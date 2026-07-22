@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IRONFORGE_BIN="${IRONFORGE_BIN:-${ROOT_DIR}/target/release/ironforge}"
+IRONFORGE_BIN="${IRONFORGE_BIN:-${ROOT_DIR}/target/release/forgekeep}"
 
 if [[ "${IRONFORGE_BIN}" != /* ]]; then
   IRONFORGE_BIN="${ROOT_DIR}/${IRONFORGE_BIN}"

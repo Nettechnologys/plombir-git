@@ -23,7 +23,7 @@ russh = "0.51"
 russh-keys = "0.45"
 
 # Database — SeaORM's default features already bundle all three sqlx backends
-# (sqlite + postgres + mysql) plus with-chrono/with-uuid, so IronForge can select
+# (sqlite + postgres + mysql) plus with-chrono/with-uuid, so ForgeKeep can select
 # the backend at runtime via the `database_url` scheme without a feature rebuild.
 # Database — keep SeaORM default features (with-chrono/with-uuid/…) and enable
 # all three sqlx backends so the backend is chosen at runtime via the

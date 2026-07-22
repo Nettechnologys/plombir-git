@@ -74,12 +74,12 @@ RUN touch crates/rg-cli/src/main.rs \
     crates/rg-http/src/lib.rs \
     crates/rg-db/src/lib.rs \
     crates/rg-ci/src/lib.rs \
-    && cargo build --release --bin ironforge --bin ironforge-runner --bin ironforge-mcp
+    && cargo build --release --bin forgekeep --bin forgekeep-runner --bin forgekeep-mcp
 
 # Strip symbols to reduce binary size
-RUN strip target/release/ironforge \
-    target/release/ironforge-runner \
-    target/release/ironforge-mcp
+RUN strip target/release/forgekeep \
+    target/release/forgekeep-runner \
+    target/release/forgekeep-mcp
 
 # ── Stage 3: Runtime ────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -96,9 +96,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --create-home --shell /bin/bash ironforge
 
 # Copy binaries
-COPY --from=builder /build/target/release/ironforge /usr/local/bin/ironforge
-COPY --from=builder /build/target/release/ironforge-runner /usr/local/bin/ironforge-runner
-COPY --from=builder /build/target/release/ironforge-mcp /usr/local/bin/ironforge-mcp
+COPY --from=builder /build/target/release/forgekeep /usr/local/bin/forgekeep
+COPY --from=builder /build/target/release/forgekeep-runner /usr/local/bin/forgekeep-runner
+COPY --from=builder /build/target/release/forgekeep-mcp /usr/local/bin/forgekeep-mcp
 
 # Copy frontend static assets (served at web/build relative to WORKDIR)
 COPY --from=frontend-builder /build/web/build /app/web/build
@@ -119,7 +119,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Default command: serve with config via env vars.
 # Set IRONFORGE_JWT_SECRET env var before running.
-CMD ["ironforge", "serve", \
+CMD ["forgekeep", "serve", \
      "--repo-root", "/data/repos", \
      "--http-addr", "0.0.0.0:8080", \
      "--ssh-addr", "0.0.0.0:2222", \

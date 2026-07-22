@@ -53,7 +53,7 @@ function runCommand(cmd, args, env = {}) {
 
     const serverLog = '/tmp/ironforge-codex-server.log';
 
-    server = spawn('./target/release/ironforge', [
+    server = spawn('./target/release/forgekeep', [
       'serve',
       '--repo-root', '/tmp/ironforge-codex-automation/repos',
       '--http-addr', '127.0.0.1:18080',
