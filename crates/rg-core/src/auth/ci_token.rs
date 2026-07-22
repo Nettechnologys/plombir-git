@@ -2,7 +2,7 @@
 //!
 //! CI job tokens (`CI_JOB_TOKEN`) are short-lived JWTs scoped to a specific
 //! repository with limited permissions. They are injected into CI job
-//! environments and can be used to call the IronForge API during job execution.
+//! environments and can be used to call the ForgeKeep API during job execution.
 //!
 //! ## Token claims
 //!
@@ -11,7 +11,7 @@
 //!   sub: "ci:job:<id>",    // CI job identifier
 //!   repo_id: <id>,          // scoped repository
 //!   scope: "repo:read packages:read",  // space-separated permissions
-//!   iss: "ironforge-ci",    // issuer identifier
+//!   iss: "forgekeep-ci",    // issuer identifier
 //!   iat, exp                // standard JWT timestamps
 //! }
 //! ```
@@ -32,7 +32,7 @@ pub struct CiJobClaims {
     pub job_id: i64,
     /// Space-separated scope list.
     pub scope: String,
-    /// Issuer: "ironforge-ci"
+    /// Issuer: "forgekeep-ci"
     pub iss: String,
     /// Issued-at (Unix timestamp seconds).
     pub iat: i64,
@@ -95,7 +95,7 @@ pub fn generate_ci_job_token_with_ttl(
         pipeline_id,
         job_id,
         scope: scopes.to_string(),
-        iss: "ironforge-ci".to_string(),
+        iss: "forgekeep-ci".to_string(),
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
@@ -112,7 +112,7 @@ pub fn generate_ci_job_token_with_ttl(
 pub fn validate_ci_token_signature(token: &str, secret: &str) -> Option<CiJobClaims> {
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     let mut validation = Validation::new(Algorithm::HS256);
-    validation.set_issuer(&["ironforge-ci"]);
+    validation.set_issuer(&["forgekeep-ci"]);
     decode::<CiJobClaims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
@@ -126,7 +126,7 @@ pub fn validate_ci_token_signature(token: &str, secret: &str) -> Option<CiJobCla
 ///
 /// Returns the claims only if:
 /// - Token signature is valid and not expired
-/// - Token has the CI issuer ("ironforge-ci")
+/// - Token has the CI issuer ("forgekeep-ci")
 /// - Token has the required scope
 /// - Token is authorized for the target repository
 pub fn validate_ci_token(
@@ -188,7 +188,7 @@ mod tests {
             pipeline_id: 1,
             job_id: 1,
             scope: "repo:read".into(),
-            iss: "ironforge-ci".into(),
+            iss: "forgekeep-ci".into(),
             iat: now.timestamp(),
             exp: exp.timestamp(),
         };

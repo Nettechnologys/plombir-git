@@ -22,7 +22,7 @@ use crate::api::auth::{extract_user_id, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
-pub(crate) const MFA_CHALLENGE_COOKIE: &str = "ironforge_mfa_challenge";
+pub(crate) const MFA_CHALLENGE_COOKIE: &str = "forgekeep_mfa_challenge";
 
 pub(crate) fn build_mfa_challenge_cookie(token: &str, is_https: bool) -> String {
     format!(
@@ -129,7 +129,7 @@ pub async fn setup_mfa(
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
     let (secret, otpauth_url, _qr_text) =
-        rg_core::auth::totp::generate_secret(&user.username, "IronForge").map_err(|e| {
+        rg_core::auth::totp::generate_secret(&user.username, "ForgeKeep").map_err(|e| {
             tracing::error!("TOTP error: {}", e);
             AppError::internal("TOTP generation failed")
         })?;

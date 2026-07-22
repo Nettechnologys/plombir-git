@@ -80,7 +80,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('auth.login.title')} · IronForge</title>
+  <title>{t('auth.login.title')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="login-page">

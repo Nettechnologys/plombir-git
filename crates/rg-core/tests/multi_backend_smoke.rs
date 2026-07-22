@@ -1,15 +1,15 @@
 //! Runtime smoke for PostgreSQL/MySQL CI service containers.
 //!
 //! Run with:
-//! `IRONFORGE_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
+//! `FORGEKEEP_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
 
 use sea_orm::{NotSet, Set};
 
 #[tokio::test]
-#[ignore = "requires IRONFORGE_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
-    let database_url = std::env::var("IRONFORGE_TEST_DATABASE_URL")
-        .expect("IRONFORGE_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, 15, 60, 2)
         .await
         .expect("connect to test database");

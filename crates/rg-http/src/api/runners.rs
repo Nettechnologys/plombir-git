@@ -334,7 +334,7 @@ pub async fn poll_job(
                         .unwrap_or_default();
                     for reserved in [
                         "CI",
-                        "IRONFORGE",
+                        "FORGEKEEP",
                         "CI_PIPELINE_ID",
                         "CI_COMMIT_SHA",
                         "CI_SHA",
@@ -362,7 +362,7 @@ pub async fn poll_job(
                         }
                     }
                     variables.insert("CI".into(), serde_json::json!("true"));
-                    variables.insert("IRONFORGE".into(), serde_json::json!("true"));
+                    variables.insert("FORGEKEEP".into(), serde_json::json!("true"));
                     variables.insert("CI_PIPELINE_ID".into(), serde_json::json!(pipeline_id));
                     if let Some(pipeline) = &pipeline {
                         variables.insert(

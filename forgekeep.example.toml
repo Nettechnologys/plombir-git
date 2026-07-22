@@ -1,5 +1,5 @@
-# IronForge Configuration File
-# Copy this to ironforge.toml and customize for your deployment.
+# ForgeKeep Configuration File
+# Copy this to forgekeep.toml and customize for your deployment.
 
 [server]
 repo_root = "./repos"
@@ -8,7 +8,7 @@ ssh_addr = "0.0.0.0:2222"
 # host_key = "/path/to/ssh_host_key"
 
 [database]
-url = "sqlite://./ironforge.db?mode=rwc"
+url = "sqlite://./forgekeep.db?mode=rwc"
 
 [auth]
 jwt_secret = "change-me-in-production"
@@ -20,7 +20,7 @@ docker = false
 max = 0          # 0 = disabled
 window_secs = 60
 # Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP for rate limiting.
-# Leave empty when IronForge is directly exposed.
+# Leave empty when ForgeKeep is directly exposed.
 trusted_proxies = []
 # trusted_proxies = ["127.0.0.1", "::1", "10.0.0.10"]
 
@@ -29,14 +29,14 @@ trusted_proxies = []
 # port = 587
 # user = "noreply@example.com"
 # pass = "your-password"
-# from = "IronForge <noreply@example.com>"
+# from = "ForgeKeep <noreply@example.com>"
 
 [tls]
 # cert = "/path/to/cert.pem"
 # key = "/path/to/key.pem"
 
 [logging]
-# file = "/var/log/ironforge/ironforge.log"
+# file = "/var/log/forgekeep/forgekeep.log"
 max_size_mb = 10
 max_files = 5
 

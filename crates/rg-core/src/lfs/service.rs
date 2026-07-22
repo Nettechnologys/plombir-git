@@ -77,7 +77,7 @@ fn action_signature_payload(
     expires_at: i64,
 ) -> String {
     format!(
-        "ironforge-lfs-v1:{}:{}:{}:{}",
+        "forgekeep-lfs-v1:{}:{}:{}:{}",
         action.as_str(),
         repo_id,
         oid,

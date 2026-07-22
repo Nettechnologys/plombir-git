@@ -1,16 +1,16 @@
-//! IronForge Runner Agent — polls jobs from the server and executes them.
+//! ForgeKeep Runner Agent — polls jobs from the server and executes them.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! # Register and start running
-//! ironforge-runner run --server http://127.0.0.1:8080 --name my-runner
+//! forgekeep-runner run --server http://127.0.0.1:8080 --name my-runner
 //!
 //! # Using a config file
-//! ironforge-runner run --config ~/.ironforge/runner.toml
+//! forgekeep-runner run --config ~/.forgekeep/runner.toml
 //!
 //! # Register only (get token for later use)
-//! ironforge-runner register --server http://127.0.0.1:8080 --name my-runner
+//! forgekeep-runner register --server http://127.0.0.1:8080 --name my-runner
 //! ```
 //!
 //! Jobs that specify a container image fail closed when Docker is unavailable.
@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ironforge-runner", about = "IronForge CI Runner Agent")]
+#[command(name = "forgekeep-runner", about = "ForgeKeep CI Runner Agent")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,7 +32,7 @@ struct Cli {
 enum Commands {
     /// Register a new runner and get a token
     Register {
-        /// IronForge server URL
+        /// ForgeKeep server URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         server: String,
 
@@ -55,7 +55,7 @@ enum Commands {
 
     /// Start the runner (register if needed, then poll and execute jobs)
     Run {
-        /// IronForge server URL
+        /// ForgeKeep server URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         server: String,
 
@@ -80,7 +80,7 @@ enum Commands {
         auth_token: Option<String>,
 
         /// Path to config file
-        #[arg(long, default_value = "~/.ironforge/runner.toml")]
+        #[arg(long, default_value = "~/.forgekeep/runner.toml")]
         config: String,
     },
 }
@@ -136,7 +136,25 @@ fn save_config(path: &str, config: &RunnerConfig) -> Result<()> {
 }
 
 fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
-    auth_token.or_else(|| std::env::var("IRONFORGE_AUTH_TOKEN").ok())
+    auth_token.or_else(|| env_var_compat("FORGEKEEP_AUTH_TOKEN", "IRONFORGE_AUTH_TOKEN"))
+}
+
+/// Read `new` from the environment, falling back to the deprecated `old` name
+/// (IronForge → ForgeKeep rebrand) with a one-time deprecation warning.
+fn env_var_compat(new: &str, old: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(new) {
+        return Some(value);
+    }
+    match std::env::var(old) {
+        Ok(value) => {
+            tracing::warn!(
+                "environment variable `{old}` is deprecated and will be removed in a future \
+                 release; use `{new}` instead"
+            );
+            Some(value)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Register a runner with the server.
@@ -288,7 +306,7 @@ async fn download_workspace(
     }
     let archive = response.bytes().await?;
     let workspace = std::env::temp_dir()
-        .join("ironforge-runner")
+        .join("forgekeep-runner")
         .join("jobs")
         .join(job_id.to_string());
     let unpack_path = workspace.clone();
@@ -526,7 +544,7 @@ async fn run_job_docker(
     }
 
     let mut command = tokio::process::Command::new("docker");
-    let container_name = format!("ironforge-runner-job-{job_id}");
+    let container_name = format!("forgekeep-runner-job-{job_id}");
     command.args(["run", "--rm", "--name", &container_name, "-v"]);
     command.arg(format!("{}:/workspace", workspace.to_string_lossy()));
     command.args(["-w", "/workspace"]);
@@ -582,7 +600,7 @@ mod tests {
     async fn local_executor_injects_polled_variables_with_a_clean_environment() {
         let variables = vec![("RUNNER_MESSAGE".into(), "hello".into())];
         let (code, log) = run_job_local(
-            "test \"$RUNNER_MESSAGE\" = hello && test -z \"$IRONFORGE_HOST_SECRET\" && echo ok",
+            "test \"$RUNNER_MESSAGE\" = hello && test -z \"$FORGEKEEP_HOST_SECRET\" && echo ok",
             &variables,
             std::path::Path::new("."),
         )
@@ -668,7 +686,7 @@ async fn main() -> Result<()> {
                 .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
             let auth_token = resolve_auth_token(auth_token)
-                .context("runner registration requires --auth-token or IRONFORGE_AUTH_TOKEN")?;
+                .context("runner registration requires --auth-token or FORGEKEEP_AUTH_TOKEN")?;
 
             println!("Registering runner '{}' with {}...", name, server);
             let (runner_id, token) =
@@ -685,7 +703,7 @@ async fn main() -> Result<()> {
                     name: Some(name),
                     labels: Some(labels_vec),
                 };
-                let config_path = "~/.ironforge/runner.toml";
+                let config_path = "~/.forgekeep/runner.toml";
                 save_config(config_path, &config)?;
                 println!("  Config saved to {}", config_path);
             }
@@ -739,7 +757,7 @@ async fn main() -> Result<()> {
                         cfg_name, resolved_server
                     );
                     let auth_token = resolve_auth_token(auth_token).context(
-                        "runner auto-registration requires --auth-token or IRONFORGE_AUTH_TOKEN; \
+                        "runner auto-registration requires --auth-token or FORGEKEEP_AUTH_TOKEN; \
                          alternatively pass --runner-id and --token",
                     )?;
                     let (id, tok) = register_runner(
@@ -909,7 +927,7 @@ async fn main() -> Result<()> {
                                         .args([
                                             "rm",
                                             "-f",
-                                            &format!("ironforge-runner-job-{}", job.job_id),
+                                            &format!("forgekeep-runner-job-{}", job.job_id),
                                         ])
                                         .output()
                                         .await;

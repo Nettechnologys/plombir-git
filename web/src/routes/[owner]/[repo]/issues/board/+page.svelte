@@ -155,7 +155,7 @@
 </script>
 
 <svelte:head>
-  <title>Board · {owner}/{repo} · IronForge</title>
+  <title>Board · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

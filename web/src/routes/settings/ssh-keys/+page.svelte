@@ -86,7 +86,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('ssh_keys.title')} · IronForge</title>
+  <title>{t('ssh_keys.title')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container ssh-keys-page">

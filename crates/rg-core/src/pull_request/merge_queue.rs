@@ -431,10 +431,10 @@ async fn ensure_merge_group_ci(
         ],
         Some(&repo_path),
         &[
-            ("GIT_AUTHOR_NAME", "IronForge Merge Queue"),
-            ("GIT_AUTHOR_EMAIL", "merge-queue@ironforge.local"),
-            ("GIT_COMMITTER_NAME", "IronForge Merge Queue"),
-            ("GIT_COMMITTER_EMAIL", "merge-queue@ironforge.local"),
+            ("GIT_AUTHOR_NAME", "ForgeKeep Merge Queue"),
+            ("GIT_AUTHOR_EMAIL", "merge-queue@forgekeep.local"),
+            ("GIT_COMMITTER_NAME", "ForgeKeep Merge Queue"),
+            ("GIT_COMMITTER_EMAIL", "merge-queue@forgekeep.local"),
         ],
     )?;
     commit_output.ensure_success()?;

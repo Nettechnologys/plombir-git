@@ -34,7 +34,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('explore.title')} · IronForge</title>
+  <title>{t('explore.title')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

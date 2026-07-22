@@ -23,7 +23,7 @@
 //!   `{artifactId}-{version}.jar`
 //!   `maven-metadata.xml`
 //!
-//! IronForge serves the directory listing at:
+//! ForgeKeep serves the directory listing at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/maven/{groupId}/{artifactId}/`
 
 use std::io::Read;

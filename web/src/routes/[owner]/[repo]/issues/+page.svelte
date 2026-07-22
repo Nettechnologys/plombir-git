@@ -90,7 +90,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('issues.title')} · {owner}/{repo} · IronForge</title>
+  <title>{t('issues.title')} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

@@ -124,7 +124,7 @@
 </script>
 
 <svelte:head>
-  <title>Releases · {owner}/{repo} · IronForge</title>
+  <title>Releases · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

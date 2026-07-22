@@ -15,7 +15,7 @@
 //! - `RegistrationsBaseUrl/3.6.0` — registration index
 //! - `SearchQueryService/3.5.0` — search endpoint
 //!
-//! IronForge serves these at:
+//! ForgeKeep serves these at:
 //! - Service Index:  `GET /api/v1/repos/{owner}/{repo}/packages/nuget/index.json`
 //! - Registration:   `GET /api/v1/repos/{owner}/{repo}/packages/nuget/registration/{id}/index.json`
 //! - Search:         `GET /api/v1/repos/{owner}/{repo}/packages/nuget/query?q=...`

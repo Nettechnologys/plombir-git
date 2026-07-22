@@ -174,12 +174,12 @@ fn extract_bearer_from_protocol(headers: &HeaderMap) -> Option<(String, String)>
 
 /// Extract a Bearer token from the `Cookie` header (M-4: HttpOnly cookie auth).
 ///
-/// Returns the raw token string if a valid `ironforge_token` cookie is present.
+/// Returns the raw token string if a valid `forgekeep_token` cookie is present.
 fn extract_token_from_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get("cookie")?.to_str().ok()?;
     for cookie in cookie_header.split(';') {
         let cookie = cookie.trim();
-        if let Some(token) = cookie.strip_prefix("ironforge_token=") {
+        if let Some(token) = cookie.strip_prefix("forgekeep_token=") {
             if !token.is_empty() {
                 return Some(token.to_string());
             }

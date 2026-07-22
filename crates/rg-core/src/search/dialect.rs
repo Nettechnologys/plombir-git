@@ -1,6 +1,6 @@
 //! Cross-backend full-text-search (FTS) SQL dialect helpers.
 //!
-//! IronForge supports three database backends. Each expresses full-text search
+//! ForgeKeep supports three database backends. Each expresses full-text search
 //! very differently:
 //!
 //! | Backend    | FTS mechanism                                  |

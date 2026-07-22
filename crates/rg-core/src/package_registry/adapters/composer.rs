@@ -18,7 +18,7 @@
 //! }
 //! ```
 //!
-//! IronForge serves this at:
+//! ForgeKeep serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/composer/packages.json`
 
 use std::io::{Cursor, Read};

@@ -1,4 +1,4 @@
-//! IronForge core business logic.
+//! ForgeKeep core business logic.
 //!
 //! Handles users, repositories, authentication, access control,
 //! issues, pull requests, wiki, LFS, webhooks, code reviews,
@@ -44,6 +44,7 @@ pub mod release;
 pub mod audit;
 pub mod blob_storage;
 pub mod email;
+pub mod env_compat; // IRONFORGE_* → FORGEKEEP_* env var fallback (fork rebrand)
 pub mod lfs;
 pub mod platform;
 pub mod search; // Cross-platform abstractions

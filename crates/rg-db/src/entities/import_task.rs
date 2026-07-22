@@ -2,7 +2,7 @@
 //!
 //! Tracks the progress of migrating a repository and its metadata
 //! (issues, PRs, labels, milestones, releases, wiki) from
-//! external platforms (GitHub, GitLab) into IronForge.
+//! external platforms (GitHub, GitLab) into ForgeKeep.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ pub struct Model {
     pub platform: String,
     /// Source repository URL (e.g., https://github.com/user/repo)
     pub source_url: String,
-    /// Target owner in IronForge
+    /// Target owner in ForgeKeep
     pub target_owner: String,
     /// Target repository name
     pub target_name: String,

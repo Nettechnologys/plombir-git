@@ -143,7 +143,7 @@
 </script>
 
 <svelte:head>
-  <title>{title} · {owner}/{repo} Wiki · IronForge</title>
+  <title>{title} · {owner}/{repo} Wiki · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

@@ -61,7 +61,7 @@ async fn runner_register_accepts_admin_httponly_cookie() {
         .post(format!("{}/api/v1/runners/register", base))
         .header(
             reqwest::header::COOKIE,
-            format!("ironforge_token={}", admin_token),
+            format!("forgekeep_token={}", admin_token),
         )
         .json(&serde_json::json!({"name": "cookie-runner"}))
         .send()

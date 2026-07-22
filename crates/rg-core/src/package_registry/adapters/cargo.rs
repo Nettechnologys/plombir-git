@@ -6,7 +6,7 @@
 //!
 //! Cargo ≥ 1.68 uses the "sparse index" protocol: a GET to
 //! `{registry}/index/{name}` returns line-delimited JSON with one entry
-//! per version.  IronForge serves this at:
+//! per version.  ForgeKeep serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/cargo/index/{pkg_name}`
 
 use flate2::read::GzDecoder;

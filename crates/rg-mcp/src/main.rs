@@ -1,4 +1,4 @@
-//! `ironforge-mcp` – MCP server entry point.
+//! `forgekeep-mcp` – MCP server entry point.
 //!
 //! # Transports
 //! - **stdio** – run as subprocess of an AI agent.
@@ -9,8 +9,8 @@
 //! # Environment
 //! | Variable        | Default                 | Notes                     |
 //! |-----------------|-------------------------|---------------------------|
-//! | `IRONFORGE_URL` | `http://localhost:8080` | IronForge API base       |
-//! | `IRONFORGE_PAT` | _(none)_              | Bearer token for API auth |
+//! | `FORGEKEEP_URL` | `http://localhost:8080` | ForgeKeep API base       |
+//! | `FORGEKEEP_PAT` | _(none)_              | Bearer token for API auth |
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::io::{stdin, stdout};
@@ -88,7 +88,7 @@ fn handle_initialize(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse
     let result = serde_json::json!({
         "protocolVersion": "2024-11-05",
         "serverInfo": {
-            "name": "ironforge-mcp",
+            "name": "forgekeep-mcp",
             "version": "0.1.0"
         },
         "capabilities": {
@@ -120,7 +120,7 @@ fn main() -> anyhow::Result<()> {
 
     if std::env::args().any(|a| a == "--sse") {
         anyhow::bail!(
-            "SSE transport is not implemented; use stdio by running ironforge-mcp without --sse"
+            "SSE transport is not implemented; use stdio by running forgekeep-mcp without --sse"
         );
     }
 

@@ -214,7 +214,7 @@
 </script>
 
 <svelte:head>
-  <title>{filePath} · {owner}/{repo} · IronForge</title>
+  <title>{filePath} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

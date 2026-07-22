@@ -7,7 +7,7 @@ pub enum Error {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("IronForge API error: status={status}, body={body}")]
+    #[error("ForgeKeep API error: status={status}, body={body}")]
     Api { status: u16, body: String },
 
     #[error("JSON serialization error: {0}")]

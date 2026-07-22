@@ -34,7 +34,7 @@ async fn request_oci_token(
     let client = reqwest::Client::new();
     let mut req = client
         .get(format!("{}/v2/auth/token", base))
-        .query(&[("service", "ironforge-registry"), ("scope", scope)]);
+        .query(&[("service", "forgekeep-registry"), ("scope", scope)]);
     if let Some(auth) = auth_header {
         req = req.header(reqwest::header::AUTHORIZATION, auth);
     }

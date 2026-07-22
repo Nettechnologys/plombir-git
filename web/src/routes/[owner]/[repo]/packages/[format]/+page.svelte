@@ -47,7 +47,7 @@
     if (f === 'docker') return `docker pull ${owner}/${repo}:${version}`;
     if (f === 'nuget') return `dotnet add package ${name}`;
     if (f === 'rubygems') return `gem install ${name}`;
-    if (f === 'go') return `GOPROXY=<IronForge URL>/api/v1/repos/${owner}/${repo}/packages/go go get ${name}`;
+    if (f === 'go') return `GOPROXY=<ForgeKeep URL>/api/v1/repos/${owner}/${repo}/packages/go go get ${name}`;
     if (f === 'helm') return `helm install my-release ${name}`;
     if (f === 'composer') return `composer require ${name}`;
     return `# install ${name}`;
@@ -63,7 +63,7 @@
 </script>
 
 <svelte:head>
-  <title>{packageFormatLabel(format!)} · {owner}/{repo} · IronForge</title>
+  <title>{packageFormatLabel(format!)} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

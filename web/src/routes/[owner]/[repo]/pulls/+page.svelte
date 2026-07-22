@@ -82,7 +82,7 @@
 </script>
 
 <svelte:head>
-  <title>Pull Requests · {owner}/{repo} · IronForge</title>
+  <title>Pull Requests · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

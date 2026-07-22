@@ -2,7 +2,7 @@
 //!
 //! Each tool:
 //! 1. parses `req.params` → arguments JSON
-//! 2. calls IronForge REST API
+//! 2. calls ForgeKeep REST API
 //! 3. returns `JsonRpcResponse` with `ToolCallResult`
 
 use super::protocol::*;

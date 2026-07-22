@@ -1,9 +1,9 @@
-//! IronForge CI/CD Engine.
+//! ForgeKeep CI/CD Engine.
 //!
-//! Parses `.ironforge-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format)
+//! Parses `.forgekeep-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format)
 //! from the repository and executes pipelines.
 //!
-//! ## Native format (`.ironforge-ci.yml`)
+//! ## Native format (`.forgekeep-ci.yml`)
 //!
 //! ```yaml
 //! stages:
@@ -96,7 +96,7 @@ pub async fn resume_pipeline(params: ResumePipelineParams<'_>) -> Result<()> {
 /// Trigger a CI pipeline for a push event.
 ///
 /// This function:
-/// 1. Reads `.ironforge-ci.yml` from the repo at the given commit
+/// 1. Reads `.forgekeep-ci.yml` from the repo at the given commit
 /// 2. Parses the CI configuration
 /// 3. Checks concurrency control (if configured)
 /// 4. Creates pipeline/stage/job records in the DB
@@ -520,7 +520,7 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
 ///
 /// Tries formats in order:
 /// 1. `.gitea/workflows/*.yml` (Gitea Actions format)
-/// 2. `.ironforge-ci.yml` (native format)
+/// 2. `.forgekeep-ci.yml` (native format)
 ///
 /// For Gitea Actions workflows, multiple files are merged into a single `CiConfig`.
 /// Jobs from different workflow files are placed in separate stages.
@@ -539,25 +539,36 @@ fn read_ci_config(
         return Ok(config);
     }
 
-    // Fall back to native .ironforge-ci.yml
-    let revspec = format!("{}:.ironforge-ci.yml", commit_sha);
-    let object_id = repo.rev_parse_single(revspec.as_str()).map_err(|_| {
-        anyhow::anyhow!(
-            "no CI config found (.gitea/workflows/*.yml or .ironforge-ci.yml) at commit {}",
-            commit_sha
-        )
-    })?;
+    // Fall back to the native CI config: the current ForgeKeep filename, then the
+    // deprecated IronForge name for backwards compatibility (removed in a future release).
+    let ci_filename = [".forgekeep-ci.yml", ".ironforge-ci.yml"]
+        .into_iter()
+        .find(|name| {
+            repo.rev_parse_single(format!("{}:{}", commit_sha, name).as_str())
+                .is_ok()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no CI config found (.gitea/workflows/*.yml, .forgekeep-ci.yml, or .ironforge-ci.yml) at commit {}",
+                commit_sha
+            )
+        })?;
+
+    let revspec = format!("{}:{}", commit_sha, ci_filename);
+    let object_id = repo
+        .rev_parse_single(revspec.as_str())
+        .context("failed to resolve CI config object")?;
 
     let object_id = object_id.object().context("failed to resolve object")?;
     let blob = object_id
         .try_into_blob()
-        .context("expected a blob object for .ironforge-ci.yml")?;
+        .with_context(|| format!("expected a blob object for {}", ci_filename))?;
 
-    let ci_yml =
-        String::from_utf8(blob.data.to_vec()).context(".ironforge-ci.yml is not valid UTF-8")?;
+    let ci_yml = String::from_utf8(blob.data.to_vec())
+        .with_context(|| format!("{} is not valid UTF-8", ci_filename))?;
 
     let config: CiConfig = serde_yaml::from_str(&ci_yml)
-        .with_context(|| format!("failed to parse .ironforge-ci.yml: {}", ci_yml))?;
+        .with_context(|| format!("failed to parse {}: {}", ci_filename, ci_yml))?;
 
     Ok(config)
 }
@@ -748,7 +759,7 @@ mod matrix_tests {
     async fn matrix_job_conditions_persist_and_skip_only_false_variants() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
-            temp.path().join(".ironforge-ci.yml"),
+            temp.path().join(".forgekeep-ci.yml"),
             "stages: [test, deploy]\nconditional:\n  stage: test\n  if: matrix.os == 'linux' && github.ref_name == 'main'\n  script: [echo ok]\n  matrix:\n    os: [linux, macos]\ndeploy:\n  stage: deploy\n  if: github.ref_name == 'main'\n  script: [echo deploy]\n",
         ).unwrap();
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
@@ -765,7 +776,7 @@ mod matrix_tests {
             .unwrap()
             .success());
         assert!(git
-            .run(&["add", ".ironforge-ci.yml"], Some(temp.path()))
+            .run(&["add", ".forgekeep-ci.yml"], Some(temp.path()))
             .unwrap()
             .success());
         assert!(git

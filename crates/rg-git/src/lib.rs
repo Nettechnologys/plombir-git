@@ -1,4 +1,4 @@
-//! `rg-git` — Git Smart Protocol implementation for IronForge.
+//! `rg-git` — Git Smart Protocol implementation for ForgeKeep.
 //!
 //! This crate handles the server side of Git's smart HTTP and SSH protocols.
 //! It speaks pkt-line framing, sideband multiplexing, and implements both
@@ -20,7 +20,7 @@
 //!
 //! # Key design decisions
 //!
-//! - **Bare repositories only.**  IronForge repos live as `{owner}/{repo}.git`
+//! - **Bare repositories only.**  ForgeKeep repos live as `{owner}/{repo}.git`
 //!   bare repos on disk.
 //! - **Hybrid gix + git CLI.**  Uses `gix` 0.83 for ref traversal, object
 //!   reading, and reference updates.  Falls back to `git` CLI for pack

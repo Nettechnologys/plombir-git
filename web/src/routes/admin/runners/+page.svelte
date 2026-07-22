@@ -119,7 +119,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('admin.runners.title')} · IronForge</title>
+  <title>{t('admin.runners.title')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="container">

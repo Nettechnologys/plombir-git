@@ -133,7 +133,7 @@
 </script>
 
 <svelte:head>
-  <title>Imports · IronForge</title>
+  <title>Imports · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

@@ -235,7 +235,7 @@ fn build_ref_advertisement(ref_list: &[(String, String)], _service: &str) -> Vec
     // - agent: server identification
     // NOTE: We do NOT advertise atomic (all-or-nothing ref updates) because
     // we process refs sequentially.
-    let caps = "report-status report-status-v2 side-band-64k agent=ironforge/0.1";
+    let caps = "report-status report-status-v2 side-band-64k agent=forgekeep/0.1";
 
     if let Some((sha, refname)) = ref_list.first() {
         let line = format!("{} {}\0{}", sha, refname, caps);

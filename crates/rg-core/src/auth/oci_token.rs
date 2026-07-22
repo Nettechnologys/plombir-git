@@ -5,13 +5,13 @@
 //!
 //! ## Token Format
 //!
-//! IronForge issues **signed JWTs** (HS256) with the following claims:
+//! ForgeKeep issues **signed JWTs** (HS256) with the following claims:
 //!
 //! ```json
 //! {
-//!   "iss": "ironforge",
+//!   "iss": "forgekeep",
 //!   "sub": "<username>",
-//!   "aud": "ironforge-registry",
+//!   "aud": "forgekeep-registry",
 //!   "exp": 1700000000,
 //!   "iat": 1699999900,
 //!   "scope": "repository:owner/repo:pull,push"
@@ -39,13 +39,13 @@ use std::collections::HashSet;
 /// OCI Bearer token JWT claims.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OciTokenClaims {
-    /// Issuer — always `"ironforge"`.
+    /// Issuer — always `"forgekeep"`.
     pub iss: String,
 
     /// Subject — username (or `anonymous`).
     pub sub: String,
 
-    /// Audience — must match `service` query parameter (`"ironforge-registry"`).
+    /// Audience — must match `service` query parameter (`"forgekeep-registry"`).
     pub aud: String,
 
     /// Expiration (UNIX seconds).
@@ -134,9 +134,9 @@ pub fn generate_oci_token(
         .as_secs() as usize;
 
     let claims = OciTokenClaims {
-        iss: "ironforge".to_string(),
+        iss: "forgekeep".to_string(),
         sub: username.to_string(),
-        aud: "ironforge-registry".to_string(),
+        aud: "forgekeep-registry".to_string(),
         iat: now,
         exp: now + ttl_secs as usize,
         nbf: None,
@@ -160,9 +160,9 @@ pub fn generate_oci_token(
 pub fn validate_oci_token(token: &str, secret: &str) -> Option<OciTokenClaims> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::default();
-    validation.iss = Some(std::collections::HashSet::from(["ironforge".to_string()]));
+    validation.iss = Some(std::collections::HashSet::from(["forgekeep".to_string()]));
     validation.aud = Some(std::collections::HashSet::from([
-        "ironforge-registry".to_string()
+        "forgekeep-registry".to_string()
     ]));
 
     match decode::<OciTokenClaims>(token, &key, &validation) {
@@ -268,7 +268,7 @@ mod tests {
 
         let claims = validate_oci_token(&token, TEST_SECRET).unwrap();
         assert_eq!(claims.sub, "alice");
-        assert_eq!(claims.aud, "ironforge-registry");
+        assert_eq!(claims.aud, "forgekeep-registry");
         assert!(claims.scope.as_ref().unwrap().contains("pull,push"));
     }
 

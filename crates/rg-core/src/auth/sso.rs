@@ -226,7 +226,7 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
     let user_resp = client
         .get("https://api.github.com/user")
         .header("Authorization", format!("Bearer {}", access_token))
-        .header("User-Agent", "IronForge/0.1")
+        .header("User-Agent", "ForgeKeep/0.1")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
@@ -263,7 +263,7 @@ async fn fetch_github_email(client: &reqwest::Client, access_token: &str) -> Opt
     let resp = client
         .get("https://api.github.com/user/emails")
         .header("Authorization", format!("Bearer {}", access_token))
-        .header("User-Agent", "IronForge/0.1")
+        .header("User-Agent", "ForgeKeep/0.1")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await

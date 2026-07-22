@@ -146,7 +146,7 @@
 </script>
 
 <svelte:head>
-  <title>{query ? `${query} · ` : ''}{t('search.title')} · IronForge</title>
+  <title>{query ? `${query} · ` : ''}{t('search.title')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container search-page">

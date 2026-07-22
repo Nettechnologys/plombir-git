@@ -1,4 +1,4 @@
-//! Prometheus metrics endpoint for IronForge.
+//! Prometheus metrics endpoint for ForgeKeep.
 //!
 //! Provides `/metrics` endpoint returning metrics in Prometheus text format.
 //! Uses the `prometheus` crate (default-features = false to avoid OpenSSL).
@@ -241,7 +241,7 @@ pub mod security {
     pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         let ae = IntCounterVec::new(
             Opts::new(
-                "ironforge_auth_events_total",
+                "forgekeep_auth_events_total",
                 "Auth events (login/register/logout)",
             ),
             &["event", "outcome"],
@@ -253,7 +253,7 @@ pub mod security {
 
         let fl = IntCounterVec::new(
             Opts::new(
-                "ironforge_failed_logins_total",
+                "forgekeep_failed_logins_total",
                 "Failed login attempts by reason",
             ),
             &["reason"],
@@ -326,41 +326,41 @@ pub mod business {
 
         register_counter!(
             USERS_REGISTERED,
-            "ironforge_users_registered_total",
+            "forgekeep_users_registered_total",
             "Total user registrations"
         );
         register_counter!(
             REPOS_CREATED,
-            "ironforge_repos_created_total",
+            "forgekeep_repos_created_total",
             "Total repositories created"
         );
         register_counter!(
             REPOS_DELETED,
-            "ironforge_repos_deleted_total",
+            "forgekeep_repos_deleted_total",
             "Total repositories deleted"
         );
         register_counter!(
             REPOS_FORKED,
-            "ironforge_repos_forked_total",
+            "forgekeep_repos_forked_total",
             "Total repositories forked"
         );
         register_counter!(
             ISSUES_OPENED,
-            "ironforge_issues_opened_total",
+            "forgekeep_issues_opened_total",
             "Total issues opened"
         );
         register_counter!(
             ISSUES_CLOSED,
-            "ironforge_issues_closed_total",
+            "forgekeep_issues_closed_total",
             "Total issues closed"
         );
-        register_counter!(PRS_OPENED, "ironforge_prs_opened_total", "Total PRs opened");
-        register_counter!(PRS_MERGED, "ironforge_prs_merged_total", "Total PRs merged");
-        register_counter!(STARS_GIVEN, "ironforge_stars_total", "Total stars given");
+        register_counter!(PRS_OPENED, "forgekeep_prs_opened_total", "Total PRs opened");
+        register_counter!(PRS_MERGED, "forgekeep_prs_merged_total", "Total PRs merged");
+        register_counter!(STARS_GIVEN, "forgekeep_stars_total", "Total stars given");
 
         let wh = IntCounterVec::new(
             Opts::new(
-                "ironforge_webhook_deliveries_total",
+                "forgekeep_webhook_deliveries_total",
                 "Total webhook deliveries",
             ),
             &["status"],
@@ -371,7 +371,7 @@ pub mod business {
         registry.register(Box::new(wh))?;
 
         let ws = IntGauge::with_opts(Opts::new(
-            "ironforge_ws_connections",
+            "forgekeep_ws_connections",
             "Active WebSocket connections",
         ))?;
         WS_CONNECTIONS
@@ -379,14 +379,14 @@ pub mod business {
             .map_err(|_| prometheus::Error::Msg("WS_CONNECTIONS already set".into()))?;
         registry.register(Box::new(ws))?;
 
-        let ut = IntGauge::with_opts(Opts::new("ironforge_users", "Total registered users"))?;
+        let ut = IntGauge::with_opts(Opts::new("forgekeep_users", "Total registered users"))?;
         USERS_TOTAL
             .set(ut.clone())
             .map_err(|_| prometheus::Error::Msg("USERS_TOTAL already set".into()))?;
         registry.register(Box::new(ut))?;
 
         let rt = IntGauge::with_opts(Opts::new(
-            "ironforge_repositories",
+            "forgekeep_repositories",
             "Total non-deleted repositories",
         ))?;
         REPOS_TOTAL

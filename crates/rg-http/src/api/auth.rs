@@ -8,7 +8,7 @@
 //!   Validated by `extract_user_id` and `extract_bearer_claims`.
 //! - **CI Job tokens** (`CI_JOB_TOKEN`): Least-privilege tokens scoped to a
 //!   specific repository. Validated by `extract_ci_job_claims`. Used by CI jobs
-//!   to call selected read-only IronForge APIs.
+//!   to call selected read-only ForgeKeep APIs.
 //!
 //! ## H-3: Unified Axum Extractor
 //!
@@ -53,11 +53,11 @@ impl FromRequestParts<crate::AppState> for AuthUser {
 }
 
 /// Cookie name used for HttpOnly JWT storage (M-4).
-pub(crate) const AUTH_COOKIE_NAME: &str = "ironforge_token";
+pub(crate) const AUTH_COOKIE_NAME: &str = "forgekeep_token";
 
 /// Extract a JWT from the `Cookie` header (M-4: HttpOnly cookie auth).
 ///
-/// Returns the raw token string if a valid `ironforge_token` cookie is present.
+/// Returns the raw token string if a valid `forgekeep_token` cookie is present.
 fn extract_token_from_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get("cookie")?.to_str().ok()?;
     for cookie in cookie_header.split(';') {

@@ -1,4 +1,4 @@
-//! CI configuration types for `.ironforge-ci.yml`.
+//! CI configuration types for `.forgekeep-ci.yml`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -13,7 +13,7 @@
 //! - `GET /gems/{name}-{version}.gem` — gem download
 //! - `POST /api/v1/gems` — gem push
 //!
-//! IronForge serves these at:
+//! ForgeKeep serves these at:
 //! - Dependencies: `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/dependencies?gems={name}`
 //! - Gem info:     `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/gems/{name}.json`
 //! - Download:     (standard package download endpoint)

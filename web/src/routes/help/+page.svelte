@@ -1,11 +1,11 @@
 <svelte:head>
-  <title>Help - IronForge</title>
+  <title>Help - ForgeKeep</title>
 </svelte:head>
 
 <div class="help-page">
   <header class="help-header">
     <h1>Help</h1>
-    <p>Common commands and entry points for using this IronForge instance.</p>
+    <p>Common commands and entry points for using this ForgeKeep instance.</p>
   </header>
 
   <section class="help-section">

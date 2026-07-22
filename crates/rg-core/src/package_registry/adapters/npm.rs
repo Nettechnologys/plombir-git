@@ -22,7 +22,7 @@
 //! }
 //! ```
 //!
-//! IronForge serves this at:
+//! ForgeKeep serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/npm/{pkg_name}`
 
 use flate2::read::GzDecoder;

@@ -178,7 +178,7 @@ impl GitLabClient {
 
         let client = Client::builder()
             .default_headers(headers)
-            .user_agent("IronForge/0.1")
+            .user_agent("ForgeKeep/0.1")
             .build()
             .expect("failed to build HTTP client");
 

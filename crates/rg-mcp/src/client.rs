@@ -1,4 +1,4 @@
-//! Thin async client for the IronForge REST API.
+//! Thin async client for the ForgeKeep REST API.
 //!
 //! Wraps `reqwest::Client` and adds:
 //! - `/api/v1/` prefix

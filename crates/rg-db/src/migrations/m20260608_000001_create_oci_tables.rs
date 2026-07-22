@@ -6,7 +6,7 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // 1. OCI repositories — links an IronForge repo to an OCI namespace
+        // 1. OCI repositories — links an ForgeKeep repo to an OCI namespace
         manager
             .create_table(
                 Table::create()

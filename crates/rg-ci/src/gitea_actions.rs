@@ -1,7 +1,7 @@
 //! Gitea Actions / GitHub Actions workflow compatibility layer.
 //!
 //! Parses `.gitea/workflows/*.yml` (GitHub Actions-compatible format) and
-//! translates them into IronForge's internal `CiConfig` model.
+//! translates them into ForgeKeep's internal `CiConfig` model.
 //!
 //! Supported features:
 //! - `on: push`, `on: pull_request` triggers with branch filtering
@@ -227,7 +227,7 @@ impl GiteaWorkflow {
     }
 
     /// Reject workflows that would otherwise appear successful after silently
-    /// dropping an action step. IronForge's native `.ironforge-ci.yml` format
+    /// dropping an action step. ForgeKeep's native `.forgekeep-ci.yml` format
     /// is the supported escape hatch for commands that do not have an Actions
     /// runtime.
     pub fn validate_supported_actions(&self) -> Result<()> {
@@ -269,7 +269,7 @@ impl GiteaWorkflow {
             Ok(())
         } else {
             anyhow::bail!(
-                "unsupported action step(s): {}. Convert them to run: commands or use .ironforge-ci.yml",
+                "unsupported action step(s): {}. Convert them to run: commands or use .forgekeep-ci.yml",
                 unsupported.join(", ")
             )
         }
@@ -314,7 +314,7 @@ impl GiteaWorkflow {
         }
     }
 
-    /// Convert this workflow into an IronForge `CiConfig`.
+    /// Convert this workflow into an ForgeKeep `CiConfig`.
     ///
     /// The conversion:
     /// - Groups jobs by their dependency order (needs) into stages
@@ -399,7 +399,7 @@ impl GiteaWorkflow {
 
             if let Some(uses) = &job.uses {
                 script.push(format!(
-                    "echo \"IronForge does not support reusable workflow '{}'; use explicit jobs or .ironforge-ci.yml\" >&2; exit 78",
+                    "echo \"ForgeKeep does not support reusable workflow '{}'; use explicit jobs or .forgekeep-ci.yml\" >&2; exit 78",
                     uses
                 ));
             }
@@ -420,7 +420,7 @@ impl GiteaWorkflow {
                         continue;
                     }
                 }
-                // Handle `uses: actions/checkout@vX` — implicit in IronForge, skip
+                // Handle `uses: actions/checkout@vX` — implicit in ForgeKeep, skip
                 if let Some(ref uses) = step.uses {
                     if uses.starts_with("actions/checkout") {
                         has_checkout = true;
@@ -448,7 +448,7 @@ impl GiteaWorkflow {
                     // Direct callers should still fail visibly even if they
                     // skipped `validate_supported_actions`.
                     script.push(format!(
-                        "echo \"IronForge does not support action '{}'; use run: or .ironforge-ci.yml\" >&2; exit 78",
+                        "echo \"ForgeKeep does not support action '{}'; use run: or .forgekeep-ci.yml\" >&2; exit 78",
                         uses
                     ));
                     continue;
@@ -472,7 +472,7 @@ impl GiteaWorkflow {
             if !has_checkout && !script.is_empty() {
                 script.insert(
                     0,
-                    "# [IronForge] Repository is already checked out at /workspace".to_string(),
+                    "# [ForgeKeep] Repository is already checked out at /workspace".to_string(),
                 );
             }
 
@@ -925,7 +925,7 @@ jobs:
         let workflow = GiteaWorkflow::parse(yml).unwrap();
         let error = workflow.validate_supported_actions().unwrap_err();
         assert!(error.to_string().contains("actions/setup-node@v4"));
-        assert!(error.to_string().contains(".ironforge-ci.yml"));
+        assert!(error.to_string().contains(".forgekeep-ci.yml"));
     }
 
     #[test]

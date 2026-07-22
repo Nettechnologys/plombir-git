@@ -37,7 +37,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('repo.new_file')} · {owner}/{repo} · IronForge</title>
+  <title>{t('repo.new_file')} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <FileEditor

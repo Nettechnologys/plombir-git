@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_generate_secret() {
-        let (secret, _url, _qr) = generate_secret("testuser", "IronForge").unwrap();
+        let (secret, _url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
         assert!(!secret.is_empty());
     }
 }

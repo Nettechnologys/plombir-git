@@ -50,5 +50,8 @@ deploy/docker-compose.override.yml
 .playwright-cli/
 
 # Local runtime configs containing real secrets (keep only *.example.toml in VCS)
+/forgekeep.toml
+/forgekeep-simple.toml
+# Legacy IronForge config names (pre-rebrand) — still ignored so old local files never get committed
 /ironforge.toml
 /ironforge-simple.toml

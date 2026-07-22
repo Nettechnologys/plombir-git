@@ -52,7 +52,7 @@ pub fn build_test_app_state(
         .or_else(|_| std::env::var("TMP"))
         .or_else(|_| std::env::var("TEMP"))
         .unwrap_or_else(|_| "/private/tmp".to_string());
-    let oci_storage_path = std::path::Path::new(&tmp_dir).join("ironforge-test-oci");
+    let oci_storage_path = std::path::Path::new(&tmp_dir).join("forgekeep-test-oci");
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> =
         Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root));
     rg_http::AppState {

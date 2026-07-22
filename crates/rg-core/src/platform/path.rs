@@ -39,13 +39,13 @@ pub fn validate_repo_path(path: &str) -> Result<()> {
 /// Create a platform-appropriate PathBuf for repository storage.
 ///
 /// # Unix
-/// `/tmp/ironforge/repos/{owner}/{repo}.git`
+/// `/tmp/forgekeep/repos/{owner}/{repo}.git`
 ///
 /// # Windows
-/// `C:\Users\Username\AppData\Local\Temp\ironforge\repos\{owner}\{repo}.git`
+/// `C:\Users\Username\AppData\Local\Temp\forgekeep\repos\{owner}\{repo}.git`
 pub fn repo_path(owner: &str, repo: &str) -> PathBuf {
     let mut path = temp_dir();
-    path.push("ironforge");
+    path.push("forgekeep");
     path.push("repos");
     path.push(owner);
     path.push(format!("{}.git", repo));
@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn test_repo_path() {
         let path = repo_path("testowner", "testrepo");
-        assert!(path.to_string_lossy().contains("ironforge"));
+        assert!(path.to_string_lossy().contains("forgekeep"));
         assert!(path.to_string_lossy().contains("repos"));
         assert!(path.to_string_lossy().contains("testowner"));
         assert!(path.to_string_lossy().contains("testrepo.git"));
@@ -96,9 +96,9 @@ mod tests {
 
     #[test]
     fn test_expand_home() {
-        let result = expand_home("~/.ironforge/config.toml");
+        let result = expand_home("~/.forgekeep/config.toml");
         assert!(!result.starts_with('~'));
-        assert!(result.contains(".ironforge"));
+        assert!(result.contains(".forgekeep"));
     }
 
     #[test]

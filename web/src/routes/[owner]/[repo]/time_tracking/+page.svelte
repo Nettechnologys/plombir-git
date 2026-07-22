@@ -117,7 +117,7 @@
 </script>
 
 <svelte:head>
-  <title>Time Tracking · {owner}/{repo} · IronForge</title>
+  <title>Time Tracking · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

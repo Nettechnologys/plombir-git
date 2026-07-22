@@ -30,7 +30,7 @@
 </script>
 
 <svelte:head>
-  <title>Forgot Password · IronForge</title>
+  <title>Forgot Password · ForgeKeep</title>
 </svelte:head>
 
 <div class="login-page">

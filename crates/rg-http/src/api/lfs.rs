@@ -119,7 +119,7 @@ pub async fn batch(
     let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);
 
     // Prefer the configured public URL so signed actions retain HTTPS and the
-    // externally visible host when IronForge runs behind a reverse proxy.
+    // externally visible host when ForgeKeep runs behind a reverse proxy.
     let base_url = state
         .external_url
         .as_deref()

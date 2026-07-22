@@ -22,12 +22,12 @@ use crate::sideband;
 /// V2 Protocol constants
 pub const PROTOCOL_VERSION: &str = "2";
 
-/// Capabilities that IronForge currently implements end to end.
+/// Capabilities that ForgeKeep currently implements end to end.
 ///
 /// Keep HTTP and SSH advertisements sourced from this list. Unsupported fetch
 /// features must not be appended here until `handle_fetch` implements them.
 pub const ADVERTISED_CAPABILITIES: &[&str] = &[
-    "agent=ironforge/0.1",
+    "agent=forgekeep/0.1",
     caps::LS_REFS,
     caps::FETCH_SHALLOW,
     "object-format=sha1",

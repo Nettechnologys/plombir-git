@@ -390,7 +390,7 @@ pub async fn create_repo_with_opts(
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| {
                     if opts.owner_display_name.trim().is_empty() {
-                        "IronForge"
+                        "ForgeKeep"
                     } else {
                         opts.owner_display_name.as_str()
                     }
@@ -398,7 +398,7 @@ pub async fn create_repo_with_opts(
             opts.git_author_email
                 .as_deref()
                 .filter(|email| !email.trim().is_empty())
-                .unwrap_or("ironforge@example.invalid"),
+                .unwrap_or("forgekeep@example.invalid"),
         );
 
         if let Err(e) = &init_result {
@@ -507,7 +507,7 @@ fn auto_init_repo(
         .with_context(|| format!("bare repo path does not exist: {:?}", bare_path))?;
 
     // Create a temp directory for the working tree
-    let tmp = std::env::temp_dir().join(format!("ironforge-init-{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("forgekeep-init-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
 
     // Init a non-bare repo in the temp dir
@@ -1061,7 +1061,7 @@ pub async fn create_or_update_file(
     }
 
     // Create temp working directory
-    let tmp = std::env::temp_dir().join(format!("ironforge-file-{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("forgekeep-file-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
 
     // Clone the repo
@@ -1191,7 +1191,7 @@ pub fn update_files_in_commit(
         }
     }
 
-    let tmp = std::env::temp_dir().join(format!("ironforge-files-{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("forgekeep-files-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
     let result = (|| -> Result<String> {
         let clone_url = path_to_git_url(&repo_path)?;
@@ -1305,7 +1305,7 @@ pub async fn delete_file(
     }
 
     // Create temp working directory
-    let tmp = std::env::temp_dir().join(format!("ironforge-file-del-{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("forgekeep-file-del-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
 
     // Clone the repo

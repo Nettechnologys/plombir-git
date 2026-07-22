@@ -74,7 +74,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('packages.upload')} · {owner}/{repo} · IronForge</title>
+  <title>{t('packages.upload')} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

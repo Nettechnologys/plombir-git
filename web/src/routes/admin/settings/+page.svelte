@@ -268,7 +268,7 @@
 </script>
 
 <svelte:head>
-  <title>Instance Settings · Admin · IronForge</title>
+  <title>Instance Settings · Admin · ForgeKeep</title>
 </svelte:head>
 
 <div class="settings-page">

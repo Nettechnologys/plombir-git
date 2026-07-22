@@ -18,7 +18,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 urlencoding = "2"
 
-# HTTP client (call IronForge REST API)
+# HTTP client (call ForgeKeep REST API)
 reqwest = { workspace = true }
 
 # Error handling

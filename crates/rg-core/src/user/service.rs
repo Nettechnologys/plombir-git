@@ -52,7 +52,7 @@ pub struct AuthResponse {
     pub username: String,
 }
 
-/// Validate a username according to IronForge rules.
+/// Validate a username according to ForgeKeep rules.
 ///
 /// Rules:
 /// - Length: 3–30 characters
@@ -403,7 +403,7 @@ async fn resolve_ldap_identity(
         .as_deref()
         .unwrap_or(&ldap_user.username)
         .trim();
-    validate_username(username).context("LDAP username is not valid for IronForge")?;
+    validate_username(username).context("LDAP username is not valid for ForgeKeep")?;
 
     if let Some(user) = existing {
         if user.auth_provider != "ldap"
@@ -563,9 +563,9 @@ pub async fn forgot_password(
 
     // Send email
     if let Some(smtp) = smtp_config {
-        let subject = "Reset your IronForge password";
+        let subject = "Reset your ForgeKeep password";
         let message = format!(
-            "We received a request to reset the password for your IronForge account ({}). \
+            "We received a request to reset the password for your ForgeKeep account ({}). \
              Click the button below to set a new password. This link expires in 15 minutes.",
             user.username
         );

@@ -1,7 +1,7 @@
 //! Import pipeline service — orchestrates full repository migration.
 //!
 //! Supports importing from GitHub and GitLab, including:
-//! - Repository cloning (git clone --bare) + IronForge DB registration
+//! - Repository cloning (git clone --bare) + ForgeKeep DB registration
 //! - Labels and milestones
 //! - Issues with comments
 //! - Pull/Merge requests with reviews/comments
@@ -121,7 +121,7 @@ async fn run_github_import(
     // Parse owner/repo from source URL (https://github.com/owner/repo)
     let (gh_owner, gh_repo) = parse_github_url(&task.source_url)?;
 
-    // Resolve (or create) the target repo in IronForge DB
+    // Resolve (or create) the target repo in ForgeKeep DB
     let repo_id =
         resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
 
@@ -290,7 +290,7 @@ async fn run_gitlab_import(
     // Extract project path from source URL (https://gitlab.com/group/project)
     let project_path = parse_gitlab_url(&task.source_url)?;
 
-    // Resolve (or create) the target repo in IronForge DB
+    // Resolve (or create) the target repo in ForgeKeep DB
     let repo_id =
         resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
 
@@ -431,7 +431,7 @@ async fn run_gitlab_import(
 // Target repo resolution
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Find the target repo in IronForge DB, or create it if it doesn't exist.
+/// Find the target repo in ForgeKeep DB, or create it if it doesn't exist.
 /// Returns the repo_id for use in all subsequent import operations.
 async fn resolve_or_create_target_repo(
     db: &DatabaseConnection,
@@ -456,7 +456,7 @@ async fn resolve_or_create_target_repo(
             (org.owner_id, Some(org.id))
         } else {
             anyhow::bail!(
-                "target owner '{}' not found (must be an existing IronForge user or organization)",
+                "target owner '{}' not found (must be an existing ForgeKeep user or organization)",
                 target_owner
             );
         };
@@ -481,7 +481,7 @@ async fn resolve_or_create_target_repo(
 // Git helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Clone a repository (bare) into the IronForge repo root.
+/// Clone a repository (bare) into the ForgeKeep repo root.
 fn clone_repo(
     source_url: &str,
     repo_root: &Path,
@@ -612,7 +612,7 @@ async fn build_gitlab_user_map(
     map_users(task, &usernames)
 }
 
-/// Map external user logins/usernames to local IronForge user IDs.
+/// Map external user logins/usernames to local ForgeKeep user IDs.
 /// Falls back to the importing user if no match is found.
 fn map_users(
     task: &ImportTask,

@@ -11,7 +11,7 @@
 //! - `GET /index.yaml` — repository index listing all charts
 //! - Chart files served at paths relative to the index
 //!
-//! IronForge serves these at:
+//! ForgeKeep serves these at:
 //! - Index: `GET /api/v1/repos/{owner}/{repo}/packages/helm/index.yaml`
 //! - Download: standard package download endpoint
 

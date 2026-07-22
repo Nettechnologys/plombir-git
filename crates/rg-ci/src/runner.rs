@@ -584,7 +584,7 @@ impl PipelineRunner {
         }
 
         // Generate a unique container name
-        let container_name = format!("ironforge-job-{}", job_id);
+        let container_name = format!("forgekeep-job-{}", job_id);
 
         // Run: docker run --rm --name <name> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
         let mut args = vec![
@@ -692,7 +692,7 @@ impl PipelineRunner {
             }
         }
         env.insert("CI".into(), "true".into());
-        env.insert("IRONFORGE".into(), "true".into());
+        env.insert("FORGEKEEP".into(), "true".into());
         env.insert("CI_PIPELINE_ID".into(), self.pipeline_id.to_string());
         env.insert("CI_COMMIT_SHA".into(), pipeline.commit_sha.clone());
         env.insert("CI_SHA".into(), pipeline.commit_sha);
@@ -928,7 +928,7 @@ fn valid_environment_name(name: &str) -> bool {
 fn is_reserved_ci_variable(name: &str) -> bool {
     matches!(
         name,
-        "CI" | "IRONFORGE"
+        "CI" | "FORGEKEEP"
             | "CI_PIPELINE_ID"
             | "CI_COMMIT_SHA"
             | "CI_SHA"

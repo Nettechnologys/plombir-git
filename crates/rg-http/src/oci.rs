@@ -79,10 +79,10 @@ fn extract_user(headers: &HeaderMap, jwt_secret: &str) -> Option<i64> {
 
 /// Check if the request has access to perform an OCI repo action.
 ///
-/// Normal IronForge JWTs are checked against repo `can_read_repo`/`can_write_repo`.
+/// Normal ForgeKeep JWTs are checked against repo `can_read_repo`/`can_write_repo`.
 /// OCI scoped tokens are trusted only for the exact signed scope they carry;
 /// token issuance is constrained by the same repo permission checks below.
-/// Anonymous pull is allowed only when the backing IronForge repo is public.
+/// Anonymous pull is allowed only when the backing ForgeKeep repo is public.
 async fn check_access(
     state: &AppState,
     headers: &HeaderMap,
@@ -141,7 +141,7 @@ async fn check_access(
         }
     }
 
-    // For pull, allow anonymous only when the backing IronForge repo is public.
+    // For pull, allow anonymous only when the backing ForgeKeep repo is public.
     if required_action == "pull" {
         let allowed = rg_core::repo::service::can_read_repo(&state.db, &repo_model, None).await?;
         return Ok((allowed, None));
@@ -169,7 +169,7 @@ async fn require_access(
 }
 
 /// Resolve owner/repo from OCI namespace string.
-/// In IronForge, the OCI name is always "{owner}/{repo}".
+/// In ForgeKeep, the OCI name is always "{owner}/{repo}".
 fn parse_namespace(name: &str) -> Option<(&str, &str)> {
     let parts: Vec<&str> = name.splitn(2, '/').collect();
     if parts.len() == 2 {
@@ -194,7 +194,7 @@ pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap
     let _ = extract_user(&headers, &state.jwt_secret);
 
     let realm = format!("{}/v2/token", get_base_url(&headers));
-    let service = "ironforge-registry";
+    let service = "forgekeep-registry";
 
     (
         StatusCode::UNAUTHORIZED,
@@ -232,7 +232,7 @@ pub async fn get_token(
     let _service = params
         .get("service")
         .cloned()
-        .unwrap_or_else(|| "ironforge-registry".to_string());
+        .unwrap_or_else(|| "forgekeep-registry".to_string());
     let scope = params.get("scope").cloned().unwrap_or_default();
 
     // Default: anonymous token (limited scope)
@@ -1036,15 +1036,15 @@ async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow:
 // ── DB helpers ────────────────────────────────────────────────
 
 /// Find an OCI repository, auto-creating if it doesn't exist.
-/// Uses the IronForge repo as the owner.
+/// Uses the ForgeKeep repo as the owner.
 async fn find_oci_repo(
     db: &DatabaseConnection,
     owner: &str,
     repo: &str,
 ) -> anyhow::Result<Option<rg_db::entities::oci_repository::Model>> {
-    // Look up the IronForge repository
-    let ironforge_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo).await?;
-    match ironforge_repo {
+    // Look up the ForgeKeep repository
+    let forgekeep_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo).await?;
+    match forgekeep_repo {
         Some(r) => {
             let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(db, r.id).await?;
             Ok(oci_repo)
@@ -1059,7 +1059,7 @@ async fn find_or_create_oci_repo(
     repo: &str,
     owner_id: Option<i64>,
 ) -> anyhow::Result<rg_db::entities::oci_repository::Model> {
-    let ironforge_repo = if let Some(id) = owner_id.filter(|&id| id > 0) {
+    let forgekeep_repo = if let Some(id) = owner_id.filter(|&id| id > 0) {
         rg_db::ops::repo_ops::find_by_owner_and_name(db, id, repo)
             .await?
             .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?
@@ -1072,7 +1072,7 @@ async fn find_or_create_oci_repo(
     let namespace = format!("{}/{}", owner, repo);
     rg_db::ops::oci_ops::find_or_create_repo(
         db,
-        ironforge_repo.id,
+        forgekeep_repo.id,
         &namespace,
         owner_id.unwrap_or(0),
     )

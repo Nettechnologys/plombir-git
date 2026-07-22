@@ -64,7 +64,7 @@ async fn admin_sso_accepts_httponly_cookie_without_bearer() {
         .get(format!("{}/api/v1/admin/sso/providers", base))
         .header(
             reqwest::header::COOKIE,
-            format!("ironforge_token={}", admin_token),
+            format!("forgekeep_token={}", admin_token),
         )
         .send()
         .await

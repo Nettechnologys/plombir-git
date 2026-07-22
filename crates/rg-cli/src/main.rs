@@ -1,4 +1,4 @@
-//! IronForge CLI — main entry point.
+//! ForgeKeep CLI — main entry point.
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -34,7 +34,7 @@ enum PackageCmd {
         #[arg(long)]
         token: Option<String>,
 
-        /// IronForge server URL (for token-based auth)
+        /// ForgeKeep server URL (for token-based auth)
         #[arg(long, default_value = "http://localhost:8080")]
         server_url: String,
     },
@@ -51,13 +51,13 @@ enum PackageCmd {
         pkg_type: String,
 
         /// Database URL for direct DB access (SQLite, PostgreSQL, or MySQL)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
     },
 }
 
 #[derive(Parser)]
-#[command(name = "ironforge", about = "A Git hosting platform written in Rust")]
+#[command(name = "forgekeep", about = "A Git hosting platform written in Rust")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -66,7 +66,7 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Start the IronForge server
+    /// Start the ForgeKeep server
     Serve {
         /// Root directory for git repositories
         #[arg(long, default_value = "./repos")]
@@ -85,7 +85,7 @@ enum Commands {
         host_key: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
 
         /// JWT secret key (use a long random string in production)
@@ -161,21 +161,21 @@ enum Commands {
     /// Run database migrations and exit
     Migrate {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
     },
 
     /// Rebuild or refresh full-text search indexes from main tables
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
     },
 
     /// Create a consistent SQLite database backup.
     BackupDb {
-        /// SQLite database URL (e.g. sqlite://./ironforge.db?mode=rwc)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        /// SQLite database URL (e.g. sqlite://./forgekeep.db?mode=rwc)
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
 
         /// Output backup file path.
@@ -189,7 +189,7 @@ enum Commands {
     /// Restore a SQLite database file from a backup.
     RestoreDb {
         /// SQLite database URL to restore into.
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
 
         /// Backup file path to restore from.
@@ -215,7 +215,7 @@ enum Commands {
 
     /// Run as a CI Runner — polls jobs and executes them
     Runner {
-        /// IronForge server URL (e.g. http://127.0.0.1:8080)
+        /// ForgeKeep server URL (e.g. http://127.0.0.1:8080)
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         server: String,
 
@@ -245,7 +245,7 @@ enum Commands {
         /// Source repository URL (e.g., https://github.com/user/repo)
         source_url: String,
 
-        /// Target owner in IronForge
+        /// Target owner in ForgeKeep
         #[arg(long)]
         target_owner: String,
 
@@ -262,7 +262,7 @@ enum Commands {
         repo_root: String,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
 
         /// Skip importing the repository itself
@@ -304,7 +304,7 @@ enum Commands {
         repo_root: String,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./ironforge.db?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
         db_url: String,
 
         /// Git ref to index (default: repository's default branch)
@@ -455,7 +455,7 @@ mod config_tests {
     #[test]
     fn example_config_includes_valid_audit_archive_settings() {
         let config: ConfigFile =
-            toml::from_str(include_str!("../../../ironforge.example.toml")).unwrap();
+            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
         assert_eq!(config.audit.enabled, Some(true));
         assert_eq!(config.audit.archive_after_days, Some(90));
         assert_eq!(config.audit.interval_minutes, Some(60));
@@ -537,7 +537,7 @@ fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> anyhow::Resu
     let target = sqlite_db_path_from_url(db_url)?;
     if target.exists() && !force {
         anyhow::bail!(
-            "target database already exists: {} (stop IronForge and use --force to overwrite)",
+            "target database already exists: {} (stop ForgeKeep and use --force to overwrite)",
             target.display()
         );
     }
@@ -593,7 +593,7 @@ fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Result<()> {
     if jwt_secret == "change-me-in-production" {
         tracing::error!(
             "FATAL: jwt_secret is set to the default value from {}. \
-             Set a strong secret via IRONFORGE_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
+             Set a strong secret via FORGEKEEP_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
             source
         );
         anyhow::bail!("refusing to start with default jwt_secret");
@@ -808,10 +808,15 @@ async fn main() -> anyhow::Result<()> {
                     // Register new runner
                     let name = name.as_deref().unwrap_or("default-runner");
                     let auth_token = auth_token
-                        .or_else(|| std::env::var("IRONFORGE_AUTH_TOKEN").ok())
+                        .or_else(|| {
+                            rg_core::env_compat::env_var_compat(
+                                "FORGEKEEP_AUTH_TOKEN",
+                                "IRONFORGE_AUTH_TOKEN",
+                            )
+                        })
                         .context(
                             "runner auto-registration requires --auth-token or \
-                             IRONFORGE_AUTH_TOKEN; alternatively pass --runner-id and --token",
+                             FORGEKEEP_AUTH_TOKEN; alternatively pass --runner-id and --token",
                         )?;
                     let resp: serde_json::Value = client
                         .post(format!("{}/api/v1/runners/register", server))
@@ -960,7 +965,7 @@ async fn main() -> anyhow::Result<()> {
 
             println!("╔══════════════════════════════════════════════════╗");
             println!(
-                "║  IronForge Import — {} → IronForge",
+                "║  ForgeKeep Import — {} → ForgeKeep",
                 platform.to_uppercase()
             );
             println!("╠══════════════════════════════════════════════════╣");
@@ -1286,7 +1291,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Initialise and run the IronForge server (HTTP + SSH).
+/// Initialise and run the ForgeKeep server (HTTP + SSH).
 #[allow(clippy::too_many_arguments)]
 async fn run_serve(
     repo_root: String,
@@ -1320,9 +1325,11 @@ async fn run_serve(
     };
 
     // Resolve JWT secret: env var > CLI args > config file > error
-    let resolved_jwt_secret = if let Ok(env_secret) = std::env::var("IRONFORGE_JWT_SECRET") {
-        validate_jwt_secret(&env_secret, "environment variable IRONFORGE_JWT_SECRET")?;
-        tracing::info!("Using JWT secret from environment variable IRONFORGE_JWT_SECRET");
+    let resolved_jwt_secret = if let Some(env_secret) =
+        rg_core::env_compat::env_var_compat("FORGEKEEP_JWT_SECRET", "IRONFORGE_JWT_SECRET")
+    {
+        validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
+        tracing::info!("Using JWT secret from environment variable FORGEKEEP_JWT_SECRET");
         env_secret
     } else if let Some(cli_secret) = jwt_secret {
         validate_jwt_secret(&cli_secret, "--jwt-secret CLI argument")?;
@@ -1332,7 +1339,7 @@ async fn run_serve(
         cfg_secret
     } else {
         anyhow::bail!(
-            "No JWT secret provided. Set IRONFORGE_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
+            "No JWT secret provided. Set FORGEKEEP_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
         );
     };
 
@@ -1435,7 +1442,7 @@ async fn run_serve(
         let log_prefix = std::path::Path::new(log_path)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("ironforge");
+            .unwrap_or("forgekeep");
         let log_suffix = std::path::Path::new(log_path)
             .extension()
             .and_then(|s| s.to_str())
@@ -1609,7 +1616,7 @@ async fn run_serve(
         }
     });
 
-    tracing::info!("IronForge server started (Phase 20)");
+    tracing::info!("ForgeKeep server started (Phase 20)");
 
     if let Err(e) = http_handle.await {
         tracing::error!("HTTP server task terminated: {:#}", e);

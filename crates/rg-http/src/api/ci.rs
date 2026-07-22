@@ -477,7 +477,7 @@ pub async fn trigger_pipeline(
 
     // Check if CI config exists
     if !state.ci_engine.has_ci_config(&repo_path, &commit_sha) {
-        return AppError::bad_request("no .ironforge-ci.yml found").into_response();
+        return AppError::bad_request("no .forgekeep-ci.yml found").into_response();
     }
 
     match state

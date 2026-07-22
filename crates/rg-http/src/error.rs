@@ -1,4 +1,4 @@
-//! Centralized error handling for IronForge HTTP API.
+//! Centralized error handling for ForgeKeep HTTP API.
 //!
 //! All API handlers should return `AppError` variants instead of ad-hoc
 //! `(StatusCode, Json)` tuples.

@@ -9,7 +9,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('admin.runners.title')} · {owner}/{repo} · IronForge</title>
+  <title>{t('admin.runners.title')} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <section class="panel">

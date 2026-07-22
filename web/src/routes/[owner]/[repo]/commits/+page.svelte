@@ -38,7 +38,7 @@
 </script>
 
 <svelte:head>
-  <title>{owner}/{repo} · {t('repo.tabs.commits')} · IronForge</title>
+  <title>{owner}/{repo} · {t('repo.tabs.commits')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

@@ -100,7 +100,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('settings.general')} · {owner}/{repo} · IronForge</title>
+  <title>{t('settings.general')} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="settings-page">

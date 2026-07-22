@@ -1,4 +1,4 @@
-//! OpenAPI (Swagger) documentation for IronForge REST API.
+//! OpenAPI (Swagger) documentation for ForgeKeep REST API.
 //!
 //! Provides auto-generated OpenAPI 3.0 spec via utoipa.
 //! Access at:
@@ -16,13 +16,13 @@ pub struct PaginatedRepoResponse {
     pub pagination: crate::pagination::PaginationMeta,
 }
 
-/// IronForge API — OpenAPI specification.
+/// ForgeKeep API — OpenAPI specification.
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "IronForge API",
+        title = "ForgeKeep API",
         version = "0.1.0",
-        description = "IronForge is a self-hosted Git platform written in Rust. \
+        description = "ForgeKeep is a self-hosted Git platform written in Rust. \
             This API provides repository management, issue tracking, pull requests, \
             CI/CD pipelines, wiki, LFS, webhooks, and more.",
     ),

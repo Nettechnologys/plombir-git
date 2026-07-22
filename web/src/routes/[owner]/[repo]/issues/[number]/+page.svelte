@@ -65,7 +65,7 @@
 </script>
 
 <svelte:head>
-  <title>{issue?.title || `${t('issues.title')} #${number}`} · {owner}/{repo} · IronForge</title>
+  <title>{issue?.title || `${t('issues.title')} #${number}`} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

@@ -30,7 +30,7 @@ pub struct MfaChallengeClaims {
 }
 
 fn mfa_challenge_key(secret: &str) -> String {
-    format!("ironforge:mfa-challenge:{secret}")
+    format!("forgekeep:mfa-challenge:{secret}")
 }
 
 /// Generate a signed JWT for a user.

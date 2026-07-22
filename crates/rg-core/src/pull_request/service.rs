@@ -1298,7 +1298,7 @@ fn git_rebase_merge(
 ) -> Result<String> {
     let canonical_repo = std::fs::canonicalize(repo_path)
         .with_context(|| format!("failed to canonicalize repository: {:?}", repo_path))?;
-    let worktree = std::env::temp_dir().join(format!("ironforge-rebase-{}", uuid::Uuid::new_v4()));
+    let worktree = std::env::temp_dir().join(format!("forgekeep-rebase-{}", uuid::Uuid::new_v4()));
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1323,10 +1323,10 @@ fn git_rebase_merge(
             &["rebase", &upstream],
             Some(&worktree),
             &[
-                ("GIT_AUTHOR_NAME", "IronForge"),
-                ("GIT_AUTHOR_EMAIL", "noreply@ironforge.local"),
-                ("GIT_COMMITTER_NAME", "IronForge"),
-                ("GIT_COMMITTER_EMAIL", "noreply@ironforge.local"),
+                ("GIT_AUTHOR_NAME", "ForgeKeep"),
+                ("GIT_AUTHOR_EMAIL", "noreply@forgekeep.local"),
+                ("GIT_COMMITTER_NAME", "ForgeKeep"),
+                ("GIT_COMMITTER_EMAIL", "noreply@forgekeep.local"),
             ],
         )?;
         if !rebase.success() {

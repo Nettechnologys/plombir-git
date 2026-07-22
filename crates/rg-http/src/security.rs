@@ -1,4 +1,4 @@
-//! Security headers middleware for IronForge.
+//! Security headers middleware for ForgeKeep.
 //!
 //! Phase 22-D: Adds defense-in-depth HTTP security headers to all responses.
 //! These headers protect against common web vulnerabilities (XSS, clickjacking,
@@ -133,8 +133,10 @@ fn is_https_uri(uri: &Uri) -> bool {
 }
 
 fn build_content_security_policy(nonce: &str) -> String {
-    let cors_origins = std::env::var("IRONFORGE_CORS_ORIGINS").ok();
-    let explicit_connect_src = std::env::var("IRONFORGE_CSP_CONNECT_SRC").ok();
+    let cors_origins =
+        rg_core::env_compat::env_var_compat("FORGEKEEP_CORS_ORIGINS", "IRONFORGE_CORS_ORIGINS");
+    let explicit_connect_src =
+        rg_core::env_compat::env_var_compat("FORGEKEEP_CSP_CONNECT_SRC", "IRONFORGE_CSP_CONNECT_SRC");
     let connect_src = build_connect_src(cors_origins.as_deref(), explicit_connect_src.as_deref());
 
     format!(

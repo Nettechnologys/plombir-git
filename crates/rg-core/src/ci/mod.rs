@@ -76,7 +76,9 @@ pub fn has_ci_config(repo_path: &Path, commit_sha: &str) -> bool {
         return true;
     }
 
-    // Check native format
-    let revspec = format!("{}:.ironforge-ci.yml", commit_sha);
-    repo.rev_parse_single(revspec.as_str()).is_ok()
+    // Check native format: current ForgeKeep filename, then the deprecated IronForge name.
+    [".forgekeep-ci.yml", ".ironforge-ci.yml"].iter().any(|name| {
+        repo.rev_parse_single(format!("{}:{}", commit_sha, name).as_str())
+            .is_ok()
+    })
 }

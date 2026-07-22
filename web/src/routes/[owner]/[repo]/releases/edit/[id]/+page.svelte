@@ -75,7 +75,7 @@
 </script>
 
 <svelte:head>
-  <title>Edit Release · {owner}/{repo} · IronForge</title>
+  <title>Edit Release · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

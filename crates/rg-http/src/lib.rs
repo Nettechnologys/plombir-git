@@ -1,4 +1,4 @@
-//! IronForge HTTP server implementation using Axum.
+//! ForgeKeep HTTP server implementation using Axum.
 //!
 //! Provides:
 //!  - Git Smart HTTP protocol endpoints (`/git/...`)
@@ -43,12 +43,12 @@ use tower_http::trace::TraceLayer;
 
 /// Build a restrictive CORS layer.
 ///
-/// If `IRONFORGE_CORS_ORIGINS` is set (comma-separated URLs), only those
+/// If `FORGEKEEP_CORS_ORIGINS` is set (comma-separated URLs), only those
 /// origins are allowed. Otherwise, all origins are reflected (for development
 /// convenience) with a warning logged.
 ///
 /// Replaces `CorsLayer::permissive()` — restricts allowed methods and headers
-/// to only what IronForge needs.
+/// to only what ForgeKeep needs.
 fn build_cors_layer() -> CorsLayer {
     use std::time::Duration;
 
@@ -63,8 +63,8 @@ fn build_cors_layer() -> CorsLayer {
 
     let headers_list = [header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT];
 
-    match std::env::var("IRONFORGE_CORS_ORIGINS") {
-        Ok(origins_str) if !origins_str.is_empty() => {
+    match rg_core::env_compat::env_var_compat("FORGEKEEP_CORS_ORIGINS", "IRONFORGE_CORS_ORIGINS") {
+        Some(origins_str) if !origins_str.is_empty() => {
             let origins: Vec<HeaderValue> = origins_str
                 .split(',')
                 .map(|s| s.trim())
@@ -74,7 +74,7 @@ fn build_cors_layer() -> CorsLayer {
 
             if origins.is_empty() {
                 tracing::warn!(
-                    "IRONFORGE_CORS_ORIGINS set but no valid origins parsed — CORS disabled"
+                    "FORGEKEEP_CORS_ORIGINS set but no valid origins parsed — CORS disabled"
                 );
                 CorsLayer::new()
                     .allow_methods(methods)
@@ -91,7 +91,7 @@ fn build_cors_layer() -> CorsLayer {
         }
         _ => {
             tracing::warn!(
-                "IRONFORGE_CORS_ORIGINS not set — CORS allows all origins (not recommended for production)"
+                "FORGEKEEP_CORS_ORIGINS not set — CORS allows all origins (not recommended for production)"
             );
             CorsLayer::new()
                 .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
@@ -1745,7 +1745,7 @@ async fn check_git_access(
         // credentials. The String body carries the default text/plain type.
         Ok(false) if actor_id.is_none() => Err((
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"IronForge\"")],
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"ForgeKeep\"")],
             "authentication required".to_string(),
         )),
         // Authenticated but lacking permission → 403.
@@ -1921,9 +1921,9 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     }
 
     let caps = if service == "git-upload-pack" {
-        "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=ironforge/0.1"
+        "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=forgekeep/0.1"
     } else {
-        "report-status report-status-v2 side-band-64k agent=ironforge/0.1"
+        "report-status report-status-v2 side-band-64k agent=forgekeep/0.1"
     };
 
     if let Some((sha, refname)) = ref_list.first() {
@@ -2509,7 +2509,7 @@ async fn post_push_hooks(
             }
         }
 
-        // 1. Trigger CI pipeline if .ironforge-ci.yml exists
+        // 1. Trigger CI pipeline if .forgekeep-ci.yml exists
         if ci_engine.has_ci_config(repo_path, &update.new_sha) {
             match ci_engine
                 .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
@@ -2549,7 +2549,7 @@ async fn post_push_hooks(
                             rg_db::ops::user_ops::find_by_id(db, repo_owner_id).await
                         {
                             let subject = format!(
-                                "[IronForge] CI pipeline #{} triggered for {}/{}",
+                                "[ForgeKeep] CI pipeline #{} triggered for {}/{}",
                                 pipeline_id, owner, repo_name
                             );
                             let body = format!(

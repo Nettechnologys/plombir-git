@@ -30,7 +30,7 @@
 </script>
 
 <svelte:head>
-  <title>{owner} · IronForge</title>
+  <title>{owner} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container-narrow">

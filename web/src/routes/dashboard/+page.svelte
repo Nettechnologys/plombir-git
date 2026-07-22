@@ -110,7 +110,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('dashboard.title')} · IronForge</title>
+  <title>{t('dashboard.title')} · ForgeKeep</title>
 </svelte:head>
 
 <div class="dashboard">

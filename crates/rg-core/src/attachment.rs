@@ -287,7 +287,7 @@ pub async fn delete_attachment(
     let key = BlobKey::new(attachment.blob_key.clone())?;
     let backup = if let Some(source) = storage.local_path(&key) {
         let path = std::env::temp_dir().join(format!(
-            "ironforge-attachment-delete-{}.tmp",
+            "forgekeep-attachment-delete-{}.tmp",
             Uuid::new_v4()
         ));
         tokio::fs::copy(&source, &path)

@@ -68,7 +68,7 @@
 </script>
 
 <svelte:head>
-  <title>Packages · {owner}/{repo} · IronForge</title>
+  <title>Packages · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

@@ -89,7 +89,7 @@
       "code_review_desc": "PR reviews & branch protection",
       "cicd": "CI/CD",
       "cicd_desc": "Built-in pipeline engine",
-      "title": "Why choose IronForge?",
+      "title": "Why choose ForgeKeep?",
       "lightweight": {
         "title": "Lightweight",
         "desc": "Memory usage <50MB, minimal resource footprint"
@@ -124,7 +124,7 @@
       "view_all": "View all",
       "empty": "No public repositories yet"
     },
-    "description": "IronForge is a lightweight Git hosting platform built in Rust, designed as a modern alternative to Gitea. Single binary deployment, memory efficient, full-featured.",
+    "description": "ForgeKeep is a lightweight Git hosting platform built in Rust, designed as a modern alternative to Gitea. Single binary deployment, memory efficient, full-featured.",
     "sign_up": "Sign up",
     "sign_in": "Sign in",
     "stats": {
@@ -143,12 +143,12 @@
   },
   "auth": {
     "login": {
-      "title": "Sign in to IronForge",
+      "title": "Sign in to ForgeKeep",
       "username": "Username",
       "password": "Password",
       "submit": "Sign in",
       "submitting": "Signing in...",
-      "footer": "New to IronForge? {link}",
+      "footer": "New to ForgeKeep? {link}",
       "footer_link": "Create an account",
       "failed": "Login failed",
       "mfa_code": "Authentication code",
@@ -568,7 +568,7 @@
     },
     "timeline": {
       "title": "Review timeline",
-      "system": "IronForge",
+      "system": "ForgeKeep",
       "pull_request_opened": "opened this pull request",
       "review_comment": "commented",
       "review_reply": "replied to a review thread",
@@ -652,7 +652,7 @@
     "condition_skipped": "Skipped by condition",
     "no_pipelines": "No pipelines yet.",
     "hint": "Push a commit with {file} to trigger a pipeline.",
-    "file": ".ironforge-ci.yml",
+    "file": ".forgekeep-ci.yml",
     "detail_title": "Pipeline #{id}",
     "commit": "Commit",
     "branch": "Branch",

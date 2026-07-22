@@ -36,7 +36,7 @@ pub(crate) fn valid_secret_name(name: &str) -> bool {
         && name.len() <= 100
         && !matches!(
             name,
-            "CI" | "IRONFORGE"
+            "CI" | "FORGEKEEP"
                 | "CI_PIPELINE_ID"
                 | "CI_COMMIT_SHA"
                 | "CI_SHA"

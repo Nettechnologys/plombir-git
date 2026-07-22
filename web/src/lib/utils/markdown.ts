@@ -50,7 +50,7 @@ function isSafeUrl(value: string): boolean {
   }
 
   try {
-    const url = new URL(trimmed, 'https://ironforge.local');
+    const url = new URL(trimmed, 'https://forgekeep.local');
     return ['http:', 'https:', 'mailto:'].includes(url.protocol);
   } catch {
     return false;

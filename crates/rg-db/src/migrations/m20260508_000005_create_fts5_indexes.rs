@@ -48,9 +48,9 @@ impl MigrationTrait for Migration {
                 "DROP TRIGGER IF EXISTS issues_fts_ad ON issues".into(),
                 "DROP TRIGGER IF EXISTS wiki_pages_fts_ai ON wiki_pages".into(),
                 "DROP TRIGGER IF EXISTS wiki_pages_fts_ad ON wiki_pages".into(),
-                "DROP FUNCTION IF EXISTS ironforge_sync_repos_fts".into(),
-                "DROP FUNCTION IF EXISTS ironforge_sync_issues_fts".into(),
-                "DROP FUNCTION IF EXISTS ironforge_sync_wiki_fts".into(),
+                "DROP FUNCTION IF EXISTS forgekeep_sync_repos_fts".into(),
+                "DROP FUNCTION IF EXISTS forgekeep_sync_issues_fts".into(),
+                "DROP FUNCTION IF EXISTS forgekeep_sync_wiki_fts".into(),
                 "DROP TABLE IF EXISTS repos_fts".into(),
                 "DROP TABLE IF EXISTS issues_fts".into(),
                 "DROP TABLE IF EXISTS wiki_pages_fts".into(),
@@ -174,7 +174,7 @@ fn postgres_stmts() -> Vec<String> {
         "CREATE INDEX issues_fts_tsv_idx ON issues_fts USING GIN(tsv)".into(),
         "CREATE TABLE wiki_pages_fts (rowid BIGINT PRIMARY KEY, title TEXT, content TEXT, tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,''))) STORED)".into(),
         "CREATE INDEX wiki_pages_fts_tsv_idx ON wiki_pages_fts USING GIN(tsv)".into(),
-        "CREATE OR REPLACE FUNCTION ironforge_sync_repos_fts() RETURNS TRIGGER AS $$
+        "CREATE OR REPLACE FUNCTION forgekeep_sync_repos_fts() RETURNS TRIGGER AS $$
          BEGIN
            IF TG_OP = 'DELETE' THEN
              DELETE FROM repos_fts WHERE rowid = OLD.id;
@@ -185,9 +185,9 @@ fn postgres_stmts() -> Vec<String> {
            RETURN NULL;
          END;
          $$ LANGUAGE plpgsql".into(),
-        "CREATE TRIGGER repos_fts_ai AFTER INSERT OR UPDATE ON repositories FOR EACH ROW EXECUTE FUNCTION ironforge_sync_repos_fts()".into(),
-        "CREATE TRIGGER repos_fts_ad AFTER DELETE ON repositories FOR EACH ROW EXECUTE FUNCTION ironforge_sync_repos_fts()".into(),
-        "CREATE OR REPLACE FUNCTION ironforge_sync_issues_fts() RETURNS TRIGGER AS $$
+        "CREATE TRIGGER repos_fts_ai AFTER INSERT OR UPDATE ON repositories FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_repos_fts()".into(),
+        "CREATE TRIGGER repos_fts_ad AFTER DELETE ON repositories FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_repos_fts()".into(),
+        "CREATE OR REPLACE FUNCTION forgekeep_sync_issues_fts() RETURNS TRIGGER AS $$
          BEGIN
            IF TG_OP = 'DELETE' THEN
              DELETE FROM issues_fts WHERE rowid = OLD.id;
@@ -198,9 +198,9 @@ fn postgres_stmts() -> Vec<String> {
            RETURN NULL;
          END;
          $$ LANGUAGE plpgsql".into(),
-        "CREATE TRIGGER issues_fts_ai AFTER INSERT OR UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION ironforge_sync_issues_fts()".into(),
-        "CREATE TRIGGER issues_fts_ad AFTER DELETE ON issues FOR EACH ROW EXECUTE FUNCTION ironforge_sync_issues_fts()".into(),
-        "CREATE OR REPLACE FUNCTION ironforge_sync_wiki_fts() RETURNS TRIGGER AS $$
+        "CREATE TRIGGER issues_fts_ai AFTER INSERT OR UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_issues_fts()".into(),
+        "CREATE TRIGGER issues_fts_ad AFTER DELETE ON issues FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_issues_fts()".into(),
+        "CREATE OR REPLACE FUNCTION forgekeep_sync_wiki_fts() RETURNS TRIGGER AS $$
          BEGIN
            IF TG_OP = 'DELETE' THEN
              DELETE FROM wiki_pages_fts WHERE rowid = OLD.id;
@@ -211,8 +211,8 @@ fn postgres_stmts() -> Vec<String> {
            RETURN NULL;
          END;
          $$ LANGUAGE plpgsql".into(),
-        "CREATE TRIGGER wiki_pages_fts_ai AFTER INSERT OR UPDATE ON wiki_pages FOR EACH ROW EXECUTE FUNCTION ironforge_sync_wiki_fts()".into(),
-        "CREATE TRIGGER wiki_pages_fts_ad AFTER DELETE ON wiki_pages FOR EACH ROW EXECUTE FUNCTION ironforge_sync_wiki_fts()".into(),
+        "CREATE TRIGGER wiki_pages_fts_ai AFTER INSERT OR UPDATE ON wiki_pages FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_wiki_fts()".into(),
+        "CREATE TRIGGER wiki_pages_fts_ad AFTER DELETE ON wiki_pages FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_wiki_fts()".into(),
         "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, COALESCE(description,'') FROM repositories ON CONFLICT (rowid) DO NOTHING".into(),
         "INSERT INTO issues_fts(rowid, title, body) SELECT id, title, COALESCE(body,'') FROM issues ON CONFLICT (rowid) DO NOTHING".into(),
         "INSERT INTO wiki_pages_fts(rowid, title, content) SELECT id, title, content FROM wiki_pages ON CONFLICT (rowid) DO NOTHING".into(),

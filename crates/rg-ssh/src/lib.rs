@@ -1,4 +1,4 @@
-//! IronForge SSH server implementation using russh.
+//! ForgeKeep SSH server implementation using russh.
 //!
 //! Phase 2: auth_publickey queries the database for matching SSH keys.
 //! auth_password queries the database and verifies via Argon2.
@@ -63,7 +63,7 @@ struct SharedState {
     db: Option<Arc<DatabaseConnection>>,
 }
 
-/// The IronForge SSH server — implements `russh::server::Server`.
+/// The ForgeKeep SSH server — implements `russh::server::Server`.
 struct SshServer {
     config: Arc<Config>,
     shared: Arc<SharedState>,
@@ -163,7 +163,7 @@ impl russh::server::Server for SshServer {
     }
 }
 
-/// russh Handler implementation for IronForge.
+/// russh Handler implementation for ForgeKeep.
 /// One SshHandler per client connection.
 struct SshHandler {
     shared: Arc<SharedState>,

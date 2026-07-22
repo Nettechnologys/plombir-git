@@ -246,7 +246,7 @@
 </script>
 
 <svelte:head>
-  <title>CI/CD · {owner}/{repo} · IronForge</title>
+  <title>CI/CD · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

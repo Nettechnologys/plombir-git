@@ -23,8 +23,8 @@ use crate::AppState;
 // ── Cookie helpers ───────────────────────────────────────────────
 
 /// Cookie names for secure OAuth2 flow.
-const SSO_STATE_COOKIE: &str = "ironforge_sso_state";
-const SSO_VERIFIER_COOKIE: &str = "ironforge_sso_code_verifier";
+const SSO_STATE_COOKIE: &str = "forgekeep_sso_state";
+const SSO_VERIFIER_COOKIE: &str = "forgekeep_sso_code_verifier";
 
 fn append_set_cookie(response: &mut axum::response::Response, cookie: String) {
     if let Ok(header_value) = HeaderValue::from_str(&cookie) {
@@ -851,11 +851,11 @@ mod tests {
         assert!(cookies[0]
             .to_str()
             .unwrap()
-            .starts_with("ironforge_sso_state="));
+            .starts_with("forgekeep_sso_state="));
         assert!(cookies[1]
             .to_str()
             .unwrap()
-            .starts_with("ironforge_sso_code_verifier="));
+            .starts_with("forgekeep_sso_code_verifier="));
     }
 
     #[test]

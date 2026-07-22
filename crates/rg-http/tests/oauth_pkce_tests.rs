@@ -164,8 +164,8 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .await
         .unwrap();
     assert!(authorize.status().is_redirection());
-    let state_cookie = cookie_pair(authorize.headers(), "ironforge_sso_state");
-    let verifier_cookie = cookie_pair(authorize.headers(), "ironforge_sso_code_verifier");
+    let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
+    let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
     let state = signed_cookie_value(&state_cookie);
     let verifier = signed_cookie_value(&verifier_cookie);
     assert!((43..=128).contains(&verifier.len()));
@@ -208,12 +208,12 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .collect::<Vec<_>>();
     assert!(set_cookies
         .iter()
-        .any(|cookie| cookie.starts_with("ironforge_token=")));
+        .any(|cookie| cookie.starts_with("forgekeep_token=")));
     assert!(set_cookies
         .iter()
-        .any(|cookie| cookie.starts_with("ironforge_sso_state=;") && cookie.contains("Max-Age=0")));
+        .any(|cookie| cookie.starts_with("forgekeep_sso_state=;") && cookie.contains("Max-Age=0")));
     assert!(set_cookies.iter().any(|cookie| {
-        cookie.starts_with("ironforge_sso_code_verifier=;") && cookie.contains("Max-Age=0")
+        cookie.starts_with("forgekeep_sso_code_verifier=;") && cookie.contains("Max-Age=0")
     }));
     assert_eq!(token_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -238,7 +238,7 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    let state_cookie = cookie_pair(authorize_without_verifier.headers(), "ironforge_sso_state");
+    let state_cookie = cookie_pair(authorize_without_verifier.headers(), "forgekeep_sso_state");
     let state = signed_cookie_value(&state_cookie);
     let missing_verifier = client
         .get(format!(
@@ -256,8 +256,8 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    let state_cookie = cookie_pair(authorize_mismatch.headers(), "ironforge_sso_state");
-    let verifier_cookie = cookie_pair(authorize_mismatch.headers(), "ironforge_sso_code_verifier");
+    let state_cookie = cookie_pair(authorize_mismatch.headers(), "forgekeep_sso_state");
+    let verifier_cookie = cookie_pair(authorize_mismatch.headers(), "forgekeep_sso_code_verifier");
     let mismatch = client
         .get(format!(
             "{base}/api/v1/auth/sso/oidc-test/callback?code=valid-code&state=wrong-state"

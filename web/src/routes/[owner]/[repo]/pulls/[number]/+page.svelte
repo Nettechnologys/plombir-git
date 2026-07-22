@@ -303,7 +303,7 @@
 </script>
 
 <svelte:head>
-  <title>PR #{number} · {owner}/{repo} · IronForge</title>
+  <title>PR #{number} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container">

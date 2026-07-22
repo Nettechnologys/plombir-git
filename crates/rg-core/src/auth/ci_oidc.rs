@@ -38,7 +38,7 @@ pub struct CiOidcJwk {
 
 fn signing_key(secret: &str) -> SigningKey {
     let mut hash = Sha256::new();
-    hash.update(b"ironforge-ci-oidc-ed25519-v1\0");
+    hash.update(b"forgekeep-ci-oidc-ed25519-v1\0");
     hash.update(secret.as_bytes());
     SigningKey::from_bytes(&hash.finalize().into())
 }

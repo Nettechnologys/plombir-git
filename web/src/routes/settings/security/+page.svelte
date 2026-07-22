@@ -107,7 +107,7 @@
 </script>
 
 <svelte:head>
-  <title>Security · IronForge</title>
+  <title>Security · ForgeKeep</title>
 </svelte:head>
 
 <div class="page-container security-page">
