@@ -1,0 +1,14 @@
+# IronForge Grafana Datasource Provisioning
+# Auto-load Prometheus as the default datasource
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    orgId: 1
+    url: http://prometheus:9090
+    isDefault: true
+    version: 1
+    editable: true

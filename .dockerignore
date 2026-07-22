@@ -1,0 +1,56 @@
+# === IronForge .dockerignore ===
+# Exclude everything that shouldn't be in Docker build context.
+
+# Rust build artifacts (huge)
+target/
+target/**/*
+
+# Node.js dependencies and build cache
+web/node_modules/
+web/.svelte-kit/
+
+# Git repositories and test data
+test-repos/
+testdata/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Git (we fetch the current git info separately)
+.git/
+
+# Cargo incremental compilation
+.cargo/registry/
+.cargo/git/
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Docs & misc (not needed for build)
+docs/
+ironforge-docs/
+*.md
+plan.md
+deploy/
+scripts/
+
+# Keep Cargo.lock and Cargo.toml
+!Cargo.lock
+!Cargo.toml

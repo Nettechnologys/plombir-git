@@ -1,0 +1,119 @@
+[workspace]
+members = [
+    "crates/rg-cli",
+    "crates/rg-core",
+    "crates/rg-git",
+    "crates/rg-ssh",
+    "crates/rg-http",
+    "crates/rg-db",
+    "crates/rg-ci",
+    "crates/rg-runner",
+    "crates/rg-mcp",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# HTTP
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "limit"] }
+
+# SSH
+russh = "0.51"
+russh-keys = "0.45"
+
+# Database — SeaORM's default features already bundle all three sqlx backends
+# (sqlite + postgres + mysql) plus with-chrono/with-uuid, so IronForge can select
+# the backend at runtime via the `database_url` scheme without a feature rebuild.
+# Database — keep SeaORM default features (with-chrono/with-uuid/…) and enable
+# all three sqlx backends so the backend is chosen at runtime via the
+# `database_url` scheme (sqlite:// / postgres:// / mysql://).
+sea-orm = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls", "macros"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Auth
+argon2 = "0.5"
+jsonwebtoken = "9"
+password-hash = "0.5"
+rand_core = "0.6"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Email
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "builder", "hostname", "smtp-transport"] }
+
+# Crypto
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem"] }
+
+# TOTP / 2FA
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+qrcode = "0.14"
+rand = "0.8"
+
+# LDAP
+ldap3 = { version = "0.11", features = ["tls"] }
+
+# TLS
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# Config
+toml = "0.8"
+
+# Log rotation
+tracing-appender = "0.2"
+
+# Git library (replacing git CLI)
+gix = { version = "0.84", features = [
+    "blocking-http-transport-curl",
+    "max-performance",
+    "blob-diff",
+    "pack-cache-lru-dynamic",
+    "merge",
+] }
+
+# Archive / compression
+flate2 = "1"
+tar = "0.4"
+zip = "2"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+home = "0.5"
+
+# DB migration
+sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3

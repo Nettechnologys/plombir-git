@@ -1,0 +1,185 @@
+name: Regression
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rust:
+    name: Rust tests and migration smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace tests compile
+        run: cargo check --workspace --tests
+
+      - name: Run HTTP integration tests
+        run: cargo test -p rg-http -- --nocapture
+
+      - name: Run workspace tests
+        run: cargo test --workspace -- --nocapture
+
+      - name: Fresh DB migration smoke
+        run: |
+          db_path="${RUNNER_TEMP}/ironforge-ci-migration.db"
+          cargo run -p rg-cli -- migrate --db-url "sqlite://${db_path}?mode=rwc"
+
+  git-protocol:
+    name: Real Git client protocol matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git openssh-client curl python3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build IronForge
+        run: cargo build -p rg-cli
+
+      - name: Run HTTP and SSH protocol matrix
+        env:
+          IRONFORGE_BIN: ${{ github.workspace }}/target/debug/ironforge
+        run: scripts/git-protocol-e2e.sh
+
+  postgres-smoke:
+    name: PostgreSQL migration, CRUD and FTS smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ironforge
+          POSTGRES_PASSWORD: ironforge
+          POSTGRES_DB: ironforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ironforge -d ironforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      IRONFORGE_TEST_DATABASE_URL: postgres://ironforge:ironforge@127.0.0.1:5432/ironforge
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run PostgreSQL runtime smoke
+        run: cargo test -p rg-core --test multi_backend_smoke -- --ignored --nocapture
+
+  mysql-smoke:
+    name: MySQL migration, CRUD and FTS smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: ironforge
+          MYSQL_USER: ironforge
+          MYSQL_PASSWORD: ironforge
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uironforge -pironforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      IRONFORGE_TEST_DATABASE_URL: mysql://ironforge:ironforge@127.0.0.1:3306/ironforge
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run MySQL runtime smoke
+        run: cargo test -p rg-core --test multi_backend_smoke -- --ignored --nocapture
+
+  frontend:
+    name: Frontend check and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Svelte check
+        run: npm run check
+
+      - name: Build frontend
+        run: npm run build
+
+  deploy-config:
+    name: Docker compose config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate main compose
+        run: |
+          cp deploy/.env.example deploy/.env
+          secret="$(openssl rand -hex 32)"
+          sed -i "s/^IRONFORGE_JWT_SECRET=.*/IRONFORGE_JWT_SECRET=${secret}/" deploy/.env
+          docker compose -f deploy/docker-compose.yml config >/tmp/ironforge-compose-main.yml
+          rm -f deploy/.env
+
+      - name: Validate observability compose
+        run: docker compose -f deploy/docker-compose.observability.yml config >/tmp/ironforge-compose-observability.yml

@@ -1,0 +1,48 @@
+# IronForge Configuration File
+# Copy this to ironforge.toml and customize for your deployment.
+
+[server]
+repo_root = "./repos"
+http_addr = "0.0.0.0:8080"
+ssh_addr = "0.0.0.0:2222"
+# host_key = "/path/to/ssh_host_key"
+
+[database]
+url = "sqlite://./ironforge.db?mode=rwc"
+
+[auth]
+jwt_secret = "change-me-in-production"
+
+[ci]
+docker = false
+
+[rate_limit]
+max = 0          # 0 = disabled
+window_secs = 60
+# Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP for rate limiting.
+# Leave empty when IronForge is directly exposed.
+trusted_proxies = []
+# trusted_proxies = ["127.0.0.1", "::1", "10.0.0.10"]
+
+[smtp]
+# host = "smtp.example.com"
+# port = 587
+# user = "noreply@example.com"
+# pass = "your-password"
+# from = "IronForge <noreply@example.com>"
+
+[tls]
+# cert = "/path/to/cert.pem"
+# key = "/path/to/key.pem"
+
+[logging]
+# file = "/var/log/ironforge/ironforge.log"
+max_size_mb = 10
+max_files = 5
+
+[audit]
+enabled = true
+archive_dir = "./data/audit-archive"
+archive_after_days = 90
+interval_minutes = 60
+batch_size = 1000

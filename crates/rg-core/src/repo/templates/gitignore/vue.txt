@@ -1,0 +1,37 @@
+# Vue.js / Svelte .gitignore
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.next/
+.nuxt/
+out/
+.svelte-kit/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+
+# Vite
+vite.config.ts.timestamp-*

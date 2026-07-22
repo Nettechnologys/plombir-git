@@ -1,0 +1,35 @@
+# Ruby .gitignore
+# Dependencies
+vendor/bundle/
+.bundle/
+
+# Build output
+*.gem
+*.rbc
+pkg/
+tmp/
+log/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+!.env.example
+
+# Database
+*.sqlite3
+db/*.sqlite3
+
+# Rails
+/public/assets
+/storage/
+coverage/

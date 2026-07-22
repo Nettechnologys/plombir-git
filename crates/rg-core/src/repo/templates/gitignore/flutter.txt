@@ -1,0 +1,27 @@
+# Flutter/Dart .gitignore
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android
+*.apk
+*.aab
+local.properties
+
+# iOS
+ios/Pods/
+ios/.symlinks/

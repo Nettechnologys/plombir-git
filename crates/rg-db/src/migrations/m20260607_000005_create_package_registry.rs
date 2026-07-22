@@ -1,0 +1,313 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(PackageRegistry::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(PackageRegistry::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageRegistry::RepoId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageRegistry::PackageType)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageRegistry::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(PackageRegistry::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageRegistry::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Index: one package type per repo
+        manager
+            .create_index(
+                Index::create()
+                    .unique()
+                    .name("idx_package_registry_repo_type")
+                    .table(PackageRegistry::Table)
+                    .col(PackageRegistry::RepoId)
+                    .col(PackageRegistry::PackageType)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(Package::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Package::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Package::PackageRegistryId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Package::OwnerId).big_integer().not_null())
+                    .col(ColumnDef::new(Package::Name).string().not_null())
+                    .col(ColumnDef::new(Package::Description).string().null())
+                    .col(ColumnDef::new(Package::Homepage).string().null())
+                    .col(ColumnDef::new(Package::RepositoryUrl).string().null())
+                    .col(
+                        ColumnDef::new(Package::IsPublic)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(Package::DownloadCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(Package::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Package::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Unique index: one package name per registry
+        manager
+            .create_index(
+                Index::create()
+                    .unique()
+                    .name("idx_package_registry_name")
+                    .table(Package::Table)
+                    .col(Package::PackageRegistryId)
+                    .col(Package::Name)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(PackageVersion::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(PackageVersion::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageVersion::PackageId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(PackageVersion::Version).string().not_null())
+                    .col(ColumnDef::new(PackageVersion::Semver).string().null())
+                    .col(ColumnDef::new(PackageVersion::Metadata).text().null())
+                    .col(
+                        ColumnDef::new(PackageVersion::Size)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(PackageVersion::Sha256).string().null())
+                    .col(
+                        ColumnDef::new(PackageVersion::IsYanked)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(PackageVersion::DownloadCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(PackageVersion::AuthorId)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageVersion::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Unique: one version per package
+        manager
+            .create_index(
+                Index::create()
+                    .unique()
+                    .name("idx_package_version")
+                    .table(PackageVersion::Table)
+                    .col(PackageVersion::PackageId)
+                    .col(PackageVersion::Version)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(PackageFile::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(PackageFile::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(PackageFile::VersionId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(PackageFile::Filename).string().not_null())
+                    .col(
+                        ColumnDef::new(PackageFile::Size)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(PackageFile::Sha256).string().null())
+                    .col(ColumnDef::new(PackageFile::StoragePath).string().not_null())
+                    .col(
+                        ColumnDef::new(PackageFile::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_package_file_version")
+                    .table(PackageFile::Table)
+                    .col(PackageFile::VersionId)
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(PackageFile::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(PackageVersion::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Package::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(PackageRegistry::Table).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(DeriveIden)]
+enum PackageRegistry {
+    Table,
+    Id,
+    RepoId,
+    PackageType,
+    Enabled,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(DeriveIden)]
+enum Package {
+    Table,
+    Id,
+    PackageRegistryId,
+    OwnerId,
+    Name,
+    Description,
+    Homepage,
+    RepositoryUrl,
+    IsPublic,
+    DownloadCount,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(DeriveIden)]
+enum PackageVersion {
+    Table,
+    Id,
+    PackageId,
+    Version,
+    Semver,
+    Metadata,
+    Size,
+    Sha256,
+    IsYanked,
+    DownloadCount,
+    AuthorId,
+    CreatedAt,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(DeriveIden)]
+enum PackageFile {
+    Table,
+    Id,
+    VersionId,
+    Filename,
+    Size,
+    Sha256,
+    StoragePath,
+    CreatedAt,
+}

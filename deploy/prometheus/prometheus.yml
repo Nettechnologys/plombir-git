@@ -1,0 +1,46 @@
+# IronForge Prometheus Configuration
+# Phase 22-C: Observability Stack
+
+global:
+  scrape_interval: 15s          # Scrape targets every 15s
+  evaluation_interval: 15s      # Evaluate rules every 15s
+  external_labels:
+    cluster: 'ironforge'
+    environment: 'production'
+
+# Load rules
+rule_files:
+  - "alerts.yml"
+
+# Alertmanager endpoint
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+# Scrape targets
+scrape_configs:
+  # IronForge main app
+  - job_name: 'ironforge'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ['ironforge:8080']
+        labels:
+          service: 'ironforge-api'
+          component: 'api'
+
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+  # Node exporter (host metrics)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node-exporter'

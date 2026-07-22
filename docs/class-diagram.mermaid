@@ -1,0 +1,96 @@
+classDiagram
+    class Repository {
+        +i64 id
+        +i64 owner_id
+        +String name
+        +Option~String~ description
+        +bool is_private
+        +String default_branch
+        +Option~i64~ fork_id
+        +i64 stars_count
+        +i64 forks_count
+        +Option~i64~ org_id
+        +Option~DateTimeUtc~ deleted_at
+        +Option~i64~ origin_repo_id
+        +DateTimeUtc created_at
+        +DateTimeUtc updated_at
+    }
+
+    class RepoStar {
+        +i64 id
+        +i64 user_id
+        +i64 repo_id
+        +DateTimeUtc created_at
+    }
+
+    class RepoWatch {
+        +i64 id
+        +i64 user_id
+        +i64 repo_id
+        +String watch_state
+        +DateTimeUtc created_at
+        +DateTimeUtc updated_at
+    }
+
+    class Release {
+        +i64 id
+        +i64 repo_id
+        +String tag_name
+        +String target_commitish
+        +String title
+        +Option~String~ body
+        +bool is_draft
+        +bool is_prerelease
+        +i64 author_id
+        +DateTimeUtc created_at
+        +DateTimeUtc updated_at
+    }
+
+    class ReleaseAsset {
+        +i64 id
+        +i64 release_id
+        +String name
+        +i64 size
+        +i64 download_count
+        +i64 uploader_id
+        +DateTimeUtc created_at
+    }
+
+    class Label {
+        +i64 id
+        +i64 repo_id
+        +String name
+        +String color
+        +Option~String~ description
+        +DateTimeUtc created_at
+        +DateTimeUtc updated_at
+    }
+
+    class IssueLabel {
+        +i64 id
+        +i64 issue_id
+        +i64 label_id
+        +DateTimeUtc created_at
+    }
+
+    class CommitStatus {
+        +i64 id
+        +i64 repo_id
+        +String sha
+        +String state
+        +String context
+        +Option~String~ description
+        +Option~String~ target_url
+        +i64 creator_id
+        +DateTimeUtc created_at
+        +DateTimeUtc updated_at
+    }
+
+    Repository "1" --> "*" RepoStar : has
+    Repository "1" --> "*" RepoWatch : has
+    Repository "1" --> "*" Release : has
+    Repository "1" --> "*" Label : has
+    Repository "1" --> "*" CommitStatus : has
+    Repository "1" --> "*" Repository : forks
+    Release "1" --> "*" ReleaseAsset : has
+    Label "1" --> "*" IssueLabel : has

@@ -1,0 +1,23 @@
+# .NET/C# .gitignore
+# Build results
+[Dd]ebug/
+[Rr]elease/
+[Bb]in/
+[Oo]bj/
+
+# NuGet
+packages/
+*.nupkg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+*.user
+*.suo
+*.vs/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,45 @@
+# Python .gitignore
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# uv / pip
+uv.lock

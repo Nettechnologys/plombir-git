@@ -1,0 +1,33 @@
+# Java .gitignore
+# Compiled class files
+*.class
+
+# Build output
+target/
+build/
+out/
+.gradle/
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Maven
+dependency-reduced-pom.xml
+
+# Gradle
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar

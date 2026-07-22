@@ -1,0 +1,70 @@
+# IronForge Docker Compose
+#
+# Quick start (run from the repo root):
+#   1. cp deploy/.env.example deploy/.env
+#   2. Set IRONFORGE_JWT_SECRET in deploy/.env, for example:
+#        openssl rand -hex 32
+#   3. docker compose -f deploy/docker-compose.yml up -d
+#
+# For observability (Prometheus + Grafana + Alertmanager):
+#   docker compose -f deploy/docker-compose.observability.yml up -d
+
+services:
+  ironforge:
+    build:
+      # Context is the repo root (this file lives in deploy/), where the
+      # Dockerfile and crates/ live.
+      context: ..
+      dockerfile: Dockerfile
+    container_name: ironforge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # HTTP
+      - "2222:2222"   # SSH
+    volumes:
+      # Persistent data (repos, DB, logs)
+      - ironforge-data:/data
+      # Config file (optional — mount your ironforge.toml here)
+      # - ./ironforge.toml:/app/ironforge.toml:ro
+      # SSH host key (persist to avoid key change on restart)
+      # - ./ssh_host_key:/app/ssh_host_key:ro
+    # IRONFORGE_JWT_SECRET is required and is read from deploy/.env.
+    # Optional SMTP settings can also be added to that file.
+    env_file:
+      - .env
+    # Uncomment to use config file instead of env vars:
+    # command: >
+    #   ironforge serve
+    #   --config /app/ironforge.toml
+    networks:
+      - ironforge-net
+
+  # ── Optional: CI Runner ─────────────────────────────────
+  # runner:
+  #   build:
+  #     context: ..
+  #     dockerfile: Dockerfile
+  #   container_name: ironforge-runner
+  #   restart: unless-stopped
+  #   command: >
+  #     ironforge-runner run
+  #     --server http://ironforge:8080
+  #     --runner-id ${IRONFORGE_RUNNER_ID}
+  #     --token ${IRONFORGE_RUNNER_TOKEN}
+  #   environment:
+  #     - IRONFORGE_RUNNER_ID=1
+  #     - IRONFORGE_RUNNER_TOKEN=your-runner-token
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock  # for Docker CI jobs
+  #     - ironforge-data:/data
+  #   depends_on:
+  #     - ironforge
+
+volumes:
+  ironforge-data:
+    driver: local
+
+networks:
+  ironforge-net:
+    name: ironforge-net
+    driver: bridge

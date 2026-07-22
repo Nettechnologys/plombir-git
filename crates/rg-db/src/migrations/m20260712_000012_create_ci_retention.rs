@@ -1,0 +1,196 @@
+use sea_orm_migration::prelude::*;
+
+pub struct Migration;
+impl MigrationName for Migration {
+    fn name(&self) -> &str {
+        "m20260712_000012_create_ci_retention"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(CiRetentionPolicies::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(CiRetentionPolicies::RepoId)
+                            .big_integer()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(CiRetentionPolicies::ArtifactRetentionDays)
+                            .integer()
+                            .not_null()
+                            .default(30),
+                    )
+                    .col(
+                        ColumnDef::new(CiRetentionPolicies::CacheRetentionDays)
+                            .integer()
+                            .not_null()
+                            .default(7),
+                    )
+                    .col(
+                        ColumnDef::new(CiRetentionPolicies::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(CiRetentionPolicies::Table, CiRetentionPolicies::RepoId)
+                            .to(Repositories::Table, Repositories::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(CiCacheEntries::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(CiCacheEntries::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::RepoId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::KeyHash)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::FilePath)
+                            .string_len(1024)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::Size)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::LastAccessedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CiCacheEntries::ExpiresAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(CiCacheEntries::Table, CiCacheEntries::RepoId)
+                            .to(Repositories::Table, Repositories::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("uq_ci_cache_entries_repo_key")
+                    .table(CiCacheEntries::Table)
+                    .col(CiCacheEntries::RepoId)
+                    .col(CiCacheEntries::KeyHash)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_ci_cache_entries_expires")
+                    .table(CiCacheEntries::Table)
+                    .col(CiCacheEntries::ExpiresAt)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_artifacts_expires_at")
+                    .table(Artifacts::Table)
+                    .col(Artifacts::ExpiresAt)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await?;
+        Ok(())
+    }
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_artifacts_expires_at")
+                    .table(Artifacts::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(CiCacheEntries::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(CiRetentionPolicies::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        Ok(())
+    }
+}
+#[derive(DeriveIden)]
+enum CiRetentionPolicies {
+    Table,
+    RepoId,
+    ArtifactRetentionDays,
+    CacheRetentionDays,
+    UpdatedAt,
+}
+#[derive(DeriveIden)]
+enum CiCacheEntries {
+    Table,
+    Id,
+    RepoId,
+    KeyHash,
+    FilePath,
+    Size,
+    CreatedAt,
+    LastAccessedAt,
+    ExpiresAt,
+}
+#[derive(DeriveIden)]
+enum Repositories {
+    Table,
+    Id,
+}
+#[derive(DeriveIden)]
+enum Artifacts {
+    Table,
+    ExpiresAt,
+}

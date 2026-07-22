@@ -1,0 +1,31 @@
+# PHP .gitignore
+# Composer
+/vendor/
+composer.phar
+composer.lock
+
+# Build
+/build/
+/node_modules/
+
+# Environment
+.env
+.env.local
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Laravel
+/storage/*.key
+/public/storage
+/public/hot
+/storage/logs/
+/bootstrap/cache/

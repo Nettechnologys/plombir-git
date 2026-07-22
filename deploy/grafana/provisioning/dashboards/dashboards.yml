@@ -1,0 +1,14 @@
+# IronForge Grafana Dashboard Provisioning
+# Auto-load dashboards from /var/lib/grafana/dashboards
+
+apiVersion: 1
+
+providers:
+  - name: 'IronForge'
+    orgId: 1
+    folder: 'IronForge'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

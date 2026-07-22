@@ -1,0 +1,30 @@
+{
+  "name": "ironforge",
+  "version": "0.1.0",
+  "description": "IronForge MCP Server — 提供仓库/Issue/PR 数据的结构化访问",
+  "transport": "stdio",
+  "command": "ironforge",
+  "args": ["mcp", "--repo", "."],
+  "env": {},
+  "tools": [
+    "list_repos",
+    "get_repo",
+    "create_repo",
+    "list_issues",
+    "get_issue",
+    "create_issue",
+    "update_issue",
+    "create_comment",
+    "list_prs",
+    "get_pr",
+    "create_pr",
+    "merge_pr",
+    "list_tree",
+    "get_file"
+  ],
+  "notes": [
+    "将 command 中的 'ironforge' 替换为完整路径（如 target/debug/ironforge）",
+    "args 中的 '.' 替换为实际仓库路径",
+    "SSE 模式使用：ironforge mcp --transport sse --port 4000"
+  ]
+}

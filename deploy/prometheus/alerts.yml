@@ -1,0 +1,174 @@
+# IronForge Alert Rules
+# Phase 22-C: Observability Stack
+groups:
+  # HTTP/API alerts
+  - name: ironforge_http
+    interval: 30s
+    rules:
+      # High error rate
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (route)
+            /
+          sum(rate(http_requests_total[5m])) by (route)
+            > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: ironforge
+        annotations:
+          summary: "High HTTP 5xx error rate on {{ $labels.route }}"
+          description: "{{ $labels.route }} has error rate {{ $value | humanizePercentage }} for 5+ minutes."
+
+      # Slow requests
+      - alert: SlowRequestDuration
+        expr: |
+          histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+            > 1.0
+        for: 10m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "P95 latency on {{ $labels.route }} exceeds 1s"
+          description: "P95 = {{ $value }}s for route {{ $labels.route }}."
+
+      # In-flight spike
+      - alert: HighInFlightRequests
+        expr: http_requests_in_flight > 100
+        for: 5m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "High number of in-flight requests: {{ $value }}"
+          description: "May indicate traffic spike or service degradation."
+
+  # Database alerts
+  - name: ironforge_database
+    interval: 30s
+    rules:
+      # Slow DB queries
+      - alert: SlowDatabaseQueries
+        expr: |
+          histogram_quantile(0.95, sum by (le, operation) (rate(db_query_duration_seconds_bucket[5m])))
+            > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "P95 DB query duration exceeds 500ms for {{ $labels.operation }}"
+          description: "P95 = {{ $value }}s. Check for missing indexes or slow queries."
+
+      # DB query spike
+      - alert: HighDatabaseQPS
+        expr: sum by (operation) (rate(db_queries_total[5m])) > 1000
+        for: 5m
+        labels:
+          severity: info
+          service: ironforge
+        annotations:
+          summary: "High DB QPS for {{ $labels.operation }}: {{ $value }} req/s"
+          description: "May indicate hot table or missing cache."
+
+  # Git operations alerts
+  - name: ironforge_git
+    interval: 30s
+    rules:
+      # Slow Git clone
+      - alert: SlowGitClone
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(git_operation_duration_seconds_bucket{operation="clone"}[5m])))
+            > 30
+        for: 15m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "P95 git clone latency exceeds 30s"
+          description: "P95 = {{ $value }}s. Check disk I/O and pack file access."
+
+      # Git operation failures (approximation via HTTP 5xx on /git/*)
+      - alert: HighGitOperationFailure
+        expr: |
+          sum(rate(http_requests_total{status=~"5..", route=~"/git/.*"}[5m]))
+            > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: ironforge
+        annotations:
+          summary: "High Git operation failure rate"
+          description: "Git endpoints returning 5xx errors at {{ $value }} req/s."
+
+  # CI/CD alerts
+  - name: ironforge_cicd
+    interval: 30s
+    rules:
+      # Pipeline failure rate
+      - alert: HighPipelineFailureRate
+        expr: |
+          sum(rate(ci_pipelines_total{status="failed"}[1h]))
+            /
+          sum(rate(ci_pipelines_total[1h]))
+            > 0.3
+        for: 30m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "Pipeline failure rate exceeds 30%"
+          description: "{{ $value | humanizePercentage }} of pipelines failed in the last hour."
+
+      # Job queue buildup
+      - alert: CIJobQueueBuildup
+        expr: ci_jobs_running > 50
+        for: 15m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "CI job queue buildup: {{ $value }} jobs running"
+          description: "Consider adding more runners."
+
+  # Health/availability alerts
+  - name: ironforge_health
+    interval: 15s
+    rules:
+      # Health check failure (requires blackbox or up{} check)
+      - alert: IronForgeDown
+        expr: up{job="ironforge"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: ironforge
+        annotations:
+          summary: "IronForge is DOWN"
+          description: "Target has been unreachable for 2+ minutes. Page on-call!"
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))
+            > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "Host memory usage > 90%"
+          description: "Memory pressure: {{ $value | humanizePercentage }}. Consider scaling or investigating leak."
+
+      # Disk space low
+      - alert: LowDiskSpace
+        expr: |
+          (1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes))
+            > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          service: ironforge
+        annotations:
+          summary: "Disk usage > 85% on {{ $labels.instance }}"
+          description: "Filesystem: {{ $labels.mountpoint }} at {{ $value | humanizePercentage }}."

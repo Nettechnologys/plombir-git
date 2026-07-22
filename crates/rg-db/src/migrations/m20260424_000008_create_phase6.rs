@@ -1,0 +1,355 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // ── PR Reviews ────────────────────────────────────────────────
+        manager
+            .create_table(
+                Table::create()
+                    .table(PrReviews::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(PrReviews::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(PrReviews::PrId).big_integer().not_null())
+                    .col(ColumnDef::new(PrReviews::RepoId).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(PrReviews::ReviewerId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    // comment / approve / request_changes / dismiss
+                    .col(ColumnDef::new(PrReviews::Action).string().not_null())
+                    .col(ColumnDef::new(PrReviews::Body).string().null())
+                    .col(ColumnDef::new(PrReviews::CommitId).string().null())
+                    .col(
+                        ColumnDef::new(PrReviews::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_pr_reviews_pr_id")
+                    .table(PrReviews::Table)
+                    .col(PrReviews::PrId)
+                    .to_owned(),
+            )
+            .await?;
+
+        // ── Review Comments (inline comments on specific diff lines) ──
+        manager
+            .create_table(
+                Table::create()
+                    .table(ReviewComments::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ReviewComments::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ReviewComments::ReviewId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ReviewComments::PrId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ReviewComments::AuthorId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ReviewComments::Path).string().not_null())
+                    .col(
+                        ColumnDef::new(ReviewComments::Position)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(ColumnDef::new(ReviewComments::Line).big_integer().null())
+                    .col(ColumnDef::new(ReviewComments::Side).string().null()) // LEFT / RIGHT
+                    .col(ColumnDef::new(ReviewComments::Body).string().not_null())
+                    .col(ColumnDef::new(ReviewComments::CommitId).string().null())
+                    .col(
+                        ColumnDef::new(ReviewComments::ReplyToId)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ReviewComments::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(ReviewComments::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_review_comments_pr_id")
+                    .table(ReviewComments::Table)
+                    .col(ReviewComments::PrId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_review_comments_review_id")
+                    .table(ReviewComments::Table)
+                    .col(ReviewComments::ReviewId)
+                    .to_owned(),
+            )
+            .await?;
+
+        // ── Protected Branches ────────────────────────────────────────
+        manager
+            .create_table(
+                Table::create()
+                    .table(ProtectedBranches::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ProtectedBranches::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::RepoId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::BranchName)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::RequirePr)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::RequireStatusCheck)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::RequiredStatusChecks)
+                            .string()
+                            .null(),
+                    ) // JSON array
+                    .col(
+                        ColumnDef::new(ProtectedBranches::RequireApproval)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::RequiredApprovals)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::AllowForcePush)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::AllowedPushUserIds)
+                            .string()
+                            .null(),
+                    ) // JSON array
+                    .col(
+                        ColumnDef::new(ProtectedBranches::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(ProtectedBranches::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_protected_branches_repo_branch")
+                    .table(ProtectedBranches::Table)
+                    .col(ProtectedBranches::RepoId)
+                    .col(ProtectedBranches::BranchName)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        // ── Repo Collaborators ────────────────────────────────────────
+        manager
+            .create_table(
+                Table::create()
+                    .table(RepoCollaborators::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(RepoCollaborators::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(RepoCollaborators::RepoId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RepoCollaborators::UserId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    // read / write / admin
+                    .col(
+                        ColumnDef::new(RepoCollaborators::Permission)
+                            .string()
+                            .not_null()
+                            .default("read"),
+                    )
+                    .col(
+                        ColumnDef::new(RepoCollaborators::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_repo_collaborators_repo_user")
+                    .table(RepoCollaborators::Table)
+                    .col(RepoCollaborators::RepoId)
+                    .col(RepoCollaborators::UserId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(RepoCollaborators::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ProtectedBranches::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ReviewComments::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(PrReviews::Table).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(DeriveIden)]
+enum PrReviews {
+    Table,
+    Id,
+    PrId,
+    RepoId,
+    ReviewerId,
+    Action,
+    Body,
+    CommitId,
+    CreatedAt,
+}
+
+#[derive(DeriveIden)]
+enum ReviewComments {
+    Table,
+    Id,
+    ReviewId,
+    PrId,
+    AuthorId,
+    Path,
+    Position,
+    Line,
+    Side,
+    Body,
+    CommitId,
+    ReplyToId,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum ProtectedBranches {
+    Table,
+    Id,
+    RepoId,
+    BranchName,
+    RequirePr,
+    RequireStatusCheck,
+    RequiredStatusChecks,
+    RequireApproval,
+    RequiredApprovals,
+    AllowForcePush,
+    AllowedPushUserIds,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum RepoCollaborators {
+    Table,
+    Id,
+    RepoId,
+    UserId,
+    Permission,
+    CreatedAt,
+}

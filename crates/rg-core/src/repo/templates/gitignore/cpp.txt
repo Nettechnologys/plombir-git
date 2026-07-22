@@ -1,0 +1,32 @@
+# C/C++ .gitignore
+# Compiled output
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dylib
+*.dll
+
+# Build directories
+build/
+cmake-build-*/
+Debug/
+Release/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile

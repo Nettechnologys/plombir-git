@@ -1,0 +1,32 @@
+# cargo-llvm-cov configuration
+# Usage: LLVM_COV=/path/to/llvm-cov LLVM_PROFDATA=/path/to/llvm-profdata cargo llvm-cov <command>
+
+[workspace]
+# 覆盖率报告输出目录
+html-report-dir = "target/llvm-cov/html"
+lcov-report-dir = "target/llvm-cov/lcov"
+json-report-path = "target/llvm-cov/coverage.json"
+
+[run]
+# 包含测试代码
+tests = true
+# 包含 doc tests
+doctests = true
+# 忽略未使用的函数/分支
+ignore-filename-regex = "(/_|target/)"
+
+[report]
+# 排除测试和 benchmarks
+exclude-files = [
+    "tests/**",
+    "benches/**",
+]
+
+[html]
+# 侧边栏按文件分组
+sidebar = true
+
+# CiEnvironment configuration for CI
+[ci]
+# 当需要 CI 环境时自动检测
+detect-ci = "Auto"

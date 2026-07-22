@@ -1,0 +1,21 @@
+pub mod cargo;
+pub mod composer;
+pub mod docker;
+pub mod generic;
+pub mod helm;
+pub mod maven;
+pub mod npm;
+pub mod nuget;
+pub mod pypi;
+pub mod rubygems;
+
+pub use cargo::CargoAdapter;
+pub use composer::ComposerAdapter;
+pub use docker::DockerAdapter;
+pub use generic::GenericAdapter;
+pub use helm::HelmAdapter;
+pub use maven::MavenAdapter;
+pub use npm::NpmAdapter;
+pub use nuget::NuGetAdapter;
+pub use pypi::PyPIAdapter;
+pub use rubygems::RubyGemsAdapter;

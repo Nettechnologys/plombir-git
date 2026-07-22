@@ -1,0 +1,14 @@
+# Docker .gitignore
+# Docker
+.docker/
+*.tar
+*.tar.gz
+
+# Environment
+.env
+.env.local
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
