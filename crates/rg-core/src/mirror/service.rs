@@ -30,6 +30,10 @@ pub async fn create_mirror(
         anyhow::bail!("repository not found");
     }
 
+    // Reject an obviously-internal / non-git-transport remote at registration
+    // for immediate operator feedback; sync re-checks with DNS resolution.
+    crate::net::check_git_url_static(&url).context("invalid mirror URL")?;
+
     // Check for existing mirror
     if rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
@@ -81,6 +85,8 @@ pub async fn update_mirror(
 
     let mut model: ActiveModel = existing.into();
     if let Some(v) = url {
+        // Same static SSRF/scheme guard as create; sync re-checks with DNS.
+        crate::net::check_git_url_static(&v).context("invalid mirror URL")?;
         model.url = Set(v);
     }
     if let Some(v) = username {
@@ -122,12 +128,22 @@ pub async fn sync_mirror(
 
     let repo_path = repo_root.join(format!("{}.mirror", mirror.repo_id));
 
-    let result = if repo_path.join("HEAD").exists() {
-        // Existing mirror: git remote update
-        run_git_remote_update(&repo_path)
-    } else {
-        // First time: git clone --mirror
-        run_git_clone_mirror(&mirror.url, &repo_path)
+    // SSRF guard (with DNS resolution) immediately before the git subprocess.
+    // Re-checked here — not only at create/update — so a URL that resolved
+    // public earlier, an old mirror predating this guard, or a DNS-rebind to an
+    // internal address is caught right before the network call. A failure is
+    // recorded as a normal sync error below (status=error), not propagated.
+    let result = match crate::net::guard_git_url(&mirror.url).await {
+        Ok(()) => {
+            if repo_path.join("HEAD").exists() {
+                // Existing mirror: git remote update
+                run_git_remote_update(&repo_path)
+            } else {
+                // First time: git clone --mirror
+                run_git_clone_mirror(&mirror.url, &repo_path)
+            }
+        }
+        Err(e) => Err(e.context("mirror remote URL failed SSRF validation")),
     };
 
     let now = Utc::now();

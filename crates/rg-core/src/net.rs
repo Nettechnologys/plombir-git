@@ -161,6 +161,124 @@ pub async fn guard_outbound_url(raw: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Git-remote SSRF guard ───────────────────────────────────────────────────
+//
+// A user-supplied *git remote* (mirror sync, repository import) is reached by
+// spawning a `git` subprocess, not by `reqwest`, so the webhook client hardening
+// above does not cover it. These helpers are the git twins of
+// [`check_url_static`] / [`guard_outbound_url`]: same private-IP classifier
+// ([`is_forbidden_ip`]), but a scheme allow-list tuned for git transports and a
+// parser that also understands scp-like `host:path` shorthand.
+
+/// URL schemes ForgeKeep will run a `git` subprocess against for a
+/// **user-supplied** remote. Everything else — `file://` (local-disk read),
+/// `ext::` (arbitrary transport-helper command), `ftp://`, … — is rejected so a
+/// remote URL can neither read local files nor execute a helper binary.
+pub const ALLOWED_GIT_URL_SCHEMES: &[&str] = &["https", "http", "git", "ssh"];
+
+/// Split a git remote into `(scheme, host)`.
+///
+/// Handles both the URL forms git understands (`https://`, `http://`, `git://`,
+/// `ssh://`) and the scp-like shorthand `[user@]host:path`, which git treats as
+/// ssh. A bare local path (no scheme, no `host:` prefix) yields no host and is
+/// rejected by the caller.
+fn split_git_remote(raw: &str) -> Result<(String, String)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("git remote URL is empty");
+    }
+    // Standard URL form. scp-like shorthand fails to parse as a URL (the `@` in
+    // the authority is not a valid scheme char) and falls through below.
+    if let Ok(url) = reqwest::Url::parse(raw) {
+        let scheme = url.scheme().to_string();
+        let host = url.host_str().unwrap_or("").to_string();
+        return Ok((scheme, host));
+    }
+    // scp-like shorthand `[user@]host:path` → ssh. Guard on the absence of
+    // `://` so a real (but unexpectedly unparsed) URL can never be mistaken for
+    // scp syntax. The part before the first ':' must be a plain host (no '/'),
+    // else it is a bare local path like `/srv/repo.git` with no remote host.
+    if !raw.contains("://") {
+        if let Some((authority, _path)) = raw.split_once(':') {
+            if !authority.is_empty() && !authority.contains('/') {
+                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+                if !host.is_empty() {
+                    return Ok(("ssh".to_string(), host.to_string()));
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "'{raw}' is not a valid git remote (expected an https/http/git/ssh URL or scp-like host:path)"
+    );
+}
+
+/// DNS-free static validation of a user-supplied **git remote** URL (mirror /
+/// import). Enforces an allowed scheme ([`ALLOWED_GIT_URL_SCHEMES`]) and rejects
+/// an obviously-internal IP-literal host. The git twin of [`check_url_static`];
+/// use at create/update time for immediate operator feedback without a DNS
+/// lookup that a transient outage could fail.
+pub fn check_git_url_static(raw: &str) -> Result<()> {
+    let (scheme, host) = split_git_remote(raw)?;
+    if !ALLOWED_GIT_URL_SCHEMES.contains(&scheme.as_str()) {
+        anyhow::bail!(
+            "git remote scheme '{scheme}' not allowed (only https/http/git/ssh) — \
+             file://, ext:: and other transports are refused"
+        );
+    }
+    if host.is_empty() {
+        anyhow::bail!("git remote URL has no host");
+    }
+    // `host_str()` keeps brackets for IPv6 literals (`[::1]`); strip them so the
+    // literal parses. A domain name never contains brackets.
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        if is_forbidden_ip(ip) {
+            anyhow::bail!(
+                "git remote points at a forbidden (private/loopback/link-local) address: {ip}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Full SSRF guard for a user-supplied **git remote**: [`check_git_url_static`]
+/// **plus** DNS resolution — reject if *any* resolved address is internal. The
+/// git twin of [`guard_outbound_url`]; call immediately before spawning the
+/// clone/fetch subprocess.
+pub async fn guard_git_url(raw: &str) -> Result<()> {
+    check_git_url_static(raw)?;
+
+    let (_scheme, host) = split_git_remote(raw)?;
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+
+    // IP-literal host: already fully validated by check_git_url_static, no DNS.
+    if literal.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    // Domain host: resolve and reject if ANY address is internal. The port is
+    // irrelevant to address classification, so resolve on port 0.
+    let addrs = tokio::net::lookup_host((host.as_str(), 0))
+        .await
+        .with_context(|| format!("failed to resolve git remote host '{host}'"))?;
+
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if is_forbidden_ip(addr.ip()) {
+            anyhow::bail!(
+                "git remote host '{host}' resolves to a forbidden address: {}",
+                addr.ip()
+            );
+        }
+    }
+    if !saw_any {
+        anyhow::bail!("git remote host '{host}' did not resolve to any address");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +355,68 @@ mod tests {
     async fn guard_blocks_localhost_by_resolution() {
         // `localhost` is a domain, caught only by the DNS-resolution stage.
         assert!(guard_outbound_url("http://localhost/hook").await.is_err());
+    }
+
+    // ── Git-remote guard ────────────────────────────────────────────────────
+
+    #[test]
+    fn git_url_rejects_dangerous_schemes_and_local_paths() {
+        // Local-file / transport-helper / other transports — refused outright.
+        assert!(check_git_url_static("file:///etc/passwd").is_err());
+        assert!(check_git_url_static("ext::sh -c 'id'").is_err());
+        assert!(check_git_url_static("ftp://example.com/repo.git").is_err());
+        // Bare local path (no scheme, no host:) — no remote host.
+        assert!(check_git_url_static("/srv/git/repo.git").is_err());
+        assert!(check_git_url_static("./relative/repo.git").is_err());
+        assert!(check_git_url_static("").is_err());
+    }
+
+    #[test]
+    fn git_url_rejects_internal_ip_literals() {
+        for s in [
+            "https://127.0.0.1/r.git",
+            "http://169.254.169.254/r.git", // cloud metadata
+            "git://10.0.0.5/r.git",
+            "ssh://git@192.168.1.1/r.git",
+            "git://[::1]/r.git",
+            "https://[fd00::1]/r.git",
+        ] {
+            assert!(check_git_url_static(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn git_url_allows_public_forms() {
+        for s in [
+            "https://github.com/owner/repo.git",
+            "http://example.com/repo.git",
+            "git://example.com/repo.git",
+            "ssh://git@example.com:22/owner/repo.git",
+            "git@github.com:owner/repo.git", // scp-like → ssh
+            "https://1.1.1.1/repo.git",      // public IP literal
+        ] {
+            assert!(check_git_url_static(s).is_ok(), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn git_url_scp_shorthand_parses_to_ssh_host() {
+        assert_eq!(
+            split_git_remote("git@github.com:owner/repo.git").unwrap(),
+            ("ssh".to_string(), "github.com".to_string())
+        );
+        // scp-like pointing at an internal literal is caught statically.
+        assert!(check_git_url_static("git@127.0.0.1:owner/repo.git").is_err());
+    }
+
+    #[tokio::test]
+    async fn guard_git_url_blocks_internal_targets() {
+        assert!(guard_git_url("https://127.0.0.1/r.git").await.is_err());
+        assert!(guard_git_url("git://[::1]/r.git").await.is_err());
+        // `localhost` is a domain, caught only by the DNS-resolution stage.
+        assert!(guard_git_url("http://localhost/r.git").await.is_err());
+        assert!(guard_git_url("git@localhost:owner/repo.git").await.is_err());
+        // Public IP literal passes without DNS.
+        assert!(guard_git_url("https://1.1.1.1/r.git").await.is_ok());
     }
 }
