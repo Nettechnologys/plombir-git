@@ -36,6 +36,35 @@ fn env_var_compat(new: &str, old: &str) -> Option<String> {
     }
 }
 
+/// Request timeout for MCP → ForgeKeep API calls (whole request, incl. body),
+/// so a slow/hanging server can't pin a tool call forever.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Connect timeout (TCP + TLS handshake only).
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build the `reqwest::Client` used for every ForgeKeep API call: the static
+/// `Bearer` header plus the outbound request + connect timeouts.
+///
+/// Built once and cached on [`AppState`] — cloning a `reqwest::Client` is a
+/// cheap `Arc` bump that shares one connection pool + TLS config, so tool calls
+/// reuse keep-alive connections instead of standing up a fresh pool each time.
+fn build_http_client(pat: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if !pat.is_empty() {
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {pat}"))
+            .unwrap_or(reqwest::header::HeaderValue::from_static(""));
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    // unwrap is acceptable here — build() only fails if native TLS is
+    // entirely unavailable, which means the system is fundamentally broken
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .default_headers(headers)
+        .build()
+        .expect("reqwest::Client::build() failed: no native TLS backend available")
+}
+
 /// ForgeKeep API base URL + PAT cache.
 ///
 /// Constructed once at startup from environment variables.
@@ -43,6 +72,8 @@ fn env_var_compat(new: &str, old: &str) -> Option<String> {
 pub struct AppState {
     pub api_base: String,
     pub pat: String,
+    /// Pre-built, reusable API client (Bearer header + timeouts baked in).
+    http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -55,22 +86,23 @@ impl AppState {
             tracing::warn!("FORGEKEEP_PAT not set – API calls may fail");
         }
 
-        Ok(Self { api_base, pat })
+        Ok(Self::new(api_base, pat))
     }
 
-    /// Build a `reqwest::Client` with Bearer token header.
-    pub fn http_client(&self) -> reqwest::Client {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if !self.pat.is_empty() {
-            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.pat))
-                .unwrap_or(reqwest::header::HeaderValue::from_static(""));
-            headers.insert(reqwest::header::AUTHORIZATION, value);
+    /// Construct from an explicit base URL + PAT, building the cached HTTP
+    /// client once. The `Bearer` header depends only on `pat`, which is fixed
+    /// for the lifetime of an `AppState`, so the client never needs rebuilding.
+    pub fn new(api_base: String, pat: String) -> Self {
+        let http_client = build_http_client(&pat);
+        Self {
+            api_base,
+            pat,
+            http_client,
         }
-        // unwrap is acceptable here — build() only fails if native TLS is
-        // entirely unavailable, which means the system is fundamentally broken
-        reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("reqwest::Client::build() failed: no native TLS backend available")
+    }
+
+    /// Cheap clone of the shared `reqwest::Client` (Bearer header + timeouts).
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http_client.clone()
     }
 }

@@ -985,10 +985,7 @@ mod tests {
     use super::*;
 
     fn state() -> AppState {
-        AppState {
-            api_base: "http://localhost:8080".into(),
-            pat: String::new(),
-        }
+        AppState::new("http://localhost:8080".into(), String::new())
     }
 
     fn req(method: &str, params: Value) -> JsonRpcRequest {
