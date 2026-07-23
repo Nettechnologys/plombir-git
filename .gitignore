@@ -33,6 +33,8 @@ config/local.toml
 
 # AI assistant workspace (local memory, not project source)
 .workbuddy/
+.ai/
+.mimocode/
 
 # Logs
 *.log

@@ -1,4 +1,4 @@
-# === IronForge .dockerignore ===
+# === ForgeKeep .dockerignore ===
 # Exclude everything that shouldn't be in Docker build context.
 
 # Rust build artifacts (huge)
@@ -45,7 +45,6 @@ Dockerfile
 
 # Docs & misc (not needed for build)
 docs/
-ironforge-docs/
 *.md
 plan.md
 deploy/
