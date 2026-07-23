@@ -1,0 +1,203 @@
+//! Administrative helpers: SQLite backup/restore and JWT secret generation
+//! and validation.
+
+use std::path::PathBuf;
+
+use anyhow::Context;
+
+pub(crate) async fn backup_sqlite_db(
+    db_url: &str,
+    output: &PathBuf,
+    force: bool,
+) -> anyhow::Result<()> {
+    if !db_url.starts_with("sqlite:") {
+        anyhow::bail!(
+            "database backup is only supported for the SQLite backend in this version; \
+             use your PostgreSQL/MySQL server's native dump tool (pg_dump / mysqldump) for other backends"
+        );
+    }
+    if output.exists() && !force {
+        anyhow::bail!(
+            "backup output already exists: {} (use --force to overwrite)",
+            output.display()
+        );
+    }
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create backup directory: {}", parent.display())
+            })?;
+        }
+    }
+    if output.exists() {
+        std::fs::remove_file(output)
+            .with_context(|| format!("failed to remove existing backup: {}", output.display()))?;
+    }
+
+    tracing::info!(db_url = %rg_db::redact_database_url(db_url), output = %output.display(), "Creating SQLite backup");
+    let db = rg_db::connect(db_url).await?;
+    let output_str = output
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("backup output path is not valid UTF-8"))?;
+
+    use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "VACUUM INTO ?",
+        [output_str.into()],
+    ))
+    .await
+    .context("SQLite VACUUM INTO backup failed")?;
+
+    tracing::info!(output = %output.display(), "SQLite backup complete");
+    println!("Backup written to {}", output.display());
+    Ok(())
+}
+
+pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> anyhow::Result<()> {
+    if !input.exists() {
+        anyhow::bail!("backup input does not exist: {}", input.display());
+    }
+    if !input.is_file() {
+        anyhow::bail!("backup input is not a file: {}", input.display());
+    }
+
+    let target = sqlite_db_path_from_url(db_url)?;
+    if target.exists() && !force {
+        anyhow::bail!(
+            "target database already exists: {} (stop ForgeKeep and use --force to overwrite)",
+            target.display()
+        );
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create database directory: {}", parent.display())
+            })?;
+        }
+    }
+
+    if force {
+        remove_sqlite_sidecar_files(&target)?;
+    }
+    std::fs::copy(input, &target).with_context(|| {
+        format!(
+            "failed to restore backup {} to {}",
+            input.display(),
+            target.display()
+        )
+    })?;
+
+    tracing::info!(input = %input.display(), target = %target.display(), "SQLite restore complete");
+    println!("Restored {} to {}", input.display(), target.display());
+    Ok(())
+}
+
+fn remove_sqlite_sidecar_files(db_path: &PathBuf) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_db_path_from_url(db_url: &str) -> anyhow::Result<PathBuf> {
+    let rest = db_url
+        .strip_prefix("sqlite://")
+        .ok_or_else(|| anyhow::anyhow!("only sqlite:// database URLs are supported"))?;
+    let path_part = rest.split_once('?').map(|(path, _)| path).unwrap_or(rest);
+    if path_part.is_empty() || path_part == ":memory:" || path_part == "/:memory:" {
+        anyhow::bail!("restore requires a file-backed SQLite database URL");
+    }
+    Ok(PathBuf::from(path_part))
+}
+
+/// JWT secrets that must never sign tokens in production.
+///
+/// - `change-me-in-production` is the placeholder shipped in every
+///   `*.example.toml` — starting with it means no secret was ever set.
+/// - The base64 value below leaked in the upstream IronForge source repo
+///   (committed to VCS), so it is public and forever compromised. Reject it so
+///   nobody who copied an old local config can forge tokens (card_a3cd0a5de84a).
+const KNOWN_BAD_JWT_SECRETS: &[&str] = &[
+    "change-me-in-production",
+    "uYT7aF/+zA2Zh6P48xnsuY0IbcHH3WdWA4SAtP/Uv6s=",
+];
+
+/// Generate a cryptographically strong JWT secret: 32 random bytes (256 bits)
+/// from the OS CSPRNG, standard-base64 encoded — the `openssl rand -base64 32`
+/// equivalent. Used by the `gen-secret` subcommand.
+pub(crate) fn generate_jwt_secret() -> String {
+    use base64::Engine as _;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Validate JWT secret strength.
+/// Common function used for CLI arg, env var, and config file values.
+pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Result<()> {
+    if KNOWN_BAD_JWT_SECRETS.contains(&jwt_secret) {
+        tracing::error!(
+            "FATAL: jwt_secret from {} is a known default/compromised value. \
+             Generate a fresh one with `forgekeep gen-secret` and set it via \
+             FORGEKEEP_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
+            source
+        );
+        anyhow::bail!("refusing to start with default/compromised jwt_secret");
+    }
+    if jwt_secret.len() < 16 {
+        tracing::warn!(
+            jwt_len = jwt_secret.len(),
+            "jwt_secret from {} is shorter than 16 characters — consider using a stronger secret",
+            source
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod jwt_secret_tests {
+    use super::{generate_jwt_secret, validate_jwt_secret, KNOWN_BAD_JWT_SECRETS};
+    use base64::Engine as _;
+
+    #[test]
+    fn rejects_shipped_default() {
+        assert!(validate_jwt_secret("change-me-in-production", "test").is_err());
+    }
+
+    #[test]
+    fn rejects_leaked_upstream_secret() {
+        // The value that leaked in the IronForge source repo must stay rejected.
+        assert!(
+            validate_jwt_secret("uYT7aF/+zA2Zh6P48xnsuY0IbcHH3WdWA4SAtP/Uv6s=", "test").is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_strong_secret() {
+        assert!(validate_jwt_secret("a-sufficiently-long-random-secret-value", "test").is_ok());
+    }
+
+    #[test]
+    fn generated_secret_is_strong_and_not_known_bad() {
+        let secret = generate_jwt_secret();
+        // 32 bytes standard-base64 → 44 chars, well over the 16-char floor.
+        assert!(secret.len() >= 16, "generated secret too short: {secret}");
+        assert!(!KNOWN_BAD_JWT_SECRETS.contains(&secret.as_str()));
+        // Decodes back to exactly 32 bytes of entropy.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&secret)
+            .expect("generated secret must be valid base64");
+        assert_eq!(decoded.len(), 32);
+        // A fresh call yields a different value (CSPRNG, not a constant).
+        assert_ne!(secret, generate_jwt_secret());
+        // The generated secret passes validation.
+        assert!(validate_jwt_secret(&secret, "test").is_ok());
+    }
+}
