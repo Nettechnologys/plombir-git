@@ -1758,26 +1758,69 @@ async fn run_job_local(script: &str) -> (i32, String) {
     }
 }
 
+/// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
+const DOCKER_PIDS_LIMIT: &str = "512";
+/// Default memory ceiling for a job container.
+const DOCKER_MEMORY_LIMIT: &str = "2g";
+/// Default CPU quota for a job container.
+const DOCKER_CPU_LIMIT: &str = "2";
+
+/// Message returned when a job declared a Docker `image:` but the daemon is
+/// unavailable. Mirrors `rg-runner`'s wording so both runners fail identically.
+fn docker_unavailable_message(image: &str) -> String {
+    format!(
+        "Docker daemon not available. Job requires image '{}' but cannot run in container. \
+         Refusing to fall back to local execution.",
+        image
+    )
+}
+
 /// Execute a job script inside a Docker container.
+///
+/// SECURITY (CWE-269 privilege escalation): a job that declares `image:` expects
+/// to run inside a sandbox. If the Docker daemon is unavailable we FAIL the job
+/// instead of silently executing its script on the runner host with `sh -c` — the
+/// same fail-closed contract the internal `PipelineRunner` and `rg-runner` enforce.
+/// The container is confined with `--cap-drop=ALL` (strip all Linux capabilities),
+/// `--security-opt=no-new-privileges` (block setuid escalation) and `--pids-limit`
+/// / `--memory` / `--cpus` (resource-exhaustion guards). The Docker socket is never
+/// mounted and `--privileged` is never passed, so a malicious job has no path to the
+/// host daemon or devices.
 async fn run_job_docker(image: &str, script: &str) -> (i32, String) {
-    // Check if Docker is available
-    let docker_check = tokio::process::Command::new("docker")
+    // Check if the Docker daemon is running. Fail closed if it is not, rather
+    // than silently dropping to host execution of a job that expected a sandbox.
+    let docker_ok = tokio::process::Command::new("docker")
         .arg("info")
         .output()
-        .await;
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    match docker_check {
-        Ok(check) if !check.status.success() => {
-            return run_job_local(script).await;
-        }
-        Err(_) => {
-            return run_job_local(script).await;
-        }
-        _ => {}
+    if !docker_ok {
+        let msg = docker_unavailable_message(image);
+        eprintln!("{}", msg);
+        return (-1, msg);
     }
 
     let output = tokio::process::Command::new("docker")
-        .args(["run", "--rm", image, "sh", "-c", script])
+        .args([
+            "run",
+            "--rm",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            DOCKER_PIDS_LIMIT,
+            "--memory",
+            DOCKER_MEMORY_LIMIT,
+            "--cpus",
+            DOCKER_CPU_LIMIT,
+            image,
+            "sh",
+            "-c",
+            script,
+        ])
         .output()
         .await;
 
@@ -1800,5 +1843,18 @@ async fn run_job_docker(image: &str, script: &str) -> (i32, String) {
             (code, log)
         }
         Err(e) => (-1, format!("Failed to run docker: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod runner_docker_tests {
+    use super::docker_unavailable_message;
+
+    #[test]
+    fn docker_unavailable_message_is_fail_closed() {
+        // A job that declared an image must never silently drop to host `sh -c`.
+        let msg = docker_unavailable_message("alpine:3.20");
+        assert!(msg.contains("alpine:3.20"));
+        assert!(msg.contains("Refusing to fall back to local execution"));
     }
 }
