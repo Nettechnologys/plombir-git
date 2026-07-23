@@ -84,11 +84,11 @@ _Последняя сверка с кодом: 2026-07-23._
 | Фича | Статус | Где | Заметки |
 |------|--------|-----|---------|
 | MCP-сервер (JSON-RPC, stdio) | ✅ | `rg-mcp/` | |
-| Read-only tools (list_repos, read_file, read_dir, get_issue, get_pr) | ✅ | `rg-mcp/src/tools/mod.rs:14` | всего 5 |
-| Write-tools (create/update issues, PR, review, merge) | ❌ | — | backend REST готов в `rg-core`; нужны только обёртки → см. card |
-| CI-tools (list/retry/cancel pipelines, job logs) | ❌ | — | endpoints готовы (`rg-http/src/api/ci.rs`) → см. card |
-| `search_code` / поиск через MCP | ❌ | — | endpoint `/search` готов → см. card |
-| Обёртки `/ai/*` (repo index / PR summary) | ❌ | `rg-http/src/api/ai.rs` | готовый AI-namespace, MCP его не оборачивает → см. card |
+| Read tools (list_repos, read_file, read_dir, get_issue, get_pr, get_pr_diff) | ✅ | `rg-mcp/src/tools/mod.rs` | 6 read-обёрток |
+| Write-tools (create/update/comment/labels issues, PR create/merge, review + inline-comment + apply-suggestion, request-reviewers) | ✅ | `rg-mcp/src/tools/mod.rs` | тонкие обёртки над REST, тело строится из whitelist ключей |
+| CI-tools (list/get pipeline, retry/cancel, get job) | ✅ | `rg-mcp/src/tools/mod.rs` | `list_pipelines`/`get_pipeline`/`retry_pipeline`/`cancel_pipeline`/`get_ci_job` |
+| `search` через MCP | ✅ | `rg-mcp/src/tools/mod.rs` | обёртка `/search` (q/type/page/per_page) |
+| Обёртки `/ai/*` (summary / issues / prs / tree / search_code) | ✅ | `rg-mcp/src/tools/mod.rs` | оборачивает готовый AI-namespace `rg-http/src/api/ai.rs` |
 
 ---
 
