@@ -76,8 +76,8 @@ _Последняя сверка с кодом: 2026-07-23._
 |------|--------|-----|---------|
 | BlobStorage trait + локальный atomic backend | ✅ | `rg-core/src/blob_storage.rs:88` | чистый trait-based дизайн |
 | OCI package registry (content-addressed digests) | ✅ | `rg-core/src/package_registry/oci/` | digest для content-addressing, не provenance |
-| SHA-256 digest для релизных ассетов | ❌ 🔒 | `rg-core/src/release/service.rs:153` | `upload_asset` не пишет checksum → см. card |
-| Подпись/attestation артефактов (SLSA/Sigstore-совместимо) | ❌ 🔒 | — | supply-chain provenance; подписант = server/CI Ed25519 → см. card |
+| SHA-256 digest для релизных ассетов | ✅ 🔒 | `rg-core/src/release/service.rs:154,214` | `upload_asset` пишет `sha256`, `download_asset` сверяет целостность (bail при mismatch), отдаётся `X-Checksum-Sha256`; legacy-ассеты (NULL) без guard'а |
+| Подпись/attestation артефактов (SLSA/Sigstore-совместимо) | ❌ 🔒 | — | supply-chain provenance; подписант = server/CI Ed25519 → см. card_b6cfd5fdd0eb (Шаг 2) |
 
 ## 7. Agent-native / MCP
 
