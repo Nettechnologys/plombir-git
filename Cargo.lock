@@ -4244,8 +4244,10 @@ name = "rg-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "gix",
+ "rand 0.8.6",
  "reqwest",
  "rg-ci",
  "rg-core",

@@ -165,6 +165,14 @@ enum Commands {
         db_url: String,
     },
 
+    /// Generate a cryptographically strong JWT secret and print it to stdout.
+    ///
+    /// Use it to seed `[auth].jwt_secret`, `FORGEKEEP_JWT_SECRET`, or
+    /// `--jwt-secret` instead of copying a shared default:
+    ///     forgekeep gen-secret
+    ///     FORGEKEEP_JWT_SECRET="$(forgekeep gen-secret)"
+    GenSecret,
+
     /// Rebuild or refresh full-text search indexes from main tables
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)
@@ -587,16 +595,41 @@ fn sqlite_db_path_from_url(db_url: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(path_part))
 }
 
+/// JWT secrets that must never sign tokens in production.
+///
+/// - `change-me-in-production` is the placeholder shipped in every
+///   `*.example.toml` — starting with it means no secret was ever set.
+/// - The base64 value below leaked in the upstream IronForge source repo
+///   (committed to VCS), so it is public and forever compromised. Reject it so
+///   nobody who copied an old local config can forge tokens (card_a3cd0a5de84a).
+const KNOWN_BAD_JWT_SECRETS: &[&str] = &[
+    "change-me-in-production",
+    "uYT7aF/+zA2Zh6P48xnsuY0IbcHH3WdWA4SAtP/Uv6s=",
+];
+
+/// Generate a cryptographically strong JWT secret: 32 random bytes (256 bits)
+/// from the OS CSPRNG, standard-base64 encoded — the `openssl rand -base64 32`
+/// equivalent. Used by the `gen-secret` subcommand.
+fn generate_jwt_secret() -> String {
+    use base64::Engine as _;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// Validate JWT secret strength.
 /// Common function used for CLI arg, env var, and config file values.
 fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Result<()> {
-    if jwt_secret == "change-me-in-production" {
+    if KNOWN_BAD_JWT_SECRETS.contains(&jwt_secret) {
         tracing::error!(
-            "FATAL: jwt_secret is set to the default value from {}. \
-             Set a strong secret via FORGEKEEP_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
+            "FATAL: jwt_secret from {} is a known default/compromised value. \
+             Generate a fresh one with `forgekeep gen-secret` and set it via \
+             FORGEKEEP_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
             source
         );
-        anyhow::bail!("refusing to start with default jwt_secret");
+        anyhow::bail!("refusing to start with default/compromised jwt_secret");
     }
     if jwt_secret.len() < 16 {
         tracing::warn!(
@@ -606,6 +639,47 @@ fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod jwt_secret_tests {
+    use super::{generate_jwt_secret, validate_jwt_secret, KNOWN_BAD_JWT_SECRETS};
+    use base64::Engine as _;
+
+    #[test]
+    fn rejects_shipped_default() {
+        assert!(validate_jwt_secret("change-me-in-production", "test").is_err());
+    }
+
+    #[test]
+    fn rejects_leaked_upstream_secret() {
+        // The value that leaked in the IronForge source repo must stay rejected.
+        assert!(
+            validate_jwt_secret("uYT7aF/+zA2Zh6P48xnsuY0IbcHH3WdWA4SAtP/Uv6s=", "test").is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_strong_secret() {
+        assert!(validate_jwt_secret("a-sufficiently-long-random-secret-value", "test").is_ok());
+    }
+
+    #[test]
+    fn generated_secret_is_strong_and_not_known_bad() {
+        let secret = generate_jwt_secret();
+        // 32 bytes standard-base64 → 44 chars, well over the 16-char floor.
+        assert!(secret.len() >= 16, "generated secret too short: {secret}");
+        assert!(!KNOWN_BAD_JWT_SECRETS.contains(&secret.as_str()));
+        // Decodes back to exactly 32 bytes of entropy.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&secret)
+            .expect("generated secret must be valid base64");
+        assert_eq!(decoded.len(), 32);
+        // A fresh call yields a different value (CSPRNG, not a constant).
+        assert_ne!(secret, generate_jwt_secret());
+        // The generated secret passes validation.
+        assert!(validate_jwt_secret(&secret, "test").is_ok());
+    }
 }
 
 /// Validate critical configuration before starting servers.
@@ -711,6 +785,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Running database migrations...");
             rg_db::run_migrations(&db).await?;
             tracing::info!("Migrations complete ✅");
+        }
+
+        Commands::GenSecret => {
+            // Print only the secret to stdout so it can be captured directly,
+            // e.g. FORGEKEEP_JWT_SECRET="$(forgekeep gen-secret)".
+            println!("{}", generate_jwt_secret());
         }
 
         Commands::RebuildFts { db_url } => {

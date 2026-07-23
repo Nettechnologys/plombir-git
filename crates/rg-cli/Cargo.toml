@@ -30,3 +30,5 @@ toml = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 reqwest = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }

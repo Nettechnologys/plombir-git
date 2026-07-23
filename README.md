@@ -82,11 +82,14 @@ ssh-keygen -t ed25519 -f ./forgekeep_host_key -N ""
   --ssh-addr  0.0.0.0:2222 \
   --host-key  ./forgekeep_host_key \
   --db-url    "sqlite://./forgekeep.db?mode=rwc" \
-  --jwt-secret "$(openssl rand -base64 32)"
+  --jwt-secret "$(forgekeep gen-secret)"
 ```
 
-Database migrations run automatically on startup. Set the log level with
-`RUST_LOG` (e.g. `RUST_LOG=debug`).
+`forgekeep gen-secret` prints a fresh 256-bit secret (the `openssl rand -base64
+32` equivalent). The server refuses to start with the shipped
+`change-me-in-production` placeholder, so generate your own and keep it out of
+version control. Database migrations run automatically on startup. Set the log
+level with `RUST_LOG` (e.g. `RUST_LOG=debug`).
 
 Common `serve` flags:
 
