@@ -41,7 +41,7 @@ jobs:
 
       - name: Fresh DB migration smoke
         run: |
-          db_path="${RUNNER_TEMP}/ironforge-ci-migration.db"
+          db_path="${RUNNER_TEMP}/forgekeep-ci-migration.db"
           cargo run -p rg-cli -- migrate --db-url "sqlite://${db_path}?mode=rwc"
 
   git-protocol:
@@ -63,12 +63,12 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build IronForge
+      - name: Build ForgeKeep
         run: cargo build -p rg-cli
 
       - name: Run HTTP and SSH protocol matrix
         env:
-          IRONFORGE_BIN: ${{ github.workspace }}/target/debug/ironforge
+          FORGEKEEP_BIN: ${{ github.workspace }}/target/debug/forgekeep
         run: scripts/git-protocol-e2e.sh
 
   postgres-smoke:
@@ -79,18 +79,18 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: ironforge
-          POSTGRES_PASSWORD: ironforge
-          POSTGRES_DB: ironforge
+          POSTGRES_USER: forgekeep
+          POSTGRES_PASSWORD: forgekeep
+          POSTGRES_DB: forgekeep
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U ironforge -d ironforge"
+          --health-cmd "pg_isready -U forgekeep -d forgekeep"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
-      IRONFORGE_TEST_DATABASE_URL: postgres://ironforge:ironforge@127.0.0.1:5432/ironforge
+      FORGEKEEP_TEST_DATABASE_URL: postgres://forgekeep:forgekeep@127.0.0.1:5432/forgekeep
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -113,18 +113,18 @@ jobs:
         image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: ironforge
-          MYSQL_USER: ironforge
-          MYSQL_PASSWORD: ironforge
+          MYSQL_DATABASE: forgekeep
+          MYSQL_USER: forgekeep
+          MYSQL_PASSWORD: forgekeep
         ports:
           - 3306:3306
         options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uironforge -pironforge"
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uforgekeep -pforgekeep"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
     env:
-      IRONFORGE_TEST_DATABASE_URL: mysql://ironforge:ironforge@127.0.0.1:3306/ironforge
+      FORGEKEEP_TEST_DATABASE_URL: mysql://forgekeep:forgekeep@127.0.0.1:3306/forgekeep
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -177,9 +177,9 @@ jobs:
         run: |
           cp deploy/.env.example deploy/.env
           secret="$(openssl rand -hex 32)"
-          sed -i "s/^IRONFORGE_JWT_SECRET=.*/IRONFORGE_JWT_SECRET=${secret}/" deploy/.env
-          docker compose -f deploy/docker-compose.yml config >/tmp/ironforge-compose-main.yml
+          sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" deploy/.env
+          docker compose -f deploy/docker-compose.yml config >/tmp/forgekeep-compose-main.yml
           rm -f deploy/.env
 
       - name: Validate observability compose
-        run: docker compose -f deploy/docker-compose.observability.yml config >/tmp/ironforge-compose-observability.yml
+        run: docker compose -f deploy/docker-compose.observability.yml config >/tmp/forgekeep-compose-observability.yml

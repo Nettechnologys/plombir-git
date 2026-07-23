@@ -3,10 +3,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IRONFORGE_BIN="${IRONFORGE_BIN:-${ROOT_DIR}/target/release/forgekeep}"
+FORGEKEEP_BIN="${FORGEKEEP_BIN:-${ROOT_DIR}/target/release/forgekeep}"
 
-if [[ "${IRONFORGE_BIN}" != /* ]]; then
-  IRONFORGE_BIN="${ROOT_DIR}/${IRONFORGE_BIN}"
+if [[ "${FORGEKEEP_BIN}" != /* ]]; then
+  FORGEKEEP_BIN="${ROOT_DIR}/${FORGEKEEP_BIN}"
 fi
 
 for command in curl git python3 ssh ssh-keygen; do
@@ -16,13 +16,13 @@ for command in curl git python3 ssh ssh-keygen; do
   fi
 done
 
-if [[ ! -x "${IRONFORGE_BIN}" ]]; then
-  echo "IronForge binary not found: ${IRONFORGE_BIN}" >&2
+if [[ ! -x "${FORGEKEEP_BIN}" ]]; then
+  echo "ForgeKeep binary not found: ${FORGEKEEP_BIN}" >&2
   echo "build it first with: cargo build --release -p rg-cli" >&2
   exit 1
 fi
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ironforge-git-e2e.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/forgekeep-git-e2e.XXXXXX")"
 SERVER_PID=""
 
 cleanup() {
@@ -36,7 +36,7 @@ cleanup() {
     echo "git protocol E2E failed; server log follows:" >&2
     tail -200 "${WORK_DIR}/server.log" >&2 || true
   fi
-  if [[ "${IRONFORGE_E2E_KEEP_TMP:-0}" == "1" ]]; then
+  if [[ "${FORGEKEEP_E2E_KEEP_TMP:-0}" == "1" ]]; then
     echo "kept E2E workspace: ${WORK_DIR}" >&2
   else
     rm -rf "${WORK_DIR}"
@@ -104,12 +104,12 @@ HTTP_REPO="${HTTP_BASE}/git/${USERNAME}/${REPO_NAME}"
 SSH_REPO="ssh://git@127.0.0.1:${SSH_PORT}/${USERNAME}/${REPO_NAME}"
 
 mkdir -p "${WORK_DIR}/repos"
-"${IRONFORGE_BIN}" serve \
+"${FORGEKEEP_BIN}" serve \
   --repo-root "${WORK_DIR}/repos" \
   --http-addr "127.0.0.1:${HTTP_PORT}" \
   --ssh-addr "127.0.0.1:${SSH_PORT}" \
   --host-key "${WORK_DIR}/host-key" \
-  --db-url "sqlite://${WORK_DIR}/ironforge.db?mode=rwc" \
+  --db-url "sqlite://${WORK_DIR}/forgekeep.db?mode=rwc" \
   --jwt-secret "git-protocol-e2e-secret-2026" \
   >"${WORK_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
@@ -119,7 +119,7 @@ for _ in $(seq 1 120); do
     break
   fi
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "IronForge server exited before becoming healthy" >&2
+    echo "ForgeKeep server exited before becoming healthy" >&2
     exit 1
   fi
   sleep 0.25
@@ -161,7 +161,7 @@ git -C "${WORK_DIR}/seed" config user.name "Protocol Matrix"
 git -C "${WORK_DIR}/seed" config user.email "protocol-matrix@example.com"
 printf 'initial\n' >"${WORK_DIR}/seed/README.md"
 python3 - <<'PY' >"${WORK_DIR}/seed/payload.txt"
-print("ironforge-protocol-matrix-" * 4096)
+print("forgekeep-protocol-matrix-" * 4096)
 PY
 git -C "${WORK_DIR}/seed" add README.md payload.txt
 GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" \
