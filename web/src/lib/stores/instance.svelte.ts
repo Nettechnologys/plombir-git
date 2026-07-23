@@ -47,7 +47,7 @@ export function registerKeyboardShortcuts() {
 function focusSearch() {
   // Try to find and focus the global search input
   const searchInput = document.querySelector<HTMLInputElement>(
-    'input[type="search"], input[placeholder*="earch"], input[placeholder*="搜索"]'
+    '[data-global-search], input[type="search"]'
   );
   if (searchInput) {
     searchInput.focus();

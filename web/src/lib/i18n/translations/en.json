@@ -271,6 +271,10 @@
     "fork": "Fork",
     "forking": "Forking...",
     "forks": "Forks",
+    "fork_login_required": "Sign in before forking this repository.",
+    "fork_own_repo": "You cannot fork your own repository under the same name.",
+    "fork_success": "Repository forked successfully, redirecting...",
+    "fork_failed": "Failed to fork the repository.",
     "clone": "Clone",
     "clone_http": "HTTPS",
     "clone_ssh": "SSH",
@@ -669,7 +673,10 @@
     "unauthorized": "Unauthorized",
     "network_error": "Network error",
     "load_failed": "Failed to load",
-    "create_failed": "Failed to create"
+    "create_failed": "Failed to create",
+    "backend_health_failed": "Backend health check failed (HTTP {status}).",
+    "backend_unhealthy": "The backend is in an abnormal state; some features may be unavailable.",
+    "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running."
   },
   "search": {
     "title": "Search",

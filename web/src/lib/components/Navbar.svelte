@@ -59,6 +59,7 @@
       <input
         type="search"
         class="search-input"
+        data-global-search
         bind:value={search}
         placeholder={t('nav.search_placeholder', 'Search or jump to...')}
         aria-label={t('nav.search')}

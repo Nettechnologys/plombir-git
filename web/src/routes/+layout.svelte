@@ -5,7 +5,7 @@
   import Layout from '$lib/components/Layout.svelte';
 import { fetchUser, isAuthReady } from '$lib/stores/auth.svelte';
 import { registerKeyboardShortcuts } from '$lib/stores/instance.svelte';
-import { locale } from '$lib/i18n';
+import { locale, t } from '$lib/i18n';
 import { onMount } from 'svelte';
 import type { Snippet } from 'svelte';
 import { setBanner } from '$lib/stores/instance.svelte';
@@ -32,16 +32,16 @@ import { withBackendBase } from '$lib/api/_base';
     try {
       const res = await fetch(withBackendBase('/health'), { cache: 'no-store' });
       if (!res.ok) {
-        setBanner(`后端健康检查失败（HTTP ${res.status}）`, 'error');
+        setBanner(t('errors.backend_health_failed', { status: res.status }), 'error');
         return;
       }
       const body = await res.json().catch(() => null);
       if (!body || !['healthy', 'ok'].includes(String(body.status || ''))) {
-        setBanner('后端状态异常，部分接口可能不可用', 'warning');
+        setBanner(t('errors.backend_unhealthy'), 'warning');
         return;
       }
     } catch {
-      setBanner('无法连接后端，请确认 8080 服务已启动', 'error');
+      setBanner(t('errors.backend_unreachable'), 'error');
     }
   }
 </script>

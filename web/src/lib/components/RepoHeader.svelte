@@ -182,12 +182,12 @@
     forkSuccess = '';
 
     if (!isLoggedIn()) {
-      forkError = '请先登录后再复刻仓库。';
+      forkError = t('repo.fork_login_required');
       return;
     }
 
     if (isOwnRepo) {
-      forkError = '不能复刻自己名下的同名仓库。';
+      forkError = t('repo.fork_own_repo');
       return;
     }
 
@@ -197,19 +197,19 @@
       const result = await repos.fork(owner, repo);
       const forkOwner = result?.owner?.username || result?.owner_name || result?.owner || getUser()?.username;
       const forkName = result?.name || repo;
-      forkSuccess = '仓库复刻成功，正在跳转...';
+      forkSuccess = t('repo.fork_success');
       if (forkOwner) {
         goto(`/${forkOwner}/${forkName}`);
       }
     } catch (e: any) {
-      forkError = e?.message || '复刻仓库失败。';
+      forkError = e?.message || t('repo.fork_failed');
       forking = false;
     }
   }
 
   function getForkTitle() {
     if (!isLoggedIn()) return 'Login to fork';
-    if (isOwnRepo) return '不能复刻自己名下的同名仓库';
+    if (isOwnRepo) return t('repo.fork_own_repo');
     return forking ? t('repo.forking') : t('repo.fork');
   }
 

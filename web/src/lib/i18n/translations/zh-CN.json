@@ -272,6 +272,10 @@
     "fork": "复刻",
     "forking": "复刻中...",
     "forks": "复刻",
+    "fork_login_required": "请先登录后再复刻仓库。",
+    "fork_own_repo": "不能复刻自己名下的同名仓库。",
+    "fork_success": "仓库复刻成功，正在跳转...",
+    "fork_failed": "复刻仓库失败。",
     "clone": "克隆",
     "clone_title": "克隆",
     "clone_http": "HTTPS",
@@ -669,7 +673,10 @@
     "unauthorized": "未授权",
     "network_error": "网络错误",
     "load_failed": "加载失败",
-    "create_failed": "创建失败"
+    "create_failed": "创建失败",
+    "backend_health_failed": "后端健康检查失败（HTTP {status}）。",
+    "backend_unhealthy": "后端状态异常，部分接口可能不可用。",
+    "backend_unreachable": "无法连接后端，请确认 8080 服务已启动。"
   },
   "search": {
     "title": "搜索",
