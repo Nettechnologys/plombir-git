@@ -107,7 +107,14 @@ fn encode_query_component(value: &str) -> String {
 }
 
 /// Verify and extract a signed cookie value. Returns None if missing or invalid.
+///
+/// The signature is verified in **constant time** via `Mac::verify_slice`
+/// (guards against timing oracles), mirroring `verify_hub_signature`.
 fn verify_state_cookie(headers: &HeaderMap, name: &str, jwt_secret: &str) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
     let cookie_header = headers.get("cookie")?.to_str().ok()?;
     let prefix = format!("{}=", name);
 
@@ -116,8 +123,16 @@ fn verify_state_cookie(headers: &HeaderMap, name: &str, jwt_secret: &str) -> Opt
         if let Some(value) = trimmed.strip_prefix(&prefix) {
             // Split value:signature
             if let Some((val, sig)) = value.rsplit_once(':') {
-                let expected_sig = sign_cookie_value(val, jwt_secret);
-                if sig == expected_sig {
+                // Decode the provided hex signature; skip malformed cookies.
+                let Ok(provided) = hex::decode(sig) else {
+                    continue;
+                };
+                // HMAC accepts a key of any length, so init cannot fail.
+                let mut mac = HmacSha256::new_from_slice(jwt_secret.as_bytes())
+                    .expect("HMAC accepts keys of any length");
+                mac.update(val.as_bytes());
+                // Constant-time comparison — no early-exit timing side channel.
+                if mac.verify_slice(&provided).is_ok() {
                     return Some(val.to_string());
                 }
             }
@@ -126,22 +141,21 @@ fn verify_state_cookie(headers: &HeaderMap, name: &str, jwt_secret: &str) -> Opt
     None
 }
 
-/// SHA256-based cookie signing using JWT secret.
+/// HMAC-SHA256 cookie signing keyed by the JWT secret, hex-encoded.
+///
+/// Uses a proper HMAC construction (not `SHA256(secret ‖ value)`, which is
+/// vulnerable to length-extension) so a signed `value:sig` pair can't be
+/// extended into another valid pair.
 fn sign_cookie_value(value: &str, secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    hasher.update(b":");
-    hasher.update(value.as_bytes());
-    let result = hasher.finalize();
-    // Hex encode the digest
-    let mut hex = String::with_capacity(64);
-    for byte in &result {
-        use std::fmt::Write;
-        // write! to a String never fails, so unwrap is safe here
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    // HMAC accepts a key of any length, so init cannot fail.
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(value.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 // ── Extract base URL ─────────────────────────────────────────────
