@@ -5,6 +5,22 @@
 //! - CSRF state tied to a signed cookie
 //! - Token refresh support
 //! - OIDC Discovery for Google and generic OIDC providers
+//!
+//! # Outbound HTTP hardening
+//! Every call to a provider endpoint (token / userinfo / discovery) goes
+//! through the shared [`crate::net::outbound_client`], which bounds every
+//! request with a request + connect timeout and follows **no** redirects — so a
+//! slow/hanging IdP can't pin a login task forever, and a `3xx` from a token or
+//! userinfo endpoint can't bounce the bearer token to an internal host.
+//!
+//! Unlike webhook delivery, SSO endpoints are **admin-configured** (or come from
+//! the provider's own OIDC discovery document), not arbitrary user input, and a
+//! self-hosted forge legitimately points SSO at an *internal* IdP (self-hosted
+//! Keycloak / GitLab on a private address). We therefore deliberately do **not**
+//! run these endpoints through [`crate::net::guard_outbound_url`]'s private-IP
+//! rejection — doing so would break that supported deployment. The timeout +
+//! redirect ban are the parts of the hardening that apply regardless of trust
+//! boundary.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -103,7 +119,7 @@ pub async fn oauth2_exchange_code(
             .ok_or_else(|| anyhow::anyhow!("no token URL for provider: {}", config.slug))?
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::net::outbound_client();
 
     #[derive(Deserialize)]
     struct RawTokenResponse {
@@ -158,7 +174,7 @@ pub async fn oauth2_refresh_token(
             .ok_or_else(|| anyhow::anyhow!("no token URL for provider: {}", config.slug))?
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::net::outbound_client();
 
     #[derive(Deserialize)]
     struct RawTokenResponse {
@@ -221,7 +237,7 @@ pub async fn oauth2_fetch_user_info(
 // ── GitHub user info ─────────────────────────────────────────────
 
 async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
-    let client = reqwest::Client::new();
+    let client = crate::net::outbound_client();
 
     let user_resp = client
         .get("https://api.github.com/user")
@@ -246,7 +262,7 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
     let provider_username = user["login"].as_str().unwrap_or("").to_string();
     let display_name = user["name"].as_str().map(str::to_string);
     let avatar_url = user["avatar_url"].as_str().map(str::to_string);
-    let email = fetch_github_email(&client, access_token)
+    let email = fetch_github_email(client, access_token)
         .await
         .unwrap_or_else(|| user["email"].as_str().unwrap_or("").to_string());
 
@@ -291,7 +307,7 @@ async fn fetch_github_email(client: &reqwest::Client, access_token: &str) -> Opt
 // ── GitLab user info ─────────────────────────────────────────────
 
 async fn fetch_gitlab_user(access_token: &str) -> Result<SsoUserInfo> {
-    let client = reqwest::Client::new();
+    let client = crate::net::outbound_client();
     let resp = client
         .get("https://gitlab.com/api/v4/user")
         .header("Authorization", format!("Bearer {}", access_token))
@@ -319,7 +335,7 @@ async fn fetch_gitlab_user(access_token: &str) -> Result<SsoUserInfo> {
 // ── Google OIDC user info ────────────────────────────────────────
 
 async fn fetch_google_user(access_token: &str) -> Result<SsoUserInfo> {
-    let client = reqwest::Client::new();
+    let client = crate::net::outbound_client();
     let resp = client
         .get("https://openidconnect.googleapis.com/v1/userinfo")
         .header("Authorization", format!("Bearer {}", access_token))
@@ -353,7 +369,7 @@ async fn fetch_oidc_userinfo(
     config: &SsoProviderConfig,
     access_token: &str,
 ) -> Result<SsoUserInfo> {
-    let client = reqwest::Client::new();
+    let client = crate::net::outbound_client();
     let endpoint = resolve_oidc_endpoints(config).await?.userinfo_endpoint;
     let user = client
         .get(endpoint)
@@ -393,7 +409,7 @@ async fn resolve_oidc_endpoints(config: &SsoProviderConfig) -> Result<OidcEndpoi
         .as_deref()
         .filter(|url| !url.trim().is_empty())
     {
-        return reqwest::Client::new()
+        return crate::net::outbound_client()
             .get(discovery_url)
             .send()
             .await
