@@ -1,11 +1,11 @@
-# IronForge Prometheus Configuration
+# ForgeKeep Prometheus Configuration
 # Phase 22-C: Observability Stack
 
 global:
   scrape_interval: 15s          # Scrape targets every 15s
   evaluation_interval: 15s      # Evaluate rules every 15s
   external_labels:
-    cluster: 'ironforge'
+    cluster: 'forgekeep'
     environment: 'production'
 
 # Load rules
@@ -20,15 +20,15 @@ alerting:
 
 # Scrape targets
 scrape_configs:
-  # IronForge main app
-  - job_name: 'ironforge'
+  # ForgeKeep main app
+  - job_name: 'forgekeep'
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
     static_configs:
-      - targets: ['ironforge:8080']
+      - targets: ['forgekeep:8080']
         labels:
-          service: 'ironforge-api'
+          service: 'forgekeep-api'
           component: 'api'
 
   # Prometheus itself

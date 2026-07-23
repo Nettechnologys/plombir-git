@@ -1,4 +1,4 @@
-# IronForge Alertmanager Configuration
+# ForgeKeep Alertmanager Configuration
 # Phase 22-C: Observability Stack
 
 global:
@@ -52,7 +52,7 @@ receivers:
   - name: 'slack'
     slack_configs:
       - api_url: '<SLACK_WEBHOOK_URL>'  # Set via env or secret
-        channel: '#ironforge-alerts'
+        channel: '#forgekeep-alerts'
         send_resolved: true
         title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
         text: |
@@ -66,7 +66,7 @@ receivers:
   - name: 'slack-info'
     slack_configs:
       - api_url: '<SLACK_WEBHOOK_URL>'  # Set via env or secret
-        channel: '#ironforge-info'
+        channel: '#forgekeep-info'
         send_resolved: false
         title: '[INFO] {{ .GroupLabels.alertname }}'
         text: |
@@ -76,11 +76,11 @@ receivers:
 
 # Inhibition rules (suppress noisy alerts)
 inhibit_rules:
-  # If IronForge is down, suppress all other alerts
+  # If ForgeKeep is down, suppress all other alerts
   - source_match:
-      alertname: 'IronForgeDown'
+      alertname: 'ForgeKeepDown'
     target_match_re:
-      service: 'ironforge'
+      service: 'forgekeep'
     equal: ['service']
 
   # If a specific route is slow, suppress generic "high latency" alerts

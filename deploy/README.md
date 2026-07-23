@@ -1,6 +1,6 @@
-# IronForge Deployment Guide
+# ForgeKeep Deployment Guide
 
-## 🚀 Quick Start — IronForge Application
+## 🚀 Quick Start — ForgeKeep Application
 
 ```bash
 cd deploy
@@ -8,10 +8,10 @@ cd deploy
 # 1. Create runtime environment file
 cp .env.example .env
 secret="$(openssl rand -hex 32)"
-sed -i.bak "s/^IRONFORGE_JWT_SECRET=.*/IRONFORGE_JWT_SECRET=${secret}/" .env
+sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
 rm -f .env.bak
 
-# 2. Start IronForge
+# 2. Start ForgeKeep
 docker compose up -d
 
 # 3. Check status
@@ -24,13 +24,13 @@ Access: **http://localhost:8080**
 ### Environment variables (used with default CMD):
 | Variable | Required | Default |
 |----------|----------|---------|
-| `IRONFORGE_JWT_SECRET` | **Yes** | set in `deploy/.env` |
-| `IRONFORGE_CORS_ORIGINS` | No | unset |
-| `IRONFORGE_CSP_CONNECT_SRC` | No | unset |
+| `FORGEKEEP_JWT_SECRET` | **Yes** | set in `deploy/.env` |
+| `FORGEKEEP_CORS_ORIGINS` | No | unset |
+| `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
 
-For a separately hosted frontend, set `IRONFORGE_CORS_ORIGINS` to the browser
-origin. IronForge also adds those origins, plus matching `ws://` or `wss://`
-origins, to CSP `connect-src`. Use `IRONFORGE_CSP_CONNECT_SRC` only for extra
+For a separately hosted frontend, set `FORGEKEEP_CORS_ORIGINS` to the browser
+origin. ForgeKeep also adds those origins, plus matching `ws://` or `wss://`
+origins, to CSP `connect-src`. Use `FORGEKEEP_CSP_CONNECT_SRC` only for extra
 API/WebSocket origins not covered by CORS.
 
 ### Volumes
@@ -44,32 +44,32 @@ The Docker image includes all runtime binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `ironforge` | Main server and admin CLI |
-| `ironforge-runner` | Standalone CI runner agent |
-| `ironforge-mcp` | MCP stdio server |
+| `forgekeep` | Main server and admin CLI |
+| `forgekeep-runner` | Standalone CI runner agent |
+| `forgekeep-mcp` | MCP stdio server |
 
 ### SQLite Backup / Restore
 
-Backups use SQLite `VACUUM INTO`, so they can be taken while IronForge is
+Backups use SQLite `VACUUM INTO`, so they can be taken while ForgeKeep is
 running:
 
 ```bash
-docker compose exec ironforge sh -lc \
-  'mkdir -p /data/backups && ironforge backup-db \
-    --db-url "sqlite:///data/ironforge.db?mode=rw" \
-    "/data/backups/ironforge-$(date +%Y%m%d-%H%M%S).db"'
+docker compose exec forgekeep sh -lc \
+  'mkdir -p /data/backups && forgekeep backup-db \
+    --db-url "sqlite:///data/forgekeep.db?mode=rw" \
+    "/data/backups/forgekeep-$(date +%Y%m%d-%H%M%S).db"'
 ```
 
 Restore requires the main service to be stopped so the database file is not in
 use:
 
 ```bash
-docker compose stop ironforge
-docker compose run --rm ironforge restore-db \
-  --db-url "sqlite:///data/ironforge.db?mode=rwc" \
+docker compose stop forgekeep
+docker compose run --rm forgekeep restore-db \
+  --db-url "sqlite:///data/forgekeep.db?mode=rwc" \
   --force \
-  /data/backups/ironforge-YYYYMMDD-HHMMSS.db
-docker compose up -d ironforge
+  /data/backups/forgekeep-YYYYMMDD-HHMMSS.db
+docker compose up -d forgekeep
 ```
 
 ### Ports
@@ -84,7 +84,7 @@ docker compose up -d ironforge
 
 ## Overview
 
-This is a production-grade observability stack for IronForge, providing:
+This is a production-grade observability stack for ForgeKeep, providing:
 
 - **Metrics**: Prometheus scrapes `/metrics` every 15s
 - **Alerting**: Alertmanager routes alerts by severity (critical/warning/info)
@@ -110,8 +110,8 @@ docker compose -f docker-compose.observability.yml ps
 docker compose -f docker-compose.observability.yml logs -f
 ```
 
-Prometheus scrapes the app at `ironforge:8080` through the shared Docker
-network `ironforge-net`; start the main IronForge compose service first.
+Prometheus scrapes the app at `forgekeep:8080` through the shared Docker
+network `forgekeep-net`; start the main ForgeKeep compose service first.
 
 ## 📈 Available Metrics
 
@@ -144,19 +144,19 @@ network `ironforge-net`; start the main IronForge compose service first.
 ### Business Metrics (Phase 22-C)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `ironforge_users_registered_total` | Counter | User registrations |
-| `ironforge_repos_created_total` | Counter | Repos created |
-| `ironforge_repos_deleted_total` | Counter | Repos deleted |
-| `ironforge_repos_forked_total` | Counter | Repos forked |
-| `ironforge_issues_opened_total` | Counter | Issues opened |
-| `ironforge_issues_closed_total` | Counter | Issues closed |
-| `ironforge_prs_opened_total` | Counter | PRs opened |
-| `ironforge_prs_merged_total` | Counter | PRs merged |
-| `ironforge_stars_total` | Counter | Stars given |
-| `ironforge_webhook_deliveries_total` | Counter (labels: status) | Webhook deliveries |
-| `ironforge_ws_connections` | Gauge | Active WS connections |
-| `ironforge_users` | Gauge | Total registered users |
-| `ironforge_repositories` | Gauge | Total non-deleted repos |
+| `forgekeep_users_registered_total` | Counter | User registrations |
+| `forgekeep_repos_created_total` | Counter | Repos created |
+| `forgekeep_repos_deleted_total` | Counter | Repos deleted |
+| `forgekeep_repos_forked_total` | Counter | Repos forked |
+| `forgekeep_issues_opened_total` | Counter | Issues opened |
+| `forgekeep_issues_closed_total` | Counter | Issues closed |
+| `forgekeep_prs_opened_total` | Counter | PRs opened |
+| `forgekeep_prs_merged_total` | Counter | PRs merged |
+| `forgekeep_stars_total` | Counter | Stars given |
+| `forgekeep_webhook_deliveries_total` | Counter (labels: status) | Webhook deliveries |
+| `forgekeep_ws_connections` | Gauge | Active WS connections |
+| `forgekeep_users` | Gauge | Total registered users |
+| `forgekeep_repositories` | Gauge | Total non-deleted repos |
 
 ## 🔔 Alert Rules
 
@@ -178,13 +178,13 @@ network `ironforge-net`; start the main IronForge compose service first.
 - **CIJobQueueBuildup**: > 50 jobs running for 15+ minutes (warning)
 
 ### Health Alerts
-- **IronForgeDown**: Target down for 2+ minutes (critical, pages on-call)
+- **ForgeKeepDown**: Target down for 2+ minutes (critical, pages on-call)
 - **HighMemoryUsage**: Memory > 90% for 10+ minutes (warning)
 - **LowDiskSpace**: Disk > 85% for 10+ minutes (warning)
 
 ## 📋 Dashboard Panels
 
-The main dashboard (`ironforge-main`) includes:
+The main dashboard (`forgekeep-main`) includes:
 
 1. **Request Rate (QPS)** - per-route traffic
 2. **P95/P99 Latency** - latency distribution per route
@@ -246,7 +246,7 @@ metrics::recorder::my_event();
 
 ```
 ┌──────────────────┐  scrape   ┌─────────────────┐
-│  IronForge       │ ────────▶ │  Prometheus     │
+│  ForgeKeep       │ ────────▶ │  Prometheus     │
 │  :7878/metrics   │  15s      │  :9090          │
 └──────────────────┘           └────────┬────────┘
                                         │

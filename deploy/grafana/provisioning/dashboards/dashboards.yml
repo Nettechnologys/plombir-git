@@ -1,12 +1,12 @@
-# IronForge Grafana Dashboard Provisioning
+# ForgeKeep Grafana Dashboard Provisioning
 # Auto-load dashboards from /var/lib/grafana/dashboards
 
 apiVersion: 1
 
 providers:
-  - name: 'IronForge'
+  - name: 'ForgeKeep'
     orgId: 1
-    folder: 'IronForge'
+    folder: 'ForgeKeep'
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10

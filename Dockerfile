@@ -1,14 +1,14 @@
-# === IronForge Dockerfile ===
+# === ForgeKeep Dockerfile ===
 # Multi-stage build: frontend (SvelteKit) + Rust builder + minimal runtime.
 #
 # Build:
-#   docker build -t ironforge:latest .
+#   docker build -t forgekeep:latest .
 #
 # Run:
 #   docker run -d -p 8080:8080 -p 2222:2222 \
-#     -e IRONFORGE_JWT_SECRET=your-secret \
-#     -v ironforge-data:/data \
-#     ironforge:latest
+#     -e FORGEKEEP_JWT_SECRET=your-secret \
+#     -v forgekeep-data:/data \
+#     forgekeep:latest
 
 # ── Stage 1: Frontend (SvelteKit SPA) ────────────────────────
 FROM node:22-alpine AS frontend-builder
@@ -93,7 +93,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash ironforge
+RUN useradd --create-home --shell /bin/bash forgekeep
 
 # Copy binaries
 COPY --from=builder /build/target/release/forgekeep /usr/local/bin/forgekeep
@@ -105,23 +105,23 @@ COPY --from=frontend-builder /build/web/build /app/web/build
 
 # Create data directories
 RUN mkdir -p /data/repos /data/config /data/logs \
-    && chown -R ironforge:ironforge /data /app
+    && chown -R forgekeep:forgekeep /data /app
 
 WORKDIR /app
-USER ironforge
+USER forgekeep
 
 # Expose ports
 EXPOSE 8080 2222
 
-# Health check (uses ironforge's built-in /health endpoint)
+# Health check (uses forgekeep's built-in /health endpoint)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Default command: serve with config via env vars.
-# Set IRONFORGE_JWT_SECRET env var before running.
+# Set FORGEKEEP_JWT_SECRET env var before running.
 CMD ["forgekeep", "serve", \
      "--repo-root", "/data/repos", \
      "--http-addr", "0.0.0.0:8080", \
      "--ssh-addr", "0.0.0.0:2222", \
-     "--db-url", "sqlite:///data/ironforge.db?mode=rwc", \
-     "--log-file", "/data/logs/ironforge.log"]
+     "--db-url", "sqlite:///data/forgekeep.db?mode=rwc", \
+     "--log-file", "/data/logs/forgekeep.log"]

@@ -1,7 +1,7 @@
 {
-  "title": "IronForge - Production Overview",
-  "uid": "ironforge-main",
-  "tags": ["ironforge", "production"],
+  "title": "ForgeKeep - Production Overview",
+  "uid": "forgekeep-main",
+  "tags": ["forgekeep", "production"],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
@@ -193,7 +193,7 @@
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 24 },
       "targets": [
         {
-          "expr": "up{job=\"ironforge\"}",
+          "expr": "up{job=\"forgekeep\"}",
           "refId": "A"
         }
       ],

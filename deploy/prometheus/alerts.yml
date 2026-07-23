@@ -1,8 +1,8 @@
-# IronForge Alert Rules
+# ForgeKeep Alert Rules
 # Phase 22-C: Observability Stack
 groups:
   # HTTP/API alerts
-  - name: ironforge_http
+  - name: forgekeep_http
     interval: 30s
     rules:
       # High error rate
@@ -15,7 +15,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "High HTTP 5xx error rate on {{ $labels.route }}"
           description: "{{ $labels.route }} has error rate {{ $value | humanizePercentage }} for 5+ minutes."
@@ -28,7 +28,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "P95 latency on {{ $labels.route }} exceeds 1s"
           description: "P95 = {{ $value }}s for route {{ $labels.route }}."
@@ -39,13 +39,13 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "High number of in-flight requests: {{ $value }}"
           description: "May indicate traffic spike or service degradation."
 
   # Database alerts
-  - name: ironforge_database
+  - name: forgekeep_database
     interval: 30s
     rules:
       # Slow DB queries
@@ -56,7 +56,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "P95 DB query duration exceeds 500ms for {{ $labels.operation }}"
           description: "P95 = {{ $value }}s. Check for missing indexes or slow queries."
@@ -67,13 +67,13 @@ groups:
         for: 5m
         labels:
           severity: info
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "High DB QPS for {{ $labels.operation }}: {{ $value }} req/s"
           description: "May indicate hot table or missing cache."
 
   # Git operations alerts
-  - name: ironforge_git
+  - name: forgekeep_git
     interval: 30s
     rules:
       # Slow Git clone
@@ -84,7 +84,7 @@ groups:
         for: 15m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "P95 git clone latency exceeds 30s"
           description: "P95 = {{ $value }}s. Check disk I/O and pack file access."
@@ -97,13 +97,13 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "High Git operation failure rate"
           description: "Git endpoints returning 5xx errors at {{ $value }} req/s."
 
   # CI/CD alerts
-  - name: ironforge_cicd
+  - name: forgekeep_cicd
     interval: 30s
     rules:
       # Pipeline failure rate
@@ -116,7 +116,7 @@ groups:
         for: 30m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "Pipeline failure rate exceeds 30%"
           description: "{{ $value | humanizePercentage }} of pipelines failed in the last hour."
@@ -127,24 +127,24 @@ groups:
         for: 15m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "CI job queue buildup: {{ $value }} jobs running"
           description: "Consider adding more runners."
 
   # Health/availability alerts
-  - name: ironforge_health
+  - name: forgekeep_health
     interval: 15s
     rules:
       # Health check failure (requires blackbox or up{} check)
-      - alert: IronForgeDown
-        expr: up{job="ironforge"} == 0
+      - alert: ForgeKeepDown
+        expr: up{job="forgekeep"} == 0
         for: 2m
         labels:
           severity: critical
-          service: ironforge
+          service: forgekeep
         annotations:
-          summary: "IronForge is DOWN"
+          summary: "ForgeKeep is DOWN"
           description: "Target has been unreachable for 2+ minutes. Page on-call!"
 
       # High memory usage
@@ -155,7 +155,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "Host memory usage > 90%"
           description: "Memory pressure: {{ $value | humanizePercentage }}. Consider scaling or investigating leak."
@@ -168,7 +168,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: ironforge
+          service: forgekeep
         annotations:
           summary: "Disk usage > 85% on {{ $labels.instance }}"
           description: "Filesystem: {{ $labels.mountpoint }} at {{ $value | humanizePercentage }}."

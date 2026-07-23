@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IronForge Observability Quick Start
+# ForgeKeep Observability Quick Start
 # Phase 22-C
 
 set -e
@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  IronForge Observability Stack — Phase 22-C"
+echo "  ForgeKeep Observability Stack — Phase 22-C"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
@@ -17,12 +17,12 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-# Check if IronForge is running
-echo "🔍 Checking if IronForge is running on :7878..."
+# Check if ForgeKeep is running
+echo "🔍 Checking if ForgeKeep is running on :7878..."
 if curl -s -o /dev/null -w "%{http_code}" http://localhost:7878/health 2>/dev/null | grep -q "200\|404\|401"; then
-    echo "✅ IronForge detected"
+    echo "✅ ForgeKeep detected"
 else
-    echo "⚠️  IronForge not detected on :7878 (will still start the stack)"
+    echo "⚠️  ForgeKeep not detected on :7878 (will still start the stack)"
 fi
 
 # Start the stack
@@ -56,14 +56,14 @@ echo "  Grafana:        http://localhost:3000  (admin/admin)"
 echo "  Alertmanager:   http://localhost:9093"
 echo "  Node Exporter:  http://localhost:9100/metrics"
 echo ""
-echo "  IronForge:      http://localhost:7878/metrics"
+echo "  ForgeKeep:      http://localhost:7878/metrics"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "📈 Try these PromQL queries in Prometheus:"
 echo "  • sum(rate(http_requests_total[5m]))  (QPS)"
 echo "  • histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))"
-echo "  • ironforge_repositories  (total repos)"
-echo "  • up{job=\"ironforge\"}  (health)"
+echo "  • forgekeep_repositories  (total repos)"
+echo "  • up{job=\"forgekeep\"}  (health)"
 echo ""
 echo "🔥 To stop the stack:"
 echo "  docker compose -f docker-compose.observability.yml down"
