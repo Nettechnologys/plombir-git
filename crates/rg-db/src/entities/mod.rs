@@ -37,6 +37,7 @@ pub mod package;
 pub mod package_file;
 pub mod package_registry;
 pub mod package_version;
+pub mod passkey_credential;
 pub mod password_reset_token;
 pub mod pipeline;
 pub mod pipeline_job;

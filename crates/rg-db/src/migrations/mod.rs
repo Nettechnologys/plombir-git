@@ -67,6 +67,7 @@ pub mod m20260712_000015_fix_oauth_accounts_table_name;
 pub mod m20260713_000001_fix_postgres_utc_timestamps;
 pub mod m20260714_000001_create_attachments;
 pub mod m20260714_000002_repair_mysql_fts_triggers;
+pub mod m20260723_000001_create_passkey_credentials;
 
 use sea_orm_migration::prelude::*;
 
@@ -147,6 +148,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260713_000001_fix_postgres_utc_timestamps::Migration),
             Box::new(m20260714_000001_create_attachments::Migration),
             Box::new(m20260714_000002_repair_mysql_fts_triggers::Migration),
+            Box::new(m20260723_000001_create_passkey_credentials::Migration),
         ]
     }
 }

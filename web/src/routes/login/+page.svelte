@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     login,
+    loginWithPasskey,
     verifyMfa,
     getAuthError,
     getAuthLoading,
@@ -9,7 +10,7 @@
     beginMfa,
   } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
-  import { auth, type PublicSsoProvider } from '$lib/api/client.svelte';
+  import { auth, isPasskeySupported, type PublicSsoProvider } from '$lib/api/client.svelte';
   import { goto } from '$app/navigation';
 
   const t = createT();
@@ -21,6 +22,7 @@
   let localError = $state('');
   let ssoProviders = $state<PublicSsoProvider[]>([]);
   let ssoLoading = $state(true);
+  const passkeySupported = isPasskeySupported();
 
   // Redirect if already logged in (prevents flash of login form for authenticated users)
   $effect(() => {
@@ -64,6 +66,20 @@
       localError = '';
     } else {
       localError = getAuthError() || t('auth.login.failed');
+    }
+  }
+
+  async function handlePasskeyLogin() {
+    localError = '';
+    if (!username.trim()) {
+      localError = 'Enter your username first, then use your passkey.';
+      return;
+    }
+    const ok = await loginWithPasskey(username);
+    if (ok) {
+      window.location.href = '/dashboard';
+    } else {
+      localError = getAuthError() || 'Passkey login failed';
     }
   }
 
@@ -133,6 +149,22 @@
         <button type="submit" class="btn-primary" disabled={getAuthLoading()}>
           {getAuthLoading() ? t('auth.login.submitting') : t('auth.login.submit')}
         </button>
+
+        {#if passkeySupported}
+          <button
+            type="button"
+            class="btn-passkey"
+            onclick={handlePasskeyLogin}
+            disabled={getAuthLoading()}
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M2 18v3h6v-3a3 3 0 0 0-3-3 3 3 0 0 0-3 3Z" />
+              <circle cx="5" cy="10" r="3" />
+              <path d="M12 8h9M18 8v4M15 8v2" />
+            </svg>
+            Sign in with a passkey
+          </button>
+        {/if}
       </form>
     {/if}
 
@@ -222,6 +254,23 @@
   }
   .btn-primary:hover { background: var(--green); }
   .btn-primary:disabled { opacity: 0.6; }
+
+  .btn-passkey {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-passkey:hover { background: var(--bg-tertiary); }
+  .btn-passkey:disabled { opacity: 0.6; cursor: not-allowed; }
 
   .sso-loading {
     margin: 18px 0 0;

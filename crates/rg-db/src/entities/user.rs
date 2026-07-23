@@ -64,6 +64,8 @@ pub enum Relation {
     MfaBackupCode,
     #[sea_orm(has_many = "super::login_log::Entity")]
     LoginLog,
+    #[sea_orm(has_many = "super::passkey_credential::Entity")]
+    PasskeyCredential,
 }
 
 impl Related<super::repository::Entity> for Entity {
@@ -99,6 +101,12 @@ impl Related<super::mfa_backup_code::Entity> for Entity {
 impl Related<super::login_log::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::LoginLog.def()
+    }
+}
+
+impl Related<super::passkey_credential::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PasskeyCredential.def()
     }
 }
 

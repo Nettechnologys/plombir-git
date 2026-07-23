@@ -1,6 +1,6 @@
 // Auth state store using Svelte 5 runes
 
-import { setToken, getToken, auth } from '$lib/api/client.svelte';
+import { setToken, getToken, auth, passkeys } from '$lib/api/client.svelte';
 
 interface User {
   id: number;
@@ -104,6 +104,35 @@ export async function verifyMfa(code: string, backup = false) {
     return true;
   } catch (e: any) {
     error = e.message || 'MFA verification failed';
+    return false;
+  } finally {
+    isLoading = false;
+  }
+}
+
+export async function loginWithPasskey(username: string) {
+  if (!username.trim()) {
+    error = 'Enter your username to sign in with a passkey';
+    return false;
+  }
+
+  isLoading = true;
+  error = null;
+  try {
+    const res = await passkeys.login(username.trim());
+    pendingMfaUsername = null;
+    setToken(res.token);
+    const me = await auth.me();
+    currentUser = {
+      id: me.id,
+      username: me.username,
+      email: me.email,
+      is_admin: me.is_admin ?? false,
+      display_name: me.display_name,
+    };
+    return true;
+  } catch (e: any) {
+    error = e.message || 'Passkey login failed';
     return false;
   } finally {
     isLoading = false;

@@ -98,6 +98,12 @@ totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 qrcode = "0.14"
 rand = "0.8"
 
+# WebAuthn / passkeys. `danger-allow-state-serialisation` lets us persist the
+# in-progress registration/authentication ceremony state (PasskeyRegistration /
+# PasskeyAuthentication) into a short-lived signed cookie between the begin and
+# finish HTTP round-trips — ForgeKeep keeps no server-side session store.
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+
 # LDAP
 ldap3 = { version = "0.11", features = ["tls"] }
 

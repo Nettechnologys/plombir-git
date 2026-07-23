@@ -1,7 +1,14 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
-  import { mfa, type MfaBackupStatus, type MfaSetupResponse } from '$lib/api/client.svelte';
+  import {
+    mfa,
+    passkeys,
+    isPasskeySupported,
+    type MfaBackupStatus,
+    type MfaSetupResponse,
+    type PasskeyInfo,
+  } from '$lib/api/client.svelte';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -12,6 +19,11 @@
   let verificationCode = $state('');
   let disablePassword = $state('');
   let newBackupCodes = $state<string[]>([]);
+
+  let passkeyList = $state<PasskeyInfo[]>([]);
+  let passkeyName = $state('');
+  let passkeyBusy = $state(false);
+  const passkeySupported = isPasskeySupported();
 
   const mfaEnabled = $derived((backupStatus?.total ?? 0) > 0);
 
@@ -29,10 +41,45 @@
       loading = true;
       error = '';
       backupStatus = await mfa.backup();
+      if (passkeySupported) {
+        passkeyList = await passkeys.list();
+      }
     } catch (err: any) {
       error = err.message || 'Failed to load security settings';
     } finally {
       loading = false;
+    }
+  }
+
+  async function addPasskey(event: SubmitEvent) {
+    event.preventDefault();
+    try {
+      passkeyBusy = true;
+      error = '';
+      success = '';
+      passkeyList = await passkeys.register(passkeyName.trim());
+      passkeyName = '';
+      success = 'Passkey registered.';
+    } catch (err: any) {
+      error = err.message || 'Failed to register passkey';
+    } finally {
+      passkeyBusy = false;
+    }
+  }
+
+  async function removePasskey(id: number) {
+    if (!confirm('Remove this passkey? You will no longer be able to sign in with it.')) return;
+    try {
+      passkeyBusy = true;
+      error = '';
+      success = '';
+      await passkeys.remove(id);
+      passkeyList = passkeyList.filter((p) => p.id !== id);
+      success = 'Passkey removed.';
+    } catch (err: any) {
+      error = err.message || 'Failed to remove passkey';
+    } finally {
+      passkeyBusy = false;
     }
   }
 
@@ -163,6 +210,65 @@
       <button type="button" class="btn btn-primary" onclick={startSetup} disabled={saving}>
         {saving ? 'Starting...' : 'Set up MFA'}
       </button>
+    {/if}
+  </section>
+
+  <section class="section">
+    <div class="section-heading">
+      <div>
+        <h2>Passkeys</h2>
+        <p>Sign in without a password using Touch ID, Windows Hello, or a security key.</p>
+      </div>
+      <span class:enabled={passkeyList.length > 0} class="status">
+        {passkeyList.length > 0 ? `${passkeyList.length} active` : 'None'}
+      </span>
+    </div>
+
+    {#if !passkeySupported}
+      <p class="muted">This browser does not support passkeys.</p>
+    {:else}
+      {#if loading}
+        <p class="muted">Loading...</p>
+      {:else if passkeyList.length > 0}
+        <ul class="passkey-list">
+          {#each passkeyList as key (key.id)}
+            <li>
+              <div>
+                <strong>{key.name}</strong>
+                <span class="muted">
+                  Added {new Date(key.created_at).toLocaleDateString()}
+                  {#if key.last_used_at}· Last used {new Date(key.last_used_at).toLocaleDateString()}{/if}
+                </span>
+              </div>
+              <button
+                type="button"
+                class="btn btn-danger"
+                onclick={() => removePasskey(key.id)}
+                disabled={passkeyBusy}
+              >
+                Remove
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="muted">No passkeys registered yet.</p>
+      {/if}
+
+      <form class="passkey-form" onsubmit={addPasskey}>
+        <label>
+          Passkey name
+          <input
+            type="text"
+            bind:value={passkeyName}
+            placeholder="e.g. YubiKey, MacBook"
+            disabled={passkeyBusy}
+          />
+        </label>
+        <button type="submit" class="btn btn-primary" disabled={passkeyBusy}>
+          {passkeyBusy ? 'Waiting for authenticator...' : 'Add passkey'}
+        </button>
+      </form>
     {/if}
   </section>
 
@@ -343,6 +449,38 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-primary);
+  }
+
+  .passkey-list {
+    list-style: none;
+    margin: 0 0 18px;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+
+  .passkey-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-primary);
+  }
+
+  .passkey-list li > div {
+    display: grid;
+    gap: 2px;
+  }
+
+  .passkey-list .muted {
+    font-size: 12px;
+  }
+
+  .passkey-form {
+    margin-top: 4px;
   }
 
   .error-box,

@@ -10,3 +10,4 @@ pub mod pat_scope;
 pub mod ssh_key;
 pub mod sso;
 pub mod totp;
+pub mod webauthn;

@@ -31,6 +31,7 @@ export { tagProtections, type TagProtection } from './tagProtections';
 export { ciEnvironments, type CiEnvironment, type CiEnvironmentPayload } from './ciEnvironments';
 export { ciRetention, type CiRetentionPolicy, type CiCleanupResult } from './ciRetention';
 export { mfa, type MfaBackupStatus, type MfaEnableResponse, type MfaSetupResponse } from './mfa';
+export { passkeys, isPasskeySupported, type PasskeyInfo, type PasskeyLoginResponse } from './passkeys';
 export {
   admin,
   type AdminOrg,

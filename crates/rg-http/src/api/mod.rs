@@ -23,6 +23,7 @@ pub mod mirrors;
 pub mod notifications;
 pub mod orgs;
 pub mod packages;
+pub mod passkeys;
 pub mod pulls;
 pub mod releases;
 pub(crate) mod repo_access;

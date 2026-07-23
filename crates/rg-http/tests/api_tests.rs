@@ -603,3 +603,158 @@ async fn test_me_unauthenticated() {
 
     assert_eq!(resp.status(), 401);
 }
+
+// ── Passkeys (WebAuthn) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_passkey_endpoints_require_auth() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    let list = client
+        .get(format!("{}/api/v1/users/passkeys", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 401);
+
+    let start = client
+        .post(format!("{}/api/v1/users/passkeys/register/start", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 401);
+}
+
+#[tokio::test]
+async fn test_passkey_list_starts_empty() {
+    let base = spawn_test_app().await;
+    let (token, _uid) = register_full(&base, "pk_empty", "pk_empty@example.com").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/v1/users/passkeys", base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_passkey_register_start_issues_challenge_and_cookie() {
+    let base = spawn_test_app().await;
+    let (token, _uid) = register_full(&base, "pk_reg", "pk_reg@example.com").await;
+    let client = reqwest::Client::new();
+
+    // WebAuthn RP ids must be domains; the test host is a bare IP, so send a
+    // domain Host header (as a reverse proxy would).
+    let resp = client
+        .post(format!("{}/api/v1/users/passkeys/register/start", base))
+        .bearer_auth(&token)
+        .header(reqwest::header::HOST, "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A sealed ceremony-state cookie must be set, HttpOnly.
+    let cookie = resp
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("forgekeep_passkey_reg="));
+    assert!(cookie.contains("HttpOnly"));
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let challenge = body["publicKey"]["challenge"].as_str().unwrap();
+    assert!(!challenge.is_empty());
+    // Fresh user: nothing to exclude.
+    let exclude = body["publicKey"]["excludeCredentials"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(exclude, 0);
+}
+
+#[tokio::test]
+async fn test_passkey_register_finish_requires_challenge_cookie() {
+    let base = spawn_test_app().await;
+    let (token, _uid) = register_full(&base, "pk_finish", "pk_finish@example.com").await;
+    let client = reqwest::Client::new();
+
+    // A well-formed (but bogus) credential with no ceremony cookie must be
+    // rejected as a missing/expired challenge, not accepted.
+    let resp = client
+        .post(format!("{}/api/v1/users/passkeys/register/finish", base))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "bogus",
+            "credential": {
+                "id": "AAAA",
+                "rawId": "AAAA",
+                "type": "public-key",
+                "response": {
+                    "attestationObject": "AAAA",
+                    "clientDataJSON": "AAAA"
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn test_passkey_login_start_without_passkeys_is_rejected() {
+    let base = spawn_test_app().await;
+    register_full(&base, "pk_login", "pk_login@example.com").await;
+    let client = reqwest::Client::new();
+
+    // Registered user but no passkeys → uniform rejection.
+    let resp = client
+        .post(format!("{}/api/v1/users/passkeys/login/start", base))
+        .json(&serde_json::json!({"username": "pk_login"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // Unknown user → same rejection (no enumeration signal in the status).
+    let ghost = client
+        .post(format!("{}/api/v1/users/passkeys/login/start", base))
+        .json(&serde_json::json!({"username": "does_not_exist"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ghost.status(), 400);
+}
+
+#[tokio::test]
+async fn test_passkey_login_finish_requires_challenge_cookie() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/v1/users/passkeys/login/finish", base))
+        .json(&serde_json::json!({
+            "id": "AAAA",
+            "rawId": "AAAA",
+            "type": "public-key",
+            "response": {
+                "authenticatorData": "AAAA",
+                "clientDataJSON": "AAAA",
+                "signature": "AAAA"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
