@@ -11,8 +11,8 @@ sequenceDiagram
     API->>Core: fork_repo(db, user_id, owner, repo_name, target_org?)
     Core->>Ops: find_by_owner_and_name(db, owner_id, repo_name)
     Ops-->>Core: source_repo
-    Core->>Core: 校验: source_repo 存在 && 非 private || can_read
-    Core->>Core: 检查目标 namespace 下同名 repo 是否冲突
+    Core->>Core: validate: source_repo exists && (not private || can_read)
+    Core->>Core: check target namespace for a name collision
     Core->>Git: git clone --bare source_path target_path
     Core->>Ops: create(db, RepoActiveModel { origin_repo_id: source_repo.id, ... })
     Ops-->>Core: forked_repo
