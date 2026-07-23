@@ -181,7 +181,13 @@ impl GitHubClient {
             header::HeaderValue::from_static("2022-11-28"),
         );
 
-        let client = Client::builder()
+        // Reuse the shared outbound builder so the import client inherits the
+        // request + connect timeout — a slow/hanging import source (e.g. a
+        // self-hosted GHES `base_url`) can't pin the import worker forever.
+        // Redirects keep reqwest's default (API hosts legitimately 3xx on a
+        // renamed repo); no `guard_outbound_url` — a private-IP GHES base_url is
+        // a legitimate admin-configured target.
+        let client = crate::net::outbound_client_builder()
             .default_headers(headers)
             .user_agent("ForgeKeep/0.1")
             .build()

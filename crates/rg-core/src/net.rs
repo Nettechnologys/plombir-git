@@ -28,6 +28,32 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+/// Default request timeout for outbound HTTP (whole request, including body).
+const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default connect timeout for outbound HTTP (TCP + TLS handshake only).
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A `reqwest::ClientBuilder` pre-seeded with the outbound `timeout` +
+/// `connect_timeout`, so a slow/hanging peer can't pin a task forever.
+///
+/// This is the shared floor for **any** long-lived outbound client. It sets
+/// only the timeouts — no redirect policy, no user-agent, no default headers —
+/// so each caller layers on what it needs:
+///
+/// - [`outbound_client`] adds `redirect(Policy::none())` + a webhook UA for
+///   user-supplied webhook/mirror targets (paired with [`guard_outbound_url`]).
+/// - The import clients (`GitHubClient` / `GitLabClient`) add their per-instance
+///   auth headers (`Bearer` / `PRIVATE-TOKEN`) + UA. They deliberately keep the
+///   reqwest **default** redirect policy — API hosts legitimately 3xx (e.g. a
+///   renamed repo) — and do **not** run `guard_outbound_url`, because a
+///   self-hosted GitHub Enterprise / GitLab `base_url` on a private IP is a
+///   legitimate admin-configured target, exactly like an internal SSO IdP.
+pub fn outbound_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(OUTBOUND_TIMEOUT)
+        .connect_timeout(OUTBOUND_CONNECT_TIMEOUT)
+}
+
 /// Shared, SSRF-hardened outbound HTTP client for user-supplied targets.
 ///
 /// Built once and reused: `timeout` + `connect_timeout` bound every request,
@@ -35,9 +61,7 @@ use anyhow::{Context, Result};
 pub fn outbound_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
+        outbound_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("ForgeKeep-Webhook/0.1")
             .build()
