@@ -9,6 +9,7 @@ export interface ReleaseAsset {
   download_count: number;
   uploader_id: number;
   created_at: string;
+  sha256: string | null;
 }
 
 function contentDispositionAttachment(filename: string): string {

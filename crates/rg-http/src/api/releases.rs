@@ -630,17 +630,23 @@ pub async fn download_asset(
     {
         Ok((asset, data)) => {
             let content_disposition = format!("attachment; filename=\"{}\"", asset.filename);
-            let content_length = asset.size.to_string();
-            let response = (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, asset.content_type.as_str()),
-                    (header::CONTENT_DISPOSITION, content_disposition.as_str()),
-                    (header::CONTENT_LENGTH, content_length.as_str()),
-                ],
-                data,
-            );
-            response.into_response()
+            let mut resp_headers = HeaderMap::new();
+            if let Ok(v) = header::HeaderValue::from_str(&asset.content_type) {
+                resp_headers.insert(header::CONTENT_TYPE, v);
+            }
+            if let Ok(v) = header::HeaderValue::from_str(&content_disposition) {
+                resp_headers.insert(header::CONTENT_DISPOSITION, v);
+            }
+            if let Ok(v) = header::HeaderValue::from_str(&asset.size.to_string()) {
+                resp_headers.insert(header::CONTENT_LENGTH, v);
+            }
+            // Let clients verify the payload against the digest recorded at upload.
+            if let Some(sha) = asset.sha256.as_deref() {
+                if let Ok(v) = header::HeaderValue::from_str(sha) {
+                    resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
+                }
+            }
+            (StatusCode::OK, resp_headers, data).into_response()
         }
         Err(e) => AppError::not_found(e).into_response(),
     }

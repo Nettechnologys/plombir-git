@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use rg_db::{
@@ -166,6 +167,10 @@ pub async fn upload_asset(
     // Verify release exists and get repo info
     let _release = get_release(db, release_id).await?;
 
+    // Content digest for integrity + provenance, recorded at upload time and
+    // re-checked on every download. Mirrors the package-registry idiom.
+    let sha256 = hex::encode(Sha256::digest(data));
+
     // Create DB record first to get asset ID
     let model = AssetActiveModel {
         release_id: Set(release_id),
@@ -175,6 +180,7 @@ pub async fn upload_asset(
         download_count: Set(0),
         uploader_id: Set(uploader_id),
         created_at: Set(Utc::now()),
+        sha256: Set(Some(sha256)),
         ..Default::default()
     };
     let asset = rg_db::ops::release_ops::create_asset(db, model).await?;
@@ -219,6 +225,18 @@ pub async fn download_asset(
         }
         Err(error) => return Err(error).context("failed to read release asset"),
     };
+
+    // Integrity check: the stored bytes must still hash to the digest recorded
+    // at upload. Legacy assets (uploaded before digest tracking) carry no
+    // recorded hash and are served without this guard.
+    if let Some(expected) = asset.sha256.as_deref() {
+        let actual = hex::encode(Sha256::digest(&data));
+        if actual != expected {
+            anyhow::bail!(
+                "asset integrity check failed: expected sha256 {expected}, got {actual}"
+            );
+        }
+    }
 
     Ok((asset, data))
 }

@@ -211,6 +211,16 @@ async fn release_asset_round_trip_uses_blob_storage() {
     let asset: serde_json::Value = uploaded.json().await.unwrap();
     let asset_id = asset["id"].as_i64().unwrap();
 
+    // Upload records a SHA-256 digest of the bytes.
+    let sha256 = asset["sha256"].as_str().expect("asset carries sha256");
+    assert_eq!(sha256.len(), 64, "sha256 is 64 hex chars");
+    assert!(sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+    // "release asset" → known SHA-256.
+    assert_eq!(
+        sha256,
+        "e6abe9df7db8513616674b02b5edb26c37bf3b2f81daeec1e3c6fc8c9a802850",
+    );
+
     let downloaded = client
         .get(format!(
             "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/download"
@@ -220,6 +230,14 @@ async fn release_asset_round_trip_uses_blob_storage() {
         .await
         .unwrap();
     assert_eq!(downloaded.status(), 200);
+    // Download echoes the digest so clients can verify the payload.
+    assert_eq!(
+        downloaded
+            .headers()
+            .get("x-checksum-sha256")
+            .and_then(|v| v.to_str().ok()),
+        Some(sha256),
+    );
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), b"release asset");
 
     let deleted = client
