@@ -432,23 +432,20 @@ pub struct AccessTokenResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Generate a cryptographically strong Personal Access Token.
+///
+/// 32 random bytes (256 bits) drawn from the OS CSPRNG (`OsRng`), hex-encoded
+/// and prefixed with `ifp_` so the token type stays recognisable (GitHub
+/// `ghp_` style) and scannable by secret-detection tools. Every byte of
+/// entropy comes from the CSPRNG — there is deliberately no timestamp- or
+/// PID-derived fallback that could make a token predictable. Mirrors
+/// `generate_jwt_secret` in `rg-cli`. If the OS entropy source is unavailable
+/// `fill_bytes` panics rather than emitting a guessable token.
 fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let entropy: u128 = {
-        let mut buf = [0u8; 16];
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = std::io::Read::read_exact(&mut f, &mut buf);
-            u128::from_le_bytes(buf)
-        } else {
-            let pid = std::process::id() as u128;
-            (nanos << 32) | pid
-        }
-    };
-    format!("ifp_{:016x}{:032x}", nanos, entropy)
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("ifp_{}", hex::encode(bytes))
 }
 
 fn hash_token(token: &str) -> String {
@@ -708,5 +705,46 @@ pub async fn reset_password(
                 .into_response()
         }
         Err(e) => AppError::bad_request(e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::{generate_token, hash_token};
+    use std::collections::HashSet;
+
+    #[test]
+    fn pat_has_expected_prefix_and_length() {
+        let token = generate_token();
+        // `ifp_` (4) + 32 bytes as hex (64) = 68 chars.
+        assert!(token.starts_with("ifp_"), "PAT must carry the ifp_ prefix: {token}");
+        assert_eq!(token.len(), 68, "unexpected PAT length: {token}");
+    }
+
+    #[test]
+    fn pat_body_is_256_bits_of_hex_entropy() {
+        let token = generate_token();
+        let body = token.strip_prefix("ifp_").expect("prefix");
+        assert!(
+            body.chars().all(|c| c.is_ascii_hexdigit()),
+            "PAT body must be pure hex: {body}"
+        );
+        let bytes = hex::decode(body).expect("PAT body must be valid hex");
+        assert_eq!(bytes.len(), 32, "PAT must carry 32 bytes (256 bits) of entropy");
+    }
+
+    #[test]
+    fn pat_is_unique_across_many_calls() {
+        // A CSPRNG token — not a timestamp/PID — must never collide, even when
+        // minted in a tight loop within the same process/instant.
+        let mut seen = HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(generate_token()), "PAT collision — entropy too weak");
+        }
+    }
+
+    #[test]
+    fn distinct_tokens_hash_distinctly() {
+        assert_ne!(hash_token(&generate_token()), hash_token(&generate_token()));
     }
 }
