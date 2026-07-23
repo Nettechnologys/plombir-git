@@ -60,6 +60,7 @@ pub fn build_test_app_state(
         repo_root: Arc::new(repo_root),
         db,
         jwt_secret: Arc::new("test-secret-key".to_string()),
+        external_webhook_secret: None,
         docker_enabled: false,
         external_runners: false,
         allow_host_runner: false,

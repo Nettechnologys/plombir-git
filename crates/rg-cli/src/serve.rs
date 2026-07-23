@@ -34,6 +34,8 @@ struct ConfigFile {
     audit: AuditConfig,
     #[serde(default)]
     timeouts: TimeoutConfig,
+    #[serde(default)]
+    webhooks: WebhooksConfig,
     /// Server external URL (e.g., "https://git.example.com"). Used for SSO callbacks.
     #[serde(default)]
     external_url: Option<String>,
@@ -119,6 +121,16 @@ struct AuditConfig {
     archive_after_days: Option<i64>,
     interval_minutes: Option<u64>,
     batch_size: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[allow(dead_code)]
+struct WebhooksConfig {
+    /// Shared secret for verifying HMAC-SHA256 signatures on *inbound* external
+    /// webhooks (`/webhooks/external/*`). Unset = signature checking disabled
+    /// (endpoints rely on JWT/PAT auth alone). Also settable via the
+    /// `FORGEKEEP_EXTERNAL_WEBHOOK_SECRET` environment variable, which wins.
+    external_secret: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -379,6 +391,17 @@ pub(crate) async fn run_serve(
         .and_then(|c| c.external_url.clone())
         .or_else(|| cfg.as_ref().and_then(|c| c.server.external_url.clone()));
 
+    // Inbound-webhook HMAC secret: env var wins, fallback to config file.
+    // Unset ⇒ signature verification stays off (endpoints are auth-gated).
+    let resolved_external_webhook_secret = rg_core::env_compat::env_var_compat(
+        "FORGEKEEP_EXTERNAL_WEBHOOK_SECRET",
+        "IRONFORGE_EXTERNAL_WEBHOOK_SECRET",
+    )
+    .or_else(|| cfg.as_ref().and_then(|c| c.webhooks.external_secret.clone()));
+    if resolved_external_webhook_secret.is_some() {
+        tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
+    }
+
     // Timeouts from config (with defaults)
     let resolved_job_timeout = cfg.as_ref().map(|c| c.timeouts.job_secs).unwrap_or(3600);
     let resolved_git_timeout = cfg
@@ -551,6 +574,7 @@ pub(crate) async fn run_serve(
         repo_root: repo_root.clone(),
         db: db.clone(),
         jwt_secret: resolved_jwt_secret.clone(),
+        external_webhook_secret: resolved_external_webhook_secret,
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,

@@ -13,6 +13,15 @@ url = "sqlite://./forgekeep.db?mode=rwc"
 [auth]
 jwt_secret = "change-me-in-production"
 
+[webhooks]
+# Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
+# external webhooks (POST /api/v1/repos/{owner}/{name}/webhooks/external/*).
+# When set, the request must carry an `X-Hub-Signature-256: sha256=<hex>` header
+# whose HMAC over the raw body matches (constant-time check) — defense-in-depth
+# on top of the JWT/PAT the endpoint already requires. Leave unset to keep the
+# endpoint auth-only. The FORGEKEEP_EXTERNAL_WEBHOOK_SECRET env var overrides this.
+# external_secret = "change-me-shared-with-your-ci"
+
 [ci]
 docker = false
 # Run imageless CI jobs as a shell directly on the host. Keep false on shared or

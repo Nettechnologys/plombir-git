@@ -46,6 +46,11 @@ pub struct AppState {
     pub repo_root: Arc<PathBuf>,
     pub db: DatabaseConnection,
     pub jwt_secret: Arc<String>,
+    /// Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
+    /// external webhooks (defense-in-depth on `/webhooks/external/*`). `None`
+    /// (the default) disables signature checking; the endpoints then rely on
+    /// JWT/PAT auth alone.
+    pub external_webhook_secret: Option<Arc<String>>,
     pub docker_enabled: bool,
     pub external_runners: bool,
     /// Whether imageless CI jobs may run as a shell on the host (default false).
@@ -75,6 +80,9 @@ pub struct HttpServerConfig {
     pub db: DatabaseConnection,
     /// JWT secret key.
     pub jwt_secret: String,
+    /// Optional shared secret for verifying HMAC-SHA256 signatures on inbound
+    /// external webhooks. `None` disables signature checking (auth-only).
+    pub external_webhook_secret: Option<String>,
     /// Whether Docker runner is enabled for CI jobs.
     pub docker_enabled: bool,
     /// Whether to use external runners instead of embedded runner for CI.
@@ -179,6 +187,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         repo_root: Arc::new(config.repo_root),
         db: config.db,
         jwt_secret: Arc::new(config.jwt_secret),
+        external_webhook_secret: config.external_webhook_secret.map(Arc::new),
         docker_enabled: config.docker_enabled,
         external_runners: config.external_runners,
         allow_host_runner: config.allow_host_runner,

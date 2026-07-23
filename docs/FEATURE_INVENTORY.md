@@ -55,7 +55,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | HMAC-SHA256 подпись исходящих (`X-Hub-Signature-256`) | ✅ 🔒 | `rg-core/src/webhook/service.rs:188` | GitHub-совместимо |
 | Timeout на исходящем HTTP-клиенте | ✅ 🔒 | `rg-core/src/net.rs`, `auth/sso.rs` | общий `outbound_client()` с `timeout(30s)` + `connect_timeout(10s)`; все 7 SSO/OIDC call-site'ов идут через него |
 | Запрет редиректов / SSRF-защита (private/loopback IP) | ✅ 🔒 | `rg-core/src/net.rs`, `webhook/service.rs`, `auth/sso.rs` | `redirect(Policy::none())` + `guard_outbound_url()` (резолв хоста, reject private/loopback/link-local/ULA/CGNAT + non-http(s)). SSO-outbound: timeout + redirect-ban применены; private-IP guard сознательно НЕ навешен (admin-config / OIDC-discovery endpoint'ы, self-hosted internal IdP — легитимен). Import github/gitlab + rg-mcp клиенты без timeout — см. cards |
-| Верификация HMAC на входящих вебхуках | 🟡 🔒 | `rg-http/src/api/webhooks_external.rs:60` | эндпоинт за JWT/PAT; подпись — defense-in-depth → см. card |
+| Верификация HMAC на входящих вебхуках | ✅ 🔒 | `rg-http/src/api/webhooks_external.rs` | opt-in `[webhooks].external_secret` / `FORGEKEEP_EXTERNAL_WEBHOOK_SECRET`; при заданном секрете `X-Hub-Signature-256` над сырым телом проверяется constant-time (`hmac::verify_slice`), формат `sha256=<hex>` симметричен исходящим; не задан → auth-only как раньше |
 
 ## 5. Robustness / эксплуатация
 
