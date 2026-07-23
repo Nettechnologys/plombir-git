@@ -104,7 +104,7 @@ const REGRESSION_REPORT_FORMAT = (() => {
     return requested;
   }
   if (requested) {
-    console.warn(`⚠️  不支持的回归报告格式: ${requested}，回退为 json`);
+    console.warn(`⚠️  Unsupported regression report format: ${requested}, falling back to json`);
   }
 
   return 'json';
@@ -219,12 +219,12 @@ function run(label, command, args, options = {}) {
   });
 
   if (result.error) {
-    console.error(`❌ ${label} 启动失败: ${result.error.message}`);
+    console.error(`❌ ${label} failed to start: ${result.error.message}`);
     return false;
   }
 
   if (result.status !== 0) {
-    console.error(`❌ ${label} 失败（exit ${result.status}）`);
+    console.error(`❌ ${label} failed (exit ${result.status})`);
     return false;
   }
 
@@ -275,12 +275,12 @@ async function runWithRetry(label, command, args, options = {}) {
     }
 
     if (attempt === maxRetries) {
-      console.error(`❌ ${label} 超过重试上限（${maxRetries}）`);
+      console.error(`❌ ${label} exceeded the retry limit (${maxRetries})`);
       return false;
     }
 
     const delay = getRetryDelay(attempt, delayConfig);
-    console.warn(`⚠️ ${label} 失败，${delay}ms 后重试（第 ${currentAttempt} 次）`);
+    console.warn(`⚠️ ${label} failed, retrying in ${delay}ms (attempt ${currentAttempt})`);
     if (delay > 0) {
       await sleep(delay);
     }
@@ -346,10 +346,10 @@ function saveRegressionReport(summary) {
         : JSON.stringify(payload, null, 2);
     writeFileSync(REGRESSION_REPORT_FILE, report, 'utf8');
     console.log(
-      `✅ 已写入${REGRESSION_REPORT_FORMAT.toUpperCase()}回归报告: ${REGRESSION_REPORT_FILE}`,
+      `✅ Wrote ${REGRESSION_REPORT_FORMAT.toUpperCase()} regression report: ${REGRESSION_REPORT_FILE}`,
     );
   } catch (error) {
-    console.error(`❌ 写入回归报告失败: ${error.message}`);
+    console.error(`❌ Failed to write regression report: ${error.message}`);
   }
 }
 
@@ -366,61 +366,61 @@ function buildMarkdownReport(payload) {
     .map((step, index) => {
       const attempts = (step.attempts || [])
         .map((attempt) => `${attempt.attempt}:${attempt.status} (${attempt.durationMs}ms)`)
-        .join('，');
-      return `| ${index + 1} | ${escapeMarkdown(formatMarkdownRows(step.label))} | ${escapeMarkdown(step.scope)} | ${escapeMarkdown(step.status)} | ${step.actualRetries}/${step.configuredRetries} | ${step.durationMs ?? 0} | ${escapeMarkdown(formatMarkdownRows(step.timeoutMs))} | ${escapeMarkdown(step.command)} | ${escapeMarkdown(attempts || '无')} |`;
+        .join(', ');
+      return `| ${index + 1} | ${escapeMarkdown(formatMarkdownRows(step.label))} | ${escapeMarkdown(step.scope)} | ${escapeMarkdown(step.status)} | ${step.actualRetries}/${step.configuredRetries} | ${step.durationMs ?? 0} | ${escapeMarkdown(formatMarkdownRows(step.timeoutMs))} | ${escapeMarkdown(step.command)} | ${escapeMarkdown(attempts || 'none')} |`;
     })
     .join('\n');
 
   const failedSteps = payload.steps.filter((step) => step.status !== 'passed');
   const failedItems = failedSteps
-    .map((step) => `- ${escapeMarkdown(step.label)}（scope: ${escapeMarkdown(step.scope)}）`)
+    .map((step) => `- ${escapeMarkdown(step.label)} (scope: ${escapeMarkdown(step.scope)})`)
     .join('\n');
 
-  return `# 全量接口回归报告
+  return `# Full Interface Regression Report
 
-## 生成信息
+## Generation Info
 
-- 生成时间：${payload.generatedAt}
-- 状态：${payload.summary.status}
-- 开始：${payload.summary.startedAt}
-- 结束：${payload.summary.endedAt}
+- Generated at: ${payload.generatedAt}
+- Status: ${payload.summary.status}
+- Started: ${payload.summary.startedAt}
+- Ended: ${payload.summary.endedAt}
 
-## 汇总
+## Summary
 
-- total：${payload.summary.total}
-- passed：${payload.summary.passed}
-- failed：${payload.summary.failed}
-- executed：${payload.summary.executed}
-- skipped：${payload.summary.skipped}
+- total: ${payload.summary.total}
+- passed: ${payload.summary.passed}
+- failed: ${payload.summary.failed}
+- executed: ${payload.summary.executed}
+- skipped: ${payload.summary.skipped}
 
-## 配置
+## Configuration
 
-### 后端与前端（超时）
+### Backend and Frontend (Timeouts)
 
 ${Object.entries(payload.config.timeouts)
-      .map(([key, value]) => `- ${escapeMarkdown(key)}：${escapeMarkdown(formatMarkdownRows(value))}`)
+      .map(([key, value]) => `- ${escapeMarkdown(key)}: ${escapeMarkdown(formatMarkdownRows(value))}`)
       .join('\n')}
 
-### 重试参数
+### Retry Parameters
 
 ${Object.entries(payload.config.retries)
-      .map(([key, value]) => `- ${escapeMarkdown(key)}：${escapeMarkdown(formatMarkdownRows(value))}`)
+      .map(([key, value]) => `- ${escapeMarkdown(key)}: ${escapeMarkdown(formatMarkdownRows(value))}`)
       .join('\n')}
 
-### 后端连接
+### Backend Connection
 
-- BACKEND_URL：${escapeMarkdown(payload.config.backendUrl)}
-- FRONTEND_CANDIDATES：${escapeMarkdown(payload.config.frontendCandidates.join(', '))}
+- BACKEND_URL: ${escapeMarkdown(payload.config.backendUrl)}
+- FRONTEND_CANDIDATES: ${escapeMarkdown(payload.config.frontendCandidates.join(', '))}
 
-## 步骤明细
+## Step Details
 
-| # | 步骤 | scope | 状态 | 实际/配置重试 | 耗时(ms) | 超时(ms) | 命令 | 重试明细 |
+| # | Step | scope | Status | Actual/Configured retries | Duration(ms) | Timeout(ms) | Command | Retry details |
 | - | - | - | - | - | - | - | - |
-${stepRows || '| - | 暂无执行步骤 | - | skipped | 0/0 | 0 | - | - | - |'}
+${stepRows || '| - | No steps executed | - | skipped | 0/0 | 0 | - | - | - |'}
 
-## 失败清单
+## Failed Steps
 
-${failedItems || '- 无失败步骤'}
+${failedItems || '- No failed steps'}
 
 `;
 }
@@ -430,68 +430,68 @@ async function main() {
   const allOk = [];
   const invalidScope = FULL_REGRESSION_ONLY && !['backend', 'frontend', 'runtime', 'all'].includes(FULL_REGRESSION_ONLY);
   if (invalidScope) {
-    console.error(`❌ FULL_REGRESSION_ONLY 不支持: ${FULL_REGRESSION_ONLY}`);
-    console.error('支持: backend | frontend | runtime | all');
+    console.error(`❌ FULL_REGRESSION_ONLY not supported: ${FULL_REGRESSION_ONLY}`);
+    console.error('Supported: backend | frontend | runtime | all');
     process.exit(1);
   }
 
-  console.log('--- 回归超时配置 ---');
-  console.log(`默认(全链路): ${EFFECTIVE_TIMEOUTS.all}`);
-  console.log(`后端: ${EFFECTIVE_TIMEOUTS.backend}`);
-  console.log(`前端静态: ${EFFECTIVE_TIMEOUTS.frontend}`);
-  console.log(`运行态: ${EFFECTIVE_TIMEOUTS.runtime}`);
-  console.log(`后端 rg-http: ${EFFECTIVE_TIMEOUTS.backendRgHttp}`);
-  console.log(`后端 workspace: ${EFFECTIVE_TIMEOUTS.backendWorkspace}`);
-  console.log(`前端 check: ${EFFECTIVE_TIMEOUTS.frontendCheck}`);
-  console.log(`前端 build: ${EFFECTIVE_TIMEOUTS.frontendBuild}`);
-  console.log(`openapi 冒烟: ${EFFECTIVE_TIMEOUTS.openapiSmoke}`);
-  console.log(`参数对齐: ${EFFECTIVE_TIMEOUTS.clientContract}`);
-  console.log(`前后端联调冒烟: ${EFFECTIVE_TIMEOUTS.frontendBackendSmoke}`);
-  console.log(`页面 console 冒烟: ${EFFECTIVE_TIMEOUTS.consoleSmoke}`);
-  console.log(`admin 浏览器冒烟: ${EFFECTIVE_TIMEOUTS.adminBrowserSmoke}`);
-  console.log('--- 回归重试配置 ---');
-  console.log(`默认重试次数: ${EFFECTIVE_RETRIES.all}`);
-  console.log(`后端: ${EFFECTIVE_RETRIES.backend}`);
-  console.log(`前端静态: ${EFFECTIVE_RETRIES.frontend}`);
-  console.log(`运行态: ${EFFECTIVE_RETRIES.runtime}`);
-  console.log(`后端 rg-http: ${EFFECTIVE_RETRIES.backendRgHttp}`);
-  console.log(`后端 workspace: ${EFFECTIVE_RETRIES.backendWorkspace}`);
-  console.log(`前端 check: ${EFFECTIVE_RETRIES.frontendCheck}`);
-  console.log(`前端 build: ${EFFECTIVE_RETRIES.frontendBuild}`);
-  console.log(`openapi 冒烟: ${EFFECTIVE_RETRIES.openapiSmoke}`);
-  console.log(`参数对齐: ${EFFECTIVE_RETRIES.clientContract}`);
-  console.log(`前后端联调冒烟: ${EFFECTIVE_RETRIES.frontendBackendSmoke}`);
-  console.log(`页面 console 冒烟: ${EFFECTIVE_RETRIES.consoleSmoke}`);
-  console.log(`admin 浏览器冒烟: ${EFFECTIVE_RETRIES.adminBrowserSmoke}`);
-  console.log(`后端 rg-http 重试退避: ${EFFECTIVE_RETRIES.backendRgHttpBackoff}`);
-  console.log(`后端 workspace 重试退避: ${EFFECTIVE_RETRIES.backendWorkspaceBackoff}`);
-  console.log(`前端 check 重试退避: ${EFFECTIVE_RETRIES.frontendCheckBackoff}`);
-  console.log(`前端 build 重试退避: ${EFFECTIVE_RETRIES.frontendBuildBackoff}`);
-  console.log(`openapi 冒烟重试退避: ${EFFECTIVE_RETRIES.openapiSmokeBackoff}`);
-  console.log(`参数对齐重试退避: ${EFFECTIVE_RETRIES.clientContractBackoff}`);
-  console.log(`前后端联调冒烟重试退避: ${EFFECTIVE_RETRIES.frontendBackendSmokeBackoff}`);
-  console.log(`页面 console 冒烟重试退避: ${EFFECTIVE_RETRIES.consoleSmokeBackoff}`);
-  console.log(`后端 rg-http 重试上限间隔: ${EFFECTIVE_RETRIES.backendRgHttpMaxDelay}ms`);
-  console.log(`后端 workspace 重试上限间隔: ${EFFECTIVE_RETRIES.backendWorkspaceMaxDelay}ms`);
-  console.log(`前端 check 重试上限间隔: ${EFFECTIVE_RETRIES.frontendCheckMaxDelay}ms`);
-  console.log(`前端 build 重试上限间隔: ${EFFECTIVE_RETRIES.frontendBuildMaxDelay}ms`);
-  console.log(`openapi 冒烟重试上限间隔: ${EFFECTIVE_RETRIES.openapiSmokeMaxDelay}ms`);
-  console.log(`参数对齐重试上限间隔: ${EFFECTIVE_RETRIES.clientContractMaxDelay}ms`);
-  console.log(`前后端联调冒烟重试上限间隔: ${EFFECTIVE_RETRIES.frontendBackendSmokeMaxDelay}ms`);
-  console.log(`页面 console 冒烟重试上限间隔: ${EFFECTIVE_RETRIES.consoleSmokeMaxDelay}ms`);
-  console.log(`admin 浏览器冒烟重试上限间隔: ${EFFECTIVE_RETRIES.adminBrowserSmokeMaxDelay}ms`);
-  console.log(`重试间隔: ${REGRESSION_RETRY_DELAY_MS}ms`);
-  console.log(`重试退避: ${REGRESSION_RETRY_BACKOFF_MS}`);
-  console.log(`重试上限间隔: ${REGRESSION_RETRY_MAX_DELAY_MS}ms`);
-  console.log(`回归报告格式: ${REGRESSION_REPORT_FORMAT}`);
+  console.log('--- Regression timeout config ---');
+  console.log(`Default (full pipeline): ${EFFECTIVE_TIMEOUTS.all}`);
+  console.log(`Backend: ${EFFECTIVE_TIMEOUTS.backend}`);
+  console.log(`Frontend static: ${EFFECTIVE_TIMEOUTS.frontend}`);
+  console.log(`Runtime: ${EFFECTIVE_TIMEOUTS.runtime}`);
+  console.log(`Backend rg-http: ${EFFECTIVE_TIMEOUTS.backendRgHttp}`);
+  console.log(`Backend workspace: ${EFFECTIVE_TIMEOUTS.backendWorkspace}`);
+  console.log(`Frontend check: ${EFFECTIVE_TIMEOUTS.frontendCheck}`);
+  console.log(`Frontend build: ${EFFECTIVE_TIMEOUTS.frontendBuild}`);
+  console.log(`openapi smoke: ${EFFECTIVE_TIMEOUTS.openapiSmoke}`);
+  console.log(`Parameter alignment: ${EFFECTIVE_TIMEOUTS.clientContract}`);
+  console.log(`Frontend/backend integration smoke: ${EFFECTIVE_TIMEOUTS.frontendBackendSmoke}`);
+  console.log(`Page console smoke: ${EFFECTIVE_TIMEOUTS.consoleSmoke}`);
+  console.log(`admin browser smoke: ${EFFECTIVE_TIMEOUTS.adminBrowserSmoke}`);
+  console.log('--- Regression retry config ---');
+  console.log(`Default retry count: ${EFFECTIVE_RETRIES.all}`);
+  console.log(`Backend: ${EFFECTIVE_RETRIES.backend}`);
+  console.log(`Frontend static: ${EFFECTIVE_RETRIES.frontend}`);
+  console.log(`Runtime: ${EFFECTIVE_RETRIES.runtime}`);
+  console.log(`Backend rg-http: ${EFFECTIVE_RETRIES.backendRgHttp}`);
+  console.log(`Backend workspace: ${EFFECTIVE_RETRIES.backendWorkspace}`);
+  console.log(`Frontend check: ${EFFECTIVE_RETRIES.frontendCheck}`);
+  console.log(`Frontend build: ${EFFECTIVE_RETRIES.frontendBuild}`);
+  console.log(`openapi smoke: ${EFFECTIVE_RETRIES.openapiSmoke}`);
+  console.log(`Parameter alignment: ${EFFECTIVE_RETRIES.clientContract}`);
+  console.log(`Frontend/backend integration smoke: ${EFFECTIVE_RETRIES.frontendBackendSmoke}`);
+  console.log(`Page console smoke: ${EFFECTIVE_RETRIES.consoleSmoke}`);
+  console.log(`admin browser smoke: ${EFFECTIVE_RETRIES.adminBrowserSmoke}`);
+  console.log(`Backend rg-http retry backoff: ${EFFECTIVE_RETRIES.backendRgHttpBackoff}`);
+  console.log(`Backend workspace retry backoff: ${EFFECTIVE_RETRIES.backendWorkspaceBackoff}`);
+  console.log(`Frontend check retry backoff: ${EFFECTIVE_RETRIES.frontendCheckBackoff}`);
+  console.log(`Frontend build retry backoff: ${EFFECTIVE_RETRIES.frontendBuildBackoff}`);
+  console.log(`openapi smoke retry backoff: ${EFFECTIVE_RETRIES.openapiSmokeBackoff}`);
+  console.log(`Parameter alignment retry backoff: ${EFFECTIVE_RETRIES.clientContractBackoff}`);
+  console.log(`Frontend/backend integration smoke retry backoff: ${EFFECTIVE_RETRIES.frontendBackendSmokeBackoff}`);
+  console.log(`Page console smoke retry backoff: ${EFFECTIVE_RETRIES.consoleSmokeBackoff}`);
+  console.log(`Backend rg-http max retry interval: ${EFFECTIVE_RETRIES.backendRgHttpMaxDelay}ms`);
+  console.log(`Backend workspace max retry interval: ${EFFECTIVE_RETRIES.backendWorkspaceMaxDelay}ms`);
+  console.log(`Frontend check max retry interval: ${EFFECTIVE_RETRIES.frontendCheckMaxDelay}ms`);
+  console.log(`Frontend build max retry interval: ${EFFECTIVE_RETRIES.frontendBuildMaxDelay}ms`);
+  console.log(`openapi smoke max retry interval: ${EFFECTIVE_RETRIES.openapiSmokeMaxDelay}ms`);
+  console.log(`Parameter alignment max retry interval: ${EFFECTIVE_RETRIES.clientContractMaxDelay}ms`);
+  console.log(`Frontend/backend integration smoke max retry interval: ${EFFECTIVE_RETRIES.frontendBackendSmokeMaxDelay}ms`);
+  console.log(`Page console smoke max retry interval: ${EFFECTIVE_RETRIES.consoleSmokeMaxDelay}ms`);
+  console.log(`admin browser smoke max retry interval: ${EFFECTIVE_RETRIES.adminBrowserSmokeMaxDelay}ms`);
+  console.log(`Retry interval: ${REGRESSION_RETRY_DELAY_MS}ms`);
+  console.log(`Retry backoff: ${REGRESSION_RETRY_BACKOFF_MS}`);
+  console.log(`Max retry interval: ${REGRESSION_RETRY_MAX_DELAY_MS}ms`);
+  console.log(`Regression report format: ${REGRESSION_REPORT_FORMAT}`);
 
   const runBackendTests = isScopeEnabled('backend');
   const runFrontendStatic = isScopeEnabled('frontend');
   const runRuntime = isScopeEnabled('runtime');
 
   if (runBackendTests && !SKIP_BACKEND_TESTS) {
-    console.log('=== 后端回归 ===');
-    allOk.push(await runWithRetry('cargo test (rg-http 全量接口测试)', 'cargo', ['test', '-p', 'rg-http', '--', '--nocapture'], {
+    console.log('=== Backend regression ===');
+    allOk.push(await runWithRetry('cargo test (rg-http full interface tests)', 'cargo', ['test', '-p', 'rg-http', '--', '--nocapture'], {
       scope: 'backend',
       retries: BACKEND_TEST_RG_HTTP_RETRIES,
       timeout: BACKEND_TEST_RG_HTTP_TIMEOUT_MS,
@@ -499,7 +499,7 @@ async function main() {
       retryBackoffMs: BACKEND_TEST_RG_HTTP_RETRY_BACKOFF_MS,
       retryMaxDelayMs: BACKEND_TEST_RG_HTTP_RETRY_MAX_DELAY_MS,
     }));
-    allOk.push(await runWithRetry('cargo test (workspace 核心回归)', 'cargo', ['test', '--workspace', '--', '--nocapture'], {
+    allOk.push(await runWithRetry('cargo test (workspace core regression)', 'cargo', ['test', '--workspace', '--', '--nocapture'], {
       scope: 'backend',
       retries: BACKEND_TEST_WORKSPACE_RETRIES,
       timeout: BACKEND_TEST_WORKSPACE_TIMEOUT_MS,
@@ -508,15 +508,15 @@ async function main() {
       retryMaxDelayMs: BACKEND_TEST_WORKSPACE_RETRY_MAX_DELAY_MS,
     }));
   } else {
-    console.log('=== 后端回归 ===');
+    console.log('=== Backend regression ===');
     if (SKIP_BACKEND_TESTS) {
-      console.log('⚠️ SKIP_BACKEND_TESTS=1，已跳过后端测试');
+      console.log('⚠️ SKIP_BACKEND_TESTS=1, backend tests skipped');
     } else if (FULL_REGRESSION_ONLY && !runBackendTests) {
-      console.log('⚠️ FULL_REGRESSION_ONLY 设置为', FULL_REGRESSION_ONLY, '，已跳过后端测试');
+      console.log('⚠️ FULL_REGRESSION_ONLY set to', FULL_REGRESSION_ONLY, ', backend tests skipped');
     }
   }
 
-  console.log('\n=== 前端静态回归 ===');
+  console.log('\n=== Frontend static regression ===');
   if (runFrontendStatic && !SKIP_FRONTEND_STATIC) {
     allOk.push(await runWithRetry('web npm run check', 'npm', ['run', 'check'], {
       cwd: `${ROOT}/web`,
@@ -537,7 +537,7 @@ async function main() {
       retryMaxDelayMs: FRONTEND_BUILD_RETRY_MAX_DELAY_MS,
     }));
   } else {
-    console.log('⚠️ SKIP_FRONTEND_STATIC=1 或 FULL_REGRESSION_ONLY 设置，已跳过 web npm run check/build');
+    console.log('⚠️ SKIP_FRONTEND_STATIC=1 or FULL_REGRESSION_ONLY set, skipped web npm run check/build');
   }
 
   const backendOk = await canPing(`${BACKEND_URL}/health`);
@@ -545,10 +545,10 @@ async function main() {
   const frontendOk = !!frontendUrl;
 
   if (backendOk && runRuntime && !SKIP_RUNTIME_SMOKES) {
-    console.log('\n=== 后端运行态接口回归（需后端可达）===');
+    console.log('\n=== Backend runtime interface regression (backend must be reachable) ===');
     allOk.push(
       await runWithRetry(
-        'openapi 路径级接口冒烟',
+        'openapi path-level interface smoke',
         'node',
         ['scripts/openapi-interface-smoke.mjs'],
         {
@@ -563,7 +563,7 @@ async function main() {
     );
     allOk.push(
       await runWithRetry(
-        '前后端参数对齐检查（前端 client vs OpenAPI）',
+        'Frontend/backend parameter alignment check (frontend client vs OpenAPI)',
         'node',
         ['scripts/api-client-contract-check.mjs'],
         {
@@ -579,10 +579,10 @@ async function main() {
   }
 
   if (backendOk && frontendOk && runRuntime && !SKIP_RUNTIME_SMOKES) {
-    console.log('\n=== 前端运行态接口回归（后端+前端均可达）===');
+    console.log('\n=== Frontend runtime interface regression (backend + frontend both reachable) ===');
     allOk.push(
       await runWithRetry(
-        '前后端联调基础可达性',
+        'Frontend/backend integration basic reachability',
         'node',
         ['scripts/frontend-backend-smoke.mjs'],
         {
@@ -597,7 +597,7 @@ async function main() {
     );
     allOk.push(
       await runWithRetry(
-        '前端关键页面运行时冒烟（console/network）',
+        'Frontend key-page runtime smoke (console/network)',
         'node',
         ['scripts/console-smoke.mjs'],
         {
@@ -612,7 +612,7 @@ async function main() {
     );
     allOk.push(
       await runWithRetry(
-        'admin 页面浏览器冒烟（登录态与未登录跳转）',
+        'admin page browser smoke (authenticated and unauthenticated redirects)',
         'node',
         ['scripts/browser-admin-smoke.mjs'],
         {
@@ -631,12 +631,12 @@ async function main() {
     );
   } else {
     if (SKIP_RUNTIME_SMOKES || (FULL_REGRESSION_ONLY && !runRuntime)) {
-      console.log('\n⚠️ SKIP_RUNTIME_SMOKES=1，已跳过运行态联调');
+      console.log('\n⚠️ SKIP_RUNTIME_SMOKES=1, runtime integration skipped');
     } else {
-      console.log('\n⚠️ 跳过部分运行态冒烟：');
-      if (!backendOk) console.log(`  - 后端未就绪：${BACKEND_URL}/health`);
-      if (!frontendOk) console.log(`  - 前端未就绪：${FRONTEND_URL_CANDIDATES.map((url) => `${url.replace(/\/$/, '')}/`).join(', ')}`);
-      console.log('  启动服务后可设置 BACKEND_URL/FRONTEND_URL 进行完整接口回归');
+      console.log('\n⚠️ Skipping some runtime smokes:');
+      if (!backendOk) console.log(`  - Backend not ready: ${BACKEND_URL}/health`);
+      if (!frontendOk) console.log(`  - Frontend not ready: ${FRONTEND_URL_CANDIDATES.map((url) => `${url.replace(/\/$/, '')}/`).join(', ')}`);
+      console.log('  Start the services, then set BACKEND_URL/FRONTEND_URL to run the full interface regression');
     }
   }
 
@@ -656,11 +656,11 @@ async function main() {
   });
 
   if (failed) {
-    console.error('\n❌ 全链路接口回归未通过');
+    console.error('\n❌ Full pipeline interface regression failed');
     process.exit(1);
   }
 
-  console.log('\n✅ 全链路接口回归通过');
+  console.log('\n✅ Full pipeline interface regression passed');
 }
 
 await main();

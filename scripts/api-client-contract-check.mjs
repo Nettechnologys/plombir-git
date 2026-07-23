@@ -55,7 +55,7 @@ function readLocalOpenApi() {
     const raw = readFileSync(OPENAPI_SPEC_FILE, 'utf8');
     return JSON.parse(raw);
   } catch (error) {
-    console.log(`❌ 读取本地 OpenAPI 文件失败: ${OPENAPI_SPEC_FILE} -> ${error?.message || String(error)}`);
+    console.log(`❌ Failed to read local OpenAPI file: ${OPENAPI_SPEC_FILE} -> ${error?.message || String(error)}`);
     return null;
   }
 }
@@ -424,7 +424,7 @@ function resolveClientSources(rawSources) {
     try {
       stat = statSync(abs);
     } catch (error) {
-      console.log(`⚠️  无法读取前端客户端路径: ${abs}`);
+      console.log(`⚠️  Unable to read frontend client path: ${abs}`);
       continue;
     }
 
@@ -436,7 +436,7 @@ function resolveClientSources(rawSources) {
     }
 
     if (!stat.isDirectory()) {
-      console.log(`⚠️  CLIENT_FILES 条目不是文件/目录: ${abs}`);
+      console.log(`⚠️  CLIENT_FILES entry is not a file/directory: ${abs}`);
       continue;
     }
 
@@ -452,7 +452,7 @@ function resolveClientSources(rawSources) {
   }
 
   if (files.length === 0) {
-    console.log(`⚠️  未在 ${rawSources || CLIENT_SOURCE} 发现可扫描的 API 客户端文件`);
+    console.log(`⚠️  No scannable API client files found in ${rawSources || CLIENT_SOURCE}`);
   }
 
   return files.sort();
@@ -466,12 +466,12 @@ function loadOpenApiFromRustSource() {
   try {
     rootStat = statSync(OPENAPI_SOURCE_DIR);
   } catch (error) {
-    console.log(`⚠️  OpenAPI 源码目录不可读: ${OPENAPI_SOURCE_DIR}`);
+    console.log(`⚠️  OpenAPI source directory is not readable: ${OPENAPI_SOURCE_DIR}`);
     return null;
   }
 
   if (!rootStat.isDirectory()) {
-    console.log(`⚠️  OpenAPI_SOURCE_DIR 需要是目录: ${OPENAPI_SOURCE_DIR}`);
+    console.log(`⚠️  OPENAPI_SOURCE_DIR must be a directory: ${OPENAPI_SOURCE_DIR}`);
     return null;
   }
 
@@ -498,7 +498,7 @@ function loadOpenApiFromRustSource() {
   walk(OPENAPI_SOURCE_DIR);
 
   if (files.length === 0) {
-    console.log(`⚠️  未在 ${OPENAPI_SOURCE_DIR} 发现 .rs 文件`);
+    console.log(`⚠️  No .rs files found in ${OPENAPI_SOURCE_DIR}`);
     return null;
   }
 
@@ -711,13 +711,13 @@ function inspectBodyAlignment(operation, bodyKeys) {
   const required = schema.required || [];
   if (required.length === 0) return { ok: true, details: null };
   if (!bodyKeys.present) {
-    return { ok: false, details: '未检测到 body，请确认请求体是否已上传' };
+    return { ok: false, details: 'No body detected; verify whether the request body is sent' };
   }
   if (bodyKeys.dynamic) return { ok: true, details: null };
 
   const missing = required.filter((name) => !bodyKeys.keys.includes(name));
   if (missing.length === 0) return { ok: true, details: null };
-  return { ok: false, details: `缺少 required body 字段: ${missing.join(',')}` };
+  return { ok: false, details: `Missing required body fields: ${missing.join(',')}` };
 }
 
 function inspectKnownBodyContracts(method, targetPath, bodyKeys) {
@@ -727,17 +727,17 @@ function inspectKnownBodyContracts(method, targetPath, bodyKeys) {
   if (!contract) return { ok: true, details: null };
 
   if (!bodyKeys.present) {
-    return { ok: false, details: `未检测到 body，接口需要字段: ${contract.required.join(', ')}` };
+    return { ok: false, details: `No body detected; the endpoint requires fields: ${contract.required.join(', ')}` };
   }
   if (bodyKeys.dynamic) return { ok: true, details: null };
 
   const missing = contract.required.filter((name) => !bodyKeys.keys.includes(name));
   const forbidden = contract.forbidden.filter((name) => bodyKeys.keys.includes(name));
   const details = [];
-  if (missing.length > 0) details.push(`缺少字段: ${missing.join(', ')}`);
-  if (forbidden.length > 0) details.push(`发送了后端不接收的旧字段: ${forbidden.join(', ')}`);
+  if (missing.length > 0) details.push(`Missing fields: ${missing.join(', ')}`);
+  if (forbidden.length > 0) details.push(`Sent legacy fields the backend does not accept: ${forbidden.join(', ')}`);
 
-  return details.length === 0 ? { ok: true, details: null } : { ok: false, details: details.join('；') };
+  return details.length === 0 ? { ok: true, details: null } : { ok: false, details: details.join('; ') };
 }
 
 function parseMethod(source, start) {
@@ -853,20 +853,20 @@ function inspectFrontendFlowContracts() {
     packageDetailSource = readFileSync(packageDetailFile, 'utf8');
   } catch (error) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 前端流程缺失: 无法读取包详情页（${packageDetailFile}）`);
+    ISSUE.lines.push(`❌ Frontend flow missing: unable to read package detail page (${packageDetailFile})`);
     return;
   }
 
   const loadPackageMatch = packageDetailSource.match(/async function loadPackage\(\)\s*\{([\s\S]*?)\n  \}/);
   if (!loadPackageMatch) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 前端流程缺失: 包详情页未找到 loadPackage()（来源: ${packageDetailFile}）`);
+    ISSUE.lines.push(`❌ Frontend flow missing: loadPackage() not found in package detail page (source: ${packageDetailFile})`);
     return;
   }
 
   if (!/\bpackages\.getVersions\(/.test(loadPackageMatch[1]) && !/\bloadVersions\(\)/.test(loadPackageMatch[1])) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 前端流程未加载版本: 包详情页 loadPackage() 没有调用版本列表接口（来源: ${packageDetailFile}）`);
+    ISSUE.lines.push(`❌ Frontend flow does not load versions: package detail page loadPackage() does not call the version-list endpoint (source: ${packageDetailFile})`);
   }
 
   let authStoreSource = '';
@@ -876,36 +876,36 @@ function inspectFrontendFlowContracts() {
     loginPageSource = readFileSync(loginPageFile, 'utf8');
   } catch (error) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 前端流程缺失: 无法读取登录/MFA 流程文件（${authStoreFile}, ${loginPageFile}）`);
+    ISSUE.lines.push(`❌ Frontend flow missing: unable to read login/MFA flow files (${authStoreFile}, ${loginPageFile})`);
     return;
   }
 
   const loginFunctionMatch = authStoreSource.match(/export async function login\(username: string, password: string\)\s*\{([\s\S]*?)\n\}/);
   if (!loginFunctionMatch) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 前端流程缺失: auth store 未找到 login(username, password)（来源: ${authStoreFile}）`);
+    ISSUE.lines.push(`❌ Frontend flow missing: login(username, password) not found in auth store (source: ${authStoreFile})`);
   } else {
     const loginBody = loginFunctionMatch[1];
     if (!/res\.mfa_required/.test(loginBody)) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`❌ 登录契约未处理 MFA: /users/login 可返回 mfa_required=true，但 auth store 未分支处理（来源: ${authStoreFile}）`);
+      ISSUE.lines.push(`❌ Login contract does not handle MFA: /users/login can return mfa_required=true, but the auth store has no branch for it (source: ${authStoreFile})`);
     }
     const mfaIndex = loginBody.indexOf('res.mfa_required');
     const tokenIndex = loginBody.indexOf('setToken(res.token)');
     if (mfaIndex === -1 || tokenIndex === -1 || tokenIndex < mfaIndex) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`❌ 登录契约会保存空 MFA token: setToken(res.token) 必须发生在 mfa_required 分支之后（来源: ${authStoreFile}）`);
+      ISSUE.lines.push(`❌ Login contract would store an empty MFA token: setToken(res.token) must occur after the mfa_required branch (source: ${authStoreFile})`);
     }
   }
 
   if (!/export async function verifyMfa\(/.test(authStoreSource) || !/\bauth\.verifyMfa\(/.test(authStoreSource)) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ MFA 流程缺失: auth store 未调用 /users/mfa/verify（来源: ${authStoreFile}）`);
+    ISSUE.lines.push(`❌ MFA flow missing: auth store does not call /users/mfa/verify (source: ${authStoreFile})`);
   }
 
   if (!/\bisMfaRequired\(\)/.test(loginPageSource) || !/\bverifyMfa\(/.test(loginPageSource)) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ MFA UI 缺失: 登录页没有展示并提交二步验证码（来源: ${loginPageFile}）`);
+    ISSUE.lines.push(`❌ MFA UI missing: the login page does not display and submit the two-step verification code (source: ${loginPageFile})`);
   }
 
   let repoHeaderSource = '';
@@ -913,23 +913,23 @@ function inspectFrontendFlowContracts() {
     repoHeaderSource = readFileSync(repoHeaderFile, 'utf8');
   } catch (error) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 前端流程缺失: 无法读取仓库头部组件（${repoHeaderFile}）`);
+    ISSUE.lines.push(`❌ Frontend flow missing: unable to read repo header component (${repoHeaderFile})`);
     return;
   }
 
   if (/archive\/main\.zip/.test(repoHeaderSource)) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 仓库归档链接硬编码 main: RepoHeader 必须使用仓库 default_branch 或后端返回值（来源: ${repoHeaderFile}）`);
+    ISSUE.lines.push(`❌ Repo archive link hardcodes main: RepoHeader must use the repo default_branch or the backend-returned value (source: ${repoHeaderFile})`);
   }
 
   if (!/\bdefaultBranch\b/.test(repoHeaderSource) || !/\brepos\.get\(/.test(repoHeaderSource)) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 仓库归档链接未对齐默认分支: RepoHeader 应从 props 或 /repos/{owner}/{repo} 获取 default_branch（来源: ${repoHeaderFile}）`);
+    ISSUE.lines.push(`❌ Repo archive link not aligned with default branch: RepoHeader should obtain default_branch from props or /repos/{owner}/{repo} (source: ${repoHeaderFile})`);
   }
 
   if (!/\bdownloadApiFile\(/.test(repoHeaderSource) || !/archive\/\$\{encodeURIComponent\(archiveRef\)\}\.zip/.test(repoHeaderSource)) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 仓库归档下载未使用认证 API helper/ref 编码: RepoHeader 下载应对齐后端 /archive/{ref}.zip 并携带 Bearer auth（来源: ${repoHeaderFile}）`);
+    ISSUE.lines.push(`❌ Repo archive download does not use the authenticated API helper/ref encoding: RepoHeader download should align with backend /archive/{ref}.zip and carry Bearer auth (source: ${repoHeaderFile})`);
   }
 
   let reposApiSource = '';
@@ -937,21 +937,21 @@ function inspectFrontendFlowContracts() {
     reposApiSource = readFileSync(reposApiFile, 'utf8');
   } catch (error) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 后端契约缺失: 无法读取仓库 API 文件（${reposApiFile}）`);
+    ISSUE.lines.push(`❌ Backend contract missing: unable to read repo API file (${reposApiFile})`);
     return;
   }
 
   const repoResponseMatch = reposApiSource.match(/pub struct RepoResponse\s*\{([\s\S]*?)\n\}/);
   if (!repoResponseMatch) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ 后端契约缺失: RepoResponse schema 未定义（来源: ${reposApiFile}）`);
+    ISSUE.lines.push(`❌ Backend contract missing: RepoResponse schema is not defined (source: ${reposApiFile})`);
     return;
   }
 
   for (const field of ['default_branch', 'stars_count', 'forks_count', 'fork_id']) {
     if (!new RegExp(`\\bpub\\s+${field}\\s*:`).test(repoResponseMatch[1])) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`❌ 仓库详情响应 schema 漂移: 前端仓库页依赖 ${field}，RepoResponse 未声明（来源: ${reposApiFile}）`);
+      ISSUE.lines.push(`❌ Repo detail response schema drift: frontend repo page depends on ${field}, but RepoResponse does not declare it (source: ${reposApiFile})`);
     }
   }
 }
@@ -961,7 +961,7 @@ async function main() {
   if (!openapi) {
     const sourceOpenApi = loadOpenApiFromRustSource();
     if (sourceOpenApi) {
-      console.log('✅ 已使用 Rust 源码自动提取的 OpenAPI 路由信息进行对齐（离线模式）');
+      console.log('✅ Aligned using OpenAPI route info auto-extracted from Rust source (offline mode)');
       openapi = sourceOpenApi;
     }
   }
@@ -969,11 +969,11 @@ async function main() {
   if (!openapi) {
     const openapiResp = await requestWithTimeout(OPENAPI_URL);
     if (!openapiResp.ok) {
-      console.log(`❌ 无法读取 OpenAPI: ${openapiResp.error?.message || `HTTP ${openapiResp.response?.status}`}`);
+      console.log(`❌ Unable to read OpenAPI: ${openapiResp.error?.message || `HTTP ${openapiResp.response?.status}`}`);
       process.exit(1);
     }
     if (!openapiResp.response.ok) {
-      console.log(`❌ OpenAPI 返回异常: HTTP ${openapiResp.response.status}`);
+      console.log(`❌ OpenAPI returned an error: HTTP ${openapiResp.response.status}`);
       process.exit(1);
     }
     openapi = await openapiResp.response.json().catch(() => ({}));
@@ -992,7 +992,7 @@ async function main() {
 
   const clientFiles = resolveClientSources(CLIENT_SOURCE);
   if (clientFiles.length === 0) {
-    console.log('❌ 未发现可扫描的前端 API 调用点');
+    console.log('❌ No scannable frontend API call sites found');
     process.exit(1);
   }
 
@@ -1009,7 +1009,7 @@ async function main() {
     const matches = findOpenApiMatch(rawPaths, method, targetPath);
     if (matches.length === 0) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`❌ 前端路由未对齐: ${method.toUpperCase()} ${targetPath} 在 OpenAPI 中无对应 path/method（来源: ${call.file}）`);
+      ISSUE.lines.push(`❌ Frontend route not aligned: ${method.toUpperCase()} ${targetPath} has no matching path/method in OpenAPI (source: ${call.file})`);
       continue;
     }
 
@@ -1021,27 +1021,27 @@ async function main() {
       const matched = [...apiParams].some((entry) => equivalentParam(name, entry));
       if (!matched) {
         ISSUE.count += 1;
-        ISSUE.lines.push(`⚠️ 参数名潜在不一致: ${method.toUpperCase()} ${targetPath}, 客户端使用 ${name}，接口定义 ${Array.from(apiParams).join(', ') || '无参数'}（来源: ${call.file})`);
+        ISSUE.lines.push(`⚠️ Potential parameter name mismatch: ${method.toUpperCase()} ${targetPath}, client uses ${name}, endpoint defines ${Array.from(apiParams).join(', ') || 'no parameters'} (source: ${call.file})`);
       }
     }
     for (const name of apiParams) {
       const matched = [...clientParams].some((entry) => equivalentParam(name, entry));
       if (!matched) {
         ISSUE.count += 1;
-        ISSUE.lines.push(`⚠️ 参数名缺失: ${method.toUpperCase()} ${targetPath}, OpenAPI 需要 {${name}} 但客户端模板未显式包含（来源: ${call.file})`);
+        ISSUE.lines.push(`⚠️ Parameter name missing: ${method.toUpperCase()} ${targetPath}, OpenAPI requires {${name}} but the client template does not include it explicitly (source: ${call.file})`);
       }
     }
 
     const bodyCheck = inspectBodyAlignment(firstMatch, call.body || {});
     if (!bodyCheck.ok) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`⚠️ 请求体参数缺失: ${method.toUpperCase()} ${targetPath} -> ${bodyCheck.details}（来源: ${call.file})`);
+      ISSUE.lines.push(`⚠️ Request body parameter missing: ${method.toUpperCase()} ${targetPath} -> ${bodyCheck.details} (source: ${call.file})`);
     }
 
     const knownBodyCheck = inspectKnownBodyContracts(method, targetPath, call.body || {});
     if (!knownBodyCheck.ok) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`⚠️ 已知请求体契约不一致: ${method.toUpperCase()} ${targetPath} -> ${knownBodyCheck.details}（来源: ${call.file})`);
+      ISSUE.lines.push(`⚠️ Known request body contract mismatch: ${method.toUpperCase()} ${targetPath} -> ${knownBodyCheck.details} (source: ${call.file})`);
     }
   }
 
@@ -1054,9 +1054,9 @@ async function main() {
   const totalCalls = normalizedCalls.length;
   const mismatches = ISSUE.lines.length;
   if (mismatches > 0) {
-    console.log(`\n❌ 前后端接口对齐检查: ${mismatches}/${totalCalls} 条存在问题`);
+    console.log(`\n❌ Frontend/backend API alignment check: ${mismatches}/${totalCalls} issues found`);
   } else {
-    console.log(`\n✅ 前后端接口对齐检查通过: ${totalCalls} 条前端请求`);
+    console.log(`\n✅ Frontend/backend API alignment check passed: ${totalCalls} frontend requests`);
   }
 
   if (STRICT && mismatches > 0) {
@@ -1065,6 +1065,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.log(`❌ 对齐检查执行失败: ${err?.message || String(err)}`);
+  console.log(`❌ Alignment check execution failed: ${err?.message || String(err)}`);
   process.exit(1);
 });

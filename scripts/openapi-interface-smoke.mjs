@@ -293,14 +293,14 @@ function isParameterMismatch(method, rawPath, resolvedPath, pathParams) {
       const key = match[1].trim();
       const expected = encodeURIComponent(byName[key] ?? sampleForParam(key));
       if (right !== expected) {
-        checks.push(`❌ ${method.toUpperCase()} ${rawPath}: 参数替换异常，{${key}} -> ${right || '(missing)'}, 期望 ${expected}`);
+        checks.push(`❌ ${method.toUpperCase()} ${rawPath}: parameter substitution mismatch, {${key}} -> ${right || '(missing)'}, expected ${expected}`);
         return true;
       }
       continue;
     }
 
     if (left !== right) {
-      checks.push(`❌ ${method.toUpperCase()} ${rawPath}: 路径片段不一致`);
+      checks.push(`❌ ${method.toUpperCase()} ${rawPath}: path segment mismatch`);
       return true;
     }
   }
@@ -346,7 +346,7 @@ async function ensureToken() {
   });
 
   if (!regResp.ok) {
-    checks.push(`⚠️ 用户注册失败: ${regResp.error.message}`);
+    checks.push(`⚠️ User registration failed: ${regResp.error.message}`);
     return null;
   }
 
@@ -362,7 +362,7 @@ async function ensureToken() {
   });
 
   if (!loginResp.ok) {
-    checks.push(`⚠️ 生成 Token 失败：${loginResp.error.message}`);
+    checks.push(`⚠️ Failed to generate token: ${loginResp.error.message}`);
     return null;
   }
 
@@ -371,7 +371,7 @@ async function ensureToken() {
     return loginBody?.token || null;
   }
 
-  checks.push(`⚠️ 生成 Token 失败：HTTP ${loginResp.response.status}`);
+  checks.push(`⚠️ Failed to generate token: HTTP ${loginResp.response.status}`);
   return null;
 }
 
@@ -379,7 +379,7 @@ function isFailureStatus(status) {
   return status >= 500;
 }
 
-console.log('接口全量冒烟开始');
+console.log('Full interface smoke test started');
 console.log(`backend: ${BACKEND_URL}`);
 console.log(`openapi: ${OPENAPI_URL}`);
 
@@ -391,20 +391,20 @@ let response = await requestWithTimeout(OPENAPI_URL, {
 
 const openapiStatus = response.response?.status ?? 0;
 if (response.ok && response.response?.ok) {
-  checks.push(`❌ /api-docs/openapi.json 未启用鉴权即可访问（HTTP ${openapiStatus}）`);
+  checks.push(`❌ /api-docs/openapi.json is accessible without authentication (HTTP ${openapiStatus})`);
   if (OPENAPI_REQUIRE_AUTH) {
     process.exit(1);
   }
-  checks.push('ℹ️ 未开启文档鉴权，继续使用匿名状态复测');
+  checks.push('ℹ️ Doc authentication is disabled, continuing to retest anonymously');
 }
 
 const unauthorized = response.ok && response.response?.status === 401;
 if (unauthorized) {
-  checks.push('✅ /api-docs/openapi.json 返回 401，符合文档鉴权预期');
-  checks.push('⚠️ 尝试自动生成鉴权 Token 继续重试');
+  checks.push('✅ /api-docs/openapi.json returned 401, matching the doc authentication expectation');
+  checks.push('⚠️ Attempting to auto-generate an auth token and retry');
   token = await ensureToken();
   if (!token) {
-    console.log('❌ OpenAPI 文档需鉴权，但未能生成可用 Token');
+    console.log('❌ OpenAPI docs require authentication, but no usable token could be generated');
     process.exit(1);
   }
   response = await requestWithTimeout(OPENAPI_URL, {
@@ -414,12 +414,12 @@ if (unauthorized) {
 }
 
 if (!response.ok || !response.response) {
-  console.log(`❌ 读取 OpenAPI 规范失败: ${response.error?.message || `HTTP ${response.response?.status || 'network error'}`}`);
+  console.log(`❌ Failed to read the OpenAPI spec: ${response.error?.message || `HTTP ${response.response?.status || 'network error'}`}`);
   process.exit(1);
 }
 
 if (!response.response.ok) {
-  console.log(`❌ OpenAPI 规范返回异常: HTTP ${response.response.status}`);
+  console.log(`❌ OpenAPI spec returned an error: HTTP ${response.response.status}`);
   process.exit(1);
 }
 
@@ -427,12 +427,12 @@ const uiUnauthResp = await requestWithTimeout(`${BACKEND_URL}/api-docs/`, { meth
 const uiUnauthStatus = uiUnauthResp.response?.status ?? 0;
 if (OPENAPI_REQUIRE_AUTH) {
   if (!uiUnauthResp.ok || uiUnauthStatus !== 401) {
-    console.log(`❌ /api-docs/ 鉴权行为异常: HTTP ${uiUnauthStatus || 'network error'}`);
+    console.log(`❌ /api-docs/ authentication behaviour is abnormal: HTTP ${uiUnauthStatus || 'network error'}`);
     process.exit(1);
   }
-  checks.push('✅ /api-docs/ 返回 401，符合鉴权预期');
+  checks.push('✅ /api-docs/ returned 401, matching the authentication expectation');
 } else if (uiUnauthResp.ok && uiUnauthResp.response) {
-  checks.push(`ℹ️ /api-docs/ 可直接访问（HTTP ${uiUnauthResp.response.status}）`);
+  checks.push(`ℹ️ /api-docs/ is directly accessible (HTTP ${uiUnauthResp.response.status})`);
 }
 
 const openapi = await response.response.json().catch(() => ({}));
@@ -444,9 +444,9 @@ if (!token) {
   token = await ensureToken();
 }
 if (token) {
-  checks.push('✅ 已生成 JWT token，受保护接口将带鉴权头重放');
+  checks.push('✅ JWT token generated; protected endpoints will be replayed with an auth header');
 } else {
-  checks.push('⚠️ 受保护接口将不带鉴权头执行（部分接口会返回 401）');
+  checks.push('⚠️ Protected endpoints will run without an auth header (some will return 401)');
 }
 
 const entries = Object.entries(paths);
@@ -504,9 +504,9 @@ for (const line of checks) {
 }
 
 if (failed > 0) {
-  console.log(`\n❌ OpenAPI 接口冒烟失败: ${failed}/${total} 个异常`);
+  console.log(`\n❌ OpenAPI interface smoke test failed: ${failed}/${total} errors`);
   process.exit(1);
 }
 
-console.log(`\n✅ OpenAPI 接口冒烟通过: ${total} 个已请求`);
+console.log(`\n✅ OpenAPI interface smoke test passed: ${total} requested`);
 process.exit(0);
