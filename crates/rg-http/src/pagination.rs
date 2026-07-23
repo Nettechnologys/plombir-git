@@ -108,13 +108,13 @@ impl PaginationMeta {
 
 /// Paginated response wrapper.
 ///
-/// CRITICAL: Serialization (踩坑经验 #2)
+/// CRITICAL: Serialization (pitfall #2)
 ///
 /// When returning from Axum handler, MUST wrap with serde_json::to_value():
 ///   (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
 /// Without to_value(), the `data` field may be empty in the JSON response.
 ///
-/// CRITICAL: Serialization (踩坑经验 #2)
+/// CRITICAL: Serialization (pitfall #2)
 ///
 /// When returning `PaginatedResponse<T>` from an Axum handler,
 /// you MUST wrap it with `serde_json::to_value()` before returning:

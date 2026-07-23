@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let _runtime_guard = runtime.enter();
 
-    // 日志打到 stderr，不污染 stdio JSON-RPC 通道
+    // Log to stderr so the stdio JSON-RPC channel stays clean.
     let _ = tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

@@ -1,6 +1,7 @@
-//! Package Registry 核心服务
+//! Package Registry core service.
 //!
-//! 提供通用的包发布/下载/列表/删除操作，协调 DB ops 和存储层。
+//! Provides generic package publish/download/list/delete operations,
+//! coordinating the DB ops and the storage layer.
 
 use sea_orm::DatabaseConnection;
 

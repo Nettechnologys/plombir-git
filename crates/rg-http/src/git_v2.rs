@@ -59,7 +59,7 @@ fn build_v2_capability_sync() -> Vec<u8> {
 /// Protocol V2 negotiation happens on first request with Git-Protocol header.
 /// Git Smart HTTP `/info/refs` endpoint (Protocol V2).
 ///
-/// CRITICAL: Content-Type handling (踩坑经验 #6)
+/// CRITICAL: Content-Type handling (pitfall #6)
 ///
 /// Git Smart HTTP is VERY sensitive to Content-Type headers.
 /// Incorrect Content-Type causes `git` client to fail with:

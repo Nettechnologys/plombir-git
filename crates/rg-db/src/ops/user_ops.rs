@@ -67,7 +67,7 @@ pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<User>
 }
 
 ///
-/// CRITICAL: SeaORM single-row update (踩坑经验 #11)
+/// CRITICAL: SeaORM single-row update (pitfall #11)
 ///
 /// To update a single row, you MUST first `find_by_id()` to get the model,
 /// then convert it into an `ActiveModel`, modify fields, and call `update()`.

@@ -1,7 +1,7 @@
-//! AI Agent 专用 REST API 端点。
+//! REST API endpoints dedicated to AI agents.
 //!
-//! 这些端点在 `/api/v1/ai/` 下注册，提供比通用 REST API
-//! 更适合 AI Agent 消费的高层语义数据。
+//! These endpoints are registered under `/api/v1/ai/` and expose high-level
+//! semantic data better suited for AI agent consumption than the generic REST API.
 
 use axum::{
     extract::{Path, Query, State},
@@ -19,7 +19,7 @@ use sea_orm::{ConnectionTrait, Statement};
 
 // ── Response types ───────────────────────────────────
 
-/// 仓库摘要响应（AI 友好格式）
+/// Repository summary response (AI-friendly format).
 #[derive(Serialize, ToSchema)]
 pub struct RepoSummary {
     pub full_name: String,
@@ -31,7 +31,7 @@ pub struct RepoSummary {
     pub updated_at: String,
 }
 
-/// Issue 摘要（AI 友好格式）
+/// Issue summary (AI-friendly format).
 #[derive(Serialize, ToSchema)]
 pub struct IssueSummary {
     pub number: i64,
@@ -41,7 +41,7 @@ pub struct IssueSummary {
     pub created_at: String,
 }
 
-/// PR 摘要（AI 友好格式）
+/// PR summary (AI-friendly format).
 #[derive(Serialize, ToSchema)]
 pub struct PrSummary {
     pub number: i64,

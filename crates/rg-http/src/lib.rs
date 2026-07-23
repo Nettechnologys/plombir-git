@@ -237,7 +237,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     //   axum::serve(listener, app).await?;  // ERROR: no TLS!
     // ── HTTPS mode (axum-server + rustls) ──────────────────
     //
-    // CRITICAL: Axum TLS requires `axum-server`, NOT `axum::serve()` (踩坑经验 #2)
+    // CRITICAL: Axum TLS requires `axum-server`, NOT `axum::serve()` (pitfall #2)
     //
     // `axum::serve()` only supports plain TCP (no TLS).
     // To use TLS, you MUST use `axum_server::bind_rustls()` instead.
@@ -330,7 +330,7 @@ fn create_router(state: AppState, rate_limiter: rate_limit::RateLimiter) -> Rout
 
 /// Shared router builder used by both production and test routers.
 ///
-/// CRITICAL: Axum `nest()` State requirement (踩坑经验 #2)
+/// CRITICAL: Axum `nest()` State requirement (pitfall #2)
 ///
 /// All nested routers MUST share the same `State<AppState>` type.
 /// If `git_routes` or `api_v1` use a different State type,
@@ -1294,7 +1294,7 @@ fn build_routes(state: &AppState) -> (Router<AppState>, Router<AppState>) {
             "/ai/repos/{owner}/{name}/search/code",
             get(api::ai::ai_search_code),
         )
-        // .route("/ai/repos/{owner}/{name}/index", post(api::ai::ai_index_repository))  // 暂时注释：Axum Handler trait 问题，改用 CLI 命令
+        // .route("/ai/repos/{owner}/{name}/index", post(api::ai::ai_index_repository))  // Temporarily disabled: Axum Handler trait issue, using a CLI command instead
         // WebSocket
         .route("/ws/notifications", get(ws::ws_notifications_handler))
         .route("/ws/job/{job_id}", get(ws::ws_job_log_handler));
@@ -1764,7 +1764,7 @@ async fn check_git_access(
 
 /// Git Smart HTTP `/info/refs` endpoint.
 ///
-/// CRITICAL: Content-Type handling (踩坑经验 #6)
+/// CRITICAL: Content-Type handling (pitfall #6)
 ///
 /// The Git Smart HTTP protocol is VERY sensitive to Content-Type headers.
 /// Incorrect Content-Type will cause `git` client to silently fail or
@@ -1887,7 +1887,7 @@ async fn handle_info_refs(
 
 fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String> {
     let mut buf = String::new();
-    // 踩坑 #1: # service= 行必须用 pkt-line 包裹，不能裸写
+    // Pitfall #1: the "# service=" line must be wrapped in a pkt-line, not written raw
     let svc_line = format!("# service={}\n", service);
     buf.push_str(&format!("{:04x}", svc_line.len() + 4));
     buf.push_str(&svc_line);
@@ -1962,15 +1962,15 @@ fn build_v2_capability_advertisement() -> Result<String> {
 
     let mut buf = Vec::new();
 
-    // 踩坑: Smart HTTP 要求 # service= 行用 pkt-line 包裹 + flush
+    // Pitfall: Smart HTTP requires the "# service=" line to be wrapped in a pkt-line + flush
     let svc_line = format!("# service=git-upload-pack\n");
     let len = svc_line.len() + 4;
     write!(buf, "{:04x}", len)?;
     buf.extend_from_slice(svc_line.as_bytes());
     buf.extend_from_slice(b"0000");
 
-    // Helper to write pkt-line data (踩坑: pkt-line payload 末尾带 \n,
-    // 长度头 = payload.len() + 4(头) + 1(\n); 用 write! 不是 writeln!)
+    // Helper to write pkt-line data (pitfall: the pkt-line payload ends with \n,
+    // length header = payload.len() + 4 (header) + 1 (\n); use write! not writeln!)
     let write_pkt = |buf: &mut Vec<u8>, text: &str| {
         let payload = text.as_bytes();
         let len = payload.len() + 4 + 1; // +4 for hex header, +1 for trailing \n

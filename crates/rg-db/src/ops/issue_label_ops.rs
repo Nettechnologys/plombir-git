@@ -11,7 +11,7 @@ use crate::entities::issue_label::{
 pub async fn set_labels(db: &DatabaseConnection, issue_id: i64, label_ids: Vec<i64>) -> Result<()> {
     let txn = db.begin().await.context("db: begin transaction")?;
 
-    // CRITICAL: SeaORM batch delete (踩坑经验 #3)
+    // CRITICAL: SeaORM batch delete (pitfall #3)
     //
     // To delete multiple rows, MUST use:
     //   Entity::delete_many().filter(...).exec(db)

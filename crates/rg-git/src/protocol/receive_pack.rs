@@ -360,7 +360,7 @@ where
     // Receive pack data and pipe to git index-pack
     // TODO(gix): Replace with gix pack indexing when available.
     //
-    // CRITICAL: --fix-thin is REQUIRED (踩坑经验 #4)
+    // CRITICAL: --fix-thin is REQUIRED (pitfall #4)
     //
     // Thin packs reference base objects NOT in the pack.
     // Without --fix-thin, git index-pack fails with "pack has delta resolution error".
@@ -368,7 +368,7 @@ where
     // TODO(gix): Replace with gix pack indexing when available.
     // Currently using git index-pack CLI as gix doesn't have a direct replacement.
     //
-    // CRITICAL: --fix-thin is REQUIRED (踩坑经验 #4)
+    // CRITICAL: --fix-thin is REQUIRED (pitfall #4)
     //
     // A "thin pack" is a packfile that references base objects NOT included in
     // the pack. Git clients send thin packs during push to reduce network traffic.

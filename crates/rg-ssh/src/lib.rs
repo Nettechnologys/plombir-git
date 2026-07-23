@@ -196,7 +196,7 @@ impl AuthenticatedIdentity {
 impl Handler for SshHandler {
     type Error = HandlerError;
 
-    // CRITICAL: Auth::Reject must include `partial_success: false` (踩坑经验 #5)
+    // CRITICAL: Auth::Reject must include `partial_success: false` (pitfall #5)
     //
     // russh's `Auth::Reject` has a field `partial_success: bool`.
     // If this is `true`, the server tells the client "you partially succeeded,
@@ -513,7 +513,7 @@ impl Handler for SshHandler {
                 Err(e) => tracing::error!(error = %e, %service_name, "Git SSH session failed"),
             }
 
-            // CRITICAL: SSH stream shutdown order (踩坑经验)
+            // CRITICAL: SSH stream shutdown order (pitfall)
             //
             // Must send exit_status BEFORE shutting down the stream.
             // The russh client expects to receive the exit-status message before

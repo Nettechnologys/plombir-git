@@ -365,7 +365,7 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
 
     // Close stdin immediately — `--all` packs all objects without stdin input,
     // but the piped stdin keeps the child waiting for EOF if we don't close it.
-    // 踩坑: Stdio::piped() creates a pipe but git pack-objects blocks reading stdin
+    // Pitfall: Stdio::piped() creates a pipe but git pack-objects blocks reading stdin
     // until EOF; must take and drop stdin to signal EOF.
     {
         let stdin = cmd.stdin.take();
