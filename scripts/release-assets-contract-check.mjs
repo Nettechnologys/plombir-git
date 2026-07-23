@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const mainClientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
 const splitClientPath = path.join(root, 'web/src/lib/api/releases.ts');
 const baseClientPath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
 const releasesPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/releases/+page.svelte');
@@ -12,7 +11,6 @@ const repoHeaderPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte
 const backendPath = path.join(root, 'crates/rg-http/src/api/releases.rs');
 const archiveBackendPath = path.join(root, 'crates/rg-http/src/api/archive.rs');
 
-const mainClient = readFileSync(mainClientPath, 'utf8');
 const splitClient = readFileSync(splitClientPath, 'utf8');
 const baseClient = readFileSync(baseClientPath, 'utf8');
 const page = readFileSync(releasesPagePath, 'utf8');
@@ -35,7 +33,6 @@ for (const route of requiredRoutes) {
 }
 
 for (const [name, source] of [
-  ['client.svelte.ts', mainClient],
   ['releases.ts', splitClient],
 ]) {
   for (const method of ['listAssets', 'uploadAsset', 'getAsset', 'assetDownloadUrl', 'downloadAsset', 'deleteAsset']) {

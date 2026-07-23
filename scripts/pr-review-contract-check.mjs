@@ -5,7 +5,7 @@ import path from 'node:path';
 
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/pulls/[number]/+page.svelte');
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/pulls.ts');
 const backendPath = path.join(root, 'crates/rg-core/src/review/service.rs');
 
 const page = readFileSync(pagePath, 'utf8');

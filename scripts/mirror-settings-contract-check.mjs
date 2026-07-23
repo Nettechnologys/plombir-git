@@ -5,7 +5,7 @@ import path from 'node:path';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/mirrors.rs');
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/mirrors.ts');
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/mirror/+page.svelte');
 

@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
 const splitClientPath = path.join(root, 'web/src/lib/api/repos.ts');
 const repoPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/+page.svelte');
 const blobPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/blob/[...path]/+page.svelte');
@@ -12,7 +11,6 @@ const editPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/edit/[...pat
 const newPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/new/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/repo_content.rs');
 
-const client = readFileSync(clientPath, 'utf8');
 const splitClient = readFileSync(splitClientPath, 'utf8');
 const repoPage = readFileSync(repoPagePath, 'utf8');
 const blobPage = readFileSync(blobPagePath, 'utf8');
@@ -24,22 +22,6 @@ const failures = [];
 
 if (!/path\s*=\s*"\/repos\/\{owner\}\/\{name\}\/contents\/\{\*path\}"/.test(backend)) {
   failures.push('Backend content save route must remain a splat path endpoint.');
-}
-
-if (!/function\s+encodeRepoPath\s*\([^)]*\)[\s\S]*split\('\/'\)\.map\(encodeURIComponent\)\.join\('\/'\)/.test(client)) {
-  failures.push('API client must encode file path segments while preserving repository subdirectories.');
-}
-
-if (!/blob\/\$\{encodeRepoPath\(path\)\}/.test(client)) {
-  failures.push('repos.blob must encode file paths before calling the backend blob route.');
-}
-
-if (!/contents\/\$\{encodeRepoPath\(path\)\}/.test(client)) {
-  failures.push('repos.saveContent must encode file paths before calling the backend contents route.');
-}
-
-if (!/deleteContent[\s\S]*contents\/\$\{encodeRepoPath\(path\)\}[\s\S]*method:\s*'DELETE'/.test(client)) {
-  failures.push('repos.deleteContent must encode file paths before calling the backend contents route.');
 }
 
 if (!/function\s+encodeRepoPath\s*\([^)]*\)[\s\S]*split\('\/'\)\.map\(encodeURIComponent\)\.join\('\/'\)/.test(splitClient)) {

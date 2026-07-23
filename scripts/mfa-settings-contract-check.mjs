@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/mfa.ts');
 const pagePath = path.join(root, 'web/src/routes/settings/security/+page.svelte');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/mfa.rs');

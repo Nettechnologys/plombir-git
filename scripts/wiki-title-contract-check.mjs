@@ -4,13 +4,11 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
 const splitClientPath = path.join(root, 'web/src/lib/api/wiki.ts');
 const wikiPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/wiki/[title]/+page.svelte');
 const wikiHistoryPath = path.join(root, 'web/src/routes/[owner]/[repo]/wiki/[title]/history/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/wiki.rs');
 
-const client = readFileSync(clientPath, 'utf8');
 const splitClient = readFileSync(splitClientPath, 'utf8');
 const wikiPage = readFileSync(wikiPagePath, 'utf8');
 const wikiHistory = readFileSync(wikiHistoryPath, 'utf8');
@@ -33,7 +31,6 @@ for (const [method, route] of [
 }
 
 for (const [label, source] of [
-  ['main client', client],
   ['split wiki client', splitClient],
 ]) {
   expect(

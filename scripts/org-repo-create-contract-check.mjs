@@ -5,13 +5,11 @@ import path from 'node:path';
 
 const root = process.cwd();
 const files = {
-  monolithClient: path.join(root, 'web/src/lib/api/client.svelte.ts'),
   splitClient: path.join(root, 'web/src/lib/api/repos.ts'),
   orgPage: path.join(root, 'web/src/routes/orgs/[name]/+page.svelte'),
   backend: path.join(root, 'crates/rg-http/src/api/repos.rs'),
 };
 
-const monolithClient = readFileSync(files.monolithClient, 'utf8');
 const splitClient = readFileSync(files.splitClient, 'utf8');
 const orgPage = readFileSync(files.orgPage, 'utf8');
 const backend = readFileSync(files.backend, 'utf8');
@@ -33,7 +31,6 @@ function expectCreateObjectContract(label, source) {
   }
 }
 
-expectCreateObjectContract('web/src/lib/api/client.svelte.ts', monolithClient);
 expectCreateObjectContract('web/src/lib/api/repos.ts', splitClient);
 
 if (!/pub struct CreateRepoRequest[\s\S]*pub org:\s*Option<String>/.test(backend)) {

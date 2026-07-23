@@ -5,7 +5,6 @@ import path from 'node:path';
 
 const root = process.cwd();
 const clientPaths = [
-  path.join(root, 'web/src/lib/api/client.svelte.ts'),
   path.join(root, 'web/src/lib/api/repos.ts'),
 ];
 const headerPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte');

@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 const allPackagesPagePath = 'web/src/routes/[owner]/[repo]/packages/+page.svelte';
 const formatPackagesPagePath = 'web/src/routes/[owner]/[repo]/packages/[format]/+page.svelte';
 const detailPagePath = 'web/src/routes/[owner]/[repo]/packages/[format]/[...name]/+page.svelte';
-const clientPath = 'web/src/lib/api/client.svelte.ts';
+const clientPath = 'web/src/lib/api/packages.ts';
 
 const failures = [];
 

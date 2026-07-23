@@ -13,7 +13,6 @@ function check(condition, message) {
 }
 
 const backendIssueEntity = read('crates/rg-db/src/entities/issue.rs');
-const mainClient = read('web/src/lib/api/client.svelte.ts');
 const splitClient = read('web/src/lib/api/issues.ts');
 const issuesListPage = read('web/src/routes/[owner]/[repo]/issues/+page.svelte');
 const issueDetailPage = read('web/src/routes/[owner]/[repo]/issues/[number]/+page.svelte');
@@ -26,7 +25,6 @@ check(
 );
 
 for (const [name, source] of [
-  ['client.svelte.ts', mainClient],
   ['issues.ts', splitClient],
 ]) {
   check(

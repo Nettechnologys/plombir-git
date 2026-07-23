@@ -7,7 +7,7 @@ const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/imports.rs');
 const entityPath = path.join(root, 'crates/rg-db/src/entities/import_task.rs');
 const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/imports.ts');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 const pagePath = path.join(root, 'web/src/routes/imports/+page.svelte');
 

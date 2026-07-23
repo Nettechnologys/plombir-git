@@ -2,7 +2,7 @@
 
 import { readFileSync } from 'node:fs';
 
-const source = readFileSync('web/src/lib/api/client.svelte.ts', 'utf8');
+const source = readFileSync('web/src/lib/api/packages.ts', 'utf8');
 const failures = [];
 
 if (!/headers\[['"]Content-Disposition['"]\]\s*=\s*contentDispositionAttachment\(filename\)/.test(source)) {

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/packages.ts');
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/+page.svelte');
 const formatPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[format]/+page.svelte');
 const uploadPath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/upload/+page.svelte');
@@ -12,7 +12,10 @@ const packageFormatsPath = path.join(root, 'web/src/lib/packageFormats.ts');
 const backendPackageServicePath = path.join(root, 'crates/rg-core/src/package_registry/service.rs');
 const httpLibPath = path.join(root, 'crates/rg-http/src/lib.rs');
 
-const client = readFileSync(clientPath, 'utf8');
+const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
+// packages.ts holds the packages surface; the shared request()/204 handling
+// asserted below lives in _base.svelte.ts after the client split.
+const client = `${readFileSync(clientPath, 'utf8')}\n${readFileSync(basePath, 'utf8')}`;
 const page = readFileSync(pagePath, 'utf8');
 const formatPage = readFileSync(formatPagePath, 'utf8');
 const uploadPage = readFileSync(uploadPath, 'utf8');

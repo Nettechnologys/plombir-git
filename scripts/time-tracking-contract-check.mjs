@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/timeTracking.ts');
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/time_tracking/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/time_tracking.rs');
 const repoHeaderPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte');

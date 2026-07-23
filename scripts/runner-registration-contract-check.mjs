@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/runners.ts');
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/runners/+page.svelte');
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const adminPagePath = path.join(root, 'web/src/routes/admin/runners/+page.svelte');

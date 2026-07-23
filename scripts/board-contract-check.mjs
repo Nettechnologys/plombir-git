@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 
 const files = {
-  client: 'web/src/lib/api/client.svelte.ts',
+  client: 'web/src/lib/api/boards.ts',
   boardsPage: 'web/src/routes/[owner]/[repo]/boards/+page.svelte',
   issueBoardPage: 'web/src/routes/[owner]/[repo]/issues/board/+page.svelte',
   backend: 'crates/rg-http/src/api/boards.rs',

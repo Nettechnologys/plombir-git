@@ -6,7 +6,7 @@ import path from 'node:path';
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
 const backendPath = path.join(root, 'crates/rg-http/src/api/audit.rs');
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/admin.ts');
 const pagePath = path.join(root, 'web/src/routes/admin/audit/+page.svelte');
 
 const router = readFileSync(routerPath, 'utf8');

@@ -6,7 +6,7 @@ import path from 'node:path';
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
 const backendPath = path.join(root, 'crates/rg-http/src/api/users.rs');
-const clientPath = path.join(root, 'web/src/lib/api/client.svelte.ts');
+const clientPath = path.join(root, 'web/src/lib/api/tokens.ts');
 const pagePath = path.join(root, 'web/src/routes/settings/tokens/+page.svelte');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 

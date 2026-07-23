@@ -3,12 +3,10 @@
 import { readFileSync } from 'node:fs';
 
 const backendPath = 'crates/rg-http/src/api/repo_content.rs';
-const mainClientPath = 'web/src/lib/api/client.svelte.ts';
 const splitClientPath = 'web/src/lib/api/repos.ts';
 const newReleasePagePath = 'web/src/routes/[owner]/[repo]/releases/new/+page.svelte';
 
 const backend = readFileSync(backendPath, 'utf8');
-const mainClient = readFileSync(mainClientPath, 'utf8');
 const splitClient = readFileSync(splitClientPath, 'utf8');
 const newReleasePage = readFileSync(newReleasePagePath, 'utf8');
 
@@ -23,7 +21,6 @@ if (!/fn list_tag_names[\s\S]*?anyhow::Result<Vec<String>>/.test(backend)) {
 }
 
 for (const [name, source] of [
-  ['client.svelte.ts', mainClient],
   ['repos.ts', splitClient],
 ]) {
   if (!/type BranchRefResponse\s*=\s*string\s*\|/.test(source)) {

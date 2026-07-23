@@ -7,7 +7,6 @@ const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/collaborators.rs');
 const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
 const clientPaths = [
-  path.join(root, 'web/src/lib/api/client.svelte.ts'),
   path.join(root, 'web/src/lib/api/collaborators.ts'),
 ];
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
