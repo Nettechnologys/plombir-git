@@ -44,6 +44,9 @@ pub async fn create_webhook(
     repo_id: i64,
     req: &CreateWebhookRequest,
 ) -> Result<webhook::Model> {
+    // Reject obviously-internal targets (bad scheme / private IP literal) at
+    // registration for immediate feedback; delivery re-checks with DNS.
+    crate::net::check_url_static(&req.url).context("invalid webhook URL")?;
     let now = Utc::now();
     let events_str = req.events.join(",");
     let model = webhook::ActiveModel {
@@ -80,6 +83,9 @@ pub async fn update_webhook(
     existing: &webhook::Model,
     req: &UpdateWebhookRequest,
 ) -> Result<webhook::Model> {
+    if let Some(url) = req.url.as_deref() {
+        crate::net::check_url_static(url).context("invalid webhook URL")?;
+    }
     let model = webhook::ActiveModel {
         id: sea_orm::Set(existing.id),
         repo_id: sea_orm::Set(existing.repo_id),
@@ -172,7 +178,16 @@ async fn deliver(
     secret: &Option<String>,
     payload: &str,
 ) -> Result<i32> {
-    let client = reqwest::Client::new();
+    // SSRF guard: reject non-http(s) schemes and any target that resolves to a
+    // private / loopback / link-local address (e.g. cloud metadata). A blocked
+    // delivery surfaces as a recorded delivery error — it is never sent.
+    crate::net::guard_outbound_url(url)
+        .await
+        .context("webhook target rejected by SSRF guard")?;
+
+    // Shared, hardened client: request/connect timeout + no redirect following
+    // (a 3xx to an internal host is returned verbatim, never chased).
+    let client = crate::net::outbound_client();
     let mut builder = client.post(url);
 
     if content_type == "form" {

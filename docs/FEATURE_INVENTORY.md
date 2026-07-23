@@ -52,8 +52,8 @@ _Последняя сверка с кодом: 2026-07-23._
 |------|--------|-----|---------|
 | Outbound webhook доставка | ✅ | `rg-core/src/webhook/service.rs:169` | |
 | HMAC-SHA256 подпись исходящих (`X-Hub-Signature-256`) | ✅ 🔒 | `rg-core/src/webhook/service.rs:188` | GitHub-совместимо |
-| Timeout на исходящем HTTP-клиенте | ❌ 🔒 | `rg-core/src/webhook/service.rs:175` | `reqwest::Client::new()` без таймаута → см. card |
-| Запрет редиректов / SSRF-защита (private/loopback IP) | ❌ 🔒 | `webhook/`, `mirror/` | дефолтно следует ≤10 редиректов → SSRF на `169.254.169.254`, внутренние сервисы → см. card |
+| Timeout на исходящем HTTP-клиенте | ✅ 🔒 | `rg-core/src/net.rs` | общий `outbound_client()` с `timeout(30s)` + `connect_timeout(10s)` |
+| Запрет редиректов / SSRF-защита (private/loopback IP) | ✅ 🔒 | `rg-core/src/net.rs`, `webhook/service.rs` | `redirect(Policy::none())` + `guard_outbound_url()` (резолв хоста, reject private/loopback/link-local/ULA/CGNAT + non-http(s)); SSO-outbound — см. отдельную card |
 | Верификация HMAC на входящих вебхуках | 🟡 🔒 | `rg-http/src/api/webhooks_external.rs:60` | эндпоинт за JWT/PAT; подпись — defense-in-depth → см. card |
 
 ## 5. Robustness / эксплуатация
