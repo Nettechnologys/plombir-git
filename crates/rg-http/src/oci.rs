@@ -223,6 +223,120 @@ pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap
 //   - Anonymous: returns token with limited scope (public pull)
 //   - Basic Auth: validates username/password, returns full scope token
 //
+/// Resolve Basic-auth credentials from the request headers.
+///
+/// Returns the authenticated `(username, user_id)` when valid Docker-login
+/// credentials are present, or the anonymous default (`"anonymous"`, `None`)
+/// otherwise (missing header, malformed value, unknown user, bad password).
+async fn authenticate_basic(db: &DatabaseConnection, headers: &HeaderMap) -> (String, Option<i64>) {
+    let anonymous = || ("anonymous".to_string(), None);
+
+    let Some(auth_header) = headers.get(header::AUTHORIZATION) else {
+        return anonymous();
+    };
+    let Ok(auth_str) = auth_header.to_str() else {
+        return anonymous();
+    };
+    let Some(b64) = auth_str.strip_prefix("Basic ") else {
+        return anonymous();
+    };
+    use base64::Engine as _;
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return anonymous();
+    };
+    let Ok(creds) = std::str::from_utf8(&decoded) else {
+        return anonymous();
+    };
+    let parts: Vec<&str> = creds.splitn(2, ':').collect();
+    let [user, pass] = parts[..] else {
+        return anonymous();
+    };
+
+    match rg_db::ops::user_ops::find_by_username(db, user).await {
+        Ok(Some(u))
+            if rg_core::auth::password::verify_password(pass, &u.password_hash)
+                .unwrap_or(false) =>
+        {
+            (user.to_string(), Some(u.id))
+        }
+        _ => anonymous(),
+    }
+}
+
+/// Resolve a single `repository:...` scope request into the granted scope
+/// string, or `None` when the repo is missing or the caller has no access.
+async fn grant_repository_scope(
+    db: &DatabaseConnection,
+    parsed: &ParsedScope,
+    authenticated_user_id: Option<i64>,
+) -> Option<String> {
+    let (scope_owner, scope_repo) = parse_namespace(&parsed.name)?;
+    let repo_model =
+        match rg_core::repo::service::find_repo_by_owner_name(db, scope_owner, scope_repo).await {
+            Ok(Some(repo)) => repo,
+            _ => return None,
+        };
+
+    let mut allowed_actions = Vec::new();
+    if parsed.has_action("pull") {
+        let can_pull = rg_core::repo::service::can_read_repo(db, &repo_model, authenticated_user_id)
+            .await
+            .unwrap_or(false);
+        if can_pull {
+            allowed_actions.push("pull");
+        }
+    }
+    if parsed.has_action("push") {
+        if let Some(user_id) = authenticated_user_id {
+            let can_push = rg_core::repo::service::can_write_repo(db, &repo_model, Some(user_id))
+                .await
+                .unwrap_or(false);
+            if can_push {
+                allowed_actions.push("push");
+            }
+        }
+    }
+
+    if allowed_actions.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "repository:{}:{}",
+            parsed.name,
+            allowed_actions.join(",")
+        ))
+    }
+}
+
+/// Evaluate every requested scope against the caller's permissions and return
+/// the subset of scope strings that are actually granted.
+async fn resolve_granted_scopes(
+    db: &DatabaseConnection,
+    scope: &str,
+    authenticated_user_id: Option<i64>,
+) -> Vec<String> {
+    let mut granted_scopes = Vec::new();
+    for scope_part in scope.split_whitespace() {
+        let Some(parsed) = ParsedScope::parse(scope_part) else {
+            continue;
+        };
+
+        if parsed.scope_type == "repository" {
+            if let Some(granted) =
+                grant_repository_scope(db, &parsed, authenticated_user_id).await
+            {
+                granted_scopes.push(granted);
+            }
+        } else if parsed.scope_type == "registry"
+            && parsed.name == "catalog"
+            && authenticated_user_id.is_some()
+        {
+            granted_scopes.push(scope_part.to_string());
+        }
+    }
+    granted_scopes
+}
+
 /// `GET /v2/auth/token` — issue an OCI Bearer token.
 pub async fn get_token(
     State(state): State<AppState>,
@@ -235,104 +349,11 @@ pub async fn get_token(
         .unwrap_or_else(|| "forgekeep-registry".to_string());
     let scope = params.get("scope").cloned().unwrap_or_default();
 
-    // Default: anonymous token (limited scope)
-    let mut username = "anonymous".to_string();
-    let mut authenticated_user_id = None;
+    let (username, authenticated_user_id) = authenticate_basic(&state.db, &headers).await;
 
-    // Check for Basic Auth (Docker login)
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(b64) = auth_str.strip_prefix("Basic ") {
-                use base64::Engine as _;
-                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    if let Ok(creds) = std::str::from_utf8(&decoded) {
-                        let parts: Vec<&str> = creds.splitn(2, ':').collect();
-                        if parts.len() == 2 {
-                            let (user, pass) = (parts[0], parts[1]);
-                            // Validate credentials
-                            if let Ok(Some(u)) =
-                                rg_db::ops::user_ops::find_by_username(&state.db, user).await
-                            {
-                                // Verify password
-                                if rg_core::auth::password::verify_password(pass, &u.password_hash)
-                                    .unwrap_or(false)
-                                {
-                                    username = user.to_string();
-                                    authenticated_user_id = Some(u.id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut granted_scopes = Vec::new();
-    for scope_part in scope.split_whitespace() {
-        let Some(parsed) = ParsedScope::parse(scope_part) else {
-            continue;
-        };
-
-        if parsed.scope_type == "repository" {
-            let Some((scope_owner, scope_repo)) = parse_namespace(&parsed.name) else {
-                continue;
-            };
-            let repo_model = match rg_core::repo::service::find_repo_by_owner_name(
-                &state.db,
-                scope_owner,
-                scope_repo,
-            )
-            .await
-            {
-                Ok(Some(repo)) => repo,
-                _ => continue,
-            };
-
-            let mut allowed_actions = Vec::new();
-            if parsed.has_action("pull") {
-                let can_pull = rg_core::repo::service::can_read_repo(
-                    &state.db,
-                    &repo_model,
-                    authenticated_user_id,
-                )
-                .await
-                .unwrap_or(false);
-                if can_pull {
-                    allowed_actions.push("pull");
-                }
-            }
-            if parsed.has_action("push") {
-                if let Some(user_id) = authenticated_user_id {
-                    let can_push = rg_core::repo::service::can_write_repo(
-                        &state.db,
-                        &repo_model,
-                        Some(user_id),
-                    )
-                    .await
-                    .unwrap_or(false);
-                    if can_push {
-                        allowed_actions.push("push");
-                    }
-                }
-            }
-
-            if !allowed_actions.is_empty() {
-                granted_scopes.push(format!(
-                    "repository:{}:{}",
-                    parsed.name,
-                    allowed_actions.join(",")
-                ));
-            }
-        } else if parsed.scope_type == "registry"
-            && parsed.name == "catalog"
-            && authenticated_user_id.is_some()
-        {
-            granted_scopes.push(scope_part.to_string());
-        }
-    }
-
-    let granted_scope = granted_scopes.join(" ");
+    let granted_scope = resolve_granted_scopes(&state.db, &scope, authenticated_user_id)
+        .await
+        .join(" ");
 
     // Generate token (TTL: 300s for normal, 60s for anonymous)
     let ttl = if username == "anonymous" { 60 } else { 300 };

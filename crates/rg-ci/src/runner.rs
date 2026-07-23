@@ -30,6 +30,16 @@ const DOCKER_CPU_LIMIT: &str = "2";
 /// Grants read access to the triggering repo and packages.
 const DEFAULT_CI_TOKEN_SCOPES: &str = "repo:read packages:read";
 
+/// Outcome of running one pipeline stage.
+enum StageOutcome {
+    /// The stage finished; the bool is whether it failed (a non-`allow_failure`
+    /// job failed or errored).
+    Completed(bool),
+    /// The pipeline was paused mid-stage — a `manual` job or a job awaiting
+    /// environment approval — so no further stages should run.
+    Paused,
+}
+
 /// Pipeline runner that executes stages/jobs sequentially.
 pub struct PipelineRunner {
     db: DatabaseConnection,
@@ -171,161 +181,17 @@ impl PipelineRunner {
                 continue;
             }
             if pipeline_failed {
-                // Skip remaining stages
-                pipeline_ops::update_stage_status(&self.db, stage.id, "skipped", None, None)
-                    .await?;
-
-                // Mark all jobs in this stage as skipped
-                let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
-                for job in jobs {
-                    pipeline_ops::update_job_result(
-                        &self.db, job.id, "skipped", None, None, None, None,
-                    )
-                    .await?;
-                }
+                self.skip_stage(stage).await?;
                 continue;
             }
 
-            // Mark stage as running
-            let stage_start = chrono::Utc::now().naive_utc();
-            pipeline_ops::update_stage_status(
-                &self.db,
-                stage.id,
-                "running",
-                stage.started_at.is_none().then_some(stage_start),
-                None,
-            )
-            .await?;
-
-            let mut stage_failed = false;
-            let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
-
-            for job in &jobs {
-                if matches!(job.status.as_str(), "success" | "skipped" | "canceled") {
-                    continue;
-                }
-                if matches!(job.status.as_str(), "failed" | "failure" | "error") {
-                    if !job.allow_failure {
-                        stage_failed = true;
-                    }
-                    continue;
-                }
-                if job.status == "manual" {
-                    pipeline_ops::update_stage_status(&self.db, stage.id, "manual", None, None)
-                        .await?;
-                    pipeline_ops::update_pipeline_status(
-                        &self.db,
-                        self.pipeline_id,
-                        "manual",
-                        None,
-                        None,
-                    )
-                    .await?;
-                    tracing::info!(
-                        pipeline_id = self.pipeline_id,
-                        job_id = job.id,
-                        "Pipeline paused at manual job"
-                    );
-                    return Ok(());
-                }
-                if job.status == "waiting_approval" {
-                    pipeline_ops::update_stage_status(
-                        &self.db,
-                        stage.id,
-                        "waiting_approval",
-                        None,
-                        None,
-                    )
-                    .await?;
-                    pipeline_ops::update_pipeline_status(
-                        &self.db,
-                        self.pipeline_id,
-                        "waiting_approval",
-                        None,
-                        None,
-                    )
-                    .await?;
-                    tracing::info!(
-                        pipeline_id = self.pipeline_id,
-                        job_id = job.id,
-                        "Pipeline paused for environment approval"
-                    );
-                    return Ok(());
-                }
-                if job.status != "pending" {
-                    anyhow::bail!(
-                        "job {} cannot be resumed from unexpected status '{}'",
-                        job.id,
-                        job.status
-                    );
-                }
-                let job_result = self
-                    .run_job(
-                        job.id,
-                        &job.script,
-                        job.image.as_deref(),
-                        job.variables.as_deref(),
-                        job.cache_key.as_deref(),
-                        job.cache_paths.as_deref(),
-                        job.timeout_seconds,
-                    )
-                    .await;
-
-                match job_result {
-                    Ok((exit_code, log)) => {
-                        let status = if exit_code == 0 { "success" } else { "failed" };
-                        if exit_code != 0 && !job.allow_failure {
-                            stage_failed = true;
-                        }
-                        if let Err(e) = pipeline_ops::update_job_result(
-                            &self.db,
-                            job.id,
-                            status,
-                            Some(exit_code),
-                            Some(&log),
-                            None,
-                            None,
-                        )
-                        .await
-                        {
-                            tracing::error!(job_id = job.id, error = %e, "Failed to update job result");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(job_id = job.id, "Job execution error: {:#}", e);
-                        if !job.allow_failure {
-                            stage_failed = true;
-                        }
-                        if let Err(e) = pipeline_ops::update_job_result(
-                            &self.db,
-                            job.id,
-                            "failed",
-                            Some(-1),
-                            Some(&format!("Runner error: {}", e)),
-                            None,
-                            None,
-                        )
-                        .await
-                        {
-                            tracing::error!(job_id = job.id, error = %e, "Failed to update job result");
-                        }
+            match self.run_stage(stage).await? {
+                StageOutcome::Paused => return Ok(()),
+                StageOutcome::Completed(stage_failed) => {
+                    if stage_failed {
+                        pipeline_failed = true;
                     }
                 }
-            }
-
-            let stage_end = chrono::Utc::now().naive_utc();
-            let stage_status = if stage_failed { "failed" } else { "success" };
-            pipeline_ops::update_stage_status(
-                &self.db,
-                stage.id,
-                stage_status,
-                None,
-                Some(stage_end),
-            )
-            .await?;
-
-            if stage_failed {
-                pipeline_failed = true;
             }
         }
 
@@ -342,44 +208,7 @@ impl PipelineRunner {
         .await?;
 
         if pipeline_status == "success" {
-            if let (Some(repo_root), Some(pipeline)) = (
-                self.repo_path.parent().and_then(std::path::Path::parent),
-                pipeline_ops::get_pipeline(&self.db, self.pipeline_id).await?,
-            ) {
-                if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
-                    &self.db,
-                    repo_root,
-                    pipeline.repo_id,
-                    &pipeline.commit_sha,
-                )
-                .await
-                {
-                    tracing::warn!(pipeline_id = self.pipeline_id, %error, "auto-merge evaluation after local CI failed");
-                }
-                let ci_engine = crate::CiEngine;
-                if let Err(error) =
-                    rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-                        &self.db,
-                        repo_root,
-                        pipeline.repo_id,
-                        &pipeline.commit_sha,
-                        &rg_core::pull_request::merge_queue::MergeQueueCi {
-                            trigger: &ci_engine,
-                            docker_enabled: self.docker_enabled,
-                            external_runners: false,
-                            allow_host_runner: self.allow_host_runner,
-                            jwt_secret: self.jwt_secret.as_deref(),
-                            external_url: self
-                                .oidc_token_url
-                                .as_deref()
-                                .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
-                        },
-                    )
-                    .await
-                {
-                    tracing::warn!(pipeline_id = self.pipeline_id, %error, "merge queue evaluation after local CI failed");
-                }
-            }
+            self.run_success_followups().await?;
         }
 
         tracing::info!(
@@ -387,6 +216,216 @@ impl PipelineRunner {
             status = pipeline_status,
             "Pipeline completed"
         );
+
+        Ok(())
+    }
+
+    /// Mark a stage and all of its jobs as `skipped`. Used once an earlier
+    /// stage has already failed the pipeline.
+    async fn skip_stage(&self, stage: &rg_db::entities::pipeline_stage::Model) -> Result<()> {
+        pipeline_ops::update_stage_status(&self.db, stage.id, "skipped", None, None).await?;
+        let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
+        for job in jobs {
+            pipeline_ops::update_job_result(&self.db, job.id, "skipped", None, None, None, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Run every runnable job in one stage in order, updating stage/job status.
+    ///
+    /// Returns [`StageOutcome::Paused`] the moment a `manual` job or a job
+    /// awaiting environment approval is reached (the pipeline stops there),
+    /// otherwise [`StageOutcome::Completed`] carrying whether the stage failed.
+    async fn run_stage(
+        &self,
+        stage: &rg_db::entities::pipeline_stage::Model,
+    ) -> Result<StageOutcome> {
+        // Mark stage as running
+        let stage_start = chrono::Utc::now().naive_utc();
+        pipeline_ops::update_stage_status(
+            &self.db,
+            stage.id,
+            "running",
+            stage.started_at.is_none().then_some(stage_start),
+            None,
+        )
+        .await?;
+
+        let mut stage_failed = false;
+        let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
+
+        for job in &jobs {
+            if matches!(job.status.as_str(), "success" | "skipped" | "canceled") {
+                continue;
+            }
+            if matches!(job.status.as_str(), "failed" | "failure" | "error") {
+                if !job.allow_failure {
+                    stage_failed = true;
+                }
+                continue;
+            }
+            if job.status == "manual" {
+                pipeline_ops::update_stage_status(&self.db, stage.id, "manual", None, None).await?;
+                pipeline_ops::update_pipeline_status(
+                    &self.db,
+                    self.pipeline_id,
+                    "manual",
+                    None,
+                    None,
+                )
+                .await?;
+                tracing::info!(
+                    pipeline_id = self.pipeline_id,
+                    job_id = job.id,
+                    "Pipeline paused at manual job"
+                );
+                return Ok(StageOutcome::Paused);
+            }
+            if job.status == "waiting_approval" {
+                pipeline_ops::update_stage_status(
+                    &self.db,
+                    stage.id,
+                    "waiting_approval",
+                    None,
+                    None,
+                )
+                .await?;
+                pipeline_ops::update_pipeline_status(
+                    &self.db,
+                    self.pipeline_id,
+                    "waiting_approval",
+                    None,
+                    None,
+                )
+                .await?;
+                tracing::info!(
+                    pipeline_id = self.pipeline_id,
+                    job_id = job.id,
+                    "Pipeline paused for environment approval"
+                );
+                return Ok(StageOutcome::Paused);
+            }
+            if job.status != "pending" {
+                anyhow::bail!(
+                    "job {} cannot be resumed from unexpected status '{}'",
+                    job.id,
+                    job.status
+                );
+            }
+            if self.run_and_record_job(job).await {
+                stage_failed = true;
+            }
+        }
+
+        let stage_end = chrono::Utc::now().naive_utc();
+        let stage_status = if stage_failed { "failed" } else { "success" };
+        pipeline_ops::update_stage_status(&self.db, stage.id, stage_status, None, Some(stage_end))
+            .await?;
+
+        Ok(StageOutcome::Completed(stage_failed))
+    }
+
+    /// Execute a single pending job and persist its result. Returns `true`
+    /// when the job failed in a way that should fail the stage (a non-
+    /// `allow_failure` non-zero exit or an execution error). Persisting the
+    /// result is best-effort: DB errors are logged, not propagated.
+    async fn run_and_record_job(&self, job: &rg_db::entities::pipeline_job::Model) -> bool {
+        let job_result = self
+            .run_job(
+                job.id,
+                &job.script,
+                job.image.as_deref(),
+                job.variables.as_deref(),
+                job.cache_key.as_deref(),
+                job.cache_paths.as_deref(),
+                job.timeout_seconds,
+            )
+            .await;
+
+        match job_result {
+            Ok((exit_code, log)) => {
+                let status = if exit_code == 0 { "success" } else { "failed" };
+                let stage_failed = exit_code != 0 && !job.allow_failure;
+                if let Err(e) = pipeline_ops::update_job_result(
+                    &self.db,
+                    job.id,
+                    status,
+                    Some(exit_code),
+                    Some(&log),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    tracing::error!(job_id = job.id, error = %e, "Failed to update job result");
+                }
+                stage_failed
+            }
+            Err(e) => {
+                tracing::error!(job_id = job.id, "Job execution error: {:#}", e);
+                let stage_failed = !job.allow_failure;
+                if let Err(e) = pipeline_ops::update_job_result(
+                    &self.db,
+                    job.id,
+                    "failed",
+                    Some(-1),
+                    Some(&format!("Runner error: {}", e)),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    tracing::error!(job_id = job.id, error = %e, "Failed to update job result");
+                }
+                stage_failed
+            }
+        }
+    }
+
+    /// After a successful pipeline, evaluate auto-merges and the merge queue
+    /// for the head commit. These are best-effort side effects: failures are
+    /// logged, never propagated back to the pipeline result.
+    async fn run_success_followups(&self) -> Result<()> {
+        let (Some(repo_root), Some(pipeline)) = (
+            self.repo_path.parent().and_then(std::path::Path::parent),
+            pipeline_ops::get_pipeline(&self.db, self.pipeline_id).await?,
+        ) else {
+            return Ok(());
+        };
+
+        if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
+            &self.db,
+            repo_root,
+            pipeline.repo_id,
+            &pipeline.commit_sha,
+        )
+        .await
+        {
+            tracing::warn!(pipeline_id = self.pipeline_id, %error, "auto-merge evaluation after local CI failed");
+        }
+        let ci_engine = crate::CiEngine;
+        if let Err(error) = rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
+            &self.db,
+            repo_root,
+            pipeline.repo_id,
+            &pipeline.commit_sha,
+            &rg_core::pull_request::merge_queue::MergeQueueCi {
+                trigger: &ci_engine,
+                docker_enabled: self.docker_enabled,
+                external_runners: false,
+                allow_host_runner: self.allow_host_runner,
+                jwt_secret: self.jwt_secret.as_deref(),
+                external_url: self
+                    .oidc_token_url
+                    .as_deref()
+                    .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
+            },
+        )
+        .await
+        {
+            tracing::warn!(pipeline_id = self.pipeline_id, %error, "merge queue evaluation after local CI failed");
+        }
 
         Ok(())
     }

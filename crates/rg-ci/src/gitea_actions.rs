@@ -322,9 +322,69 @@ impl GiteaWorkflow {
     /// - Maps `runs-on` labels to `tags`
     /// - Translates `container.image` to `image`
     pub fn to_ci_config(&self, ctx: &WorkflowContext) -> CiConfig {
-        let mut job_configs: HashMap<String, JobConfig> = HashMap::new();
-        let mut stages: Vec<String> = Vec::new();
+        let (job_stage, max_stage) = self.compute_job_stages();
 
+        // Generate stage names
+        let stages: Vec<String> = (0..=max_stage).map(|i| format!("stage-{}", i)).collect();
+
+        // Convert each job
+        let mut job_configs: HashMap<String, JobConfig> = HashMap::new();
+        for (name, job) in &self.jobs {
+            let (script, job_vars, cache) = self.build_job_script(name, job, ctx);
+
+            let s = job_stage.get(name).copied().unwrap_or(0);
+            let stage_name = format!("stage-{}", s);
+
+            job_configs.insert(
+                name.clone(),
+                JobConfig {
+                    stage: Some(stage_name),
+                    script,
+                    image: job.container.as_ref().map(|c| c.image.clone()),
+                    only: None, // filtering is done at trigger time
+                    variables: if job_vars.is_empty() {
+                        None
+                    } else {
+                        Some(job_vars)
+                    },
+                    when: None,
+                    condition: job.condition.clone(),
+                    environment: job.environment.as_ref().and_then(environment_name),
+                    allow_failure: Some(job.continue_on_error),
+                    timeout_seconds: job
+                        .timeout_minutes
+                        .map(|minutes| minutes.saturating_mul(60)),
+                    tags: runs_on_tags(&job.runs_on),
+                    matrix: job.strategy.as_ref().map(|strategy| {
+                        strategy
+                            .matrix
+                            .iter()
+                            .map(|(key, values)| {
+                                let values = values.iter().filter_map(yaml_scalar_string).collect();
+                                (key.clone(), values)
+                            })
+                            .collect()
+                    }),
+                    cache,
+                },
+            );
+        }
+
+        CiConfig {
+            stages: Some(stages),
+            concurrency: self.concurrency.as_ref().map(|c| ConcurrencyConfig {
+                group: c.group.clone(),
+                cancel_in_progress: c.cancel_in_progress.unwrap_or(false),
+            }),
+            jobs: job_configs,
+        }
+    }
+
+    /// Assign each job to a stage index via a simple BFS topological pass:
+    /// a job's stage is `max(stage of its `needs`) + 1`, or 0 when it has no
+    /// dependencies. Jobs caught in a dependency cycle fall back to stage 0.
+    /// Returns the per-job stage map and the highest stage index used.
+    fn compute_job_stages(&self) -> (HashMap<String, usize>, usize) {
         // Build dependency graph to determine stage ordering
         let mut job_deps: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut job_order: Vec<&str> = Vec::new();
@@ -338,7 +398,6 @@ impl GiteaWorkflow {
             }
         }
 
-        // Topological sort: simple BFS (each job goes to stage = max(deps_stage) + 1)
         let mut job_stage: HashMap<String, usize> = HashMap::new();
         let mut max_stage = 0usize;
 
@@ -375,171 +434,133 @@ impl GiteaWorkflow {
             job_stage.entry(name.to_string()).or_insert(0);
         }
 
-        // Generate stage names
-        for i in 0..=max_stage {
-            stages.push(format!("stage-{}", i));
+        (job_stage, max_stage)
+    }
+
+    /// Build the shell `script`, resolved job variables, and optional cache
+    /// config for a single job: expands workflow/job env, then translates each
+    /// step (`uses: checkout` → implicit, `uses: cache` → `CacheConfig`, other
+    /// `uses:` → hard failure, `run:` → exported env + command).
+    fn build_job_script(
+        &self,
+        job_name: &str,
+        job: &GiteaJob,
+        ctx: &WorkflowContext,
+    ) -> (Vec<String>, HashMap<String, String>, Option<CacheConfig>) {
+        // GitHub's default bash invocation is fail-fast; preserving this
+        // prevents a later successful step from masking an earlier failure.
+        let mut script: Vec<String> = vec!["set -e".into()];
+        let mut job_vars: HashMap<String, String> = HashMap::new();
+        let mut cache = None;
+
+        // Copy workflow-level env
+        for (k, v) in &self.env {
+            job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
+        }
+        // Copy job-level env
+        for (k, v) in &job.env {
+            job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
         }
 
-        // Convert each job
-        for (name, job) in &self.jobs {
-            // GitHub's default bash invocation is fail-fast; preserving this
-            // prevents a later successful step from masking an earlier failure.
-            let mut script: Vec<String> = vec!["set -e".into()];
-            let mut job_vars: HashMap<String, String> = HashMap::new();
-            let mut cache = None;
+        if let Some(uses) = &job.uses {
+            script.push(format!(
+                "echo \"ForgeKeep does not support reusable workflow '{}'; use explicit jobs or .forgekeep-ci.yml\" >&2; exit 78",
+                uses
+            ));
+        }
 
-            // Copy workflow-level env
-            for (k, v) in &self.env {
-                job_vars.insert(k.clone(), substitute_expr(v, name, &self.env, &job.env));
-            }
-            // Copy job-level env
-            for (k, v) in &job.env {
-                job_vars.insert(k.clone(), substitute_expr(v, name, &self.env, &job.env));
-            }
-
-            if let Some(uses) = &job.uses {
-                script.push(format!(
-                    "echo \"ForgeKeep does not support reusable workflow '{}'; use explicit jobs or .forgekeep-ci.yml\" >&2; exit 78",
-                    uses
-                ));
-            }
-
-            // Process steps
-            let mut has_checkout = false;
-            for step in &job.steps {
-                if let Some(condition) = step.condition.as_deref() {
-                    let mut condition_variables = job_vars.clone();
-                    for (name, value) in &step.env {
-                        condition_variables.insert(
-                            name.clone(),
-                            substitute_expr(value, name, &self.env, &job.env),
-                        );
-                    }
-                    let context = actions_condition_context(ctx, &condition_variables);
-                    if !crate::condition::evaluate_condition(condition, &context).unwrap_or(false) {
-                        continue;
-                    }
+        // Process steps
+        let mut has_checkout = false;
+        for step in &job.steps {
+            if let Some(condition) = step.condition.as_deref() {
+                let mut condition_variables = job_vars.clone();
+                for (name, value) in &step.env {
+                    condition_variables.insert(
+                        name.clone(),
+                        substitute_expr(value, name, &self.env, &job.env),
+                    );
                 }
-                // Handle `uses: actions/checkout@vX` — implicit in ForgeKeep, skip
-                if let Some(ref uses) = step.uses {
-                    if uses.starts_with("actions/checkout") {
-                        has_checkout = true;
-                        continue;
-                    }
-                    if uses.starts_with("actions/cache@") {
-                        if let (Some(path), Some(key)) =
-                            (step.with.get("path"), step.with.get("key"))
-                        {
-                            let paths = path
-                                .lines()
-                                .map(str::trim)
-                                .filter(|path| !path.is_empty())
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>();
-                            cache = Some(CacheConfig {
-                                key: substitute_expr(key, name, &self.env, &job_vars),
-                                paths,
-                            });
-                        } else {
-                            script.push("echo \"actions/cache requires both 'path' and 'key'\" >&2; exit 78".into());
-                        }
-                        continue;
-                    }
-                    // Direct callers should still fail visibly even if they
-                    // skipped `validate_supported_actions`.
-                    script.push(format!(
-                        "echo \"ForgeKeep does not support action '{}'; use run: or .forgekeep-ci.yml\" >&2; exit 78",
-                        uses
-                    ));
+                let context = actions_condition_context(ctx, &condition_variables);
+                if !crate::condition::evaluate_condition(condition, &context).unwrap_or(false) {
                     continue;
                 }
-
-                // Handle `run:` commands
-                if let Some(ref run_cmd) = step.run {
-                    // Copy step-level env
-                    for (k, v) in &step.env {
-                        let expanded = substitute_expr(v, name, &self.env, &job_vars);
-                        script.push(format!("export {}={}", k, expanded));
-                    }
-
-                    // Substitute expressions in the command
-                    let expanded_cmd = substitute_expr(run_cmd, name, &self.env, &job_vars);
-                    script.push(expanded_cmd);
+            }
+            // Handle `uses: actions/checkout@vX` — implicit in ForgeKeep, skip
+            if let Some(ref uses) = step.uses {
+                if uses.starts_with("actions/checkout") {
+                    has_checkout = true;
+                    continue;
                 }
+                if uses.starts_with("actions/cache@") {
+                    if let (Some(path), Some(key)) = (step.with.get("path"), step.with.get("key")) {
+                        let paths = path
+                            .lines()
+                            .map(str::trim)
+                            .filter(|path| !path.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        cache = Some(CacheConfig {
+                            key: substitute_expr(key, job_name, &self.env, &job_vars),
+                            paths,
+                        });
+                    } else {
+                        script.push("echo \"actions/cache requires both 'path' and 'key'\" >&2; exit 78".into());
+                    }
+                    continue;
+                }
+                // Direct callers should still fail visibly even if they
+                // skipped `validate_supported_actions`.
+                script.push(format!(
+                    "echo \"ForgeKeep does not support action '{}'; use run: or .forgekeep-ci.yml\" >&2; exit 78",
+                    uses
+                ));
+                continue;
             }
 
-            // If no checkout step was found, add a comment
-            if !has_checkout && !script.is_empty() {
-                script.insert(
-                    0,
-                    "# [ForgeKeep] Repository is already checked out at /workspace".to_string(),
-                );
-            }
-
-            // Determine tags from runs-on
-            let tags = match &job.runs_on {
-                Some(serde_yaml::Value::String(s)) => Some(vec![s.clone()]),
-                Some(serde_yaml::Value::Sequence(arr)) => {
-                    let tags: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    if tags.is_empty() {
-                        None
-                    } else {
-                        Some(tags)
-                    }
+            // Handle `run:` commands
+            if let Some(ref run_cmd) = step.run {
+                // Copy step-level env
+                for (k, v) in &step.env {
+                    let expanded = substitute_expr(v, job_name, &self.env, &job_vars);
+                    script.push(format!("export {}={}", k, expanded));
                 }
-                _ => None,
-            };
 
-            // Determine stage
-            let s = job_stage.get(name).copied().unwrap_or(0);
-            let stage_name = format!("stage-{}", s);
+                // Substitute expressions in the command
+                let expanded_cmd = substitute_expr(run_cmd, job_name, &self.env, &job_vars);
+                script.push(expanded_cmd);
+            }
+        }
 
-            job_configs.insert(
-                name.clone(),
-                JobConfig {
-                    stage: Some(stage_name),
-                    script,
-                    image: job.container.as_ref().map(|c| c.image.clone()),
-                    only: None, // filtering is done at trigger time
-                    variables: if job_vars.is_empty() {
-                        None
-                    } else {
-                        Some(job_vars)
-                    },
-                    when: None,
-                    condition: job.condition.clone(),
-                    environment: job.environment.as_ref().and_then(environment_name),
-                    allow_failure: Some(job.continue_on_error),
-                    timeout_seconds: job
-                        .timeout_minutes
-                        .map(|minutes| minutes.saturating_mul(60)),
-                    tags,
-                    matrix: job.strategy.as_ref().map(|strategy| {
-                        strategy
-                            .matrix
-                            .iter()
-                            .map(|(key, values)| {
-                                let values = values.iter().filter_map(yaml_scalar_string).collect();
-                                (key.clone(), values)
-                            })
-                            .collect()
-                    }),
-                    cache,
-                },
+        // If no checkout step was found, add a comment
+        if !has_checkout && !script.is_empty() {
+            script.insert(
+                0,
+                "# [ForgeKeep] Repository is already checked out at /workspace".to_string(),
             );
         }
 
-        CiConfig {
-            stages: Some(stages),
-            concurrency: self.concurrency.as_ref().map(|c| ConcurrencyConfig {
-                group: c.group.clone(),
-                cancel_in_progress: c.cancel_in_progress.unwrap_or(false),
-            }),
-            jobs: job_configs,
+        (script, job_vars, cache)
+    }
+}
+
+/// Map a job's `runs-on` value to ForgeKeep runner tags: a scalar becomes a
+/// single tag, a sequence becomes the list of its string entries. Returns
+/// `None` when absent, non-string, or an empty sequence.
+fn runs_on_tags(runs_on: &Option<serde_yaml::Value>) -> Option<Vec<String>> {
+    match runs_on {
+        Some(serde_yaml::Value::String(s)) => Some(vec![s.clone()]),
+        Some(serde_yaml::Value::Sequence(arr)) => {
+            let tags: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if tags.is_empty() {
+                None
+            } else {
+                Some(tags)
+            }
         }
+        _ => None,
     }
 }
 

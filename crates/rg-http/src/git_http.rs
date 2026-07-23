@@ -702,34 +702,263 @@ fn tag_protection_rejected_refs(
         .collect()
 }
 
+/// Section 0 of the post-push hook (branch updates only): refresh open-PR head
+/// SHAs, run the auto-merge / merge-queue evaluations for the new commit, and
+/// emit the protected-branch acceptance audit log.
+async fn post_push_branch_maintenance(
+    params: &PostPushParams<'_>,
+    repo_id: i64,
+    branch_name: &str,
+    update: &rg_git::protocol::receive_pack::RefUpdate,
+) {
+    if !update.new_sha.chars().all(|character| character == '0') {
+        match rg_db::ops::pull_request_ops::update_open_head_sha(
+            params.db,
+            repo_id,
+            branch_name,
+            &update.new_sha,
+        )
+        .await
+        {
+            Ok(_) => {
+                if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
+                    params.db,
+                    params.repo_root,
+                    repo_id,
+                    &update.new_sha,
+                )
+                .await
+                {
+                    tracing::warn!(%error, "auto-merge evaluation after push failed");
+                }
+                if let Err(error) =
+                    rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
+                        params.db,
+                        params.repo_root,
+                        repo_id,
+                        &update.new_sha,
+                        &rg_core::pull_request::merge_queue::MergeQueueCi {
+                            trigger: params.ci_engine,
+                            docker_enabled: params.docker_enabled,
+                            external_runners: params.external_runners,
+                            allow_host_runner: params.allow_host_runner,
+                            jwt_secret: Some(params.jwt_secret),
+                            external_url: params.external_url,
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "merge queue evaluation after push failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to refresh PR head SHA after push")
+            }
+        }
+    }
+    match rg_db::ops::protected_branch_ops::find_by_repo_and_branch(params.db, repo_id, branch_name)
+        .await
+    {
+        Ok(Some(_protection)) => {
+            tracing::info!(
+                branch = %branch_name,
+                "Post-push: protected branch update accepted by pre-receive rules"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to check branch protection");
+        }
+        _ => {}
+    }
+}
+
+/// Section 1 of the post-push hook: trigger a CI pipeline when a
+/// `.forgekeep-ci.yml` is present at the pushed commit, then fan out the
+/// real-time owner notification and the optional SMTP email.
+async fn trigger_ci_for_push(
+    params: &PostPushParams<'_>,
+    repo_id: i64,
+    repo_owner_id: i64,
+    update: &rg_git::protocol::receive_pack::RefUpdate,
+) {
+    if !params.ci_engine.has_ci_config(params.repo_path, &update.new_sha) {
+        return;
+    }
+    let pipeline_id = match params
+        .ci_engine
+        .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
+            db: params.db,
+            repo_path: params.repo_path,
+            repo_id,
+            commit_sha: &update.new_sha,
+            ref_name: &update.refname,
+            trigger_type: "push",
+            triggered_by: None,
+            docker_enabled: params.docker_enabled,
+            external_runners: params.external_runners,
+            allow_host_runner: params.allow_host_runner,
+            jwt_secret: Some(params.jwt_secret),
+            external_url: params.external_url,
+        })
+        .await
+    {
+        Ok(pipeline_id) => pipeline_id,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to trigger CI pipeline");
+            return;
+        }
+    };
+
+    tracing::info!(pipeline_id, "CI pipeline triggered");
+
+    // Push real-time notification to repo owner
+    ws::push_notification(
+        params.notification_hub,
+        repo_owner_id,
+        "ci_triggered",
+        serde_json::json!({
+            "pipeline_id": pipeline_id,
+            "repo": format!("{}/{}", params.owner, params.repo_name),
+            "ref": update.refname,
+            "commit": update.new_sha,
+        }),
+    );
+
+    // Send email notification if SMTP is configured
+    if let Some(smtp) = params.smtp_config {
+        if let Ok(Some(owner_user)) =
+            rg_db::ops::user_ops::find_by_id(params.db, repo_owner_id).await
+        {
+            let subject = format!(
+                "[ForgeKeep] CI pipeline #{} triggered for {}/{}",
+                pipeline_id, params.owner, params.repo_name
+            );
+            let body = format!(
+                "A CI pipeline has been triggered for repository {}/{} on branch {}.<br/><br/>Commit: {}<br/>Pipeline ID: {}",
+                params.owner, params.repo_name, update.refname, update.new_sha, pipeline_id
+            );
+            if let Err(e) = rg_core::email::send_html_notification(
+                smtp,
+                &owner_user.email,
+                &subject,
+                &body,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "Failed to send CI notification email");
+            }
+        }
+    }
+}
+
+/// Sections 2–3 of the post-push hook: fire the generic `push` webhook, the
+/// branch/tag create/delete webhooks, and the real-time push notification.
+async fn trigger_push_webhooks(
+    params: &PostPushParams<'_>,
+    repo_id: i64,
+    repo_owner_id: i64,
+    update: &rg_git::protocol::receive_pack::RefUpdate,
+) {
+    // 2. Trigger push webhook
+    let payload = serde_json::json!({
+        "ref": update.refname,
+        "before": update.old_sha,
+        "after": update.new_sha,
+        "repository": {
+            "owner": params.owner,
+            "name": params.repo_name,
+        },
+    });
+
+    if let Err(e) =
+        rg_core::webhook::service::trigger_event(params.db, repo_id, "push", &payload).await
+    {
+        tracing::warn!(error = %e, "Failed to trigger push webhook");
+    }
+
+    // 3. Trigger branch/tag-specific webhooks
+    if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
+        if update.old_sha.is_empty()
+            || update.old_sha == "0000000000000000000000000000000000000000"
+        {
+            // New branch created
+            if let Err(e) =
+                rg_core::webhook::service::trigger_branch_created(params.db, repo_id, branch_name)
+                    .await
+            {
+                tracing::warn!(
+                    "Failed to trigger branch.created webhook for {}: {e}",
+                    branch_name
+                );
+            }
+        } else if update.new_sha.is_empty()
+            || update.new_sha == "0000000000000000000000000000000000000000"
+        {
+            // Branch deleted
+            if let Err(e) =
+                rg_core::webhook::service::trigger_branch_deleted(params.db, repo_id, branch_name)
+                    .await
+            {
+                tracing::warn!(
+                    "Failed to trigger branch.deleted webhook for {}: {e}",
+                    branch_name
+                );
+            }
+        }
+    } else if let Some(tag_name) = update.refname.strip_prefix("refs/tags/") {
+        if update.old_sha.is_empty()
+            || update.old_sha == "0000000000000000000000000000000000000000"
+        {
+            // New tag created
+            if let Err(e) =
+                rg_core::webhook::service::trigger_tag_created(params.db, repo_id, tag_name).await
+            {
+                tracing::warn!(
+                    "Failed to trigger tag.created webhook for {}: {e}",
+                    tag_name
+                );
+            }
+        } else if update.new_sha.is_empty()
+            || update.new_sha == "0000000000000000000000000000000000000000"
+        {
+            // Tag deleted
+            if let Err(e) =
+                rg_core::webhook::service::trigger_tag_deleted(params.db, repo_id, tag_name).await
+            {
+                tracing::warn!(
+                    "Failed to trigger tag.deleted webhook for {}: {e}",
+                    tag_name
+                );
+            }
+        }
+    }
+
+    // Push real-time notification for push event
+    ws::push_notification(
+        params.notification_hub,
+        repo_owner_id,
+        "push",
+        serde_json::json!({
+            "repo": format!("{}/{}", params.owner, params.repo_name),
+            "ref": update.refname,
+            "commit": update.new_sha,
+        }),
+    );
+}
+
 /// Post-push hook: trigger CI pipeline and webhook for push events.
 async fn post_push_hooks(
     params: &PostPushParams<'_>,
     ref_updates: &[rg_git::protocol::receive_pack::RefUpdate],
 ) {
-    let PostPushParams {
-        db,
-        repo_path,
-        repo_root,
-        owner,
-        repo_name,
-        docker_enabled,
-        external_runners,
-        allow_host_runner,
-        jwt_secret,
-        notification_hub,
-        smtp_config,
-        ci_engine,
-        external_url,
-    } = params;
-
     // Find repo_id from DB
-    let repo_model = find_repo_by_name(db, owner, repo_name).await;
+    let repo_model = find_repo_by_name(params.db, params.owner, params.repo_name).await;
 
     let (repo_id, repo_owner_id) = match repo_model {
         Ok(Some(r)) => (r.id, r.owner_id),
         _ => {
-            tracing::warn!(owner = %owner, repo = %repo_name, "Post-push: repo not found in DB, skipping hooks");
+            tracing::warn!(owner = %params.owner, repo = %params.repo_name, "Post-push: repo not found in DB, skipping hooks");
             return;
         }
     };
@@ -745,226 +974,16 @@ async fn post_push_hooks(
             "Post-push: triggering hooks"
         );
 
-        // 0. Branch protection audit: log if push targets a protected branch
+        // 0. PR head-SHA refresh + auto-merge/merge-queue + protected-branch audit
         if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
-            if !update.new_sha.chars().all(|character| character == '0') {
-                match rg_db::ops::pull_request_ops::update_open_head_sha(
-                    db,
-                    repo_id,
-                    branch_name,
-                    &update.new_sha,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
-                            db,
-                            repo_root,
-                            repo_id,
-                            &update.new_sha,
-                        )
-                        .await
-                        {
-                            tracing::warn!(%error, "auto-merge evaluation after push failed");
-                        }
-                        if let Err(error) =
-                            rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-                                db,
-                                repo_root,
-                                repo_id,
-                                &update.new_sha,
-                                &rg_core::pull_request::merge_queue::MergeQueueCi {
-                                    trigger: params.ci_engine,
-                                    docker_enabled: params.docker_enabled,
-                                    external_runners: params.external_runners,
-                                    allow_host_runner: params.allow_host_runner,
-                                    jwt_secret: Some(params.jwt_secret),
-                                    external_url: params.external_url,
-                                },
-                            )
-                            .await
-                        {
-                            tracing::warn!(%error, "merge queue evaluation after push failed");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to refresh PR head SHA after push")
-                    }
-                }
-            }
-            match rg_db::ops::protected_branch_ops::find_by_repo_and_branch(
-                db,
-                repo_id,
-                branch_name,
-            )
-            .await
-            {
-                Ok(Some(_protection)) => {
-                    tracing::info!(
-                        branch = %branch_name,
-                        "Post-push: protected branch update accepted by pre-receive rules"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to check branch protection");
-                }
-                _ => {}
-            }
+            post_push_branch_maintenance(params, repo_id, branch_name, update).await;
         }
 
         // 1. Trigger CI pipeline if .forgekeep-ci.yml exists
-        if ci_engine.has_ci_config(repo_path, &update.new_sha) {
-            match ci_engine
-                .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
-                    db,
-                    repo_path,
-                    repo_id,
-                    commit_sha: &update.new_sha,
-                    ref_name: &update.refname,
-                    trigger_type: "push",
-                    triggered_by: None,
-                    docker_enabled: *docker_enabled,
-                    external_runners: *external_runners,
-                    allow_host_runner: *allow_host_runner,
-                    jwt_secret: Some(jwt_secret),
-                    external_url: *external_url,
-                })
-                .await
-            {
-                Ok(pipeline_id) => {
-                    tracing::info!(pipeline_id, "CI pipeline triggered");
+        trigger_ci_for_push(params, repo_id, repo_owner_id, update).await;
 
-                    // Push real-time notification to repo owner
-                    ws::push_notification(
-                        notification_hub,
-                        repo_owner_id,
-                        "ci_triggered",
-                        serde_json::json!({
-                            "pipeline_id": pipeline_id,
-                            "repo": format!("{}/{}", owner, repo_name),
-                            "ref": update.refname,
-                            "commit": update.new_sha,
-                        }),
-                    );
-
-                    // Send email notification if SMTP is configured
-                    if let Some(smtp) = smtp_config {
-                        if let Ok(Some(owner_user)) =
-                            rg_db::ops::user_ops::find_by_id(db, repo_owner_id).await
-                        {
-                            let subject = format!(
-                                "[ForgeKeep] CI pipeline #{} triggered for {}/{}",
-                                pipeline_id, owner, repo_name
-                            );
-                            let body = format!(
-                                "A CI pipeline has been triggered for repository {}/{} on branch {}.<br/><br/>Commit: {}<br/>Pipeline ID: {}",
-                                owner, repo_name, update.refname, update.new_sha, pipeline_id
-                            );
-                            if let Err(e) = rg_core::email::send_html_notification(
-                                smtp,
-                                &owner_user.email,
-                                &subject,
-                                &body,
-                                None,
-                            )
-                            .await
-                            {
-                                tracing::warn!(error = %e, "Failed to send CI notification email");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to trigger CI pipeline");
-                }
-            }
-        }
-
-        // 2. Trigger push webhook
-        let payload = serde_json::json!({
-            "ref": update.refname,
-            "before": update.old_sha,
-            "after": update.new_sha,
-            "repository": {
-                "owner": owner,
-                "name": repo_name,
-            },
-        });
-
-        if let Err(e) =
-            rg_core::webhook::service::trigger_event(db, repo_id, "push", &payload).await
-        {
-            tracing::warn!(error = %e, "Failed to trigger push webhook");
-        }
-
-        // 3. Trigger branch/tag-specific webhooks
-        if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
-            if update.old_sha.is_empty()
-                || update.old_sha == "0000000000000000000000000000000000000000"
-            {
-                // New branch created
-                if let Err(e) =
-                    rg_core::webhook::service::trigger_branch_created(db, repo_id, branch_name)
-                        .await
-                {
-                    tracing::warn!(
-                        "Failed to trigger branch.created webhook for {}: {e}",
-                        branch_name
-                    );
-                }
-            } else if update.new_sha.is_empty()
-                || update.new_sha == "0000000000000000000000000000000000000000"
-            {
-                // Branch deleted
-                if let Err(e) =
-                    rg_core::webhook::service::trigger_branch_deleted(db, repo_id, branch_name)
-                        .await
-                {
-                    tracing::warn!(
-                        "Failed to trigger branch.deleted webhook for {}: {e}",
-                        branch_name
-                    );
-                }
-            }
-        } else if let Some(tag_name) = update.refname.strip_prefix("refs/tags/") {
-            if update.old_sha.is_empty()
-                || update.old_sha == "0000000000000000000000000000000000000000"
-            {
-                // New tag created
-                if let Err(e) =
-                    rg_core::webhook::service::trigger_tag_created(db, repo_id, tag_name).await
-                {
-                    tracing::warn!(
-                        "Failed to trigger tag.created webhook for {}: {e}",
-                        tag_name
-                    );
-                }
-            } else if update.new_sha.is_empty()
-                || update.new_sha == "0000000000000000000000000000000000000000"
-            {
-                // Tag deleted
-                if let Err(e) =
-                    rg_core::webhook::service::trigger_tag_deleted(db, repo_id, tag_name).await
-                {
-                    tracing::warn!(
-                        "Failed to trigger tag.deleted webhook for {}: {e}",
-                        tag_name
-                    );
-                }
-            }
-        }
-
-        // Push real-time notification for push event
-        ws::push_notification(
-            notification_hub,
-            repo_owner_id,
-            "push",
-            serde_json::json!({
-                "repo": format!("{}/{}", owner, repo_name),
-                "ref": update.refname,
-                "commit": update.new_sha,
-            }),
-        );
+        // 2-3. Push + branch/tag webhooks and the real-time notification
+        trigger_push_webhooks(params, repo_id, repo_owner_id, update).await;
     }
 }
 
