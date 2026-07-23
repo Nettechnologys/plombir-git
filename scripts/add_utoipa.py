@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auto-generate utoipa::path annotations for IronForge API handlers.
+"""Auto-generate utoipa::path annotations for ForgeKeep API handlers.
 
 Reads route definitions from lib.rs, maps handler names to (method, path),
 then adds utoipa::path annotations to handlers that don't have them.
@@ -8,7 +8,8 @@ import re
 import os
 import sys
 
-BASE = "/Users/yuqu/Vbercodeing/ironforge/crates/rg-http/src/api"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE = os.path.join(REPO_ROOT, "crates/rg-http/src/api")
 
 # Module → Tag mapping
 MODULE_TAGS = {

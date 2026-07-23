@@ -40,9 +40,9 @@ function runCommand(cmd, args, env = {}) {
       'rg-cli',
     ], {});
 
-    await runCommand('mkdir', ['-p', '/tmp/ironforge-codex-automation/repos']);
+    await runCommand('mkdir', ['-p', '/tmp/forgekeep-codex-automation/repos']);
 
-    const dbPath = '/tmp/ironforge-codex-smoke.db';
+    const dbPath = '/tmp/forgekeep-codex-smoke.db';
     ['', '-shm', '-wal'].forEach((suffix) => {
       try {
         fs.rmSync(`${dbPath}${suffix}`, { force: true });
@@ -51,13 +51,13 @@ function runCommand(cmd, args, env = {}) {
       }
     });
 
-    const serverLog = '/tmp/ironforge-codex-server.log';
+    const serverLog = '/tmp/forgekeep-codex-server.log';
 
     server = spawn('./target/release/forgekeep', [
       'serve',
-      '--repo-root', '/tmp/ironforge-codex-automation/repos',
+      '--repo-root', '/tmp/forgekeep-codex-automation/repos',
       '--http-addr', '127.0.0.1:18080',
-      '--db-url', `sqlite:////tmp/ironforge-codex-smoke.db?mode=rwc`,
+      '--db-url', `sqlite:////tmp/forgekeep-codex-smoke.db?mode=rwc`,
     ], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
