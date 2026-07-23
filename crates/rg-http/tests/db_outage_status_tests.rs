@@ -42,3 +42,34 @@ async fn db_outage_in_handler_returns_503_not_500() {
         "database outage must map to 503, not 500"
     );
 }
+
+/// Peripheral of the same class (card_2e5ab5773b6f): the package-registry
+/// handlers converted DB errors through a local `err()` helper (which stringifies
+/// into `AppError::internal` → 500) instead of `AppError::from`, and their shared
+/// `resolve_repo` gateway used `.map_err(AppError::internal)`. A DB outage on a
+/// packages route (here `list_packages`, whose first action is the `resolve_repo`
+/// DB lookup) must now surface as 503, not 500.
+#[tokio::test]
+async fn db_outage_in_packages_handler_returns_503_not_500() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    let state = build_test_app_state(db.clone(), repo_root);
+
+    // Close the pool to simulate a connection-level outage.
+    db.close().await.expect("close pool");
+
+    let response = rg_http::api::packages::list_packages(
+        State(state),
+        axum::http::HeaderMap::new(),
+        Path(("owner".to_string(), "repo".to_string(), "cargo".to_string())),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "database outage on a packages route must map to 503, not 500"
+    );
+}

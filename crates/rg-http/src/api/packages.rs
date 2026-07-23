@@ -121,7 +121,13 @@ async fn resolve_repo(
 ) -> Result<rg_db::entities::repository::Model, AppError> {
     rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
         .await
-        .map_err(AppError::internal)?
+        // A DB-outage here must classify as 503 (retryable), not 500: route the
+        // anyhow error through `AppError::from` (which downcasts to `DbErr` and
+        // maps connection-level failures to `ServiceUnavailable`) rather than
+        // the blanket `AppError::internal`. `resolve_repo` is the first DB call
+        // of nearly every packages route, so a 500 here would mask the outage
+        // classification the per-handler error arms provide.
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("repository not found"))
 }
 
@@ -315,7 +321,7 @@ pub async fn publish(
             )
                 .into_response()
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -388,7 +394,7 @@ pub async fn list_registries(
                 .collect(),
         })
         .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -420,7 +426,7 @@ pub async fn list_packages(
         .await
     {
         Ok(packages) => Json(PackageListResponse { packages }).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -586,7 +592,7 @@ pub async fn delete_version(
     .await
     {
         Ok(_) => (StatusCode::NO_CONTENT,).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -617,7 +623,7 @@ pub async fn yank_version(
             Json(serde_json::json!({"yanked": body.yank})),
         )
             .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -1038,7 +1044,7 @@ pub async fn nuget_search(
             .await
         {
             Ok(p) => p,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+            Err(e) => return AppError::from(e).into_response(),
         };
 
     let mut results: Vec<rg_core::package_registry::NuGetSearchResult> = Vec::new();
@@ -1250,7 +1256,7 @@ pub async fn helm_index(
             .await
         {
             Ok(p) => p,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+            Err(e) => return AppError::from(e).into_response(),
         };
 
     let mut entries: Vec<rg_core::package_registry::HelmIndexEntry> = Vec::new();
