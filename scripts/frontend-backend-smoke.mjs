@@ -255,7 +255,7 @@ if (ADMIN_TOKEN) {
       return hasObject(body)
         && Number.isInteger(body.total)
         && Number.isInteger(body.page)
-        && Number.isInteger(body.page_size)
+        && Number.isInteger(body.per_page)
         && hasArray(body.logs);
     },
   );

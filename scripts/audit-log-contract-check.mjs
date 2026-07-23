@@ -27,8 +27,9 @@ if (!/pub async fn list_audit_logs/.test(backend) || !/pub async fn get_audit_lo
   failures.push('Backend audit API must keep list and detail handlers');
 }
 
-if (!/page_size:\s*Option<u64>/.test(backend) || !/logs:\s*Vec<AuditLogEntry>/.test(backend)) {
-  failures.push('Backend audit list contract must return page_size and logs');
+// L-4: query param standardized to `per_page` (legacy `page_size` kept only as a serde alias).
+if (!/per_page:\s*Option<u64>/.test(backend) || !/logs:\s*Vec<AuditLogEntry>/.test(backend)) {
+  failures.push('Backend audit list contract must accept per_page and return logs');
 }
 
 if (!/listAuditLogs:\s*\(query\?:\s*AuditLogQuery\)\s*=>[\s\S]*request<AuditLogResponse>\(`\/admin\/audit\/logs/.test(client)) {
