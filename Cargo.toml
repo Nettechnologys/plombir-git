@@ -18,6 +18,15 @@ resolver = "2"
 [workspace.package]
 license = "MIT"
 
+# Regression guard for CWE-833: holding a non-async lock guard across an `.await`
+# blocks the tokio worker and risks deadlock/DoS. clippy already warns on this by
+# default; deny it workspace-wide so `cargo clippy` fails instead of merely
+# warning. Covers std/parking_lot Mutex+RwLock guards and RefCell refs held over
+# await. Every crate opts in via `[lints] workspace = true`.
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
 [workspace.dependencies]
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }

@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+
+[lints]
+workspace = true

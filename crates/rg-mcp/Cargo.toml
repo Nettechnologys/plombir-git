@@ -32,3 +32,6 @@ tracing-subscriber = { workspace = true }
 
 # Env / Config
 dotenv = "0.15"
+
+[lints]
+workspace = true
