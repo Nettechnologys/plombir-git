@@ -12,6 +12,9 @@ use utoipa::ToSchema;
 use super::repo_access::{require_authenticated_read, require_read, require_write};
 use crate::error::AppError;
 use crate::AppState;
+use rg_db::entities::{
+    merge_queue_entry, pr_event, pr_review, pr_reviewer_request, pull_request, review_comment,
+};
 
 // ── Request / Response types ──────────────────────────────────────────
 
@@ -512,11 +515,34 @@ pub async fn get_review_timeline(
         Ok(pr) => pr,
         Err(error) => return AppError::not_found(error.to_string()).into_response(),
     };
-    let persisted_events = match rg_db::ops::pr_event_ops::list_by_pr(&state.db, pr.id).await {
-        Ok(events) => events,
-        Err(error) => return AppError::internal(error).into_response(),
+    let data = match load_timeline_data(&state.db, pr).await {
+        Ok(data) => data,
+        Err(response) => return response,
     };
-    let persisted_events = persisted_events
+    let timeline = build_review_timeline(data);
+    (StatusCode::OK, Json(timeline)).into_response()
+}
+
+/// Everything the review timeline is assembled from, fetched up front.
+struct TimelineData {
+    pr: pull_request::Model,
+    persisted_events: Vec<(pr_event::Model, serde_json::Value)>,
+    reviews: Vec<pr_review::Model>,
+    comments: Vec<review_comment::Model>,
+    reviewer_requests: Vec<pr_reviewer_request::Model>,
+    queue_entry: Option<merge_queue_entry::Model>,
+    users: HashMap<i64, String>,
+}
+
+/// Load every source the timeline draws from for one PR. Any DB error is mapped
+/// to the same `Response` the handler would have returned inline.
+async fn load_timeline_data(
+    db: &sea_orm::DatabaseConnection,
+    pr: pull_request::Model,
+) -> Result<TimelineData, axum::response::Response> {
+    let persisted_events = rg_db::ops::pr_event_ops::list_by_pr(db, pr.id)
+        .await
+        .map_err(|error| AppError::internal(error).into_response())?
         .into_iter()
         .map(|event| {
             let metadata =
@@ -524,24 +550,57 @@ pub async fn get_review_timeline(
             (event, metadata)
         })
         .collect::<Vec<_>>();
-    let reviews = match rg_db::ops::pr_review_ops::list_by_pr(&state.db, pr.id).await {
-        Ok(reviews) => reviews,
-        Err(error) => return AppError::internal(error).into_response(),
-    };
-    let comments = match rg_db::ops::review_comment_ops::list_by_pr(&state.db, pr.id).await {
-        Ok(comments) => comments,
-        Err(error) => return AppError::internal(error).into_response(),
-    };
-    let reviewer_requests =
-        match rg_db::ops::pr_reviewer_request_ops::list_by_pr(&state.db, pr.id).await {
-            Ok(requests) => requests,
-            Err(error) => return AppError::internal(error).into_response(),
-        };
-    let queue_entry = match rg_db::ops::merge_queue_ops::find_by_pr(&state.db, pr.id).await {
-        Ok(entry) => entry,
-        Err(error) => return AppError::internal(error).into_response(),
-    };
+    let reviews = rg_db::ops::pr_review_ops::list_by_pr(db, pr.id)
+        .await
+        .map_err(|error| AppError::internal(error).into_response())?;
+    let comments = rg_db::ops::review_comment_ops::list_by_pr(db, pr.id)
+        .await
+        .map_err(|error| AppError::internal(error).into_response())?;
+    let reviewer_requests = rg_db::ops::pr_reviewer_request_ops::list_by_pr(db, pr.id)
+        .await
+        .map_err(|error| AppError::internal(error).into_response())?;
+    let queue_entry = rg_db::ops::merge_queue_ops::find_by_pr(db, pr.id)
+        .await
+        .map_err(|error| AppError::internal(error).into_response())?;
 
+    let actor_ids = collect_timeline_actor_ids(
+        &pr,
+        &persisted_events,
+        &reviews,
+        &comments,
+        &reviewer_requests,
+        &queue_entry,
+    );
+    let users = rg_db::entities::user::Entity::find()
+        .filter(rg_db::entities::user::Column::Id.is_in(actor_ids))
+        .all(db)
+        .await
+        .map_err(|error| AppError::internal(error).into_response())?
+        .into_iter()
+        .map(|user| (user.id, user.username))
+        .collect::<HashMap<_, _>>();
+
+    Ok(TimelineData {
+        pr,
+        persisted_events,
+        reviews,
+        comments,
+        reviewer_requests,
+        queue_entry,
+        users,
+    })
+}
+
+/// Gather every user id referenced anywhere in the timeline so their usernames
+/// can be resolved in a single query.
+fn collect_timeline_actor_ids(
+    pr: &pull_request::Model,
+    persisted_events: &[(pr_event::Model, serde_json::Value)],
+    reviews: &[pr_review::Model],
+    comments: &[review_comment::Model],
+    reviewer_requests: &[pr_reviewer_request::Model],
+    queue_entry: &Option<merge_queue_entry::Model>,
+) -> HashSet<i64> {
     let mut actor_ids = HashSet::from([pr.author_id]);
     actor_ids.extend(
         persisted_events
@@ -549,222 +608,282 @@ pub async fn get_review_timeline(
             .filter_map(|(event, _)| event.actor_id),
     );
     actor_ids.extend(reviews.iter().map(|review| review.reviewer_id));
-    for comment in &comments {
+    for comment in comments {
         actor_ids.insert(comment.author_id);
         actor_ids.extend(comment.suggestion_applied_by_id);
         actor_ids.extend(comment.resolved_by_id);
     }
-    for request in &reviewer_requests {
+    for request in reviewer_requests {
         actor_ids.insert(request.reviewer_id);
         actor_ids.insert(request.requested_by_id);
     }
     actor_ids.extend(pr.auto_merge_enabled_by_id);
-    if let Some(entry) = &queue_entry {
+    if let Some(entry) = queue_entry {
         actor_ids.insert(entry.enqueued_by_id);
     }
-    let users = match rg_db::entities::user::Entity::find()
-        .filter(rg_db::entities::user::Column::Id.is_in(actor_ids))
-        .all(&state.db)
-        .await
-    {
-        Ok(users) => users
-            .into_iter()
-            .map(|user| (user.id, user.username))
-            .collect::<HashMap<_, _>>(),
-        Err(error) => return AppError::internal(error).into_response(),
+    actor_ids
+}
+
+/// Assemble the ordered timeline from the pre-loaded data.
+fn build_review_timeline(data: TimelineData) -> Vec<ReviewTimelineEvent> {
+    let TimelineData {
+        pr,
+        persisted_events,
+        reviews,
+        comments,
+        reviewer_requests,
+        queue_entry,
+        users,
+    } = data;
+    let mut builder = TimelineBuilder {
+        persisted_events,
+        users,
+        timeline: Vec::new(),
     };
-    let actor = |id: i64| {
-        users.get(&id).map(|username| TimelineActor {
+    builder.push_opened(&pr);
+    builder.push_reviews(reviews);
+    builder.push_comments(comments);
+    builder.push_reviewer_requests(reviewer_requests);
+    builder.push_lifecycle(&pr, queue_entry);
+    builder.finish()
+}
+
+/// Accumulates synthetic + persisted timeline events, sharing the actor lookup
+/// and "was this already persisted?" checks across all event sources.
+struct TimelineBuilder {
+    persisted_events: Vec<(pr_event::Model, serde_json::Value)>,
+    users: HashMap<i64, String>,
+    timeline: Vec<ReviewTimelineEvent>,
+}
+
+impl TimelineBuilder {
+    fn actor(&self, id: i64) -> Option<TimelineActor> {
+        self.users.get(&id).map(|username| TimelineActor {
             id,
             username: username.clone(),
         })
-    };
+    }
 
-    let has_event = |kind: &str| {
-        persisted_events
+    fn has_event(&self, kind: &str) -> bool {
+        self.persisted_events
             .iter()
             .any(|(event, _)| event.event_type == kind)
-    };
-    let has_resource_event = |kind: &str, field: &str, id: i64| {
-        persisted_events.iter().any(|(event, metadata)| {
+    }
+
+    fn has_resource_event(&self, kind: &str, field: &str, id: i64) -> bool {
+        self.persisted_events.iter().any(|(event, metadata)| {
             event.event_type == kind
                 && metadata.get(field).and_then(|value| value.as_i64()) == Some(id)
         })
-    };
-    let mut timeline = Vec::new();
-    if !has_event("pull_request_opened") {
-        timeline.push(ReviewTimelineEvent {
+    }
+
+    fn push_opened(&mut self, pr: &pull_request::Model) {
+        if self.has_event("pull_request_opened") {
+            return;
+        }
+        let actor = self.actor(pr.author_id);
+        self.timeline.push(ReviewTimelineEvent {
             id: format!("pr:{}:opened", pr.id),
             kind: "pull_request_opened".to_string(),
-            actor: actor(pr.author_id),
+            actor,
             created_at: pr.created_at,
             body: pr.body.clone(),
             metadata: serde_json::json!({"title": pr.title, "head_sha": pr.head_sha}),
         });
     }
-    for review in reviews {
-        let kind = format!("review_{}", review.action);
-        if has_resource_event(&kind, "review_id", review.id) {
-            continue;
+
+    fn push_reviews(&mut self, reviews: Vec<pr_review::Model>) {
+        for review in reviews {
+            let kind = format!("review_{}", review.action);
+            if self.has_resource_event(&kind, "review_id", review.id) {
+                continue;
+            }
+            let actor = self.actor(review.reviewer_id);
+            self.timeline.push(ReviewTimelineEvent {
+                id: format!("review:{}", review.id),
+                kind,
+                actor,
+                created_at: review.created_at,
+                body: review.body,
+                metadata: serde_json::json!({"commit_id": review.commit_id}),
+            });
         }
-        timeline.push(ReviewTimelineEvent {
-            id: format!("review:{}", review.id),
-            kind,
-            actor: actor(review.reviewer_id),
-            created_at: review.created_at,
-            body: review.body,
-            metadata: serde_json::json!({"commit_id": review.commit_id}),
-        });
     }
-    for comment in comments {
-        let comment_kind = if comment.reply_to_id.is_some() {
-            "review_reply"
-        } else if comment.suggestion.is_some() {
-            "code_suggestion"
-        } else {
-            "review_comment"
-        };
-        if !has_resource_event(comment_kind, "comment_id", comment.id) {
-            timeline.push(ReviewTimelineEvent {
-                id: format!("comment:{}", comment.id),
-                kind: comment_kind.to_string(),
-                actor: actor(comment.author_id),
-                created_at: comment.created_at,
-                body: Some(comment.body.clone()),
+
+    fn push_comments(&mut self, comments: Vec<review_comment::Model>) {
+        for comment in comments {
+            let comment_kind = if comment.reply_to_id.is_some() {
+                "review_reply"
+            } else if comment.suggestion.is_some() {
+                "code_suggestion"
+            } else {
+                "review_comment"
+            };
+            if !self.has_resource_event(comment_kind, "comment_id", comment.id) {
+                let actor = self.actor(comment.author_id);
+                self.timeline.push(ReviewTimelineEvent {
+                    id: format!("comment:{}", comment.id),
+                    kind: comment_kind.to_string(),
+                    actor,
+                    created_at: comment.created_at,
+                    body: Some(comment.body.clone()),
+                    metadata: serde_json::json!({
+                        "comment_id": comment.id,
+                        "path": comment.path,
+                        "start_line": comment.start_line,
+                        "line": comment.line,
+                        "side": comment.side,
+                        "reply_to_id": comment.reply_to_id
+                    }),
+                });
+            }
+            if let (Some(applied_at), Some(applied_by_id)) = (
+                comment.suggestion_applied_at,
+                comment.suggestion_applied_by_id,
+            ) {
+                if !self.has_resource_event("suggestion_applied", "comment_id", comment.id) {
+                    let actor = self.actor(applied_by_id);
+                    self.timeline.push(ReviewTimelineEvent {
+                        id: format!("comment:{}:applied", comment.id),
+                        kind: "suggestion_applied".to_string(),
+                        actor,
+                        created_at: applied_at,
+                        body: None,
+                        metadata: serde_json::json!({
+                            "comment_id": comment.id,
+                            "commit_sha": comment.suggestion_commit_sha
+                        }),
+                    });
+                }
+            }
+            if let (Some(resolved_at), Some(resolved_by_id)) =
+                (comment.resolved_at, comment.resolved_by_id)
+            {
+                if !self.has_resource_event("thread_resolved", "comment_id", comment.id) {
+                    let actor = self.actor(resolved_by_id);
+                    self.timeline.push(ReviewTimelineEvent {
+                        id: format!("comment:{}:resolved", comment.id),
+                        kind: "thread_resolved".to_string(),
+                        actor,
+                        created_at: resolved_at,
+                        body: None,
+                        metadata: serde_json::json!({"comment_id": comment.id}),
+                    });
+                }
+            }
+        }
+    }
+
+    fn push_reviewer_requests(&mut self, reviewer_requests: Vec<pr_reviewer_request::Model>) {
+        for request in reviewer_requests {
+            if self.has_resource_event("reviewer_requested", "request_id", request.id) {
+                continue;
+            }
+            let actor = self.actor(request.requested_by_id);
+            let reviewer = self.users.get(&request.reviewer_id).cloned();
+            self.timeline.push(ReviewTimelineEvent {
+                id: format!("reviewer-request:{}", request.id),
+                kind: "reviewer_requested".to_string(),
+                actor,
+                created_at: request.created_at,
+                body: None,
                 metadata: serde_json::json!({
-                    "comment_id": comment.id,
-                    "path": comment.path,
-                    "start_line": comment.start_line,
-                    "line": comment.line,
-                    "side": comment.side,
-                    "reply_to_id": comment.reply_to_id
+                    "reviewer_id": request.reviewer_id,
+                    "reviewer": reviewer
                 }),
             });
         }
-        if let (Some(applied_at), Some(applied_by_id)) = (
-            comment.suggestion_applied_at,
-            comment.suggestion_applied_by_id,
-        ) {
-            if !has_resource_event("suggestion_applied", "comment_id", comment.id) {
-                timeline.push(ReviewTimelineEvent {
-                    id: format!("comment:{}:applied", comment.id),
-                    kind: "suggestion_applied".to_string(),
-                    actor: actor(applied_by_id),
-                    created_at: applied_at,
+    }
+
+    fn push_lifecycle(
+        &mut self,
+        pr: &pull_request::Model,
+        queue_entry: Option<merge_queue_entry::Model>,
+    ) {
+        if let (Some(enabled_at), Some(enabled_by_id)) =
+            (pr.auto_merge_enabled_at, pr.auto_merge_enabled_by_id)
+        {
+            if !self.has_event("auto_merge_enabled") {
+                let actor = self.actor(enabled_by_id);
+                self.timeline.push(ReviewTimelineEvent {
+                    id: format!("pr:{}:auto-merge", pr.id),
+                    kind: "auto_merge_enabled".to_string(),
+                    actor,
+                    created_at: enabled_at,
+                    body: None,
+                    metadata: serde_json::json!({"strategy": pr.auto_merge_strategy}),
+                });
+            }
+        }
+        if let Some(entry) = queue_entry {
+            if !self.has_resource_event("merge_queue_enqueued", "entry_id", entry.id) {
+                let actor = self.actor(entry.enqueued_by_id);
+                self.timeline.push(ReviewTimelineEvent {
+                    id: format!("queue:{}:enqueued", entry.id),
+                    kind: "merge_queue_enqueued".to_string(),
+                    actor,
+                    created_at: entry.created_at,
+                    body: None,
+                    metadata: serde_json::json!({"strategy": entry.strategy}),
+                });
+            }
+            if let Some(finished_at) = entry.finished_at {
+                let kind = format!("merge_queue_{}", entry.status);
+                if !self.has_resource_event(&kind, "entry_id", entry.id) {
+                    self.timeline.push(ReviewTimelineEvent {
+                        id: format!("queue:{}:{}", entry.id, entry.status),
+                        kind,
+                        actor: None,
+                        created_at: finished_at,
+                        body: entry.failure_reason,
+                        metadata: serde_json::json!({}),
+                    });
+                }
+            }
+        }
+        if let Some(closed_at) = pr.closed_at {
+            let kind = if pr.state == "merged" {
+                "pull_request_merged"
+            } else {
+                "pull_request_closed"
+            };
+            if !self.has_event(kind) {
+                self.timeline.push(ReviewTimelineEvent {
+                    id: format!("pr:{}:{}", pr.id, pr.state),
+                    kind: kind.to_string(),
+                    actor: None,
+                    created_at: closed_at,
                     body: None,
                     metadata: serde_json::json!({
-                        "comment_id": comment.id,
-                        "commit_sha": comment.suggestion_commit_sha
+                        "strategy": pr.merge_strategy,
+                        "commit_sha": pr.merge_commit_sha
                     }),
                 });
             }
         }
-        if let (Some(resolved_at), Some(resolved_by_id)) =
-            (comment.resolved_at, comment.resolved_by_id)
-        {
-            if !has_resource_event("thread_resolved", "comment_id", comment.id) {
-                timeline.push(ReviewTimelineEvent {
-                    id: format!("comment:{}:resolved", comment.id),
-                    kind: "thread_resolved".to_string(),
-                    actor: actor(resolved_by_id),
-                    created_at: resolved_at,
-                    body: None,
-                    metadata: serde_json::json!({"comment_id": comment.id}),
-                });
-            }
-        }
     }
-    for request in reviewer_requests {
-        if has_resource_event("reviewer_requested", "request_id", request.id) {
-            continue;
+
+    /// Append the raw persisted events, then sort the whole timeline.
+    fn finish(mut self) -> Vec<ReviewTimelineEvent> {
+        let persisted_events = std::mem::take(&mut self.persisted_events);
+        for (event, metadata) in persisted_events {
+            let actor = event.actor_id.and_then(|id| self.actor(id));
+            self.timeline.push(ReviewTimelineEvent {
+                id: format!("event:{}", event.id),
+                kind: event.event_type,
+                actor,
+                created_at: event.created_at,
+                body: event.body,
+                metadata,
+            });
         }
-        timeline.push(ReviewTimelineEvent {
-            id: format!("reviewer-request:{}", request.id),
-            kind: "reviewer_requested".to_string(),
-            actor: actor(request.requested_by_id),
-            created_at: request.created_at,
-            body: None,
-            metadata: serde_json::json!({
-                "reviewer_id": request.reviewer_id,
-                "reviewer": users.get(&request.reviewer_id)
-            }),
+        self.timeline.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
         });
+        self.timeline
     }
-    if let (Some(enabled_at), Some(enabled_by_id)) =
-        (pr.auto_merge_enabled_at, pr.auto_merge_enabled_by_id)
-    {
-        if !has_event("auto_merge_enabled") {
-            timeline.push(ReviewTimelineEvent {
-                id: format!("pr:{}:auto-merge", pr.id),
-                kind: "auto_merge_enabled".to_string(),
-                actor: actor(enabled_by_id),
-                created_at: enabled_at,
-                body: None,
-                metadata: serde_json::json!({"strategy": pr.auto_merge_strategy}),
-            });
-        }
-    }
-    if let Some(entry) = queue_entry {
-        if !has_resource_event("merge_queue_enqueued", "entry_id", entry.id) {
-            timeline.push(ReviewTimelineEvent {
-                id: format!("queue:{}:enqueued", entry.id),
-                kind: "merge_queue_enqueued".to_string(),
-                actor: actor(entry.enqueued_by_id),
-                created_at: entry.created_at,
-                body: None,
-                metadata: serde_json::json!({"strategy": entry.strategy}),
-            });
-        }
-        if let Some(finished_at) = entry.finished_at {
-            let kind = format!("merge_queue_{}", entry.status);
-            if !has_resource_event(&kind, "entry_id", entry.id) {
-                timeline.push(ReviewTimelineEvent {
-                    id: format!("queue:{}:{}", entry.id, entry.status),
-                    kind,
-                    actor: None,
-                    created_at: finished_at,
-                    body: entry.failure_reason,
-                    metadata: serde_json::json!({}),
-                });
-            }
-        }
-    }
-    if let Some(closed_at) = pr.closed_at {
-        let kind = if pr.state == "merged" {
-            "pull_request_merged"
-        } else {
-            "pull_request_closed"
-        };
-        if !has_event(kind) {
-            timeline.push(ReviewTimelineEvent {
-                id: format!("pr:{}:{}", pr.id, pr.state),
-                kind: kind.to_string(),
-                actor: None,
-                created_at: closed_at,
-                body: None,
-                metadata: serde_json::json!({
-                    "strategy": pr.merge_strategy,
-                    "commit_sha": pr.merge_commit_sha
-                }),
-            });
-        }
-    }
-    for (event, metadata) in persisted_events {
-        timeline.push(ReviewTimelineEvent {
-            id: format!("event:{}", event.id),
-            kind: event.event_type,
-            actor: event.actor_id.and_then(&actor),
-            created_at: event.created_at,
-            body: event.body,
-            metadata,
-        });
-    }
-    timeline.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    (StatusCode::OK, Json(timeline)).into_response()
 }
 
 /// Create a review comment.

@@ -430,6 +430,45 @@ pub struct ShallowRequest {
 ///   command-args...
 ///   0000 (flush)
 async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<CommandRequest> {
+    let (command, capabilities, args) = match read_command_frames(reader).await? {
+        CommandFrames::Flush => return Ok(CommandRequest::Flush),
+        CommandFrames::Command {
+            command,
+            capabilities,
+            args,
+        } => (command, capabilities, args),
+    };
+
+    let cmd = match command {
+        Some(c) => c,
+        None => return Ok(CommandRequest::Flush),
+    };
+
+    // Parse based on command type
+    match cmd.as_str() {
+        "ls-refs" => Ok(parse_ls_refs_args(&args)),
+        "fetch" => parse_fetch_args(&args, capabilities),
+        "object-info" => Ok(parse_object_info_args(&args, cmd)),
+        _ => Ok(CommandRequest::Unknown(cmd)),
+    }
+}
+
+/// Outcome of reading the framed header + args of a Protocol V2 command.
+enum CommandFrames {
+    /// An empty flush or response-end — the caller should return `Flush`.
+    Flush,
+    /// The parsed frames: the `command=` line, capabilities (header section),
+    /// and the args section (after the `0001` delimiter).
+    Command {
+        command: Option<String>,
+        capabilities: Vec<String>,
+        args: Vec<String>,
+    },
+}
+
+/// Read the pkt-line frames of one command request, splitting the header
+/// (command + capabilities) from the args section at the `0001` delimiter.
+async fn read_command_frames<R: AsyncRead + Unpin>(reader: &mut R) -> Result<CommandFrames> {
     let mut command = None;
     let mut capabilities = Vec::new();
     let mut args = Vec::new();
@@ -445,7 +484,7 @@ async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Co
                     break;
                 } else {
                     // Empty flush means end of commands
-                    return Ok(CommandRequest::Flush);
+                    return Ok(CommandFrames::Flush);
                 }
             }
             PktLine::Delim => {
@@ -453,7 +492,7 @@ async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Co
             }
             PktLine::ResponseEnd => {
                 // End of stateless response
-                return Ok(CommandRequest::Flush);
+                return Ok(CommandFrames::Flush);
             }
             PktLine::Data(bytes) => {
                 let line = String::from_utf8_lossy(&bytes);
@@ -474,119 +513,122 @@ async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Co
         }
     }
 
-    let cmd = match command {
-        Some(c) => c,
-        None => return Ok(CommandRequest::Flush),
-    };
+    Ok(CommandFrames::Command {
+        command,
+        capabilities,
+        args,
+    })
+}
 
-    // Parse based on command type
-    match cmd.as_str() {
-        "ls-refs" => {
-            let mut ref_patterns = Vec::new();
-            let mut peel = false;
-            let mut symrefs = false;
-            let mut unborn = false;
-            let mut server_options = Vec::new();
+/// Parse the args section of an `ls-refs` command.
+fn parse_ls_refs_args(args: &[String]) -> CommandRequest {
+    let mut ref_patterns = Vec::new();
+    let mut peel = false;
+    let mut symrefs = false;
+    let mut unborn = false;
+    let mut server_options = Vec::new();
 
-            for arg in &args {
-                if let Some(pattern) = arg.strip_prefix("ref-prefix ") {
-                    ref_patterns.push(pattern.to_string());
-                } else if *arg == "peel" {
-                    peel = true;
-                } else if *arg == "symrefs" {
-                    symrefs = true;
-                } else if *arg == "unborn" {
-                    unborn = true;
-                } else if let Some(opt) = arg.strip_prefix("server-option=") {
-                    server_options.push(opt.to_string());
-                }
-            }
-
-            Ok(CommandRequest::LsRefs {
-                ref_patterns,
-                peel,
-                symrefs,
-                unborn,
-                server_options,
-            })
+    for arg in args {
+        if let Some(pattern) = arg.strip_prefix("ref-prefix ") {
+            ref_patterns.push(pattern.to_string());
+        } else if *arg == "peel" {
+            peel = true;
+        } else if *arg == "symrefs" {
+            symrefs = true;
+        } else if *arg == "unborn" {
+            unborn = true;
+        } else if let Some(opt) = arg.strip_prefix("server-option=") {
+            server_options.push(opt.to_string());
         }
-        "fetch" => {
-            // Protocol V2 fetch: want/have/done are in the ARGS section (after 0001 delimiter),
-            // while capabilities are in the header section (before 0001 delimiter).
-            // Bug note: earlier version incorrectly parsed args from `capabilities`.
-            let mut wants = Vec::new();
-            let mut haves = Vec::new();
-            let mut shallows = Vec::new();
-            let mut deepen = None;
-            let mut deepen_relative = false;
-            let mut deepen_since = None;
-            let mut deepen_not = Vec::new();
-            let mut filter = None;
-            let mut done = false;
+    }
 
-            for arg in &args {
-                if let Some(want) = arg.strip_prefix("want ") {
-                    wants.push(want.to_string());
-                } else if let Some(have) = arg.strip_prefix("have ") {
-                    haves.push(have.to_string());
-                } else if let Some(shallow) = arg.strip_prefix("shallow ") {
-                    shallows.push(shallow.to_string());
-                } else if let Some(d) = arg.strip_prefix("deepen ") {
-                    deepen = Some(d.parse().context("invalid Protocol V2 deepen value")?);
-                } else if *arg == "deepen-relative" {
-                    deepen_relative = true;
-                } else if let Some(timestamp) = arg.strip_prefix("deepen-since ") {
-                    deepen_since = Some(
-                        timestamp
-                            .parse()
-                            .context("invalid Protocol V2 deepen-since value")?,
-                    );
-                } else if let Some(revision) = arg.strip_prefix("deepen-not ") {
-                    deepen_not.push(revision.to_string());
-                } else if let Some(f) = arg.strip_prefix("filter ") {
-                    filter = Some(f.to_string());
-                } else if *arg == "done" {
-                    done = true;
-                }
-            }
+    CommandRequest::LsRefs {
+        ref_patterns,
+        peel,
+        symrefs,
+        unborn,
+        server_options,
+    }
+}
 
-            // capabilities remain in the capabilities list (side-band, ofs-delta, etc.)
-            Ok(CommandRequest::Fetch {
-                wants,
-                haves,
-                shallow: ShallowRequest {
-                    shallows,
-                    deepen,
-                    deepen_relative,
-                    deepen_since,
-                    deepen_not,
-                },
-                filter,
-                done,
-                client_caps: capabilities,
-            })
+/// Parse the args section of a `fetch` command.
+///
+/// Protocol V2 fetch: want/have/done are in the ARGS section (after 0001 delimiter),
+/// while capabilities are in the header section (before 0001 delimiter).
+/// Bug note: earlier version incorrectly parsed args from `capabilities`.
+fn parse_fetch_args(args: &[String], capabilities: Vec<String>) -> Result<CommandRequest> {
+    let mut wants = Vec::new();
+    let mut haves = Vec::new();
+    let mut shallows = Vec::new();
+    let mut deepen = None;
+    let mut deepen_relative = false;
+    let mut deepen_since = None;
+    let mut deepen_not = Vec::new();
+    let mut filter = None;
+    let mut done = false;
+
+    for arg in args {
+        if let Some(want) = arg.strip_prefix("want ") {
+            wants.push(want.to_string());
+        } else if let Some(have) = arg.strip_prefix("have ") {
+            haves.push(have.to_string());
+        } else if let Some(shallow) = arg.strip_prefix("shallow ") {
+            shallows.push(shallow.to_string());
+        } else if let Some(d) = arg.strip_prefix("deepen ") {
+            deepen = Some(d.parse().context("invalid Protocol V2 deepen value")?);
+        } else if *arg == "deepen-relative" {
+            deepen_relative = true;
+        } else if let Some(timestamp) = arg.strip_prefix("deepen-since ") {
+            deepen_since = Some(
+                timestamp
+                    .parse()
+                    .context("invalid Protocol V2 deepen-since value")?,
+            );
+        } else if let Some(revision) = arg.strip_prefix("deepen-not ") {
+            deepen_not.push(revision.to_string());
+        } else if let Some(f) = arg.strip_prefix("filter ") {
+            filter = Some(f.to_string());
+        } else if *arg == "done" {
+            done = true;
         }
-        "object-info" => {
-            let mut oid = None;
-            let mut server_options = Vec::new();
+    }
 
-            for arg in &args {
-                if let Some(o) = arg.strip_prefix("oid ") {
-                    oid = Some(o.to_string());
-                } else if let Some(opt) = arg.strip_prefix("server-option=") {
-                    server_options.push(opt.to_string());
-                }
-            }
+    // capabilities remain in the capabilities list (side-band, ofs-delta, etc.)
+    Ok(CommandRequest::Fetch {
+        wants,
+        haves,
+        shallow: ShallowRequest {
+            shallows,
+            deepen,
+            deepen_relative,
+            deepen_since,
+            deepen_not,
+        },
+        filter,
+        done,
+        client_caps: capabilities,
+    })
+}
 
-            match oid {
-                Some(o) => Ok(CommandRequest::ObjectInfo {
-                    oid: o,
-                    server_options,
-                }),
-                None => Ok(CommandRequest::Unknown(cmd)),
-            }
+/// Parse the args section of an `object-info` command.
+fn parse_object_info_args(args: &[String], cmd: String) -> CommandRequest {
+    let mut oid = None;
+    let mut server_options = Vec::new();
+
+    for arg in args {
+        if let Some(o) = arg.strip_prefix("oid ") {
+            oid = Some(o.to_string());
+        } else if let Some(opt) = arg.strip_prefix("server-option=") {
+            server_options.push(opt.to_string());
         }
-        _ => Ok(CommandRequest::Unknown(cmd)),
+    }
+
+    match oid {
+        Some(o) => CommandRequest::ObjectInfo {
+            oid: o,
+            server_options,
+        },
+        None => CommandRequest::Unknown(cmd),
     }
 }
 

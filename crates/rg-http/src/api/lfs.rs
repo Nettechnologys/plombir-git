@@ -273,26 +273,9 @@ pub async fn download_object(
             Err(e) => return AppError::internal(e).into_response(),
         };
 
-    let signed = match verify_signed_action(
-        &state,
-        repo_model.id,
-        &oid,
-        rg_core::lfs::service::LfsActionKind::Download,
-        &query,
-    ) {
-        Ok(signed) => signed,
-        Err(error) => return error.into_response(),
-    };
-    if !signed && repo_model.is_private {
-        let user_id = match authenticated_user_id(&headers, &state) {
-            Ok(user_id) => user_id,
-            Err(error) => return error.into_response(),
-        };
-        match rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => return AppError::forbidden("access denied").into_response(),
-            Err(error) => return AppError::internal(error).into_response(),
-        }
+    if let Err(response) = authorize_lfs_download(&state, &repo_model, &oid, &query, &headers).await
+    {
+        return response;
     }
 
     let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);
@@ -311,104 +294,13 @@ pub async fn download_object(
             compressed: is_compressed,
         }) => {
             if is_compressed {
-                // Stream-decompress via channel: spawn_blocking reads zstd chunks → channel → response body
-                let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(8);
-                let path_for_thread = file_path.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    let file = match std::fs::File::open(&path_for_thread) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(e));
-                            return;
-                        }
-                    };
-                    let decoder = match zstd::stream::Decoder::new(file) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-                            return;
-                        }
-                    };
-                    let mut reader = std::io::BufReader::with_capacity(64 * 1024, decoder);
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        match reader.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if tx
-                                    .blocking_send(Ok(axum::body::Bytes::from(buf[..n].to_vec())))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.blocking_send(Err(e));
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-                let frame_stream =
-                    futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
-                let stream_body = http_body_util::StreamBody::new(frame_stream);
-                (
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                    Body::new(stream_body),
-                )
-                    .into_response()
+                stream_compressed_lfs_object(file_path)
             } else {
-                // Uncompressed file — stream directly
-                match tokio::fs::File::open(&file_path).await {
-                    Ok(file) => {
-                        let stream = tokio_util::io::ReaderStream::new(file);
-                        let frame_stream = futures::StreamExt::map(stream, |item| {
-                            item.map(http_body::Frame::data)
-                        });
-                        let stream_body = http_body_util::StreamBody::new(frame_stream);
-                        let estimated_size =
-                            std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-                        (
-                            StatusCode::OK,
-                            [
-                                (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-                                (
-                                    axum::http::header::CONTENT_LENGTH,
-                                    estimated_size.to_string().as_str(),
-                                ),
-                            ],
-                            Body::new(stream_body),
-                        )
-                            .into_response()
-                    }
-                    Err(_) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to open LFS object file",
-                    )
-                        .into_response(),
-                }
+                stream_uncompressed_lfs_object(&file_path).await
             }
         }
         Ok(rg_core::lfs::service::LfsObjectSource::Bytes { data, compressed }) => {
-            let body = if compressed {
-                match zstd::stream::decode_all(std::io::Cursor::new(data)) {
-                    Ok(decoded) => decoded,
-                    Err(error) => return AppError::internal(error).into_response(),
-                }
-            } else {
-                data
-            };
-            (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                body,
-            )
-                .into_response()
+            respond_with_lfs_bytes(data, compressed)
         }
         Err(e) => (
             StatusCode::NOT_FOUND,
@@ -417,6 +309,142 @@ pub async fn download_object(
         )
             .into_response(),
     }
+}
+
+/// Enforce download authorization: a valid signed action URL bypasses auth,
+/// otherwise a private repo requires an authenticated user with read access.
+async fn authorize_lfs_download(
+    state: &AppState,
+    repo_model: &rg_db::entities::repository::Model,
+    oid: &str,
+    query: &LfsActionQuery,
+    headers: &HeaderMap,
+) -> Result<(), axum::response::Response> {
+    let signed = match verify_signed_action(
+        state,
+        repo_model.id,
+        oid,
+        rg_core::lfs::service::LfsActionKind::Download,
+        query,
+    ) {
+        Ok(signed) => signed,
+        Err(error) => return Err(error.into_response()),
+    };
+    if !signed && repo_model.is_private {
+        let user_id = match authenticated_user_id(headers, state) {
+            Ok(user_id) => user_id,
+            Err(error) => return Err(error.into_response()),
+        };
+        match rg_core::repo::service::can_read_repo(&state.db, repo_model, Some(user_id)).await {
+            Ok(true) => {}
+            Ok(false) => return Err(AppError::forbidden("access denied").into_response()),
+            Err(error) => return Err(AppError::internal(error).into_response()),
+        }
+    }
+    Ok(())
+}
+
+/// Stream a zstd-compressed LFS object, decompressing on a blocking thread and
+/// piping decoded chunks through a channel into the response body.
+fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::response::Response {
+    // Stream-decompress via channel: spawn_blocking reads zstd chunks → channel → response body
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(8);
+    let path_for_thread = file_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let file = match std::fs::File::open(&path_for_thread) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        };
+        let decoder = match zstd::stream::Decoder::new(file) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+                return;
+            }
+        };
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, decoder);
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .blocking_send(Ok(axum::body::Bytes::from(buf[..n].to_vec())))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
+    let stream_body = http_body_util::StreamBody::new(frame_stream);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        Body::new(stream_body),
+    )
+        .into_response()
+}
+
+/// Stream an uncompressed LFS object file directly from disk.
+async fn stream_uncompressed_lfs_object(file_path: &std::path::Path) -> axum::response::Response {
+    match tokio::fs::File::open(file_path).await {
+        Ok(file) => {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let frame_stream =
+                futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
+            let stream_body = http_body_util::StreamBody::new(frame_stream);
+            let estimated_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        axum::http::header::CONTENT_LENGTH,
+                        estimated_size.to_string().as_str(),
+                    ),
+                ],
+                Body::new(stream_body),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to open LFS object file",
+        )
+            .into_response(),
+    }
+}
+
+/// Build the response for an in-memory LFS object, decompressing if needed.
+fn respond_with_lfs_bytes(data: Vec<u8>, compressed: bool) -> axum::response::Response {
+    let body = if compressed {
+        match zstd::stream::decode_all(std::io::Cursor::new(data)) {
+            Ok(decoded) => decoded,
+            Err(error) => return AppError::internal(error).into_response(),
+        }
+    } else {
+        data
+    };
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        body,
+    )
+        .into_response()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
