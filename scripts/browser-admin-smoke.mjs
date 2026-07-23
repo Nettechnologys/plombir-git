@@ -226,17 +226,30 @@ async function checkAdminRoute(route, hasToken) {
   const tab = await openTab(`${FRONTEND_URL}/login`);
 
   try {
-    // Ensure origin is loaded first so localStorage is writeable without
-    // triggering unrelated logged-out dashboard API calls.
+    // Ensure the origin is loaded first so the auth cookie is scoped to it
+    // without triggering unrelated logged-out dashboard API calls.
     await tab.send('Page.navigate', { url: `${FRONTEND_URL}/login` });
     await tab.waitForLoad();
     await sleep(300);
 
     if (hasToken) {
-      await tab.send('Runtime.evaluate', {
-        expression: `window.localStorage.setItem('ironforge_token', ${JSON.stringify(ADMIN_TOKEN)});`,
-        awaitPromise: true,
+      // Auth is cookie-based: the frontend no longer reads the token from
+      // localStorage — it relies on the HttpOnly `forgekeep_token` cookie the
+      // backend sets on login (crates/rg-http/src/api/auth.rs). Inject that
+      // cookie via CDP so fetchUser() (GET /users/me) and the notification
+      // WebSocket authenticate and the admin route becomes reachable.
+      const { success } = await tab.send('Network.setCookie', {
+        name: 'forgekeep_token',
+        value: ADMIN_TOKEN,
+        url: FRONTEND_URL,
+        path: '/',
+        httpOnly: true,
+        sameSite: 'Strict',
       });
+      if (!success) {
+        checks.push(`❌ admin route [${routeName}] ${route}: failed to set auth cookie`);
+        failed += 1;
+      }
       await sleep(200);
     }
 
