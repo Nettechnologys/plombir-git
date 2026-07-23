@@ -21,7 +21,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | SSH transport | ✅ | `rg-ssh/` (`russh`) | public-key auth |
 | Лимит размера тела git-запроса | ✅ 🔒 | `rg-http/src/routes.rs` | RequestBodyLimit на git-роутах |
 | git CLI gateway с timeout+kill | ✅ 🔒 | `rg-git/src/cli_gateway.rs` | синхронный `run()` — timeout + kill child (default 120s) |
-| Wall-clock bound на стриминг-пути (pack-objects/index-pack) | 🟡 🔒 | `rg-git/src/cli_gateway.rs::spawn_async` | только `kill_on_drop`; git_http-хендлеры НЕ оборачивают I/O в `timeout()` → см. card |
+| Wall-clock bound на стриминг-пути (pack-objects/index-pack) | ✅ 🔒 | `rg-http/src/git_http.rs::with_git_timeout` | upload-pack (V1+V2) и receive-pack обёрнуты в `tokio::time::timeout([timeouts].git_stream_secs, деф. 300, 0=off)`; по таймауту future дропается → `kill_on_drop` убивает git → 504 `GIT_TIMEOUT`. SSH-транспорт того же класса (`rg-ssh` exec spawn) пока не покрыт → см. card |
 
 ## 2. Аутентификация и авторизация
 

@@ -71,6 +71,7 @@ pub fn build_test_app_state(
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
         external_url: None,
         job_timeout_secs: 3600,
+        git_stream_timeout_secs: 300,
         ci_engine: Arc::new(NoopCiEngine),
     }
 }

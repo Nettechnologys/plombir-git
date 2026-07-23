@@ -17,6 +17,30 @@ use rg_core::branch_protection::push_rules::{
 use crate::pat_auth::extract_actor_id;
 use crate::{git_v2, ws, AppState};
 
+/// Wall-clock guard around a streaming git protocol handler.
+///
+/// The protocol handlers (`handle_upload_pack_http`, `handle_v2_http`,
+/// `handle_receive_pack_http_with_rejections`) spawn a `git` subprocess via
+/// [`rg_git::cli_gateway::GitCommandGateway::spawn_async`], which only sets
+/// `kill_on_drop(true)` and asks the caller to bound the I/O loop. Without a
+/// bound a hung or pathologically slow git process holds the connection +
+/// subprocess forever.
+///
+/// On timeout the inner future is dropped, which drops the `git` child held
+/// inside the handler → `kill_on_drop` kills the subprocess. Callers then map
+/// `Err(Elapsed)` to a `504 Gateway Timeout`.
+///
+/// `secs == 0` disables the bound (the future runs unbounded).
+async fn with_git_timeout<T>(
+    secs: u64,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    if secs == 0 {
+        return Ok(fut.await);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await
+}
+
 /// Check repository access for git protocol.
 ///
 /// - upload-pack (clone/fetch): can_read
@@ -354,8 +378,13 @@ pub(crate) async fn handle_git_upload_pack(
             output
         });
 
-        match rg_git::protocol::v2::handle_v2_http(&repo_path, pipe_read, &mut buf_writer).await {
-            Ok(()) => {
+        match with_git_timeout(
+            state.git_stream_timeout_secs,
+            rg_git::protocol::v2::handle_v2_http(&repo_path, pipe_read, &mut buf_writer),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
                 let _ = buf_writer.flush().await;
                 drop(buf_writer);
                 let output = reader_task.await.unwrap_or_default();
@@ -366,13 +395,27 @@ pub(crate) async fn handle_git_upload_pack(
                 )
                     .into_response()
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 drop(buf_writer);
                 reader_task.abort();
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(header::CONTENT_TYPE, "text/plain")],
                     Body::from(format!("error: {:#}", e)),
+                )
+                    .into_response()
+            }
+            Err(_elapsed) => {
+                drop(buf_writer);
+                reader_task.abort();
+                tracing::warn!(
+                    %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
+                    "git upload-pack (v2) exceeded wall-clock timeout — killed git, returning 504"
+                );
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from("git operation timed out"),
                 )
                     .into_response()
             }
@@ -393,14 +436,17 @@ pub(crate) async fn handle_git_upload_pack(
             output
         });
 
-        match rg_git::protocol::upload_pack::handle_upload_pack_http(
-            &repo_path,
-            pipe_read,
-            &mut buf_writer,
+        match with_git_timeout(
+            state.git_stream_timeout_secs,
+            rg_git::protocol::upload_pack::handle_upload_pack_http(
+                &repo_path,
+                pipe_read,
+                &mut buf_writer,
+            ),
         )
         .await
         {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 let _ = buf_writer.flush().await;
                 drop(buf_writer);
                 let output = reader_task.await.unwrap_or_default();
@@ -411,13 +457,27 @@ pub(crate) async fn handle_git_upload_pack(
                 )
                     .into_response()
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 drop(buf_writer);
                 reader_task.abort();
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(header::CONTENT_TYPE, "text/plain")],
                     Body::from(format!("error: {:#}", e)),
+                )
+                    .into_response()
+            }
+            Err(_elapsed) => {
+                drop(buf_writer);
+                reader_task.abort();
+                tracing::warn!(
+                    %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
+                    "git upload-pack exceeded wall-clock timeout — killed git, returning 504"
+                );
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from("git operation timed out"),
                 )
                     .into_response()
             }
@@ -537,16 +597,19 @@ pub(crate) async fn handle_git_receive_pack(
     let require_signed_refs = signed_commit_required_refs(&protection_rules);
     let mut rejected_refs = branch_protection_rejected_refs(protection_rules, actor_id);
     rejected_refs.extend(tag_protection_rejected_refs(tag_protection_rules, actor_id));
-    match rg_git::protocol::receive_pack::handle_receive_pack_http_with_rejections(
-        &repo_path,
-        pipe_read,
-        &mut buf_writer,
-        rejected_refs,
-        require_signed_refs,
+    match with_git_timeout(
+        state.git_stream_timeout_secs,
+        rg_git::protocol::receive_pack::handle_receive_pack_http_with_rejections(
+            &repo_path,
+            pipe_read,
+            &mut buf_writer,
+            rejected_refs,
+            require_signed_refs,
+        ),
     )
     .await
     {
-        Ok(ref_updates) => {
+        Ok(Ok(ref_updates)) => {
             let _ = buf_writer.flush().await;
             drop(buf_writer);
             let output = reader_task.await.unwrap_or_default();
@@ -597,11 +660,24 @@ pub(crate) async fn handle_git_receive_pack(
                 Body::from(output),
             )
         }
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "text/plain")],
             Body::from(format!("error: {:#}", e)),
         ),
+        Err(_elapsed) => {
+            drop(buf_writer);
+            reader_task.abort();
+            tracing::warn!(
+                %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
+                "git receive-pack exceeded wall-clock timeout — killed git, returning 504"
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from("git operation timed out"),
+            )
+        }
     }
 }
 
@@ -914,4 +990,86 @@ async fn find_repo_by_name(
     name: &str,
 ) -> anyhow::Result<Option<rg_db::entities::repository::Model>> {
     rg_core::repo::service::find_repo_by_owner_name(db, owner, name).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_git_timeout;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn with_git_timeout_elapses_on_slow_future() {
+        // A streaming handler slower than the wall-clock bound must elapse so
+        // the caller can kill git + return 504.
+        let res = with_git_timeout(1, async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            42
+        })
+        .await;
+        assert!(res.is_err(), "slow future should elapse");
+    }
+
+    #[tokio::test]
+    async fn with_git_timeout_passes_fast_future() {
+        let res = with_git_timeout(30, async { 7 }).await;
+        assert_eq!(res.ok(), Some(7), "fast future should complete, not elapse");
+    }
+
+    #[tokio::test]
+    async fn with_git_timeout_zero_disables_bound() {
+        // 0 = opt out: the future runs unbounded and its value passes through.
+        let res = with_git_timeout(0, async { 5 }).await;
+        assert_eq!(res.ok(), Some(5));
+    }
+
+    /// Read a process's state char from `/proc/<pid>/stat`, or `None` if it no
+    /// longer exists. `'Z'` = zombie (killed, awaiting reap). `comm` may contain
+    /// spaces/parens, so split on the last `)`.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().next().and_then(|s| s.chars().next())
+    }
+
+    /// The core anti-zombie guarantee: the subprocess lives *inside* the future,
+    /// so when `with_git_timeout` drops that future on elapse, `kill_on_drop`
+    /// reaps it — it must not keep running. Emulated here with a long `sleep`
+    /// child (the git handlers spawn their child the same `kill_on_drop` way).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn with_git_timeout_kills_child_on_elapse() {
+        use tokio::process::Command;
+
+        let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = holder.clone();
+        let res = with_git_timeout(1, async move {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sleep child");
+            *captured.lock().unwrap() = child.id();
+            let _ = child.wait().await; // hang until the future is dropped
+        })
+        .await;
+        assert!(res.is_err(), "the hanging future should elapse");
+
+        let pid = holder.lock().unwrap().expect("child pid captured");
+        // Poll up to ~3s for the kill + reap to land.
+        let mut killed = false;
+        for _ in 0..30 {
+            match proc_state(pid) {
+                None | Some('Z') => {
+                    killed = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        assert!(
+            killed,
+            "sleep child (pid {pid}) must be killed on timeout, not left running"
+        );
+    }
 }

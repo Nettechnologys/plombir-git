@@ -66,6 +66,10 @@ pub struct AppState {
     pub external_url: Option<String>,
     /// CI job timeout in seconds.
     pub job_timeout_secs: u64,
+    /// Wall-clock timeout (seconds) for streaming git operations
+    /// (upload-pack / receive-pack). On elapse the `git` subprocess is killed
+    /// (via `kill_on_drop`) and the handler returns 504. 0 disables the bound.
+    pub git_stream_timeout_secs: u64,
     /// CI engine (M-14: trait object decouples rg-http from rg-ci).
     pub ci_engine: Arc<dyn rg_core::ci::CiTrigger + Send + Sync>,
 }
@@ -116,6 +120,11 @@ pub struct HttpServerConfig {
     pub external_url: Option<String>,
     /// CI job timeout in seconds (default: 3600).
     pub job_timeout_secs: u64,
+    /// Wall-clock timeout (seconds) for the streaming git transport
+    /// (upload-pack / receive-pack). Bounds a hung or pathologically slow `git`
+    /// subprocess so it can't hold a connection + process indefinitely. 0
+    /// disables the bound (default: 300).
+    pub git_stream_timeout_secs: u64,
     /// CI engine implementation (M-14: injected from rg-cli, decouples rg-http from rg-ci).
     pub ci_engine: Arc<dyn rg_core::ci::CiTrigger + Send + Sync>,
     /// Graceful-shutdown signal. Flips to `true` on SIGTERM/ctrl_c; the server
@@ -199,6 +208,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         log_write_queue,
         external_url: config.external_url,
         job_timeout_secs: config.job_timeout_secs,
+        git_stream_timeout_secs: config.git_stream_timeout_secs,
         ci_engine: config.ci_engine,
     };
 

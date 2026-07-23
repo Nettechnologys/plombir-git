@@ -141,6 +141,14 @@ struct TimeoutConfig {
     /// Git CLI command timeout in seconds (default: 120).
     #[serde(default = "default_git_timeout")]
     git_cmd_secs: u64,
+    /// Wall-clock timeout in seconds for the streaming git transport —
+    /// upload-pack (clone/fetch) and receive-pack (push). Bounds a hung or
+    /// pathologically slow `git` subprocess so it can't hold a connection +
+    /// process indefinitely. More generous than `git_cmd_secs` because pack
+    /// generation over a large repo is legitimately slower than a metadata
+    /// command. 0 disables the bound (default: 300).
+    #[serde(default = "default_git_stream_timeout")]
+    git_stream_secs: u64,
     /// Database connect timeout in seconds (default: 10).
     #[serde(default = "default_db_connect_timeout")]
     db_connect_secs: u64,
@@ -154,6 +162,9 @@ fn default_job_timeout() -> u64 {
 }
 fn default_git_timeout() -> u64 {
     120
+}
+fn default_git_stream_timeout() -> u64 {
+    300
 }
 fn default_db_connect_timeout() -> u64 {
     10
@@ -408,6 +419,10 @@ pub(crate) async fn run_serve(
         .as_ref()
         .map(|c| c.timeouts.git_cmd_secs)
         .unwrap_or_else(default_git_timeout);
+    let resolved_git_stream_timeout = cfg
+        .as_ref()
+        .map(|c| c.timeouts.git_stream_secs)
+        .unwrap_or_else(default_git_stream_timeout);
     let resolved_db_connect_timeout = cfg
         .as_ref()
         .map(|c| c.timeouts.db_connect_secs)
@@ -589,6 +604,7 @@ pub(crate) async fn run_serve(
         oci_storage_path: None,
         external_url: resolved_external_url,
         job_timeout_secs: resolved_job_timeout,
+        git_stream_timeout_secs: resolved_git_stream_timeout,
         // M-14: Inject CiEngine via trait object, decoupling rg-http from rg-ci.
         ci_engine: std::sync::Arc::new(rg_ci::CiEngine),
         shutdown_rx: shutdown_rx.clone(),
