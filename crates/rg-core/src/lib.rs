@@ -49,6 +49,7 @@ pub mod lfs;
 pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;
 pub mod search; // Cross-platform abstractions
+pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks
 
 pub mod error; // Domain error types (CoreError)
 

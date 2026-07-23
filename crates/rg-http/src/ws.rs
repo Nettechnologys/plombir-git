@@ -304,6 +304,10 @@ async fn handle_ws_connection(socket: WebSocket, hub: NotificationHub, user_id: 
 /// Spawns an async task to send to the user's channel without blocking
 /// the caller. The notification is also persisted in the database, so
 /// offline users will see it via the REST API on next fetch.
+///
+/// The task is routed through the shared delivery tracker rather than a bare
+/// `tokio::spawn` so graceful shutdown can await the persisted notification row
+/// instead of severing it mid-write on SIGTERM.
 pub fn push_notification(
     hub: &NotificationHub,
     user_id: i64,
@@ -312,7 +316,7 @@ pub fn push_notification(
 ) {
     let hub = hub.clone();
     let event_type = event_type.to_string();
-    tokio::spawn(async move {
+    rg_core::task_tracker::delivery_tracker().spawn(async move {
         hub.push_notification(user_id, &event_type, data).await;
     });
 }

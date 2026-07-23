@@ -312,6 +312,26 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         Err(_) => tracing::warn!("CI-log queue drain timed out within grace window"),
     }
 
+    // ── Drain detached delivery tasks ──────────────────────────────────
+    // Webhook deliveries (`webhook::service::trigger_event`) and WS
+    // notifications (`ws::push_notification`) are spawned detached so handlers
+    // don't block on them. The shared tracker lets us await the outstanding
+    // ones — bounded by the grace window — so a SIGTERM under load doesn't
+    // sever an in-flight delivery or leave a half-written `webhook_delivery`
+    // row. Each delivery already carries its own outbound-HTTP timeout, so a
+    // wedged remote can't hold the drain past that bound either.
+    let delivery_tracker = rg_core::task_tracker::delivery_tracker();
+    delivery_tracker.close();
+    if !delivery_tracker.is_empty() {
+        match tokio::time::timeout(shutdown_grace, delivery_tracker.wait()).await {
+            Ok(()) => tracing::info!("detached delivery tasks drained on shutdown"),
+            Err(_) => tracing::warn!(
+                grace_secs = shutdown_grace.as_secs(),
+                "detached delivery task drain timed out within grace window"
+            ),
+        }
+    }
+
     Ok(())
 }
 

@@ -126,7 +126,10 @@ pub async fn trigger_event(
     let hooks = webhook_ops::list_active_by_repo_and_event(db, repo_id, event).await?;
 
     for hook in hooks {
-        // Spawn delivery in background — don't block the caller
+        // Spawn delivery in background — don't block the caller. Routed through
+        // the shared delivery tracker (not a bare `tokio::spawn`) so graceful
+        // shutdown can await the outbound POST + `webhook_delivery` row write
+        // instead of severing it mid-flight on SIGTERM.
         let db_clone = db.clone();
         let hook_id = hook.id;
         let event_str = event.to_string();
@@ -135,7 +138,7 @@ pub async fn trigger_event(
         let content_type = hook.content_type.clone();
         let secret = hook.secret.clone();
 
-        tokio::spawn(async move {
+        crate::task_tracker::delivery_tracker().spawn(async move {
             let delivery_id = uuid::Uuid::new_v4().to_string();
             let start = std::time::Instant::now();
 
