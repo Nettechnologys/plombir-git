@@ -63,8 +63,8 @@ _Последняя сверка с кодом: 2026-07-23._
 |------|--------|-----|---------|
 | Graceful shutdown + drain in-flight запросов | ✅ | `rg-cli/src/serve.rs`, `rg-http/src/lib.rs` | SIGTERM/ctrl_c → `watch`-канал; `with_graceful_shutdown` (HTTP) + `axum_server::Handle::graceful_shutdown` (HTTPS) с конфигурируемым grace-окном (`[server].shutdown_grace_secs`, деф. 30). Живой тест: `kill -TERM` → exit 0 за ~0.2s |
 | Shutdown-канал для фоновых воркеров | 🟡 | audit/ci-retention/runner-watchdog/rate-limit/ci-log | Персистентные loop-воркеры + CI-log-очередь (`spawn_with_shutdown`) сливают буфер и выходят по сигналу (unit-тест `drains_buffered_writes_on_shutdown`). Per-request fire-and-forget доставки webhook/mirror остаются detached (best-effort) — не трекаются глобальным tracker'ом |
-| Разделение ошибок: 503 (БД недоступна) vs 500 | ❌ | `rg-http/src/error.rs` | всё в `InternalError`/500, БД-ошибки тоже → см. card |
-| Отдельный 504 для git-timeout | ❌ | `rg-http/src/error.rs` | нет варианта Timeout → см. card |
+| Разделение ошибок: 503 (БД недоступна) vs 500 | ✅ 🔒 | `rg-http/src/error.rs` | `AppError::ServiceUnavailable`→503 `DB_UNAVAILABLE`; `From<DbErr>` классифицирует connection-level (`Conn`/`ConnectionAcquire`) → 503, statement-level (Exec/Query) → 500. Health-probe уже отдаёт 503 при падении БД. Осталось: часть хендлеров конвертит `DbErr` явно через `AppError::internal(...)` в обход `From` → см. card |
+| Отдельный 504 для git-timeout | ✅ 🔒 | `rg-http/src/error.rs` | `AppError::Timeout`→504 `GIT_TIMEOUT`; `From<anyhow::Error>` downcast'ит `GitCliError::Timeout` (в т.ч. сквозь `.context()`). Детали (git-командная строка) не утекают клиенту |
 | Range-валидация числовых конфигов | ❌ | `rg-cli/src/serve.rs` | serde-дефолты без проверки; `0`/абсурд принимается молча → см. card |
 | Prometheus метрики (HTTP/db/git/ci/business/security) | ✅ | `rg-http/src/metrics.rs` | богаче, чем у аналогов; на основном порту |
 | `/metrics` на отдельном приватном интерфейсе | 🟡 | `rg-http/src/metrics.rs` | сейчас на публичном app-порту (опционально вынести) |
