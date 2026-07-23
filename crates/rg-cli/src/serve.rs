@@ -133,7 +133,7 @@ struct WebhooksConfig {
     external_secret: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize)]
 struct TimeoutConfig {
     /// CI job timeout in seconds (default: 3600 = 1 hour).
     #[serde(default = "default_job_timeout")]
@@ -155,6 +155,24 @@ struct TimeoutConfig {
     /// Database idle timeout in seconds (default: 600).
     #[serde(default = "default_db_idle_timeout")]
     db_idle_secs: u64,
+}
+
+// Hand-written so an *entirely omitted* `[timeouts]` table (which routes through
+// `TimeoutConfig::default()` via the parent `#[serde(default)]`, NOT through the
+// per-field `#[serde(default = ...)]` functions) still lands on the documented
+// non-zero defaults. A `#[derive(Default)]` here would silently zero every knob
+// — a 0 acquire/idle timeout makes the DB pool churn/unusable and a 0 git
+// timeout makes every git command elapse instantly.
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            job_secs: default_job_timeout(),
+            git_cmd_secs: default_git_timeout(),
+            git_stream_secs: default_git_stream_timeout(),
+            db_connect_secs: default_db_connect_timeout(),
+            db_idle_secs: default_db_idle_timeout(),
+        }
+    }
 }
 
 fn default_job_timeout() -> u64 {
@@ -250,6 +268,46 @@ fn validate_config(
     }
 
     tracing::info!("Configuration validation passed");
+    Ok(())
+}
+
+/// Reject a numeric config knob left at `0` when every downstream consumer
+/// treats `0` as broken rather than as a meaningful "disabled" sentinel:
+/// a zero DB acquire/idle timeout makes the SQLite/MySQL pool churn or become
+/// unusable, a zero rate-limit window is nonsensical, a zero archiver interval
+/// busy-loops, etc.
+///
+/// Knobs that *do* document `0` as "disable the bound" are deliberately never
+/// routed through here: `timeouts.git_stream_secs` (see `with_git_timeout`),
+/// `timeouts.job_secs` (see `PipelineRunner::set_job_timeout`),
+/// `rate_limit.max`, `rate_limit.max_keys`, and `rate_limit.auth_max`.
+fn require_positive(key: &str, value: u64) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!(
+            "config `{key}` must be >= 1 (got 0); remove the key to use its default \
+             or set a positive value"
+        );
+    }
+    Ok(())
+}
+
+/// Range-validate the always-consumed numeric timeout / rate-limit knobs, whose
+/// `0` values are silently accepted by serde `#[serde(default)]` but break the
+/// consumer. Extracted as a pure function so the boundary behaviour stays
+/// unit-testable without booting the whole server. Audit-archiver and SMTP-port
+/// ranges are validated closer to their (conditional) consumers.
+fn validate_numeric_ranges(
+    git_cmd_secs: u64,
+    db_connect_secs: u64,
+    db_idle_secs: u64,
+    rate_limit_window_secs: u64,
+    rate_limit_auth_window_secs: u64,
+) -> anyhow::Result<()> {
+    require_positive("timeouts.git_cmd_secs", git_cmd_secs)?;
+    require_positive("timeouts.db_connect_secs", db_connect_secs)?;
+    require_positive("timeouts.db_idle_secs", db_idle_secs)?;
+    require_positive("rate_limit.window_secs", rate_limit_window_secs)?;
+    require_positive("rate_limit.auth_window_secs", rate_limit_auth_window_secs)?;
     Ok(())
 }
 
@@ -432,6 +490,17 @@ pub(crate) async fn run_serve(
         .map(|c| c.timeouts.db_idle_secs)
         .unwrap_or_else(default_db_idle_timeout);
 
+    // Range-check the numeric knobs before anything consumes them: reject a
+    // silently-accepted `0` (e.g. `db_connect_secs = 0`) with a clear message
+    // rather than booting into a churning pool or a nonsensical rate window.
+    validate_numeric_ranges(
+        resolved_git_timeout,
+        resolved_db_connect_timeout,
+        resolved_db_idle_timeout,
+        resolved_rate_limit_window,
+        resolved_rate_limit_auth_window,
+    )?;
+
     // ── Initialize logging ─────────────────────────────────────
     if let Some(ref log_path) = resolved_log_file {
         let log_dir = std::path::Path::new(log_path)
@@ -526,6 +595,10 @@ pub(crate) async fn run_serve(
         .and_then(|config| config.enabled)
         .unwrap_or(true)
     {
+        // Note: the archiver's numeric knobs (archive_after_days /
+        // interval_minutes / batch_size) are range-checked by
+        // `AuditArchiveConfig::validate()`, invoked at the top of
+        // `spawn_archiver_with_shutdown` below, so a 0 there also fails at start.
         let archive_config = rg_core::audit::archiver::AuditArchiveConfig {
             archive_dir: PathBuf::from(
                 audit_config
@@ -560,9 +633,20 @@ pub(crate) async fn run_serve(
             resolved_smtp_pass,
             resolved_smtp_from,
         ) {
-            (Some(host), Some(user), Some(pass), Some(from)) => Some(
-                rg_core::email::SmtpConfig::new(&host, resolved_smtp_port, &user, &pass, &from),
-            ),
+            (Some(host), Some(user), Some(pass), Some(from)) => {
+                if resolved_smtp_port == 0 {
+                    anyhow::bail!(
+                        "config `smtp.port` must be 1-65535 (got 0) when SMTP is configured"
+                    );
+                }
+                Some(rg_core::email::SmtpConfig::new(
+                    &host,
+                    resolved_smtp_port,
+                    &user,
+                    &pass,
+                    &from,
+                ))
+            }
             _ => None,
         };
 
@@ -657,5 +741,55 @@ mod config_tests {
         assert_eq!(config.audit.archive_after_days, Some(90));
         assert_eq!(config.audit.interval_minutes, Some(60));
         assert_eq!(config.audit.batch_size, Some(1_000));
+    }
+
+    #[test]
+    fn numeric_ranges_accept_defaults_and_minimum_boundary() {
+        // Shipped defaults pass.
+        assert!(super::validate_numeric_ranges(120, 10, 600, 60, 60).is_ok());
+        // The lower boundary (1) is the smallest valid value for every knob.
+        assert!(super::validate_numeric_ranges(1, 1, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn numeric_ranges_reject_zero_db_connect_timeout() {
+        // The card's flagship case: `db_connect_secs = 0` must fail at start
+        // with a message that names the offending key.
+        let err = super::validate_numeric_ranges(120, 0, 600, 60, 60)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("db_connect_secs"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn numeric_ranges_reject_each_zero_knob() {
+        assert!(super::validate_numeric_ranges(0, 10, 600, 60, 60).is_err()); // git_cmd_secs
+        assert!(super::validate_numeric_ranges(120, 0, 600, 60, 60).is_err()); // db_connect_secs
+        assert!(super::validate_numeric_ranges(120, 10, 0, 60, 60).is_err()); // db_idle_secs
+        assert!(super::validate_numeric_ranges(120, 10, 600, 0, 60).is_err()); // rate_limit.window_secs
+        assert!(super::validate_numeric_ranges(120, 10, 600, 60, 0).is_err()); // rate_limit.auth_window_secs
+    }
+
+    #[test]
+    fn omitted_timeouts_table_uses_documented_defaults_not_zeros() {
+        // A config file that provides *some* section but omits `[timeouts]`
+        // entirely must still land on the non-zero documented defaults — a
+        // `#[derive(Default)]` on TimeoutConfig would zero every knob and the
+        // range validator would (rightly) refuse to boot.
+        let config: ConfigFile = toml::from_str("[rate_limit]\nmax = 0\n").unwrap();
+        assert_eq!(config.timeouts.job_secs, 3600);
+        assert_eq!(config.timeouts.git_cmd_secs, 120);
+        assert_eq!(config.timeouts.git_stream_secs, 300);
+        assert_eq!(config.timeouts.db_connect_secs, 10);
+        assert_eq!(config.timeouts.db_idle_secs, 600);
+        // And those defaults pass the range gate.
+        assert!(super::validate_numeric_ranges(
+            config.timeouts.git_cmd_secs,
+            config.timeouts.db_connect_secs,
+            config.timeouts.db_idle_secs,
+            60,
+            60,
+        )
+        .is_ok());
     }
 }
