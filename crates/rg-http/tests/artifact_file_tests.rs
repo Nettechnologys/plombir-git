@@ -2,6 +2,7 @@ mod common;
 
 use common::{register_full, spawn_test_app_with_db};
 use sea_orm::{ActiveModelTrait, Set};
+use sha2::{Digest, Sha256};
 
 async fn create_private_repo(base: &str, token: &str, name: &str) -> i64 {
     let client = reqwest::Client::new();
@@ -111,6 +112,10 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
     assert!(stored.expires_at.is_some());
     assert!(stored.file_path.starts_with("artifacts/jobs/"));
     assert!(!std::path::Path::new(&stored.file_path).is_absolute());
+    // Upload records a SHA-256 digest of the artifact bytes.
+    let expected_sha = hex::encode(Sha256::digest(b"artifact bytes"));
+    assert_eq!(stored.sha256.as_deref(), Some(expected_sha.as_str()));
+    assert_eq!(expected_sha.len(), 64);
 
     let anon_download = client
         .get(format!(
@@ -132,6 +137,14 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
         .await
         .unwrap();
     assert_eq!(owner_download.status(), 200);
+    // Download echoes the digest so clients can verify the payload end-to-end.
+    assert_eq!(
+        owner_download
+            .headers()
+            .get("x-checksum-sha256")
+            .and_then(|v| v.to_str().ok()),
+        Some(expected_sha.as_str()),
+    );
     assert_eq!(
         owner_download.bytes().await.unwrap().as_ref(),
         b"artifact bytes"

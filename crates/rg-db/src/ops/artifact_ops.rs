@@ -13,6 +13,7 @@ pub async fn create_artifact(
     name: &str,
     file_path: &str,
     size: i64,
+    sha256: Option<String>,
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<Artifact> {
     let now = Utc::now();
@@ -24,6 +25,7 @@ pub async fn create_artifact(
         size: Set(size),
         created_at: Set(now),
         expires_at: Set(expires_at),
+        sha256: Set(sha256),
     };
 
     active_model.insert(db).await.context("db: create artifact")

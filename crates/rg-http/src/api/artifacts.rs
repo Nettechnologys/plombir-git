@@ -2,12 +2,14 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::api::auth::extract_user_id;
@@ -26,6 +28,9 @@ pub struct ArtifactResponse {
     size: i64,
     created_at: String,
     expires_at: Option<String>,
+    /// Hex-encoded SHA-256 of the artifact bytes, recorded at upload. `None` for
+    /// legacy artifacts uploaded before digest tracking existed.
+    sha256: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -95,6 +100,7 @@ pub async fn upload_artifact(
         &upload.name,
         &upload.storage_path,
         upload.size,
+        upload.sha256,
         Some(rg_db::ops::ci_retention_ops::expires_after(
             policy.artifact_retention_days,
         )),
@@ -155,6 +161,7 @@ pub async fn list_pipeline_artifacts(
                     size: a.size,
                     created_at: a.created_at.to_string(),
                     expires_at: a.expires_at.map(|t| t.to_string()),
+                    sha256: a.sha256,
                 })
                 .collect();
             (StatusCode::OK, Json(resp)).into_response()
@@ -197,6 +204,7 @@ pub async fn get_artifact(
             size: artifact.size,
             created_at: artifact.created_at.to_string(),
             expires_at: artifact.expires_at.map(|t| t.to_string()),
+            sha256: artifact.sha256,
         }),
     )
         .into_response()
@@ -257,19 +265,41 @@ pub async fn download_artifact(
         Err(error) => return error.into_response(),
     };
 
+    // Integrity check: the stored bytes must still hash to the digest recorded at
+    // upload. Legacy artifacts (uploaded before digest tracking) carry no recorded
+    // hash and are served without this guard.
+    if let Some(expected) = artifact.sha256.as_deref() {
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != expected {
+            return AppError::internal(anyhow::anyhow!(
+                "artifact integrity check failed: expected sha256 {expected}, got {actual}"
+            ))
+            .into_response();
+        }
+    }
+
     let disposition = format!(
         "attachment; filename=\"{}\"",
         artifact.name.replace('"', "")
     );
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CONTENT_DISPOSITION, disposition.as_str()),
-        ],
-        bytes,
-    )
-        .into_response()
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    // Expose the upload-time digest so clients can verify the payload end-to-end.
+    if let Some(sha) = artifact.sha256.as_deref() {
+        if let Ok(value) = HeaderValue::from_str(sha) {
+            headers.insert(
+                header::HeaderName::from_static("x-checksum-sha256"),
+                value,
+            );
+        }
+    }
+    (StatusCode::OK, headers, bytes).into_response()
 }
 
 /// DELETE /api/v1/artifacts/:id
@@ -320,6 +350,7 @@ struct ParsedArtifactUpload {
     name: String,
     storage_path: String,
     size: i64,
+    sha256: Option<String>,
 }
 
 async fn parse_artifact_upload(
@@ -348,6 +379,12 @@ async fn parse_artifact_upload(
             .map_err(|_| AppError::bad_request("artifact metadata file does not exist"))?
             .len() as i64;
         let name = sanitize_artifact_name(&req.name);
+        // Stream the digest over the referenced file instead of buffering it in
+        // memory — the metadata path exists precisely to avoid loading the whole
+        // artifact into the request body.
+        let sha256 = hash_file(&file_path)
+            .await
+            .map_err(|_| AppError::bad_request("failed to hash artifact metadata file"))?;
         let key = artifact_key(job_id, &name).map_err(AppError::bad_request)?;
         state
             .blob_storage
@@ -358,6 +395,7 @@ async fn parse_artifact_upload(
             name,
             storage_path: key.to_string(),
             size,
+            sha256: Some(sha256),
         });
     }
 
@@ -367,6 +405,8 @@ async fn parse_artifact_upload(
 
     let name = artifact_name_from_headers(headers).unwrap_or_else(|| "artifact.bin".to_string());
     let safe_name = sanitize_artifact_name(&name);
+    // The raw body is already in memory here, so hash it directly.
+    let sha256 = hex::encode(Sha256::digest(body));
     let key = artifact_key(job_id, &safe_name).map_err(AppError::bad_request)?;
     let stored = state
         .blob_storage
@@ -378,7 +418,24 @@ async fn parse_artifact_upload(
         name: safe_name,
         storage_path: key.to_string(),
         size: stored.size as i64,
+        sha256: Some(sha256),
     })
+}
+
+/// Compute the hex-encoded SHA-256 of a file by streaming it in bounded chunks,
+/// so a large artifact is never held in application memory just to be hashed.
+async fn hash_file(path: &FsPath) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn artifact_key(job_id: i64, name: &str) -> Result<rg_core::blob_storage::BlobKey, String> {

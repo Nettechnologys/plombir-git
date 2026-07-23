@@ -14,6 +14,9 @@ pub struct Model {
     pub size: i64,
     pub created_at: DateTimeUtc,
     pub expires_at: Option<DateTimeUtc>,
+    /// Hex-encoded SHA-256 of the artifact bytes, recorded at upload. `None` for
+    /// legacy artifacts uploaded before digest tracking existed.
+    pub sha256: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
