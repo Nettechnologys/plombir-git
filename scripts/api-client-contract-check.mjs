@@ -335,10 +335,19 @@ function isQueryLikeTemplateExpression(expr) {
   return false;
 }
 
+// Marker for a path segment the static parser cannot resolve — e.g. a segment
+// produced by a URL-building helper (`request(`${buildPath(...)}/${id}`)`). Such
+// a call cannot be matched against the OpenAPI routes without executing the
+// helper, so we skip it rather than emit a bogus "route not aligned" failure.
+const OPAQUE_SEGMENT = '__opaque__';
+
 function normalizeParamExpr(expr) {
   const text = unwrapParamExpression(expr).trim();
   const m = text.match(/([A-Za-z_$][A-Za-z0-9_$]*)$/);
   if (m) return m[1];
+  // A function call we could not unwrap (helper returning a URL fragment):
+  // the resulting path is not statically resolvable.
+  if (text.includes('(')) return OPAQUE_SEGMENT;
   return 'param';
 }
 
@@ -576,17 +585,30 @@ const PARAM_EQUIVALENT_GROUPS = [
   ['pipeline_id', 'id'],
   ['job_id', 'id'],
   ['board_id', 'id'],
+  ['comment_id', 'id'],
+  ['secret_name', 'name'],
   ['col_id', 'col'],
   ['card_id', 'card'],
   ['user_id', 'user'],
   ['rev_id', 'rev'],
 ];
 
+// A param may appear in several groups (e.g. `id` pairs with pipeline_id, job_id,
+// comment_id, …). Union every group it belongs to instead of letting the last
+// assignment overwrite the earlier ones — otherwise only the final group's
+// equivalences would survive for that key.
 const PARAM_EQUIVALENCE = new Map();
 for (const group of PARAM_EQUIVALENT_GROUPS) {
-  for (const rawKey of group) {
-    const key = toSnakeCase(rawKey);
-    PARAM_EQUIVALENCE.set(key, new Set(group.map((value) => toSnakeCase(value))));
+  const canonical = group.map((value) => toSnakeCase(value));
+  for (const key of canonical) {
+    let bucket = PARAM_EQUIVALENCE.get(key);
+    if (!bucket) {
+      bucket = new Set();
+      PARAM_EQUIVALENCE.set(key, bucket);
+    }
+    for (const value of canonical) {
+      bucket.add(value);
+    }
   }
 }
 
@@ -1002,10 +1024,16 @@ async function main() {
     calls.push(...extractRequestCalls(src, file));
   }
 
+  let skippedDynamic = 0;
   const normalizedCalls = dedupeCalls(calls);
   for (const call of normalizedCalls) {
     const method = call.method;
     const targetPath = normalizeApiPath(call.path);
+    if (targetPath.includes(`{${OPAQUE_SEGMENT}}`)) {
+      skippedDynamic += 1;
+      console.log(`ℹ️  Skipped dynamic client route (URL built by a helper, not statically resolvable): ${method.toUpperCase()} ${call.path} (source: ${call.file})`);
+      continue;
+    }
     const matches = findOpenApiMatch(rawPaths, method, targetPath);
     if (matches.length === 0) {
       ISSUE.count += 1;
@@ -1053,10 +1081,11 @@ async function main() {
 
   const totalCalls = normalizedCalls.length;
   const mismatches = ISSUE.lines.length;
+  const skippedNote = skippedDynamic > 0 ? ` (${skippedDynamic} dynamic route(s) skipped)` : '';
   if (mismatches > 0) {
-    console.log(`\n❌ Frontend/backend API alignment check: ${mismatches}/${totalCalls} issues found`);
+    console.log(`\n❌ Frontend/backend API alignment check: ${mismatches}/${totalCalls} issues found${skippedNote}`);
   } else {
-    console.log(`\n✅ Frontend/backend API alignment check passed: ${totalCalls} frontend requests`);
+    console.log(`\n✅ Frontend/backend API alignment check passed: ${totalCalls} frontend requests${skippedNote}`);
   }
 
   if (STRICT && mismatches > 0) {

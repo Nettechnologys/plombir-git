@@ -352,6 +352,14 @@ pub async fn login(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/users/logout",
+    tag = "Users",
+    responses(
+        (status = 200, description = "Logged out; the auth cookie is cleared", body = serde_json::Value),
+    )
+)]
 /// POST /api/v1/users/logout — clears the HttpOnly auth cookie (M-4).
 ///
 /// The frontend calls this on logout to invalidate the cookie.
