@@ -53,7 +53,7 @@ impl MigrationTrait for Migration {
                     .alter_table(
                         Table::alter()
                             .table(PullRequests::Table)
-                            .add_column(&mut definition.clone())
+                            .add_column(definition.clone())
                             .to_owned(),
                     )
                     .await?;

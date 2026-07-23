@@ -164,12 +164,13 @@ impl GitHubClient {
     ///
     /// `base_url` should be `https://api.github.com` for GitHub.com
     /// or `https://<hostname>/api/v3` for GitHub Enterprise Server.
-    pub fn new(token: String, base_url: Option<String>) -> Self {
+    pub fn new(token: String, base_url: Option<String>) -> Result<Self> {
         let base = base_url.unwrap_or_else(|| "https://api.github.com".to_string());
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {token}")).expect("invalid token"),
+            header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid import auth token: not a valid HTTP header value")?,
         );
         headers.insert(
             header::ACCEPT,
@@ -184,13 +185,13 @@ impl GitHubClient {
             .default_headers(headers)
             .user_agent("ForgeKeep/0.1")
             .build()
-            .expect("failed to build HTTP client");
+            .context("failed to build GitHub HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: base,
             token,
-        }
+        })
     }
 
     /// Get repository metadata.

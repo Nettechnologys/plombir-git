@@ -398,6 +398,7 @@ impl PipelineRunner {
     /// - Otherwise: `sh -c <script>` (with timeout).
     ///
     /// Returns (exit_code, stdout+stderr output).
+    #[allow(clippy::too_many_arguments)]
     async fn run_job(
         &self,
         job_id: i64,

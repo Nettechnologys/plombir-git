@@ -116,7 +116,7 @@ async fn run_github_import(
     stats: &mut ImportStats,
 ) -> Result<()> {
     let token = task.auth_token_encrypted.as_deref().unwrap_or("");
-    let client = GitHubClient::new(token.to_string(), None);
+    let client = GitHubClient::new(token.to_string(), None)?;
 
     // Parse owner/repo from source URL (https://github.com/owner/repo)
     let (gh_owner, gh_repo) = parse_github_url(&task.source_url)?;
@@ -285,7 +285,7 @@ async fn run_gitlab_import(
     stats: &mut ImportStats,
 ) -> Result<()> {
     let token = task.auth_token_encrypted.as_deref().unwrap_or("");
-    let client = GitLabClient::new(token.to_string(), None);
+    let client = GitLabClient::new(token.to_string(), None)?;
 
     // Extract project path from source URL (https://gitlab.com/group/project)
     let project_path = parse_gitlab_url(&task.source_url)?;
@@ -498,7 +498,10 @@ fn clone_repo(
         return Ok(());
     }
 
-    std::fs::create_dir_all(target_dir.parent().unwrap())?;
+    let parent = target_dir
+        .parent()
+        .context("import target path has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
 
     let git = global_gateway()
         .as_ref()

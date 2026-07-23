@@ -57,6 +57,8 @@ pub fn jwk(secret: &str) -> CiOidcJwk {
     }
 }
 
+// Wide by design: assembles the full OIDC claim set for a CI job token.
+#[allow(clippy::too_many_arguments)]
 pub fn issue(
     secret: &str,
     issuer: &str,

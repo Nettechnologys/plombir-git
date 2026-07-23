@@ -48,7 +48,7 @@ pub fn redact_database_url(db_url: &str) -> String {
     };
     let authority_start = scheme_end + 3;
     let authority_end = db_url[authority_start..]
-        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .map(|offset| authority_start + offset)
         .unwrap_or(db_url.len());
     let authority = &db_url[authority_start..authority_end];

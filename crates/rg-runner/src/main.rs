@@ -398,6 +398,7 @@ async fn restore_cache(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn save_cache(
     client: &reqwest::Client,
     server: &str,

@@ -141,21 +141,6 @@ fn default_db_idle_timeout() -> u64 {
     600
 }
 
-#[cfg(test)]
-mod config_tests {
-    use super::ConfigFile;
-
-    #[test]
-    fn example_config_includes_valid_audit_archive_settings() {
-        let config: ConfigFile =
-            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
-        assert_eq!(config.audit.enabled, Some(true));
-        assert_eq!(config.audit.archive_after_days, Some(90));
-        assert_eq!(config.audit.interval_minutes, Some(60));
-        assert_eq!(config.audit.batch_size, Some(1_000));
-    }
-}
-
 fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
     let content = std::fs::read_to_string(path)?;
     let config: ConfigFile = toml::from_str(&content)?;
@@ -543,4 +528,19 @@ pub(crate) async fn run_serve(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::ConfigFile;
+
+    #[test]
+    fn example_config_includes_valid_audit_archive_settings() {
+        let config: ConfigFile =
+            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+        assert_eq!(config.audit.enabled, Some(true));
+        assert_eq!(config.audit.archive_after_days, Some(90));
+        assert_eq!(config.audit.interval_minutes, Some(60));
+        assert_eq!(config.audit.batch_size, Some(1_000));
+    }
 }

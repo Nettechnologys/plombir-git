@@ -174,6 +174,9 @@ pub async fn update_stage_status(
 // ── Job ops ──────────────────────────────────────────────────────
 
 /// Create a pipeline job.
+// Wide by design: mirrors the pipeline_job column set (a params struct would just
+// re-list the same fields with no call-site clarity gain).
+#[allow(clippy::too_many_arguments)]
 pub async fn create_job(
     db: &DatabaseConnection,
     stage_id: i64,

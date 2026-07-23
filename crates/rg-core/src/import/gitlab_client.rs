@@ -168,24 +168,25 @@ impl GitLabClient {
     ///
     /// `base_url` should be `https://gitlab.com/api/v4` for GitLab.com
     /// or `https://<hostname>/api/v4` for self-hosted instances.
-    pub fn new(token: String, base_url: Option<String>) -> Self {
+    pub fn new(token: String, base_url: Option<String>) -> Result<Self> {
         let base = base_url.unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "PRIVATE-TOKEN",
-            header::HeaderValue::from_str(&token).expect("invalid token"),
+            header::HeaderValue::from_str(&token)
+                .context("invalid import auth token: not a valid HTTP header value")?,
         );
 
         let client = Client::builder()
             .default_headers(headers)
             .user_agent("ForgeKeep/0.1")
             .build()
-            .expect("failed to build HTTP client");
+            .context("failed to build GitLab HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: base,
-        }
+        })
     }
 
     /// Get project metadata.

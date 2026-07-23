@@ -119,8 +119,8 @@ impl MigrationTrait for Migration {
                         "oauth2".into(),
                         "read:user user:email".into(),
                         false.into(),
-                        now.clone().into(),
-                        now.clone().into(),
+                        now.into(),
+                        now.into(),
                     ])
                     .to_owned(),
             )
@@ -146,8 +146,8 @@ impl MigrationTrait for Migration {
                         "oidc".into(),
                         "openid email profile".into(),
                         false.into(),
-                        now.clone().into(),
-                        now.clone().into(),
+                        now.into(),
+                        now.into(),
                     ])
                     .to_owned(),
             )
@@ -173,7 +173,7 @@ impl MigrationTrait for Migration {
                         "oauth2".into(),
                         "read_user".into(),
                         false.into(),
-                        now.clone().into(),
+                        now.into(),
                         now.into(),
                     ])
                     .to_owned(),

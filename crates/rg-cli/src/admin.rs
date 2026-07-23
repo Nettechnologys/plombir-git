@@ -1,7 +1,7 @@
 //! Administrative helpers: SQLite backup/restore and JWT secret generation
 //! and validation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -93,7 +93,7 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
     Ok(())
 }
 
-fn remove_sqlite_sidecar_files(db_path: &PathBuf) -> anyhow::Result<()> {
+fn remove_sqlite_sidecar_files(db_path: &Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
         if path.exists() {

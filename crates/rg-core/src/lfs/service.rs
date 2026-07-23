@@ -214,6 +214,7 @@ pub fn lfs_root(repo_root: &std::path::Path, owner: &str, repo: &str) -> PathBuf
 
 /// Handle a batch upload/download request.
 /// Processes all objects concurrently using `join_all` to avoid serial DB round-trips.
+#[allow(clippy::too_many_arguments)]
 pub async fn batch(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -503,6 +504,7 @@ pub async fn store_object(
 /// Store an LFS object from an uncompressed file on disk.
 /// Streams the file through zstd compression—never loads the entire
 /// object into memory.
+#[allow(clippy::too_many_arguments)]
 pub async fn store_object_from_file(
     db: &DatabaseConnection,
     repo_id: i64,

@@ -325,6 +325,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
     Ok(pipeline_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_initial_success(
     db: &sea_orm::DatabaseConnection,
     repo_path: &std::path::Path,
@@ -632,7 +633,7 @@ fn try_read_gitea_workflows(
     }
 
     for (name, yml) in &workflow_sources {
-        let workflow = match gitea_actions::GiteaWorkflow::parse(&yml) {
+        let workflow = match gitea_actions::GiteaWorkflow::parse(yml) {
             Ok(w) => w,
             Err(e) => {
                 tracing::debug!("Skipping .gitea/workflows/{} (parse error: {})", name, e);

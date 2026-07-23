@@ -207,7 +207,7 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
         .collect();
 
     // Get HEAD SHA
-    let head_sha = if let Some(head) = repo.head().ok() {
+    let head_sha = if let Ok(head) = repo.head() {
         head.try_into_referent() // Returns Option<Reference>
             .and_then(|r| r.target().try_id().map(|id| id.to_string()))
     } else {
@@ -261,18 +261,18 @@ fn build_v2_capability_advertisement() -> Result<String> {
     let mut buf = Vec::new();
 
     // Pitfall: Smart HTTP requires the "# service=" line to be wrapped in a pkt-line + flush
-    let svc_line = format!("# service=git-upload-pack\n");
+    let svc_line = "# service=git-upload-pack\n".to_string();
     let len = svc_line.len() + 4;
     write!(buf, "{:04x}", len)?;
     buf.extend_from_slice(svc_line.as_bytes());
     buf.extend_from_slice(b"0000");
 
     // Helper to write pkt-line data (pitfall: the pkt-line payload ends with \n,
-    // length header = payload.len() + 4 (header) + 1 (\n); use write! not writeln!)
+    // length header = payload.len() + 4 (header) + 1 (\n); writeln! supplies the \n)
     let write_pkt = |buf: &mut Vec<u8>, text: &str| {
         let payload = text.as_bytes();
         let len = payload.len() + 4 + 1; // +4 for hex header, +1 for trailing \n
-        write!(buf, "{:04x}{}\n", len, text)?;
+        writeln!(buf, "{:04x}{}", len, text)?;
         Ok::<(), std::io::Error>(())
     };
 

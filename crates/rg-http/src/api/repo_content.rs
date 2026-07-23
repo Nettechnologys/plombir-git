@@ -906,7 +906,7 @@ async fn resolve_and_check_write_access(
 
     let repo_model = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo)
         .await
-        .map_err(|e| AppError::internal(e))?
+        .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("repository not found"))?;
 
     if !rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id))
