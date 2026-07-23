@@ -400,6 +400,7 @@ pub async fn play_job(
             pipeline_id,
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,
+            allow_host_runner: state.allow_host_runner,
             jwt_secret: Some(&state.jwt_secret),
             external_url: state.external_url.as_deref(),
         })
@@ -492,6 +493,7 @@ pub async fn trigger_pipeline(
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,
+            allow_host_runner: state.allow_host_runner,
             jwt_secret: Some(&state.jwt_secret),
             external_url: state.external_url.as_deref(),
         })
@@ -589,6 +591,7 @@ pub async fn retry_pipeline(
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,
+            allow_host_runner: state.allow_host_runner,
             jwt_secret: Some(&state.jwt_secret),
             external_url: state.external_url.as_deref(),
         })

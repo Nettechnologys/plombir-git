@@ -87,6 +87,7 @@ pub async fn resume_pipeline(params: ResumePipelineParams<'_>) -> Result<()> {
         params.repo_id,
         params.pipeline_id,
         params.docker_enabled,
+        params.allow_host_runner,
         params.jwt_secret,
         params.external_url,
     );
@@ -112,6 +113,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
         triggered_by,
         docker_enabled,
         external_runners,
+        allow_host_runner,
         jwt_secret,
         external_url,
     } = params;
@@ -285,6 +287,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
             commit_sha,
             docker_enabled,
             external_runners,
+            allow_host_runner,
             jwt_secret,
             external_url,
         )
@@ -300,6 +303,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
             repo_id,
             pipeline_id,
             docker_enabled,
+            allow_host_runner,
             jwt_secret,
             external_url,
         );
@@ -328,6 +332,7 @@ async fn evaluate_initial_success(
     commit_sha: &str,
     docker_enabled: bool,
     external_runners: bool,
+    allow_host_runner: bool,
     jwt_secret: Option<&str>,
     external_url: Option<&str>,
 ) {
@@ -350,6 +355,7 @@ async fn evaluate_initial_success(
             trigger: &ci_engine,
             docker_enabled,
             external_runners,
+            allow_host_runner,
             jwt_secret,
             external_url,
         },
@@ -360,12 +366,14 @@ async fn evaluate_initial_success(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_internal_runner(
     db: &sea_orm::DatabaseConnection,
     repo_path: &std::path::Path,
     repo_id: i64,
     pipeline_id: i64,
     docker_enabled: bool,
+    allow_host_runner: bool,
     jwt_secret: Option<&str>,
     external_url: Option<&str>,
 ) {
@@ -381,6 +389,7 @@ fn spawn_internal_runner(
             PipelineRunner::new_local_only(db_clone, &repo_path_owned, pipeline_id)
         };
         runner.set_repo_id(repo_id);
+        runner.set_allow_host_runner(allow_host_runner);
         if let Some(secret) = jwt_secret_owned {
             runner.set_jwt_secret(secret);
         }
@@ -837,6 +846,7 @@ mod matrix_tests {
             triggered_by: Some(user.id),
             docker_enabled: false,
             external_runners: true,
+            allow_host_runner: false,
             jwt_secret: Some("secret"),
             external_url: None,
         })
@@ -933,6 +943,7 @@ mod matrix_tests {
             triggered_by: Some(user.id),
             docker_enabled: false,
             external_runners: true,
+            allow_host_runner: false,
             jwt_secret: Some("secret"),
             external_url: None,
         })

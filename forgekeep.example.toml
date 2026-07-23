@@ -15,6 +15,10 @@ jwt_secret = "change-me-in-production"
 
 [ci]
 docker = false
+# Run imageless CI jobs as a shell directly on the host. Keep false on shared or
+# public instances: with it off, every job must use a Docker image or a dedicated
+# runner, so pushed CI config cannot execute arbitrary code on the server.
+allow_host_runner = false
 
 [rate_limit]
 max = 0          # 0 = disabled

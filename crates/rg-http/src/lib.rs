@@ -111,6 +111,8 @@ pub struct AppState {
     pub jwt_secret: Arc<String>,
     pub docker_enabled: bool,
     pub external_runners: bool,
+    /// Whether imageless CI jobs may run as a shell on the host (default false).
+    pub allow_host_runner: bool,
     pub rate_limiter: rate_limit::RateLimiter,
     pub notification_hub: ws::NotificationHub,
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
@@ -140,6 +142,10 @@ pub struct HttpServerConfig {
     pub docker_enabled: bool,
     /// Whether to use external runners instead of embedded runner for CI.
     pub external_runners: bool,
+    /// Whether imageless CI jobs may run as a shell on the host. Defaults to
+    /// `false`: on shared/public instances every job must use a Docker sandbox
+    /// or a dedicated runner so pushed CI config cannot execute on the server.
+    pub allow_host_runner: bool,
     /// Rate limit: max requests per window (0 = disabled).
     pub rate_limit_max: u32,
     /// Rate limit: window duration in seconds.
@@ -201,6 +207,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         jwt_secret: Arc::new(config.jwt_secret),
         docker_enabled: config.docker_enabled,
         external_runners: config.external_runners,
+        allow_host_runner: config.allow_host_runner,
         rate_limiter: rate_limiter.clone(),
         notification_hub: notification_hub.clone(),
         smtp_config: config.smtp_config,
@@ -2257,6 +2264,7 @@ async fn handle_git_receive_pack(
             let repo_clone = repo.clone();
             let docker_enabled = state.docker_enabled;
             let external_runners = state.external_runners;
+            let allow_host_runner = state.allow_host_runner;
             let jwt_secret = state.jwt_secret.clone();
             let hub = state.notification_hub.clone();
             let smtp = state.smtp_config.clone();
@@ -2273,6 +2281,7 @@ async fn handle_git_receive_pack(
                         repo_name: &repo_clone,
                         docker_enabled,
                         external_runners,
+                        allow_host_runner,
                         jwt_secret: &jwt_secret,
                         notification_hub: &hub,
                         smtp_config: &smtp,
@@ -2310,6 +2319,7 @@ struct PostPushParams<'a> {
     repo_name: &'a str,
     docker_enabled: bool,
     external_runners: bool,
+    allow_host_runner: bool,
     jwt_secret: &'a str,
     notification_hub: &'a ws::NotificationHub,
     smtp_config: &'a Option<rg_core::email::SmtpConfig>,
@@ -2414,6 +2424,7 @@ async fn post_push_hooks(
         repo_name,
         docker_enabled,
         external_runners,
+        allow_host_runner,
         jwt_secret,
         notification_hub,
         smtp_config,
@@ -2475,6 +2486,7 @@ async fn post_push_hooks(
                                     trigger: params.ci_engine,
                                     docker_enabled: params.docker_enabled,
                                     external_runners: params.external_runners,
+                                    allow_host_runner: params.allow_host_runner,
                                     jwt_secret: Some(params.jwt_secret),
                                     external_url: params.external_url,
                                 },
@@ -2522,6 +2534,7 @@ async fn post_push_hooks(
                     triggered_by: None,
                     docker_enabled: *docker_enabled,
                     external_runners: *external_runners,
+                    allow_host_runner: *allow_host_runner,
                     jwt_secret: Some(jwt_secret),
                     external_url: *external_url,
                 })

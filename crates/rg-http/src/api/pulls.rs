@@ -549,6 +549,7 @@ pub async fn enqueue_merge_queue(
         trigger: &*state.ci_engine,
         docker_enabled: state.docker_enabled,
         external_runners: state.external_runners,
+        allow_host_runner: state.allow_host_runner,
         jwt_secret: Some(&state.jwt_secret),
         external_url: state.external_url.as_deref(),
     };

@@ -198,6 +198,7 @@ async fn after_suggestions_applied(
                 triggered_by: Some(actor_id),
                 docker_enabled: state.docker_enabled,
                 external_runners: state.external_runners,
+                allow_host_runner: state.allow_host_runner,
                 jwt_secret: Some(&state.jwt_secret),
                 external_url: state.external_url.as_deref(),
             })
@@ -220,6 +221,7 @@ async fn after_suggestions_applied(
         trigger: &*state.ci_engine,
         docker_enabled: state.docker_enabled,
         external_runners: state.external_runners,
+        allow_host_runner: state.allow_host_runner,
         jwt_secret: Some(&state.jwt_secret),
         external_url: state.external_url.as_deref(),
     };
@@ -348,6 +350,7 @@ pub async fn submit_review(
                     trigger: &*state.ci_engine,
                     docker_enabled: state.docker_enabled,
                     external_runners: state.external_runners,
+                    allow_host_runner: state.allow_host_runner,
                     jwt_secret: Some(&state.jwt_secret),
                     external_url: state.external_url.as_deref(),
                 };

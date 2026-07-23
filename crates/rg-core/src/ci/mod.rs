@@ -23,6 +23,11 @@ pub struct TriggerPipelineParams<'a> {
     pub triggered_by: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,
+    /// Whether jobs without an `image:` may run as a shell directly on the host.
+    /// Defaults to `false` (secure): untrusted CI config must not execute on the
+    /// server. When false, imageless jobs are refused unless dispatched to a
+    /// Docker container or an external runner.
+    pub allow_host_runner: bool,
     pub jwt_secret: Option<&'a str>,
     pub external_url: Option<&'a str>,
 }
@@ -35,6 +40,8 @@ pub struct ResumePipelineParams<'a> {
     pub pipeline_id: i64,
     pub docker_enabled: bool,
     pub external_runners: bool,
+    /// See [`TriggerPipelineParams::allow_host_runner`].
+    pub allow_host_runner: bool,
     pub jwt_secret: Option<&'a str>,
     pub external_url: Option<&'a str>,
 }

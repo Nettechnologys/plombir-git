@@ -100,6 +100,13 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         external_runners: bool,
 
+        /// Allow imageless CI jobs to run as a shell directly on the host.
+        /// Off by default: on shared/public instances every job must use a
+        /// Docker sandbox (`image:`) or a dedicated runner. Enable only on a
+        /// trusted single-tenant server.
+        #[arg(long, default_value_t = false)]
+        allow_host_runner: bool,
+
         /// Rate limit: max requests per window per IP (0 = disabled)
         #[arg(long, default_value_t = 0)]
         rate_limit_max: u32,
@@ -386,6 +393,9 @@ struct CiConfig {
     docker: Option<bool>,
     #[serde(default)]
     external_runners: Option<bool>,
+    /// Allow imageless CI jobs to run as a shell on the host (default false).
+    #[serde(default)]
+    allow_host_runner: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -727,6 +737,7 @@ async fn main() -> anyhow::Result<()> {
             jwt_secret,
             docker,
             external_runners,
+            allow_host_runner,
             rate_limit_max,
             rate_limit_window,
             rate_limit_trusted_proxies,
@@ -751,6 +762,7 @@ async fn main() -> anyhow::Result<()> {
                 jwt_secret,
                 docker,
                 external_runners,
+                allow_host_runner,
                 rate_limit_max,
                 rate_limit_window,
                 rate_limit_trusted_proxies,
@@ -1382,6 +1394,7 @@ async fn run_serve(
     jwt_secret: Option<String>,
     docker: bool,
     external_runners: bool,
+    allow_host_runner: bool,
     rate_limit_max: u32,
     rate_limit_window: u64,
     rate_limit_trusted_proxies: Vec<String>,
@@ -1435,6 +1448,11 @@ async fn run_serve(
         || cfg
             .as_ref()
             .and_then(|c| c.ci.external_runners)
+            .unwrap_or(false);
+    let resolved_allow_host_runner = allow_host_runner
+        || cfg
+            .as_ref()
+            .and_then(|c| c.ci.allow_host_runner)
             .unwrap_or(false);
     let resolved_rate_limit_max = if rate_limit_max > 0 {
         rate_limit_max
@@ -1659,6 +1677,7 @@ async fn run_serve(
         jwt_secret: resolved_jwt_secret.clone(),
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,
+        allow_host_runner: resolved_allow_host_runner,
         rate_limit_max: resolved_rate_limit_max,
         rate_limit_window_secs: resolved_rate_limit_window,
         rate_limit_trusted_proxies: resolved_rate_limit_trusted_proxies,

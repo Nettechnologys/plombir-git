@@ -19,6 +19,13 @@ use rg_db::ops::pipeline_ops;
 /// Default maximum execution time per job: 1 hour.
 const DEFAULT_JOB_TIMEOUT_SECS: u64 = 3600;
 
+/// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
+const DOCKER_PIDS_LIMIT: &str = "512";
+/// Default memory ceiling for a job container.
+const DOCKER_MEMORY_LIMIT: &str = "2g";
+/// Default CPU quota for a job container.
+const DOCKER_CPU_LIMIT: &str = "2";
+
 /// Default CI token scopes for jobs.
 /// Grants read access to the triggering repo and packages.
 const DEFAULT_CI_TOKEN_SCOPES: &str = "repo:read packages:read";
@@ -31,6 +38,11 @@ pub struct PipelineRunner {
     repo_id: i64,
     jwt_secret: Option<String>,
     docker_enabled: bool,
+    /// Whether a job without an `image:` may execute as a shell directly on the
+    /// host. Defaults to `false` (secure): imageless jobs are refused so that
+    /// pushed CI config cannot run arbitrary code on the server. Enabled only on
+    /// trusted single-tenant instances via `ci.allow_host_runner = true`.
+    allow_host_runner: bool,
     oidc_token_url: Option<String>,
     /// Per-job timeout in seconds (0 = no timeout).
     job_timeout_secs: u64,
@@ -45,6 +57,7 @@ impl PipelineRunner {
             repo_id: 0,
             jwt_secret: None,
             docker_enabled: true,
+            allow_host_runner: false,
             oidc_token_url: None,
             job_timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
         }
@@ -63,6 +76,7 @@ impl PipelineRunner {
             repo_id: 0,
             jwt_secret: None,
             docker_enabled: false,
+            allow_host_runner: false,
             oidc_token_url: None,
             job_timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
         }
@@ -71,6 +85,15 @@ impl PipelineRunner {
     /// Set the repository ID (for CI_JOB_TOKEN generation).
     pub fn set_repo_id(&mut self, repo_id: i64) {
         self.repo_id = repo_id;
+    }
+
+    /// Allow (or forbid) executing imageless jobs as a shell on the host.
+    ///
+    /// Off by default. Turn on only for trusted, single-tenant deployments via
+    /// `ci.allow_host_runner = true`; on shared/public instances leaving it off
+    /// forces every job into a Docker sandbox or an external runner.
+    pub fn set_allow_host_runner(&mut self, allow: bool) {
+        self.allow_host_runner = allow;
     }
 
     /// Set the JWT secret (for CI_JOB_TOKEN generation).
@@ -344,6 +367,7 @@ impl PipelineRunner {
                             trigger: &ci_engine,
                             docker_enabled: self.docker_enabled,
                             external_runners: false,
+                            allow_host_runner: self.allow_host_runner,
                             jwt_secret: self.jwt_secret.as_deref(),
                             external_url: self
                                 .oidc_token_url
@@ -448,6 +472,20 @@ impl PipelineRunner {
                 tracing::warn!(job_id, "{}", msg);
                 return Err(anyhow::anyhow!("{}", msg));
             }
+        }
+
+        // A job without an `image:` would run as a shell directly on the host.
+        // On shared/public instances this is disabled by default (CWE-250/CWE-269):
+        // anyone able to push CI config could otherwise execute arbitrary code with
+        // the server's privileges. Require a Docker sandbox or a dedicated runner.
+        if image.is_none() && !self.allow_host_runner {
+            let msg = "This job has no `image:` and would run directly on the host, but \
+                       host-shell CI execution is disabled (ci.allow_host_runner = false). \
+                       Add an `image:` to run in a sandboxed Docker container, dispatch the job \
+                       to a dedicated tagged runner, or enable ci.allow_host_runner on a trusted \
+                       single-tenant instance.";
+            tracing::warn!(job_id, "{}", msg);
+            return Err(anyhow::anyhow!("{}", msg));
         }
 
         let timeout_secs = timeout_seconds
@@ -586,12 +624,30 @@ impl PipelineRunner {
         // Generate a unique container name
         let container_name = format!("forgekeep-job-{}", job_id);
 
-        // Run: docker run --rm --name <name> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
+        // Run: docker run --rm --name <name> <hardening flags> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
+        //
+        // SECURITY (CWE-269 privilege escalation): the container is confined so a
+        // malicious job cannot break out onto the host:
+        // - `--cap-drop=ALL` strips every Linux capability (no raw sockets, no mount…).
+        // - `--security-opt=no-new-privileges` blocks setuid/gain-privilege via execve.
+        // - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion (fork bomb, OOM).
+        // The Docker socket is deliberately NOT mounted and `--privileged` is never
+        // passed, so the job has no path to the daemon or host devices.
         let mut args = vec![
             "run".to_string(),
             "--rm".to_string(),
             "--name".to_string(),
             container_name,
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
+            "--security-opt".to_string(),
+            "no-new-privileges".to_string(),
+            "--pids-limit".to_string(),
+            DOCKER_PIDS_LIMIT.to_string(),
+            "--memory".to_string(),
+            DOCKER_MEMORY_LIMIT.to_string(),
+            "--cpus".to_string(),
+            DOCKER_CPU_LIMIT.to_string(),
             "-v".to_string(),
             format!("{}:/workspace", repo_path_str),
             "-w".to_string(),
@@ -1184,6 +1240,7 @@ mod tests {
         let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
         runner.set_repo_id(repo.id);
         runner.set_jwt_secret(jwt_secret.into());
+        runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
 
         let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
@@ -1266,7 +1323,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
+        runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
         assert_eq!(
             rg_db::ops::pipeline_ops::get_pipeline(&db, manual_pipeline.id)
@@ -1298,7 +1356,8 @@ mod tests {
         rg_db::ops::pipeline_ops::resume_pipeline_chain(&db, manual_pipeline.id, manual_stage.id)
             .await
             .unwrap();
-        let runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
+        runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
         assert_eq!(
             rg_db::ops::pipeline_ops::get_pipeline(&db, manual_pipeline.id)
@@ -1319,5 +1378,169 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn host_runner_disabled_by_default_refuses_imageless_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("host.db").display()
+        ))
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "host-owner",
+            "host-owner@example.com",
+            "unused",
+            "Host Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("host".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let repo_path = temp.path().join("repos/host-owner/host.git");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git.run(&["init"], Some(&repo_path)).unwrap().success());
+        assert!(git
+            .run(&["config", "user.name", "CI"], Some(&repo_path))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["config", "user.email", "ci@example.com"], Some(&repo_path))
+            .unwrap()
+            .success());
+        std::fs::write(repo_path.join("README.md"), "hi").unwrap();
+        assert!(git
+            .run(&["add", "README.md"], Some(&repo_path))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["commit", "-m", "init"], Some(&repo_path))
+            .unwrap()
+            .success());
+        let commit_sha = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "hostjob",
+            "echo should-not-run",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Default runner: host shell execution is NOT allowed, so an imageless
+        // job must be refused and its script must never run.
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        runner.set_repo_id(repo.id);
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "failed");
+        let log = completed.log.unwrap_or_default();
+        assert!(
+            log.contains("host-shell CI execution is disabled"),
+            "expected host-runner refusal, got: {log}"
+        );
+        assert!(
+            !log.contains("should-not-run"),
+            "job body executed despite host runner being disabled: {log}"
+        );
+
+        // With host execution explicitly enabled, the same job now runs.
+        let allow_pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let allow_stage =
+            rg_db::ops::pipeline_ops::create_stage(&db, allow_pipeline.id, "test", 0)
+                .await
+                .unwrap();
+        let allow_job = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            allow_stage.id,
+            "hostjob",
+            "echo did-run",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, allow_pipeline.id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, allow_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success", "{:?}", completed.log);
+        assert!(completed.log.unwrap_or_default().contains("did-run"));
     }
 }
