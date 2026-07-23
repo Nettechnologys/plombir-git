@@ -1342,4 +1342,103 @@ mod tests {
         assert!(serialized.ends_with("0000"));
         assert!(!serialized.ends_with("0001"));
     }
+
+    // --- Protocol V2 command-request negotiation parsing ---
+
+    /// Encode one pkt-line (`<4-hex-len><payload>`) for building request streams.
+    fn pkt_bytes(data: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[tokio::test]
+    async fn read_command_request_parses_ls_refs() {
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pkt_bytes(b"command=ls-refs\n"));
+        buf.extend_from_slice(&pkt_bytes(b"agent=git/2.40\n"));
+        buf.extend_from_slice(b"0001"); // delimiter → args section
+        buf.extend_from_slice(&pkt_bytes(b"ref-prefix refs/heads/\n"));
+        buf.extend_from_slice(&pkt_bytes(b"peel\n"));
+        buf.extend_from_slice(&pkt_bytes(b"symrefs\n"));
+        buf.extend_from_slice(b"0000"); // flush → end of request
+
+        let mut reader = Cursor::new(buf);
+        match read_command_request(&mut reader).await.unwrap() {
+            CommandRequest::LsRefs {
+                ref_patterns,
+                peel,
+                symrefs,
+                unborn,
+                ..
+            } => {
+                assert_eq!(ref_patterns, vec!["refs/heads/".to_string()]);
+                assert!(peel);
+                assert!(symrefs);
+                assert!(!unborn);
+            }
+            other => panic!("expected LsRefs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_command_request_parses_fetch_wants_and_haves() {
+        use std::io::Cursor;
+        let want = "a".repeat(40);
+        let have = "b".repeat(40);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pkt_bytes(b"command=fetch\n"));
+        buf.extend_from_slice(&pkt_bytes(b"ofs-delta\n"));
+        buf.extend_from_slice(b"0001");
+        buf.extend_from_slice(&pkt_bytes(format!("want {want}\n").as_bytes()));
+        buf.extend_from_slice(&pkt_bytes(format!("have {have}\n").as_bytes()));
+        buf.extend_from_slice(&pkt_bytes(b"done\n"));
+        buf.extend_from_slice(b"0000");
+
+        let mut reader = Cursor::new(buf);
+        match read_command_request(&mut reader).await.unwrap() {
+            CommandRequest::Fetch {
+                wants, haves, done, ..
+            } => {
+                assert_eq!(wants, vec![want]);
+                assert_eq!(haves, vec![have]);
+                assert!(done);
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_command_request_empty_flush_yields_flush() {
+        use std::io::Cursor;
+        let mut reader = Cursor::new(Vec::from(b"0000".as_slice()));
+        assert!(matches!(
+            read_command_request(&mut reader).await.unwrap(),
+            CommandRequest::Flush
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_command_request_errors_on_garbage_header() {
+        // A non-hex pkt-line header on the negotiation stream must error, not panic.
+        use std::io::Cursor;
+        let mut reader = Cursor::new(Vec::from(b"zzzz".as_slice()));
+        assert!(read_command_request(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_command_request_errors_on_non_numeric_deepen() {
+        // A hostile `deepen <non-number>` arg must be rejected as Err (the
+        // parse().context path), never unwrapped into a panic.
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pkt_bytes(b"command=fetch\n"));
+        buf.extend_from_slice(b"0001");
+        buf.extend_from_slice(&pkt_bytes(b"deepen notanumber\n"));
+        buf.extend_from_slice(b"0000");
+
+        let mut reader = Cursor::new(buf);
+        assert!(read_command_request(&mut reader).await.is_err());
+    }
 }

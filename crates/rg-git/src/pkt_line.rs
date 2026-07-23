@@ -374,4 +374,92 @@ mod tests {
             "expected Err from batch reader on garbage, got {result:?}"
         );
     }
+
+    // --- Fuzz / property tests: no bounded input must ever panic (CWE-248/755) ---
+    //
+    // The parser is the single trust boundary for every Git wire consumer
+    // (upload-pack, receive-pack, protocol v2, sideband — see grep in the card),
+    // so hardening it here hardens all of them. We can't pull in `proptest`
+    // (no workspace dependency, and CI must stay deterministic), so we drive a
+    // small seeded xorshift PRNG. Same seed → identical corpus on every run, so
+    // a failure is always reproducible from the seed printed in the panic.
+
+    /// Deterministic, dependency-free PRNG (xorshift64*). Seed must be non-zero.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            debug_assert!(seed != 0, "xorshift seed must be non-zero");
+            Rng(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn byte(&mut self) -> u8 {
+            (self.next_u64() & 0xff) as u8
+        }
+
+        /// Uniform-ish value in `0..n` (n > 0).
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzz_read_pkt_line_never_panics_on_random_bytes() {
+        // Property: on any finite byte slice, read_pkt_line returns Ok(..) or
+        // Err(..) — it must never panic, and it must always terminate.
+        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..4000 {
+            let len = rng.below(72);
+            let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            let mut reader = BufReader::new(Cursor::new(buf));
+            // The `let _ =` is the assertion: reaching here means no panic/hang.
+            let _ = read_pkt_line(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzz_structured_headers_never_panic() {
+        // Bias the corpus toward *valid-looking* 4-hex headers with mismatched
+        // payloads — this sweeps the whole 0x0000..=0xffff length space, including
+        // the "oversized" region above MAX_PKT_LINE_LEN and short/truncated
+        // payloads that must surface as a graceful Err, not a panic or a giant
+        // (but still bounded, ≤64 KiB) allocation that hangs.
+        let mut rng = Rng::new(0xD1B5_4A32_D192_ED03);
+        for _ in 0..4000 {
+            let declared = (rng.next_u64() & 0xffff) as usize;
+            let mut buf = format!("{:04x}", declared).into_bytes();
+            let payload_len = rng.below(80);
+            buf.extend((0..payload_len).map(|_| rng.byte()));
+            let mut reader = BufReader::new(Cursor::new(buf));
+            let _ = read_pkt_line(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzz_batch_and_text_readers_never_panic() {
+        // The higher-level readers loop over read_pkt_line; a hostile stream must
+        // not make them spin forever or panic. On a finite Cursor every branch
+        // eventually hits EOF (graceful Flush) or a payload-truncation Err, so
+        // both loops must terminate for every seed.
+        let mut rng = Rng::new(0xA076_1D64_78BD_642F);
+        for _ in 0..2000 {
+            let len = rng.below(96);
+            let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+
+            let mut batch_reader = BufReader::new(Cursor::new(buf.clone()));
+            let _ = read_pkt_lines_until_flush(&mut batch_reader).await;
+
+            let mut text_reader = BufReader::new(Cursor::new(buf));
+            let _ = read_text_line(&mut text_reader).await;
+        }
+    }
 }

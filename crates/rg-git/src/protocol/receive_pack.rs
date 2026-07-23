@@ -683,3 +683,108 @@ mod rejection_pattern_tests {
             .contains("cryptographically valid signature"));
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::pkt_line::read_pkt_line;
+    use std::io::Cursor;
+    use tokio::io::BufReader;
+
+    /// Encode one pkt-line (`<4-hex-len><payload>`) for building test streams.
+    fn pkt(data: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[tokio::test]
+    async fn report_status_wraps_unpack_and_per_ref_status_in_sideband() {
+        // send_response is the report-status writer. It must emit, as band-1
+        // sideband data: `unpack ok`, then one `ok <ref>` / `ng <ref> <msg>`
+        // line per update, then an embedded flush.
+        let results = vec![
+            RefUpdate {
+                old_sha: "a".repeat(40),
+                new_sha: "b".repeat(40),
+                refname: "refs/heads/main".into(),
+                status: "ok".into(),
+                message: "ok".into(),
+            },
+            RefUpdate {
+                old_sha: "c".repeat(40),
+                new_sha: "0".repeat(40),
+                refname: "refs/heads/bad".into(),
+                status: "error".into(),
+                message: "deletion not supported".into(),
+            },
+        ];
+
+        let mut out: Vec<u8> = Vec::new();
+        send_response(&mut out, &results).await.unwrap();
+
+        // Outer layer: a single sideband band-1 pkt-line carrying the report.
+        let mut outer = BufReader::new(Cursor::new(out));
+        let band = match read_pkt_line(&mut outer).await.unwrap() {
+            PktLine::Data(d) => d,
+            other => panic!("expected sideband Data, got {other:?}"),
+        };
+        assert_eq!(band[0], 1u8, "report-status must ride on sideband band 1");
+
+        // Inner layer: the report-status pkt-lines.
+        let mut inner = BufReader::new(Cursor::new(band[1..].to_vec()));
+        assert_eq!(
+            read_pkt_line(&mut inner).await.unwrap(),
+            PktLine::text("unpack ok"),
+            "unpack status must come first"
+        );
+        assert_eq!(
+            read_pkt_line(&mut inner).await.unwrap(),
+            PktLine::text("ok refs/heads/main")
+        );
+        assert_eq!(
+            read_pkt_line(&mut inner).await.unwrap(),
+            PktLine::text("ng refs/heads/bad deletion not supported")
+        );
+        assert!(matches!(
+            read_pkt_line(&mut inner).await.unwrap(),
+            PktLine::Flush
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_push_handles_malformed_commands_without_spawning_indexer() {
+        // A garbage line (too few fields) is skipped; a deletion (null target)
+        // is reported as an error. With zero surviving `ok` updates, the pack is
+        // drained and no `git index-pack` is spawned — so this stays hermetic and
+        // must not panic on the hostile first line.
+        let repo = tempfile::tempdir().unwrap();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(b"garbage-line-with-one-field\n"));
+        let delete = format!("{} {} refs/heads/gone\n", "c".repeat(40), "0".repeat(40));
+        stream.extend_from_slice(&pkt(delete.as_bytes()));
+        stream.extend_from_slice(b"0000"); // flush → end of update commands
+
+        let mut reader = BufReader::new(Cursor::new(stream));
+        let updates = process_push(repo.path(), &mut reader).await.unwrap();
+
+        assert_eq!(updates.len(), 1, "only the deletion produces an update");
+        assert_eq!(updates[0].refname, "refs/heads/gone");
+        assert_eq!(updates[0].status, "error");
+        assert_eq!(updates[0].message, "deletion not supported");
+    }
+
+    #[tokio::test]
+    async fn process_push_propagates_error_on_non_hex_header() {
+        // A malformed pkt-line header in the command stream must surface as Err,
+        // never a panic (CWE-755).
+        let repo = tempfile::tempdir().unwrap();
+        let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
+        let result = process_push(repo.path(), &mut reader).await;
+        assert!(
+            result.is_err(),
+            "non-hex header must surface as Err, got {result:?}"
+        );
+    }
+}

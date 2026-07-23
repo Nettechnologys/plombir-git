@@ -819,3 +819,39 @@ pub async fn delete_object_from_storage(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod oid_validation_tests {
+    use super::is_valid_oid;
+
+    // is_valid_oid is the input gate for `batch()` and for the object routes in
+    // rg-http; it also protects lfs_object_path from path-traversal, so its
+    // rejection behavior is security-relevant.
+
+    #[test]
+    fn accepts_canonical_64_lowercase_hex() {
+        assert!(is_valid_oid(&"a".repeat(64)));
+        assert!(is_valid_oid(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_length() {
+        assert!(!is_valid_oid(""));
+        assert!(!is_valid_oid(&"a".repeat(63)));
+        assert!(!is_valid_oid(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn rejects_uppercase_and_non_hex() {
+        assert!(!is_valid_oid(&"A".repeat(64)), "uppercase hex must be rejected");
+        assert!(!is_valid_oid(&"g".repeat(64)), "'g' is out of the hex range");
+
+        // A path-traversal attempt padded to length 64 must never validate.
+        let mut traversal = "a".repeat(60);
+        traversal.push_str("/../");
+        assert_eq!(traversal.len(), 64);
+        assert!(!is_valid_oid(&traversal));
+    }
+}
