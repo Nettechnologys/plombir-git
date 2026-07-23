@@ -99,12 +99,12 @@ pub async fn token(
         Ok(Some(job)) if matches!(job.status.as_str(), "assigned" | "running") => job,
         Ok(Some(_)) => return AppError::forbidden("CI job is not running").into_response(),
         Ok(None) => return AppError::unauthorized("CI job no longer exists").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
         Ok(Some(stage)) => stage,
         Ok(None) => return AppError::unauthorized("CI stage no longer exists").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id).await
     {
@@ -116,7 +116,7 @@ pub async fn token(
         Ok(_) => {
             return AppError::unauthorized("CI token resource binding mismatch").into_response()
         }
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let issuer = match issuer(&state, &headers) {
         Ok(value) => value,
@@ -133,7 +133,7 @@ pub async fn token(
         &pipeline.commit_sha,
     ) {
         Ok(value) => value,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let mut response = Json(TokenResponse { value, expires_at }).into_response();
     response

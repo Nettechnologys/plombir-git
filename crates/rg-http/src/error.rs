@@ -138,6 +138,21 @@ impl From<anyhow::Error> for AppError {
             return Self::Timeout(format!("git command timed out after {timeout:?}"));
         }
 
+        // Many `rg_db::ops` helpers return `anyhow::Result`, wrapping the
+        // underlying `sea_orm::DbErr` with `.context("db: ...")`. A connection
+        // outage on such a path must still be a retryable 503, not a 500 —
+        // `downcast_ref` sees through the `.context()` layers to the original
+        // `DbErr`, so classify it exactly like the direct `From<DbErr>` path.
+        if let Some(db_err) = e.downcast_ref::<sea_orm::DbErr>() {
+            if Self::is_db_outage(db_err) {
+                // Keep the full anyhow context chain in the operator log; the
+                // IntoResponse impl still sanitizes the client-facing message.
+                let full_msg = e.to_string();
+                tracing::error!(error = %full_msg, "database unavailable (connection-level error via anyhow), returning 503");
+                return Self::ServiceUnavailable(full_msg);
+            }
+        }
+
         // H-05: Log the full error for operators, store a generic message internally.
         // The IntoResponse impl will also sanitize the client-facing message.
         let full_msg = e.to_string();
@@ -148,7 +163,6 @@ impl From<anyhow::Error> for AppError {
 
 impl From<sea_orm::DbErr> for AppError {
     fn from(e: sea_orm::DbErr) -> Self {
-        use sea_orm::DbErr;
         // H-05: Log the database error for operators, never expose to clients.
         let full_msg = e.to_string();
         // Connection-level failures mean the database itself is unreachable
@@ -157,16 +171,25 @@ impl From<sea_orm::DbErr> for AppError {
         // retry instead of treating an outage as a fatal 500. Statement-level
         // errors (Exec/Query/constraint/type) stay 500 — those are bugs, not
         // outages, and retrying them won't help.
-        match &e {
-            DbErr::Conn(_) | DbErr::ConnectionAcquire(_) => {
-                tracing::error!(error = %full_msg, "database unavailable (connection-level error), returning 503");
-                Self::ServiceUnavailable(full_msg)
-            }
-            _ => {
-                tracing::error!(error = %full_msg, "database error converted to AppError");
-                Self::InternalError(full_msg)
-            }
+        if Self::is_db_outage(&e) {
+            tracing::error!(error = %full_msg, "database unavailable (connection-level error), returning 503");
+            Self::ServiceUnavailable(full_msg)
+        } else {
+            tracing::error!(error = %full_msg, "database error converted to AppError");
+            Self::InternalError(full_msg)
         }
+    }
+}
+
+impl AppError {
+    /// Whether a `sea_orm::DbErr` represents a connection-level outage
+    /// (retryable → 503) rather than a statement-level bug (→ 500). Shared by
+    /// the `From<DbErr>` and `From<anyhow::Error>` conversions so a database
+    /// outage classifies identically whether the handler surfaced the raw
+    /// `DbErr` or an anyhow-wrapped one.
+    fn is_db_outage(e: &sea_orm::DbErr) -> bool {
+        use sea_orm::DbErr;
+        matches!(e, DbErr::Conn(_) | DbErr::ConnectionAcquire(_))
     }
 }
 
@@ -271,6 +294,27 @@ mod tests {
         let wrapped = anyhow::Error::from(git_err).context("failed to mirror repository");
         let err: AppError = wrapped.into();
         assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn anyhow_wrapped_db_connection_error_maps_to_503() {
+        // `rg_db::ops` helpers return `anyhow::Result`, wrapping the `DbErr`
+        // with `.context("db: ...")`. A connection outage on such a path must
+        // still classify as 503 — the downcast has to see through the context.
+        let db_err = DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed);
+        let wrapped = anyhow::Error::from(db_err).context("db: get job");
+        let err: AppError = wrapped.into();
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "DB_UNAVAILABLE");
+    }
+
+    #[test]
+    fn anyhow_wrapped_db_statement_error_stays_500() {
+        // A statement-level DbErr wrapped in anyhow is a bug, not an outage.
+        let db_err = DbErr::Exec(RuntimeErr::Internal("UNIQUE constraint failed".into()));
+        let wrapped = anyhow::Error::from(db_err).context("db: insert row");
+        let err: AppError = wrapped.into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

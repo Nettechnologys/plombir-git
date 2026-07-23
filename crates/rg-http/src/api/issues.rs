@@ -94,7 +94,7 @@ pub async fn list_issue_templates(
             }
             (StatusCode::OK, Json(discovery.templates)).into_response()
         }
-        Ok(Err(error)) => AppError::internal(error).into_response(),
+        Ok(Err(error)) => AppError::from(error).into_response(),
         Err(error) => AppError::internal(error).into_response(),
     }
 }
@@ -197,7 +197,7 @@ pub async fn get_pull_request_template(
     {
         Ok(Ok(Some(template))) => (StatusCode::OK, Json(template)).into_response(),
         Ok(Ok(None)) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) => AppError::internal(error).into_response(),
+        Ok(Err(error)) => AppError::from(error).into_response(),
         Err(error) => AppError::internal(error).into_response(),
     }
 }
@@ -266,7 +266,7 @@ pub async fn list_issues(
                 }
                 Err(e) => {
                     tracing::error!(%e, "handler error");
-                    AppError::internal(e).into_response()
+                    AppError::from(e).into_response()
                 }
             };
         }
@@ -292,7 +292,7 @@ pub async fn list_issues(
         }
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -419,7 +419,7 @@ pub async fn update_issue(
     {
         Ok(Some(repo)) => repo,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id))
@@ -493,7 +493,7 @@ pub async fn list_comments(
         }
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -666,7 +666,7 @@ pub async fn list_milestones(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             }
         }
     };
@@ -675,7 +675,7 @@ pub async fn list_milestones(
         Ok(milestones) => (StatusCode::OK, Json(serde_json::json!(milestones))).into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -729,7 +729,7 @@ pub async fn create_milestone(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             }
         }
     };
@@ -787,7 +787,7 @@ pub async fn get_milestone(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             }
         }
     };
@@ -796,7 +796,7 @@ pub async fn get_milestone(
         Ok(None) => AppError::not_found("milestone not found".to_string()).into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -855,7 +855,7 @@ pub async fn update_milestone(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             }
         }
     };
@@ -884,7 +884,7 @@ pub async fn update_milestone(
         Ok(m) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -932,7 +932,7 @@ pub async fn delete_milestone(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -963,7 +963,7 @@ pub async fn get_issue_labels(
             Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),
             Err(e) => {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             }
         },
         Err(e) => AppError::not_found(e.to_string()).into_response(),

@@ -153,7 +153,7 @@ async fn resolve_and_check_access(
         Ok(false) => {
             return Err(AppError::forbidden("access denied"));
         }
-        Err(e) => return Err(AppError::internal(e)),
+        Err(e) => return Err(AppError::from(e)),
     }
 
     Ok(repo_model)
@@ -221,7 +221,7 @@ pub async fn list_tree(
                     .into_response();
             }
             tracing::error!(%e, "list_tree failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -339,7 +339,7 @@ pub async fn get_log(
         Ok(log) => (StatusCode::OK, Json(serde_json::json!({ "commits": log }))).into_response(),
         Err(e) => {
             tracing::error!(%e, "get_log failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -387,7 +387,7 @@ pub async fn list_branches(
         Ok(branches) => (StatusCode::OK, Json(branches)).into_response(),
         Err(e) => {
             tracing::error!(%e, "list_branches failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -435,7 +435,7 @@ pub async fn list_tags(
         Ok(tags) => (StatusCode::OK, Json(tags)).into_response(),
         Err(e) => {
             tracing::error!(%e, "list_tags failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }

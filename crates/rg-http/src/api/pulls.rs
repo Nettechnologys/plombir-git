@@ -114,7 +114,7 @@ pub async fn list_prs(
             .into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -324,7 +324,7 @@ pub async fn get_diff(
         Ok(diff) => (StatusCode::OK, Json(diff)).into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -480,7 +480,7 @@ pub async fn list_merge_queue(
     };
     let entries = match rg_db::ops::merge_queue_ops::list_by_repo(&state.db, repository.id).await {
         Ok(entries) => entries,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let mut response = Vec::with_capacity(entries.len());
     for (index, entry) in entries.into_iter().enumerate() {
@@ -490,7 +490,7 @@ pub async fn list_merge_queue(
         {
             Ok(Some(pr)) if pr.repo_id == repository.id => pr,
             Ok(_) => continue,
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         };
         response.push(MergeQueueEntryResponse {
             id: entry.id,
@@ -562,7 +562,7 @@ pub async fn enqueue_merge_queue(
     .await
     {
         Ok(process) => process,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     (
         StatusCode::OK,
@@ -602,6 +602,6 @@ pub async fn cancel_merge_queue(
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("pull request is not queued").into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }

@@ -125,7 +125,7 @@ pub async fn get_runner_admin(
         Ok(None) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(%e, "get_runner_admin failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -179,7 +179,7 @@ pub async fn register(
             .into_response(),
         Err(e) => {
             tracing::error!(%e, "register runner failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -248,7 +248,7 @@ pub async fn deregister(
             Json(serde_json::json!({"error": "runner not found"})),
         )
             .into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -425,7 +425,7 @@ pub async fn poll_job(
                 Err(e) => {
                     // H-05: Log the full error, return sanitized response
                     tracing::error!(%e, "[poll_job] database error while finding pending job");
-                    return Err(AppError::internal(e).into_response());
+                    return Err(AppError::from(e).into_response());
                 }
             }
         }
@@ -466,7 +466,7 @@ pub async fn start_job(
         }
         Err(e) => {
             tracing::error!(%e, "start_job: get_job failed");
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -481,7 +481,7 @@ pub async fn start_job(
     .await
     {
         tracing::error!(%e, "start_job: update_job_result failed");
-        return AppError::internal(e).into_response();
+        return AppError::from(e).into_response();
     }
 
     // Mark runner as busy
@@ -522,7 +522,7 @@ pub async fn upload_log(
         }
         Err(e) => {
             tracing::error!(%e, "upload_log: get_job failed");
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -559,18 +559,18 @@ pub async fn download_workspace(
             return AppError::forbidden("job not assigned to this runner").into_response()
         }
         Ok(None) => return AppError::not_found("job not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
         Ok(Some(stage)) => stage,
         Ok(None) => return AppError::not_found("pipeline stage not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id).await
     {
         Ok(Some(pipeline)) => pipeline,
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let repository = match rg_db::entities::repository::Entity::find_by_id(pipeline.repo_id)
         .one(&state.db)
@@ -578,7 +578,7 @@ pub async fn download_workspace(
     {
         Ok(Some(repository)) => repository,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let namespace = if let Some(org_id) = repository.org_id {
         match rg_db::ops::org_ops::get_org(&state.db, org_id).await {
@@ -586,13 +586,13 @@ pub async fn download_workspace(
             Ok(None) => {
                 return AppError::not_found("repository organization not found").into_response()
             }
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         }
     } else {
         match rg_db::ops::user_ops::find_by_id(&state.db, repository.owner_id).await {
             Ok(Some(user)) => user.username,
             Ok(None) => return AppError::not_found("repository owner not found").into_response(),
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         }
     };
     let repo_path = state
@@ -613,7 +613,7 @@ pub async fn download_workspace(
     .await
     {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => return AppError::internal(error).into_response(),
+        Ok(Err(error)) => return AppError::from(error).into_response(),
         Err(error) => return AppError::internal(error).into_response(),
     };
     (
@@ -655,7 +655,7 @@ pub async fn download_cache(
         Ok(bytes) => {
             let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
                 Ok(policy) => policy,
-                Err(error) => return AppError::internal(error).into_response(),
+                Err(error) => return AppError::from(error).into_response(),
             };
             if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
                 &state.db,
@@ -667,7 +667,7 @@ pub async fn download_cache(
             )
             .await
             {
-                return AppError::internal(error).into_response();
+                return AppError::from(error).into_response();
             }
             (
                 StatusCode::OK,
@@ -718,7 +718,7 @@ pub async fn upload_cache(
     }
     let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
         Ok(policy) => policy,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let size = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta.len() as i64,
@@ -735,7 +735,7 @@ pub async fn upload_cache(
     .await
     {
         let _ = tokio::fs::remove_file(&path).await;
-        return AppError::internal(error).into_response();
+        return AppError::from(error).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -847,7 +847,7 @@ pub async fn finish_job(
         }
         Err(e) => {
             tracing::error!(%e, "finish_job: get_job failed");
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -869,7 +869,7 @@ pub async fn finish_job(
     .await
     {
         tracing::error!(%e, "finish_job: update_job_result failed");
-        return AppError::internal(e).into_response();
+        return AppError::from(e).into_response();
     }
 
     // Mark runner as online (ready for next job)
@@ -976,7 +976,7 @@ pub async fn list_runners_admin(
         }
         Err(e) => {
             tracing::error!(%e, "list_runners_admin failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -1040,7 +1040,7 @@ pub async fn authenticate_runner(
             .into_response(),
         Err(e) => {
             tracing::error!(%e, "authenticate_runner: find_by_token failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -1087,7 +1087,7 @@ pub async fn delete_runner_admin(
         Ok(false) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(%e, "delete_runner_admin failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }

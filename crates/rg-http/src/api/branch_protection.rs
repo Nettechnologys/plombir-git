@@ -81,7 +81,7 @@ pub async fn list_protections(
         Ok(protections) => (StatusCode::OK, Json(protections)).into_response(),
         Err(e) => {
             tracing::error!(%e, "list_protections failed");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }

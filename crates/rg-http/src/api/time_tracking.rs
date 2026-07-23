@@ -115,7 +115,7 @@ pub async fn list_time_entries(
             Json(PaginatedResponse::new(entries, &pagination, total as u64)),
         )
             .into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -154,7 +154,7 @@ pub async fn total_time(
             )
                 .into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -187,6 +187,6 @@ pub async fn delete_time_entry(
 
     match rg_core::time_tracking::service::delete_time_entry(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

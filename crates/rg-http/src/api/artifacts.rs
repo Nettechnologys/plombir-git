@@ -67,7 +67,7 @@ pub async fn upload_artifact(
             return AppError::not_found("job not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e.to_string()).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -81,7 +81,7 @@ pub async fn upload_artifact(
     };
     let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
         Ok(policy) => policy,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
 
     let upload = match parse_artifact_upload(&state, job_id, &headers, &body).await {
@@ -113,7 +113,7 @@ pub async fn upload_artifact(
             if let Ok(key) = rg_core::blob_storage::BlobKey::new(&upload.storage_path) {
                 let _ = state.blob_storage.delete(&key).await;
             }
-            AppError::internal(e.to_string()).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -159,7 +159,7 @@ pub async fn list_pipeline_artifacts(
                 .collect();
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -223,7 +223,7 @@ async fn require_artifact_write(
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(actor_id)).await {
         Ok(true) => Ok(artifact),
         Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(error) => Err(AppError::internal(error)),
+        Err(error) => Err(AppError::from(error)),
     }
 }
 
@@ -298,12 +298,12 @@ pub async fn delete_artifact(
     };
 
     if let Err(error) = delete_artifact_blob(&state, &artifact.file_path).await {
-        return AppError::internal(error).into_response();
+        return AppError::from(error).into_response();
     }
     match rg_db::ops::artifact_ops::delete_by_id(&state.db, artifact_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("artifact not found").into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -553,7 +553,7 @@ async fn require_repo_read(
             Err(AppError::unauthorized("authentication required"))
         }
         Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 

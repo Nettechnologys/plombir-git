@@ -264,7 +264,7 @@ pub async fn login(
                     &state.jwt_secret,
                 ) {
                     Ok(challenge) => challenge,
-                    Err(error) => return AppError::internal(error).into_response(),
+                    Err(error) => return AppError::from(error).into_response(),
                 };
                 let is_https = is_https_request(&headers);
                 let challenge_cookie =
@@ -407,7 +407,7 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         )
             .into_response(),
         Ok(None) => AppError::not_found("user not found".to_string()).into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -488,7 +488,7 @@ pub async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> i
 
             (StatusCode::OK, Json(tokens)).into_response()
         }
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -556,7 +556,7 @@ pub async fn create_token(
             })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -598,7 +598,7 @@ pub async fn delete_token(
     }
     match rg_db::ops::token_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -656,7 +656,7 @@ pub async fn forgot_password(
             )
                 .into_response()
         }
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

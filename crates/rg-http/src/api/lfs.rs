@@ -88,7 +88,7 @@ pub async fn batch(
         match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
             Ok(Some(r)) => r,
             Ok(None) => return AppError::not_found("repository not found").into_response(),
-            Err(e) => return AppError::internal(e).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         };
 
     // Upload actions always require repository write access, including for
@@ -101,7 +101,7 @@ pub async fn batch(
         match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
             Ok(true) => {}
             Ok(false) => return AppError::forbidden("write access denied").into_response(),
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         }
     } else if req.operation == "download" && repo_model.is_private {
         let user_id = match authenticated_user_id(&headers, &state) {
@@ -111,7 +111,7 @@ pub async fn batch(
         match rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(user_id)).await {
             Ok(true) => {}
             Ok(false) => return AppError::forbidden("access denied").into_response(),
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         }
     }
 
@@ -146,7 +146,7 @@ pub async fn batch(
     .await
     {
         Ok(resp) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -182,7 +182,7 @@ pub async fn upload_object(
         match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
             Ok(Some(r)) => r,
             Ok(None) => return AppError::not_found("repository not found").into_response(),
-            Err(e) => return AppError::internal(e).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         };
 
     let signed = match verify_signed_action(
@@ -203,7 +203,7 @@ pub async fn upload_object(
         match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
             Ok(true) => {}
             Ok(false) => return AppError::forbidden("write access denied").into_response(),
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         }
     }
 
@@ -231,10 +231,10 @@ pub async fn upload_object(
             .await
             {
                 Ok(()) => StatusCode::OK.into_response(),
-                Err(e) => AppError::internal(e).into_response(),
+                Err(e) => AppError::from(e).into_response(),
             }
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -270,7 +270,7 @@ pub async fn download_object(
         match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
             Ok(Some(r)) => r,
             Ok(None) => return AppError::not_found("repository not found").into_response(),
-            Err(e) => return AppError::internal(e).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         };
 
     if let Err(response) = authorize_lfs_download(&state, &repo_model, &oid, &query, &headers).await
@@ -338,7 +338,7 @@ async fn authorize_lfs_download(
         match rg_core::repo::service::can_read_repo(&state.db, repo_model, Some(user_id)).await {
             Ok(true) => {}
             Ok(false) => return Err(AppError::forbidden("access denied").into_response()),
-            Err(error) => return Err(AppError::internal(error).into_response()),
+            Err(error) => return Err(AppError::from(error).into_response()),
         }
     }
     Ok(())

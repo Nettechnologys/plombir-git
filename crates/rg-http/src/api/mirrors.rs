@@ -87,14 +87,14 @@ pub async fn create_mirror(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     // Check write permission
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
         Ok(true) => {}
         Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
 
     match rg_core::mirror::service::create_mirror(
@@ -134,13 +134,13 @@ pub async fn get_mirror(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::mirror::service::get_mirror(&state.db, repo.id).await {
         Ok(Some(mirror)) => (StatusCode::OK, Json(serde_json::json!(mirror))).into_response(),
         Ok(None) => AppError::not_found("no mirror configured for this repository").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -178,13 +178,13 @@ pub async fn update_mirror(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
         Ok(true) => {}
         Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
 
     match rg_core::mirror::service::update_mirror(
@@ -235,18 +235,18 @@ pub async fn delete_mirror(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
         Ok(true) => {}
         Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
 
     match rg_core::mirror::service::delete_mirror(&state.db, repo.id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -284,13 +284,13 @@ pub async fn trigger_mirror_sync(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
         Ok(true) => {}
         Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
 
     match rg_core::mirror::service::trigger_sync(&state.db, repo.id, &state.repo_root).await {
@@ -299,6 +299,6 @@ pub async fn trigger_mirror_sync(
             Json(serde_json::json!({"status": "sync_triggered"})),
         )
             .into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

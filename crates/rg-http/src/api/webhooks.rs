@@ -42,7 +42,7 @@ pub async fn list_webhooks(
 
     match rg_core::webhook::service::list_webhooks(&state.db, repo_id).await {
         Ok(hooks) => (StatusCode::OK, Json(serde_json::json!(hooks))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -224,7 +224,7 @@ pub async fn list_deliveries(
 
     match rg_core::webhook::service::list_deliveries(&state.db, id).await {
         Ok(deliveries) => (StatusCode::OK, Json(serde_json::json!(deliveries))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -263,7 +263,7 @@ pub async fn redeliver(
     match rg_core::webhook::service::get_delivery(&state.db, delivery_id).await {
         Ok(Some(delivery)) if delivery.webhook_id == hook.id => {}
         Ok(Some(_)) | Ok(None) => return AppError::not_found("delivery not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
 
     match rg_core::webhook::service::redeliver(&state.db, delivery_id).await {
@@ -303,6 +303,6 @@ async fn resolve_webhook_in_repo(
     match rg_core::webhook::service::get_webhook(db, webhook_id).await {
         Ok(Some(hook)) if hook.repo_id == repo_id => Ok(hook),
         Ok(Some(_)) | Ok(None) => Err(AppError::not_found("webhook not found")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }

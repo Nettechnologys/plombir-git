@@ -65,7 +65,7 @@ pub async fn list(
             Json(items.into_iter().map(response).collect::<Vec<_>>()),
         )
             .into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -89,13 +89,13 @@ pub async fn put(
     let key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
     let encrypted = match rg_core::auth::encryption::encrypt(&body.value, &key) {
         Ok(v) => v,
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     match rg_db::ops::ci_secret_ops::upsert(&state.db, repo.id, &secret_name, &encrypted, actor_id)
         .await
     {
         Ok(item) => (StatusCode::CREATED, Json(response(item))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -113,7 +113,7 @@ pub async fn delete(
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("CI secret not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

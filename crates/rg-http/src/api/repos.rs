@@ -162,7 +162,7 @@ pub async fn create_repo(
                     return AppError::not_found("organization not found".to_string())
                         .into_response()
                 }
-                Err(e) => return AppError::internal(e.to_string()).into_response(),
+                Err(e) => return AppError::from(e).into_response(),
             }
         }
         None => None,
@@ -174,7 +174,7 @@ pub async fn create_repo(
         Ok(None) => {
             return AppError::unauthorized("invalid token subject".to_string()).into_response()
         }
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let owner_display = owner_user
         .display_name
@@ -286,7 +286,7 @@ pub async fn list_repos(
                 )
                     .into_response()
             }
-            Err(e) => return AppError::internal(e.to_string()).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         }
     }
 
@@ -304,7 +304,7 @@ pub async fn list_repos(
                 )
                     .into_response()
             }
-            Err(e) => return AppError::internal(e.to_string()).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         }
     }
 
@@ -335,7 +335,7 @@ pub async fn get_repo(
     match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await {
         Ok(Some(repo)) => (StatusCode::OK, Json(serde_json::json!(repo))).into_response(),
         Ok(None) => AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -377,7 +377,7 @@ pub async fn star_repo(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::toggle_star(&state.db, user_id, repo.id).await {
@@ -386,7 +386,7 @@ pub async fn star_repo(
             Json(serde_json::json!({ "starred": starred })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -420,7 +420,7 @@ pub async fn get_starred_status(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::is_starred(&state.db, user_id, repo.id).await {
@@ -429,7 +429,7 @@ pub async fn get_starred_status(
             Json(serde_json::json!({ "starred": starred })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -460,7 +460,7 @@ pub async fn get_stargazers(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::list_stargazers(&state.db, repo.id, offset, limit).await {
@@ -473,7 +473,7 @@ pub async fn get_stargazers(
             )),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -507,7 +507,7 @@ pub async fn get_watch_status(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::get_watch(&state.db, user_id, repo.id).await {
@@ -518,7 +518,7 @@ pub async fn get_watch_status(
             })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -554,7 +554,7 @@ pub async fn watch_repo(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, &body.state).await {
@@ -563,7 +563,7 @@ pub async fn watch_repo(
             Json(serde_json::json!({ "watch_state": watch_state })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -597,7 +597,7 @@ pub async fn unwatch_repo(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, "not_watching").await {
@@ -606,7 +606,7 @@ pub async fn unwatch_repo(
             Json(serde_json::json!({ "watch_state": "not_watching" })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -648,7 +648,7 @@ pub async fn delete_repo_handler(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     // Only owner can delete
@@ -679,7 +679,7 @@ pub async fn delete_repo_handler(
 
             (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))).into_response()
         }
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -782,7 +782,7 @@ pub async fn list_forks_handler(
             Json(PaginatedResponse::new(forks, &pagination, total as u64)),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -919,7 +919,7 @@ pub async fn create_commit_status(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
@@ -967,7 +967,7 @@ pub async fn list_commit_statuses(
 ) -> impl IntoResponse {
     match rg_core::repo::service::list_commit_statuses(&state.db, &owner, &name, &sha).await {
         Ok(statuses) => (StatusCode::OK, Json(serde_json::json!(statuses))).into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -992,7 +992,7 @@ pub async fn get_combined_status(
 ) -> impl IntoResponse {
     match rg_core::repo::service::get_combined_status(&state.db, &owner, &name, &sha).await {
         Ok(combined) => (StatusCode::OK, Json(combined)).into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -1122,6 +1122,6 @@ pub async fn explore(
             )
                 .into_response()
         }
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

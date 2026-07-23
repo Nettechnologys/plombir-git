@@ -170,7 +170,7 @@ pub async fn get_import_status(
         }
         Ok(Some(_)) => AppError::not_found("import task not found").into_response(),
         Ok(None) => AppError::not_found("import task not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -198,7 +198,7 @@ pub async fn list_imports(State(state): State<AppState>, headers: HeaderMap) -> 
 
     match rg_db::ops::import_task_ops::find_by_user(&state.db, user_id, 20).await {
         Ok(tasks) => (StatusCode::OK, Json(serde_json::json!(tasks))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -235,11 +235,11 @@ pub async fn delete_import(
         Ok(Some(task)) if task.user_id == user_id => {
             match rg_db::ops::import_task_ops::delete_by_id(&state.db, id).await {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(e) => AppError::internal(e).into_response(),
+                Err(e) => AppError::from(e).into_response(),
             }
         }
         Ok(Some(_)) => AppError::not_found("import task not found").into_response(),
         Ok(None) => AppError::not_found("import task not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

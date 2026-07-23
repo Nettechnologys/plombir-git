@@ -54,7 +54,7 @@ pub async fn download_archive(
             return AppError::not_found("repository not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -72,7 +72,7 @@ pub async fn download_archive(
             return AppError::forbidden("access denied").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     }
 
@@ -102,7 +102,7 @@ pub async fn download_archive(
         Some(&repo_path),
     ) {
         Ok(o) => o,
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     let output = match git_out.ensure_success() {

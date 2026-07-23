@@ -128,7 +128,7 @@ pub async fn create_board(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::board::service::create_board(
@@ -167,12 +167,12 @@ pub async fn list_boards(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::board::service::list_boards_by_repo(&state.db, repo.id).await {
         Ok(boards) => (StatusCode::OK, Json(serde_json::json!(boards))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -198,7 +198,7 @@ pub async fn get_board(
     match rg_core::board::service::get_board(&state.db, id).await {
         Ok(Some(board)) => (StatusCode::OK, Json(serde_json::json!(board))).into_response(),
         Ok(None) => AppError::not_found("board not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -264,7 +264,7 @@ pub async fn delete_board(
     let _ = claims;
     match rg_core::board::service::delete_board(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -351,7 +351,7 @@ pub async fn delete_column(
 ) -> impl IntoResponse {
     match rg_core::board::service::delete_column(&state.db, col_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -493,6 +493,6 @@ pub async fn delete_card(
 ) -> impl IntoResponse {
     match rg_core::board::service::delete_card(&state.db, card_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

@@ -84,7 +84,7 @@ pub async fn search(
             })),
         )
             .into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

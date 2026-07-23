@@ -197,7 +197,7 @@ pub async fn ai_list_issues(
 
     let issues = rg_core::issue::service::list_issues(&state.db, &owner, &name, Some(state_filter))
         .await
-        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
+        .map_err(AppError::from)?;
 
     let limit = params.limit.unwrap_or(20) as usize;
     let summaries = issues
@@ -245,7 +245,7 @@ pub async fn ai_list_prs(
     let prs =
         rg_core::pull_request::service::list_prs(&state.db, &owner, &name, Some(state_filter))
             .await
-            .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
+            .map_err(AppError::from)?;
 
     let limit = params.limit.unwrap_or(20) as usize;
     let summaries = prs
@@ -354,11 +354,11 @@ pub async fn ai_search_code(
             [repo.id.into()],
         ))
         .await
-        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::internal("Failed to check index status".to_string()))?;
     let indexed_count: i64 = check_result
         .try_get_by_index(0)
-        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
+        .map_err(AppError::from)?;
 
     if indexed_count == 0 {
         return Err(AppError::bad_request(

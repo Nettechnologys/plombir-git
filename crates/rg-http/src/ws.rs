@@ -359,28 +359,28 @@ pub async fn ws_job_log_handler(
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) => job,
         Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
-        Err(error) => return crate::error::AppError::internal(error).into_response(),
+        Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
         Ok(Some(stage)) => stage,
         Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
-        Err(error) => return crate::error::AppError::internal(error).into_response(),
+        Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id).await
     {
         Ok(Some(pipeline)) => pipeline,
         Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
-        Err(error) => return crate::error::AppError::internal(error).into_response(),
+        Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     let repository = match rg_db::ops::repo_ops::find_by_id(&state.db, pipeline.repo_id).await {
         Ok(Some(repository)) => repository,
         Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
-        Err(error) => return crate::error::AppError::internal(error).into_response(),
+        Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     match rg_core::repo::service::can_read_repo(&state.db, &repository, Some(user_id)).await {
         Ok(true) => {}
         Ok(false) => return crate::error::AppError::forbidden("access denied").into_response(),
-        Err(error) => return crate::error::AppError::internal(error).into_response(),
+        Err(error) => return crate::error::AppError::from(error).into_response(),
     }
 
     let upgrade = if let Some(proto) = proto_echo {

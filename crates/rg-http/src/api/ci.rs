@@ -138,7 +138,7 @@ pub async fn list_pipelines(
         }
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -175,7 +175,7 @@ pub async fn get_pipeline(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             };
         }
     };
@@ -188,7 +188,7 @@ pub async fn get_pipeline(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             };
         }
     };
@@ -201,7 +201,7 @@ pub async fn get_pipeline(
             Err(e) => {
                 return {
                     tracing::error!(%e, "handler error");
-                    AppError::internal(e).into_response()
+                    AppError::from(e).into_response()
                 };
             }
         };
@@ -291,7 +291,7 @@ pub async fn get_job(
         Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -323,7 +323,7 @@ pub async fn get_job(
         Ok(None) => AppError::not_found("job not found").into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -358,19 +358,19 @@ pub async fn play_job(
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
         Ok(Some(pipeline)) if pipeline.repo_id == repo.id => pipeline,
         Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) if job_belongs_to_pipeline(&state, pipeline_id, job.stage_id).await => job,
         Ok(Some(_)) | Ok(None) => return AppError::not_found("job not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     if pipeline.status != "manual" || job.status != "manual" || job.when_condition != "manual" {
         return AppError::bad_request("job is not awaiting manual action").into_response();
     }
     let released = match rg_db::ops::pipeline_ops::play_manual_job(&state.db, job.id).await {
         Ok(released) => released,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     if !released {
         return AppError::bad_request("manual job was already released").into_response();
@@ -378,7 +378,7 @@ pub async fn play_job(
     if let Err(error) =
         rg_db::ops::pipeline_ops::resume_pipeline_chain(&state.db, pipeline_id, job.stage_id).await
     {
-        return AppError::internal(error).into_response();
+        return AppError::from(error).into_response();
     }
 
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
@@ -406,7 +406,7 @@ pub async fn play_job(
         })
         .await
     {
-        return AppError::internal(error).into_response();
+        return AppError::from(error).into_response();
     }
 
     Json(serde_json::json!({
@@ -511,7 +511,7 @@ pub async fn trigger_pipeline(
             .into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -550,7 +550,7 @@ pub async fn retry_pipeline(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             };
         }
     };
@@ -608,7 +608,7 @@ pub async fn retry_pipeline(
             .into_response(),
         Err(e) => {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         }
     }
 }
@@ -646,7 +646,7 @@ pub async fn cancel_pipeline(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             };
         }
     };
@@ -671,7 +671,7 @@ pub async fn cancel_pipeline(
     {
         return {
             tracing::error!(%e, "handler error");
-            AppError::internal(e).into_response()
+            AppError::from(e).into_response()
         };
     }
 
@@ -681,7 +681,7 @@ pub async fn cancel_pipeline(
         Err(e) => {
             return {
                 tracing::error!(%e, "handler error");
-                AppError::internal(e).into_response()
+                AppError::from(e).into_response()
             };
         }
     };
@@ -763,7 +763,7 @@ async fn resolve_repo_with_read_access(
             Err(AppError::unauthorized("authentication required"))
         }
         Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -780,7 +780,7 @@ async fn resolve_repo_with_write_access(
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(actor_id)).await {
         Ok(true) => Ok((repo, actor_id)),
         Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 

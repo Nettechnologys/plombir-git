@@ -85,7 +85,7 @@ pub async fn list_notifications(
                 .collect();
             Json(PaginatedResponse::new(resp, &pagination, total as u64)).into_response()
         }
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -109,7 +109,7 @@ pub async fn unread_count(State(state): State<AppState>, headers: HeaderMap) -> 
 
     match rg_core::notification::unread_count(&state.db, user_id).await {
         Ok(count) => Json(serde_json::json!({"unread_count": count})).into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -167,7 +167,7 @@ pub async fn mark_all_read(State(state): State<AppState>, headers: HeaderMap) ->
 
     match rg_core::notification::mark_all_read(&state.db, user_id).await {
         Ok(count) => Json(serde_json::json!({"marked_read": count})).into_response(),
-        Err(e) => AppError::internal(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

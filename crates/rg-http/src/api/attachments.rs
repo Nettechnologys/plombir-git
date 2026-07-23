@@ -351,7 +351,7 @@ async fn list(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -486,12 +486,12 @@ async fn download(
     {
         Ok(attachment) => match stream_attachment(state, &attachment).await {
             Ok(response) => response,
-            Err(error) => AppError::internal(error).into_response(),
+            Err(error) => AppError::from(error).into_response(),
         },
         Err(error) if error.to_string().contains("not found") => {
             AppError::not_found("attachment not found").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -563,7 +563,7 @@ async fn delete(
         Err(error) if error.to_string().contains("not found") => {
             AppError::not_found("attachment not found").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 

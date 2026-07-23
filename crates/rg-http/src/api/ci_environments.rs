@@ -102,7 +102,7 @@ pub async fn list(
     };
     match rg_db::ops::ci_environment_ops::list(&state.db, repo.id).await {
         Ok(items) => Json(items.into_iter().map(response).collect::<Vec<_>>()).into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -138,7 +138,7 @@ pub async fn create(
         Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
             AppError::conflict("environment already exists").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -159,7 +159,7 @@ pub async fn update(
     let model = match rg_db::ops::ci_environment_ops::find_by_id(&state.db, id).await {
         Ok(Some(model)) if model.repo_id == repo.id => model,
         Ok(_) => return AppError::not_found("environment not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let mut active: rg_db::entities::ci_environment::ActiveModel = model.into();
     active.name = Set(body.name.trim().to_string());
@@ -174,7 +174,7 @@ pub async fn update(
         Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
             AppError::conflict("environment already exists").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -191,7 +191,7 @@ pub async fn delete(
     match rg_db::ops::ci_environment_ops::find_by_id(&state.db, id).await {
         Ok(Some(model)) if model.repo_id == repo.id => {}
         Ok(_) => return AppError::not_found("environment not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     }
     match rg_db::ops::ci_environment_ops::has_jobs(&state.db, id).await {
         Ok(true) => {
@@ -199,11 +199,11 @@ pub async fn delete(
                 .into_response()
         }
         Ok(false) => {}
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     }
     match rg_db::ops::ci_environment_ops::delete(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -235,11 +235,11 @@ pub async fn approve(
     {
         Ok(true) => {}
         Ok(false) => return AppError::conflict("user already approved this job").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     }
     let approvals = match rg_db::ops::ci_environment_ops::count_approvals(&state.db, job_id).await {
         Ok(count) => count,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let released = if approvals >= ctx.environment.required_approvals as u64 {
         match release_if_ready(&state, &ctx, &owner, pipeline_id, job_id).await {
@@ -283,17 +283,17 @@ async fn authorize_approval(
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
         Ok(Some(pipeline)) if pipeline.repo_id == repo.id => pipeline,
         Ok(_) => return Err(AppError::not_found("pipeline not found").into_response()),
-        Err(error) => return Err(AppError::internal(error).into_response()),
+        Err(error) => return Err(AppError::from(error).into_response()),
     };
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) => job,
         Ok(None) => return Err(AppError::not_found("job not found").into_response()),
-        Err(error) => return Err(AppError::internal(error).into_response()),
+        Err(error) => return Err(AppError::from(error).into_response()),
     };
     let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
         Ok(Some(stage)) if stage.pipeline_id == pipeline_id => stage,
         Ok(_) => return Err(AppError::not_found("job not found").into_response()),
-        Err(error) => return Err(AppError::internal(error).into_response()),
+        Err(error) => return Err(AppError::from(error).into_response()),
     };
     if job.status != "waiting_approval" || pipeline.status != "waiting_approval" {
         return Err(
@@ -316,7 +316,7 @@ async fn authorize_approval(
                     AppError::bad_request("protected environment no longer exists").into_response(),
                 )
             }
-            Err(error) => return Err(AppError::internal(error).into_response()),
+            Err(error) => return Err(AppError::from(error).into_response()),
         };
     let allowed: Vec<i64> = environment
         .allowed_approver_ids
@@ -326,7 +326,7 @@ async fn authorize_approval(
     let is_admin =
         match rg_core::repo::service::can_admin_repo(&state.db, &repo, Some(actor_id)).await {
             Ok(value) => value,
-            Err(error) => return Err(AppError::internal(error).into_response()),
+            Err(error) => return Err(AppError::from(error).into_response()),
         };
     if !is_admin && !allowed.contains(&actor_id) {
         return Err(
@@ -354,7 +354,7 @@ async fn release_if_ready(
         .await
     {
         Ok(value) => value,
-        Err(error) => return Err(AppError::internal(error).into_response()),
+        Err(error) => return Err(AppError::from(error).into_response()),
     };
     let stage_ready = match rg_db::ops::pipeline_ops::stage_has_job_status(
         &state.db,
@@ -364,14 +364,14 @@ async fn release_if_ready(
     .await
     {
         Ok(has_waiting) => !has_waiting,
-        Err(error) => return Err(AppError::internal(error).into_response()),
+        Err(error) => return Err(AppError::from(error).into_response()),
     };
     if released && stage_ready {
         if let Err(error) =
             rg_db::ops::pipeline_ops::resume_approval_chain(&state.db, pipeline_id, ctx.stage.id)
                 .await
         {
-            return Err(AppError::internal(error).into_response());
+            return Err(AppError::from(error).into_response());
         }
         let storage_owner = resolve_storage_owner(state, &ctx.repo, owner).await?;
         let repo_path = state
@@ -392,7 +392,7 @@ async fn release_if_ready(
             })
             .await
         {
-            return Err(AppError::internal(error).into_response());
+            return Err(AppError::from(error).into_response());
         }
     }
     Ok(released)
@@ -411,6 +411,6 @@ async fn resolve_storage_owner(
     match rg_db::ops::user_ops::find_by_id(&state.db, repo.owner_id).await {
         Ok(Some(user)) => Ok(user.username),
         Ok(None) => Err(AppError::internal("repository owner not found").into_response()),
-        Err(error) => Err(AppError::internal(error).into_response()),
+        Err(error) => Err(AppError::from(error).into_response()),
     }
 }

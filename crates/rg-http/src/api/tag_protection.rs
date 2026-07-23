@@ -65,7 +65,7 @@ pub async fn list(
             Json(items.into_iter().map(response).collect::<Vec<_>>()),
         )
             .into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -103,7 +103,7 @@ pub async fn create(
         Err(e) if e.to_string().to_ascii_lowercase().contains("unique") => {
             AppError::conflict("tag protection pattern already exists").into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -121,7 +121,7 @@ pub async fn update(
     let model = match rg_db::ops::protected_tag_ops::find_by_id(&state.db, id).await {
         Ok(Some(v)) if v.repo_id == repo.id => v,
         Ok(_) => return AppError::not_found("tag protection not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let mut active: rg_db::entities::protected_tag::ActiveModel = model.into();
     active.allowed_user_ids = Set(Some(
@@ -130,7 +130,7 @@ pub async fn update(
     active.updated_at = Set(chrono::Utc::now());
     match rg_db::ops::protected_tag_ops::update(&state.db, active).await {
         Ok(v) => (StatusCode::OK, Json(response(v))).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -147,11 +147,11 @@ pub async fn delete(
     match rg_db::ops::protected_tag_ops::find_by_id(&state.db, id).await {
         Ok(Some(v)) if v.repo_id == repo.id => {}
         Ok(_) => return AppError::not_found("tag protection not found").into_response(),
-        Err(e) => return AppError::internal(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
     match rg_db::ops::protected_tag_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

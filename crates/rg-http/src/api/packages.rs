@@ -146,7 +146,7 @@ async fn require_repo_read(
             Err(AppError::unauthorized("authentication required"))
         }
         Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -161,7 +161,7 @@ async fn require_repo_write(
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
         Ok(true) => Ok((repo, user_id)),
         Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 

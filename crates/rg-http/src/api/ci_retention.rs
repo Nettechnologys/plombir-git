@@ -43,7 +43,7 @@ pub async fn get_policy(
             cache_retention_days: policy.cache_retention_days,
         })
         .into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -76,7 +76,7 @@ pub async fn update_policy(
             cache_retention_days: policy.cache_retention_days,
         })
         .into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -92,7 +92,7 @@ pub async fn cleanup(
     };
     match cleanup_expired_storage(&state, Some(repo.id)).await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 

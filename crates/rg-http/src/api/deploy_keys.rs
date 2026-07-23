@@ -79,7 +79,7 @@ pub async fn list_deploy_keys(
             ),
         )
             .into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -123,12 +123,12 @@ pub async fn create_deploy_key(
     let duplicate_user_key =
         match rg_db::ops::ssh_key_ops::find_by_fingerprint(&state.db, &fingerprint).await {
             Ok(key) => key.is_some(),
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         };
     let duplicate_deploy_key =
         match rg_db::ops::deploy_key_ops::find_by_fingerprint(&state.db, &fingerprint).await {
             Ok(key) => key.is_some(),
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         };
     if duplicate_user_key || duplicate_deploy_key {
         return AppError::conflict("this SSH key is already registered").into_response();
@@ -150,7 +150,7 @@ pub async fn create_deploy_key(
         Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
             AppError::conflict("this SSH key is already registered").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -173,10 +173,10 @@ pub async fn delete_deploy_key(
     let key = match rg_db::ops::deploy_key_ops::find_by_id(&state.db, id).await {
         Ok(Some(key)) if key.repo_id == repo.id => key,
         Ok(_) => return AppError::not_found("deploy key not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     match rg_db::ops::deploy_key_ops::delete_by_id(&state.db, key.id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }

@@ -72,7 +72,7 @@ pub async fn list_ssh_keys(State(state): State<AppState>, headers: HeaderMap) ->
             ),
         )
             .into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -120,7 +120,7 @@ pub async fn create_ssh_key(
             return AppError::conflict("this SSH key is already registered").into_response()
         }
         Ok(None) => {}
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     }
     match rg_db::ops::deploy_key_ops::find_by_fingerprint(&state.db, &fingerprint).await {
         Ok(Some(_)) => {
@@ -128,7 +128,7 @@ pub async fn create_ssh_key(
                 .into_response()
         }
         Ok(None) => {}
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     }
 
     let model = rg_db::entities::ssh_key::ActiveModel {
@@ -148,7 +148,7 @@ pub async fn create_ssh_key(
         Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
             AppError::conflict("this SSH key is already registered").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -177,7 +177,7 @@ pub async fn delete_ssh_key(
     let key = match rg_db::ops::ssh_key_ops::find_by_id(&state.db, id).await {
         Ok(Some(key)) => key,
         Ok(None) => return AppError::not_found("SSH key not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     if key.user_id != user_id {
         return AppError::forbidden("you can only delete your own SSH keys").into_response();
@@ -185,6 +185,6 @@ pub async fn delete_ssh_key(
 
     match rg_db::ops::ssh_key_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }

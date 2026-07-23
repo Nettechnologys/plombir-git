@@ -209,7 +209,7 @@ pub async fn get_org(State(state): State<AppState>, Path(name): Path<String>) ->
     match rg_core::org::get_org_by_name(&state.db, &name).await {
         Ok(Some(org)) => Json(org_to_response(&org)).into_response(),
         Ok(None) => AppError::not_found("organization not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -237,7 +237,7 @@ pub async fn list_orgs(State(state): State<AppState>, headers: HeaderMap) -> imp
             let resp: Vec<OrgResponse> = orgs.iter().map(org_to_response).collect();
             Json(resp).into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -273,7 +273,7 @@ pub async fn update_org(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -341,7 +341,7 @@ pub async fn delete_org(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -391,7 +391,7 @@ pub async fn list_org_members(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -409,7 +409,7 @@ pub async fn list_org_members(
                 .collect();
             Json(resp).into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -446,7 +446,7 @@ pub async fn add_org_member(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -518,7 +518,7 @@ pub async fn remove_org_member(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -574,7 +574,7 @@ pub async fn create_team(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -626,7 +626,7 @@ pub async fn list_org_teams(
             return AppError::not_found("organization not found").into_response();
         }
         Err(e) => {
-            return AppError::internal(e).into_response();
+            return AppError::from(e).into_response();
         }
     };
 
@@ -646,7 +646,7 @@ pub async fn list_org_teams(
                 .collect();
             Json(resp).into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -680,7 +680,7 @@ pub async fn get_team(
         })
         .into_response(),
         Ok(None) => AppError::not_found("team not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -741,7 +741,7 @@ pub async fn list_team_members(
                 .collect();
             Json(resp).into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

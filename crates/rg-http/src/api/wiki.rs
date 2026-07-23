@@ -94,7 +94,7 @@ pub async fn list_pages(
             let summaries: Vec<WikiPageSummary> = pages.iter().map(page_to_summary).collect();
             (StatusCode::OK, Json(serde_json::json!(summaries))).into_response()
         }
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -129,7 +129,7 @@ pub async fn get_page(
         )
             .into_response(),
         Ok(None) => AppError::not_found("page not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -330,7 +330,7 @@ pub async fn get_revision(
     match rg_core::wiki::service::get_revision(&state.db, rev_id).await {
         Ok(Some(rev)) => (StatusCode::OK, Json(serde_json::json!(rev))).into_response(),
         Ok(None) => AppError::not_found("revision not found").into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

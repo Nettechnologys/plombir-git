@@ -270,7 +270,7 @@ pub async fn list_reviews(
 
     match rg_core::review::service::list_reviews(&state.db, &owner, &repo, number).await {
         Ok(reviews) => (StatusCode::OK, Json(reviews)).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -488,7 +488,7 @@ pub async fn list_review_comments(
 
     match rg_core::review::service::list_review_comments(&state.db, &owner, &repo, number).await {
         Ok(comments) => (StatusCode::OK, Json(comments)).into_response(),
-        Err(e) => AppError::internal(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -542,7 +542,7 @@ async fn load_timeline_data(
 ) -> Result<TimelineData, axum::response::Response> {
     let persisted_events = rg_db::ops::pr_event_ops::list_by_pr(db, pr.id)
         .await
-        .map_err(|error| AppError::internal(error).into_response())?
+        .map_err(|error| AppError::from(error).into_response())?
         .into_iter()
         .map(|event| {
             let metadata =
@@ -552,16 +552,16 @@ async fn load_timeline_data(
         .collect::<Vec<_>>();
     let reviews = rg_db::ops::pr_review_ops::list_by_pr(db, pr.id)
         .await
-        .map_err(|error| AppError::internal(error).into_response())?;
+        .map_err(|error| AppError::from(error).into_response())?;
     let comments = rg_db::ops::review_comment_ops::list_by_pr(db, pr.id)
         .await
-        .map_err(|error| AppError::internal(error).into_response())?;
+        .map_err(|error| AppError::from(error).into_response())?;
     let reviewer_requests = rg_db::ops::pr_reviewer_request_ops::list_by_pr(db, pr.id)
         .await
-        .map_err(|error| AppError::internal(error).into_response())?;
+        .map_err(|error| AppError::from(error).into_response())?;
     let queue_entry = rg_db::ops::merge_queue_ops::find_by_pr(db, pr.id)
         .await
-        .map_err(|error| AppError::internal(error).into_response())?;
+        .map_err(|error| AppError::from(error).into_response())?;
 
     let actor_ids = collect_timeline_actor_ids(
         &pr,
@@ -575,7 +575,7 @@ async fn load_timeline_data(
         .filter(rg_db::entities::user::Column::Id.is_in(actor_ids))
         .all(db)
         .await
-        .map_err(|error| AppError::internal(error).into_response())?
+        .map_err(|error| AppError::from(error).into_response())?
         .into_iter()
         .map(|user| (user.id, user.username))
         .collect::<HashMap<_, _>>();
@@ -1103,7 +1103,7 @@ pub async fn list_requested_reviewers(
     };
     let requests = match rg_db::ops::pr_reviewer_request_ops::list_by_pr(&state.db, pr.id).await {
         Ok(requests) => requests,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
 
     let mut response = Vec::with_capacity(requests.len());
@@ -1112,7 +1112,7 @@ pub async fn list_requested_reviewers(
         {
             Ok(Some(user)) => user.username,
             Ok(None) => continue,
-            Err(error) => return AppError::internal(error).into_response(),
+            Err(error) => return AppError::from(error).into_response(),
         };
         response.push(RequestedReviewerResponse {
             id: request.id,
@@ -1159,7 +1159,7 @@ pub async fn request_reviewer(
     let reviewer = match rg_db::ops::user_ops::find_by_username(&state.db, username).await {
         Ok(Some(user)) if user.is_active && user.deleted_at.is_none() => user,
         Ok(_) => return AppError::not_found("reviewer not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     if reviewer.id == pr.author_id {
         return AppError::bad_request("the PR author cannot be requested as a reviewer")
@@ -1176,7 +1176,7 @@ pub async fn request_reviewer(
     match rg_db::ops::pr_reviewer_request_ops::find(&state.db, pr.id, reviewer.id).await {
         Ok(Some(_)) => return AppError::conflict("reviewer is already requested").into_response(),
         Ok(None) => {}
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     }
 
     let model = rg_db::entities::pr_reviewer_request::ActiveModel {
@@ -1203,7 +1203,7 @@ pub async fn request_reviewer(
             )
             .await
             {
-                return AppError::internal(error).into_response();
+                return AppError::from(error).into_response();
             }
             (
                 StatusCode::CREATED,
@@ -1220,7 +1220,7 @@ pub async fn request_reviewer(
         Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
             AppError::conflict("reviewer is already requested").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -1249,7 +1249,7 @@ pub async fn remove_requested_reviewer(
     let reviewer = match rg_db::ops::user_ops::find_by_username(&state.db, &username).await {
         Ok(Some(user)) => user,
         Ok(None) => return AppError::not_found("requested reviewer not found").into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     match rg_db::ops::pr_reviewer_request_ops::delete(&state.db, pr.id, reviewer.id).await {
         Ok(0) => AppError::not_found("requested reviewer not found").into_response(),
@@ -1268,11 +1268,11 @@ pub async fn remove_requested_reviewer(
             )
             .await
             {
-                return AppError::internal(error).into_response();
+                return AppError::from(error).into_response();
             }
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 

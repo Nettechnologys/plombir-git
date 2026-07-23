@@ -33,7 +33,7 @@ pub(crate) async fn require_read(
             Err(AppError::unauthorized("authentication required"))
         }
         Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -51,7 +51,7 @@ pub(crate) async fn require_authenticated_read(
     match rg_core::repo::service::can_read_repo(&state.db, &repo, Some(actor_id)).await {
         Ok(true) => Ok((repo, actor_id)),
         Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -69,7 +69,7 @@ pub(crate) async fn require_write(
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(actor_id)).await {
         Ok(true) => Ok((repo, actor_id)),
         Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -86,6 +86,6 @@ pub(crate) async fn require_admin(
     match rg_core::repo::service::can_admin_repo(&state.db, &repo, Some(actor_id)).await {
         Ok(true) => Ok((repo, actor_id)),
         Ok(false) => Err(AppError::forbidden("repository admin access required")),
-        Err(error) => Err(AppError::internal(error)),
+        Err(error) => Err(AppError::from(error)),
     }
 }

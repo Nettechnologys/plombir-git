@@ -149,7 +149,7 @@ pub async fn external_ci_webhook(
         Ok(None) => {
             return crate::error::AppError::not_found("repository not found").into_response()
         }
-        Err(e) => return crate::error::AppError::internal(e.to_string()).into_response(),
+        Err(e) => return crate::error::AppError::from(e).into_response(),
     };
 
     // Create commit status (without sha — will be associated later via push)
@@ -180,7 +180,7 @@ pub async fn external_ci_webhook(
     .await
     {
         Ok(s) => s,
-        Err(e) => return crate::error::AppError::internal(e.to_string()).into_response(),
+        Err(e) => return crate::error::AppError::from(e).into_response(),
     };
 
     (
