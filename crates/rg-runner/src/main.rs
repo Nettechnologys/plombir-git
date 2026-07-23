@@ -521,6 +521,13 @@ async fn run_job_local(
     }
 }
 
+/// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
+const DOCKER_PIDS_LIMIT: &str = "512";
+/// Default memory ceiling for a job container.
+const DOCKER_MEMORY_LIMIT: &str = "2g";
+/// Default CPU quota for a job container.
+const DOCKER_CPU_LIMIT: &str = "2";
+
 /// Execute a job script inside a Docker container.
 async fn run_job_docker(
     image: &str,
@@ -543,15 +550,14 @@ async fn run_job_docker(
         return (-1, msg);
     }
 
-    let mut command = tokio::process::Command::new("docker");
     let container_name = format!("forgekeep-runner-job-{job_id}");
-    command.args(["run", "--rm", "--name", &container_name, "-v"]);
-    command.arg(format!("{}:/workspace", workspace.to_string_lossy()));
-    command.args(["-w", "/workspace"]);
-    for (key, _) in variables {
-        command.arg("-e").arg(key);
-    }
-    command.args([image, "sh", "-c", script]);
+    let args = docker_run_args(image, script, variables, workspace, &container_name);
+
+    let mut command = tokio::process::Command::new("docker");
+    command.args(&args);
+    // Only the variable name is passed on the command line above; the value is
+    // inherited from the Docker CLI environment so secrets are not exposed in the
+    // host process arguments.
     for (key, value) in variables {
         command.env(key, value);
     }
@@ -576,6 +582,57 @@ async fn run_job_docker(
     }
 }
 
+/// Build the `docker run` argument vector for a job container.
+///
+/// SECURITY (CWE-269 privilege escalation): the container is confined so a
+/// malicious job cannot break out onto the runner host. Aligned with the
+/// internal rg-ci `PipelineRunner`:
+/// - `--cap-drop=ALL` strips every Linux capability (no raw sockets, no mount…).
+/// - `--security-opt=no-new-privileges` blocks setuid/gain-privilege via execve.
+/// - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion (fork bomb, OOM).
+///
+/// The Docker socket is deliberately NOT mounted and `--privileged` is never
+/// passed, so the job has no path to the daemon or host devices. Only variable
+/// *names* are placed on the command line; values are inherited from the CLI
+/// environment so secrets never appear in the host process arguments.
+fn docker_run_args(
+    image: &str,
+    script: &str,
+    variables: &[(String, String)],
+    workspace: &std::path::Path,
+    container_name: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--name".to_string(),
+        container_name.to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--pids-limit".to_string(),
+        DOCKER_PIDS_LIMIT.to_string(),
+        "--memory".to_string(),
+        DOCKER_MEMORY_LIMIT.to_string(),
+        "--cpus".to_string(),
+        DOCKER_CPU_LIMIT.to_string(),
+        "-v".to_string(),
+        format!("{}:/workspace", workspace.to_string_lossy()),
+        "-w".to_string(),
+        "/workspace".to_string(),
+    ];
+    for (key, _) in variables {
+        args.push("-e".to_string());
+        args.push(key.clone());
+    }
+    args.push(image.to_string());
+    args.push("sh".to_string());
+    args.push("-c".to_string());
+    args.push(script.to_string());
+    args
+}
+
 fn docker_unavailable_message(image: &str) -> String {
     format!(
         "Docker daemon not available. Job requires image '{}' but cannot run in container. \
@@ -594,6 +651,46 @@ mod tests {
 
         assert!(msg.contains("alpine:3.20"));
         assert!(msg.contains("Refusing to fall back to local execution"));
+    }
+
+    #[test]
+    fn docker_run_args_apply_sandbox_hardening() {
+        let variables = vec![("CI_JOB_TOKEN".to_string(), "secret".to_string())];
+        let args = docker_run_args(
+            "alpine:3.20",
+            "echo hi",
+            &variables,
+            std::path::Path::new("/workspace/repo"),
+            "forgekeep-runner-job-7",
+        );
+
+        // Defense-in-depth flags aligned with rg-ci PipelineRunner.
+        let window = |flag: &str, value: &str| {
+            args.windows(2)
+                .any(|w| w[0] == flag && w[1] == value)
+        };
+        assert!(window("--cap-drop", "ALL"), "missing --cap-drop=ALL: {args:?}");
+        assert!(
+            window("--security-opt", "no-new-privileges"),
+            "missing no-new-privileges: {args:?}"
+        );
+        assert!(window("--pids-limit", DOCKER_PIDS_LIMIT), "missing --pids-limit");
+        assert!(window("--memory", DOCKER_MEMORY_LIMIT), "missing --memory");
+        assert!(window("--cpus", DOCKER_CPU_LIMIT), "missing --cpus");
+
+        // Never grant a path to the host daemon / devices.
+        assert!(!args.iter().any(|a| a == "--privileged"), "--privileged leaked in");
+        assert!(
+            !args.iter().any(|a| a.contains("docker.sock")),
+            "docker socket mounted"
+        );
+
+        // Secret values must not appear on the command line — only the name.
+        assert!(args.iter().any(|a| a == "CI_JOB_TOKEN"));
+        assert!(!args.iter().any(|a| a == "secret"), "secret value leaked into argv");
+
+        // Image and script still terminate the invocation.
+        assert_eq!(&args[args.len() - 4..], &["alpine:3.20", "sh", "-c", "echo hi"]);
     }
 
     #[tokio::test]
