@@ -102,6 +102,13 @@ pub struct HttpServerConfig {
     pub job_timeout_secs: u64,
     /// CI engine implementation (M-14: injected from rg-cli, decouples rg-http from rg-ci).
     pub ci_engine: Arc<dyn rg_core::ci::CiTrigger + Send + Sync>,
+    /// Graceful-shutdown signal. Flips to `true` on SIGTERM/ctrl_c; the server
+    /// then stops accepting connections, drains in-flight requests, and lets the
+    /// background workers exit cleanly.
+    pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Grace window (seconds) for draining in-flight requests and the CI-log
+    /// queue after the shutdown signal fires before the process is forced down.
+    pub shutdown_grace_secs: u64,
 }
 
 /// Start the HTTP server and run forever.
@@ -111,7 +118,10 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         config.rate_limit_window_secs,
         config.rate_limit_trusted_proxies,
     );
-    rate_limiter.spawn_cleanup_task();
+    let shutdown_rx = config.shutdown_rx.clone();
+    let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs.max(1));
+
+    rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
 
     let notification_hub = ws::NotificationHub::new();
 
@@ -138,6 +148,12 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     let watchdog_db = config.db.clone();
     let log_queue_db = config.db.clone();
 
+    let (log_write_queue, log_consumer_handle) =
+        rg_core::ci::log_write_queue::LogWriteQueue::spawn_with_shutdown(
+            log_queue_db,
+            shutdown_rx.clone(),
+        );
+
     let state = AppState {
         repo_root: Arc::new(config.repo_root),
         db: config.db,
@@ -150,7 +166,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         smtp_config: config.smtp_config,
         blob_storage,
         oci_storage,
-        log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(log_queue_db),
+        log_write_queue,
         external_url: config.external_url,
         job_timeout_secs: config.job_timeout_secs,
         ci_engine: config.ci_engine,
@@ -158,12 +174,18 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
 
     let app = routes::create_router(state.clone(), rate_limiter.clone());
 
-    tokio::spawn(api::ci_retention::run_cleanup_loop(state.clone()));
+    tokio::spawn(api::ci_retention::run_cleanup_loop(
+        state.clone(),
+        shutdown_rx.clone(),
+    ));
 
     // Spawn runner watchdog background task
-    tokio::spawn(async move {
-        run_runner_watchdog(watchdog_db).await;
-    });
+    {
+        let watchdog_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_runner_watchdog(watchdog_db, watchdog_shutdown).await;
+        });
+    }
 
     tracing::info!("CORS permissive mode active — tighten in production");
 
@@ -190,12 +212,20 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
 
         let app = app;
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+
+        // axum-server drains in-flight connections via a `Handle`: on the
+        // shutdown signal we ask it to stop gracefully, and it force-closes any
+        // still-open connections once the grace window elapses.
+        let handle = axum_server::Handle::new();
+        spawn_graceful_shutdown_trigger(handle.clone(), shutdown_rx.clone(), shutdown_grace);
+
         axum_server::bind_rustls(
             config_clone
                 .parse()
                 .with_context(|| format!("invalid TLS listen address: {}", config_clone))?,
             rustls_config,
         )
+        .handle(handle)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await
         .context("HTTPS server error")?;
@@ -207,15 +237,66 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
 
         tracing::info!(addr = %config.listen_addr, "HTTP server listening");
 
-        axum::serve(
+        // `axum::serve(...).with_graceful_shutdown` stops accepting new
+        // connections once the signal fires and waits for in-flight requests to
+        // finish. We bound that wait with the grace window so a stuck handler
+        // can never block process exit indefinitely.
+        let serve_fut = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .await
-        .context("HTTP server error")?;
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx.clone()));
+
+        let grace_rx = shutdown_rx.clone();
+        tokio::select! {
+            result = serve_fut => result.context("HTTP server error")?,
+            _ = async {
+                shutdown_signal(grace_rx).await;
+                tokio::time::sleep(shutdown_grace).await;
+            } => {
+                tracing::warn!(
+                    grace_secs = shutdown_grace.as_secs(),
+                    "graceful shutdown grace window elapsed — forcing HTTP server stop"
+                );
+            }
+        }
+    }
+
+    // ── Drain the CI-log queue ─────────────────────────────────────────
+    // The server has stopped accepting work; give the log-write consumer the
+    // remaining grace window to flush its buffered writes before we return
+    // (and the runtime is torn down).
+    match tokio::time::timeout(shutdown_grace, log_consumer_handle).await {
+        Ok(Ok(())) => tracing::info!("CI-log queue drained on shutdown"),
+        Ok(Err(join_err)) => tracing::warn!(%join_err, "CI-log queue consumer join failed"),
+        Err(_) => tracing::warn!("CI-log queue drain timed out within grace window"),
     }
 
     Ok(())
+}
+
+/// Resolve when the graceful-shutdown signal fires (or the coordinator is
+/// dropped). Used as the future handed to `with_graceful_shutdown`.
+async fn shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    // Already signalled? return immediately.
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    let _ = shutdown_rx.changed().await;
+}
+
+/// Bridge the `watch` shutdown signal to an `axum_server::Handle`: once the
+/// signal fires, ask the handle to shut down gracefully with the grace window.
+fn spawn_graceful_shutdown_trigger(
+    handle: axum_server::Handle,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        shutdown_signal(shutdown_rx).await;
+        tracing::info!("shutdown signal received — draining HTTPS connections");
+        handle.graceful_shutdown(Some(grace));
+    });
 }
 
 /// Load TLS certificate and private key, return a rustls ServerConfig.
@@ -261,13 +342,25 @@ pub fn create_router_for_test(state: AppState) -> Router {
 /// Background task that periodically checks for:
 /// 1. Stuck jobs (assigned/running for too long) → reset to pending
 /// 2. Offline runners (no heartbeat) → mark as offline
-async fn run_runner_watchdog(db: DatabaseConnection) {
-    // Wait for server to fully start
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+async fn run_runner_watchdog(
+    db: DatabaseConnection,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // Wait for server to fully start (abort early if shutdown fires first)
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+        _ = shutdown_rx.changed() => return,
+    }
 
     loop {
         // Check every 60 seconds
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = shutdown_rx.changed() => {
+                tracing::info!("runner watchdog received shutdown, stopping");
+                break;
+            }
+        }
 
         // 1. Reset stuck jobs (assigned/running > 10 min)
         match rg_db::ops::pipeline_ops::find_stuck_jobs(&db, 600).await {

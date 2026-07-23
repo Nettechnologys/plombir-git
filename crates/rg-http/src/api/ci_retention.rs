@@ -165,7 +165,7 @@ async fn safe_remove_file(path: PathBuf, root: &FsPath) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn run_cleanup_loop(state: AppState) {
+pub async fn run_cleanup_loop(state: AppState, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
     loop {
         match cleanup_expired_storage(&state, None).await {
             Ok(summary)
@@ -183,6 +183,12 @@ pub async fn run_cleanup_loop(state: AppState) {
             Ok(_) => {}
             Err(error) => tracing::error!(%error, "CI retention cleanup failed"),
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+            _ = shutdown_rx.changed() => {
+                tracing::info!("CI retention cleanup received shutdown, stopping");
+                break;
+            }
+        }
     }
 }

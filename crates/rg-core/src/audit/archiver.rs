@@ -5,6 +5,7 @@ use chrono::{Duration, Utc};
 use sea_orm::DatabaseConnection;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use tokio::sync::watch;
 use tokio::time;
 
 #[derive(Clone, Debug)]
@@ -58,13 +59,33 @@ pub fn spawn_archiver_with_config(
     db: DatabaseConnection,
     config: AuditArchiveConfig,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    spawn_archiver_with_shutdown(db, config, None)
+}
+
+/// Start the background audit archive task, optionally wired to a graceful
+/// shutdown signal. When `shutdown_rx` flips to `true`, the archiver stops at
+/// the next idle point rather than being aborted mid-run — its writes are
+/// already atomic (temp file + rename, DB purge only after durable write), so
+/// there is nothing to flush, only a clean loop exit.
+pub fn spawn_archiver_with_shutdown(
+    db: DatabaseConnection,
+    config: AuditArchiveConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     config.validate()?;
     Ok(tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
         let mut interval = time::interval(time::Duration::from_secs(
             config.interval_minutes.saturating_mul(60),
         ));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = wait_optional_shutdown(&mut shutdown_rx) => {
+                    tracing::info!("audit log archiver received shutdown, stopping");
+                    break;
+                }
+            }
             loop {
                 match run_archive_once(&db, &config).await {
                     Ok(Some(result)) => {
@@ -86,6 +107,17 @@ pub fn spawn_archiver_with_config(
             }
         }
     }))
+}
+
+/// Await a shutdown signal if present, otherwise never resolve. Lets a
+/// `tokio::select!` arm be conditionally armed on an `Option<Receiver>`.
+async fn wait_optional_shutdown(shutdown_rx: &mut Option<watch::Receiver<bool>>) {
+    match shutdown_rx {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Archive one bounded batch. Returns `None` when no eligible entries exist.

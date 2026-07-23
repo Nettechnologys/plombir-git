@@ -48,6 +48,9 @@ struct ServerConfig {
     host_key: Option<String>,
     /// External-facing URL for SSO callbacks and links (e.g., "https://git.example.com")
     external_url: Option<String>,
+    /// Grace window (seconds) for draining in-flight requests and the CI-log
+    /// queue on SIGTERM/ctrl_c before the process is forced down (default: 30).
+    shutdown_grace_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -146,6 +149,38 @@ fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
     let config: ConfigFile = toml::from_str(&content)?;
     tracing::info!(path = %path, "Loaded configuration file");
     Ok(config)
+}
+
+/// Wait for the first OS shutdown signal: ctrl_c (SIGINT) on all platforms,
+/// plus SIGTERM on Unix (the signal `kill`/systemd/Docker send on stop).
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(%e, "failed to install ctrl_c handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(%e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received ctrl_c — initiating graceful shutdown"),
+        _ = terminate => tracing::info!("received SIGTERM — initiating graceful shutdown"),
+    }
 }
 
 fn parse_rate_limit_trusted_proxies(values: &[String]) -> anyhow::Result<Vec<IpAddr>> {
@@ -414,6 +449,19 @@ pub(crate) async fn run_serve(
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
 
+    // ── Graceful shutdown signal ──────────────────────────────────
+    // A single `watch` channel fans the SIGTERM/ctrl_c signal out to the HTTP
+    // server and every background worker so they can drain and exit cleanly.
+    let resolved_shutdown_grace = cfg
+        .as_ref()
+        .and_then(|c| c.server.shutdown_grace_secs)
+        .unwrap_or(30);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
     let audit_config = cfg.as_ref().map(|config| &config.audit);
     let _audit_archiver_handle = if audit_config
         .and_then(|config| config.enabled)
@@ -435,9 +483,10 @@ pub(crate) async fn run_serve(
                 .and_then(|config| config.batch_size)
                 .unwrap_or(1_000),
         };
-        Some(rg_core::audit::archiver::spawn_archiver_with_config(
+        Some(rg_core::audit::archiver::spawn_archiver_with_shutdown(
             db.clone(),
             archive_config,
+            Some(shutdown_rx.clone()),
         )?)
     } else {
         tracing::info!("Audit log archival disabled by configuration");
@@ -494,6 +543,8 @@ pub(crate) async fn run_serve(
         job_timeout_secs: resolved_job_timeout,
         // M-14: Inject CiEngine via trait object, decoupling rg-http from rg-ci.
         ci_engine: std::sync::Arc::new(rg_ci::CiEngine),
+        shutdown_rx: shutdown_rx.clone(),
+        shutdown_grace_secs: resolved_shutdown_grace,
     };
 
     // ── SSH server ────────────────────────────────────────────────

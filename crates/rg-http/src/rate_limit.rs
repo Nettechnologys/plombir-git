@@ -120,6 +120,17 @@ impl RateLimiter {
 
     /// Spawn a background task that periodically cleans up expired entries.
     pub fn spawn_cleanup_task(&self) {
+        self.spawn_cleanup_task_with_shutdown(None);
+    }
+
+    /// Spawn the periodic cleanup task, optionally wired to a graceful shutdown
+    /// signal so it exits cleanly on `SIGTERM`/ctrl_c instead of being aborted
+    /// when the runtime winds down. Cleanup is pure in-memory bookkeeping, so
+    /// there is no state to flush — this only lets the task stop gracefully.
+    pub fn spawn_cleanup_task_with_shutdown(
+        &self,
+        mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -131,8 +142,13 @@ impl RateLimiter {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                limiter.cleanup();
+                tokio::select! {
+                    _ = interval.tick() => limiter.cleanup(),
+                    _ = wait_optional_shutdown(&mut shutdown_rx) => {
+                        tracing::info!("rate-limit cleanup received shutdown, stopping");
+                        break;
+                    }
+                }
             }
         });
     }
@@ -144,6 +160,17 @@ impl RateLimiter {
             }
         }
         addr.ip().to_string()
+    }
+}
+
+/// Await a shutdown signal if present, otherwise never resolve. Lets a
+/// `tokio::select!` arm be conditionally armed on an `Option<Receiver>`.
+async fn wait_optional_shutdown(shutdown_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match shutdown_rx {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
