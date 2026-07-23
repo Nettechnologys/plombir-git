@@ -1,0 +1,24 @@
+ForgeKeep
+Copyright (c) 2026 Yahook
+
+The MIT License in the LICENSE file applies to ForgeKeep's own source code and
+modifications.
+
+------------------------------------------------------------------------------
+Upstream origin
+------------------------------------------------------------------------------
+
+ForgeKeep began as a fork of IronForge:
+
+    https://github.com/lengyuqu/ironforge
+
+At the time of forking, the upstream IronForge repository did not ship a
+LICENSE, NOTICE, or COPYING file, and GitHub reported no detected license for
+it. The "MIT" wording that appeared in the upstream README was a badge only,
+unaccompanied by any license text or copyright notice.
+
+This NOTICE is provided in good faith to credit the upstream project and to
+record the fork's provenance accurately. It does not assert that the upstream
+code is MIT-licensed — that claim could not be verified. Anyone reusing code
+that originates from upstream IronForge (rather than ForgeKeep's own changes)
+should confirm the applicable terms with the upstream author directly.
