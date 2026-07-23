@@ -80,6 +80,7 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
         listen_addr: listen_addr.clone(),
         repo_root: repo_root.clone(),
         db: Some(db.clone()),
+        git_stream_timeout_secs: 300,
     };
     let server = tokio::spawn(async move {
         rg_ssh::start_ssh_server(server_config).await.unwrap();

@@ -21,7 +21,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | SSH transport | ✅ | `rg-ssh/` (`russh`) | public-key auth |
 | Лимит размера тела git-запроса | ✅ 🔒 | `rg-http/src/routes.rs` | RequestBodyLimit на git-роутах |
 | git CLI gateway с timeout+kill | ✅ 🔒 | `rg-git/src/cli_gateway.rs` | синхронный `run()` — timeout + kill child (default 120s) |
-| Wall-clock bound на стриминг-пути (pack-objects/index-pack) | ✅ 🔒 | `rg-http/src/git_http.rs::with_git_timeout` | upload-pack (V1+V2) и receive-pack обёрнуты в `tokio::time::timeout([timeouts].git_stream_secs, деф. 300, 0=off)`; по таймауту future дропается → `kill_on_drop` убивает git → 504 `GIT_TIMEOUT`. SSH-транспорт того же класса (`rg-ssh` exec spawn) пока не покрыт → см. card |
+| Wall-clock bound на стриминг-пути (pack-objects/index-pack) | ✅ 🔒 | `rg-http/src/git_http.rs::with_git_timeout`, `rg-ssh/src/lib.rs::with_git_timeout` | **HTTP:** upload-pack (V1+V2) и receive-pack обёрнуты в `tokio::time::timeout([timeouts].git_stream_secs, деф. 300, 0=off)`; по таймауту future дропается → `kill_on_drop` убивает git → 504 `GIT_TIMEOUT`. **SSH:** тот же bound вокруг `handle_*_stream` в `exec_request` spawn (тот же `[timeouts].git_stream_secs`, проброшен через `SshServerConfig`/`SharedState`); по таймауту → лог + exit_code≠0 + `stream.shutdown()`, git убит `kill_on_drop`. Оба входа покрывают все 3 `spawn_async`-колсайта. |
 
 ## 2. Аутентификация и авторизация
 

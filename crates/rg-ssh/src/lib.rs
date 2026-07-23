@@ -23,6 +23,31 @@ use rg_git::protocol::receive_pack::{
 use rg_git::protocol::upload_pack::handle_upload_pack_stream;
 use rg_git::protocol::v2::handle_v2_stream;
 
+/// Wall-clock guard around a streaming git protocol handler.
+///
+/// The SSH stream handlers (`handle_upload_pack_stream`, `handle_v2_stream`,
+/// `handle_receive_pack_stream{,_with_rejections}`) each spawn a `git`
+/// subprocess via [`rg_git::cli_gateway::GitCommandGateway::spawn_async`],
+/// which only sets `kill_on_drop(true)` and asks the caller to bound the I/O
+/// loop. Without a bound a hung or pathologically slow git process holds the
+/// SSH connection + subprocess forever.
+///
+/// On timeout the inner future is dropped, which drops the `git` child held
+/// inside the handler → `kill_on_drop` kills the subprocess. No explicit PID
+/// management is needed. This mirrors the HTTP transport's identically-named
+/// helper in `rg-http/src/git_http.rs`.
+///
+/// `secs == 0` disables the bound (the future runs unbounded).
+async fn with_git_timeout<T>(
+    secs: u64,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    if secs == 0 {
+        return Ok(fut.await);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await
+}
+
 /// Error type for SSH handler.
 #[derive(Debug)]
 struct HandlerError(String);
@@ -57,12 +82,21 @@ pub struct SshServerConfig {
     pub repo_root: PathBuf,
     /// Database connection (None = open access, Phase 1 compat).
     pub db: Option<DatabaseConnection>,
+    /// Wall-clock timeout (seconds) for the streaming git transport
+    /// (upload-pack / receive-pack / v2). Bounds a hung or pathologically slow
+    /// `git` subprocess so a stalled-but-connected SSH client can't hold a
+    /// connection + process indefinitely. 0 disables the bound (default: 300).
+    /// Mirrors the HTTP transport's `git_stream_timeout_secs`.
+    pub git_stream_timeout_secs: u64,
 }
 
 /// Shared state passed to every SshHandler.
 struct SharedState {
     repo_root: Arc<PathBuf>,
     db: Option<Arc<DatabaseConnection>>,
+    /// Wall-clock bound (seconds) applied around each git streaming handler.
+    /// 0 = disabled. See [`SshServerConfig::git_stream_timeout_secs`].
+    git_stream_timeout_secs: u64,
 }
 
 /// The ForgeKeep SSH server — implements `russh::server::Server`.
@@ -120,6 +154,7 @@ impl SshServer {
         let shared = Arc::new(SharedState {
             repo_root: Arc::new(ssh_config.repo_root),
             db: ssh_config.db.map(Arc::new),
+            git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
         });
 
         Ok(Self {
@@ -464,49 +499,73 @@ impl Handler for SshHandler {
         let handle = session.handle();
         let service_name = service.clone();
         let git_protocol_version = self.git_protocol_version.clone();
+        let git_stream_timeout_secs = self.shared.git_stream_timeout_secs;
 
         tokio::spawn(async move {
             tracing::info!(%service_name, path = %repo_full_path.display(), "Starting git SSH session");
 
             let mut stream: ChannelStream<Msg> = ch.into_stream();
 
-            let result: Result<(), anyhow::Error> = if git_protocol_version == "2" {
-                tracing::info!(%service_name, "Using Protocol V2");
-                handle_v2_stream(&repo_full_path, &mut stream).await
-            } else {
-                match service_name.as_str() {
-                    "git-upload-pack" => handle_upload_pack_stream(&repo_full_path, &mut stream)
-                        .await
-                        .map(|_| ()),
-                    "git-receive-pack" => {
-                        if let Some((protection_rules, tag_protection_rules, actor_id)) =
-                            receive_pack_context
-                        {
-                            let require_signed_refs =
-                                signed_commit_required_refs(&protection_rules);
-                            let mut rejected_refs =
-                                branch_protection_rejected_refs(protection_rules, actor_id);
-                            rejected_refs.extend(tag_protection_rejected_refs(
-                                tag_protection_rules,
-                                actor_id,
-                            ));
-                            handle_receive_pack_stream_with_rejections(
-                                &repo_full_path,
-                                &mut stream,
-                                rejected_refs,
-                                require_signed_refs,
-                            )
-                            .await
-                            .map(|_| ())
-                        } else {
-                            handle_receive_pack_stream(&repo_full_path, &mut stream)
+            // Wall-clock bound around the git streaming handler. The `git` child
+            // lives *inside* this future (spawned via `spawn_async`'s
+            // `kill_on_drop(true)`), so an elapsed timeout drops the future →
+            // drops the child → kills git. We still own `stream` afterwards
+            // (the borrow ends when the future is dropped), so we can report the
+            // exit status + shut the channel down cleanly below.
+            let handler_fut = async {
+                if git_protocol_version == "2" {
+                    tracing::info!(%service_name, "Using Protocol V2");
+                    handle_v2_stream(&repo_full_path, &mut stream).await
+                } else {
+                    match service_name.as_str() {
+                        "git-upload-pack" => {
+                            handle_upload_pack_stream(&repo_full_path, &mut stream)
                                 .await
                                 .map(|_| ())
                         }
+                        "git-receive-pack" => {
+                            if let Some((protection_rules, tag_protection_rules, actor_id)) =
+                                receive_pack_context
+                            {
+                                let require_signed_refs =
+                                    signed_commit_required_refs(&protection_rules);
+                                let mut rejected_refs =
+                                    branch_protection_rejected_refs(protection_rules, actor_id);
+                                rejected_refs.extend(tag_protection_rejected_refs(
+                                    tag_protection_rules,
+                                    actor_id,
+                                ));
+                                handle_receive_pack_stream_with_rejections(
+                                    &repo_full_path,
+                                    &mut stream,
+                                    rejected_refs,
+                                    require_signed_refs,
+                                )
+                                .await
+                                .map(|_| ())
+                            } else {
+                                handle_receive_pack_stream(&repo_full_path, &mut stream)
+                                    .await
+                                    .map(|_| ())
+                            }
+                        }
+                        _ => Err(anyhow::anyhow!("Unknown git service: {}", service_name)),
                     }
-                    _ => Err(anyhow::anyhow!("Unknown git service: {}", service_name)),
                 }
             };
+
+            let result: Result<(), anyhow::Error> =
+                match with_git_timeout(git_stream_timeout_secs, handler_fut).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            %service_name,
+                            timeout_secs = git_stream_timeout_secs,
+                            "git SSH session exceeded wall-clock timeout — killed git, closing channel"
+                        );
+                        Err(anyhow::anyhow!("git operation timed out"))
+                    }
+                };
 
             let exit_code: u32 = if result.is_ok() { 0 } else { 1 };
 
@@ -638,7 +697,8 @@ pub async fn start_ssh_server(config: SshServerConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deploy_key_allows, parse_git_command, parse_repo_owner_name};
+    use super::{deploy_key_allows, parse_git_command, parse_repo_owner_name, with_git_timeout};
+    use std::time::Duration;
 
     #[test]
     fn parses_git_command_with_quoted_repo_path() {
@@ -676,5 +736,87 @@ mod tests {
         assert!(deploy_key_allows(7, false, 7, "git-receive-pack"));
         assert!(!deploy_key_allows(7, false, 8, "git-upload-pack"));
         assert!(!deploy_key_allows(7, false, 8, "git-receive-pack"));
+    }
+
+    #[tokio::test]
+    async fn with_git_timeout_elapses_on_slow_future() {
+        // An SSH git streaming handler slower than the wall-clock bound must
+        // elapse so the caller kills git + closes the channel with exit != 0.
+        let res = with_git_timeout(1, async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            42
+        })
+        .await;
+        assert!(res.is_err(), "slow future should elapse");
+    }
+
+    #[tokio::test]
+    async fn with_git_timeout_passes_fast_future() {
+        let res = with_git_timeout(30, async { 7 }).await;
+        assert_eq!(res.ok(), Some(7), "fast future should complete, not elapse");
+    }
+
+    #[tokio::test]
+    async fn with_git_timeout_zero_disables_bound() {
+        // 0 = opt out: the future runs unbounded and its value passes through.
+        let res = with_git_timeout(0, async { 5 }).await;
+        assert_eq!(res.ok(), Some(5));
+    }
+
+    /// Read a process's state char from `/proc/<pid>/stat`, or `None` if it no
+    /// longer exists. `'Z'` = zombie (killed, awaiting reap). `comm` may contain
+    /// spaces/parens, so split on the last `)`.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().next().and_then(|s| s.chars().next())
+    }
+
+    /// The core anti-zombie guarantee: the git subprocess lives *inside* the
+    /// future, so when `with_git_timeout` drops that future on elapse,
+    /// `kill_on_drop` reaps it — it must not keep running. Emulated here with a
+    /// long `sleep` child (the SSH git handlers spawn their child the same
+    /// `kill_on_drop` way via `spawn_async`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn with_git_timeout_kills_child_on_elapse() {
+        use tokio::io::AsyncReadExt;
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+        assert!(proc_state(pid).is_some(), "child should be alive before timeout");
+
+        // The child is owned *inside* the future, mirroring the real handlers.
+        let res = with_git_timeout(1, async move {
+            let mut child = child;
+            let mut buf = Vec::new();
+            // This never completes within the bound — the child sleeps 60s.
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_end(&mut buf).await;
+            }
+            buf
+        })
+        .await;
+        assert!(res.is_err(), "slow child future should elapse");
+
+        // After the future is dropped, kill_on_drop must have killed the child.
+        // Poll briefly — reaping is asynchronous.
+        let mut killed = false;
+        for _ in 0..50 {
+            match proc_state(pid) {
+                None | Some('Z') => {
+                    killed = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(killed, "child must be killed/zombie after timeout drop, not still running");
     }
 }

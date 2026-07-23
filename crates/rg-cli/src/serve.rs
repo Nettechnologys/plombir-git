@@ -706,6 +706,7 @@ pub(crate) async fn run_serve(
         listen_addr: resolved_ssh_addr,
         repo_root: repo_root.clone(),
         db: Some(db.clone()),
+        git_stream_timeout_secs: resolved_git_stream_timeout,
     };
 
     let http_handle = tokio::spawn(async move {
