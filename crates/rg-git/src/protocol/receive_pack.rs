@@ -526,83 +526,6 @@ pub fn ref_matches_rejection_pattern(refname: &str, pattern: &str) -> bool {
     dp[pattern.len()][value.len()]
 }
 
-#[cfg(test)]
-mod rejection_pattern_tests {
-    use super::{enforce_signed_commit_policies, ref_matches_rejection_pattern, RefUpdate};
-    #[test]
-    fn matches_exact_branches_and_wildcard_tags() {
-        assert!(ref_matches_rejection_pattern(
-            "refs/heads/main",
-            "refs/heads/main"
-        ));
-        assert!(!ref_matches_rejection_pattern(
-            "refs/heads/feature",
-            "refs/heads/main"
-        ));
-        assert!(ref_matches_rejection_pattern(
-            "refs/tags/v1.2.3",
-            "refs/tags/v*"
-        ));
-        assert!(ref_matches_rejection_pattern(
-            "refs/tags/release/2026/07",
-            "refs/tags/release/**"
-        ));
-        assert!(!ref_matches_rejection_pattern(
-            "refs/tags/test-1",
-            "refs/tags/v*"
-        ));
-    }
-
-    #[test]
-    fn signed_commit_policy_rejects_unsigned_commit_on_matching_branch() {
-        let temp = tempfile::tempdir().unwrap();
-        let gateway = crate::cli_gateway::global_gateway().as_ref().unwrap();
-        assert!(gateway.run(&["init"], Some(temp.path())).unwrap().success());
-        assert!(gateway
-            .run(&["config", "user.name", "Test"], Some(temp.path()))
-            .unwrap()
-            .success());
-        assert!(gateway
-            .run(
-                &["config", "user.email", "test@example.com"],
-                Some(temp.path())
-            )
-            .unwrap()
-            .success());
-        assert!(gateway
-            .run(&["config", "commit.gpgsign", "false"], Some(temp.path()))
-            .unwrap()
-            .success());
-        std::fs::write(temp.path().join("README.md"), "unsigned").unwrap();
-        assert!(gateway
-            .run(&["add", "README.md"], Some(temp.path()))
-            .unwrap()
-            .success());
-        assert!(gateway
-            .run(&["commit", "-m", "unsigned"], Some(temp.path()))
-            .unwrap()
-            .success());
-        let sha = gateway
-            .run(&["rev-parse", "HEAD"], Some(temp.path()))
-            .unwrap()
-            .stdout_str()
-            .trim()
-            .to_owned();
-        let mut updates = vec![RefUpdate {
-            old_sha: "0".repeat(40),
-            new_sha: sha,
-            refname: "refs/heads/main".into(),
-            status: "ok".into(),
-            message: String::new(),
-        }];
-        enforce_signed_commit_policies(temp.path(), &mut updates, &["refs/heads/main".into()]);
-        assert_eq!(updates[0].status, "error");
-        assert!(updates[0]
-            .message
-            .contains("cryptographically valid signature"));
-    }
-}
-
 async fn drain_pack<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<()> {
     let mut buf = [0u8; 8192];
     loop {
@@ -682,4 +605,81 @@ async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, results: &[RefUpda
 
     tracing::info!("Receive-pack response sent");
     Ok(())
+}
+
+#[cfg(test)]
+mod rejection_pattern_tests {
+    use super::{enforce_signed_commit_policies, ref_matches_rejection_pattern, RefUpdate};
+    #[test]
+    fn matches_exact_branches_and_wildcard_tags() {
+        assert!(ref_matches_rejection_pattern(
+            "refs/heads/main",
+            "refs/heads/main"
+        ));
+        assert!(!ref_matches_rejection_pattern(
+            "refs/heads/feature",
+            "refs/heads/main"
+        ));
+        assert!(ref_matches_rejection_pattern(
+            "refs/tags/v1.2.3",
+            "refs/tags/v*"
+        ));
+        assert!(ref_matches_rejection_pattern(
+            "refs/tags/release/2026/07",
+            "refs/tags/release/**"
+        ));
+        assert!(!ref_matches_rejection_pattern(
+            "refs/tags/test-1",
+            "refs/tags/v*"
+        ));
+    }
+
+    #[test]
+    fn signed_commit_policy_rejects_unsigned_commit_on_matching_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let gateway = crate::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(gateway.run(&["init"], Some(temp.path())).unwrap().success());
+        assert!(gateway
+            .run(&["config", "user.name", "Test"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(gateway
+            .run(
+                &["config", "user.email", "test@example.com"],
+                Some(temp.path())
+            )
+            .unwrap()
+            .success());
+        assert!(gateway
+            .run(&["config", "commit.gpgsign", "false"], Some(temp.path()))
+            .unwrap()
+            .success());
+        std::fs::write(temp.path().join("README.md"), "unsigned").unwrap();
+        assert!(gateway
+            .run(&["add", "README.md"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(gateway
+            .run(&["commit", "-m", "unsigned"], Some(temp.path()))
+            .unwrap()
+            .success());
+        let sha = gateway
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        let mut updates = vec![RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: sha,
+            refname: "refs/heads/main".into(),
+            status: "ok".into(),
+            message: String::new(),
+        }];
+        enforce_signed_commit_policies(temp.path(), &mut updates, &["refs/heads/main".into()]);
+        assert_eq!(updates[0].status, "error");
+        assert!(updates[0]
+            .message
+            .contains("cryptographically valid signature"));
+    }
 }

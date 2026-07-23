@@ -303,4 +303,75 @@ mod tests {
         let line = read_text_line(&mut reader).await.unwrap();
         assert!(line.is_none());
     }
+
+    // --- Malformed / truncated input must return Err, never panic (CWE-252/755) ---
+
+    #[tokio::test]
+    async fn test_read_invalid_hex_header_errors() {
+        // A non-hex length header is malformed; the parser must return Err, not panic.
+        let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
+        let result = read_pkt_line(&mut reader).await;
+        assert!(
+            result.is_err(),
+            "expected Err on non-hex header, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_non_utf8_header_errors() {
+        // A header with non-UTF-8 bytes must be rejected gracefully.
+        let mut reader = BufReader::new(Cursor::new(vec![0xffu8, 0xfe, 0xfd, 0xfc]));
+        let result = read_pkt_line(&mut reader).await;
+        assert!(
+            result.is_err(),
+            "expected Err on non-UTF-8 header, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_length_below_minimum_errors() {
+        // A declared length < 4 is impossible (the header itself is 4 bytes).
+        let mut reader = BufReader::new(Cursor::new(Vec::from(b"0003".as_slice())));
+        let result = read_pkt_line(&mut reader).await;
+        assert!(
+            result.is_err(),
+            "expected Err on length < 4, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_truncated_payload_errors() {
+        // Header claims a 12-byte payload but only 5 bytes follow, then EOF.
+        // read_exact on the payload must surface an Err, not panic.
+        let mut buf = Vec::from(b"0010".as_slice()); // len=16 → payload_len=12
+        buf.extend_from_slice(b"short");
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let result = read_pkt_line(&mut reader).await;
+        assert!(
+            result.is_err(),
+            "expected Err on truncated payload, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_truncated_header_is_graceful_eof() {
+        // A partial (1-3 byte) header followed by EOF is treated as a graceful
+        // connection close (Flush), matching read_exact's UnexpectedEof handling.
+        let mut reader = BufReader::new(Cursor::new(Vec::from(b"00".as_slice())));
+        let pkt = read_pkt_line(&mut reader)
+            .await
+            .expect("partial header must not error");
+        assert!(matches!(pkt, PktLine::Flush));
+    }
+
+    #[tokio::test]
+    async fn test_read_lines_until_flush_propagates_error_on_garbage() {
+        // Batch reader must propagate the parser error rather than loop or panic.
+        let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
+        let result = read_pkt_lines_until_flush(&mut reader).await;
+        assert!(
+            result.is_err(),
+            "expected Err from batch reader on garbage, got {result:?}"
+        );
+    }
 }
