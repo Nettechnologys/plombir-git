@@ -299,13 +299,14 @@ async fn load_tls_config(
     key_path: &std::path::Path,
 ) -> Result<Arc<tokio_rustls::rustls::ServerConfig>> {
     use std::io::BufReader;
-    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio_rustls::rustls::ServerConfig;
 
     let cert_file = std::fs::File::open(cert_path)
         .with_context(|| format!("failed to open TLS cert: {}", cert_path.display()))?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'_>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to parse TLS certificates")?;
 
@@ -313,9 +314,9 @@ async fn load_tls_config(
         .with_context(|| format!("failed to open TLS key: {}", key_path.display()))?;
     let mut key_reader = BufReader::new(key_file);
 
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed to parse TLS private key")?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader).with_context(|| {
+        format!("failed to parse TLS private key in {}", key_path.display())
+    })?;
 
     let server_config = ServerConfig::builder()
         .with_no_client_auth()

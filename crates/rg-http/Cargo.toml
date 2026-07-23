@@ -25,7 +25,6 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 axum-server = { workspace = true }
 utoipa = { version = "5", features = ["chrono"] }
 utoipa-swagger-ui = "8"
