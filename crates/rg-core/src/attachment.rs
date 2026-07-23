@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_db::entities::attachment::{ActiveModel, Model as Attachment};
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
+use sha2::{Digest, Sha256};
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 pub const MAX_ATTACHMENT_SIZE: usize = 100 * 1024 * 1024;
@@ -82,6 +84,9 @@ pub async fn create_attachment(
     data: &[u8],
 ) -> Result<Attachment> {
     let prepared = prepare_attachment(db, repo_id, filename, data.len() as u64).await?;
+    // Content digest for integrity + provenance, recorded at upload time and
+    // re-checked on download. Mirrors the release-asset / package-registry idiom.
+    let sha256 = hex::encode(Sha256::digest(data));
     storage
         .put(&prepared.key, data)
         .await
@@ -94,6 +99,7 @@ pub async fn create_attachment(
         target,
         prepared,
         content_type,
+        Some(sha256),
     )
     .await
 }
@@ -120,6 +126,11 @@ pub async fn create_attachment_from_file(
         anyhow::bail!("attachment upload size changed before storage");
     }
     let prepared = prepare_attachment(db, repo_id, filename, size).await?;
+    // Stream the digest over the bounded temporary file instead of buffering the
+    // whole upload in memory (the reason this variant exists).
+    let sha256 = hash_file(source)
+        .await
+        .context("failed to hash attachment upload")?;
     storage
         .put_file(&prepared.key, source)
         .await
@@ -132,8 +143,25 @@ pub async fn create_attachment_from_file(
         target,
         prepared,
         content_type,
+        Some(sha256),
     )
     .await
+}
+
+/// Compute the hex-encoded SHA-256 of a file by streaming it in bounded chunks,
+/// so a 100 MiB upload is never held in application memory just to be hashed.
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 struct PreparedAttachment {
@@ -187,6 +215,7 @@ async fn persist_attachment(
     target: AttachmentTarget,
     prepared: PreparedAttachment,
     content_type: &str,
+    sha256: Option<String>,
 ) -> Result<Attachment> {
     let PreparedAttachment {
         filename,
@@ -215,6 +244,7 @@ async fn persist_attachment(
         size: Set(size),
         download_count: Set(0),
         created_at: Set(Utc::now()),
+        sha256: Set(sha256),
         ..Default::default()
     };
     match rg_db::ops::attachment_ops::create(db, model).await {
@@ -275,6 +305,17 @@ pub async fn download_attachment(
         .get(&key)
         .await
         .context("failed to read attachment blob")?;
+    // Integrity check: the stored bytes must still hash to the digest recorded
+    // at upload. Legacy attachments (uploaded before digest tracking) carry no
+    // recorded hash and are served without this guard.
+    if let Some(expected) = attachment.sha256.as_deref() {
+        let actual = hex::encode(Sha256::digest(&data));
+        if actual != expected {
+            anyhow::bail!(
+                "attachment integrity check failed: expected sha256 {expected}, got {actual}"
+            );
+        }
+    }
     rg_db::ops::attachment_ops::increment_download_count(db, attachment.id).await?;
     Ok((attachment, data))
 }

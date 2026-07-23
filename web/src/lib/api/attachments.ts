@@ -9,6 +9,7 @@ export type Attachment = {
   download_count: number;
   created_at: string;
   browser_download_url: string;
+  sha256?: string | null;
 };
 
 export type AttachmentTarget = 'issues' | 'pulls' | 'issues/comments' | 'pulls/comments';

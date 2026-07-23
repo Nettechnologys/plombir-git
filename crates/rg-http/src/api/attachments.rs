@@ -28,6 +28,9 @@ pub struct AttachmentResponse {
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub browser_download_url: String,
+    /// Hex-encoded SHA-256 of the bytes, recorded at upload. `None` for legacy
+    /// attachments uploaded before digest tracking existed.
+    pub sha256: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -523,6 +526,16 @@ async fn stream_attachment(
             .headers_mut()
             .insert(header::CONTENT_DISPOSITION, value);
     }
+    // Expose the upload-time digest so clients can verify the payload end-to-end.
+    // The body is streamed (never fully buffered here), so verification is the
+    // client's job; the digest recorded at upload is the trust anchor.
+    if let Some(sha) = attachment.sha256.as_deref() {
+        if let Ok(value) = HeaderValue::from_str(sha) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("x-checksum-sha256"), value);
+        }
+    }
     Ok(response)
 }
 
@@ -679,5 +692,6 @@ fn response(
         download_count: attachment.download_count,
         created_at: attachment.created_at,
         browser_download_url: format!("{base}/{}", attachment.id),
+        sha256: attachment.sha256,
     }
 }

@@ -66,6 +66,16 @@ async fn issue_attachment_roundtrip_enforces_type_permission_and_ownership() {
         .as_str()
         .unwrap()
         .ends_with(&format!("/assets/{attachment_id}")));
+    // Upload records a SHA-256 digest of the bytes ("attachment body").
+    let sha256 = attachment["sha256"]
+        .as_str()
+        .expect("attachment carries sha256");
+    assert_eq!(sha256.len(), 64, "sha256 is 64 hex chars");
+    assert!(sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(
+        sha256,
+        "baebb75e3b75608ff9c4483c5c93ae00b989a63378a9d0831fecc26f8c75f90e",
+    );
 
     let listed: Vec<Value> = client
         .get(format!(
@@ -135,6 +145,14 @@ async fn issue_attachment_roundtrip_enforces_type_permission_and_ownership() {
         .unwrap();
     assert_eq!(download.status(), reqwest::StatusCode::OK);
     assert_eq!(download.headers()["content-type"], "text/plain");
+    // Download echoes the digest so clients can verify the payload end-to-end.
+    assert_eq!(
+        download
+            .headers()
+            .get("x-checksum-sha256")
+            .and_then(|v| v.to_str().ok()),
+        Some(sha256),
+    );
     assert_eq!(download.bytes().await.unwrap().as_ref(), b"attachment body");
 
     let wrong_repo = client
@@ -406,6 +424,7 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
             size: Set(rg_core::attachment::DEFAULT_REPO_ATTACHMENT_QUOTA - 1),
             download_count: Set(0),
             created_at: Set(Utc::now()),
+            sha256: Set(None),
         },
     )
     .await

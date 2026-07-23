@@ -21,6 +21,9 @@ pub struct Model {
     pub size: i64,
     pub download_count: i64,
     pub created_at: DateTimeUtc,
+    /// Hex-encoded SHA-256 of the attachment bytes, recorded at upload time.
+    /// `None` for attachments uploaded before digest tracking existed.
+    pub sha256: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

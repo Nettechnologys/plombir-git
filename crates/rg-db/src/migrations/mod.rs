@@ -69,6 +69,7 @@ pub mod m20260714_000001_create_attachments;
 pub mod m20260714_000002_repair_mysql_fts_triggers;
 pub mod m20260723_000001_create_passkey_credentials;
 pub mod m20260723_000002_add_release_asset_sha256;
+pub mod m20260724_000001_add_attachment_sha256;
 
 use sea_orm_migration::prelude::*;
 
@@ -151,6 +152,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260714_000002_repair_mysql_fts_triggers::Migration),
             Box::new(m20260723_000001_create_passkey_credentials::Migration),
             Box::new(m20260723_000002_add_release_asset_sha256::Migration),
+            Box::new(m20260724_000001_add_attachment_sha256::Migration),
         ]
     }
 }
