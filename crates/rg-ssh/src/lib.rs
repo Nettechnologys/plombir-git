@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rand::rngs::OsRng;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{load_secret_key, Algorithm, PrivateKey};
 use russh::server::{Auth, Config, Handler, Msg, Server as _, Session};
@@ -83,7 +82,7 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
                 .with_context(|| format!("failed to create host key directory: {:?}", parent))?;
         }
     }
-    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
         .context("failed to generate ed25519 host key")?;
     let pem = key
         .to_openssh(LineEnding::LF)

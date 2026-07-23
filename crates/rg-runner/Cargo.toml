@@ -5,6 +5,7 @@ edition = "2021"
 description = "ForgeKeep CI runner agent"
 repository = "https://github.com/Yahook/ForgeKeep"
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "forgekeep-runner"

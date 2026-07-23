@@ -5,6 +5,7 @@ edition = "2021"
 description = "ForgeKeep — self-hosted Git platform server (main binary)"
 repository = "https://github.com/Yahook/ForgeKeep"
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "forgekeep"

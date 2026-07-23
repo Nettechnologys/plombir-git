@@ -1,0 +1,19 @@
+# cargo-audit configuration — see https://docs.rs/cargo-audit
+#
+# Every entry here is an ADVISORY WE HAVE CONSCIOUSLY ACCEPTED because no fixed
+# release exists yet and the exposure in ForgeKeep is low. Each carries a reason
+# and, where relevant, the follow-up. Keep this list in sync with deny.toml.
+[advisories]
+ignore = [
+    # rsa "Marvin Attack" timing side-channel — NO patched release exists
+    # (RustSec `patched: []`). Reaches us only through `sqlx-mysql`'s RSA auth
+    # (caching_sha2 public-key exchange), server-to-DB, not attacker-facing.
+    # Revisit when the `rsa` crate ships a constant-time fix or sqlx drops it.
+    "RUSTSEC-2023-0071",
+    # proc-macro-error2 unmaintained — build-time proc-macro dependency only,
+    # no runtime code, pulled transitively. No maintained drop-in yet.
+    "RUSTSEC-2026-0173",
+    # rustls-pemfile unmaintained — transitive; functionality folded into rustls
+    # upstream. No security defect, just an unmaintained marker.
+    "RUSTSEC-2025-0134",
+]

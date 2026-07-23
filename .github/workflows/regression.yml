@@ -44,6 +44,33 @@ jobs:
           db_path="${RUNNER_TEMP}/forgekeep-ci-migration.db"
           cargo run -p rg-cli -- migrate --db-url "sqlite://${db_path}?mode=rwc"
 
+  security-audit:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Prebuilt binaries — no from-source compile, keeps the gate fast.
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # RustSec advisory scan. Accepted-with-no-fix advisories are pinned in
+      # .cargo/audit.toml; a NEW vulnerability fails the job.
+      - name: cargo audit
+        run: cargo audit
+
+      # advisories + licenses (permissive-only) + bans + crate sources.
+      # Config and the shared advisory ignore-list live in deny.toml.
+      - name: cargo deny
+        run: cargo deny check
+
   git-protocol:
     name: Real Git client protocol matrix
     runs-on: ubuntu-latest

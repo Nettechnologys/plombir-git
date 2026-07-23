@@ -3,6 +3,7 @@ name = "rg-ssh"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 rg-git = { path = "../rg-git" }
@@ -10,12 +11,14 @@ rg-core = { path = "../rg-core" }
 rg-db = { path = "../rg-db" }
 tokio = { workspace = true }
 russh = { workspace = true }
-russh-keys = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
-rand = { workspace = true }
 serde_json = { workspace = true }
+# rand 0.10 supplies the RNG for host-key generation: `PrivateKey::random` bounds
+# on rand_core 0.10's `CryptoRng`, which rand 0.10's `rng()` satisfies (russh 0.60
+# itself generates keys the same way). The workspace `rand` is 0.8 and incompatible.
+rand = "0.10"
 
 [dev-dependencies]
 chrono = { workspace = true }

@@ -1,0 +1,68 @@
+# cargo-deny configuration for ForgeKeep.
+# Run locally with `cargo deny check`. Enforced in CI (see .github/workflows).
+#
+# Three gates:
+#   * advisories — RustSec vulnerabilities / unmaintained crates (security).
+#   * licenses   — only OSI-approved permissive licenses are allowed in the tree.
+#   * bans       — deny.toml can pin/deny specific crates; here it only warns.
+
+[graph]
+# Evaluate the same dependency set the workspace actually builds.
+all-features = true
+
+# ─────────────────────────────── Advisories ───────────────────────────────
+[advisories]
+# `version = 2` drops the deprecated per-severity thresholds; unignored
+# vulnerabilities and unmaintained crates fail the check.
+version = 2
+# Consciously accepted advisories with no fixed release. Keep in sync with
+# `.cargo/audit.toml`; each entry documents why the exposure is acceptable.
+ignore = [
+    # rsa "Marvin Attack" timing side-channel (no patched release exists).
+    # Reaches us only via `sqlx-mysql` RSA auth (server-to-DB), not
+    # attacker-facing. Revisit when `rsa` ships a constant-time fix.
+    "RUSTSEC-2023-0071",
+    # proc-macro-error2 unmaintained — build-time proc-macro only, no runtime.
+    "RUSTSEC-2026-0173",
+    # rustls-pemfile unmaintained — folded into rustls upstream; no defect.
+    "RUSTSEC-2025-0134",
+]
+
+# ──────────────────────────────── Licenses ────────────────────────────────
+[licenses]
+version = 2
+# Confidence required for the license detector to accept a text match.
+confidence-threshold = 0.8
+# OSI-approved permissive licenses only — no copyleft that would encumber a
+# MIT-licensed forge. Extend deliberately when a new dependency needs it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # Mozilla root-certificate data bundled by webpki-roots (permissive).
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+]
+
+# ────────────────────────────────── Bans ──────────────────────────────────
+[bans]
+# Duplicate versions are common in a large tree (transitive semver skew); warn
+# rather than fail so the gate stays about security, not housekeeping noise.
+multiple-versions = "warn"
+wildcards = "allow"
+
+# ───────────────────────────────── Sources ────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io is the only registry ForgeKeep pulls from.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -17,6 +17,11 @@ resolver = "2"
 # lives in one place instead of being repeated (or, worse, drifting) per crate.
 [workspace.package]
 license = "MIT"
+# Minimum Supported Rust Version. Floored by the toughest dependencies in the
+# tree — russh 0.60 and rand 0.10 both declare `rust-version = "1.85"`. Bump only
+# deliberately (a bump is a breaking change for downstream builders). Every crate
+# inherits this via `rust-version.workspace = true`.
+rust-version = "1.85"
 
 # Regression guard for CWE-833: holding a non-async lock guard across an `.await`
 # blocks the tokio worker and risks deadlock/DoS. clippy already warns on this by
@@ -34,8 +39,11 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs", "limit"] }
 
 # SSH
-russh = "0.51"
-russh-keys = "0.45"
+# russh 0.60.3 is the first release fixing RUSTSEC-2026-0153/0154 (unbounded
+# CryptoVec / 32-bit allocation DoS in the SSH transport). russh-keys was folded
+# into `russh::keys` in 0.52+, so the standalone crate is dropped — all key code
+# already goes through `russh::keys::*`.
+russh = "0.60.3"
 
 # Database — SeaORM's default features already bundle all three sqlx backends
 # (sqlite + postgres + mysql) plus with-chrono/with-uuid, so ForgeKeep can select
