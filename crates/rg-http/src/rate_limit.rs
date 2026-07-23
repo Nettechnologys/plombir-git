@@ -11,7 +11,17 @@ use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Default hard cap on the number of distinct client keys tracked at once.
+/// Chosen to bound worst-case memory (~a few MB of `ClientState` + keys) while
+/// comfortably exceeding any realistic legitimate client population.
+const DEFAULT_MAX_KEYS: usize = 100_000;
+
+/// Minimum spacing between inline (cap-triggered) sweeps of expired entries.
+/// Throttles the O(n) `retain` so a sustained distinct-IP flood pays it at
+/// most once per second instead of on every request.
+const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Per-client rate limit state.
 #[derive(Debug)]
@@ -20,6 +30,24 @@ struct ClientState {
     tokens: u32,
     /// When the current window resets.
     reset_at: Instant,
+}
+
+/// The client map plus bookkeeping for the amortized inline sweep.
+#[derive(Debug)]
+struct ClientMap {
+    /// Client key → per-client state.
+    entries: HashMap<String, ClientState>,
+    /// Last time an inline (cap-triggered) sweep of expired entries ran.
+    last_sweep: Instant,
+}
+
+impl ClientMap {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
 }
 
 /// Shared rate limiter state.
@@ -31,12 +59,16 @@ pub struct RateLimiter {
     max_requests: u32,
     /// Window duration in seconds.
     window_secs: u64,
+    /// Hard cap on the number of distinct client keys tracked at once. Once the
+    /// map is full a previously-unseen key is rejected (429) instead of being
+    /// inserted, so a distinct-IP flood cannot exhaust memory.
+    max_keys: usize,
     /// Proxy IPs whose X-Forwarded-For / X-Real-IP headers are trusted.
     trusted_proxies: Arc<Vec<IpAddr>>,
     /// Client IP → state mapping.
     /// std::sync::Mutex is used because critical sections are very short
     /// (single HashMap lookup/update) and never await.
-    clients: Arc<Mutex<HashMap<String, ClientState>>>,
+    clients: Arc<Mutex<ClientMap>>,
 }
 
 impl RateLimiter {
@@ -49,9 +81,22 @@ impl RateLimiter {
             enabled: max_requests > 0,
             max_requests: max_requests.max(1),
             window_secs: window_secs.max(1),
+            max_keys: DEFAULT_MAX_KEYS,
             trusted_proxies: Arc::new(Vec::new()),
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(ClientMap::new())),
         }
+    }
+
+    /// Override the maximum number of distinct client keys tracked at once.
+    /// A value of `0` is treated as "use the default" rather than "track
+    /// nothing", so a misconfigured `max_keys = 0` never disables limiting.
+    pub fn with_max_keys(mut self, max_keys: usize) -> Self {
+        self.max_keys = if max_keys == 0 {
+            DEFAULT_MAX_KEYS
+        } else {
+            max_keys
+        };
+        self
     }
 
     /// Create a new rate limiter that trusts proxy headers only from the
@@ -72,50 +117,74 @@ impl RateLimiter {
             return true;
         }
 
-        let mut clients = match self.clients.lock() {
+        let mut guard = match self.clients.lock() {
             Ok(guard) => guard,
             // If the mutex is poisoned, reset the map and continue
             Err(poisoned) => {
                 let mut guard = poisoned.into_inner();
-                guard.clear();
+                guard.entries.clear();
                 return true;
             }
         };
         let now = Instant::now();
+        let window = Duration::from_secs(self.window_secs);
 
-        let entry = clients
-            .entry(key.to_string())
-            .or_insert_with(|| ClientState {
-                tokens: self.max_requests,
-                reset_at: now + std::time::Duration::from_secs(self.window_secs),
-            });
-
-        // Reset window if expired
-        if now >= entry.reset_at {
-            entry.tokens = self.max_requests;
-            entry.reset_at = now + std::time::Duration::from_secs(self.window_secs);
+        // Fast path: a client we already track — update its bucket in place.
+        // No cap check needed since this never grows the map.
+        if let Some(entry) = guard.entries.get_mut(key) {
+            if now >= entry.reset_at {
+                entry.tokens = self.max_requests;
+                entry.reset_at = now + window;
+            }
+            return if entry.tokens > 0 {
+                entry.tokens -= 1;
+                true
+            } else {
+                false
+            };
         }
 
-        if entry.tokens > 0 {
-            entry.tokens -= 1;
-            true
-        } else {
-            false
+        // New client key. Enforce the max_keys cap BEFORE inserting so a
+        // distinct-IP flood cannot grow the map without bound.
+        if guard.entries.len() >= self.max_keys {
+            // Amortized inline sweep of expired entries, throttled to at most
+            // once per SWEEP_MIN_INTERVAL so we never pay an O(n) scan on every
+            // request during a flood. Reclaims slots for genuinely new clients
+            // once old windows expire.
+            if now.duration_since(guard.last_sweep) >= SWEEP_MIN_INTERVAL {
+                guard.entries.retain(|_, state| now < state.reset_at);
+                guard.last_sweep = now;
+            }
+            // Still full after the (possible) sweep → reject the new key.
+            if guard.entries.len() >= self.max_keys {
+                return false;
+            }
         }
+
+        // Admit the new client, consuming one token immediately.
+        guard.entries.insert(
+            key.to_string(),
+            ClientState {
+                tokens: self.max_requests - 1,
+                reset_at: now + window,
+            },
+        );
+        true
     }
 
     /// Clean up expired entries. Called periodically by the background task.
     fn cleanup(&self) {
-        let mut clients = match self.clients.lock() {
+        let mut guard = match self.clients.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 let mut guard = poisoned.into_inner();
-                guard.clear();
+                guard.entries.clear();
                 return;
             }
         };
         let now = Instant::now();
-        clients.retain(|_, state| now < state.reset_at);
+        guard.entries.retain(|_, state| now < state.reset_at);
+        guard.last_sweep = now;
     }
 
     /// Spawn a background task that periodically cleans up expired entries.
@@ -277,6 +346,59 @@ mod tests {
     }
 
     #[test]
+    fn test_default_max_keys() {
+        // A freshly constructed limiter uses the built-in default cap.
+        assert_eq!(RateLimiter::new(5, 60).max_keys, DEFAULT_MAX_KEYS);
+    }
+
+    #[test]
+    fn test_with_max_keys_zero_falls_back_to_default() {
+        // A misconfigured `max_keys = 0` must not silently stop tracking clients.
+        assert_eq!(
+            RateLimiter::new(5, 60).with_max_keys(0).max_keys,
+            DEFAULT_MAX_KEYS
+        );
+        assert_eq!(RateLimiter::new(5, 60).with_max_keys(42).max_keys, 42);
+    }
+
+    #[test]
+    fn test_max_keys_cap_rejects_new_clients_when_full() {
+        let limiter = RateLimiter::new(5, 60).with_max_keys(2);
+        // Fill the map with two distinct client keys.
+        assert!(limiter.allow("a"));
+        assert!(limiter.allow("b"));
+        // A previously-unseen key is rejected once the map is full — this is
+        // the memory-exhaustion guard under a distinct-IP flood.
+        assert!(!limiter.allow("c"));
+        assert!(!limiter.allow("d"));
+        // Already-tracked clients keep being served from their own buckets.
+        assert!(limiter.allow("a"));
+        assert!(limiter.allow("b"));
+    }
+
+    #[test]
+    fn test_max_keys_cap_reclaims_expired_slots() {
+        // 1-second window, room for a single client.
+        let limiter = RateLimiter::new(5, 1).with_max_keys(1);
+        assert!(limiter.allow("a")); // inserts "a"
+        assert!(!limiter.allow("b")); // full, "a" not expired → reject "b"
+
+        // After "a"'s window expires, the throttled inline sweep evicts it and
+        // the freed slot admits a genuinely new client.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(limiter.allow("b"));
+    }
+
+    #[test]
+    fn test_disabled_limiter_ignores_cap() {
+        // With limiting disabled every request is allowed regardless of cap.
+        let limiter = RateLimiter::new(0, 60).with_max_keys(1);
+        for i in 0..100 {
+            assert!(limiter.allow(&format!("client_{i}")));
+        }
+    }
+
+    #[test]
     fn test_extract_forwarded_client_key_xff() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "192.168.1.1, 10.0.0.1".parse().unwrap());
@@ -321,5 +443,51 @@ mod tests {
         let addr: SocketAddr = "198.51.100.2:12345".parse().unwrap();
 
         assert_eq!(limiter.client_key(&headers, addr), "203.0.113.10");
+    }
+
+    /// End-to-end check of the per-route mechanism the credential endpoints use:
+    /// the limiter attached via `.layer()` returns 429 once the per-IP budget is
+    /// spent, and it correctly reads `ConnectInfo` from request extensions.
+    #[tokio::test]
+    async fn test_per_route_middleware_returns_429_after_limit() {
+        use axum::body::Body;
+        use axum::extract::connect_info::ConnectInfo;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::post;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        async fn dummy() -> &'static str {
+            "ok"
+        }
+
+        let limiter = RateLimiter::new(2, 60);
+        let app: Router = Router::new().route(
+            "/register",
+            post(dummy).layer(axum::middleware::from_fn_with_state(
+                limiter,
+                rate_limit_middleware,
+            )),
+        );
+
+        let addr: SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let make_req = || {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/register")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(addr));
+            req
+        };
+
+        // The first two requests from this IP are within budget.
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(make_req()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // The third is rejected with 429 regardless of any global limit.
+        let resp = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

@@ -82,6 +82,12 @@ struct RateLimitConfig {
     window_secs: Option<u64>,
     #[serde(default)]
     trusted_proxies: Vec<String>,
+    /// Hard cap on distinct client keys the limiter tracks (memory guard).
+    max_keys: Option<usize>,
+    /// Stricter per-IP cap for credential endpoints (register/login).
+    auth_max: Option<u32>,
+    /// Window (seconds) for the credential-endpoint limiter.
+    auth_window_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -316,6 +322,21 @@ pub(crate) async fn run_serve(
     };
     let resolved_rate_limit_trusted_proxies =
         parse_rate_limit_trusted_proxies(&resolved_rate_limit_trusted_proxy_values)?;
+    // Config-file-only knobs (no CLI flag): memory cap + credential-endpoint
+    // limiter. 0 = use the library default cap; auth defaults are always-on so
+    // registration spam is throttled even when the global limiter is disabled.
+    let resolved_rate_limit_max_keys = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.max_keys)
+        .unwrap_or(0);
+    let resolved_rate_limit_auth_max = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.auth_max)
+        .unwrap_or(10);
+    let resolved_rate_limit_auth_window = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.auth_window_secs)
+        .unwrap_or(60);
 
     // SMTP: CLI takes precedence, fallback to config
     let (
@@ -536,6 +557,9 @@ pub(crate) async fn run_serve(
         rate_limit_max: resolved_rate_limit_max,
         rate_limit_window_secs: resolved_rate_limit_window,
         rate_limit_trusted_proxies: resolved_rate_limit_trusted_proxies,
+        rate_limit_max_keys: resolved_rate_limit_max_keys,
+        rate_limit_auth_max: resolved_rate_limit_auth_max,
+        rate_limit_auth_window_secs: resolved_rate_limit_auth_window,
         smtp_config,
         tls_config,
         oci_storage_path: None,

@@ -2,7 +2,7 @@
 //! and the production vs. test router assembly.
 
 use axum::http::{header, HeaderValue, Method};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put, MethodRouter};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -76,8 +76,18 @@ fn build_cors_layer() -> CorsLayer {
 }
 
 /// Create the Axum router (Git + REST API + health).
-pub(crate) fn create_router(state: AppState, rate_limiter: rate_limit::RateLimiter) -> Router {
-    build_router(state, rate_limiter)
+///
+/// `rate_limiter` is the global per-IP limiter applied to every request;
+/// `auth_rate_limiter` is a separate, stricter limiter applied only to the
+/// unauthenticated credential endpoints (`/users/register`, `/users/login`) to
+/// blunt registration spam and password guessing independently of the global
+/// limit (which is off by default).
+pub(crate) fn create_router(
+    state: AppState,
+    rate_limiter: rate_limit::RateLimiter,
+    auth_rate_limiter: rate_limit::RateLimiter,
+) -> Router {
+    build_router(state, rate_limiter, auth_rate_limiter)
 }
 
 /// Shared router builder used by both production and test routers.
@@ -97,8 +107,12 @@ pub(crate) fn create_router(state: AppState, rate_limiter: rate_limit::RateLimit
 ///   let git_routes = Router::new()...with_state(git_state);  // different type
 ///   let api_v1 = Router::new()...with_state(api_state);     // different type
 ///   Router::new().nest("/git", git_routes).nest("/api/v1", api_v1)  // ERROR
-fn build_router(state: AppState, rate_limiter: rate_limit::RateLimiter) -> Router {
-    let (api_v1, git_routes) = build_routes(&state);
+fn build_router(
+    state: AppState,
+    rate_limiter: rate_limit::RateLimiter,
+    auth_rate_limiter: rate_limit::RateLimiter,
+) -> Router {
+    let (api_v1, git_routes) = build_routes(&state, Some(&auth_rate_limiter));
     let v2_routes = build_v2_routes(&state);
     let docs_routes = build_docs_routes(&state);
 
@@ -224,7 +238,30 @@ fn build_docs_routes(state: &AppState) -> Router<AppState> {
 }
 
 /// Build route definitions (shared between production and test routers).
-fn build_routes(state: &AppState) -> (Router<AppState>, Router<AppState>) {
+///
+/// `auth_rate_limiter` is layered only onto the unauthenticated credential
+/// endpoints (`/users/register`, `/users/login`). The test router passes
+/// `None` so those routes carry no extra layer: the limiter middleware extracts
+/// `ConnectInfo`, which the test harness (plain `oneshot`, no
+/// `into_make_service_with_connect_info`) does not provide.
+fn build_routes(
+    state: &AppState,
+    auth_rate_limiter: Option<&rate_limit::RateLimiter>,
+) -> (Router<AppState>, Router<AppState>) {
+    // Stricter per-route limiter for the credential endpoints. Applied via a
+    // per-route `.layer()` (same mechanism the OCI upload body-limit uses),
+    // keyed by the same client-IP resolution as the global limiter. `layer()`
+    // returns the same `MethodRouter<AppState>` type in both arms, so the
+    // attach-or-not choice stays type-consistent.
+    let apply_auth_rl = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        match auth_rate_limiter {
+            Some(limiter) => mr.layer(axum::middleware::from_fn_with_state(
+                limiter.clone(),
+                rate_limit::rate_limit_middleware,
+            )),
+            None => mr,
+        }
+    };
     // ── Git Smart HTTP routes ──────────────────────────────────────────────
     let git_routes = Router::new()
         .route("/{owner}/{repo}/info/refs", get(git_http::handle_info_refs))
@@ -277,8 +314,11 @@ fn build_routes(state: &AppState) -> (Router<AppState>, Router<AppState>) {
     // ── REST API routes ───────────────────────────────────────────────────
     let api_v1 = Router::new()
         // Users
-        .route("/users/register", post(api::users::register))
-        .route("/users/login", post(api::users::login))
+        .route(
+            "/users/register",
+            apply_auth_rl(post(api::users::register)),
+        )
+        .route("/users/login", apply_auth_rl(post(api::users::login)))
         .route("/users/logout", post(api::users::logout))
         .route("/users/me", get(api::users::me))
         .route("/users/forgot-password", post(api::users::forgot_password))
@@ -1088,7 +1128,9 @@ fn build_routes(state: &AppState) -> (Router<AppState>, Router<AppState>) {
 
 /// Create the Axum router for testing (no rate limiter, no static file serving).
 pub(crate) fn build_test_router(state: AppState) -> Router {
-    let (api_v1, git_routes) = build_routes(&state);
+    // No auth limiter in tests: the limiter middleware extracts ConnectInfo,
+    // which the test harness does not supply. Passing None skips that layer.
+    let (api_v1, git_routes) = build_routes(&state, None);
     let v2_routes = build_v2_routes(&state);
     let docs_routes = build_docs_routes(&state);
 

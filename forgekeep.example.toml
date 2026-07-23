@@ -21,12 +21,22 @@ docker = false
 allow_host_runner = false
 
 [rate_limit]
-max = 0          # 0 = disabled
+max = 0          # 0 = disabled (global per-IP limit for every request)
 window_secs = 60
 # Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP for rate limiting.
 # Leave empty when ForgeKeep is directly exposed.
 trusted_proxies = []
 # trusted_proxies = ["127.0.0.1", "::1", "10.0.0.10"]
+# Hard cap on the number of distinct client IPs tracked at once. Bounds memory
+# under a distinct-IP flood: once full, a previously-unseen IP is rejected (429)
+# instead of growing the map without limit. 0 = built-in default (100000).
+max_keys = 0
+# Stricter limit applied ONLY to the credential endpoints (/users/register and
+# /users/login), independent of `max` above. Always on by default so
+# registration spam and password guessing are throttled even when `max = 0`.
+# Set auth_max = 0 to disable it.
+auth_max = 10
+auth_window_secs = 60
 
 [smtp]
 # host = "smtp.example.com"

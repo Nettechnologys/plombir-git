@@ -89,6 +89,14 @@ pub struct HttpServerConfig {
     pub rate_limit_window_secs: u64,
     /// Proxy source IPs whose forwarding headers are trusted for rate limiting.
     pub rate_limit_trusted_proxies: Vec<IpAddr>,
+    /// Hard cap on the number of distinct client keys the rate limiter tracks
+    /// at once (memory-exhaustion guard). 0 = use the built-in default (100k).
+    pub rate_limit_max_keys: usize,
+    /// Stricter per-IP request cap applied only to the credential endpoints
+    /// (`/users/register`, `/users/login`). 0 disables the auth limiter.
+    pub rate_limit_auth_max: u32,
+    /// Window duration (seconds) for the credential-endpoint limiter.
+    pub rate_limit_auth_window_secs: u64,
     /// SMTP configuration for email notifications (None = disabled).
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
     /// OCI container registry storage path. None = use {repo_root}/oci.
@@ -113,15 +121,28 @@ pub struct HttpServerConfig {
 
 /// Start the HTTP server and run forever.
 pub async fn run(config: HttpServerConfig) -> Result<()> {
+    let trusted_proxies = config.rate_limit_trusted_proxies;
     let rate_limiter = rate_limit::RateLimiter::with_trusted_proxies(
         config.rate_limit_max,
         config.rate_limit_window_secs,
-        config.rate_limit_trusted_proxies,
-    );
+        trusted_proxies.clone(),
+    )
+    .with_max_keys(config.rate_limit_max_keys);
+    // Separate, stricter limiter for the credential endpoints (register/login).
+    // It shares the trusted-proxy set and the same memory cap, but is always
+    // active by default so registration spam / password guessing is throttled
+    // even when the global limiter is disabled.
+    let auth_rate_limiter = rate_limit::RateLimiter::with_trusted_proxies(
+        config.rate_limit_auth_max,
+        config.rate_limit_auth_window_secs,
+        trusted_proxies,
+    )
+    .with_max_keys(config.rate_limit_max_keys);
     let shutdown_rx = config.shutdown_rx.clone();
     let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs.max(1));
 
     rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
+    auth_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
 
     let notification_hub = ws::NotificationHub::new();
 
@@ -172,7 +193,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         ci_engine: config.ci_engine,
     };
 
-    let app = routes::create_router(state.clone(), rate_limiter.clone());
+    let app = routes::create_router(state.clone(), rate_limiter.clone(), auth_rate_limiter);
 
     tokio::spawn(api::ci_retention::run_cleanup_loop(
         state.clone(),

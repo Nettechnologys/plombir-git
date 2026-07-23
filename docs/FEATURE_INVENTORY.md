@@ -34,7 +34,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | SSO / LDAP / OAuth (PKCE) | ✅ 🔒 | `rg-core/src/auth/`, `ldap3` | |
 | CI OIDC — Ed25519 short-lived JWT + JWKS | ✅ 🔒 | `rg-core/src/auth/ci_oidc.rs` | **Ed25519-ключ уже в системе** — переиспользуем для подписи артефактов |
 | Санитизация internal-ошибок в ответах (H-05) | ✅ 🔒 | `rg-http/src/error.rs` | internal → generic message |
-| Защита регистрации от спама (invite/approval/captcha) | ❌ 🔒 | — | открытая саморегистрация; барьер только глобальный rate-limit (выкл. по умолчанию) → см. card |
+| Защита регистрации от спама (invite/approval/captcha) | ⚠️ 🔒 | `rg-http/src/routes.rs` | открытая саморегистрация; барьер — always-on per-route rate-limit на `/register`+`/login` (10/60s по умолчанию); invite/approval/captcha пока нет |
 
 ## 3. Anti-abuse / rate limiting
 
@@ -42,8 +42,9 @@ _Последняя сверка с кодом: 2026-07-23._
 |------|--------|-----|---------|
 | Rate limiter (fixed-window token bucket, per-IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs` | глобальный один слой; по умолчанию `max=0` (выкл.) |
 | Trusted-proxy resolve (XFF/X-Real-IP по allowlist IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs:140` | |
-| `max_keys` cap на карту клиентов | ❌ 🔒 | `rg-http/src/rate_limit.rs:39` | HashMap не ограничен → memory-exhaustion под distinct-IP флудом → см. card |
-| Per-route / per-endpoint лимиты (register/login/push) | ❌ 🔒 | — | сейчас один общий лимит на всё → см. card |
+| `max_keys` cap на карту клиентов | ✅ 🔒 | `rg-http/src/rate_limit.rs` | новый ключ отвергается ДО вставки при заполнении; амортизированный inline-sweep протухших ≤1×/сек; default 100k, `[rate_limit] max_keys` |
+| Per-route / per-endpoint лимиты (register/login) | ✅ 🔒 | `rg-http/src/routes.rs` | отдельный, более жёсткий лимитер per-route на `/users/register` + `/users/login`; всегда включён по умолчанию (10/60s), `[rate_limit] auth_max`/`auth_window_secs` |
+| Per-route лимит на git-push | ❌ 🔒 | — | push бьётся только глобальным лимитом; отдельный лимитер не заведён |
 | CAPTCHA / proof-of-work | ❌ | — | сознательно НЕ портируем iCaptcha (внешний сервис); альтернатива — hashcash PoW |
 
 ## 4. Исходящие сетевые вызовы (webhooks / mirrors)
