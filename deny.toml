@@ -18,13 +18,20 @@ version = 2
 # Consciously accepted advisories with no fixed release. Keep in sync with
 # `.cargo/audit.toml`; each entry documents why the exposure is acceptable.
 ignore = [
-    # rsa "Marvin Attack" timing side-channel (no patched release exists).
-    # Reaches us only via `sqlx-mysql` RSA auth (server-to-DB), not
-    # attacker-facing. Revisit when `rsa` ships a constant-time fix.
+    # rsa "Marvin Attack" timing side-channel (no patched release: `patched = []`).
+    # Reaches us via two paths: `sqlx-mysql` RSA auth (server-to-DB) and `russh`
+    # SSH host/user RSA keys (rsa 0.10.0-rc.16). Both use RSA for signatures/auth;
+    # neither exposes an attacker-controlled RSA *decryption* oracle (SSH kex is
+    # curve25519/ECDH, not RSA key transport) — the specific vector Marvin
+    # exploits. Revisit when `rsa` ships a constant-time release.
     "RUSTSEC-2023-0071",
-    # proc-macro-error2 unmaintained — build-time proc-macro only, no runtime.
+    # proc-macro-error2 unmaintained — build-time proc-macro only (via sea-orm
+    # macros), no runtime code. No maintained drop-in yet.
     "RUSTSEC-2026-0173",
-    # rustls-pemfile unmaintained — folded into rustls upstream; no defect.
+    # rustls-pemfile unmaintained — a thin wrapper over rustls-pki-types, no
+    # security defect. Direct dep of rg-http (TLS cert/key parsing) plus transitive
+    # via axum-server. Migrating our direct use to `rustls_pki_types::pem::PemObject`
+    # won't clear this while axum-server still pulls it, so the ignore stays.
     "RUSTSEC-2025-0134",
 ]
 
