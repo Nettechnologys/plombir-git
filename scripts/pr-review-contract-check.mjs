@@ -7,6 +7,7 @@ const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/pulls/[number]/+page.svelte');
 const clientPath = path.join(root, 'web/src/lib/api/pulls.ts');
 const backendPath = path.join(root, 'crates/rg-core/src/review/service.rs');
+const i18nPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 
 const page = readFileSync(pagePath, 'utf8');
 const client = readFileSync(clientPath, 'utf8');
@@ -29,12 +30,38 @@ if (!/body:\s*JSON\.stringify\(\{\s*body,\s*action:\s*verdict\s*\}\)/.test(clien
   failures.push('API client must send PR review verdict as the backend action field.');
 }
 
-if (!/reviewAction\(review\)/.test(page) || !/review\.action\s*\|\|\s*review\.verdict/.test(page)) {
-  failures.push('PR review list must render backend action values, with verdict only as a compatibility fallback.');
+// The dedicated review list was folded into the unified PR timeline: review
+// activity now renders from the backend-derived event kind (`review_<action>`),
+// never a client-side verdict field. Assert the page keeps rendering it that way.
+if (!/t\(`pulls\.timeline\.\$\{event\.kind\}`/.test(page)) {
+  failures.push('PR timeline must render review activity from the backend event kind (review_<action>), not a client-side verdict.');
 }
 
 if (/class:approved=\{review\.verdict/.test(page) || /pulls\.verdict\.\$\{review\.verdict/.test(page)) {
-  failures.push('PR review list must not render directly from the absent backend verdict field.');
+  failures.push('PR review activity must not render directly from the absent backend verdict field.');
+}
+
+// Every backend ReviewAction variant surfaces on the timeline as `review_<action>`
+// (service.rs records `format!("review_{}", review.action)`). Tie the timeline
+// labels to the enum so a new/renamed action can't silently lose its rendering.
+const asStrBody = backend.match(/pub fn as_str\(&self\)[\s\S]*?\n\s*\}/);
+const actions = asStrBody
+  ? [...asStrBody[0].matchAll(/Self::\w+\s*=>\s*"([a-z_]+)"/g)].map((m) => m[1])
+  : [];
+if (actions.length === 0) {
+  failures.push('Could not extract backend ReviewAction variants from service.rs as_str().');
+} else {
+  let timelineLabels = {};
+  try {
+    timelineLabels = JSON.parse(readFileSync(i18nPath, 'utf8'))?.pulls?.timeline ?? {};
+  } catch (err) {
+    failures.push(`Could not parse timeline labels from en.json: ${err.message}`);
+  }
+  for (const action of actions) {
+    if (!Object.prototype.hasOwnProperty.call(timelineLabels, `review_${action}`)) {
+      failures.push(`Timeline label "pulls.timeline.review_${action}" is missing for backend review action "${action}".`);
+    }
+  }
 }
 
 if (failures.length > 0) {
