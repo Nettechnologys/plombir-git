@@ -1431,3 +1431,256 @@ mod perm_cache_tests {
         assert_eq!(check_perm_cache(910_005, Some(2), true), None);
     }
 }
+
+/// DB-backed coverage of the access-control matrix: owner / anonymous /
+/// collaborator (read·write·admin) / org role / write-team / admin-team, plus
+/// the permission-cache invalidation contract (a revoked grant must actually
+/// disappear, not linger behind the 30s TTL).
+#[cfg(test)]
+mod permission_matrix_tests {
+    use super::*;
+    use rg_db::entities::{repo_collaborator, repository};
+    use rg_db::ops::{org_ops, repo_collaborator_ops};
+    use sea_orm::{ConnectOptions, Database};
+
+    // The permission cache is a process-global static shared by every test in
+    // this binary, and each in-memory DB reuses the same small autoincrement
+    // ids (repo 1, user 1, …). Serialize these tests and clear the cache at the
+    // start of each so a cached decision from one can never satisfy a lookup in
+    // another. A `tokio::sync::Mutex` is held across `.await` deliberately —
+    // unlike a `std` guard it is safe there and does not trip
+    // `clippy::await_holding_lock`.
+    static CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn setup_db() -> DatabaseConnection {
+        let mut opt = ConnectOptions::new("sqlite::memory:");
+        opt.max_connections(1);
+        let db = Database::connect(opt).await.expect("connect in-memory db");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    async fn mk_user(db: &DatabaseConnection) -> i64 {
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        user_ops::create_user(db, &format!("u_{tag}"), &format!("{tag}@example.test"), "", "")
+            .await
+            .expect("create user")
+            .id
+    }
+
+    async fn mk_repo(
+        db: &DatabaseConnection,
+        owner_id: i64,
+        org_id: Option<i64>,
+        is_private: bool,
+    ) -> repository::Model {
+        let now = Utc::now();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        repo_ops::create(
+            db,
+            RepoActiveModel {
+                owner_id: Set(owner_id),
+                name: Set(format!("r_{tag}")),
+                description: Set(None),
+                is_private: Set(is_private),
+                default_branch: Set("main".to_string()),
+                org_id: Set(org_id),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repo")
+    }
+
+    async fn add_collab(db: &DatabaseConnection, repo_id: i64, user_id: i64, permission: &str) {
+        repo_collaborator_ops::create(
+            db,
+            repo_collaborator::ActiveModel {
+                id: sea_orm::NotSet,
+                repo_id: Set(repo_id),
+                user_id: Set(user_id),
+                permission: Set(permission.to_string()),
+                created_at: Set(Utc::now()),
+            },
+        )
+        .await
+        .expect("add collaborator");
+    }
+
+    #[tokio::test]
+    async fn owner_has_full_access_others_denied_on_private() {
+        let _g = CACHE_LOCK.lock().await;
+        invalidate_perm_cache_all();
+        let db = setup_db().await;
+        let owner = mk_user(&db).await;
+        let repo = mk_repo(&db, owner, None, true).await;
+
+        // Owner: read + write + admin.
+        assert!(can_read_repo(&db, &repo, Some(owner)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(owner)).await.unwrap());
+        assert!(can_admin_repo(&db, &repo, Some(owner)).await.unwrap());
+
+        // Anonymous: nothing on a private repo.
+        assert!(!can_read_repo(&db, &repo, None).await.unwrap());
+        assert!(!can_write_repo(&db, &repo, None).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, None).await.unwrap());
+
+        // Unrelated authenticated user: nothing.
+        let stranger = mk_user(&db).await;
+        assert!(!can_read_repo(&db, &repo, Some(stranger)).await.unwrap());
+        assert!(!can_write_repo(&db, &repo, Some(stranger)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(stranger)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_repo_is_world_readable_but_write_stays_restricted() {
+        let _g = CACHE_LOCK.lock().await;
+        invalidate_perm_cache_all();
+        let db = setup_db().await;
+        let owner = mk_user(&db).await;
+        let stranger = mk_user(&db).await;
+        let repo = mk_repo(&db, owner, None, false).await; // public
+
+        // Readable by anyone, including anonymous.
+        assert!(can_read_repo(&db, &repo, None).await.unwrap());
+        assert!(can_read_repo(&db, &repo, Some(stranger)).await.unwrap());
+
+        // The public flag never grants write/admin.
+        assert!(!can_write_repo(&db, &repo, Some(stranger)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(stranger)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(owner)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn collaborator_levels_grant_expected_access() {
+        let _g = CACHE_LOCK.lock().await;
+        invalidate_perm_cache_all();
+        let db = setup_db().await;
+        let owner = mk_user(&db).await;
+        let repo = mk_repo(&db, owner, None, true).await;
+
+        // read → read only.
+        let reader = mk_user(&db).await;
+        add_collab(&db, repo.id, reader, "read").await;
+        assert!(can_read_repo(&db, &repo, Some(reader)).await.unwrap());
+        assert!(!can_write_repo(&db, &repo, Some(reader)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(reader)).await.unwrap());
+
+        // write → read + write, not admin.
+        let writer = mk_user(&db).await;
+        add_collab(&db, repo.id, writer, "write").await;
+        assert!(can_read_repo(&db, &repo, Some(writer)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(writer)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(writer)).await.unwrap());
+
+        // admin → read + write + admin.
+        let admin = mk_user(&db).await;
+        add_collab(&db, repo.id, admin, "admin").await;
+        assert!(can_read_repo(&db, &repo, Some(admin)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(admin)).await.unwrap());
+        assert!(can_admin_repo(&db, &repo, Some(admin)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn org_roles_and_team_permissions_control_access() {
+        let _g = CACHE_LOCK.lock().await;
+        invalidate_perm_cache_all();
+        let db = setup_db().await;
+
+        let org_owner = mk_user(&db).await;
+        let org_name = format!("org_{}", uuid::Uuid::new_v4().simple());
+        let org = org_ops::create_org(&db, &org_name, None, None, org_owner, "private")
+            .await
+            .unwrap();
+        // Repo owned by the org (owner_id is the org owner, org_id set).
+        let repo = mk_repo(&db, org_owner, Some(org.id), true).await;
+
+        // Plain org member: read yes, write/admin no.
+        let member = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, member, "member")
+            .await
+            .unwrap();
+        assert!(can_read_repo(&db, &repo, Some(member)).await.unwrap());
+        assert!(!can_write_repo(&db, &repo, Some(member)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(member)).await.unwrap());
+
+        // Org "admin" role: write + admin.
+        let org_admin = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, org_admin, "admin")
+            .await
+            .unwrap();
+        assert!(can_read_repo(&db, &repo, Some(org_admin)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(org_admin)).await.unwrap());
+        assert!(can_admin_repo(&db, &repo, Some(org_admin)).await.unwrap());
+
+        // Member of a write-permission team: write yes, admin no.
+        let team_writer = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, team_writer, "member")
+            .await
+            .unwrap();
+        let write_team = org_ops::create_team(&db, org.id, "writers", None, "write")
+            .await
+            .unwrap();
+        org_ops::add_team_member(&db, write_team.id, team_writer, "member")
+            .await
+            .unwrap();
+        assert!(can_write_repo(&db, &repo, Some(team_writer)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(team_writer)).await.unwrap());
+
+        // Member of an admin-permission team: admin (and therefore write) yes.
+        let team_admin = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, team_admin, "member")
+            .await
+            .unwrap();
+        let admin_team = org_ops::create_team(&db, org.id, "admins", None, "admin")
+            .await
+            .unwrap();
+        org_ops::add_team_member(&db, admin_team.id, team_admin, "member")
+            .await
+            .unwrap();
+        assert!(can_admin_repo(&db, &repo, Some(team_admin)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(team_admin)).await.unwrap());
+    }
+
+    /// The card's headline concern: after a collaborator is removed, the 30s-TTL
+    /// cache keeps serving the stale "granted" decision until it is invalidated.
+    /// This pins that contract so a future refactor can't silently let revoked
+    /// access linger.
+    #[tokio::test]
+    async fn revoked_collaborator_access_clears_only_after_invalidation() {
+        let _g = CACHE_LOCK.lock().await;
+        invalidate_perm_cache_all();
+        let db = setup_db().await;
+        let owner = mk_user(&db).await;
+        let repo = mk_repo(&db, owner, None, true).await;
+        let collab = mk_user(&db).await;
+        add_collab(&db, repo.id, collab, "write").await;
+
+        // Warm the cache: the collaborator currently has read + write.
+        assert!(can_read_repo(&db, &repo, Some(collab)).await.unwrap());
+        assert!(can_write_repo(&db, &repo, Some(collab)).await.unwrap());
+
+        // Revoke in the DB. The cache (30s TTL) still answers "yes".
+        repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, collab)
+            .await
+            .unwrap();
+        assert!(
+            can_read_repo(&db, &repo, Some(collab)).await.unwrap(),
+            "stale cache should still serve the revoked read decision"
+        );
+        assert!(
+            can_write_repo(&db, &repo, Some(collab)).await.unwrap(),
+            "stale cache should still serve the revoked write decision"
+        );
+
+        // Invalidation is what actually makes the revocation take effect —
+        // exactly what add/update/remove-collaborator call in production.
+        invalidate_perm_cache_user(repo.id, collab);
+        assert!(!can_read_repo(&db, &repo, Some(collab)).await.unwrap());
+        assert!(!can_write_repo(&db, &repo, Some(collab)).await.unwrap());
+    }
+}
