@@ -12,6 +12,12 @@ members = [
 ]
 resolver = "2"
 
+# Shared package metadata inherited by every crate via `license.workspace = true`.
+# The whole workspace is MIT (see LICENSE / NOTICE, © Yahook), so the license
+# lives in one place instead of being repeated (or, worse, drifting) per crate.
+[workspace.package]
+license = "MIT"
+
 [workspace.dependencies]
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }

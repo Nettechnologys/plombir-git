@@ -2,6 +2,7 @@
 name = "rg-db"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 sea-orm = { workspace = true }

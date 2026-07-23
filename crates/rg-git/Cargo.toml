@@ -2,6 +2,7 @@
 name = "rg-git"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["process"] }
