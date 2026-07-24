@@ -40,6 +40,15 @@ pub async fn count_by_ldap_provider(db: &DatabaseConnection, provider_id: i64) -
         .context("db: count users by LDAP provider")
 }
 
+/// Count active (non-deleted) users — backs the `forgekeep_users` gauge.
+pub async fn count_active(db: &DatabaseConnection) -> Result<u64> {
+    UserEntity::find()
+        .filter(user::Column::DeletedAt.is_null())
+        .count(db)
+        .await
+        .context("db: count active users")
+}
+
 /// List all users with optional pagination.
 pub async fn list_users(
     db: &DatabaseConnection,

@@ -374,6 +374,7 @@ pub async fn create_issue(
     .await
     {
         Ok(issue) => {
+            crate::metrics::recorder::issue_opened();
             let issue = issue_with_author(&state.db, issue).await;
             (StatusCode::CREATED, Json(issue)).into_response()
         }
@@ -439,6 +440,10 @@ pub async fn update_issue(
         return AppError::forbidden("write access required").into_response();
     }
 
+    // Capture the open→closed transition before `req.state` moves into the call
+    // (idempotent re-close of an already-closed issue is not double-counted).
+    let closing = req.state.as_deref() == Some("closed") && existing.state != "closed";
+
     match rg_core::issue::update_issue(
         &state.db,
         &owner,
@@ -454,6 +459,9 @@ pub async fn update_issue(
     .await
     {
         Ok(issue) => {
+            if closing {
+                crate::metrics::recorder::issue_closed();
+            }
             let issue = issue_with_author(&state.db, issue).await;
             (StatusCode::OK, Json(issue)).into_response()
         }

@@ -53,6 +53,7 @@ pub mod search; // Cross-platform abstractions
 pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks
 
 pub mod error; // Domain error types (CoreError)
+pub mod metrics_hook; // Observer hooks so the HTTP layer can meter core-crate events
 
 use anyhow::Result;
 

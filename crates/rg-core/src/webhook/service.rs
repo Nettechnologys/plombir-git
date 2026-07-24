@@ -153,6 +153,12 @@ pub async fn trigger_event(
 
             let duration_ms = start.elapsed().as_millis() as i64;
 
+            // Meter the delivery outcome (2xx = success) for the
+            // `forgekeep_webhook_deliveries_total` counter. Forwarded through the
+            // HTTP-layer observer since the Prometheus recorder lives above us.
+            let succeeded = matches!(status, Some(s) if (200..300).contains(&s));
+            crate::metrics_hook::record_webhook_delivery(succeeded);
+
             let delivery_model = webhook_delivery::ActiveModel {
                 id: sea_orm::NotSet,
                 webhook_id: sea_orm::Set(hook_id),

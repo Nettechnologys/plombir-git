@@ -307,6 +307,8 @@ pub async fn verify_mfa(
         if !valid {
             let locked =
                 record_mfa_attempt(&state, &headers, &user, &challenge.auth_provider, false).await;
+            crate::metrics::recorder::auth_event("mfa", "failure");
+            crate::metrics::recorder::failed_login("mfa");
             return Err(AppError::unauthorized(if locked {
                 "account is temporarily locked"
             } else {
@@ -329,6 +331,8 @@ pub async fn verify_mfa(
         if !valid {
             let locked =
                 record_mfa_attempt(&state, &headers, &user, &challenge.auth_provider, false).await;
+            crate::metrics::recorder::auth_event("mfa", "failure");
+            crate::metrics::recorder::failed_login("mfa");
             return Err(AppError::unauthorized(if locked {
                 "account is temporarily locked"
             } else {
@@ -338,6 +342,7 @@ pub async fn verify_mfa(
     }
 
     record_mfa_attempt(&state, &headers, &user, &challenge.auth_provider, true).await;
+    crate::metrics::recorder::auth_event("mfa", "success");
 
     // Issue JWT
     let token = rg_core::auth::jwt::generate_token(user.id, &user.username, &state.jwt_secret, 7)

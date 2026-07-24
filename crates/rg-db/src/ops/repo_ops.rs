@@ -8,6 +8,15 @@ use crate::entities::repository::{
     self, ActiveModel as RepoActiveModel, Entity as RepoEntity, Model as Repo,
 };
 
+/// Count non-deleted repositories — backs the `forgekeep_repositories` gauge.
+pub async fn count_non_deleted(db: &DatabaseConnection) -> Result<u64> {
+    RepoEntity::find()
+        .filter(repository::Column::DeletedAt.is_null())
+        .count(db)
+        .await
+        .context("db: count non-deleted repositories")
+}
+
 /// Find a non-deleted repository by ID.
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Repo>> {
     RepoEntity::find_by_id(id)

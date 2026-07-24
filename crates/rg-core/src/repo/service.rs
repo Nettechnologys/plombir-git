@@ -494,6 +494,11 @@ pub async fn create_repo_with_opts(
         }
     }
 
+    // Count the creation here (not in the HTTP handler) so the REST path and the
+    // import subsystem (`resolve_or_create_target_repo`) both funnel through one
+    // recording site.
+    crate::metrics_hook::record_repo_created();
+
     Ok(repo)
 }
 

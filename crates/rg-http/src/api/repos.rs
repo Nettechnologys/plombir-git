@@ -233,6 +233,9 @@ pub async fn create_repo(
             )
             .await;
 
+            // `repo_created` is recorded inside
+            // `rg_core::repo::service::create_repo_with_opts` so the REST path
+            // and the import subsystem both count through one site.
             (StatusCode::CREATED, Json(serde_json::json!(repo))).into_response()
         }
         Err(e) => AppError::bad_request(e.to_string()).into_response(),
@@ -381,11 +384,16 @@ pub async fn star_repo(
     };
 
     match rg_core::repo::service::toggle_star(&state.db, user_id, repo.id).await {
-        Ok(starred) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "starred": starred })),
-        )
-            .into_response(),
+        Ok(starred) => {
+            if starred {
+                crate::metrics::recorder::star_given();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "starred": starred })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -677,6 +685,7 @@ pub async fn delete_repo_handler(
             )
             .await;
 
+            crate::metrics::recorder::repo_deleted();
             (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -747,6 +756,7 @@ pub async fn fork_repo_handler(
             )
             .await;
 
+            crate::metrics::recorder::repo_forked();
             (StatusCode::ACCEPTED, Json(serde_json::json!(repo))).into_response()
         }
         Err(e) => AppError::bad_request(e.to_string()).into_response(),

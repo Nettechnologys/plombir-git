@@ -1090,6 +1090,10 @@ pub async fn merge_pr(
         if let Err(error) = pull_request_ops::restore_merge_claim(db, pr.id).await {
             tracing::error!(pr_id = pr.id, %error, "failed to restore PR merge state");
         }
+    } else {
+        // Count the merge here (not in the HTTP handler) so the REST path,
+        // auto-merge, and the merge queue all funnel through one recording site.
+        crate::metrics_hook::record_pr_merged();
     }
     result
 }

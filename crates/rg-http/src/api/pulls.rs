@@ -197,6 +197,7 @@ pub async fn create_pr(
             .await
             {
                 Ok(pr) => {
+                    crate::metrics::recorder::pr_opened();
                     // CODEOWNERS is advisory: a malformed/missing file or an
                     // unavailable diff must not prevent PR creation.
                     match rg_core::pull_request::compute_diff(
@@ -388,6 +389,8 @@ pub async fn merge_pr(
     )
     .await
     {
+        // `pr_merged` is recorded inside `rg_core::pull_request::merge_pr` so the
+        // REST, auto-merge, and merge-queue paths all count through one site.
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => AppError::bad_request(e.to_string()).into_response(),
     }

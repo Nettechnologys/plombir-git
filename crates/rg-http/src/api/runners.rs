@@ -286,9 +286,12 @@ pub async fn poll_job(
             };
 
         loop {
-            match rg_db::ops::pipeline_ops::find_pending_job_matching_labels(
-                &state.db,
-                &runner_labels,
+            match crate::metrics::time_db(
+                "pipeline.find_pending_job",
+                rg_db::ops::pipeline_ops::find_pending_job_matching_labels(
+                    &state.db,
+                    &runner_labels,
+                ),
             )
             .await
             {
@@ -459,7 +462,12 @@ pub async fn start_job(
     Path((runner_id, job_id)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
     // Verify the job is assigned to this runner
-    let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
+    let job = match crate::metrics::time_db(
+        "pipeline.get_job",
+        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
+    )
+    .await
+    {
         Ok(Some(j)) => j,
         Ok(None) => {
             return AppError::not_found("job not found").into_response();
@@ -518,7 +526,12 @@ pub async fn upload_log(
     body: String,
 ) -> impl IntoResponse {
     // Verify the job is assigned to this runner
-    let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
+    let job = match crate::metrics::time_db(
+        "pipeline.get_job",
+        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
+    )
+    .await
+    {
         Ok(Some(j)) => j,
         Ok(None) => {
             return AppError::not_found("job not found").into_response();
@@ -1000,7 +1013,12 @@ pub async fn finish_job(
     Json(req): Json<FinishJobRequest>,
 ) -> impl IntoResponse {
     // Verify the job is assigned to this runner
-    let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
+    let job = match crate::metrics::time_db(
+        "pipeline.get_job",
+        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
+    )
+    .await
+    {
         Ok(Some(j)) => j,
         Ok(None) => {
             return AppError::not_found("job not found").into_response();

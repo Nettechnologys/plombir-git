@@ -184,6 +184,13 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     // ── Initialize Prometheus metrics registry ──────────────────
     metrics::init_registry().expect("Failed to initialize Prometheus metrics registry");
 
+    // Forward core-crate events (webhook deliveries fire from a background task,
+    // PR merges funnel through the core service across three paths) into
+    // Prometheus via the observer hooks, since `rg-core` sits below the recorder.
+    rg_core::metrics_hook::set_webhook_delivery_observer(metrics::recorder::webhook_delivery);
+    rg_core::metrics_hook::set_pr_merged_observer(metrics::recorder::pr_merged);
+    rg_core::metrics_hook::set_repo_created_observer(metrics::recorder::repo_created);
+
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = Arc::new(
         rg_core::blob_storage::LocalBlobStorage::new(config.repo_root.clone()),
     );
@@ -244,6 +251,16 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         let watchdog_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             run_runner_watchdog(watchdog_db, watchdog_shutdown).await;
+        });
+    }
+
+    // Spawn the metrics gauge sink (refreshes entity-count gauges + keeps the
+    // db-query series warm at idle).
+    {
+        let sink_db = state.db.clone();
+        let sink_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_metrics_gauge_sink(sink_db, sink_shutdown).await;
         });
     }
 
@@ -415,6 +432,46 @@ async fn load_tls_config(
 /// Create the Axum router for testing (no rate limiter, no static file serving).
 pub fn create_router_for_test(state: AppState) -> Router {
     routes::build_test_router(state)
+}
+
+// ── Metrics gauge sink ────────────────────────────────────
+
+/// Refresh the entity-count gauges once. The count queries run through
+/// [`metrics::time_db`], so a slow count also feeds the `db_query_*` series.
+async fn refresh_entity_gauges(db: &DatabaseConnection) {
+    match metrics::time_db("user.count_active", rg_db::ops::user_ops::count_active(db)).await {
+        Ok(n) => metrics::recorder::set_users_total(n as i64),
+        Err(e) => tracing::warn!(error = %e, "metrics gauge sink: count_active failed"),
+    }
+    match metrics::time_db(
+        "repo.count_non_deleted",
+        rg_db::ops::repo_ops::count_non_deleted(db),
+    )
+    .await
+    {
+        Ok(n) => metrics::recorder::set_repos_total(n as i64),
+        Err(e) => tracing::warn!(error = %e, "metrics gauge sink: count_non_deleted failed"),
+    }
+}
+
+/// Background task that periodically refreshes the entity-count gauges
+/// (`forgekeep_users`, `forgekeep_repositories`) so the business dashboard shows
+/// live totals without every create/delete handler having to recompute them.
+/// Runs once immediately at startup, then every 60s until shutdown.
+async fn run_metrics_gauge_sink(
+    db: DatabaseConnection,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        refresh_entity_gauges(&db).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = shutdown_rx.changed() => {
+                tracing::info!("metrics gauge sink received shutdown, stopping");
+                break;
+            }
+        }
+    }
 }
 
 // ── Runner Watchdog ───────────────────────────────────────

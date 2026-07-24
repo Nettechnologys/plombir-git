@@ -194,10 +194,20 @@ async fn check_git_access(
     actor_id: Option<i64>,
     require_write: bool,
 ) -> Result<(), (StatusCode, [(header::HeaderName, &'static str); 1], String)> {
+    // Hot path: every git clone/fetch/push runs an access check. Metered into
+    // the db-query series (see `metrics::time_db` for the sampling boundary).
     let access = if require_write {
-        rg_core::repo::service::can_write(db, owner, repo_name, actor_id).await
+        crate::metrics::time_db(
+            "repo.can_write",
+            rg_core::repo::service::can_write(db, owner, repo_name, actor_id),
+        )
+        .await
     } else {
-        rg_core::repo::service::can_read(db, owner, repo_name, actor_id).await
+        crate::metrics::time_db(
+            "repo.can_read",
+            rg_core::repo::service::can_read(db, owner, repo_name, actor_id),
+        )
+        .await
     };
 
     match access {

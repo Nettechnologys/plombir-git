@@ -418,8 +418,39 @@ pub mod business {
 
 /// Helper: record a business event without exposing Prometheus types to callers.
 pub mod recorder {
-    use super::{business, ci, git};
+    use super::{business, ci, db, git, security};
     use std::time::Duration;
+
+    /// Record a completed database query: bump the per-operation counter and
+    /// observe its duration. `operation` is a coarse *logical* label
+    /// (e.g. `"repo.find_by_path"`), never raw SQL — keep its cardinality low.
+    /// Covers both the Ok and Err path of the timed future: a slow *failing*
+    /// query is still real signal for the `SlowDatabaseQueries` alert.
+    pub fn db_query(operation: &str, duration: Duration) {
+        if let Some(c) = db::QUERY_COUNT.get() {
+            c.with_label_values(&[operation]).inc();
+        }
+        if let Some(h) = db::QUERY_DURATION.get() {
+            h.observe(duration.as_secs_f64());
+        }
+    }
+
+    /// Record an auth-related event by outcome, e.g.
+    /// `auth_event("login", "success")` / `auth_event("register", "failure")`.
+    /// Keep both labels low-cardinality (a fixed vocabulary of verbs/outcomes).
+    pub fn auth_event(event: &str, outcome: &str) {
+        if let Some(c) = security::AUTH_EVENTS.get() {
+            c.with_label_values(&[event, outcome]).inc();
+        }
+    }
+
+    /// Record a failed login attempt by coarse reason
+    /// (e.g. `"invalid_credentials"`, `"account_locked"`, `"mfa"`).
+    pub fn failed_login(reason: &str) {
+        if let Some(c) = security::FAILED_LOGINS.get() {
+            c.with_label_values(&[reason]).inc();
+        }
+    }
 
     /// Record a completed Git transport operation (label: "fetch" for
     /// upload-pack / clone / pull, "push" for receive-pack). Increments the
@@ -562,6 +593,26 @@ pub mod recorder {
             g.set(count);
         }
     }
+}
+
+/// Time an async database operation and record it under `operation` when it
+/// completes (both Ok and Err paths — a slow *failing* query is still signal).
+///
+/// The `db_queries_total` / `db_query_duration_seconds` series are populated
+/// from a **curated set of hot call-sites** wrapped in this helper, not from
+/// every query in the codebase — sea-orm exposes no per-query hook and the
+/// `DatabaseConnection` is passed by reference to ~40 ops modules, so a total
+/// interceptor would be a cross-crate rewrite. The wrapped set is representative
+/// enough to keep the DB panels non-flat and the QPS/latency alerts live; treat
+/// `db_queries_total` as a lower bound on true query volume.
+pub async fn time_db<F, T>(operation: &'static str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let start = std::time::Instant::now();
+    let out = fut.await;
+    recorder::db_query(operation, start.elapsed());
+    out
 }
 
 /// GET /metrics — return Prometheus-formatted metrics.

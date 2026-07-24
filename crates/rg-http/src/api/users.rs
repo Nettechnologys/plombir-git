@@ -170,9 +170,14 @@ pub async fn register(
             )
             .await;
 
+            crate::metrics::recorder::user_registered();
+            crate::metrics::recorder::auth_event("register", "success");
             (StatusCode::CREATED, Json(serde_json::json!(resp))).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        Err(e) => {
+            crate::metrics::recorder::auth_event("register", "failure");
+            AppError::bad_request(e.to_string()).into_response()
+        }
     }
 }
 
@@ -203,6 +208,9 @@ pub async fn login(
     {
         Ok(outcome) => {
             let resp = outcome.response;
+            // First-factor credentials verified. Full-login vs MFA-challenge is
+            // split below; the second factor is counted in `verify_mfa`.
+            crate::metrics::recorder::auth_event("login", "success");
             let login_method = match outcome.method {
                 rg_core::user::service::LoginMethod::Password => "password",
                 rg_core::user::service::LoginMethod::Ldap => "ldap",
@@ -342,6 +350,13 @@ pub async fn login(
             {
                 tracing::warn!(%log_error, "failed to record unsuccessful login attempt");
             }
+            let reason = if locked {
+                "account_locked"
+            } else {
+                "invalid_credentials"
+            };
+            crate::metrics::recorder::auth_event("login", "failure");
+            crate::metrics::recorder::failed_login(reason);
             AppError::unauthorized(if locked {
                 "account is temporarily locked"
             } else {

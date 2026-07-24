@@ -24,6 +24,26 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::AppState;
 
+/// RAII guard for the `forgekeep_ws_connections` gauge: bumps it on
+/// construction and decrements on drop, so every exit path of a socket loop
+/// (normal close, welcome-send failure, lag/error break, task cancellation)
+/// settles the gauge through a single construction site — the same pattern as
+/// the git-transport `GitOpTimer`.
+struct WsConnGuard;
+
+impl WsConnGuard {
+    fn new() -> Self {
+        crate::metrics::recorder::ws_connected();
+        Self
+    }
+}
+
+impl Drop for WsConnGuard {
+    fn drop(&mut self) {
+        crate::metrics::recorder::ws_disconnected();
+    }
+}
+
 /// The broadcast channel capacity for real-time notifications.
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 
@@ -246,6 +266,7 @@ async fn handle_ws_connection(socket: WebSocket, hub: NotificationHub, user_id: 
         user_id = uid,
         "WebSocket client connected for notifications"
     );
+    let _ws_guard = WsConnGuard::new();
 
     // General notifications never receive job logs. Those are isolated on
     // the dedicated /ws/job/:job_id endpoint.
@@ -404,6 +425,7 @@ async fn handle_job_log_connection(
     user_id: i64,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    let _ws_guard = WsConnGuard::new();
     let mut rx = hub.subscribe_job(job_id).await;
 
     // Send confirmation
