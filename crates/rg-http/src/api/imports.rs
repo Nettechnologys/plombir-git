@@ -96,6 +96,14 @@ pub async fn start_import(
             .into_response();
     }
 
+    // SSRF fast-feedback: reject an obviously-internal or non-git-transport
+    // source URL up front (DNS-free). The background clone path re-checks with a
+    // full DNS-resolving guard, but this returns 400 immediately for file://,
+    // ext::, and internal IP-literal hosts instead of a later async failure.
+    if let Err(e) = rg_core::net::check_git_url_static(&body.source_url) {
+        return AppError::bad_request(format!("invalid source URL: {e}")).into_response();
+    }
+
     // Resolve target name
     let target_name = match body.target_name {
         Some(ref n) if !n.is_empty() => n.clone(),

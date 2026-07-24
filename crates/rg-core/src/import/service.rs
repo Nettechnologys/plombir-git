@@ -56,6 +56,13 @@ pub async fn run_import(
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
 
+    // SSRF guard: the platform runners spawn `git clone` (and API calls) against
+    // this user-supplied URL. Reject internal/loopback/metadata hosts and
+    // non-git transports (`file://`, `ext::`, …) before any subprocess runs —
+    // the git twin of the mirror-sync guard. For GitLab this validates the
+    // project URL; the actual API-derived clone URL is guarded again below.
+    crate::net::guard_git_url(&task.source_url).await?;
+
     match task.platform.as_str() {
         "github" => run_github_import(db, task, repo_root, &mut stats).await?,
         "gitlab" => run_gitlab_import(db, task, repo_root, &mut stats).await?,
@@ -300,6 +307,10 @@ async fn run_gitlab_import(
     if task.import_repo {
         update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
         let project = client.get_project(&project_path).await?;
+        // The clone URL comes from the GitLab API response, not the user's
+        // source_url — re-guard it (a malicious/compromised instance could point
+        // `http_url_to_repo` at an internal host). Guard the token-free URL.
+        crate::net::guard_git_url(&project.http_url_to_repo).await?;
         let clone_url = build_gitlab_clone_url(&project.http_url_to_repo, token);
         clone_repo(
             &clone_url,

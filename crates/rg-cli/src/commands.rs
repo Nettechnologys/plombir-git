@@ -122,6 +122,11 @@ pub(crate) async fn cmd_import(
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
+    // SSRF guard (fast, DNS-free): reject an internal/loopback/metadata host or a
+    // non-git transport (file://, ext::) before doing any work. The background
+    // clone path re-checks with a full DNS-resolving guard.
+    rg_core::net::check_git_url_static(&source_url).context("invalid source URL")?;
+
     // Resolve target name from source URL if not provided
     let target_repo_name = match target_name {
         Some(n) => n,
