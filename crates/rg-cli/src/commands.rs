@@ -285,7 +285,15 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
 
             // Use HTTP API via token if provided, otherwise direct DB
             if let Some(bearer) = token {
-                let client = reqwest::Client::new();
+                // Bound only the TCP + TLS handshake: a package upload streams a
+                // potentially large file body, so a global request `.timeout(...)`
+                // could abort a legitimate slow upload. `connect_timeout` alone
+                // still stops a dead/hung `--server-url` from hanging the CLI on
+                // connect forever.
+                let client = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .context("failed to build package-publish HTTP client")?;
                 let url = format!(
                     "{}/api/v1/repos/{}/{}/packages/{}/publish?name={}&version={}",
                     server_url.trim_end_matches('/'),

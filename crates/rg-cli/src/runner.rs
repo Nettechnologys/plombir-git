@@ -3,6 +3,21 @@
 
 use anyhow::Context;
 
+/// Connect timeout (TCP + TLS handshake only) for the CLI runner's HTTP client.
+///
+/// The client sets **only** this — deliberately NOT a global request
+/// `.timeout(...)`: the main loop long-polls `/jobs/poll?timeout=30`, which a
+/// whole-request timeout would abort. Bounding just the handshake still stops a
+/// dead/hung `--server` from pinning the runner on connect forever. The short
+/// control-plane calls (register / start / log / finish) layer their own
+/// per-request [`RUNNER_REQUEST_TIMEOUT`] on top; the long-poll is left uncapped.
+const RUNNER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-request timeout for the short control-plane calls (everything except the
+/// long-poll), so a server that completes the handshake but then hangs the
+/// response can't stall registration or the post-job bookkeeping forever.
+const RUNNER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Run as a CI runner: register (if needed), then poll and execute jobs forever.
 pub(crate) async fn cmd_runner(
     server: String,
@@ -13,7 +28,10 @@ pub(crate) async fn cmd_runner(
 ) -> anyhow::Result<()> {
     use reqwest::header;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(RUNNER_CONNECT_TIMEOUT)
+        .build()
+        .context("failed to build runner HTTP client")?;
 
     // ── Register or use existing credentials ─────────
     let (runner_id, token) = match (runner_id, token) {
@@ -34,6 +52,7 @@ pub(crate) async fn cmd_runner(
                 )?;
             let resp: serde_json::Value = client
                 .post(format!("{}/api/v1/runners/register", server))
+                .timeout(RUNNER_REQUEST_TIMEOUT)
                 .bearer_auth(auth_token)
                 .json(&serde_json::json!({"name": name}))
                 .send()
@@ -98,6 +117,7 @@ pub(crate) async fn cmd_runner(
                 "{}/api/v1/runners/{}/jobs/{}/start",
                 server, runner_id, job_id
             ))
+            .timeout(RUNNER_REQUEST_TIMEOUT)
             .header(header::AUTHORIZATION, &auth_header)
             .send()
             .await;
@@ -116,6 +136,7 @@ pub(crate) async fn cmd_runner(
                 "{}/api/v1/runners/{}/jobs/{}/log",
                 server, runner_id, job_id
             ))
+            .timeout(RUNNER_REQUEST_TIMEOUT)
             .header(header::AUTHORIZATION, &auth_header)
             .body(log.clone())
             .send()
@@ -128,6 +149,7 @@ pub(crate) async fn cmd_runner(
                 "{}/api/v1/runners/{}/jobs/{}/finish",
                 server, runner_id, job_id
             ))
+            .timeout(RUNNER_REQUEST_TIMEOUT)
             .header(header::AUTHORIZATION, &auth_header)
             .json(&serde_json::json!({"status": status, "exit_code": exit_code}))
             .send()
