@@ -3,7 +3,7 @@
 > A lightweight, self-hosted Git platform written in Rust.
 
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red)](LICENSE)
 
 ForgeKeep is a full-featured Git hosting platform — repositories, issues, pull
 requests, code review, wiki, CI/CD, and a package registry — built as a single
@@ -297,5 +297,7 @@ environment toggles.
 
 ## License
 
-ForgeKeep is released under the [MIT License](LICENSE). Please read
+ForgeKeep is proprietary software — see the [LICENSE](LICENSE) file. All rights
+reserved by [Yahook](https://github.com/Yahook); no use, copying, modification,
+or distribution is permitted without prior written permission. Please read
 [NOTICE](NOTICE) for the fork's upstream provenance.

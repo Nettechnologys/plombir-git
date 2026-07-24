@@ -1,8 +1,10 @@
 ForgeKeep
-Copyright (c) 2026 Yahook
+Copyright (c) 2026 Yahook (https://github.com/Yahook)
 
-The MIT License in the LICENSE file applies to ForgeKeep's own source code and
-modifications.
+ForgeKeep's own source code and modifications are proprietary. The proprietary
+license in the LICENSE file governs all use, copying, modification, and
+distribution of this Software. No rights are granted except under a separate
+written agreement with the Licensor.
 
 ------------------------------------------------------------------------------
 Upstream origin
@@ -12,13 +14,17 @@ ForgeKeep began as a fork of IronForge:
 
     https://github.com/lengyuqu/ironforge
 
-At the time of forking, the upstream IronForge repository did not ship a
-LICENSE, NOTICE, or COPYING file, and GitHub reported no detected license for
-it. The "MIT" wording that appeared in the upstream README was a badge only,
-unaccompanied by any license text or copyright notice.
+At the time of forking, the upstream IronForge README identified the project
+as MIT licensed in two places: an "MIT" license badge and a plain-text
+"License: MIT" statement in the body of the README. However, the upstream
+repository did not ship a LICENSE, NOTICE, or COPYING file containing the full
+MIT License text and an explicit copyright notice, and GitHub reported no
+detected license for it.
 
 This NOTICE is provided in good faith to credit the upstream project and to
-record the fork's provenance accurately. It does not assert that the upstream
-code is MIT-licensed — that claim could not be verified. Anyone reusing code
-that originates from upstream IronForge (rather than ForgeKeep's own changes)
-should confirm the applicable terms with the upstream author directly.
+record the fork's provenance accurately. The upstream author's stated intent
+was to release the project under the MIT License; the omission was the license
+file itself, not the license grant. Anyone reusing code that originates from
+upstream IronForge (rather than ForgeKeep's own changes) should preserve this
+attribution and, before wider distribution, confirm the applicable terms with
+the upstream author directly.

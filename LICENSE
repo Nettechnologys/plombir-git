@@ -1,21 +1,32 @@
-MIT License
+ForgeKeep — Proprietary Software License
 
-Copyright (c) 2026 Yahook
+Copyright (c) 2026 Yahook (https://github.com/Yahook). All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and its associated source code, documentation, and other
+materials (collectively, the "Software") are the confidential and proprietary
+property of Yahook (https://github.com/Yahook) (the "Licensor"). The Software is protected by copyright and
+other intellectual property laws and treaties.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+No license, right, or interest in the Software is granted by this document.
+Without the prior express written permission of the Licensor, you may NOT:
+
+  1. use, run, or execute the Software for any purpose;
+  2. copy, reproduce, or store the Software, in whole or in part;
+  3. modify, adapt, translate, or create derivative works of the Software;
+  4. distribute, publish, sublicense, sell, rent, lease, or otherwise transfer
+     the Software or any copy thereof to any third party;
+  5. reverse engineer, decompile, or disassemble the Software, except to the
+     extent such restriction is prohibited by applicable law; or
+  6. remove, alter, or obscure any copyright, trademark, or other proprietary
+     notice contained in the Software.
+
+Any use of the Software without a separate, valid written license agreement
+signed by the Licensor is strictly prohibited and constitutes infringement of
+the Licensor's rights.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
