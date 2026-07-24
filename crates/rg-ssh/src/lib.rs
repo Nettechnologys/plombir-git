@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 use rg_core::branch_protection::push_rules::{
     branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
 };
+use rg_git::io_timeout::{is_idle_timeout, IdleTimeout};
 use rg_git::protocol::receive_pack::{
     handle_receive_pack_stream, handle_receive_pack_stream_with_rejections,
 };
@@ -88,6 +89,13 @@ pub struct SshServerConfig {
     /// connection + process indefinitely. 0 disables the bound (default: 300).
     /// Mirrors the HTTP transport's `git_stream_timeout_secs`.
     pub git_stream_timeout_secs: u64,
+    /// Idle timeout (seconds) layered *on top of* the wall-clock bound: the
+    /// git stream is killed if it makes no read/write progress for this long,
+    /// even while still under the wall-clock budget. Catches a **slow-drip**
+    /// push/fetch that dribbles a byte at a time to pin a `git` subprocess +
+    /// connection. 0 disables the idle watchdog (default: 30). See
+    /// [`rg_git::io_timeout::IdleTimeout`].
+    pub git_idle_timeout_secs: u64,
 }
 
 /// Shared state passed to every SshHandler.
@@ -97,6 +105,10 @@ struct SharedState {
     /// Wall-clock bound (seconds) applied around each git streaming handler.
     /// 0 = disabled. See [`SshServerConfig::git_stream_timeout_secs`].
     git_stream_timeout_secs: u64,
+    /// Idle bound (seconds) applied to the git stream itself via
+    /// [`IdleTimeout`]. 0 = disabled. See
+    /// [`SshServerConfig::git_idle_timeout_secs`].
+    git_idle_timeout_secs: u64,
 }
 
 /// The ForgeKeep SSH server — implements `russh::server::Server`.
@@ -155,6 +167,7 @@ impl SshServer {
             repo_root: Arc::new(ssh_config.repo_root),
             db: ssh_config.db.map(Arc::new),
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
+            git_idle_timeout_secs: ssh_config.git_idle_timeout_secs,
         });
 
         Ok(Self {
@@ -500,18 +513,31 @@ impl Handler for SshHandler {
         let service_name = service.clone();
         let git_protocol_version = self.git_protocol_version.clone();
         let git_stream_timeout_secs = self.shared.git_stream_timeout_secs;
+        let git_idle_timeout_secs = self.shared.git_idle_timeout_secs;
 
         tokio::spawn(async move {
             tracing::info!(%service_name, path = %repo_full_path.display(), "Starting git SSH session");
 
-            let mut stream: ChannelStream<Msg> = ch.into_stream();
+            // Two watchdogs guard the streaming git session:
+            //   1. Idle timeout — wrapped *around the network stream itself* via
+            //      `IdleTimeout`, so a slow-drip peer that dribbles bytes to stay
+            //      under the wall-clock budget still trips as soon as a single
+            //      read/write goes quiet for `git_idle_timeout_secs`. The trip is
+            //      an `io::Error(TimedOut)` bubbling out of the handler, dropping
+            //      the `git` child → `kill_on_drop` reaps it.
+            //   2. Wall-clock bound — `with_git_timeout` around the whole handler
+            //      (below), capping *total* time.
+            // `stream` stays wrapped throughout; the wrapper forwards
+            // `shutdown()` to the channel, so exit-status + close still work.
+            let mut stream: IdleTimeout<ChannelStream<Msg>> =
+                IdleTimeout::from_secs(ch.into_stream(), git_idle_timeout_secs);
 
-            // Wall-clock bound around the git streaming handler. The `git` child
-            // lives *inside* this future (spawned via `spawn_async`'s
-            // `kill_on_drop(true)`), so an elapsed timeout drops the future →
-            // drops the child → kills git. We still own `stream` afterwards
-            // (the borrow ends when the future is dropped), so we can report the
-            // exit status + shut the channel down cleanly below.
+            // The `git` child lives *inside* this future (spawned via
+            // `spawn_async`'s `kill_on_drop(true)`), so an elapsed wall-clock
+            // timeout drops the future → drops the child → kills git. We still
+            // own `stream` afterwards (the borrow ends when the future is
+            // dropped), so we can report the exit status + shut the channel down
+            // cleanly below.
             let handler_fut = async {
                 if git_protocol_version == "2" {
                     tracing::info!(%service_name, "Using Protocol V2");
@@ -571,6 +597,15 @@ impl Handler for SshHandler {
 
             match &result {
                 Ok(_) => tracing::info!(%service_name, "Git SSH session complete"),
+                // An idle-timeout trip surfaces as an `io::Error(TimedOut)` from
+                // the stream wrapper; log it distinctly from an ordinary handler
+                // failure (git was already killed via `kill_on_drop` when the
+                // handler future returned Err). Exit code is 1 either way.
+                Err(e) if is_idle_timeout(e) => tracing::warn!(
+                    %service_name,
+                    idle_timeout_secs = git_idle_timeout_secs,
+                    "git SSH session idle (no read/write progress within idle window) — killed git, closing channel"
+                ),
                 Err(e) => tracing::error!(error = %e, %service_name, "Git SSH session failed"),
             }
 

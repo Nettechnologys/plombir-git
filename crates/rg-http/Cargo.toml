@@ -42,7 +42,7 @@ http-body = "1"
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 serde_urlencoded = "0.7"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
 tar = "0.4"
 flate2 = "1"

@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "time", "io-util"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 gix = { workspace = true }
@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 [dev-dependencies]
 walkdir = "2"
 tempfile = "3"
+# `test-util` (paused clock via `start_paused`) is test-only so the idle-timeout
+# unit tests advance virtual time deterministically instead of sleeping for real.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 
 [lints]
 workspace = true

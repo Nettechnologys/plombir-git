@@ -72,6 +72,7 @@ pub fn build_test_app_state(
         external_url: None,
         job_timeout_secs: 3600,
         git_stream_timeout_secs: 300,
+        git_idle_timeout_secs: 30,
         ci_engine: Arc::new(NoopCiEngine),
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).

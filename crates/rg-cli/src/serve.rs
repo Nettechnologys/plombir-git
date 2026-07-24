@@ -160,6 +160,14 @@ struct TimeoutConfig {
     /// command. 0 disables the bound (default: 300).
     #[serde(default = "default_git_stream_timeout")]
     git_stream_secs: u64,
+    /// Idle timeout in seconds for the streaming git transport, layered on top
+    /// of `git_stream_secs`. The git stream is killed if it makes no read/write
+    /// progress for this long — catching a slow-drip push/fetch that dribbles
+    /// bytes to stay under the wall-clock budget. Applies to SSH (stream
+    /// wrapper) and HTTP (request-body buffering). 0 disables the idle watchdog
+    /// (default: 30).
+    #[serde(default = "default_git_idle_timeout")]
+    git_idle_secs: u64,
     /// Database connect timeout in seconds (default: 10).
     #[serde(default = "default_db_connect_timeout")]
     db_connect_secs: u64,
@@ -180,6 +188,7 @@ impl Default for TimeoutConfig {
             job_secs: default_job_timeout(),
             git_cmd_secs: default_git_timeout(),
             git_stream_secs: default_git_stream_timeout(),
+            git_idle_secs: default_git_idle_timeout(),
             db_connect_secs: default_db_connect_timeout(),
             db_idle_secs: default_db_idle_timeout(),
         }
@@ -194,6 +203,9 @@ fn default_git_timeout() -> u64 {
 }
 fn default_git_stream_timeout() -> u64 {
     300
+}
+fn default_git_idle_timeout() -> u64 {
+    30
 }
 fn default_db_connect_timeout() -> u64 {
     10
@@ -500,6 +512,10 @@ pub(crate) async fn run_serve(
         .as_ref()
         .map(|c| c.timeouts.git_stream_secs)
         .unwrap_or_else(default_git_stream_timeout);
+    let resolved_git_idle_timeout = cfg
+        .as_ref()
+        .map(|c| c.timeouts.git_idle_secs)
+        .unwrap_or_else(default_git_idle_timeout);
     let resolved_db_connect_timeout = cfg
         .as_ref()
         .map(|c| c.timeouts.db_connect_secs)
@@ -708,6 +724,7 @@ pub(crate) async fn run_serve(
         external_url: resolved_external_url,
         job_timeout_secs: resolved_job_timeout,
         git_stream_timeout_secs: resolved_git_stream_timeout,
+        git_idle_timeout_secs: resolved_git_idle_timeout,
         // M-14: Inject CiEngine via trait object, decoupling rg-http from rg-ci.
         ci_engine: std::sync::Arc::new(rg_ci::CiEngine),
         shutdown_rx: shutdown_rx.clone(),
@@ -727,6 +744,7 @@ pub(crate) async fn run_serve(
         repo_root: repo_root.clone(),
         db: Some(db.clone()),
         git_stream_timeout_secs: resolved_git_stream_timeout,
+        git_idle_timeout_secs: resolved_git_idle_timeout,
     };
 
     let http_handle = tokio::spawn(async move {
@@ -801,6 +819,7 @@ mod config_tests {
         assert_eq!(config.timeouts.job_secs, 3600);
         assert_eq!(config.timeouts.git_cmd_secs, 120);
         assert_eq!(config.timeouts.git_stream_secs, 300);
+        assert_eq!(config.timeouts.git_idle_secs, 30);
         assert_eq!(config.timeouts.db_connect_secs, 10);
         assert_eq!(config.timeouts.db_idle_secs, 600);
         // And those defaults pass the range gate.

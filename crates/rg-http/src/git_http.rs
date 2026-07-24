@@ -41,6 +41,116 @@ async fn with_git_timeout<T>(
     tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await
 }
 
+/// Hard ceiling on a buffered git request body (backstop, mirrors the 1 GiB
+/// `RequestBodyLimitLayer` on the `/git`-nested routes). Guarantees the manual
+/// buffering below can't grow unbounded even on a route without an explicit
+/// upstream limit layer.
+const GIT_BODY_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Buffer a git request body into memory with a per-frame **idle** timeout.
+///
+/// This is the HTTP transport's slow-drip defense, and it lives *here* rather
+/// than around the streaming handler on purpose: axum buffers the whole request
+/// body into memory before the handler's git subprocess ever runs, so the
+/// subprocess never faces the network directly and an idle guard on the
+/// handler's in-memory duplex would be a no-op. The network bytes arrive *here*,
+/// frame by frame — so this is the one HTTP layer where an idle timeout bites.
+///
+/// If no body frame arrives within `idle_secs`, the buffer aborts with a
+/// `504 Gateway Timeout` — the same status the wall-clock path returns, so a
+/// stalled git upload classifies identically regardless of which watchdog fires.
+/// `idle_secs == 0` disables the idle bound (plain buffering).
+///
+/// Errors map to: idle stall → 504; over-limit (upstream `LengthLimitError` or
+/// the [`GIT_BODY_MAX_BYTES`] backstop) → 413; any other body error → 400.
+///
+/// NOTE: this guards the *request* body (push upload / clone negotiation). A
+/// slow-drip *download* of a large clone is a distinct residual — the response
+/// is buffered too, so the git subprocess is already done and killed before the
+/// bytes are written, and bounding that stall needs a socket-write / streaming
+/// fix one layer down. Tracked separately.
+async fn buffer_git_body(
+    body: axum::body::Body,
+    idle_secs: u64,
+) -> Result<axum::body::Bytes, (StatusCode, String)> {
+    use http_body_util::BodyExt;
+
+    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
+    let mut body = body;
+    let mut collected: Vec<u8> = Vec::new();
+
+    loop {
+        // Await the next frame, bounded by the idle window when enabled.
+        let framed = match idle {
+            Some(dur) => match tokio::time::timeout(dur, body.frame()).await {
+                Ok(framed) => framed,
+                Err(_elapsed) => {
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "git request body idle timeout: no data within the idle window".to_string(),
+                    ));
+                }
+            },
+            None => body.frame().await,
+        };
+
+        match framed {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    if collected.len().saturating_add(data.len()) > GIT_BODY_MAX_BYTES {
+                        return Err((
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "git request body exceeds the maximum allowed size".to_string(),
+                        ));
+                    }
+                    collected.extend_from_slice(&data);
+                }
+                // A trailers-only frame carries no data — nothing to buffer.
+            }
+            // Clean end of stream.
+            None => break,
+            // Body error: distinguish an upstream size-limit trip (413) from any
+            // other transport error (400). `axum::Error` *wraps* the underlying
+            // cause (e.g. `LengthLimitError` from `RequestBodyLimitLayer`), so we
+            // unwrap to its inner boxed error and walk the whole `source()` chain
+            // — a direct downcast on the outer `axum::Error` would never match.
+            Some(Err(err)) => {
+                let inner = err.into_inner();
+                if is_length_limit_error(&*inner) {
+                    return Err((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "git request body exceeds the maximum allowed size".to_string(),
+                    ));
+                }
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read git request body: {inner}"),
+                ));
+            }
+        }
+    }
+
+    Ok(axum::body::Bytes::from(collected))
+}
+
+/// Walk an error's `source()` chain looking for an `http_body_util::LengthLimitError`,
+/// which `RequestBodyLimitLayer` reports (often wrapped inside `axum::Error`) when
+/// a body exceeds its configured cap. Takes the `Send + Sync` object so no trait
+/// upcast is needed for the first hop; `source()` then yields plain `dyn Error`.
+fn is_length_limit_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if err.is::<http_body_util::LengthLimitError>() {
+        return true;
+    }
+    let mut current = err.source();
+    while let Some(e) = current {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
 /// Check repository access for git protocol.
 ///
 /// - upload-pack (clone/fetch): can_read
@@ -354,8 +464,18 @@ pub(crate) async fn handle_git_upload_pack(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
+    // Buffer the request body with an idle timeout (HTTP slow-drip defense; see
+    // `buffer_git_body`). A stalled upload → 504, matching the wall-clock path.
+    let body = match buffer_git_body(body, state.git_idle_timeout_secs).await {
+        Ok(bytes) => bytes,
+        Err((status, msg)) => {
+            return (status, [(header::CONTENT_TYPE, "text/plain")], Body::from(msg))
+                .into_response();
+        }
+    };
+
     // Strip .git suffix so both `owner/repo.git` and `owner/repo` work
     let repo = strip_git_suffix(&repo);
     // H-02: Validate owner/repo before constructing repository path
@@ -523,8 +643,19 @@ pub(crate) async fn handle_git_receive_pack(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> impl IntoResponse {
+    // Buffer the request body with an idle timeout (HTTP slow-drip defense; see
+    // `buffer_git_body`). A stalled push upload → 504, matching the wall-clock
+    // path — the primary "slow-drip pins a subprocess" case for push. The
+    // tuple shape matches every other early-return in this handler.
+    let body = match buffer_git_body(body, state.git_idle_timeout_secs).await {
+        Ok(bytes) => bytes,
+        Err((status, msg)) => {
+            return (status, [(header::CONTENT_TYPE, "text/plain")], Body::from(msg));
+        }
+    };
+
     // Strip .git suffix so both `owner/repo.git` and `owner/repo` work
     let repo = strip_git_suffix(&repo);
     // H-02: Validate owner/repo before constructing repository path
@@ -1028,8 +1159,66 @@ async fn find_repo_by_name(
 
 #[cfg(test)]
 mod tests {
-    use super::with_git_timeout;
+    use super::{buffer_git_body, with_git_timeout};
+    use axum::body::{Body, Bytes};
+    use axum::http::StatusCode;
     use std::time::Duration;
+    // NOTE: a second `use axum::http::StatusCode` further down in this module
+    // (pre-existing) was removed in favor of this single top-level import.
+
+    /// A slow-drip request body (a chunk, then a long stall) trips the idle
+    /// buffer at ~the idle window and returns 504 — not after the whole stall.
+    #[tokio::test(start_paused = true)]
+    async fn buffer_git_body_trips_on_idle_drip() {
+        // Chunk 0 arrives immediately; chunk 1 is 10s away (>> 1s idle).
+        let body = Body::from_stream(futures::stream::unfold(0u8, |i| async move {
+            match i {
+                0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(b"AAAA")), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Some((Ok(Bytes::from_static(b"BBBB")), 2))
+                }
+                _ => None,
+            }
+        }));
+
+        let err = buffer_git_body(body, 1).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT, "idle drip → 504");
+    }
+
+    /// Continuous-but-slow chunks (each gap under the idle window) buffer fully:
+    /// a legit slow-link push must not false-trip.
+    #[tokio::test(start_paused = true)]
+    async fn buffer_git_body_allows_continuous_slow_traffic() {
+        let body = Body::from_stream(futures::stream::unfold(0u8, |i| async move {
+            if i >= 5 {
+                return None;
+            }
+            // 300ms between chunks, under the 1s idle window every time.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from_static(b"pack")), i + 1))
+        }));
+
+        let buffered = buffer_git_body(body, 1).await.expect("continuous traffic must not trip");
+        assert_eq!(&buffered[..], b"packpackpackpackpack");
+    }
+
+    /// `idle_secs == 0` disables the idle bound: even a long stall is tolerated.
+    #[tokio::test(start_paused = true)]
+    async fn buffer_git_body_disabled_never_trips() {
+        let body = Body::from_stream(futures::stream::unfold(0u8, |i| async move {
+            match i {
+                0 => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Some((Ok::<_, std::io::Error>(Bytes::from_static(b"late")), 1))
+                }
+                _ => None,
+            }
+        }));
+
+        let buffered = buffer_git_body(body, 0).await.expect("disabled window must not trip");
+        assert_eq!(&buffered[..], b"late");
+    }
 
     #[tokio::test]
     async fn with_git_timeout_elapses_on_slow_future() {
@@ -1116,7 +1305,6 @@ mod tests {
     // stay 500 — the same split `error.rs` guarantees for the JSON API, proven
     // here directly on the git predicate.
     use super::git_db_status;
-    use axum::http::StatusCode;
     use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
 
     #[test]
