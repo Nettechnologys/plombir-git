@@ -18,6 +18,10 @@ pub struct Model {
     /// Hex-encoded SHA-256 of the asset bytes, recorded at upload time.
     /// `None` for assets uploaded before digest tracking existed.
     pub sha256: Option<String>,
+    /// Detached DSSE attestation envelope (JSON) binding this asset's SHA-256 to
+    /// a signed provenance statement. `None` until the asset is explicitly
+    /// signed (opt-in). See `rg_core::attestation`.
+    pub attestation: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -214,17 +214,7 @@ pub async fn download_asset(
     // Increment download count
     rg_db::ops::release_ops::increment_download_count(db, asset_id).await?;
 
-    let key = asset_blob_key(owner, repo_name, &asset)?;
-    let data = match storage.get(&key).await {
-        Ok(data) => data,
-        Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
-            let file_path = asset_file_path(repo_root, owner, repo_name, &asset);
-            tokio::fs::read(&file_path)
-                .await
-                .context("failed to read legacy release asset")?
-        }
-        Err(error) => return Err(error).context("failed to read release asset"),
-    };
+    let data = read_asset_bytes(storage, repo_root, owner, repo_name, &asset).await?;
 
     // Integrity check: the stored bytes must still hash to the digest recorded
     // at upload. Legacy assets (uploaded before digest tracking) carry no
@@ -239,6 +229,137 @@ pub async fn download_asset(
     }
 
     Ok((asset, data))
+}
+
+/// Read an asset's bytes from blob storage, falling back to the legacy on-disk
+/// path for assets written before the blob-storage migration.
+async fn read_asset_bytes(
+    storage: &dyn crate::blob_storage::BlobStorage,
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    asset: &Asset,
+) -> Result<Vec<u8>> {
+    let key = asset_blob_key(owner, repo_name, asset)?;
+    match storage.get(&key).await {
+        Ok(data) => Ok(data),
+        Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
+            let file_path = asset_file_path(repo_root, owner, repo_name, asset);
+            tokio::fs::read(&file_path)
+                .await
+                .context("failed to read legacy release asset")
+        }
+        Err(error) => Err(error).context("failed to read release asset"),
+    }
+}
+
+/// Result of verifying a stored asset attestation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttestationReport {
+    /// Whether the attestation verified against the instance key and the asset's
+    /// current bytes.
+    pub verified: bool,
+    /// Failure detail when `verified` is false.
+    pub reason: Option<String>,
+    /// Predicate type of the verified statement.
+    pub predicate_type: Option<String>,
+    /// `kid` of the signature that verified.
+    pub keyid: Option<String>,
+    /// SHA-256 recomputed from the stored bytes at verification time.
+    pub asset_sha256: String,
+}
+
+/// Sign a detached provenance attestation for an asset with the instance key
+/// and store the DSSE envelope alongside the asset row (opt-in).
+///
+/// `builder_id` attributes the build to the issuing instance (its external URL).
+/// Fails if the asset has no recorded SHA-256 (legacy upload) — there is nothing
+/// to bind the attestation to.
+pub async fn sign_asset_attestation(
+    db: &DatabaseConnection,
+    asset_id: i64,
+    secret: &str,
+    builder_id: &str,
+) -> Result<(Asset, crate::attestation::Envelope)> {
+    let asset = get_asset(db, asset_id).await?;
+    let sha256 = asset.sha256.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("asset has no recorded sha256 digest; re-upload to enable attestation")
+    })?;
+
+    let predicate_extra = serde_json::json!({
+        "release_id": asset.release_id,
+        "uploader_id": asset.uploader_id,
+        "created_at": asset.created_at.to_rfc3339(),
+    });
+    let envelope = crate::attestation::sign_asset_provenance(
+        secret,
+        &asset.filename,
+        sha256,
+        builder_id,
+        predicate_extra,
+    )?;
+
+    let json = serde_json::to_string(&envelope).context("serialize attestation envelope")?;
+    let updated = rg_db::ops::release_ops::set_asset_attestation(db, asset_id, Some(json)).await?;
+    Ok((updated, envelope))
+}
+
+/// Fetch the stored attestation envelope (parsed) for an asset, if any.
+pub async fn get_asset_attestation(
+    db: &DatabaseConnection,
+    asset_id: i64,
+) -> Result<Option<crate::attestation::Envelope>> {
+    let asset = get_asset(db, asset_id).await?;
+    match asset.attestation.as_deref() {
+        Some(json) => {
+            let env = serde_json::from_str(json).context("parse stored attestation envelope")?;
+            Ok(Some(env))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Verify an asset's stored attestation against the instance key and the asset's
+/// *current* bytes. A tampered asset (bytes no longer matching the signed
+/// subject digest) or an invalid signature yields `verified: false` — infra
+/// errors (missing asset/attestation, unreadable bytes) are returned as `Err`.
+pub async fn verify_asset_attestation(
+    db: &DatabaseConnection,
+    asset_id: i64,
+    storage: &dyn crate::blob_storage::BlobStorage,
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    secret: &str,
+) -> Result<AttestationReport> {
+    let asset = get_asset(db, asset_id).await?;
+    let json = asset
+        .attestation
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("asset has no attestation"))?;
+    let envelope: crate::attestation::Envelope =
+        serde_json::from_str(json).context("parse stored attestation envelope")?;
+
+    let data = read_asset_bytes(storage, repo_root, owner, repo_name, &asset).await?;
+    let actual_sha = hex::encode(Sha256::digest(&data));
+
+    let registry = crate::attestation::VerifierRegistry::with_defaults();
+    match crate::attestation::verify_envelope(secret, &envelope, &actual_sha, &registry) {
+        Ok(v) => Ok(AttestationReport {
+            verified: true,
+            reason: None,
+            predicate_type: Some(v.statement.predicate_type),
+            keyid: Some(v.keyid),
+            asset_sha256: actual_sha,
+        }),
+        Err(e) => Ok(AttestationReport {
+            verified: false,
+            reason: Some(format!("{e:#}")),
+            predicate_type: None,
+            keyid: None,
+            asset_sha256: actual_sha,
+        }),
+    }
 }
 
 /// Get a release asset by ID (without incrementing download count).

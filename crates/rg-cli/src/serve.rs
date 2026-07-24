@@ -23,6 +23,8 @@ struct ConfigFile {
     #[serde(default)]
     ci: CiConfig,
     #[serde(default)]
+    releases: ReleasesConfig,
+    #[serde(default)]
     rate_limit: RateLimitConfig,
     #[serde(default)]
     smtp: SmtpConfig,
@@ -76,6 +78,15 @@ struct CiConfig {
     /// Allow imageless CI jobs to run as a shell on the host (default false).
     #[serde(default)]
     allow_host_runner: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[allow(dead_code)]
+struct ReleasesConfig {
+    /// Enable opt-in Ed25519 provenance attestation of release assets (default
+    /// false). Also settable via `FORGEKEEP_ATTESTATION_ENABLED=1`, which wins.
+    #[serde(default)]
+    attestation_enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -382,6 +393,14 @@ pub(crate) async fn run_serve(
             .as_ref()
             .and_then(|c| c.ci.allow_host_runner)
             .unwrap_or(false);
+    // Env var wins over config file; both default off (opt-in).
+    let resolved_attestation_enabled = match std::env::var("FORGEKEEP_ATTESTATION_ENABLED") {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
+        Err(_) => cfg
+            .as_ref()
+            .and_then(|c| c.releases.attestation_enabled)
+            .unwrap_or(false),
+    };
     let resolved_rate_limit_max = if rate_limit_max > 0 {
         rate_limit_max
     } else {
@@ -693,6 +712,7 @@ pub(crate) async fn run_serve(
         ci_engine: std::sync::Arc::new(rg_ci::CiEngine),
         shutdown_rx: shutdown_rx.clone(),
         shutdown_grace_secs: resolved_shutdown_grace,
+        attestation_enabled: resolved_attestation_enabled,
     };
 
     // ── SSH server ────────────────────────────────────────────────

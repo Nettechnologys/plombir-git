@@ -928,6 +928,15 @@ fn build_routes(
             "/repos/{owner}/{name}/releases/assets/{asset_id}/download",
             get(api::releases::download_asset),
         )
+        .route(
+            "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+            post(api::releases::sign_asset_attestation)
+                .get(api::releases::get_asset_attestation),
+        )
+        .route(
+            "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify",
+            post(api::releases::verify_asset_attestation),
+        )
         // Fork
         .route(
             "/repos/{owner}/{name}/fork",

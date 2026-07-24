@@ -72,6 +72,10 @@ pub struct AppState {
     pub git_stream_timeout_secs: u64,
     /// CI engine (M-14: trait object decouples rg-http from rg-ci).
     pub ci_engine: Arc<dyn rg_core::ci::CiTrigger + Send + Sync>,
+    /// Whether opt-in Ed25519 provenance attestation of release assets is
+    /// enabled. Default `false`: the sign/verify endpoints return 404 until an
+    /// operator turns the feature on.
+    pub attestation_enabled: bool,
 }
 
 /// HTTP server configuration.
@@ -134,6 +138,9 @@ pub struct HttpServerConfig {
     /// Grace window (seconds) for draining in-flight requests and the CI-log
     /// queue after the shutdown signal fires before the process is forced down.
     pub shutdown_grace_secs: u64,
+    /// Enable opt-in Ed25519 provenance attestation of release assets. Default
+    /// `false` (feature off; endpoints 404).
+    pub attestation_enabled: bool,
 }
 
 /// Start the HTTP server and run forever.
@@ -210,6 +217,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         job_timeout_secs: config.job_timeout_secs,
         git_stream_timeout_secs: config.git_stream_timeout_secs,
         ci_engine: config.ci_engine,
+        attestation_enabled: config.attestation_enabled,
     };
 
     let app = routes::create_router(state.clone(), rate_limiter.clone(), auth_rate_limiter);

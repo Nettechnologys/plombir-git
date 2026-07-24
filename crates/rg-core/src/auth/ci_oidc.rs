@@ -36,11 +36,22 @@ pub struct CiOidcJwk {
     pub x: String,
 }
 
-fn signing_key(secret: &str) -> SigningKey {
+/// Derive the instance's Ed25519 key from the server secret.
+///
+/// `pub(crate)` so sibling subsystems (e.g. release-asset attestation) can sign
+/// and verify with the *same* key that backs the CI OIDC JWKS — the public half
+/// is already published at `/api/v1/ci/oidc/jwks`, so any external verifier can
+/// check those signatures without a second key to distribute.
+pub(crate) fn signing_key(secret: &str) -> SigningKey {
     let mut hash = Sha256::new();
     hash.update(b"forgekeep-ci-oidc-ed25519-v1\0");
     hash.update(secret.as_bytes());
     SigningKey::from_bytes(&hash.finalize().into())
+}
+
+/// Public verifying key matching [`signing_key`], plus its JWK `kid`.
+pub(crate) fn verifying_key(secret: &str) -> ed25519_dalek::VerifyingKey {
+    signing_key(secret).verifying_key()
 }
 
 pub fn jwk(secret: &str) -> CiOidcJwk {

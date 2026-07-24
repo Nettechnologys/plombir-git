@@ -106,6 +106,26 @@ pub async fn delete_asset_by_id(db: &DatabaseConnection, id: i64) -> Result<()> 
     Ok(())
 }
 
+/// Store (or clear) the detached attestation envelope JSON for an asset.
+pub async fn set_asset_attestation(
+    db: &DatabaseConnection,
+    id: i64,
+    attestation: Option<String>,
+) -> Result<AssetModel> {
+    let asset = AssetEntity::find_by_id(id)
+        .one(db)
+        .await
+        .context("db: find asset for attestation")?
+        .ok_or_else(|| anyhow::anyhow!("asset not found"))?;
+
+    let mut model: AssetActiveModel = asset.into();
+    model.attestation = Set(attestation);
+    model
+        .update(db)
+        .await
+        .context("db: update asset attestation")
+}
+
 /// Increment download count for an asset.
 pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Result<()> {
     let asset = AssetEntity::find_by_id(id)

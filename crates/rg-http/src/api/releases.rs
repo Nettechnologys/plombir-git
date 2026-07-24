@@ -652,6 +652,189 @@ pub async fn download_asset(
     }
 }
 
+// ─── Release Asset Attestations (opt-in) ───────────────────────────────────
+
+/// Identifier of this instance as the provenance builder.
+fn attestation_builder_id(state: &AppState) -> String {
+    state
+        .external_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "urn:forgekeep:instance".to_string())
+}
+
+/// POST /api/v1/repos/:owner/:name/releases/assets/:asset_id/attestation
+///
+/// Sign a detached Ed25519 provenance attestation for the asset with the
+/// instance key and store it. Requires write permission. Opt-in: returns 404
+/// when attestation is disabled on the instance.
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+    tag = "Releases",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("asset_id" = i64, Path, description = "asset_id"),
+    ),
+    responses(
+        (status = 201, description = "Attestation created", body = serde_json::Value),
+        (status = 400, description = "Bad request", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Not found / feature disabled", body = serde_json::Value),
+    ),
+)]
+pub async fn sign_asset_attestation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+) -> impl IntoResponse {
+    if !state.attestation_enabled {
+        return AppError::not_found("attestation is not enabled").into_response();
+    }
+
+    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
+        Some(c) => c,
+        None => return AppError::unauthorized("authentication required").into_response(),
+    };
+    let user_id: i64 = match claims.sub.parse::<i64>() {
+        Ok(id) => id,
+        Err(_) => {
+            return AppError::unauthorized("invalid token subject".to_string()).into_response()
+        }
+    };
+
+    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::forbidden("permission denied").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    }
+
+    let builder_id = attestation_builder_id(&state);
+    match rg_core::release::service::sign_asset_attestation(
+        &state.db,
+        asset_id,
+        &state.jwt_secret,
+        &builder_id,
+    )
+    .await
+    {
+        Ok((_asset, envelope)) => {
+            (StatusCode::CREATED, Json(serde_json::json!(envelope))).into_response()
+        }
+        Err(e) => AppError::bad_request(e).into_response(),
+    }
+}
+
+/// GET /api/v1/repos/:owner/:name/releases/assets/:asset_id/attestation
+///
+/// Return the stored detached attestation envelope for the asset. Read
+/// permission. Opt-in: 404 when disabled or when the asset has no attestation.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+    tag = "Releases",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("asset_id" = i64, Path, description = "asset_id"),
+    ),
+    responses(
+        (status = 200, description = "Attestation envelope", body = serde_json::Value),
+        (status = 404, description = "Not found / feature disabled", body = serde_json::Value),
+    ),
+)]
+pub async fn get_asset_attestation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+) -> impl IntoResponse {
+    if !state.attestation_enabled {
+        return AppError::not_found("attestation is not enabled").into_response();
+    }
+
+    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
+    {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let actor_id = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
+        Ok(true) => {}
+        Ok(false) if repo.is_private && actor_id.is_none() => {
+            return AppError::unauthorized("authentication required").into_response()
+        }
+        Ok(false) => return AppError::forbidden("access denied").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    }
+
+    match rg_core::release::service::get_asset_attestation(&state.db, asset_id).await {
+        Ok(Some(envelope)) => (StatusCode::OK, Json(serde_json::json!(envelope))).into_response(),
+        Ok(None) => AppError::not_found("asset has no attestation").into_response(),
+        Err(e) => AppError::not_found(e).into_response(),
+    }
+}
+
+/// POST /api/v1/repos/:owner/:name/releases/assets/:asset_id/attestation/verify
+///
+/// Verify the stored attestation against the instance key and the asset's
+/// current bytes. Read permission. Returns `{ verified, reason, ... }`.
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify",
+    tag = "Releases",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("asset_id" = i64, Path, description = "asset_id"),
+    ),
+    responses(
+        (status = 200, description = "Verification report", body = serde_json::Value),
+        (status = 404, description = "Not found / feature disabled", body = serde_json::Value),
+    ),
+)]
+pub async fn verify_asset_attestation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+) -> impl IntoResponse {
+    if !state.attestation_enabled {
+        return AppError::not_found("attestation is not enabled").into_response();
+    }
+
+    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
+    {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let actor_id = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
+        Ok(true) => {}
+        Ok(false) if repo.is_private && actor_id.is_none() => {
+            return AppError::unauthorized("authentication required").into_response()
+        }
+        Ok(false) => return AppError::forbidden("access denied").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    }
+
+    match rg_core::release::service::verify_asset_attestation(
+        &state.db,
+        asset_id,
+        state.blob_storage.as_ref(),
+        &state.repo_root,
+        &owner,
+        &name,
+        &state.jwt_secret,
+    )
+    .await
+    {
+        Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))).into_response(),
+        Err(e) => AppError::not_found(e).into_response(),
+    }
+}
+
 /// DELETE /api/v1/repos/:owner/:name/releases/assets/:asset_id
 #[utoipa::path(
     delete,

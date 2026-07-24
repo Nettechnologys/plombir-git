@@ -14,6 +14,7 @@
 
 // ── Identity & Auth ─────────────────────────────────
 pub mod attachment;
+pub mod attestation;
 pub mod auth;
 pub mod org;
 pub mod user;

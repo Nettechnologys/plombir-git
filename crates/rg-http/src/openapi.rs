@@ -192,6 +192,9 @@ pub struct PaginatedRepoResponse {
         crate::api::releases::get_asset,
         crate::api::releases::download_asset,
         crate::api::releases::delete_asset,
+        crate::api::releases::sign_asset_attestation,
+        crate::api::releases::get_asset_attestation,
+        crate::api::releases::verify_asset_attestation,
         // Organizations
         crate::api::orgs::create_org,
         crate::api::orgs::get_org,
