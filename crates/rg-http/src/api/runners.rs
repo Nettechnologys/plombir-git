@@ -600,28 +600,141 @@ pub async fn download_workspace(
         .join(namespace)
         .join(format!("{}.git", repository.name));
     let commit_sha = pipeline.commit_sha.clone();
-    let archive = match tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let gateway = rg_git::cli_gateway::global_gateway()
-            .as_ref()
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let output = gateway.run(&["archive", "--format=tar", &commit_sha], Some(&repo_path))?;
-        if !output.success() {
-            anyhow::bail!("git archive failed: {}", output.stderr_str().trim());
-        }
-        Ok(output.stdout)
-    })
-    .await
+
+    // Stream `git archive` stdout straight to the runner with an idle guard
+    // instead of buffering the whole tar in memory (card_93d08fc4a67f). A large
+    // repo's archive no longer sits in RAM, and a slow-drip runner that stops
+    // reading is torn down at ~the idle window (killing git) rather than pinning
+    // the buffer + connection until the kernel resets the socket.
+    let gateway = match rg_git::cli_gateway::global_gateway().as_ref() {
+        Ok(gateway) => gateway,
+        Err(error) => return AppError::internal(format!("{error}")).into_response(),
+    };
+    let child = match gateway
+        .spawn_async(&["archive", "--format=tar", &commit_sha], Some(&repo_path))
+        .await
     {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => return AppError::from(error).into_response(),
-        Err(error) => return AppError::internal(error).into_response(),
+        Ok(child) => child,
+        Err(error) => return AppError::internal(format!("{error}")).into_response(),
     };
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
-        archive,
+        stream_git_archive_with_idle(child, state.git_idle_timeout_secs),
     )
         .into_response()
+}
+
+/// Slice size for streaming `git archive` output to the runner.
+const ARCHIVE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Stream a spawned `git archive` child's stdout as an idle-guarded
+/// `application/x-tar` body, holding the child for the life of the stream
+/// (`kill_on_drop`).
+///
+/// This is the download-side slow-drip defense for the workspace endpoint, the
+/// twin of `git_http::git_response_body_with_idle`: instead of buffering the
+/// whole tar in memory, the producer pumps git's stdout through a bounded
+/// channel in [`ARCHIVE_STREAM_CHUNK_BYTES`] slices. Two idle points are bounded
+/// by `idle_secs`:
+/// - the **read** from git's stdout — a hung `git archive` trips (it no longer
+///   has the synchronous `git_cmd_secs` wall-clock, since we spawn it async);
+/// - the **send** to the client — a stalled runner stops draining, so the
+///   bounded channel fills and the blocked `send` trips.
+///
+/// On either trip (or the runner disconnecting) the producer returns, dropping
+/// the child → `kill_on_drop` reaps git and frees the pipe. `idle_secs == 0`
+/// disables the bound. git's stderr is drained concurrently so a chatty error
+/// can't fill its pipe and stall the archive.
+fn stream_git_archive_with_idle(
+    mut child: tokio::process::Child,
+    idle_secs: u64,
+) -> axum::body::Body {
+    use tokio::io::AsyncReadExt;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
+
+    tokio::spawn(async move {
+        // `git archive` reads no stdin; close it so git never waits on EOF.
+        drop(child.stdin.take());
+
+        // Drain stderr concurrently: it is tiny for archive, but an unread full
+        // pipe would deadlock git. Kept for a diagnostic on a non-zero exit.
+        let stderr = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut se) = stderr {
+                let _ = se.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        let mut stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => return,
+        };
+
+        let mut buf = vec![0u8; ARCHIVE_STREAM_CHUNK_BYTES];
+        let mut clean_eof = false;
+        loop {
+            // Read a chunk, bounded by the idle window (catches a hung git).
+            let n = match idle {
+                Some(dur) => match tokio::time::timeout(dur, stdout.read(&mut buf)).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(_)) => break,
+                    Err(_elapsed) => {
+                        tracing::warn!(idle_secs, "git archive read idle timeout — killing git");
+                        break;
+                    }
+                },
+                None => match stdout.read(&mut buf).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
+            };
+            if n == 0 {
+                clean_eof = true;
+                break;
+            }
+            let chunk = Bytes::copy_from_slice(&buf[..n]);
+            // Send, bounded by the idle window (catches a stalled runner: hyper
+            // stops draining the stream → the channel fills → `send` blocks).
+            let send = tx.send(Ok(chunk));
+            let sent = match idle {
+                Some(dur) => match tokio::time::timeout(dur, send).await {
+                    Ok(res) => res,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            idle_secs,
+                            "git archive response idle timeout — slow runner stopped reading, killing git"
+                        );
+                        break;
+                    }
+                },
+                None => send.await,
+            };
+            if sent.is_err() {
+                break; // receiver gone (runner disconnected)
+            }
+        }
+
+        // Reap git. On a trip we kill it; on clean EOF it has already exited.
+        let _ = child.start_kill();
+        if let Ok(status) = child.wait().await {
+            if clean_eof && !status.success() {
+                let err = stderr_task.await.unwrap_or_default();
+                tracing::warn!(
+                    stderr = %String::from_utf8_lossy(&err).trim(),
+                    "git archive exited non-zero after streaming workspace tar (truncated archive)"
+                );
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
+    axum::body::Body::new(http_body_util::StreamBody::new(frame_stream))
 }
 
 pub async fn download_cache(
@@ -1124,5 +1237,106 @@ pub async fn delete_runner_admin(
             tracing::error!(%e, "delete_runner_admin failed");
             AppError::from(e).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_stream_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    fn gw() -> &'static rg_git::cli_gateway::GitCommandGateway {
+        rg_git::cli_gateway::global_gateway().as_ref().unwrap()
+    }
+
+    /// Run git via the sanctioned gateway (keeps the raw-git-invocation guard green).
+    fn git(args: &[&str], cwd: Option<&std::path::Path>) {
+        let out = gw().run(args, cwd).unwrap();
+        assert!(out.success(), "git {args:?}: {}", out.stderr_str().trim());
+    }
+
+    fn seed_repo(repo: &std::path::Path, big: bool) -> Vec<u8> {
+        git(&["init", "--initial-branch=main"], Some(repo));
+        git(&["config", "user.name", "Archive Test"], Some(repo));
+        git(&["config", "user.email", "archive@example.com"], Some(repo));
+        let blob = if big {
+            // Poorly-compressible content so the tar spans several 64 KiB reads,
+            // exercising the multi-chunk streaming loop.
+            let mut blob = Vec::with_capacity(300 * 1024);
+            let mut x: u32 = 0x1234_5678;
+            for _ in 0..(300 * 1024) {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                blob.push((x & 0xff) as u8);
+            }
+            blob
+        } else {
+            b"hello\n".to_vec()
+        };
+        std::fs::write(repo.join("big.bin"), &blob).unwrap();
+        std::fs::write(repo.join("README.md"), "archive parity\n").unwrap();
+        git(&["add", "."], Some(repo));
+        git(&["commit", "-m", "content"], Some(repo));
+        blob
+    }
+
+    /// The streamed tar must be byte-identical to a buffered `git archive` — a
+    /// truncated or reordered stream would corrupt the runner's workspace.
+    #[tokio::test]
+    async fn streamed_archive_matches_buffered_git_archive_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        seed_repo(repo, true);
+
+        let buffered = gw()
+            .run(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .unwrap();
+        assert!(buffered.success());
+        let buffered = buffered.stdout;
+
+        let child = gw()
+            .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .await
+            .unwrap();
+        let streamed = stream_git_archive_with_idle(child, 30)
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+
+        assert_eq!(
+            streamed.len(),
+            buffered.len(),
+            "streamed tar length must match buffered"
+        );
+        assert_eq!(
+            &streamed[..],
+            &buffered[..],
+            "streamed tar must be byte-identical to buffered git archive"
+        );
+    }
+
+    /// `idle_secs == 0` disables the idle bound; the full tar still streams.
+    #[tokio::test]
+    async fn streamed_archive_idle_disabled_delivers_full_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        seed_repo(repo, false);
+
+        let buffered = gw()
+            .run(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .unwrap()
+            .stdout;
+        let child = gw()
+            .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .await
+            .unwrap();
+        let streamed = stream_git_archive_with_idle(child, 0)
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&streamed[..], &buffered[..]);
     }
 }

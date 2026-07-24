@@ -10,20 +10,23 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 
 use common::{build_test_app_state, setup_test_db};
 
-fn git(args: &[&str], cwd: Option<&Path>) {
-    let mut cmd = Command::new("git");
-    cmd.args(args);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    // Never block on a credential prompt: a public repo must clone anonymously.
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let status = cmd.status().expect("git must be installed for HTTP clone tests");
-    assert!(status.success(), "git {args:?} failed");
+/// Run git through the sanctioned gateway (the `test_no_raw_git_command_in_crates`
+/// regression guard forbids raw git process construction). Returns trimmed stdout.
+/// A `cwd` is passed as the gateway's repo path (`-C <cwd>`).
+fn git(args: &[&str], cwd: Option<&Path>) -> String {
+    let gateway = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway must initialize");
+    let output = gateway.run(args, cwd).expect("git invocation failed");
+    assert!(
+        output.success(),
+        "git {args:?} failed: {}",
+        output.stderr_str().trim()
+    );
+    output.stdout_str().trim().to_string()
 }
 
 async fn wait_for_listener(addr: &str) {
@@ -97,12 +100,7 @@ async fn public_repo_clones_over_live_http() {
         &["--git-dir", &bare_str, "symbolic-ref", "HEAD", "refs/heads/main"],
         None,
     );
-    let expected = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(worktree.path())
-        .output()
-        .unwrap();
-    let expected_sha = String::from_utf8(expected.stdout).unwrap().trim().to_string();
+    let expected_sha = git(&["rev-parse", "HEAD"], Some(worktree.path()));
 
     // ── Spawn the live HTTP app. ──
     let state = build_test_app_state(db.clone(), repo_root.clone());
@@ -119,20 +117,12 @@ async fn public_repo_clones_over_live_http() {
     let dest = tempfile::tempdir().unwrap();
     let clone_path = dest.path().join("clone");
     let url = format!("http://{addr}/http-owner/clone-repo.git");
-    git(
-        &["clone", &url, &clone_path.to_string_lossy()],
-        None,
-    );
+    git(&["clone", &url, &clone_path.to_string_lossy()], None);
 
     // The streamed pack must reconstruct the exact committed content + tip.
     let cloned_blob = std::fs::read(clone_path.join("big.bin")).expect("big.bin must be cloned");
     assert_eq!(cloned_blob, blob, "cloned blob must match byte-for-byte");
-    let cloned_head = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&clone_path)
-        .output()
-        .unwrap();
-    let cloned_sha = String::from_utf8(cloned_head.stdout).unwrap().trim().to_string();
+    let cloned_sha = git(&["rev-parse", "HEAD"], Some(clone_path.as_path()));
     assert_eq!(cloned_sha, expected_sha, "cloned HEAD must match origin tip");
 
     server.abort();
