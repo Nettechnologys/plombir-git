@@ -646,7 +646,21 @@ pub async fn download_asset(
                     resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
                 }
             }
-            (StatusCode::OK, resp_headers, data).into_response()
+            // The whole asset is already buffered because the service verifies
+            // its sha256 over the complete bytes before returning them. Handing
+            // that finished `Vec` to `Body::from` would make it a single frame a
+            // slow-drip / stalled client can pin in server memory until the
+            // kernel resets the dead connection — the same download-side slow-drip
+            // class as the artifact/cache handlers (card_9cd96bafd879). Serve it
+            // as a backpressure-sensitive, idle-guarded stream instead; reuses the
+            // git-streaming idle budget. `Content-Length` above lets clients spot
+            // an idle-aborted short read.
+            (
+                StatusCode::OK,
+                resp_headers,
+                crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
+            )
+                .into_response()
         }
         Err(e) => AppError::not_found(e).into_response(),
     }
