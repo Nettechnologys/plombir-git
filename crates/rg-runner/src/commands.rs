@@ -10,6 +10,28 @@ use crate::api::{
 use crate::config::{load_config, resolve_auth_token, save_config, RunnerConfig};
 use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_local};
 
+/// Connect timeout (TCP + TLS handshake only) for the runner's HTTP client.
+///
+/// Mirrors `rg_core::net`'s outbound connect timeout so a dead/hung server can't
+/// pin registration or the heartbeat task on the connect phase forever.
+const RUNNER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build the runner's HTTP client.
+///
+/// It sets **only** `connect_timeout`, deliberately NOT a global request
+/// `.timeout(...)`: `cmd_run` long-polls the job queue (`/jobs/poll?timeout=30`)
+/// and streams potentially large workspace / cache archives, both of which a
+/// whole-request timeout would abort. Bounding just the handshake still stops a
+/// dead peer from hanging the runner, while leaving long-poll and big transfers
+/// intact. The short, must-stay-snappy calls layer their own per-request
+/// timeout on top (see [`crate::api::send_heartbeat`]).
+fn build_runner_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(RUNNER_CONNECT_TIMEOUT)
+        .build()
+        .expect("failed to build runner HTTP client: no native TLS backend available")
+}
+
 /// Handle `forgekeep-runner register`: register a runner and optionally persist
 /// its token to the config file.
 pub(crate) async fn cmd_register(
@@ -19,7 +41,7 @@ pub(crate) async fn cmd_register(
     save: bool,
     auth_token: Option<String>,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = build_runner_client();
     let labels_vec: Vec<String> = labels
         .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_default();
@@ -60,7 +82,7 @@ pub(crate) async fn cmd_run(
     auth_token: Option<String>,
     config: String,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = build_runner_client();
 
     // Resolve config: CLI args > config file > defaults
     let cfg = load_config(&config);

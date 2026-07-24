@@ -84,6 +84,14 @@ pub(crate) struct PollJobResponse {
     pub(crate) timeout: i64,
 }
 
+/// Per-request timeout for the heartbeat call.
+///
+/// The shared client sets only a `connect_timeout` (so long-poll / large
+/// transfers aren't cut). A heartbeat is a trivial POST that must never stall
+/// the 30s heartbeat loop, so it gets its own short whole-request timeout to
+/// survive a server that completes the handshake but then hangs the response.
+const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Send a heartbeat to keep the runner marked as online.
 pub(crate) async fn send_heartbeat(
     client: &reqwest::Client,
@@ -94,6 +102,7 @@ pub(crate) async fn send_heartbeat(
     let _ = client
         .post(format!("{}/api/v1/runners/{}/heartbeat", server, runner_id))
         .header("Authorization", format!("Bearer {}", token))
+        .timeout(HEARTBEAT_TIMEOUT)
         .send()
         .await;
 }
