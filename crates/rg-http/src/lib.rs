@@ -414,6 +414,14 @@ async fn run_runner_watchdog(
     db: DatabaseConnection,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Startup one-shot: recover import tasks orphaned by the *previous* process.
+    // Background imports run as detached `tokio::spawn`s, so a restart/crash
+    // leaves any in-flight import stuck in a running status forever (its
+    // mark_completed/mark_failed never fires). A short grace (30s) skips any
+    // import this fresh process might have just started, so we only touch
+    // genuine leftovers from the prior run.
+    recover_stuck_imports(&db, 30).await;
+
     // Wait for server to fully start (abort early if shutdown fires first)
     tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
@@ -491,5 +499,55 @@ async fn run_runner_watchdog(
                 tracing::error!(error = %e, "Runner watchdog: failed to find offline runners");
             }
         }
+
+        // 3. Recover stuck import tasks (running but no update > 10 min).
+        // Catches imports orphaned by an in-process spawn death (e.g. a panic
+        // inside run_import that never reaches the mark_failed arm) as well as
+        // any restart-leftover the startup sweep missed.
+        recover_stuck_imports(&db, 600).await;
+    }
+}
+
+/// Fail every import task stuck in a running status with no update within
+/// `older_than_secs`. The DB write is guarded (`fail_stuck` re-checks status +
+/// cutoff atomically), so a task that legitimately completes in the meantime is
+/// never clobbered. Mirrors the CI stuck-job recovery, but marks imports
+/// `failed` rather than resetting them: an import (clone + full-repo metadata)
+/// is far too long to safely retry from a grace window, so we surface the
+/// interruption to the user instead.
+async fn recover_stuck_imports(db: &DatabaseConnection, older_than_secs: i64) {
+    let stuck = match rg_db::ops::import_task_ops::find_stuck(db, older_than_secs).await {
+        Ok(stuck) => stuck,
+        Err(e) => {
+            tracing::error!(error = %e, "Import watchdog: failed to find stuck import tasks");
+            return;
+        }
+    };
+
+    let mut failed = 0usize;
+    for task in &stuck {
+        tracing::warn!(
+            import_task_id = task.id,
+            status = %task.status,
+            "Import watchdog: failing stuck import task (interrupted by restart)"
+        );
+        match rg_db::ops::import_task_ops::fail_stuck(
+            db,
+            task.id,
+            older_than_secs,
+            "import interrupted by server restart",
+        )
+        .await
+        {
+            Ok(true) => failed += 1,
+            Ok(false) => {} // task advanced/completed between find and fail — leave it
+            Err(e) => {
+                tracing::error!(import_task_id = task.id, error = %e, "Failed to fail stuck import task");
+            }
+        }
+    }
+
+    if failed > 0 {
+        tracing::info!(count = failed, "Import watchdog: failed {failed} stuck import tasks");
     }
 }
