@@ -7,7 +7,9 @@ use crate::api::{
     download_workspace, finish_job, poll_job, register_runner, restore_cache, save_cache,
     send_heartbeat, start_job, upload_log,
 };
-use crate::config::{load_config, resolve_auth_token, save_config, RunnerConfig};
+use crate::config::{
+    config_not_persisted_warning, load_config, resolve_auth_token, save_config, RunnerConfig,
+};
 use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_local};
 
 /// Connect timeout (TCP + TLS handshake only) for the runner's HTTP client.
@@ -146,8 +148,13 @@ pub(crate) async fn cmd_run(
             updated_cfg.token = Some(tok.clone());
             updated_cfg.name = Some(cfg_name.clone());
             updated_cfg.labels = Some(resolved_labels);
-            if save_config(&config, &updated_cfg).is_ok() {
-                println!("Config saved to {}", config);
+            match save_config(&config, &updated_cfg) {
+                Ok(()) => println!("Config saved to {}", config),
+                // Not fatal: this run is already registered and fully usable.
+                // But the failure must be visible — otherwise the only symptom
+                // is a missing line on stdout and a server that collects a new
+                // duplicate runner on every restart.
+                Err(error) => tracing::warn!("{}", config_not_persisted_warning(&config, &error)),
             }
 
             (id, tok, cfg_name)

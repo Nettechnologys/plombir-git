@@ -85,14 +85,70 @@ pub(crate) fn load_config(path: &str) -> Result<Option<RunnerConfig>> {
     Ok(Some(config))
 }
 
+/// Remediation appended to every runner config-file **write** failure. Unlike
+/// the read path, the file is not there to be fixed — the directory or the
+/// ownership of the target is what has to change.
+const RUNNER_CONFIG_WRITE_HINT: &str = "make sure it is a writable file owned by the user \
+     running the runner — inside a container that uid is unrelated to the host user of the same \
+     name, so create the file on the host, `chown` it to the container uid, and bind-mount the \
+     file itself, not a directory";
+
+/// Persist the runner configuration file.
+///
+/// Every failure names the path it happened on: an unwritable `--config` target
+/// (a read-only volume, a directory a Docker bind-mount auto-created because the
+/// source file was missing, or a file owned by another uid) used to surface as a
+/// bare `Permission denied (os error 13)` / `Is a directory (os error 21)` with
+/// no hint of *which* path was involved. Same treatment as [`load_config`] on the
+/// read side.
 pub(crate) fn save_config(path: &str, config: &RunnerConfig) -> Result<()> {
     let p = config_path(path);
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)?;
+    let shown = p.display();
+
+    if let Some(parent) = p.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create the directory `{}` for runner config `{shown}` — \
+                 {RUNNER_CONFIG_WRITE_HINT}",
+                parent.display()
+            )
+        })?;
     }
-    let content = toml::to_string_pretty(config)?;
-    std::fs::write(&p, content)?;
+
+    let content = toml::to_string_pretty(config)
+        .with_context(|| format!("failed to serialize the runner config for `{shown}` as TOML"))?;
+
+    std::fs::write(&p, content).with_context(|| {
+        if p.is_dir() {
+            format!(
+                "failed to write runner config `{shown}`: the path is a directory, not a file — \
+                 a Docker bind-mount likely auto-created it because the source file was missing; \
+                 {RUNNER_CONFIG_WRITE_HINT}"
+            )
+        } else {
+            format!("failed to write runner config `{shown}` — {RUNNER_CONFIG_WRITE_HINT}")
+        }
+    })?;
+
+    tracing::debug!(path = %shown, "Saved runner configuration file");
     Ok(())
+}
+
+/// Warning text for a runner config that could not be persisted after an
+/// auto-registration.
+///
+/// The write failure itself is **not** fatal — the runner already holds a valid
+/// identity for this process and can work. What the operator must learn is the
+/// consequence: without a persisted config the next start registers yet another
+/// runner, so the server slowly fills with dead duplicates. Before this the whole
+/// error was dropped on the floor (`if save_config(..).is_ok()`), leaving only a
+/// missing "Config saved to …" line to notice.
+pub(crate) fn config_not_persisted_warning(path: &str, error: &anyhow::Error) -> String {
+    format!(
+        "could not persist the runner config `{path}`: {error:#}. This run continues with the \
+         identity it just registered, but every restart will register a NEW runner until the \
+         file becomes writable"
+    )
 }
 
 pub(crate) fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
@@ -119,7 +175,17 @@ fn env_var_compat(new: &str, old: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_config;
+    use super::{config_not_persisted_warning, load_config, save_config, RunnerConfig};
+
+    fn sample_config() -> RunnerConfig {
+        RunnerConfig {
+            server: Some("http://127.0.0.1:8080".to_string()),
+            token: Some("tok".to_string()),
+            runner_id: Some(7),
+            name: Some("builder-1".to_string()),
+            labels: Some(vec!["linux".to_string()]),
+        }
+    }
 
     /// A missing config file is the legitimate "no config yet" case: the runner
     /// falls back to CLI flags and auto-registration, no diagnostics needed.
@@ -241,6 +307,145 @@ labels = ["linux", "docker"]
         assert!(
             rendered.contains("failed to read"),
             "error must say the read failed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_saved_config_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("runner.toml");
+        let shown = path.to_str().unwrap();
+
+        save_config(shown, &sample_config()).expect("a writable path must save");
+
+        let loaded = load_config(shown)
+            .expect("the file just written must load")
+            .expect("a config file that exists must yield Some");
+        assert_eq!(loaded.server.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(loaded.runner_id, Some(7));
+        assert_eq!(loaded.token.as_deref(), Some("tok"));
+    }
+
+    /// The bug: both `create_dir_all` and `write` used a bare `?`, so the deploy
+    /// case (a bind-mount that left a directory at the config path) surfaced as
+    /// `Is a directory (os error 21)` with no path and nothing to act on.
+    #[test]
+    fn saving_onto_a_directory_is_reported_with_path_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = save_config(path.to_str().unwrap(), &sample_config())
+            .expect_err("writing onto a directory must fail");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(path.to_str().unwrap()),
+            "error must name the config path: {rendered}"
+        );
+        assert!(
+            rendered.contains("is a directory"),
+            "error must explain the directory case: {rendered}"
+        );
+        assert!(
+            rendered.contains("bind-mount"),
+            "error must carry the remediation hint: {rendered}"
+        );
+    }
+
+    /// The "wrong uid inside the container" case on the write side: the config
+    /// directory exists but the runner may not write into it.
+    #[cfg(unix)]
+    #[test]
+    fn saving_into_an_unwritable_directory_is_reported_with_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let readonly = dir.path().join("readonly");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let path = readonly.join("runner.toml");
+
+        // root ignores the permission bits entirely — probe instead of guessing
+        // the uid, exactly as the read-side test does.
+        if std::fs::write(&path, "probe").is_ok() {
+            return;
+        }
+
+        let error = save_config(path.to_str().unwrap(), &sample_config())
+            .expect_err("writing into an unwritable directory must fail");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(path.to_str().unwrap()),
+            "error must name the config path: {rendered}"
+        );
+        assert!(
+            rendered.contains("failed to write"),
+            "error must say the write failed: {rendered}"
+        );
+        assert!(
+            rendered.contains("chown"),
+            "error must carry the ownership remediation: {rendered}"
+        );
+    }
+
+    /// A parent directory that cannot even be created must name the *parent* —
+    /// that is the path whose permissions actually blocked the save.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_directory_that_cannot_be_created_is_reported_with_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let readonly = dir.path().join("readonly");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let parent = readonly.join("forgekeep");
+        let path = parent.join("runner.toml");
+
+        if std::fs::create_dir(&parent).is_ok() {
+            return; // running as root
+        }
+
+        let error = save_config(path.to_str().unwrap(), &sample_config())
+            .expect_err("an uncreatable parent directory must fail");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(parent.to_str().unwrap()),
+            "error must name the directory it failed to create: {rendered}"
+        );
+        assert!(
+            rendered.contains("failed to create the directory"),
+            "error must say the directory creation failed: {rendered}"
+        );
+    }
+
+    /// The call-site half of the bug: `cmd_run` threw the whole error away with
+    /// `if save_config(..).is_ok()`, so a failed save was invisible and the
+    /// runner silently re-registered on every start.
+    #[test]
+    fn the_call_site_warning_carries_the_path_the_cause_and_the_consequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.toml");
+        std::fs::create_dir(&path).unwrap();
+        let shown = path.to_str().unwrap();
+
+        let error = save_config(shown, &sample_config()).expect_err("writing onto a directory");
+        let warning = config_not_persisted_warning(shown, &error);
+
+        assert!(
+            warning.contains(shown),
+            "warning must name the config path: {warning}"
+        );
+        assert!(
+            warning.contains("is a directory"),
+            "warning must carry the underlying cause: {warning}"
+        );
+        assert!(
+            warning.contains("register a NEW runner"),
+            "warning must spell out the consequence: {warning}"
         );
     }
 }
