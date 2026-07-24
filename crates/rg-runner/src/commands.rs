@@ -84,8 +84,13 @@ pub(crate) async fn cmd_run(
 ) -> Result<()> {
     let client = build_runner_client();
 
-    // Resolve config: CLI args > config file > defaults
-    let cfg = load_config(&config);
+    // Resolve config: CLI args > config file > defaults.
+    //
+    // A missing file is fine (`None` — fall back to flags and auto-registration),
+    // but an unreadable or malformed one aborts the start instead of silently
+    // degrading to "no config": continuing would re-register the runner under a
+    // fresh identity and leave the operator's file quietly ignored.
+    let cfg = load_config(&config)?;
     let resolved_server = server.as_str();
     let (resolved_id, resolved_token, resolved_name) = match (runner_id, token, name) {
         (Some(id), Some(tok), Some(n)) => (id, tok, n),
