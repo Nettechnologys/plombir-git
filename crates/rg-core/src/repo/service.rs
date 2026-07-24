@@ -4,8 +4,6 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection};
 use std::collections::{HashMap, HashSet};
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,24 +51,69 @@ const PERM_CACHE_TTL: Duration = Duration::from_secs(30);
 type PermKey = (i64, Option<i64>, bool);
 type PermEntry = (bool, Instant);
 
-static PERM_CACHE: OnceLock<RwLock<HashMap<PermKey, PermEntry>>> = OnceLock::new();
+/// A permission-decision cache with a 30s TTL, keyed by `(repo_id, actor_id, for_write)`.
+///
+/// Production uses a single process-global instance (`perm_cache()`), but the
+/// type is standalone so the invalidation logic can be unit-tested against a
+/// private, hermetic instance instead of racing on the shared global static —
+/// the whole test suite compiles into one binary, so any test that clears the
+/// global mid-flight would otherwise flake the cache unit tests.
+#[derive(Default)]
+struct PermCache {
+    entries: RwLock<HashMap<PermKey, PermEntry>>,
+}
 
-fn perm_cache() -> &'static RwLock<HashMap<PermKey, PermEntry>> {
-    PERM_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+impl PermCache {
+    fn check(&self, repo_id: i64, actor_id: Option<i64>, for_write: bool) -> Option<bool> {
+        let cache = self.entries.read().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get(&(repo_id, actor_id, for_write))
+            .filter(|(_, ts)| ts.elapsed() < PERM_CACHE_TTL)
+            .map(|(v, _)| *v)
+    }
+
+    fn set(&self, repo_id: i64, actor_id: Option<i64>, for_write: bool, value: bool) {
+        let mut cache = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, (_, ts)| ts.elapsed() < PERM_CACHE_TTL);
+        cache.insert((repo_id, actor_id, for_write), (value, Instant::now()));
+    }
+
+    /// Drop the cached read+write decisions for a specific user on a repo.
+    fn invalidate_user(&self, repo_id: i64, user_id: i64) {
+        let mut cache = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        cache.remove(&(repo_id, Some(user_id), false));
+        cache.remove(&(repo_id, Some(user_id), true));
+    }
+
+    /// Drop every cached entry belonging to a repo.
+    fn invalidate_repo(&self, repo_id: i64) {
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(rid, _, _), _| *rid != repo_id);
+    }
+
+    /// Drop the entire cache.
+    fn invalidate_all(&self) {
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+static PERM_CACHE: OnceLock<PermCache> = OnceLock::new();
+
+fn perm_cache() -> &'static PermCache {
+    PERM_CACHE.get_or_init(PermCache::default)
 }
 
 fn check_perm_cache(repo_id: i64, actor_id: Option<i64>, for_write: bool) -> Option<bool> {
-    let cache = perm_cache().read().unwrap_or_else(|e| e.into_inner());
-    cache
-        .get(&(repo_id, actor_id, for_write))
-        .filter(|(_, ts)| ts.elapsed() < PERM_CACHE_TTL)
-        .map(|(v, _)| *v)
+    perm_cache().check(repo_id, actor_id, for_write)
 }
 
 fn set_perm_cache(repo_id: i64, actor_id: Option<i64>, for_write: bool, value: bool) {
-    let mut cache = perm_cache().write().unwrap_or_else(|e| e.into_inner());
-    cache.retain(|_, (_, ts)| ts.elapsed() < PERM_CACHE_TTL);
-    cache.insert((repo_id, actor_id, for_write), (value, Instant::now()));
+    perm_cache().set(repo_id, actor_id, for_write, value);
 }
 
 /// Invalidate cached read+write permission for a specific user on a repo.
@@ -78,27 +121,19 @@ fn set_perm_cache(repo_id: i64, actor_id: Option<i64>, for_write: bool, value: b
 /// Call after a collaborator is added/updated/removed so that granted or
 /// revoked access takes effect immediately instead of after the 30s TTL.
 pub fn invalidate_perm_cache_user(repo_id: i64, user_id: i64) {
-    let mut cache = perm_cache().write().unwrap_or_else(|e| e.into_inner());
-    cache.remove(&(repo_id, Some(user_id), false));
-    cache.remove(&(repo_id, Some(user_id), true));
+    perm_cache().invalidate_user(repo_id, user_id);
 }
 
 /// Invalidate every cached permission entry for a repo (e.g. owner transfer
 /// or deletion, which changes who can read/write).
 pub fn invalidate_perm_cache_repo(repo_id: i64) {
-    perm_cache()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(rid, _, _), _| *rid != repo_id);
+    perm_cache().invalidate_repo(repo_id);
 }
 
 /// Clear the entire permission cache. Used for org/team membership changes
 /// that can affect access across many repositories at once.
 pub fn invalidate_perm_cache_all() {
-    perm_cache()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    perm_cache().invalidate_all();
 }
 
 /// Resolve an "owner" string to either a user ID or an org ID.
@@ -1393,51 +1428,52 @@ fn get_file_sha(repo_path: &std::path::Path, git_ref: &str, file_path: &str) -> 
 mod perm_cache_tests {
     use super::*;
 
-    // The cache is a process-global static; serialize these tests so the
-    // `invalidate_all` case can't race with the others under parallel runs.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // These exercise the pure cache logic against a private `PermCache`, so they
+    // neither perturb nor are perturbed by the process-global cache the rest of
+    // the suite shares (all of which compiles into one test binary). No cross-test
+    // serialization is needed — each test owns its instance.
 
     #[test]
     fn invalidate_user_drops_only_that_user_read_and_write() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = PermCache::default();
         let (repo, user, other) = (910_001, 42, 43);
-        set_perm_cache(repo, Some(user), false, true);
-        set_perm_cache(repo, Some(user), true, true);
-        set_perm_cache(repo, Some(other), false, true);
+        cache.set(repo, Some(user), false, true);
+        cache.set(repo, Some(user), true, true);
+        cache.set(repo, Some(other), false, true);
 
-        invalidate_perm_cache_user(repo, user);
+        cache.invalidate_user(repo, user);
 
-        assert_eq!(check_perm_cache(repo, Some(user), false), None);
-        assert_eq!(check_perm_cache(repo, Some(user), true), None);
+        assert_eq!(cache.check(repo, Some(user), false), None);
+        assert_eq!(cache.check(repo, Some(user), true), None);
         // Other users on the same repo are untouched.
-        assert_eq!(check_perm_cache(repo, Some(other), false), Some(true));
+        assert_eq!(cache.check(repo, Some(other), false), Some(true));
     }
 
     #[test]
     fn invalidate_repo_drops_all_entries_for_that_repo_only() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = PermCache::default();
         let (repo, keep) = (910_002, 910_003);
-        set_perm_cache(repo, None, false, true);
-        set_perm_cache(repo, Some(7), true, true);
-        set_perm_cache(keep, Some(7), true, true);
+        cache.set(repo, None, false, true);
+        cache.set(repo, Some(7), true, true);
+        cache.set(keep, Some(7), true, true);
 
-        invalidate_perm_cache_repo(repo);
+        cache.invalidate_repo(repo);
 
-        assert_eq!(check_perm_cache(repo, None, false), None);
-        assert_eq!(check_perm_cache(repo, Some(7), true), None);
-        assert_eq!(check_perm_cache(keep, Some(7), true), Some(true));
+        assert_eq!(cache.check(repo, None, false), None);
+        assert_eq!(cache.check(repo, Some(7), true), None);
+        assert_eq!(cache.check(keep, Some(7), true), Some(true));
     }
 
     #[test]
     fn invalidate_all_clears_everything() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_perm_cache(910_004, Some(1), false, true);
-        set_perm_cache(910_005, Some(2), true, true);
+        let cache = PermCache::default();
+        cache.set(910_004, Some(1), false, true);
+        cache.set(910_005, Some(2), true, true);
 
-        invalidate_perm_cache_all();
+        cache.invalidate_all();
 
-        assert_eq!(check_perm_cache(910_004, Some(1), false), None);
-        assert_eq!(check_perm_cache(910_005, Some(2), true), None);
+        assert_eq!(cache.check(910_004, Some(1), false), None);
+        assert_eq!(cache.check(910_005, Some(2), true), None);
     }
 }
 
