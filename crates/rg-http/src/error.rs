@@ -187,7 +187,11 @@ impl AppError {
     /// the `From<DbErr>` and `From<anyhow::Error>` conversions so a database
     /// outage classifies identically whether the handler surfaced the raw
     /// `DbErr` or an anyhow-wrapped one.
-    fn is_db_outage(e: &sea_orm::DbErr) -> bool {
+    ///
+    /// `pub(crate)` so the OCI registry handlers (which must preserve their own
+    /// OCI error-envelope and therefore can't route through `AppError`) can
+    /// reuse the exact same outage predicate — see `oci::oci_status_for`.
+    pub(crate) fn is_db_outage(e: &sea_orm::DbErr) -> bool {
         use sea_orm::DbErr;
         matches!(e, DbErr::Conn(_) | DbErr::ConnectionAcquire(_))
     }

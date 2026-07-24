@@ -50,6 +50,54 @@ fn oci_not_found(code: &str, message: &str) -> Response {
     oci_err(StatusCode::NOT_FOUND, code, message)
 }
 
+/// Classify a DB-layer error into the HTTP status for an OCI response, while
+/// leaving the OCI error-envelope untouched.
+///
+/// The registry can't route errors through `AppError` the way the JSON API
+/// does: docker/podman expect the OCI-conformant `{errors:[{code,message}]}`
+/// body that `oci_err` emits, and swapping in the `AppError` JSON would break
+/// the protocol. So instead of converting the error, we classify only the
+/// *status*: a connection-level `sea_orm::DbErr` (pool closed / acquire timeout
+/// / dropped connection) is a transient, retryable outage → 503; everything
+/// else stays 500. The outage predicate is shared with the JSON API via
+/// `AppError::is_db_outage`, so a database outage on `/v2/...` classifies
+/// identically to one on the rest of the API.
+///
+/// Implemented for both error shapes the DB sites surface: `find_oci_repo` /
+/// `check_access` / `find_or_create_oci_repo` return `anyhow::Result` (a
+/// `DbErr` wrapped through `.context()`), while the `rg_db::ops::oci_ops::*`
+/// helpers return `Result<_, sea_orm::DbErr>` directly.
+trait OciDbStatus {
+    fn oci_status(&self) -> StatusCode;
+}
+
+impl OciDbStatus for sea_orm::DbErr {
+    fn oci_status(&self) -> StatusCode {
+        if crate::error::AppError::is_db_outage(self) {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+impl OciDbStatus for anyhow::Error {
+    fn oci_status(&self) -> StatusCode {
+        // `downcast_ref` sees through any `.context()` layers to the original
+        // `DbErr`, mirroring `From<anyhow::Error> for AppError`.
+        match self.downcast_ref::<sea_orm::DbErr>() {
+            Some(db_err) => db_err.oci_status(),
+            None => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Status for a DB-touching error, preserving the OCI envelope: connection-level
+/// DB outages become 503, all else 500. See [`OciDbStatus`].
+fn oci_status_for<E: OciDbStatus>(e: &E) -> StatusCode {
+    e.oci_status()
+}
+
 fn oci_unauthorized(message: &str) -> Response {
     oci_err(StatusCode::UNAUTHORIZED, error_codes::UNAUTHORIZED, message)
 }
@@ -160,11 +208,7 @@ async fn require_access(
     match check_access(state, headers, owner, repo, required_action).await {
         Ok((true, user_id)) => Ok(user_id),
         Ok((false, _)) => Err(oci_unauthorized("authentication required")),
-        Err(e) => Err(oci_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &e.to_string(),
-        )),
+        Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string())),
     }
 }
 
@@ -393,12 +437,12 @@ pub async fn list_tags(
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
         Ok(Some(r)) => r,
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     let tags = match rg_db::ops::oci_ops::list_tags(&state.db, oci_repo.id).await {
         Ok(t) => t,
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     (
@@ -444,7 +488,7 @@ async fn get_manifest_impl(
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
         Ok(Some(r)) => r,
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     let rf = Reference::parse(&reference);
@@ -462,7 +506,7 @@ async fn get_manifest_impl(
     let manifest = match manifest {
         Ok(Some(m)) => m,
         Ok(None) => return oci_not_found(error_codes::MANIFEST_UNKNOWN, "manifest not found"),
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     // Compute digest in Docker format
@@ -515,7 +559,7 @@ pub async fn put_manifest(
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
         Ok(Some(r)) => r,
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     // Validate media type
@@ -645,7 +689,7 @@ pub async fn put_manifest(
 
     let _manifest = match result {
         Ok(m) => m,
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     // Increment blob ref counts
@@ -821,7 +865,7 @@ pub async fn start_upload(
 
     let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo, user_id).await {
         Ok(r) => r,
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     match state.oci_storage.create_upload(&owner, &repo).await {
@@ -831,7 +875,7 @@ pub async fn start_upload(
                 rg_db::ops::oci_ops::create_upload(&state.db, oci_repo.id, &uuid, &upload_path)
                     .await
             {
-                return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string());
+                return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string());
             }
 
             let location = format!("/v2/{owner}/{repo}/blobs/uploads/{uuid}");
@@ -928,7 +972,7 @@ pub async fn chunk_upload(
         Ok(None) => {
             return oci_not_found(error_codes::BLOB_UPLOAD_UNKNOWN, "upload session not found");
         }
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     }
 
     // Stream body to upload file
@@ -988,7 +1032,7 @@ pub async fn complete_upload(
 
     let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo, user_id).await {
         Ok(r) => r,
-        Err(e) => return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
     // Finalize: stream-read upload file, verify digest, move to blob storage
