@@ -233,9 +233,42 @@ fn default_db_idle_timeout() -> u64 {
     600
 }
 
+/// Check that `path` is an existing, regular file *before* something tries to
+/// read it, so a bad path fails with a message that names the path and says
+/// what to do about it.
+///
+/// The motivating incident: a Docker bind-mount whose source `forgekeep.toml`
+/// did not exist made the daemon auto-create a **directory** at the mount
+/// point, and `read_to_string` reported nothing but `Is a directory (os error
+/// 21)` — no path, no cause. The container crash-looped 268 times on it.
+fn ensure_regular_file(path: &std::path::Path, what: &str, hint: &str) -> anyhow::Result<()> {
+    let shown = path.display();
+    match std::fs::metadata(path) {
+        Ok(md) if md.is_dir() => anyhow::bail!(
+            "{what} path `{shown}` is a directory, not a file — a Docker bind-mount \
+             likely auto-created it because the source file was missing; {hint}"
+        ),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("{what} `{shown}` does not exist — {hint}")
+        }
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("failed to stat {what} `{shown}`")),
+    }
+}
+
+/// Remediation appended to every `--config` failure: the file the deployer was
+/// supposed to create in the first place.
+const CONFIG_FILE_HINT: &str =
+    "create it first: `cp forgekeep.example.toml forgekeep.toml` (and bind-mount that file, \
+     not a directory)";
+
 fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
-    let content = std::fs::read_to_string(path)?;
-    let config: ConfigFile = toml::from_str(&content)?;
+    ensure_regular_file(std::path::Path::new(path), "config file", CONFIG_FILE_HINT)?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file `{path}`"))?;
+    let config: ConfigFile = toml::from_str(&content)
+        .with_context(|| format!("failed to parse config file `{path}` as TOML"))?;
     tracing::info!(path = %path, "Loaded configuration file");
     Ok(config)
 }
@@ -299,14 +332,20 @@ fn validate_config(
         .with_context(|| format!("repo_root is not writable: {:?}", repo_root))?;
     std::fs::remove_file(&test_file)?;
 
-    // 3. Verify TLS files exist if configured
+    // 3. Verify TLS files exist if configured. `exists()` alone is not enough:
+    //    a bind-mount of a missing source file leaves a *directory* behind,
+    //    which passes an existence check and then fails deep inside rustls.
     if let Some((ref cert, ref key)) = tls_config {
-        if !cert.exists() {
-            anyhow::bail!("TLS certificate not found: {:?}", cert);
-        }
-        if !key.exists() {
-            anyhow::bail!("TLS private key not found: {:?}", key);
-        }
+        ensure_regular_file(
+            cert,
+            "TLS certificate",
+            "point `--tls-cert` / `[tls].cert` at an existing PEM file",
+        )?;
+        ensure_regular_file(
+            key,
+            "TLS private key",
+            "point `--tls-key` / `[tls].key` at an existing PEM file",
+        )?;
     }
 
     tracing::info!("Configuration validation passed");
@@ -798,6 +837,100 @@ pub(crate) async fn run_serve(
 #[cfg(test)]
 mod config_tests {
     use super::ConfigFile;
+
+    #[test]
+    fn config_path_pointing_at_a_directory_names_path_and_remediation() {
+        // The exact crash-loop shape: `docker compose` bind-mounted a missing
+        // `forgekeep.toml`, so the daemon created a directory there and the
+        // server died with a bare `Is a directory (os error 21)`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forgekeep.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = super::load_config_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
+        assert!(err.contains("is a directory"), "no cause: {err}");
+        assert!(err.contains("bind-mount"), "no diagnosis: {err}");
+        assert!(
+            err.contains("cp forgekeep.example.toml forgekeep.toml"),
+            "no remediation: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_config_file_names_path_and_remediation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml");
+
+        let err = super::load_config_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
+        assert!(err.contains("does not exist"), "no cause: {err}");
+        assert!(
+            err.contains("cp forgekeep.example.toml forgekeep.toml"),
+            "no remediation: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_config_file_names_the_path_it_failed_to_parse() {
+        // A TOML syntax error otherwise surfaces as a bare parser message with
+        // no clue about *which* file the operator has to fix.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.toml");
+        std::fs::write(&path, "[server\nrepo_root = \"/data/repos\"\n").unwrap();
+
+        let err = format!(
+            "{:#}",
+            super::load_config_file(path.to_str().unwrap()).unwrap_err()
+        );
+
+        assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
+        assert!(err.contains("as TOML"), "no parse context: {err}");
+    }
+
+    #[test]
+    fn a_readable_config_file_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forgekeep.toml");
+        std::fs::write(&path, "[rate_limit]\nmax = 0\n").unwrap();
+
+        let config = super::load_config_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.timeouts.db_connect_secs, 10);
+    }
+
+    #[test]
+    fn tls_paths_that_are_directories_are_rejected_before_boot() {
+        // Same bind-mount trap, different knob: `exists()` is true for a
+        // directory, so the old check waved it through into rustls.
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("fullchain.pem");
+        let key = dir.path().join("privkey.pem");
+        std::fs::create_dir(&cert).unwrap();
+        std::fs::write(&key, "key").unwrap();
+
+        let secret = "a-sufficiently-long-test-jwt-secret-value";
+        let err = super::validate_config(secret, dir.path(), &Some((cert.clone(), key.clone())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TLS certificate"), "unexpected: {err}");
+        assert!(err.contains("is a directory"), "unexpected: {err}");
+
+        // And a missing key is reported by name too.
+        std::fs::remove_file(&key).unwrap();
+        std::fs::remove_dir(&cert).unwrap();
+        std::fs::write(&cert, "cert").unwrap();
+        let err = super::validate_config(secret, dir.path(), &Some((cert, key)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TLS private key"), "unexpected: {err}");
+        assert!(err.contains("does not exist"), "unexpected: {err}");
+    }
 
     #[test]
     fn example_config_includes_valid_audit_archive_settings() {

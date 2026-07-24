@@ -36,5 +36,8 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
