@@ -798,16 +798,25 @@ pub async fn download_cache(
             {
                 return AppError::from(error).into_response();
             }
+            // The archive is already buffered (the integrity check above needs
+            // it), so its exact length is known — advertise it so clients can
+            // detect a truncated download.
+            let content_length = bytes.len().to_string();
             (
                 StatusCode::OK,
                 [
                     (axum::http::header::CONTENT_TYPE, "application/x-tar"),
+                    (axum::http::header::CONTENT_LENGTH, content_length.as_str()),
                     (
                         axum::http::HeaderName::from_static("x-checksum-sha256"),
                         sha256.as_str(),
                     ),
                 ],
-                bytes,
+                // Idle-guarded stream of the already-verified buffer: a slow or
+                // stalled CI client would otherwise pin this cache-sized `Vec` in
+                // server memory until the kernel resets the dead connection
+                // (card_16003d99e502). Reuses the git-streaming idle budget.
+                crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
             )
                 .into_response()
         }

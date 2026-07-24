@@ -287,6 +287,13 @@ pub async fn download_artifact(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    // The whole artifact is already buffered (the integrity check above needs
+    // it), so its exact length is known — advertise it so clients can detect a
+    // truncated download. An idle abort ends the stream short of this length,
+    // which the client sees as a broken transfer rather than a silent short read.
+    if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
     if let Ok(value) = HeaderValue::from_str(&disposition) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
@@ -299,7 +306,17 @@ pub async fn download_artifact(
             );
         }
     }
-    (StatusCode::OK, headers, bytes).into_response()
+    // Hand the verified buffer to the socket as a backpressure-sensitive,
+    // idle-guarded stream instead of a single in-memory frame: a slow or stalled
+    // client would otherwise pin this artifact-sized `Vec` in server memory until
+    // the kernel eventually resets the dead TCP connection (card_16003d99e502).
+    // Reuses the git-streaming idle budget (same HTTP slow-drip download class).
+    (
+        StatusCode::OK,
+        headers,
+        crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
+    )
+        .into_response()
 }
 
 /// DELETE /api/v1/artifacts/:id

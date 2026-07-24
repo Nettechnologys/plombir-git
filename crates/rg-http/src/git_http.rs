@@ -151,87 +151,6 @@ fn is_length_limit_error(err: &(dyn std::error::Error + Send + Sync + 'static)) 
     false
 }
 
-/// Slice size for streaming a buffered git response to the client.
-const GIT_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
-
-/// Bounded channel depth for the response streamer. Small on purpose: this is
-/// the coupling point where a stalled reader's socket backpressure propagates
-/// back to the producer as a blocked `send`, so a shallow queue makes the idle
-/// timeout bite promptly instead of after several megabytes have been enqueued.
-const GIT_RESPONSE_CHANNEL_DEPTH: usize = 4;
-
-/// Deliver an already-buffered git response as a **backpressure-sensitive,
-/// idle-guarded** stream instead of a single in-memory frame.
-///
-/// The upload-pack / v2 handlers buffer the whole git response (the pack) into a
-/// `Vec` before we know the outcome — which is exactly what lets us keep precise
-/// `200 / 500 / 504` status semantics (git has fully finished, success or error,
-/// before any byte reaches the client). But handing that `Vec` to `Body::from`
-/// turns it into a single frame hyper owns and holds until the client has
-/// drained every byte. A client that reads the clone one byte at a time — or
-/// stops reading entirely — then pins the whole clone-sized buffer in server
-/// memory for as long as it likes. That is the download-side twin of the
-/// slow-drip *upload* that [`buffer_git_body`] already defends, and the residual
-/// tracked in `card_751408c41e0c`: the git subprocess is already dead, but the
-/// memory + connection are held unbounded.
-///
-/// The fix pumps `output` through a bounded channel in [`GIT_RESPONSE_CHUNK_BYTES`]
-/// slices. Hyper only pulls the next chunk after flushing the previous one to the
-/// socket, so a stalled reader stops draining → the channel fills → the
-/// producer's `send().await` blocks. We bound that `send` with `idle_secs`; on a
-/// stall the producer drops both the unsent remainder and the channel, releasing
-/// the clone-sized buffer immediately instead of holding it until the kernel
-/// eventually resets the dead TCP connection. A legit slow-but-progressing
-/// client drains at least one chunk per idle window and never trips — the same
-/// semantics the upload side already has.
-///
-/// This does not restructure the git subprocess flow (the pack is still produced
-/// exactly as before), so there is no clone quality/speed regression: it only
-/// changes how the finished bytes are handed to the socket.
-///
-/// `idle_secs == 0` disables the bound (plain, unbounded streaming).
-fn git_response_body_with_idle(output: Vec<u8>, idle_secs: u64) -> Body {
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(GIT_RESPONSE_CHANNEL_DEPTH);
-    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
-
-    tokio::spawn(async move {
-        let mut buf = axum::body::Bytes::from(output);
-        while !buf.is_empty() {
-            let take = buf.len().min(GIT_RESPONSE_CHUNK_BYTES);
-            // `split_to` moves the head out and shrinks `buf`, so the unsent
-            // remainder is all that is retained between iterations.
-            let chunk = buf.split_to(take);
-            let send = tx.send(Ok(chunk));
-            let sent = match idle {
-                Some(dur) => match tokio::time::timeout(dur, send).await {
-                    Ok(res) => res,
-                    // Idle stall: the client stopped draining. Returning drops
-                    // `buf` (the unsent pack tail) and `tx`, which tears down the
-                    // response stream and frees the buffered memory.
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            idle_secs,
-                            "git response idle timeout — slow client stopped reading, dropped buffered pack"
-                        );
-                        return;
-                    }
-                },
-                None => send.await,
-            };
-            // Receiver gone (client disconnected / response dropped): nothing
-            // left to feed, so stop and release the remainder.
-            if sent.is_err() {
-                return;
-            }
-        }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
-    Body::new(http_body_util::StreamBody::new(frame_stream))
-}
-
 /// Check repository access for git protocol.
 ///
 /// - upload-pack (clone/fetch): can_read
@@ -629,7 +548,10 @@ pub(crate) async fn handle_git_upload_pack(
                     // Stream the buffered pack with an idle guard so a slow-drip
                     // downloader can't pin the clone-sized buffer indefinitely
                     // (card_751408c41e0c). git already finished, so 200 is final.
-                    git_response_body_with_idle(output, state.git_idle_timeout_secs),
+                    crate::http_stream::buffered_body_with_idle(
+                        output,
+                        state.git_idle_timeout_secs,
+                    ),
                 )
                     .into_response()
             }
@@ -694,7 +616,10 @@ pub(crate) async fn handle_git_upload_pack(
                     // Stream the buffered pack with an idle guard so a slow-drip
                     // downloader can't pin the clone-sized buffer indefinitely
                     // (card_751408c41e0c). git already finished, so 200 is final.
-                    git_response_body_with_idle(output, state.git_idle_timeout_secs),
+                    crate::http_stream::buffered_body_with_idle(
+                        output,
+                        state.git_idle_timeout_secs,
+                    ),
                 )
                     .into_response()
             }
@@ -1246,9 +1171,7 @@ async fn find_repo_by_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        buffer_git_body, git_response_body_with_idle, with_git_timeout, GIT_RESPONSE_CHUNK_BYTES,
-    };
+    use super::{buffer_git_body, with_git_timeout};
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -1307,83 +1230,6 @@ mod tests {
 
         let buffered = buffer_git_body(body, 0).await.expect("disabled window must not trip");
         assert_eq!(&buffered[..], b"late");
-    }
-
-    /// Helper: drain a response `Body` to completion, returning the bytes seen.
-    async fn drain_body(mut body: Body) -> Vec<u8> {
-        use http_body_util::BodyExt;
-        let mut out = Vec::new();
-        while let Some(frame) = body.frame().await {
-            if let Ok(data) = frame.expect("frame error").into_data() {
-                out.extend_from_slice(&data);
-            }
-        }
-        out
-    }
-
-    /// A client that drains promptly receives the whole buffered pack, byte for
-    /// byte — the idle guard must never corrupt or truncate a healthy download.
-    #[tokio::test]
-    async fn git_response_stream_delivers_full_body_to_prompt_reader() {
-        let output: Vec<u8> = (0..GIT_RESPONSE_CHUNK_BYTES * 3 + 123)
-            .map(|i| (i % 251) as u8)
-            .collect();
-        let body = git_response_body_with_idle(output.clone(), 30);
-        let got = drain_body(body).await;
-        assert_eq!(got, output, "prompt reader must get the exact buffered bytes");
-    }
-
-    /// `idle_secs == 0` disables the bound; delivery still completes intact.
-    #[tokio::test]
-    async fn git_response_stream_disabled_delivers_full_body() {
-        let output: Vec<u8> = (0..GIT_RESPONSE_CHUNK_BYTES + 7).map(|i| i as u8).collect();
-        let got = drain_body(git_response_body_with_idle(output.clone(), 0)).await;
-        assert_eq!(got, output);
-    }
-
-    /// A slow-drip downloader that stops reading trips the idle window: the
-    /// producer drops the unsent pack tail, so the stalled client receives only
-    /// what was already in flight — strictly less than the whole buffer — rather
-    /// than pinning the clone-sized `Vec` until the kernel resets the socket.
-    ///
-    /// The stall must be observed *while no one is reading*: any read frees a
-    /// channel slot, which unblocks the producer's `send` and makes the idle
-    /// `timeout` see a ready inner future instead of firing. So the test parks
-    /// the producer on a full channel, lets the idle window elapse without
-    /// reading, and only then drains what little was buffered.
-    #[tokio::test(start_paused = true)]
-    async fn git_response_stream_trips_on_stalled_reader() {
-        use http_body_util::BodyExt;
-
-        // Far more chunks than the channel can buffer, so the producer blocks on
-        // `send` once the shallow queue fills.
-        let total = GIT_RESPONSE_CHUNK_BYTES * 50;
-        let output = vec![0xABu8; total];
-        let mut body = git_response_body_with_idle(output, 2); // 2s idle window
-
-        // Never read: let the producer fill the channel and park on a blocked
-        // `send`, then let the idle window elapse so that `send` times out and
-        // the producer drops the unsent remainder (closing the stream).
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(Duration::from_secs(3)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-
-        // Now drain only the few chunks that were buffered before the trip; the
-        // stream must end (None) well before the full buffer is delivered.
-        let mut received = 0usize;
-        while let Some(frame) = body.frame().await {
-            if let Ok(data) = frame.expect("frame error").into_data() {
-                received += data.len();
-            }
-        }
-        assert!(
-            received < total,
-            "stalled reader must not receive the whole buffer: got {received} of {total}"
-        );
     }
 
     #[tokio::test]

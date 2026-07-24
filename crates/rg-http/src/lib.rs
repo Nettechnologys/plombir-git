@@ -28,6 +28,7 @@ pub mod ws;
 
 mod git_http;
 mod handlers;
+mod http_stream;
 mod pat_auth;
 mod routes;
 
