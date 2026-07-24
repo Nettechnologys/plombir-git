@@ -80,11 +80,45 @@ async fn check_git_access(
             [(header::CONTENT_TYPE, "text/plain")],
             "access denied".to_string(),
         )),
+        // A DB outage during the access check is a retryable 503, not a 404:
+        // masking an unreachable database as "repository not found" would tell
+        // git the repo is gone (and clients not to retry). Genuine not-found —
+        // and any statement-level DB error — stays 404. See `git_db_status`.
+        Err(e) if git_db_status(&e) == StatusCode::SERVICE_UNAVAILABLE => {
+            tracing::error!(error = %format!("{e:#}"), "database unavailable during git access check, returning 503");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "database temporarily unavailable".to_string(),
+            ))
+        }
         Err(e) => Err((
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/plain")],
             format!("repository not found: {}", e),
         )),
+    }
+}
+
+/// Classify a DB-touching error into an HTTP status while preserving the git
+/// smart-HTTP response envelope.
+///
+/// The git client reads the status line and body in the protocol's own framing
+/// (`application/x-git-*-result` / `text/plain`), so — unlike the JSON API — we
+/// can't route these errors through `AppError` without breaking the
+/// content-type git expects. Instead we classify only the *status*: a
+/// connection-level `sea_orm::DbErr` (pool closed / acquire timeout / dropped
+/// connection), seen through any `anyhow` `.context()` layers, is a transient,
+/// retryable outage → 503; everything else stays 500. The outage predicate is
+/// shared with the JSON API (`From<DbErr> for AppError`) and the OCI registry
+/// (`oci::oci_status_for`) via `AppError::is_db_outage`, so a database outage
+/// classifies identically on every transport.
+fn git_db_status(e: &anyhow::Error) -> StatusCode {
+    match e.downcast_ref::<sea_orm::DbErr>() {
+        Some(db_err) if crate::error::AppError::is_db_outage(db_err) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -542,7 +576,7 @@ pub(crate) async fn handle_git_receive_pack(
         }
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                git_db_status(&e),
                 [(
                     header::CONTENT_TYPE,
                     "application/x-git-receive-pack-result",
@@ -556,7 +590,7 @@ pub(crate) async fn handle_git_receive_pack(
             Ok(rules) => rules,
             Err(e) => {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    git_db_status(&e),
                     [(
                         header::CONTENT_TYPE,
                         "application/x-git-receive-pack-result",
@@ -570,7 +604,7 @@ pub(crate) async fn handle_git_receive_pack(
             Ok(rules) => rules,
             Err(e) => {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    git_db_status(&e),
                     [(
                         header::CONTENT_TYPE,
                         "application/x-git-receive-pack-result",
@@ -1071,5 +1105,52 @@ mod tests {
             killed,
             "sleep child (pid {pid}) must be killed on timeout, not left running"
         );
+    }
+
+    // --- card_8f1b9713fd2e: git smart-HTTP DB-outage classification ---------
+    //
+    // The git handlers can't route DB errors through `AppError` (that would
+    // swap in JSON and break the `application/x-git-*-result` content-type the
+    // client parses), so `git_db_status` classifies only the *status*. These
+    // assert a connection-level outage → 503 while genuine bugs / non-DB errors
+    // stay 500 — the same split `error.rs` guarantees for the JSON API, proven
+    // here directly on the git predicate.
+    use super::git_db_status;
+    use axum::http::StatusCode;
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
+
+    #[test]
+    fn git_db_status_connection_outage_is_503() {
+        let e = anyhow::Error::from(DbErr::Conn(RuntimeErr::Internal("connection reset".into())));
+        assert_eq!(git_db_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+        let e = anyhow::Error::from(DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed));
+        assert_eq!(git_db_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn git_db_status_sees_outage_through_context() {
+        // `rg_db::ops::protected_branch_ops::list_by_repo` (and the repo lookup)
+        // return `anyhow::Result`, wrapping the `DbErr` via `.context()`. The
+        // downcast must see through that layer, or the push path would 500.
+        let e = anyhow::Error::from(DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed))
+            .context("db: list protected branches by repo");
+        assert_eq!(git_db_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn git_db_status_statement_error_stays_500() {
+        // A statement-level DbErr is a bug, not a retryable outage.
+        let e = anyhow::Error::from(DbErr::Exec(RuntimeErr::Internal(
+            "UNIQUE constraint failed".into(),
+        )));
+        assert_eq!(git_db_status(&e), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn git_db_status_non_db_error_stays_500() {
+        // A plain error with no DbErr underneath (e.g. a gix / IO failure while
+        // building the pack) must not be misclassified as a DB outage.
+        let e = anyhow::anyhow!("failed to open repository");
+        assert_eq!(git_db_status(&e), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
