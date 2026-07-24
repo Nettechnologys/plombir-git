@@ -91,9 +91,24 @@ pub struct BlobContent {
     pub sha: String,
     pub size: i64,
     pub content: String,
-    pub encoding: String, // "utf-8" | "base64"
+    pub encoding: String, // "utf-8" | "base64" | "none"
     pub is_binary: bool,
+    /// True when the blob is larger than `MAX_BLOB_API_BYTES` and was therefore
+    /// NOT read into memory or encoded: `content` is empty and `encoding` is
+    /// "none" (only `size`/`sha` are meaningful). Clients should fetch the file
+    /// another way (clone / archive) instead of the JSON blob API. Guards
+    /// against a memory-amplification DoS where a huge committed file would be
+    /// base64-inflated (×4/3) and JSON-escaped into a single in-memory frame.
+    pub too_large: bool,
 }
+
+/// Upper bound (bytes) on a blob the JSON blob API will inline. A file larger
+/// than this is reported with `too_large: true` and an empty body instead of
+/// being loaded + base64/UTF-8 encoded into one in-memory JSON frame — mirroring
+/// how GitHub's Contents API refuses to inline large files. 5 MiB sits well
+/// above normal source files while bounding worst-case per-request memory
+/// (5 MiB raw → ~6.7 MiB base64 → JSON escaping).
+pub const MAX_BLOB_API_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub struct CommitEntry {
@@ -535,7 +550,29 @@ fn get_blob_content(
         .rev_parse_single(target.as_str())
         .map_err(|e| anyhow::anyhow!("path '{}' not found at ref '{}': {}", path, git_ref, e))?;
 
-    // Find and decode the blob
+    // Inspect the object header WITHOUT decoding the blob into memory, so an
+    // oversized file is rejected before we ever buffer + base64-inflate it.
+    let header = repo
+        .find_header(object_id)
+        .map_err(|e| anyhow::anyhow!("failed to read object header: {}", e))?;
+    if header.kind() != gix::object::Kind::Blob {
+        anyhow::bail!("path '{}' is not a file", path);
+    }
+    let blob_size = header.size();
+    if blob_size > MAX_BLOB_API_BYTES {
+        // Memory-amplification guard: return metadata only, never load/encode.
+        return Ok(BlobContent {
+            path: path.to_string(),
+            sha: object_id.to_string(),
+            size: blob_size as i64,
+            content: String::new(),
+            encoding: "none".to_string(),
+            is_binary: false,
+            too_large: true,
+        });
+    }
+
+    // Under the cap: safe to load and encode the full blob.
     let object = repo
         .find_object(object_id)
         .map_err(|e| anyhow::anyhow!("failed to find object: {}", e))?;
@@ -589,6 +626,7 @@ fn get_blob_content(
         content,
         encoding,
         is_binary,
+        too_large: false,
     })
 }
 
