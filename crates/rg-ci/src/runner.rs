@@ -903,10 +903,10 @@ impl PipelineRunner {
         let archive = self.cache_archive_path(key);
         let key_hash = cache_key_hash(key);
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await?;
-        if let Some(entry) =
+        let existing =
             rg_db::ops::ci_retention_ops::find_cache_entry(&self.db, self.repo_id, &key_hash)
-                .await?
-        {
+                .await?;
+        if let Some(entry) = &existing {
             if entry.expires_at <= chrono::Utc::now() {
                 let _ = std::fs::remove_file(&archive);
                 rg_db::ops::ci_retention_ops::delete_cache_entry(&self.db, entry.id).await?;
@@ -917,6 +917,18 @@ impl PipelineRunner {
             return Ok(());
         }
         let size = std::fs::metadata(&archive)?.len() as i64;
+        // Integrity: verify the on-disk archive against the digest recorded when
+        // it was saved before unpacking it into the workspace — a poisoned or
+        // corrupted cache must never inject files into the build. Legacy entries
+        // carry no digest and are restored without this guard.
+        let digest = hash_archive(&archive)?;
+        if let Some(expected) = existing.as_ref().and_then(|e| e.sha256.as_deref()) {
+            if digest != expected {
+                anyhow::bail!(
+                    "CI cache integrity check failed: expected sha256 {expected}, got {digest}"
+                );
+            }
+        }
         tar::Archive::new(std::fs::File::open(&archive)?)
             .unpack(self.workspace_path())
             .context("unpack CI cache")?;
@@ -926,6 +938,7 @@ impl PipelineRunner {
             &key_hash,
             archive.to_string_lossy().as_ref(),
             size,
+            Some(&digest),
             policy.cache_retention_days,
         )
         .await?;
@@ -952,6 +965,7 @@ impl PipelineRunner {
         builder.finish()?;
         std::fs::rename(temporary, &archive)?;
         let size = std::fs::metadata(&archive)?.len() as i64;
+        let digest = hash_archive(&archive)?;
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await?;
         if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
             &self.db,
@@ -959,6 +973,7 @@ impl PipelineRunner {
             &cache_key_hash(key),
             archive.to_string_lossy().as_ref(),
             size,
+            Some(&digest),
             policy.cache_retention_days,
         )
         .await
@@ -973,6 +988,24 @@ impl PipelineRunner {
 fn cache_key_hash(key: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(key.as_bytes()))
+}
+
+/// Hex-encoded SHA-256 of a file's *contents*, streamed in bounded chunks so a
+/// large cache archive is never buffered in memory just to be hashed.
+fn hash_archive(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn cache_spec(

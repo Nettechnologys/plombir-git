@@ -62,6 +62,7 @@ pub async fn upsert_cache_entry(
     key_hash: &str,
     file_path: &str,
     size: i64,
+    sha256: Option<&str>,
     retention_days: i32,
 ) -> Result<ci_cache_entry::Model> {
     let now = Utc::now();
@@ -75,6 +76,11 @@ pub async fn upsert_cache_entry(
         let mut active: ci_cache_entry::ActiveModel = model.into();
         active.file_path = Set(file_path.to_string());
         active.size = Set(size);
+        // Only overwrite the stored digest when the caller supplies one, so a
+        // digest-less re-registration never wipes an existing content hash.
+        if let Some(digest) = sha256 {
+            active.sha256 = Set(Some(digest.to_string()));
+        }
         active.last_accessed_at = Set(now);
         active.expires_at = Set(expires_at);
         return active.update(db).await.context("db: update CI cache entry");
@@ -84,6 +90,7 @@ pub async fn upsert_cache_entry(
         key_hash: Set(key_hash.to_string()),
         file_path: Set(file_path.to_string()),
         size: Set(size),
+        sha256: Set(sha256.map(|s| s.to_string())),
         created_at: Set(now),
         last_accessed_at: Set(now),
         expires_at: Set(expires_at),

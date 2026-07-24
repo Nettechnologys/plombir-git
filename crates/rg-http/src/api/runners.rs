@@ -642,9 +642,11 @@ pub async fn download_cache(
     };
     let path = cache_archive_path(&state, repo_id, key);
     let key_hash = cache_key_hash(key);
-    if let Ok(Some(entry)) =
-        rg_db::ops::ci_retention_ops::find_cache_entry(&state.db, repo_id, &key_hash).await
-    {
+    let existing = rg_db::ops::ci_retention_ops::find_cache_entry(&state.db, repo_id, &key_hash)
+        .await
+        .ok()
+        .flatten();
+    if let Some(entry) = &existing {
         if entry.expires_at <= chrono::Utc::now() {
             let _ = tokio::fs::remove_file(&path).await;
             let _ = rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, entry.id).await;
@@ -653,6 +655,19 @@ pub async fn download_cache(
     }
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
+            let sha256 = cache_content_hash(&bytes);
+            // Integrity: the stored archive must still hash to the digest recorded
+            // at upload — a tampered/corrupted cache would otherwise inject files
+            // into a downstream build. Legacy entries carry no digest and are
+            // served without this guard.
+            if let Some(expected) = existing.as_ref().and_then(|e| e.sha256.as_deref()) {
+                if sha256 != expected {
+                    return AppError::internal(anyhow::anyhow!(
+                        "cache integrity check failed: expected sha256 {expected}, got {sha256}"
+                    ))
+                    .into_response();
+                }
+            }
             let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
                 Ok(policy) => policy,
                 Err(error) => return AppError::from(error).into_response(),
@@ -663,6 +678,7 @@ pub async fn download_cache(
                 &key_hash,
                 path.to_string_lossy().as_ref(),
                 bytes.len() as i64,
+                Some(&sha256),
                 policy.cache_retention_days,
             )
             .await
@@ -671,7 +687,13 @@ pub async fn download_cache(
             }
             (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/x-tar"),
+                    (
+                        axum::http::HeaderName::from_static("x-checksum-sha256"),
+                        sha256.as_str(),
+                    ),
+                ],
                 bytes,
             )
                 .into_response()
@@ -709,6 +731,10 @@ pub async fn upload_cache(
             return AppError::internal(error).into_response();
         }
     }
+    // Digest the payload before the write consumes `body` — the archive is
+    // already fully buffered in memory (≤ 1 GiB, bounded above), so hashing the
+    // in-memory bytes costs nothing extra.
+    let sha256 = cache_content_hash(body.as_ref());
     let temporary = path.with_extension("tar.tmp");
     if let Err(error) = tokio::fs::write(&temporary, body).await {
         return AppError::internal(error).into_response();
@@ -730,6 +756,7 @@ pub async fn upload_cache(
         &cache_key_hash(key),
         path.to_string_lossy().as_ref(),
         size,
+        Some(&sha256),
         policy.cache_retention_days,
     )
     .await
@@ -786,6 +813,14 @@ fn cache_archive_path(state: &AppState, repo_id: i64, key: &str) -> std::path::P
 fn cache_key_hash(key: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+/// Hex-encoded SHA-256 of a cache archive's *contents* (distinct from
+/// `cache_key_hash`, which digests the cache key). Used to record and later
+/// verify the integrity of the stored archive.
+fn cache_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 async fn decrypted_repo_secrets(
