@@ -38,6 +38,8 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Skip the mode-bit-dependent permission tests when running as root.
+libc = "0.2"
 
 [lints]
 workspace = true

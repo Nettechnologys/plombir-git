@@ -1,0 +1,106 @@
+# ForgeKeep — config file + persistent host directory
+#
+# The alternative to the default `docker-compose.yml` (env vars + named
+# volume). Use this one when you want the data on a path you can see, back up
+# and restore from the host, and the settings in a `forgekeep.toml` you edit.
+#
+# Quick start (from this directory — the full version is in README.md):
+#   cp .env.example .env
+#   sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=$(openssl rand -hex 32)/" .env
+#   echo "FORGEKEEP_UID=$(id -u)" >> .env
+#   echo "FORGEKEEP_GID=$(id -g)" >> .env
+#   cp forgekeep.docker.toml forgekeep.toml       # MUST exist before `up`
+#   mkdir -p data
+#   docker compose -f docker-compose.hostdir.yml up -d --build
+#
+# Two traps this file is built to avoid — both cost a real deployment a day:
+#
+#   1. **Bind-mounting a file that does not exist yet.** Docker creates a
+#      *directory* at the mount point, and the server dies on a config file
+#      that is a directory. Copy `forgekeep.toml` into place *before* `up`.
+#      That is also why the SSH host key is NOT mounted from the host here: it
+#      lives at `/data/ssh_host_key` inside the data directory and the server
+#      generates it on first start.
+#
+#   2. **uid mismatch on the data directory.** The container's `forgekeep` user
+#      is not the host user of the same name — only the *number* matters. The
+#      image is built with uid/gid 1000 by default; `FORGEKEEP_UID` /
+#      `FORGEKEEP_GID` in `.env` rebuild it as *your* host user so `./data`
+#      needs no `chown` at all. If you keep the default, run:
+#          sudo chown -R 1000:1000 ./data
+#      A wrong owner shows up as `repo_root … is unusable: Permission denied`,
+#      and that error names the uid to chown to.
+
+services:
+  forgekeep:
+    build:
+      # Context is the repo root (this file lives in deploy/).
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        # Match the host owner of ./data. Defaults to 1000 when unset in .env.
+        FORGEKEEP_UID: ${FORGEKEEP_UID:-1000}
+        FORGEKEEP_GID: ${FORGEKEEP_GID:-1000}
+    container_name: forgekeep
+    restart: unless-stopped
+    ports:
+      # HTTP is bound to loopback: put a TLS-terminating reverse proxy in front
+      # of it. Drop the "127.0.0.1:" prefix only if you really want it exposed
+      # to the world without a proxy. Override the host port in .env when 8080
+      # is already taken on the machine.
+      - "127.0.0.1:${FORGEKEEP_HTTP_PORT:-8080}:8080"
+      # Git-over-SSH has to be reachable by clients.
+      - "${FORGEKEEP_SSH_PORT:-2222}:2222"
+    volumes:
+      # Everything persistent lives here: repos/, forgekeep.db, logs/,
+      # audit-archive/ and the generated ssh_host_key.
+      - ./data:/data
+      # Settings. Read-only inside the container; edit it on the host and
+      # `docker compose restart forgekeep`.
+      - ./forgekeep.toml:/app/forgekeep.toml:ro
+    # FORGEKEEP_JWT_SECRET lives here rather than in forgekeep.toml — the env
+    # var wins over the config file, and .env is easier to keep out of git.
+    env_file:
+      - .env
+    # The image's default CMD passes --repo-root/--db-url/--log-file flags, and
+    # a CLI flag always beats the config file. Override it so forgekeep.toml is
+    # the single source of truth.
+    command: ["forgekeep", "serve", "--config", "/app/forgekeep.toml"]
+    networks:
+      - forgekeep-net
+
+  # ── Optional: CI Runner ─────────────────────────────────
+  # Needs a runner token: register the runner first
+  # (`docker compose -f docker-compose.hostdir.yml exec forgekeep forgekeep
+  # runner-create --name docker-runner`), then put the token in .env.
+  # runner:
+  #   build:
+  #     context: ..
+  #     dockerfile: Dockerfile
+  #     args:
+  #       FORGEKEEP_UID: ${FORGEKEEP_UID:-1000}
+  #       FORGEKEEP_GID: ${FORGEKEEP_GID:-1000}
+  #   container_name: forgekeep-runner
+  #   restart: unless-stopped
+  #   command: >
+  #     forgekeep-runner run
+  #     --server http://forgekeep:8080
+  #     --runner-id ${FORGEKEEP_RUNNER_ID}
+  #     --token ${FORGEKEEP_RUNNER_TOKEN}
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     # Docker-mode CI jobs drive the host daemon — this grants the container
+  #     # root-equivalent access to the host, so only enable it on a machine you
+  #     # are willing to hand over.
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - ./data:/data
+  #   depends_on:
+  #     - forgekeep
+  #   networks:
+  #     - forgekeep-net
+
+networks:
+  forgekeep-net:
+    name: forgekeep-net
+    driver: bridge

@@ -260,6 +260,65 @@ fn ensure_regular_file(path: &std::path::Path, what: &str, hint: &str) -> anyhow
     }
 }
 
+/// Extract the on-disk file a SQLite URL points at, or `None` for a
+/// non-SQLite/in-memory URL. Used only to turn an opaque "unable to open
+/// database file" into a message naming the directory that has to be writable.
+fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
+    let rest = db_url
+        .strip_prefix("sqlite://")
+        .or_else(|| db_url.strip_prefix("sqlite:"))?;
+    let path = rest.split('?').next().unwrap_or("");
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// True when the process can create a file in `dir` right now.
+fn dir_is_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".forgekeep_db_write_test");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Attach the uid/ownership diagnostic to a SQLite connection failure caused by
+/// an unwritable data directory.
+///
+/// SQLite reports that case as `unable to open database file` with no path and
+/// no reason, and it is the single most likely first-boot failure of a
+/// container whose `/data` bind-mount is owned by the host uid: the WAL and
+/// `-shm` sidecar files need write access to the *directory*, not just the
+/// database file. Non-permission failures (corrupt file, bad URL, Postgres,
+/// MySQL) are returned untouched.
+fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
+    let Some(path) = sqlite_file_path(db_url) else {
+        return error;
+    };
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if dir_is_writable(dir) {
+        return error;
+    }
+
+    let mut context = format!(
+        "SQLite database `{}` could not be opened: `{}` is not writable by the server, and SQLite \
+         needs to create the `-wal` / `-shm` sidecar files next to the database",
+        path.display(),
+        dir.display()
+    );
+    if let Some(hint) = rg_core::platform::fs::ownership_hint(dir) {
+        context.push_str(&format!("\n  hint: {hint}"));
+    }
+    error.context(context)
+}
+
 /// Remediation appended to every `--config` failure: the file the deployer was
 /// supposed to create in the first place.
 const CONFIG_FILE_HINT: &str =
@@ -329,10 +388,18 @@ fn validate_config(
     // 1. Validate JWT secret (refuse default, warn if too short)
     validate_jwt_secret(jwt_secret, "config")?;
 
-    // 2. Verify repo_root is writable
+    // 2. Verify repo_root is writable. A bind-mounted host directory owned by
+    //    the wrong uid fails exactly here, so the message carries the uid/chown
+    //    diagnostic rather than a bare `Permission denied (os error 13)`.
     let test_file = repo_root.join(".write_test");
-    std::fs::write(&test_file, "test")
-        .with_context(|| format!("repo_root is not writable: {:?}", repo_root))?;
+    std::fs::write(&test_file, "test").map_err(|e| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "repo_root",
+            repo_root,
+            &e,
+            "the server must be able to write into repo_root",
+        ))
+    })?;
     std::fs::remove_file(&test_file)?;
 
     // 3. Verify TLS files exist if configured. `exists()` alone is not enough:
@@ -715,7 +782,20 @@ pub(crate) async fn run_serve(
                 .filename_suffix(log_suffix)
                 .max_log_files(resolved_log_max_files)
                 .build(log_dir)
-                .map_err(|e| anyhow::anyhow!("failed to create log appender: {}", e))?;
+                .map_err(|e| {
+                    // The appender error names neither the directory nor the
+                    // reason, and an unwritable bind-mounted log directory is
+                    // the usual cause — carry both.
+                    let mut message = format!(
+                        "failed to create log appender in {}: {e}\n  \
+                         hint: point `--log-file` / `[logging].file` at a path the server can write to",
+                        log_dir.display()
+                    );
+                    if let Some(hint) = rg_core::platform::fs::ownership_hint(log_dir) {
+                        message.push_str(&format!("\n  hint: {hint}"));
+                    }
+                    anyhow::anyhow!(message)
+                })?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             (BoxMakeWriter::new(non_blocking), Some(guard))
@@ -744,7 +824,14 @@ pub(crate) async fn run_serve(
     }
 
     let repo_root = PathBuf::from(&resolved_repo_root);
-    std::fs::create_dir_all(&repo_root)?;
+    std::fs::create_dir_all(&repo_root).map_err(|e| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "repo_root",
+            &repo_root,
+            &e,
+            "point `--repo-root` / `[server].repo_root` at a directory the server can create",
+        ))
+    })?;
 
     // ── Git CLI gateway (seed configured command timeout) ─────────
     if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
@@ -765,7 +852,8 @@ pub(crate) async fn run_serve(
         resolved_db_connect_timeout,
         resolved_db_idle_timeout,
     )
-    .await?;
+    .await
+    .map_err(|e| annotate_db_open_error(e, &resolved_db_url))?;
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
 
@@ -1179,6 +1267,92 @@ max_files = 7
             .to_string();
         assert!(err.contains("TLS private key"), "unexpected: {err}");
         assert!(err.contains("does not exist"), "unexpected: {err}");
+    }
+
+    /// The shipped container config must keep every persistent path inside the
+    /// one bind-mounted directory — a stray relative path would write into the
+    /// image's ephemeral `/app` and vanish on the next `docker compose up`.
+    #[test]
+    fn docker_example_config_keeps_all_state_in_the_data_directory() {
+        let config: ConfigFile =
+            toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
+
+        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
+        assert_eq!(resolved.repo_root, "/data/repos");
+        assert_eq!(resolved.db_url, "sqlite:///data/forgekeep.db?mode=rwc");
+        assert_eq!(resolved.host_key.as_deref(), Some("/data/ssh_host_key"));
+        // No log file: a container logs to stdout, otherwise `docker compose
+        // logs` shows nothing and the operator debugs a silent box.
+        assert!(config.logging.file.is_none());
+        assert_eq!(config.audit.archive_dir.as_deref(), Some("/data/audit-archive"));
+        // The JWT secret belongs in deploy/.env, never in a file that may be
+        // committed.
+        assert!(config.auth.jwt_secret.is_none());
+    }
+
+    #[test]
+    fn sqlite_urls_resolve_to_the_file_the_directory_check_needs() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::sqlite_file_path("sqlite:///data/forgekeep.db?mode=rwc"),
+            Some(PathBuf::from("/data/forgekeep.db"))
+        );
+        assert_eq!(
+            super::sqlite_file_path("sqlite://./forgekeep.db"),
+            Some(PathBuf::from("./forgekeep.db"))
+        );
+        assert_eq!(super::sqlite_file_path("sqlite::memory:"), None);
+        assert_eq!(
+            super::sqlite_file_path("postgres://user:pw@localhost/forgekeep"),
+            None
+        );
+    }
+
+    /// The `/data` bind-mount case: the directory is unwritable, so the opaque
+    /// SQLite failure gains the path plus the uid to `chown` to.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_sqlite_directory_is_named_in_the_connect_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes through the mode bits
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", data.display());
+
+        let annotated = format!(
+            "{:#}",
+            super::annotate_db_open_error(anyhow::anyhow!("unable to open database file"), &url)
+        );
+
+        assert!(annotated.contains("unable to open database file"), "{annotated}");
+        assert!(annotated.contains("is not writable"), "{annotated}");
+        assert!(annotated.contains("this process runs as uid="), "{annotated}");
+        assert!(
+            annotated.contains("chmod") || annotated.contains("chown"),
+            "{annotated}"
+        );
+
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A corrupt database or a bad URL must not be blamed on permissions.
+    #[test]
+    fn writable_sqlite_directory_leaves_the_connect_error_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", dir.path().display());
+
+        let annotated = format!(
+            "{:#}",
+            super::annotate_db_open_error(anyhow::anyhow!("file is not a database"), &url)
+        );
+
+        assert_eq!(annotated, "file is not a database");
     }
 
     #[test]

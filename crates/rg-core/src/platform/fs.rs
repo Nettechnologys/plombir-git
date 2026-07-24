@@ -207,6 +207,90 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 
 use std::path::PathBuf;
 
+/// Ownership / permission diagnostic for a path the process failed to use.
+///
+/// Container deployments hit this constantly: the container user and the host
+/// user share a *name* but not a *uid*, so a bind-mounted directory created by
+/// the host user is unusable inside the container and the failure surfaces as a
+/// bare `Permission denied (os error 13)` with no hint of which side is wrong.
+/// This turns that into one line naming both sides of the mismatch plus the
+/// `chown` that fixes it.
+///
+/// When `path` itself does not exist yet (the usual case for a directory the
+/// server is about to create), the nearest existing ancestor is reported —
+/// that is the directory whose permissions actually blocked the operation.
+///
+/// Returns `None` on non-unix platforms and when no ancestor can be stat'd.
+pub fn ownership_hint<P: AsRef<Path>>(path: P) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = path.as_ref();
+        let (blocking, metadata) = path
+            .ancestors()
+            .find_map(|candidate| fs::metadata(candidate).ok().map(|m| (candidate, m)))?;
+
+        // SAFETY: `geteuid`/`getegid` are always-succeeding libc calls that read
+        // the calling process's own credentials and touch no memory.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (owner_uid, owner_gid) = (metadata.uid(), metadata.gid());
+        let mode = metadata.mode() & 0o7777;
+        let shown = blocking.display();
+
+        // Wrong owner and wrong mode need opposite fixes, and telling an
+        // operator to `chown` a directory they already own reads as nonsense.
+        let remedy = if owner_uid == uid {
+            format!(
+                "the owner already matches, so it is the mode that denies access: `chmod -R u+rwX {shown}`"
+            )
+        } else {
+            format!(
+                "fix it with `chown -R {uid}:{gid} {shown}` — for a Docker bind-mount run that on \
+                 the host against the host-side directory, since the container uid is unrelated to \
+                 the host user of the same name"
+            )
+        };
+
+        Some(format!(
+            "this process runs as uid={uid} gid={gid}, but {shown} is owned by uid={owner_uid} \
+             gid={owner_gid} (mode {mode:04o}); {remedy}"
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Format `error` on `path` as a single actionable line: the failure, the
+/// remediation for the caller's situation, and — when the error is
+/// permission-related — the uid/ownership diagnostic from [`ownership_hint`].
+///
+/// `what` names the thing in operator terms (`"repo_root"`, `"SSH host key"`),
+/// `remedy` is the caller-specific advice appended when the failure is *not* a
+/// permission problem (a missing parent, a bind-mounted directory, …).
+pub fn describe_path_error(
+    what: &str,
+    path: &Path,
+    error: &std::io::Error,
+    remedy: &str,
+) -> String {
+    let mut message = format!("{what} {} is unusable: {error}", path.display());
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        if let Some(hint) = ownership_hint(path) {
+            message.push_str(&format!("\n  hint: {hint}"));
+            return message;
+        }
+    }
+    if !remedy.is_empty() {
+        message.push_str(&format!("\n  hint: {remedy}"));
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +312,62 @@ mod tests {
 
         #[cfg(windows)]
         assert!(is_absolute(Path::new("C:\\test")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_hint_names_both_sides_of_the_uid_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let hint = super::ownership_hint(dir.path()).expect("unix hint");
+
+        assert!(hint.contains("this process runs as uid="), "{hint}");
+        assert!(hint.contains("is owned by uid="), "{hint}");
+        assert!(hint.contains(&dir.path().display().to_string()), "{hint}");
+    }
+
+    /// A directory the process already owns cannot be fixed by `chown`, and
+    /// telling an operator to chown to the uid they are is how a diagnostic
+    /// loses its credibility.
+    #[cfg(unix)]
+    #[test]
+    fn ownership_hint_blames_the_mode_when_the_owner_already_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let hint = super::ownership_hint(dir.path()).expect("unix hint");
+
+        assert!(hint.contains("chmod -R u+rwX"), "{hint}");
+        assert!(!hint.contains("chown"), "{hint}");
+    }
+
+    /// The blocking directory is the one to `chown`, so a path that does not
+    /// exist yet must report its nearest existing ancestor rather than nothing.
+    #[cfg(unix)]
+    #[test]
+    fn ownership_hint_falls_back_to_the_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("repos").join("deep");
+
+        let hint = super::ownership_hint(&missing).expect("unix hint");
+
+        assert!(hint.contains(&dir.path().display().to_string()), "{hint}");
+        assert!(!hint.contains("deep"), "{hint}");
+    }
+
+    #[test]
+    fn describe_path_error_appends_the_caller_remedy_for_non_permission_errors() {
+        let error = std::io::Error::new(std::io::ErrorKind::IsADirectory, "Is a directory");
+        let message = super::describe_path_error(
+            "config file",
+            Path::new("/app/forgekeep.toml"),
+            &error,
+            "create the file before starting the container",
+        );
+
+        assert!(message.contains("/app/forgekeep.toml"), "{message}");
+        assert!(message.contains("Is a directory"), "{message}");
+        assert!(
+            message.contains("create the file before starting the container"),
+            "{message}"
+        );
     }
 
     #[test]

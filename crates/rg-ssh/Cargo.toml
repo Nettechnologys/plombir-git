@@ -23,6 +23,8 @@ rand = "0.10"
 [dev-dependencies]
 chrono = { workspace = true }
 tempfile = "3"
+# Skip the unreadable-host-key test when running as root, which ignores mode bits.
+libc = "0.2"
 
 [lints]
 workspace = true

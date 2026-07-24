@@ -1,10 +1,15 @@
-# ForgeKeep Docker Compose
+# ForgeKeep Docker Compose — env vars + named volume (the simple variant).
 #
 # Quick start (run from the repo root):
 #   1. cp deploy/.env.example deploy/.env
 #   2. Set FORGEKEEP_JWT_SECRET in deploy/.env, for example:
 #        openssl rand -hex 32
 #   3. docker compose -f deploy/docker-compose.yml up -d
+#
+# Want the data on a host path you can back up, and the settings in a
+# forgekeep.toml instead of flags? Use `deploy/docker-compose.hostdir.yml` —
+# it is the same stack with a bind-mounted ./data, a config file, and the
+# uid/permission traps of bind-mounts already handled. See deploy/README.md.
 #
 # For observability (Prometheus + Grafana + Alertmanager):
 #   docker compose -f deploy/docker-compose.observability.yml up -d

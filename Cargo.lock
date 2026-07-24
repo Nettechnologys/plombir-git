@@ -5147,6 +5147,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "gix",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -5189,6 +5190,7 @@ dependencies = [
  "jsonwebtoken",
  "ldap3",
  "lettre",
+ "libc",
  "password-hash",
  "qrcode",
  "rand 0.8.6",
@@ -5333,6 +5335,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "rand 0.10.2",
  "rg-core",
  "rg-db",

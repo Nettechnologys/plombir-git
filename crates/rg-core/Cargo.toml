@@ -49,6 +49,11 @@ rand = { workspace = true }
 urlencoding = "2.1"
 http = "1"
 
+# Effective uid/gid of the running process, for the bind-mount ownership
+# diagnostic in `platform::fs::ownership_hint` (std exposes no uid API).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

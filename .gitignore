@@ -54,6 +54,10 @@ deploy/docker-compose.override.yml
 # Local runtime configs containing real secrets (keep only *.example.toml in VCS)
 /forgekeep.toml
 /forgekeep-simple.toml
+# The deployed copy of deploy/forgekeep.docker.toml and the host data directory
+# it points at (repos, DB, logs, generated SSH host key).
+deploy/forgekeep.toml
+deploy/data/
 # Legacy IronForge config names (pre-rebrand) — still ignored so old local files never get committed
 /ironforge.toml
 /ironforge-simple.toml

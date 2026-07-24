@@ -1,0 +1,70 @@
+# ForgeKeep configuration for the containerised deployment.
+#
+#   cp forgekeep.docker.toml forgekeep.toml
+#
+# and edit `forgekeep.toml` — that is the file `docker-compose.hostdir.yml`
+# bind-mounts. It has to exist *before* `docker compose up`, otherwise Docker
+# creates a directory at the mount point and the server refuses to start.
+#
+# Every path below is a path *inside the container*. The compose file mounts
+# the host directory `./data` onto `/data`, so everything the server persists
+# ends up in that one host directory — back it up and you have backed up the
+# whole instance.
+#
+# Precedence: env var > CLI flag > this file > built-in default.
+
+[server]
+repo_root = "/data/repos"
+http_addr = "0.0.0.0:8080"
+ssh_addr = "0.0.0.0:2222"
+# The SSH host key is generated on first start and kept in the data directory,
+# so client `known_hosts` entries survive a rebuild. Deliberately NOT a
+# separate bind-mount: mounting a file that does not exist yet gets you a
+# directory here, which is not a key.
+host_key = "/data/ssh_host_key"
+# Public URL of this instance, used in emails and webhook payloads. Set it to
+# whatever your reverse proxy serves.
+# external_url = "https://git.example.com"
+
+[database]
+url = "sqlite:///data/forgekeep.db?mode=rwc"
+
+[auth]
+# Left unset on purpose: keep the secret in deploy/.env as
+# FORGEKEEP_JWT_SECRET (the env var wins over this file), so a config file that
+# accidentally lands in git carries no credentials.
+# jwt_secret = "..."
+
+[ci]
+# Run CI jobs in Docker containers. Requires mounting the host Docker socket
+# into the runner, which is root-equivalent access to the host — see the
+# commented `runner` service in docker-compose.hostdir.yml.
+docker = false
+# Keep false on any shared or public instance: with it on, pushed CI config
+# executes arbitrary shell directly in the container.
+allow_host_runner = false
+
+[rate_limit]
+max = 0          # 0 = no global per-IP limit
+window_secs = 60
+# Behind a reverse proxy, list the proxy's IP so X-Forwarded-For is trusted for
+# rate limiting — without it every request looks like it comes from the proxy.
+# trusted_proxies = ["172.17.0.1"]
+auth_max = 10
+auth_window_secs = 60
+
+[logging]
+# Left unset on purpose: with no `file`, the server logs to stdout, which is
+# where `docker compose logs -f` and every Docker log driver read from. Setting
+# a file here silently empties `docker compose logs`.
+# Uncomment to log into the data directory instead (rotated daily,
+# max_files caps how many are kept):
+# file = "/data/logs/forgekeep.log"
+max_files = 5
+
+[audit]
+enabled = true
+archive_dir = "/data/audit-archive"
+archive_after_days = 90
+interval_minutes = 60
+batch_size = 1000

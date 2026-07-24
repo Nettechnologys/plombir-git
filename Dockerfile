@@ -92,8 +92,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash forgekeep
+# Create non-root user.
+#
+# The uid/gid are pinned (and overridable) on purpose: with a bind-mounted data
+# directory the *number* is what matters, not the name — the container's
+# `forgekeep` user has nothing to do with a host user of the same name. Build
+# with `--build-arg FORGEKEEP_UID=$(id -u)` to match the host owner of the
+# bind-mount and skip the `chown` step entirely.
+ARG FORGEKEEP_UID=1000
+ARG FORGEKEEP_GID=1000
+RUN groupadd --gid ${FORGEKEEP_GID} forgekeep \
+    && useradd --uid ${FORGEKEEP_UID} --gid ${FORGEKEEP_GID} \
+       --create-home --shell /bin/bash forgekeep
 
 # Copy binaries
 COPY --from=builder /build/target/release/forgekeep /usr/local/bin/forgekeep

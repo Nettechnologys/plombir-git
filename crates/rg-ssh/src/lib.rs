@@ -127,8 +127,14 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create host key directory: {:?}", parent))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+                    "SSH host key directory",
+                    parent,
+                    &e,
+                    "point `--host-key` / `[server].host_key` at a directory the server can write to",
+                ))
+            })?;
         }
     }
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
@@ -136,8 +142,14 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
     let pem = key
         .to_openssh(LineEnding::LF)
         .context("failed to encode generated host key")?;
-    std::fs::write(path, pem.as_bytes())
-        .with_context(|| format!("failed to write generated host key: {:?}", path))?;
+    std::fs::write(path, pem.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "SSH host key",
+            path,
+            &e,
+            "the server generates the key on first start and needs write access to its directory",
+        ))
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -148,13 +160,57 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Fail loudly *before* handing the path to russh when the host key is not a
+/// readable regular file.
+///
+/// Both failure modes are one-way tickets to an unhelpful message otherwise:
+/// a bind-mount whose source file was missing leaves a **directory** behind
+/// (russh then reports a parse failure), and a key owned by a different uid —
+/// the norm for a container, whose `forgekeep` user is not the host's
+/// `forgekeep` user — surfaces as a bare `Permission denied (os error 13)`
+/// with no clue which uid to chown to.
+fn check_host_key_readable(path: &std::path::Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "SSH host key",
+            path,
+            &e,
+            "point `--host-key` / `[server].host_key` at an existing OpenSSH private key",
+        ))
+    })?;
+    if metadata.is_dir() {
+        anyhow::bail!(
+            "SSH host key path `{}` is a directory, not a file — a Docker bind-mount \
+             likely auto-created it because the source file was missing; remove the directory \
+             and let the server generate a key there, or bind-mount an existing key file",
+            path.display()
+        );
+    }
+    // `File::open` on a directory succeeds on Linux, so this check must come
+    // after the is_dir() one to be meaningful.
+    std::fs::File::open(path).map_err(|e| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "SSH host key",
+            path,
+            &e,
+            "the host key must be readable by the server process (mode 0600, owned by it)",
+        ))
+    })?;
+    Ok(())
+}
+
 impl SshServer {
     /// Create a new SSH server from configuration.
     /// Loads the host key and validates the key file permissions.
     pub fn new(ssh_config: SshServerConfig) -> Result<Self> {
         ensure_host_key(&ssh_config.host_key_path)?;
-        let host_key = load_secret_key(&ssh_config.host_key_path, None)
-            .with_context(|| format!("failed to load host key: {:?}", ssh_config.host_key_path))?;
+        check_host_key_readable(&ssh_config.host_key_path)?;
+        let host_key = load_secret_key(&ssh_config.host_key_path, None).with_context(|| {
+            format!(
+                "failed to load SSH host key {}",
+                ssh_config.host_key_path.display()
+            )
+        })?;
 
         let config = Config {
             auth_rejection_time: std::time::Duration::from_secs(1),
@@ -732,8 +788,66 @@ pub async fn start_ssh_server(config: SshServerConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deploy_key_allows, parse_git_command, parse_repo_owner_name, with_git_timeout};
+    use super::{
+        check_host_key_readable, deploy_key_allows, ensure_host_key, parse_git_command,
+        parse_repo_owner_name, with_git_timeout,
+    };
     use std::time::Duration;
+
+    /// The bind-mount trap: `docker compose up` with a missing `./ssh_host_key`
+    /// leaves a *directory* at the mount point. `ensure_host_key` sees an
+    /// existing path and steps aside, so the check must name the real cause
+    /// instead of letting russh report a key-parse failure.
+    #[test]
+    fn host_key_directory_is_reported_as_a_bind_mount_mistake() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("ssh_host_key");
+        std::fs::create_dir(&key_path).unwrap();
+
+        let err = check_host_key_readable(&key_path).unwrap_err().to_string();
+
+        assert!(err.contains("is a directory, not a file"), "{err}");
+        assert!(err.contains("bind-mount"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_host_key_reports_the_uid_and_the_fix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root ignores the permission bits, so this can only be observed as a
+        // regular user.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("ssh_host_key");
+        ensure_host_key(&key_path).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = check_host_key_readable(&key_path).unwrap_err().to_string();
+
+        assert!(err.contains("this process runs as uid="), "{err}");
+        assert!(err.contains("chmod") || err.contains("chown"), "{err}");
+    }
+
+    #[test]
+    fn missing_host_key_is_generated_with_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("nested").join("ssh_host_key");
+
+        ensure_host_key(&key_path).unwrap();
+
+        assert!(key_path.is_file());
+        check_host_key_readable(&key_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn parses_git_command_with_quoted_repo_path() {

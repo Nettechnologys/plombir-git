@@ -1,5 +1,12 @@
 # ForgeKeep Deployment Guide
 
+Two compose files, pick one:
+
+| File | Data lives in | Settings come from | Use it when |
+|------|---------------|--------------------|-------------|
+| `docker-compose.yml` | Docker named volume `forgekeep-data` | env vars + the image's default flags | trying ForgeKeep out |
+| `docker-compose.hostdir.yml` | host directory `deploy/data/` | `deploy/forgekeep.toml` | running it for real: you want to see, back up and restore the data yourself |
+
 ## 🚀 Quick Start — ForgeKeep Application
 
 ```bash
@@ -20,6 +27,98 @@ docker compose logs -f
 ```
 
 Access: **http://localhost:8080**
+
+---
+
+## 🏠 Production Setup — config file + host directory
+
+`docker-compose.hostdir.yml` bind-mounts `deploy/data/` onto `/data` and runs
+`forgekeep serve --config /app/forgekeep.toml`. Everything the server persists —
+repos, the SQLite DB, the audit archive and the generated SSH host key — lands
+in that one host directory. Logs go to stdout, so `docker compose logs` and
+your log driver work as usual; set `[logging].file` if you want them in
+`data/logs/` instead.
+
+```bash
+cd deploy
+
+# 1. Environment: JWT secret + the uid the container should run as.
+cp .env.example .env
+secret="$(openssl rand -hex 32)"
+sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
+rm -f .env.bak
+printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+
+# 2. Config file. It MUST exist before `up` — see the bind-mount trap below.
+cp forgekeep.docker.toml forgekeep.toml
+
+# 3. Data directory, owned by the uid from step 1.
+mkdir -p data
+
+# 4. Build + start (the build bakes FORGEKEEP_UID into the image).
+docker compose -f docker-compose.hostdir.yml up -d --build
+
+# 5. Verify both listeners are up.
+docker compose -f docker-compose.hostdir.yml logs -f
+curl -sf http://127.0.0.1:8080/health && echo OK
+ssh -p 2222 -o StrictHostKeyChecking=no git@localhost 2>&1 | head -1
+```
+
+HTTP is published on `127.0.0.1:8080` only — put a TLS-terminating reverse
+proxy in front of it. Git-over-SSH listens on `0.0.0.0:2222`.
+
+`forgekeep.toml` and `data/` are git-ignored, so a rebuilt container keeps
+reading the settings and data you edited on the host.
+
+### The two traps this layout avoids
+
+**1. Bind-mounting a file that does not exist yet.** Docker silently creates a
+*directory* at the mount point. Mounting a missing `forgekeep.toml` therefore
+gives the server a directory to parse — which is why step 2 above copies the
+file into place *before* `up`. For the same reason the SSH host key is **not**
+mounted from the host here: `[server].host_key = "/data/ssh_host_key"` puts it
+inside the data directory, where the server generates it on first start and it
+persists across rebuilds.
+
+**2. uid mismatch on the bind-mount.** The container's `forgekeep` user is not
+the host user of the same name — only the numeric uid matters. Three ways out,
+in order of preference:
+
+```bash
+# a. Build the image as your host user (what step 1 does).
+printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+docker compose -f docker-compose.hostdir.yml up -d --build
+
+# b. Keep the image default (uid 1000) and chown the host directory.
+sudo chown -R 1000:1000 ./data
+
+# c. Check what the image actually runs as, if you inherited it from someone.
+docker compose -f docker-compose.hostdir.yml run --rm --entrypoint id forgekeep
+```
+
+Note that `FORGEKEEP_UID` is a **build** argument: after changing it you must
+`up --build`, not just `restart`.
+
+### Troubleshooting a failed first start
+
+Every one of these is a startup error that names the path and, for permission
+failures, prints the uid to `chown` to.
+
+| Log line | Cause | Fix |
+|----------|-------|-----|
+| `config file … is a directory, not a file` | mounted a `forgekeep.toml` that did not exist | `rm -rf forgekeep.toml && cp forgekeep.docker.toml forgekeep.toml` |
+| `repo_root … Permission denied` + `this process runs as uid=…` | `data/` owned by a different uid | `chown` to the uid from the message, or rebuild with `FORGEKEEP_UID` |
+| `SQLite database … is not writable` | same, for the DB and its `-wal`/`-shm` sidecars | as above — the *directory* must be writable, not just the file |
+| `SSH host key … Permission denied` | key file readable only by another uid | `chown <uid> data/ssh_host_key && chmod 600 data/ssh_host_key` |
+| `SSH host key path … is a directory` | bind-mounted a host key file that did not exist | remove the directory and let the server generate the key |
+| HTTP works, SSH silent | SSH failed on its own; HTTP is unaffected by design | `docker compose logs \| grep 'SSH server error'` |
+
+### Backup / restore
+
+The whole instance is `deploy/data/`. Stop the container and copy the
+directory, or take a hot SQLite backup with the commands in the
+[SQLite Backup / Restore](#sqlite-backup--restore) section below (add
+`-f docker-compose.hostdir.yml` to each `docker compose` invocation).
 
 ### Environment variables (used with default CMD):
 | Variable | Required | Default |
