@@ -768,7 +768,7 @@ async fn find_or_create_sso_user(
                 AppError::internal("failed to generate username")
             })?;
 
-        rg_db::ops::user_ops::create_user(
+        let created = rg_db::ops::user_ops::create_user(
             db,
             &username,
             &user_info.email,
@@ -779,8 +779,11 @@ async fn find_or_create_sso_user(
         .map_err(|e| {
             tracing::error!("Failed to create SSO user: {}", e);
             AppError::internal("user creation failed")
-        })?
-        .id
+        })?;
+        // SSO first-login provision is a new account: count it in the
+        // `users_registered_total` funnel with `sso` provenance.
+        crate::metrics::recorder::user_provisioned("sso");
+        created.id
     };
 
     // Encrypt and store tokens

@@ -62,3 +62,23 @@ pub fn record_repo_created() {
         observer();
     }
 }
+
+/// Observer invoked when a new user account is auto-provisioned by an external
+/// identity source inside `rg-core` (currently LDAP first-login). The `&str` is
+/// a low-cardinality provenance label (e.g. `"ldap"`). Recorded here rather than
+/// in the HTTP handler because directory auto-provision happens deep in the
+/// login service, below the recorder. Set once by the HTTP layer.
+static USER_PROVISIONED_OBSERVER: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Install the user-provisioned observer. Idempotent (first installer wins).
+pub fn set_user_provisioned_observer(observer: fn(&str)) {
+    let _ = USER_PROVISIONED_OBSERVER.set(observer);
+}
+
+/// Record a user account auto-provisioned by an external identity source.
+/// No-op when no observer is installed.
+pub fn record_user_provisioned(source: &str) {
+    if let Some(observer) = USER_PROVISIONED_OBSERVER.get() {
+        observer(source);
+    }
+}

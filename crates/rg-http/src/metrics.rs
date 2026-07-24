@@ -260,7 +260,7 @@ pub mod security {
         let ae = IntCounterVec::new(
             Opts::new(
                 "forgekeep_auth_events_total",
-                "Auth events (login/register/logout)",
+                "Auth events (login/register/provision/mfa/logout)",
             ),
             &["event", "outcome"],
         )?;
@@ -345,7 +345,7 @@ pub mod business {
         register_counter!(
             USERS_REGISTERED,
             "forgekeep_users_registered_total",
-            "Total user registrations"
+            "Total user accounts created (self-service registration + LDAP/SSO auto-provision)"
         );
         register_counter!(
             REPOS_CREATED,
@@ -495,11 +495,27 @@ pub mod recorder {
         }
     }
 
-    /// Record a user registration.
+    /// Record a self-service user registration (the `/users/register` handler).
     pub fn user_registered() {
         if let Some(c) = business::USERS_REGISTERED.get() {
             c.inc();
         }
+    }
+
+    /// Record a user account auto-provisioned by an external identity source
+    /// (LDAP / SSO first-login) rather than self-service registration.
+    ///
+    /// Bumps the same `forgekeep_users_registered_total` counter — so it stays a
+    /// true "accounts created" total that tracks the `forgekeep_users` gauge
+    /// instead of silently undercounting directory-backed deployments — and
+    /// records provenance via `forgekeep_auth_events_total{event="provision",
+    /// outcome=<source>}`. `source` must be a low-cardinality literal
+    /// (`"ldap"` / `"sso"`).
+    pub fn user_provisioned(source: &str) {
+        if let Some(c) = business::USERS_REGISTERED.get() {
+            c.inc();
+        }
+        auth_event("provision", source);
     }
 
     /// Record a repository created.

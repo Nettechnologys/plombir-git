@@ -142,15 +142,14 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 | `ci_jobs_running` | Gauge | - | Currently running jobs |
 | `ci_job_duration_seconds` | Histogram | - | Job execution duration (runner start→finish) |
 
-> **Note — not-yet-emitted metrics.** The Database, Business, and Security
-> metric families below are *registered* (they appear in `/metrics` at zero) but
-> the emit side is not yet wired into the code, so their panels/alerts stay flat
-> until that lands. HTTP, rate-limit, Git, and CI/CD metrics above are live.
+> **Note.** All metric families — HTTP, rate-limit, Git, CI/CD, Database,
+> Business, and Security — are registered *and* emitted; their panels/alerts are
+> live.
 
 ### Business Metrics (Phase 22-C)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `forgekeep_users_registered_total` | Counter | User registrations |
+| `forgekeep_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `forgekeep_auth_events_total{event="provision",outcome="ldap"\|"sso"}`) |
 | `forgekeep_repos_created_total` | Counter | Repos created |
 | `forgekeep_repos_deleted_total` | Counter | Repos deleted |
 | `forgekeep_repos_forked_total` | Counter | Repos forked |

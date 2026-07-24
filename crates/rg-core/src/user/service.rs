@@ -437,7 +437,7 @@ async fn resolve_ldap_identity(
     if user_ops::find_by_email(db, email).await?.is_some() {
         bail!("LDAP identity conflicts with an existing account");
     }
-    user_ops::create_ldap_user(
+    let user = user_ops::create_ldap_user(
         db,
         ldap_provider_id,
         username,
@@ -446,7 +446,12 @@ async fn resolve_ldap_identity(
         &ldap_user.dn,
         ldap_user.uid.as_deref(),
     )
-    .await
+    .await?;
+    // First-login LDAP auto-provision is a new account: count it in the
+    // `users_registered_total` funnel with `ldap` provenance so directory-only
+    // deployments don't silently undercount registrations.
+    crate::metrics_hook::record_user_provisioned("ldap");
+    Ok(user)
 }
 
 fn valid_email(email: &str) -> bool {
