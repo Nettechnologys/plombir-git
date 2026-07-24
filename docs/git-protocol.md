@@ -259,6 +259,16 @@ It must be converted to a complete pack with `--fix-thin`:
 git -C <repo_path> index-pack --fix-thin --stdin
 ```
 
+**Experimental native path (opt-in, default off).** Setting
+`FORGEKEEP_NATIVE_INDEX_PACK=1` (`true`/`yes`/`on`) makes receive-pack index the
+incoming pack in-process via `gix_pack::Bundle::write_to_directory` instead of
+the `git index-pack` subprocess. The repository is passed as the thin-pack
+base-object lookup — the native equivalent of `--fix-thin` — and the unpack is
+interrupt-driven (a tripped wall-clock/idle watchdog aborts it). It is a PoC:
+parity-tested against `git index-pack --fix-thin` on real thin packs, but it does
+**not** remove the git dependency (pack generation, verify-commit, archive, etc.
+still shell out), so it stays off by default.
+
 ### Report-status response format (critical!)
 
 This is the most error-prone part. The correct format, **verified by capturing real

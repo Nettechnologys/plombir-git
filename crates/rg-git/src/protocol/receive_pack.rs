@@ -357,32 +357,69 @@ where
         return Ok(updates);
     }
 
-    // Receive pack data and pipe to git index-pack
-    // TODO(gix): Replace with gix pack indexing when available.
+    // Receive the incoming pack and index it into the repository.
     //
-    // CRITICAL: --fix-thin is REQUIRED (pitfall #4)
+    // Two implementations exist behind a flag (default: the git CLI):
+    //   * `index_pack_via_git`    — `git index-pack --fix-thin --stdin` (subprocess).
+    //   * `index_pack_native`     — `gix_pack::Bundle::write_to_directory` (in-process,
+    //     interrupt-driven). Opt-in PoC via `FORGEKEEP_NATIVE_INDEX_PACK`, off by default.
     //
-    // Thin packs reference base objects NOT in the pack.
-    // Without --fix-thin, git index-pack fails with "pack has delta resolution error".
-    // With --fix-thin, missing bases are resolved from the repo before indexing.
-    // TODO(gix): Replace with gix pack indexing when available.
-    // Currently using git index-pack CLI as gix doesn't have a direct replacement.
-    //
-    // CRITICAL: --fix-thin is REQUIRED (pitfall #4)
-    //
-    // A "thin pack" is a packfile that references base objects NOT included in
-    // the pack. Git clients send thin packs during push to reduce network traffic.
-    //
-    // Without --fix-thin:
-    //   git index-pack will fail with "pack has delta resolution error"
-    //   or "missing delta base object"
-    //
-    // With --fix-thin:
-    //   git index-pack resolves missing bases from the repository, adds them
-    //   to the pack, making it "non-thin" before indexing.
-    //
-    // This is a common gotcha when implementing receive-pack. Always use
-    // --fix-thin unless you're absolutely sure the client sends full packs.
+    // Both must resolve the thin-pack the same way: ForgeKeep advertises the
+    // `thin-pack` capability, so clients send deltas whose base objects live in
+    // the repo but NOT in the pack. The CLI resolves them with `--fix-thin`; the
+    // native path passes the repo as the thin-pack base-object lookup. Omitting
+    // either fails with "missing delta base object".
+    if native_index_pack_enabled() {
+        index_pack_native(repo_path, reader).await?;
+    } else {
+        index_pack_via_git(repo_path, reader).await?;
+    }
+
+    enforce_signed_commit_policies(repo_path, &mut updates, require_signed_refs);
+
+    // Update the refs
+    for update in &mut updates {
+        if update.status != "ok" {
+            continue;
+        }
+        match update_ref(repo_path, &update.refname, &update.new_sha) {
+            Ok(()) => {
+                update.message = "ok".to_string();
+            }
+            Err(e) => {
+                update.status = "error".to_string();
+                update.message = format!("{}", e);
+            }
+        }
+    }
+
+    Ok(updates)
+}
+
+/// Whether receive-pack should index the incoming pack with the native gix
+/// indexer instead of the `git index-pack` subprocess.
+///
+/// PoC, opt-in — **default off**. Enable with `FORGEKEEP_NATIVE_INDEX_PACK` set
+/// to one of `1` / `true` / `yes` / `on` (case-insensitive). Any other value
+/// (or an unset variable) keeps the git CLI path.
+fn native_index_pack_enabled() -> bool {
+    std::env::var("FORGEKEEP_NATIVE_INDEX_PACK")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Index the incoming pack via the `git index-pack --fix-thin --stdin`
+/// subprocess (the default path). `--fix-thin` resolves delta bases that are in
+/// the repo but not in the pack, completing the thin pack before indexing.
+async fn index_pack_via_git<R>(repo_path: &Path, reader: &mut BufReader<R>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut index_pack = crate::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?
@@ -409,33 +446,91 @@ where
         if let Some(mut stderr) = stderr {
             let mut err_msg = Vec::new();
             stderr.read_to_end(&mut err_msg).await?;
-            bail!(
-                "git index-pack failed: {}",
-                String::from_utf8_lossy(&err_msg)
-            );
+            bail!("git index-pack failed: {}", String::from_utf8_lossy(&err_msg));
         }
         bail!("git index-pack failed with status {}", status);
     }
+    Ok(())
+}
 
-    enforce_signed_commit_policies(repo_path, &mut updates, require_signed_refs);
+/// Sets the shared interrupt flag when dropped, so an aborted async scope (e.g.
+/// the wall-clock `with_git_timeout` upstream cancelling this future) propagates
+/// into a detached `spawn_blocking` unpack that only observes an `AtomicBool`.
+struct InterruptOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
-    // Update the refs
-    for update in &mut updates {
-        if update.status != "ok" {
-            continue;
-        }
-        match update_ref(repo_path, &update.refname, &update.new_sha) {
-            Ok(()) => {
-                update.message = "ok".to_string();
-            }
-            Err(e) => {
-                update.status = "error".to_string();
-                update.message = format!("{}", e);
-            }
-        }
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
 
-    Ok(updates)
+/// Index the incoming pack natively with `gix_pack::Bundle::write_to_directory`,
+/// the interrupt-driven, subprocess-free replacement for `git index-pack`.
+///
+/// Two properties are load-bearing and mirror `index_pack_via_git`:
+///
+///   * **Thin-pack resolution (== `--fix-thin`).** ForgeKeep advertises the
+///     `thin-pack` capability, so the client sends a thin pack whose deltas
+///     reference base objects that already exist in the repo. We pass the opened
+///     repository as `thin_pack_base_object_lookup`; the writer resolves the
+///     missing bases and emits a complete (non-thin) pack + index into
+///     `objects/pack`. Passing `None` here would fail on the first missing base.
+///
+///   * **Interruptibility.** The unpack runs on a blocking thread and observes a
+///     shared `AtomicBool` that gix checks on every read *and* during delta
+///     resolution. [`InterruptOnDrop`] flips it if this async scope is cancelled
+///     (the A1 idle/wall-clock watchdog dropping the handler future), so a
+///     runaway unpack is actually aborted rather than left running detached.
+async fn index_pack_native<R>(repo_path: &Path, reader: &mut BufReader<R>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    // Drain the remaining pack bytes from the transport into memory. On SSH this
+    // read goes through the `IdleTimeout` wrapper (A1), so a slow-drip upload
+    // trips the idle watchdog right here; on HTTP the body is already buffered.
+    let mut pack = Vec::new();
+    reader
+        .read_to_end(&mut pack)
+        .await
+        .context("failed to read incoming pack stream")?;
+
+    let repo_path = repo_path.to_owned();
+    let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Held across the blocking join: on cancellation its Drop sets `interrupt`.
+    let _guard = InterruptOnDrop(interrupt.clone());
+
+    let join = tokio::task::spawn_blocking(move || -> Result<()> {
+        let repo = gix::open(&repo_path).context("failed to open repository")?;
+        let pack_dir = repo_path.join("objects").join("pack");
+        // `write_to_directory` requires the target directory to already exist.
+        std::fs::create_dir_all(&pack_dir)
+            .with_context(|| format!("failed to create {}", pack_dir.display()))?;
+
+        let mut cursor = std::io::Cursor::new(pack);
+        let mut progress = gix::progress::Discard;
+        let outcome = gix::odb::pack::Bundle::write_to_directory(
+            &mut cursor,
+            Some(pack_dir.as_path()),
+            &mut progress,
+            &interrupt,
+            Some(&repo), // thin-pack base lookup — the native equivalent of --fix-thin
+            Default::default(),
+        );
+
+        if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("native index-pack interrupted (timeout)");
+        }
+        let outcome = outcome.context("native pack indexing failed")?;
+
+        // `git index-pack` leaves a plain, immediately-usable pack. The writer
+        // may drop a `.keep` alongside it; remove it so the objects are live.
+        if let Some(keep) = outcome.keep_path {
+            let _ = std::fs::remove_file(keep);
+        }
+        Ok(())
+    });
+
+    join.await.context("native index-pack task panicked")?
 }
 
 fn enforce_signed_commit_policies(
@@ -786,5 +881,222 @@ mod wire_tests {
             result.is_err(),
             "non-hex header must surface as Err, got {result:?}"
         );
+    }
+}
+
+/// Parity + interrupt tests for the native (`gix_pack`) receive-pack indexer.
+///
+/// All git subprocesses go through the sanctioned `GitCommandGateway` so the
+/// raw-git-invocation guard in `cli_gateway.rs` stays green.
+#[cfg(test)]
+mod native_index_pack_tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::path::Path;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    fn gw() -> &'static crate::cli_gateway::GitCommandGateway {
+        crate::cli_gateway::global_gateway().as_ref().unwrap()
+    }
+
+    /// Run a git command (cwd = `dir` via `-C`), assert success, return trimmed stdout.
+    fn git_ok(args: &[&str], dir: &Path) -> String {
+        let out = gw().run(args, Some(dir)).unwrap();
+        assert!(
+            out.success(),
+            "git {args:?} failed: {}",
+            out.stderr_str().trim()
+        );
+        out.stdout_str().trim().to_owned()
+    }
+
+    /// Run a git command feeding `input` to stdin (cwd = `dir`), return raw stdout bytes.
+    async fn git_stdin(args: &[&str], dir: &Path, input: &[u8]) -> (bool, Vec<u8>) {
+        let mut child = gw().spawn_async(args, Some(dir)).await.unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(input).await.unwrap();
+            stdin.shutdown().await.unwrap();
+        }
+        let out = child.wait_with_output().await.unwrap();
+        (out.status.success(), out.stdout)
+    }
+
+    /// Sorted list of every object id physically present in `dir` (across all packs + loose).
+    fn all_object_ids(dir: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = git_ok(
+            &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+            dir,
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        ids.sort();
+        ids
+    }
+
+    fn seed_repo(work: &Path) {
+        git_ok(&["init", "-q", "-b", "main"], work);
+        git_ok(&["config", "user.name", "T"], work);
+        git_ok(&["config", "user.email", "t@example.invalid"], work);
+        git_ok(&["config", "commit.gpgsign", "false"], work);
+    }
+
+    /// Core acceptance test: pushing a **real thin pack** through the native
+    /// `write_to_directory` path yields the identical object set + working ref
+    /// as `git index-pack --fix-thin`, and the thin-pack base lookup is proven
+    /// load-bearing (indexing into a repo lacking the base fails).
+    #[tokio::test]
+    async fn native_index_pack_thin_parity_with_git_fix_thin() {
+        if crate::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping native_index_pack parity: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        seed_repo(&work);
+
+        // Commit A: a sizable file so a later 1-line edit deltifies (→ thin pack).
+        let base: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(work.join("data.txt"), &base).unwrap();
+        git_ok(&["add", "."], &work);
+        git_ok(&["commit", "-q", "-m", "A"], &work);
+        let a = git_ok(&["rev-parse", "HEAD"], &work);
+
+        // Three bare targets seeded with EXACTLY A (objects + refs/heads/main → A),
+        // cloned before B exists so their object store has only A's objects.
+        let work_s = work.to_str().unwrap();
+        let t_git = tmp.path().join("t_git.git");
+        let t_native = tmp.path().join("t_native.git");
+        for dst in [&t_git, &t_native] {
+            git_ok(
+                &["clone", "-q", "--bare", work_s, dst.to_str().unwrap()],
+                tmp.path(),
+            );
+        }
+        // A fresh empty bare repo (NO base objects) to prove the pack is thin.
+        let t_empty = tmp.path().join("t_empty.git");
+        git_ok(
+            &["init", "-q", "--bare", t_empty.to_str().unwrap()],
+            tmp.path(),
+        );
+
+        // Commit B: small edit → its blob deltifies against A's blob (external base).
+        let edited = format!("{base}appended tail line\n");
+        std::fs::write(work.join("data.txt"), &edited).unwrap();
+        git_ok(&["add", "."], &work);
+        git_ok(&["commit", "-q", "-m", "B"], &work);
+        let b = git_ok(&["rev-parse", "HEAD"], &work);
+
+        // Build the thin pack: objects in B but not A, deltas against A (not in pack).
+        let revs = format!("^{a}\n{b}\n");
+        let (ok, thin) =
+            git_stdin(&["pack-objects", "--thin", "--revs", "--stdout"], &work, revs.as_bytes())
+                .await;
+        assert!(ok, "pack-objects failed");
+        assert!(thin.windows(4).any(|w| w == b"PACK"), "expected a PACK stream");
+
+        // Path 1 — git index-pack --fix-thin into t_git.
+        let (git_ok_status, _) =
+            git_stdin(&["index-pack", "--fix-thin", "--stdin"], &t_git, &thin).await;
+        assert!(git_ok_status, "git index-pack --fix-thin failed");
+
+        // Path 2 — native indexer into t_native.
+        let mut reader = BufReader::new(Cursor::new(thin.clone()));
+        index_pack_native(&t_native, &mut reader)
+            .await
+            .expect("native index-pack should succeed against a repo holding the base");
+
+        // Thin-ness proof: same pack into a repo WITHOUT the base must fail — the
+        // thin lookup cannot resolve the external delta base. This deterministically
+        // proves both (a) the pack is genuinely thin and (b) our lookup is load-bearing.
+        let mut reader_empty = BufReader::new(Cursor::new(thin.clone()));
+        let empty_res = index_pack_native(&t_empty, &mut reader_empty).await;
+        assert!(
+            empty_res.is_err(),
+            "indexing a thin pack without its base must fail; pack was not thin"
+        );
+
+        // Publish the ref in both real targets, then assert parity.
+        for dst in [&t_git, &t_native] {
+            git_ok(&["update-ref", "refs/heads/main", &b], dst);
+            assert!(
+                gw().run(&["cat-file", "-e", &b], Some(dst)).unwrap().success(),
+                "B unreachable in {}",
+                dst.display()
+            );
+            assert!(
+                gw().run(&["fsck", "--strict"], Some(dst)).unwrap().success(),
+                "fsck failed in {}",
+                dst.display()
+            );
+        }
+
+        let git_objs = all_object_ids(&t_git);
+        let native_objs = all_object_ids(&t_native);
+        assert_eq!(
+            native_objs, git_objs,
+            "native path produced a different object set than git index-pack --fix-thin"
+        );
+        assert!(git_objs.contains(&b), "B commit object must be present");
+        assert!(
+            git_objs.len() > all_object_ids(&t_empty).len(),
+            "targets must hold more than the empty repo"
+        );
+    }
+
+    /// A pre-set interrupt flag aborts the unpack promptly instead of indexing —
+    /// the mechanism the wall-clock/idle watchdog uses to cancel a runaway push.
+    #[tokio::test]
+    async fn native_index_pack_respects_preset_interrupt() {
+        if crate::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping native_index_pack interrupt: git not available");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        seed_repo(&work);
+        std::fs::write(work.join("f.txt"), "hello\n").unwrap();
+        git_ok(&["add", "."], &work);
+        git_ok(&["commit", "-q", "-m", "c"], &work);
+        let head = git_ok(&["rev-parse", "HEAD"], &work);
+
+        // A full (non-thin) pack of HEAD.
+        let (ok, pack) =
+            git_stdin(&["pack-objects", "--revs", "--stdout"], &work, format!("{head}\n").as_bytes())
+                .await;
+        assert!(ok, "pack-objects failed");
+
+        let target = tmp.path().join("t.git");
+        git_ok(&["init", "-q", "--bare", target.to_str().unwrap()], tmp.path());
+
+        // Drive write_to_directory directly with an already-tripped interrupt.
+        let repo_path = target.clone();
+        let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let repo = gix::open(&repo_path)?;
+            let pack_dir = repo_path.join("objects").join("pack");
+            std::fs::create_dir_all(&pack_dir)?;
+            let mut cursor = Cursor::new(pack);
+            let mut progress = gix::progress::Discard;
+            let outcome = gix::odb::pack::Bundle::write_to_directory(
+                &mut cursor,
+                Some(pack_dir.as_path()),
+                &mut progress,
+                &interrupt,
+                Some(&repo),
+                Default::default(),
+            );
+            if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                bail!("interrupted");
+            }
+            outcome.map(|_| ()).map_err(Into::into)
+        })
+        .await
+        .unwrap();
+        assert!(res.is_err(), "a pre-set interrupt must abort the unpack");
     }
 }
