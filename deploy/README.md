@@ -131,15 +131,21 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 ### Git Metrics
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `git_operations_total` | Counter | operation | clone/push/pull count |
-| `git_operation_duration_seconds` | Histogram | - | Git op duration |
+| `git_operations_total` | Counter | operation (`fetch`\|`push`) | Authorized upload-pack/receive-pack count |
+| `git_operation_duration_seconds` | Histogram | - | Git op duration (fetch + push) |
 
 ### CI/CD Metrics
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ci_pipelines_total` | Counter | status | Pipeline count by status |
-| `ci_jobs_total` | Counter | status | Job count by status |
+| `ci_pipelines_total` | Counter | status | Pipeline count by terminal status |
+| `ci_jobs_total` | Counter | status | Job count by outcome (success/failure/error) |
 | `ci_jobs_running` | Gauge | - | Currently running jobs |
+| `ci_job_duration_seconds` | Histogram | - | Job execution duration (runner start→finish) |
+
+> **Note — not-yet-emitted metrics.** The Database, Business, and Security
+> metric families below are *registered* (they appear in `/metrics` at zero) but
+> the emit side is not yet wired into the code, so their panels/alerts stay flat
+> until that lands. HTTP, rate-limit, Git, and CI/CD metrics above are live.
 
 ### Business Metrics (Phase 22-C)
 | Metric | Type | Description |
@@ -170,12 +176,39 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 - **HighDatabaseQPS**: > 1000 QPS for 5+ minutes (info)
 
 ### Git Alerts
-- **SlowGitClone**: P95 clone > 30s for 15+ minutes (warning)
+- **SlowGitFetch**: P95 git op > 30s for 15+ minutes (warning)
 - **HighGitOperationFailure**: Git 5xx > 0.1 req/s (critical)
 
 ### CI/CD Alerts
 - **HighPipelineFailureRate**: > 30% failure for 30+ minutes (warning)
 - **CIJobQueueBuildup**: > 50 jobs running for 15+ minutes (warning)
+
+## 🔭 Distributed Tracing (OpenTelemetry)
+
+Beyond Prometheus metrics, ForgeKeep can export **distributed traces** over
+OTLP/HTTP (protobuf) to any OpenTelemetry collector (Tempo, Jaeger, the OTel
+Collector, Honeycomb, …). Tracing is **opt-in** and independent of `/metrics`.
+
+Enable it via `[observability]` in `forgekeep.toml` or the standard env vars:
+
+```toml
+[observability]
+otlp_endpoint = "http://localhost:4318"   # /v1/traces is appended automatically
+# service_name = "forgekeep"
+# sample_ratio = 1.0                       # 0.0..=1.0 head sampling
+```
+
+```bash
+# Equivalent via the standard OpenTelemetry environment variables:
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
+export OTEL_SERVICE_NAME="forgekeep"
+```
+
+With no endpoint configured, none of the tracing machinery runs. When enabled,
+each HTTP request produces an `http_request` span (method, uri, status,
+request_id) plus any nested `tracing` spans, and the W3C `traceparent` header is
+honoured so traces stitch across services. Spans are batched on a background
+thread and flushed on graceful shutdown.
 
 ### Health Alerts
 - **ForgeKeepDown**: Target down for 2+ minutes (critical, pages on-call)

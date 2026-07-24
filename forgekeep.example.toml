@@ -69,3 +69,19 @@ archive_dir = "./data/audit-archive"
 archive_after_days = 90
 interval_minutes = 60
 batch_size = 1000
+
+[observability]
+# OpenTelemetry distributed tracing (OTLP/HTTP export). Prometheus metrics at
+# /metrics are always on and independent of this section — these knobs only add
+# *traces*. Leave otlp_endpoint unset to keep tracing off (zero overhead).
+#
+# OTLP/HTTP endpoint of your collector. The "/v1/traces" path is appended
+# automatically, so the base URL is enough. Overridden by the standard
+# OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_TRACES_ENDPOINT env vars.
+# otlp_endpoint = "http://localhost:4318"
+# service.name resource attribute reported to the collector (default "forgekeep").
+# Overridden by OTEL_SERVICE_NAME.
+# service_name = "forgekeep"
+# Head sampling ratio in 0.0..=1.0 (default 1.0 = record every trace). Lower it
+# on a busy instance to reduce export volume, e.g. 0.1 = sample 10%.
+# sample_ratio = 1.0

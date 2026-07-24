@@ -5,9 +5,9 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use tracing_subscriber::EnvFilter;
 
 use crate::admin::validate_jwt_secret;
+use crate::telemetry;
 
 /// TOML configuration file structure.
 #[derive(Debug, serde::Deserialize)]
@@ -38,6 +38,8 @@ struct ConfigFile {
     timeouts: TimeoutConfig,
     #[serde(default)]
     webhooks: WebhooksConfig,
+    #[serde(default)]
+    observability: ObservabilityConfig,
     /// Server external URL (e.g., "https://git.example.com"). Used for SSO callbacks.
     #[serde(default)]
     external_url: Option<String>,
@@ -132,6 +134,23 @@ struct AuditConfig {
     archive_after_days: Option<i64>,
     interval_minutes: Option<u64>,
     batch_size: Option<u64>,
+}
+
+/// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
+/// fields optional; with no endpoint set (here or via the `OTEL_EXPORTER_OTLP_*`
+/// env vars) OTel tracing stays off and only Prometheus `/metrics` + logs run.
+#[derive(Debug, serde::Deserialize, Default)]
+#[allow(dead_code)]
+struct ObservabilityConfig {
+    /// OTLP/HTTP endpoint, e.g. "http://localhost:4318" (the `/v1/traces` path is
+    /// appended automatically). Overridden by `OTEL_EXPORTER_OTLP_ENDPOINT` /
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. Unset ⇒ tracing disabled.
+    otlp_endpoint: Option<String>,
+    /// `service.name` resource attribute (default "forgekeep"). Overridden by
+    /// `OTEL_SERVICE_NAME`.
+    service_name: Option<String>,
+    /// Head sampling ratio in 0.0..=1.0 (default 1.0 = sample every trace).
+    sample_ratio: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -536,40 +555,51 @@ pub(crate) async fn run_serve(
         resolved_rate_limit_auth_window,
     )?;
 
-    // ── Initialize logging ─────────────────────────────────────
+    // ── Initialize logging + tracing ───────────────────────────
+    // Build the log writer (rolling file or stdout), then let `telemetry::init`
+    // compose the fmt layer with an optional OTLP export layer. The returned
+    // guard owns the non-blocking appender worker and the OTLP tracer provider;
+    // it is flushed on shutdown at the end of this function.
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    let (log_writer, appender_guard): (BoxMakeWriter, Option<tracing_appender::non_blocking::WorkerGuard>) =
+        if let Some(ref log_path) = resolved_log_file {
+            let log_dir = std::path::Path::new(log_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let log_prefix = std::path::Path::new(log_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("forgekeep");
+            let log_suffix = std::path::Path::new(log_path)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("log");
+
+            let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(log_prefix)
+                .filename_suffix(log_suffix)
+                .max_log_files(resolved_log_max_files)
+                .build(log_dir)
+                .map_err(|e| anyhow::anyhow!("failed to create log appender: {}", e))?;
+
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            (BoxMakeWriter::new(non_blocking), Some(guard))
+        } else {
+            (BoxMakeWriter::new(std::io::stdout), None)
+        };
+
+    let otel_config = telemetry::resolve_otel_config(
+        cfg.as_ref()
+            .and_then(|c| c.observability.otlp_endpoint.clone()),
+        cfg.as_ref()
+            .and_then(|c| c.observability.service_name.clone()),
+        cfg.as_ref().and_then(|c| c.observability.sample_ratio),
+    );
+
+    let telemetry_guard = telemetry::init(log_writer, appender_guard, otel_config)?;
+
     if let Some(ref log_path) = resolved_log_file {
-        let log_dir = std::path::Path::new(log_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let log_prefix = std::path::Path::new(log_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("forgekeep");
-        let log_suffix = std::path::Path::new(log_path)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("log");
-
-        let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix(log_prefix)
-            .filename_suffix(log_suffix)
-            .max_log_files(resolved_log_max_files)
-            .build(log_dir)
-            .map_err(|e| anyhow::anyhow!("failed to create log appender: {}", e))?;
-
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
-            .with_target(false)
-            .with_writer(non_blocking)
-            .init();
-
-        std::mem::forget(_guard);
-
         tracing::info!(file = %log_path, "Logging to file with rotation");
         if resolved_log_max_size_mb != 10 {
             tracing::warn!(
@@ -577,13 +607,6 @@ pub(crate) async fn run_serve(
                 "log_max_size_mb is not enforced: the file appender rotates daily (not by size). Use log_max_files to cap the number of retained files."
             );
         }
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
-            .with_target(false)
-            .init();
     }
 
     let repo_root = PathBuf::from(&resolved_repo_root);
@@ -764,6 +787,10 @@ pub(crate) async fn run_serve(
     if let Err(e) = http_handle.await {
         tracing::error!("HTTP server task terminated: {:#}", e);
     }
+
+    // Flush the OTLP exporter (and the non-blocking log appender) before exit so
+    // the final batch of spans reaches the collector.
+    telemetry_guard.shutdown();
 
     Ok(())
 }

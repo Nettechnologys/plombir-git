@@ -76,17 +76,20 @@ groups:
   - name: forgekeep_git
     interval: 30s
     rules:
-      # Slow Git clone
-      - alert: SlowGitClone
+      # Slow Git fetch/clone/pull (upload-pack). The server emits the "fetch"
+      # operation label for all upload-pack traffic (clone and incremental
+      # fetch are indistinguishable at the wire protocol); "push" covers
+      # receive-pack.
+      - alert: SlowGitFetch
         expr: |
-          histogram_quantile(0.95, sum by (le) (rate(git_operation_duration_seconds_bucket{operation="clone"}[5m])))
+          histogram_quantile(0.95, sum by (le) (rate(git_operation_duration_seconds_bucket[5m])))
             > 30
         for: 15m
         labels:
           severity: warning
           service: forgekeep
         annotations:
-          summary: "P95 git clone latency exceeds 30s"
+          summary: "P95 git operation latency exceeds 30s"
           description: "P95 = {{ $value }}s. Check disk I/O and pack file access."
 
       # Git operation failures (approximation via HTTP 5xx on /git/*)

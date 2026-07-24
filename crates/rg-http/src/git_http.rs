@@ -17,6 +17,31 @@ use rg_core::branch_protection::push_rules::{
 use crate::pat_auth::extract_actor_id;
 use crate::{git_v2, ws, AppState};
 
+/// RAII timer that records a Git transport operation into the Prometheus
+/// metrics on drop — so every return path of the (branch-heavy) pack handlers
+/// is covered by a single construction site. Created only *after* the access
+/// check passes, so unauthorized / 404 attempts are not counted as operations;
+/// a timed-out or errored transfer still records (a slow push is real signal).
+struct GitOpTimer {
+    operation: &'static str,
+    start: std::time::Instant,
+}
+
+impl GitOpTimer {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            operation,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for GitOpTimer {
+    fn drop(&mut self) {
+        crate::metrics::recorder::git_operation(self.operation, self.start.elapsed());
+    }
+}
+
 /// Wall-clock guard around a streaming git protocol handler.
 ///
 /// The protocol handlers (`handle_upload_pack_http`, `handle_v2_http`,
@@ -513,6 +538,9 @@ pub(crate) async fn handle_git_upload_pack(
         return (resp.0, resp.1, Body::from(resp.2)).into_response();
     }
 
+    // Record fetch/clone/pull duration + count across every return path below.
+    let _op_timer = GitOpTimer::new("fetch");
+
     // Check if client wants Protocol V2
     let wants_v2 = git_v2::wants_protocol_v2(&headers);
 
@@ -704,6 +732,9 @@ pub(crate) async fn handle_git_receive_pack(
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, true).await {
         return (resp.0, resp.1, Body::from(resp.2));
     }
+
+    // Record push duration + count across every return path below.
+    let _op_timer = GitOpTimer::new("push");
 
     let repo_model = match find_repo_by_name(&state.db, &owner, &repo).await {
         Ok(Some(repo_model)) => repo_model,

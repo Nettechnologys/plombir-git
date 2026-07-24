@@ -484,6 +484,9 @@ pub async fn start_job(
         return AppError::from(e).into_response();
     }
 
+    // Metrics: a job is now executing on a runner.
+    crate::metrics::recorder::ci_job_started();
+
     // Mark runner as busy
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "busy").await {
         tracing::error!(runner_id, error = %e, "Failed to mark runner as busy");
@@ -1029,6 +1032,13 @@ pub async fn finish_job(
         return AppError::from(e).into_response();
     }
 
+    // Metrics: job left the running set — count its outcome and, if we know when
+    // it started, its execution duration.
+    let job_duration = job.started_at.and_then(|started| {
+        (chrono::Utc::now().naive_utc() - started).to_std().ok()
+    });
+    crate::metrics::recorder::ci_job_finished(&req.status, job_duration);
+
     // Mark runner as online (ready for next job)
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "online").await {
         tracing::error!(runner_id, error = %e, "Failed to mark runner as online");
@@ -1044,42 +1054,48 @@ pub async fn finish_job(
         {
             match rg_db::ops::pipeline_ops::try_update_pipeline(&state.db, stage.pipeline_id).await
             {
-                Ok(Some(status)) if status == "success" => {
-                    if let Ok(Some(pipeline)) =
-                        rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id).await
-                    {
-                        if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
-                            &state.db,
-                            &state.repo_root,
-                            pipeline.repo_id,
-                            &pipeline.commit_sha,
-                        )
-                        .await
+                Ok(Some(status)) => {
+                    // Metrics: the pipeline reached a terminal status.
+                    crate::metrics::recorder::ci_pipeline_finished(&status);
+                    if status == "success" {
+                        if let Ok(Some(pipeline)) =
+                            rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
+                                .await
                         {
-                            tracing::warn!(pipeline_id = pipeline.id, %error, "auto-merge evaluation after CI failed");
-                        }
-                        if let Err(error) =
-                            rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-                                &state.db,
-                                &state.repo_root,
-                                pipeline.repo_id,
-                                &pipeline.commit_sha,
-                                &rg_core::pull_request::merge_queue::MergeQueueCi {
-                                    trigger: &*state.ci_engine,
-                                    docker_enabled: state.docker_enabled,
-                                    external_runners: state.external_runners,
-                                    allow_host_runner: state.allow_host_runner,
-                                    jwt_secret: Some(&state.jwt_secret),
-                                    external_url: state.external_url.as_deref(),
-                                },
-                            )
-                            .await
-                        {
-                            tracing::warn!(pipeline_id = pipeline.id, %error, "merge queue evaluation after CI failed");
+                            if let Err(error) =
+                                rg_core::pull_request::try_auto_merges_for_head_commit(
+                                    &state.db,
+                                    &state.repo_root,
+                                    pipeline.repo_id,
+                                    &pipeline.commit_sha,
+                                )
+                                .await
+                            {
+                                tracing::warn!(pipeline_id = pipeline.id, %error, "auto-merge evaluation after CI failed");
+                            }
+                            if let Err(error) =
+                                rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
+                                    &state.db,
+                                    &state.repo_root,
+                                    pipeline.repo_id,
+                                    &pipeline.commit_sha,
+                                    &rg_core::pull_request::merge_queue::MergeQueueCi {
+                                        trigger: &*state.ci_engine,
+                                        docker_enabled: state.docker_enabled,
+                                        external_runners: state.external_runners,
+                                        allow_host_runner: state.allow_host_runner,
+                                        jwt_secret: Some(&state.jwt_secret),
+                                        external_url: state.external_url.as_deref(),
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(pipeline_id = pipeline.id, %error, "merge queue evaluation after CI failed");
+                            }
                         }
                     }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(pipeline_id = stage.pipeline_id, error = %e, "Failed to update pipeline after stage completion");
                 }

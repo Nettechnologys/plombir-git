@@ -142,7 +142,7 @@ pub mod git {
 
 /// CI/CD metrics.
 pub mod ci {
-    use prometheus::{IntCounterVec, IntGauge, Opts, Registry};
+    use prometheus::{Histogram, HistogramOpts, IntCounterVec, IntGauge, Opts, Registry};
     use std::sync::OnceLock;
 
     /// Counter: total CI pipelines by status.
@@ -153,6 +153,10 @@ pub mod ci {
 
     /// Gauge: current running jobs.
     pub static JOBS_RUNNING: OnceLock<IntGauge> = OnceLock::new();
+
+    /// Histogram: CI job execution duration (seconds), from runner start to
+    /// finish.
+    pub static JOB_DURATION: OnceLock<Histogram> = OnceLock::new();
 
     /// Register all CI metrics with the registry.
     pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
@@ -180,6 +184,20 @@ pub mod ci {
             .set(jobs_running.clone())
             .map_err(|_| prometheus::Error::Msg("JOBS_RUNNING already set".into()))?;
         registry.register(Box::new(jobs_running))?;
+
+        let job_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "ci_job_duration_seconds",
+                "CI job execution duration in seconds",
+            )
+            .buckets(vec![
+                1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+            ]),
+        )?;
+        JOB_DURATION
+            .set(job_duration.clone())
+            .map_err(|_| prometheus::Error::Msg("JOB_DURATION already set".into()))?;
+        registry.register(Box::new(job_duration))?;
 
         Ok(())
     }
@@ -400,7 +418,51 @@ pub mod business {
 
 /// Helper: record a business event without exposing Prometheus types to callers.
 pub mod recorder {
-    use super::business;
+    use super::{business, ci, git};
+    use std::time::Duration;
+
+    /// Record a completed Git transport operation (label: "fetch" for
+    /// upload-pack / clone / pull, "push" for receive-pack). Increments the
+    /// per-operation counter and observes its duration.
+    pub fn git_operation(operation: &str, duration: Duration) {
+        if let Some(c) = git::OPERATION_COUNT.get() {
+            c.with_label_values(&[operation]).inc();
+        }
+        if let Some(h) = git::OPERATION_DURATION.get() {
+            h.observe(duration.as_secs_f64());
+        }
+    }
+
+    /// Record that a CI job started executing on a runner (bumps the
+    /// currently-running gauge).
+    pub fn ci_job_started() {
+        if let Some(g) = ci::JOBS_RUNNING.get() {
+            g.inc();
+        }
+    }
+
+    /// Record that a CI job finished: decrements the running gauge, counts the
+    /// outcome by status (e.g. "success" / "failure" / "error"), and — when a
+    /// start time is known — observes the execution duration.
+    pub fn ci_job_finished(status: &str, duration: Option<Duration>) {
+        if let Some(g) = ci::JOBS_RUNNING.get() {
+            g.dec();
+        }
+        if let Some(c) = ci::JOB_COUNT.get() {
+            c.with_label_values(&[status]).inc();
+        }
+        if let (Some(h), Some(d)) = (ci::JOB_DURATION.get(), duration) {
+            h.observe(d.as_secs_f64());
+        }
+    }
+
+    /// Record that a CI pipeline reached a terminal status (e.g. "success" /
+    /// "failed").
+    pub fn ci_pipeline_finished(status: &str) {
+        if let Some(c) = ci::PIPELINE_COUNT.get() {
+            c.with_label_values(&[status]).inc();
+        }
+    }
 
     /// Record a user registration.
     pub fn user_registered() {

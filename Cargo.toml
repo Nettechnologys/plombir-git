@@ -117,6 +117,22 @@ toml = "0.8"
 # Log rotation
 tracing-appender = "0.2"
 
+# OpenTelemetry — distributed tracing exported over OTLP/HTTP. The exporter uses
+# the blocking reqwest client with rustls (no OpenSSL, matching the rest of the
+# tree) and the thread-based batch span processor, so no extra tokio runtime is
+# needed. Traces are opt-in (see `[observability]` in the config); with no OTLP
+# endpoint set, none of this machinery runs. tracing-opentelemetry 0.33 pins
+# opentelemetry 0.32 — keep the four crates on the same release train on bump.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+] }
+tracing-opentelemetry = "0.33"
+
 # Git library (replacing git CLI)
 gix = { version = "0.84", features = [
     "blocking-http-transport-curl",

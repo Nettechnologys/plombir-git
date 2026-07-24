@@ -12,6 +12,7 @@ mod cli;
 mod commands;
 mod runner;
 mod serve;
+mod telemetry;
 
 use clap::Parser;
 

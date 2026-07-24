@@ -462,6 +462,15 @@ async fn run_runner_watchdog(
                     );
                     if let Err(e) = rg_db::ops::pipeline_ops::reset_stuck_job(&db, job_id).await {
                         tracing::error!(job_id, error = %e, "Failed to reset stuck job");
+                    } else if job.status == "running" {
+                        // Settle the ci_jobs_running gauge: a running job was
+                        // counted at start_job, but this watchdog reset returns
+                        // it to pending without ever hitting finish_job, so
+                        // decrement here and count the timeout outcome.
+                        // (Best-effort: the offline-runner bulk reset in
+                        // `reset_runner_jobs` is not itemised, so its running
+                        // jobs are not settled here.)
+                        crate::metrics::recorder::ci_job_finished("timeout", None);
                     }
                 }
                 if !stuck.is_empty() {
