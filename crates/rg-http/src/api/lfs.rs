@@ -300,7 +300,7 @@ pub async fn download_object(
             }
         }
         Ok(rg_core::lfs::service::LfsObjectSource::Bytes { data, compressed }) => {
-            respond_with_lfs_bytes(data, compressed)
+            respond_with_lfs_bytes(data, compressed, state.git_idle_timeout_secs)
         }
         Err(e) => (
             StatusCode::NOT_FOUND,
@@ -430,7 +430,19 @@ async fn stream_uncompressed_lfs_object(file_path: &std::path::Path) -> axum::re
 }
 
 /// Build the response for an in-memory LFS object, decompressing if needed.
-fn respond_with_lfs_bytes(data: Vec<u8>, compressed: bool) -> axum::response::Response {
+///
+/// This is the **remote (non-local) blob-backend** branch: `read_object_source`
+/// hands back the whole object as a `Vec` (the local-path branch above streams
+/// from disk instead). LFS objects can be very large, so the finished buffer is
+/// served as a backpressure-sensitive, idle-guarded stream rather than a single
+/// in-memory frame a slow/stalled client can pin until the kernel resets the
+/// dead connection (card_444e03f1ca15). `Content-Length` lets clients spot an
+/// idle-aborted short read.
+fn respond_with_lfs_bytes(
+    data: Vec<u8>,
+    compressed: bool,
+    idle_secs: u64,
+) -> axum::response::Response {
     let body = if compressed {
         match zstd::stream::decode_all(std::io::Cursor::new(data)) {
             Ok(decoded) => decoded,
@@ -439,10 +451,14 @@ fn respond_with_lfs_bytes(data: Vec<u8>, compressed: bool) -> axum::response::Re
     } else {
         data
     };
+    let len = body.len();
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        body,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CONTENT_LENGTH, len.to_string().as_str()),
+        ],
+        crate::http_stream::buffered_body_with_idle(body, idle_secs),
     )
         .into_response()
 }

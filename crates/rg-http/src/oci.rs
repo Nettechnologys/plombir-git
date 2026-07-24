@@ -824,16 +824,25 @@ pub async fn get_blob(
             ),
         },
         Ok(None) => match state.oci_storage.read_blob(&owner, &repo, &digest).await {
-            Ok(data) => (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/octet-stream"),
-                    (header::CONTENT_LENGTH, data.len().to_string().as_str()),
-                    (DOCKER_CONTENT_DIGEST, digest.as_str()),
-                ],
-                data,
-            )
-                .into_response(),
+            Ok(data) => {
+                // Remote (non-local) OCI storage returns the whole blob as a
+                // `Vec`; the local-path branch above already streams from disk.
+                // Serve the buffer as a backpressure-sensitive, idle-guarded
+                // stream so a slow/stalled client can't pin the blob-sized `Vec`
+                // in server memory until the kernel resets the dead connection
+                // (card_444e03f1ca15).
+                let len = data.len();
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream"),
+                        (header::CONTENT_LENGTH, len.to_string().as_str()),
+                        (DOCKER_CONTENT_DIGEST, digest.as_str()),
+                    ],
+                    crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
+                )
+                    .into_response()
+            }
             Err(_) => oci_not_found(error_codes::BLOB_UNKNOWN, "blob not found"),
         },
         Err(error) => oci_err(

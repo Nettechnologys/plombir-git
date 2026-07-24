@@ -508,7 +508,16 @@ async fn stream_attachment(
         let stream = ReaderStream::new(file);
         Response::new(Body::from_stream(stream))
     } else {
-        Response::new(Body::from(state.blob_storage.get(&key).await?))
+        // Remote (non-local) blob backend returns the whole attachment as a
+        // `Vec`; the local-path branch above streams from disk. Serve the buffer
+        // as a backpressure-sensitive, idle-guarded stream so a slow/stalled
+        // client can't pin the attachment-sized `Vec` in server memory until the
+        // kernel resets the dead connection (card_444e03f1ca15).
+        let data = state.blob_storage.get(&key).await?;
+        Response::new(crate::http_stream::buffered_body_with_idle(
+            data,
+            state.git_idle_timeout_secs,
+        ))
     };
     rg_db::ops::attachment_ops::increment_download_count(&state.db, attachment.id).await?;
 

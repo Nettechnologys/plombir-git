@@ -652,18 +652,31 @@ pub async fn download_file(
     )
     .await
     {
-        Ok((data, content_type, _size)) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, content_type),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", filename),
-                ),
-            ],
-            data,
-        )
-            .into_response(),
+        Ok((data, content_type, _size)) => {
+            // The whole package file is buffered in memory (`read_file` returns a
+            // `Vec` — there is no local-path streaming branch, so unlike the
+            // LFS/OCI/attachment handlers this fires even in the default on-disk
+            // config). Serve it as a backpressure-sensitive, idle-guarded stream
+            // instead of a single `Body::from` frame a slow/stalled client can pin
+            // in server memory until the kernel resets the dead connection — the
+            // same download-side slow-drip class as the artifact/cache/release
+            // handlers (card_444e03f1ca15). `Content-Length` lets clients spot an
+            // idle-aborted short read.
+            let len = data.len();
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{}\"", filename),
+                    ),
+                    (header::CONTENT_LENGTH, len.to_string()),
+                ],
+                crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
+            )
+                .into_response()
+        }
         Err(e) => err(StatusCode::NOT_FOUND, &format!("{e:#}")),
     }
 }
