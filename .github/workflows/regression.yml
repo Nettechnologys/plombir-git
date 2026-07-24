@@ -71,6 +71,29 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
+      # OSV/GHSA advisory scan — closes the RustSec-vs-OSV source-coverage gap.
+      # cargo-audit/deny only see the RustSec DB; some advisories are GHSA/OSV-only
+      # (e.g. jsonwebtoken CVE-2026-25537 / GHSA-h395-gr6q-cpjc, openssl 0.10.x
+      # memory-safety fixes) and slip past the RustSec gate entirely. This step
+      # runs osv-scanner against Cargo.lock so those surface in CI.
+      #
+      # Informational for now (continue-on-error): the live OSV DB may flag
+      # OSV-only advisories across the transitive tree that haven't been triaged
+      # yet, and a hard fail would block unrelated PRs. Once the full OSV finding
+      # set is triaged (ignore-list where justified, no-fix documented), drop
+      # continue-on-error to promote this to a blocking gate.
+      - name: Install osv-scanner
+        continue-on-error: true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: osv-scanner
+
+      - name: osv-scanner (OSV/GHSA advisories, informational)
+        continue-on-error: true
+        run: |
+          osv-scanner scan --lockfile=Cargo.lock \
+            || osv-scanner --lockfile=Cargo.lock
+
   git-protocol:
     name: Real Git client protocol matrix
     runs-on: ubuntu-latest
