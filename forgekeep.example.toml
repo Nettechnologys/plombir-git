@@ -1,5 +1,10 @@
 # ForgeKeep Configuration File
-# Copy this to forgekeep.toml and customize for your deployment.
+# Copy this to forgekeep.toml and customize for your deployment, then start the
+# server with `forgekeep serve --config forgekeep.toml`.
+#
+# Precedence: CLI arg > this file > built-in default. A key you leave commented
+# out falls through to the default; a flag passed on the command line overrides
+# whatever this file says.
 
 [server]
 repo_root = "./repos"

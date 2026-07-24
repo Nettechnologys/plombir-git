@@ -101,7 +101,7 @@ Common `serve` flags:
 | `--host-key` | SSH host key path | — |
 | `--db-url` | `sqlite://` / `postgres://` / `mysql://` URL | `sqlite://./forgekeep.db?mode=rwc` |
 | `--jwt-secret` | JWT signing key (use a long random value) | — |
-| `--config` | TOML config file (overrides CLI defaults) | — |
+| `--config` | TOML config file; a flag you pass wins over its config key | — |
 | `--tls-cert` / `--tls-key` | PEM cert/key to enable HTTPS | — |
 | `--docker` | Run CI jobs with an `image` in Docker | `false` |
 | `--external-runners` | Use external runners instead of the embedded one | `false` |
@@ -110,7 +110,10 @@ Common `serve` flags:
 | `--log-file` / `--log-max-files` | Enable rotating file logs | — / `5` |
 
 Prefer a config file? Copy `forgekeep.example.toml` to `forgekeep.toml`, edit
-it, and pass `--config forgekeep.toml`.
+it, and pass `--config forgekeep.toml`. Every flag in the table above has a
+config-file equivalent (named in `forgekeep serve --help`), and values resolve
+as **CLI arg > config file > built-in default** — so a config-only deployment
+needs no flags at all.
 
 ### Create a test repository
 

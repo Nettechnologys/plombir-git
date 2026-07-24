@@ -45,8 +45,12 @@ struct ConfigFile {
     external_url: Option<String>,
 }
 
+// No `#[allow(dead_code)]` here on purpose: every field below must actually be
+// consumed by `resolve_settings` / `run_serve`. If a key is added to the struct
+// (and to `forgekeep.example.toml`) but never wired up, the dead-code lint says
+// so at build time instead of the operator finding out that their setting is
+// silently ignored.
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
 struct ServerConfig {
     repo_root: Option<String>,
     http_addr: Option<String>,
@@ -60,7 +64,6 @@ struct ServerConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
 struct DatabaseConfig {
     url: Option<String>,
 }
@@ -392,23 +395,122 @@ fn validate_numeric_ranges(
     Ok(())
 }
 
-/// Initialise and run the ForgeKeep server (HTTP + SSH).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_serve(
+/// Built-in defaults for the settings that exist both as a CLI flag and as a
+/// config-file key. They live here rather than in clap's `default_value` on
+/// purpose: a clap default is indistinguishable from a value the operator
+/// typed, so with one the config file could never win over "the flag was not
+/// passed" — which is exactly why `[server].repo_root` and `[database].url`
+/// were silently ignored for every `forgekeep serve --config …` deployment.
+const DEFAULT_REPO_ROOT: &str = "./repos";
+const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
+const DEFAULT_SSH_ADDR: &str = "0.0.0.0:2222";
+const DEFAULT_DB_URL: &str = "sqlite://./forgekeep.db?mode=rwc";
+const DEFAULT_SMTP_PORT: u16 = 587;
+const DEFAULT_RATE_LIMIT_MAX: u32 = 0;
+const DEFAULT_RATE_LIMIT_WINDOW: u64 = 60;
+const DEFAULT_LOG_MAX_SIZE_MB: u64 = 10;
+const DEFAULT_LOG_MAX_FILES: usize = 5;
+
+/// The CLI half of every dual-source knob, resolved against the config file by
+/// [`resolve_settings`]. `None` means "flag not passed" — never a default.
+#[derive(Debug, Default)]
+struct CliSettings {
+    repo_root: Option<String>,
+    http_addr: Option<String>,
+    ssh_addr: Option<String>,
+    host_key: Option<String>,
+    db_url: Option<String>,
+    rate_limit_max: Option<u32>,
+    rate_limit_window: Option<u64>,
+    smtp_port: Option<u16>,
+    log_max_size_mb: Option<u64>,
+    log_max_files: Option<usize>,
+}
+
+/// The same knobs after `CLI arg > config file > built-in default` has been
+/// applied.
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedSettings {
     repo_root: String,
     http_addr: String,
     ssh_addr: String,
     host_key: Option<String>,
     db_url: String,
+    rate_limit_max: u32,
+    rate_limit_window: u64,
+    smtp_port: u16,
+    log_max_size_mb: u64,
+    log_max_files: usize,
+}
+
+/// Apply the documented `CLI arg > config file > built-in default` precedence
+/// to every setting that has both a flag and a config key.
+///
+/// Extracted as a pure function so the wiring (which config key feeds which
+/// flag) is unit-testable without booting a server — the original bug was a
+/// missing wire, not a bad value.
+fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> ResolvedSettings {
+    let server = cfg.map(|c| &c.server);
+    ResolvedSettings {
+        repo_root: cli
+            .repo_root
+            .or_else(|| server.and_then(|s| s.repo_root.clone()))
+            .unwrap_or_else(|| DEFAULT_REPO_ROOT.to_string()),
+        http_addr: cli
+            .http_addr
+            .or_else(|| server.and_then(|s| s.http_addr.clone()))
+            .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string()),
+        ssh_addr: cli
+            .ssh_addr
+            .or_else(|| server.and_then(|s| s.ssh_addr.clone()))
+            .unwrap_or_else(|| DEFAULT_SSH_ADDR.to_string()),
+        host_key: cli
+            .host_key
+            .or_else(|| server.and_then(|s| s.host_key.clone())),
+        db_url: cli
+            .db_url
+            .or_else(|| cfg.and_then(|c| c.database.url.clone()))
+            .unwrap_or_else(|| DEFAULT_DB_URL.to_string()),
+        rate_limit_max: cli
+            .rate_limit_max
+            .or_else(|| cfg.and_then(|c| c.rate_limit.max))
+            .unwrap_or(DEFAULT_RATE_LIMIT_MAX),
+        rate_limit_window: cli
+            .rate_limit_window
+            .or_else(|| cfg.and_then(|c| c.rate_limit.window_secs))
+            .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW),
+        smtp_port: cli
+            .smtp_port
+            .or_else(|| cfg.and_then(|c| c.smtp.port))
+            .unwrap_or(DEFAULT_SMTP_PORT),
+        log_max_size_mb: cli
+            .log_max_size_mb
+            .or_else(|| cfg.and_then(|c| c.logging.max_size_mb))
+            .unwrap_or(DEFAULT_LOG_MAX_SIZE_MB),
+        log_max_files: cli
+            .log_max_files
+            .or_else(|| cfg.and_then(|c| c.logging.max_files))
+            .unwrap_or(DEFAULT_LOG_MAX_FILES),
+    }
+}
+
+/// Initialise and run the ForgeKeep server (HTTP + SSH).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_serve(
+    repo_root: Option<String>,
+    http_addr: Option<String>,
+    ssh_addr: Option<String>,
+    host_key: Option<String>,
+    db_url: Option<String>,
     jwt_secret: Option<String>,
     docker: bool,
     external_runners: bool,
     allow_host_runner: bool,
-    rate_limit_max: u32,
-    rate_limit_window: u64,
+    rate_limit_max: Option<u32>,
+    rate_limit_window: Option<u64>,
     rate_limit_trusted_proxies: Vec<String>,
     smtp_host: Option<String>,
-    smtp_port: u16,
+    smtp_port: Option<u16>,
     smtp_user: Option<String>,
     smtp_pass: Option<String>,
     smtp_from: Option<String>,
@@ -416,8 +518,8 @@ pub(crate) async fn run_serve(
     tls_key: Option<String>,
     config: Option<String>,
     log_file: Option<String>,
-    log_max_size_mb: u64,
-    log_max_files: usize,
+    log_max_size_mb: Option<u64>,
+    log_max_files: Option<usize>,
 ) -> anyhow::Result<()> {
     // ── Load config file (if specified) ────────────────────────
     let cfg = if let Some(config_path) = &config {
@@ -445,13 +547,35 @@ pub(crate) async fn run_serve(
         );
     };
 
-    // Resolve other values: CLI args > config file
-    let resolved_repo_root = repo_root;
-    let resolved_http_addr = http_addr;
-    let resolved_ssh_addr = ssh_addr;
-    let resolved_host_key =
-        host_key.or_else(|| cfg.as_ref().and_then(|c| c.server.host_key.clone()));
-    let resolved_db_url = db_url;
+    // Resolve every dual-source knob in one place: CLI args > config file >
+    // built-in default.
+    let ResolvedSettings {
+        repo_root: resolved_repo_root,
+        http_addr: resolved_http_addr,
+        ssh_addr: resolved_ssh_addr,
+        host_key: resolved_host_key,
+        db_url: resolved_db_url,
+        rate_limit_max: resolved_rate_limit_max,
+        rate_limit_window: resolved_rate_limit_window,
+        smtp_port: resolved_smtp_port,
+        log_max_size_mb: resolved_log_max_size_mb,
+        log_max_files: resolved_log_max_files,
+    } = resolve_settings(
+        CliSettings {
+            repo_root,
+            http_addr,
+            ssh_addr,
+            host_key,
+            db_url,
+            rate_limit_max,
+            rate_limit_window,
+            smtp_port,
+            log_max_size_mb,
+            log_max_files,
+        },
+        cfg.as_ref(),
+    );
+
     let resolved_docker = docker || cfg.as_ref().and_then(|c| c.ci.docker).unwrap_or(false);
     let resolved_external_runners = external_runners
         || cfg
@@ -470,18 +594,6 @@ pub(crate) async fn run_serve(
             .as_ref()
             .and_then(|c| c.releases.attestation_enabled)
             .unwrap_or(false),
-    };
-    let resolved_rate_limit_max = if rate_limit_max > 0 {
-        rate_limit_max
-    } else {
-        cfg.as_ref().and_then(|c| c.rate_limit.max).unwrap_or(0_u32)
-    };
-    let resolved_rate_limit_window = if rate_limit_window != 60 {
-        rate_limit_window
-    } else {
-        cfg.as_ref()
-            .and_then(|c| c.rate_limit.window_secs)
-            .unwrap_or(60)
     };
     let resolved_rate_limit_trusted_proxy_values = if !rate_limit_trusted_proxies.is_empty() {
         rate_limit_trusted_proxies
@@ -508,40 +620,23 @@ pub(crate) async fn run_serve(
         .and_then(|c| c.rate_limit.auth_window_secs)
         .unwrap_or(60);
 
-    // SMTP: CLI takes precedence, fallback to config
-    let (
-        resolved_smtp_host,
-        resolved_smtp_port,
-        resolved_smtp_user,
-        resolved_smtp_pass,
-        resolved_smtp_from,
-    ) = {
+    // SMTP: CLI takes precedence, fallback to config (the port is resolved
+    // alongside the other dual-source knobs above).
+    let (resolved_smtp_host, resolved_smtp_user, resolved_smtp_pass, resolved_smtp_from) = {
         let h = smtp_host.or_else(|| cfg.as_ref().and_then(|c| c.smtp.host.clone()));
-        let p = cfg.as_ref().and_then(|c| c.smtp.port).unwrap_or(smtp_port);
         let u = smtp_user.or_else(|| cfg.as_ref().and_then(|c| c.smtp.user.clone()));
         let pw = smtp_pass.or_else(|| cfg.as_ref().and_then(|c| c.smtp.pass.clone()));
         let f = smtp_from.or_else(|| cfg.as_ref().and_then(|c| c.smtp.from.clone()));
-        (h, p, u, pw, f)
+        (h, u, pw, f)
     };
 
     // TLS: CLI takes precedence, fallback to config
     let resolved_tls_cert = tls_cert.or_else(|| cfg.as_ref().and_then(|c| c.tls.cert.clone()));
     let resolved_tls_key = tls_key.or_else(|| cfg.as_ref().and_then(|c| c.tls.key.clone()));
 
-    // Logging: CLI takes precedence, fallback to config
+    // Logging: CLI takes precedence, fallback to config (rotation sizes are
+    // resolved alongside the other dual-source knobs above).
     let resolved_log_file = log_file.or_else(|| cfg.as_ref().and_then(|c| c.logging.file.clone()));
-    let resolved_log_max_files = if log_max_files != 5 {
-        log_max_files
-    } else {
-        cfg.as_ref().and_then(|c| c.logging.max_files).unwrap_or(5)
-    };
-    let resolved_log_max_size_mb = if log_max_size_mb != 10 {
-        log_max_size_mb
-    } else {
-        cfg.as_ref()
-            .and_then(|c| c.logging.max_size_mb)
-            .unwrap_or(10)
-    };
 
     // External URL: CLI takes precedence, fallback to config
     let resolved_external_url = cfg
@@ -640,7 +735,7 @@ pub(crate) async fn run_serve(
 
     if let Some(ref log_path) = resolved_log_file {
         tracing::info!(file = %log_path, "Logging to file with rotation");
-        if resolved_log_max_size_mb != 10 {
+        if resolved_log_max_size_mb != DEFAULT_LOG_MAX_SIZE_MB {
             tracing::warn!(
                 max_size_mb = resolved_log_max_size_mb,
                 "log_max_size_mb is not enforced: the file appender rotates daily (not by size). Use log_max_files to cap the number of retained files."
@@ -836,7 +931,161 @@ pub(crate) async fn run_serve(
 
 #[cfg(test)]
 mod config_tests {
-    use super::ConfigFile;
+    use super::{CliSettings, ConfigFile};
+
+    /// `[server].repo_root` / `[database].url` from the config file were parsed
+    /// and then thrown away: `run_serve` assigned the clap value verbatim. A
+    /// `forgekeep serve --config …` with no flags therefore wrote repos and the
+    /// SQLite file into `./repos` / `./forgekeep.db` relative to the working
+    /// directory (inside the container: an ephemeral `/app`), not where the
+    /// config said.
+    #[test]
+    fn config_file_locations_apply_when_no_cli_flag_is_passed() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[server]
+repo_root = "/srv/forgekeep/repos"
+http_addr = "127.0.0.1:9000"
+ssh_addr = "127.0.0.1:2323"
+host_key = "/srv/forgekeep/ssh_host_key"
+
+[database]
+url = "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc"
+
+[smtp]
+port = 2525
+
+[rate_limit]
+max = 500
+window_secs = 30
+
+[logging]
+max_size_mb = 42
+max_files = 7
+"#,
+        )
+        .unwrap();
+
+        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
+
+        assert_eq!(resolved.repo_root, "/srv/forgekeep/repos");
+        assert_eq!(resolved.db_url, "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc");
+        assert_eq!(resolved.http_addr, "127.0.0.1:9000");
+        assert_eq!(resolved.ssh_addr, "127.0.0.1:2323");
+        assert_eq!(
+            resolved.host_key.as_deref(),
+            Some("/srv/forgekeep/ssh_host_key")
+        );
+        assert_eq!(resolved.smtp_port, 2525);
+        assert_eq!(resolved.rate_limit_max, 500);
+        assert_eq!(resolved.rate_limit_window, 30);
+        assert_eq!(resolved.log_max_size_mb, 42);
+        assert_eq!(resolved.log_max_files, 7);
+    }
+
+    /// The documented order is `CLI args > config file > defaults`
+    /// (ARCHITECTURE.md §8). A passed flag must beat the config file even when
+    /// the value it carries happens to equal the built-in default — which is
+    /// why none of these flags may have a clap `default_value`.
+    #[test]
+    fn cli_flags_win_over_the_config_file() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[server]
+repo_root = "/from/config"
+http_addr = "10.0.0.1:1111"
+ssh_addr = "10.0.0.1:2222"
+host_key = "/from/config/key"
+
+[database]
+url = "postgres://config/db"
+
+[smtp]
+port = 2525
+
+[rate_limit]
+max = 500
+window_secs = 30
+
+[logging]
+max_size_mb = 42
+max_files = 7
+"#,
+        )
+        .unwrap();
+
+        let cli = CliSettings {
+            repo_root: Some("/from/cli".to_string()),
+            http_addr: Some(super::DEFAULT_HTTP_ADDR.to_string()),
+            ssh_addr: Some("0.0.0.0:9999".to_string()),
+            host_key: Some("/from/cli/key".to_string()),
+            db_url: Some("mysql://cli/db".to_string()),
+            // Exactly the built-in defaults: an explicit `--rate-limit-max 0`
+            // disables the limiter even though the config file enables it.
+            rate_limit_max: Some(super::DEFAULT_RATE_LIMIT_MAX),
+            rate_limit_window: Some(super::DEFAULT_RATE_LIMIT_WINDOW),
+            smtp_port: Some(super::DEFAULT_SMTP_PORT),
+            log_max_size_mb: Some(super::DEFAULT_LOG_MAX_SIZE_MB),
+            log_max_files: Some(super::DEFAULT_LOG_MAX_FILES),
+        };
+
+        let resolved = super::resolve_settings(cli, Some(&config));
+
+        assert_eq!(resolved.repo_root, "/from/cli");
+        assert_eq!(resolved.db_url, "mysql://cli/db");
+        assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
+        assert_eq!(resolved.ssh_addr, "0.0.0.0:9999");
+        assert_eq!(resolved.host_key.as_deref(), Some("/from/cli/key"));
+        assert_eq!(resolved.smtp_port, super::DEFAULT_SMTP_PORT);
+        assert_eq!(resolved.rate_limit_max, super::DEFAULT_RATE_LIMIT_MAX);
+        assert_eq!(resolved.rate_limit_window, super::DEFAULT_RATE_LIMIT_WINDOW);
+        assert_eq!(resolved.log_max_size_mb, super::DEFAULT_LOG_MAX_SIZE_MB);
+        assert_eq!(resolved.log_max_files, super::DEFAULT_LOG_MAX_FILES);
+    }
+
+    /// Bottom of the chain: no flag, no config file at all.
+    #[test]
+    fn built_in_defaults_apply_without_cli_or_config() {
+        let resolved = super::resolve_settings(CliSettings::default(), None);
+
+        assert_eq!(resolved.repo_root, super::DEFAULT_REPO_ROOT);
+        assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
+        assert_eq!(resolved.ssh_addr, super::DEFAULT_SSH_ADDR);
+        assert_eq!(resolved.host_key, None);
+        assert_eq!(resolved.db_url, super::DEFAULT_DB_URL);
+        assert_eq!(resolved.smtp_port, super::DEFAULT_SMTP_PORT);
+        assert_eq!(resolved.rate_limit_max, super::DEFAULT_RATE_LIMIT_MAX);
+        assert_eq!(resolved.rate_limit_window, super::DEFAULT_RATE_LIMIT_WINDOW);
+        assert_eq!(resolved.log_max_size_mb, super::DEFAULT_LOG_MAX_SIZE_MB);
+        assert_eq!(resolved.log_max_files, super::DEFAULT_LOG_MAX_FILES);
+    }
+
+    /// A config file that sets none of these keys must not shadow the defaults
+    /// with empty values.
+    #[test]
+    fn an_empty_config_file_falls_through_to_the_defaults() {
+        let config: ConfigFile = toml::from_str("[ci]\ndocker = true\n").unwrap();
+        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
+
+        assert_eq!(resolved.repo_root, super::DEFAULT_REPO_ROOT);
+        assert_eq!(resolved.db_url, super::DEFAULT_DB_URL);
+        assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
+        assert_eq!(resolved.ssh_addr, super::DEFAULT_SSH_ADDR);
+    }
+
+    /// The shipped example is the file operators copy — the values it advertises
+    /// must be the values the server actually boots with.
+    #[test]
+    fn example_config_locations_are_actually_applied() {
+        let config: ConfigFile =
+            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
+
+        assert_eq!(resolved.repo_root, "./repos");
+        assert_eq!(resolved.db_url, "sqlite://./forgekeep.db?mode=rwc");
+        assert_eq!(resolved.http_addr, "0.0.0.0:8080");
+        assert_eq!(resolved.ssh_addr, "0.0.0.0:2222");
+    }
 
     #[test]
     fn config_path_pointing_at_a_directory_names_path_and_remediation() {

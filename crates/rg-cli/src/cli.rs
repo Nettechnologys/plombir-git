@@ -63,26 +63,37 @@ pub(crate) struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Commands {
     /// Start the ForgeKeep server
+    ///
+    /// Settings that also exist as a `--config` key resolve in the order
+    /// CLI arg > config file > built-in default.
+    // Hence every such flag is an `Option` with no clap `default_value`: a clap
+    // default is indistinguishable from a value the operator typed, so with one
+    // the config file could never win over "the flag was not passed". The
+    // defaults live in `serve::DEFAULT_*` and are named in each flag's help.
     Serve {
-        /// Root directory for git repositories
-        #[arg(long, default_value = "./repos")]
-        repo_root: String,
+        /// Root directory for git repositories [config: [server].repo_root]
+        /// [default: ./repos]
+        #[arg(long)]
+        repo_root: Option<String>,
 
-        /// HTTP listen address
-        #[arg(long, default_value = "0.0.0.0:8080")]
-        http_addr: String,
+        /// HTTP listen address [config: [server].http_addr]
+        /// [default: 0.0.0.0:8080]
+        #[arg(long)]
+        http_addr: Option<String>,
 
-        /// SSH listen address
-        #[arg(long, default_value = "0.0.0.0:2222")]
-        ssh_addr: String,
+        /// SSH listen address [config: [server].ssh_addr]
+        /// [default: 0.0.0.0:2222]
+        #[arg(long)]
+        ssh_addr: Option<String>,
 
-        /// Path to SSH host key
+        /// Path to SSH host key [config: [server].host_key]
         #[arg(long)]
         host_key: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
 
         /// JWT secret key (use a long random string in production)
         #[arg(long)]
@@ -104,12 +115,14 @@ pub(crate) enum Commands {
         allow_host_runner: bool,
 
         /// Rate limit: max requests per window per IP (0 = disabled)
-        #[arg(long, default_value_t = 0)]
-        rate_limit_max: u32,
+        /// [config: [rate_limit].max] [default: 0]
+        #[arg(long)]
+        rate_limit_max: Option<u32>,
 
         /// Rate limit: window duration in seconds
-        #[arg(long, default_value_t = 60)]
-        rate_limit_window: u64,
+        /// [config: [rate_limit].window_secs] [default: 60]
+        #[arg(long)]
+        rate_limit_window: Option<u64>,
 
         /// Comma-separated proxy IPs whose X-Forwarded-For / X-Real-IP headers are trusted
         #[arg(long, value_delimiter = ',')]
@@ -119,9 +132,9 @@ pub(crate) enum Commands {
         #[arg(long)]
         smtp_host: Option<String>,
 
-        /// SMTP server port
-        #[arg(long, default_value_t = 587)]
-        smtp_port: u16,
+        /// SMTP server port [config: [smtp].port] [default: 587]
+        #[arg(long)]
+        smtp_port: Option<u16>,
 
         /// SMTP username
         #[arg(long)]
@@ -143,7 +156,8 @@ pub(crate) enum Commands {
         #[arg(long)]
         tls_key: Option<String>,
 
-        /// Path to TOML configuration file (overrides CLI defaults)
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
         #[arg(long)]
         config: Option<String>,
 
@@ -153,12 +167,14 @@ pub(crate) enum Commands {
 
         /// Log rotation: nominal max log file size in MB. NOTE: the file
         /// appender rotates daily, not by size — this value is advisory only.
-        #[arg(long, default_value_t = 10)]
-        log_max_size_mb: u64,
+        /// [config: [logging].max_size_mb] [default: 10]
+        #[arg(long)]
+        log_max_size_mb: Option<u64>,
 
-        /// Log rotation: max number of old log files to keep (default: 5)
-        #[arg(long, default_value_t = 5)]
-        log_max_files: usize,
+        /// Log rotation: max number of old log files to keep
+        /// [config: [logging].max_files] [default: 5]
+        #[arg(long)]
+        log_max_files: Option<usize>,
     },
 
     /// Run database migrations and exit
