@@ -160,12 +160,24 @@ home = "0.5"
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls"] }
 
 # Argon2id at the production parameters (m=19 MiB, t=2) is deliberately
-# expensive, and an unoptimized build makes it roughly an order of magnitude
-# worse — every test that registers or logs in a user pays it, several times.
-# Optimizing just the two hashing crates keeps the test suite honest (same
-# algorithm, same cost parameters as production; nothing about auth changes)
-# while taking the debug-build penalty off the critical path. They are stable
-# dependencies, so this costs one rebuild, not a slower edit loop.
+# expensive, and an unoptimized build makes it far worse. Measured on one
+# hash, configurations interleaved so machine drift cannot fake the result:
+#
+#   argon2 built with opt-level=0   347.6 / 347.2 ms
+#   argon2 built with opt-level=3    15.2 /  15.4 ms   → 22.8x
+#
+# Every test that registers or logs in a user pays that; the suite has 130+
+# such call sites, so this is worth roughly 45-50s of a full run. Do not try
+# to confirm that at the level of the whole suite — run-to-run variance here
+# spans several times the effect (the same configuration has produced 199s
+# and 502s of summed test time), which is why the number above is measured on
+# the operation itself rather than end to end.
+#
+# Optimizing only the two hashing crates keeps the tests honest: same
+# algorithm, same cost parameters, same code path as production. The
+# alternative — lowering m_cost/t_cost for tests — buys the same speed by no
+# longer exercising what production runs. blake2 is required as well; argon2
+# 0.5 does its core hashing through it.
 [profile.dev.package.argon2]
 opt-level = 3
 
