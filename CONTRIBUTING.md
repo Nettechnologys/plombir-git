@@ -348,6 +348,25 @@ cargo nextest run -p rg-http --test oauth_pkce_tests
 cargo nextest run -E 'test(admin_sso)'          # filter by test name
 ```
 
+#### A faster linker is worth having, but keep it local
+
+This tree links a lot of large binaries, so the linker is a real part of the
+edit-build cycle. `mold` is a drop-in replacement with no effect on the
+resulting binary:
+
+```bash
+sudo apt install mold           # or your platform's package
+# ~/.cargo/config.toml — deliberately NOT committed, see below
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+Put it in your **own** `~/.cargo/config.toml`, not in the repository's
+`.cargo/config.toml`. `-fuse-ld=mold` is a hard failure when `mold` is not on
+`PATH`, so committing it would break the build for every contributor and CI
+runner that has not installed it — the flag is target-scoped and therefore
+inert on macOS/Windows, but on Linux without `mold` it simply does not link.
+
 #### `target/` needs sweeping out now and then
 
 Cargo never garbage-collects artifacts from earlier builds, and this tree links
