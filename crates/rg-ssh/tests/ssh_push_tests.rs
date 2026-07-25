@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use sea_orm::{ConnectOptions, Database, Set};
+use sea_orm::Set;
 
 fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
@@ -26,9 +26,12 @@ async fn wait_for_listener(addr: &str) {
 async fn registered_key_can_push_and_clone_over_live_ssh() {
     let app_dir = tempfile::tempdir().unwrap();
     let db_path = app_dir.path().join("test.db");
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", db_path.display()));
-    options.max_connections(2).min_connections(1);
-    let db = Database::connect(options).await.unwrap();
+    // Production connect path (WAL + synchronous=NORMAL + busy_timeout), not a
+    // bare `Database::connect` on sqlx's DELETE/FULL defaults — same
+    // configuration as the server, and ~6x less time in the migration run.
+    let db = rg_db::connect_with_pool(&format!("sqlite://{}?mode=rwc", db_path.display()), 5, 60, 2)
+        .await
+        .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
 
     let user = rg_db::ops::user_ops::create_user(

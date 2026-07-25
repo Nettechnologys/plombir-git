@@ -245,8 +245,20 @@ async fn write_archive_atomically(
 mod tests {
     use super::{ensure_archive_dir, run_archive_once, AuditArchiveConfig};
     use chrono::{Duration, Utc};
-    use sea_orm::{ConnectOptions, Database, NotSet, Set};
+    use sea_orm::{NotSet, Set};
     use std::io::Cursor;
+
+    /// Connect a throwaway database through the production path.
+    ///
+    /// `rg_db::connect_with_pool` applies the PRAGMAs the server runs with
+    /// (WAL journalling, `synchronous = NORMAL`, `busy_timeout`). A bare
+    /// `Database::connect` would leave sqlx's defaults in place —
+    /// `journal_mode = DELETE` and `synchronous = FULL` — which is both a
+    /// different configuration from production and an fsync on each of the
+    /// ~75 migration commits.
+    async fn connect_test_db(db_url: &str) -> sea_orm::DatabaseConnection {
+        rg_db::connect_with_pool(db_url, 5, 60, 2).await.unwrap()
+    }
 
     /// Permission bits mean nothing to uid 0, so the read-only-directory tests
     /// would see a successful write and fail for the wrong reason.
@@ -335,9 +347,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let db = Database::connect(ConnectOptions::new(db_url))
-            .await
-            .unwrap();
+        let db = connect_test_db(&db_url).await;
         let archive_dir = dir.path().join("audit-archive");
         std::fs::create_dir(&archive_dir).unwrap();
         make_read_only(&archive_dir);
@@ -368,9 +378,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let db = Database::connect(ConnectOptions::new(db_url))
-            .await
-            .unwrap();
+        let db = connect_test_db(&db_url).await;
         rg_db::run_migrations(&db).await.unwrap();
         insert_audit_row(&db, "old.action", Utc::now() - Duration::days(91)).await;
 
@@ -425,9 +433,7 @@ mod tests {
     async fn archives_only_expired_rows_as_compressed_ndjson() {
         let dir = tempfile::tempdir().unwrap();
         let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let db = Database::connect(ConnectOptions::new(db_url))
-            .await
-            .unwrap();
+        let db = connect_test_db(&db_url).await;
         rg_db::run_migrations(&db).await.unwrap();
 
         for (action, created_at) in [

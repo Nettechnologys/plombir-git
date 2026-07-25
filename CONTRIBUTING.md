@@ -35,6 +35,7 @@ which git
 ### Recommended tools
 
 ```bash
+cargo install cargo-nextest --locked   # the test runner the gate and CI use
 cargo install cargo-watch   # incremental rebuilds on change
 cargo install cargo-audit   # dependency vulnerability audit
 cargo tree                  # inspect the dependency graph
@@ -314,8 +315,58 @@ mod tests {
 }
 ```
 
-Prefer running tests per-crate (`cargo test -p rg-core`) rather than
-`cargo test --workspace`, which can be memory-hungry.
+### Running the suite
+
+The gate is `cargo-nextest` plus a doc-test pass — the same two commands CI
+runs:
+
+```bash
+cargo install cargo-nextest --locked   # one-off
+cargo nextest run --workspace -j 6     # 628 tests
+cargo test --workspace --doc           # nextest does not run doc-tests
+```
+
+Both commands are needed. `cargo nextest` does not run doc-tests at all, so on
+its own it silently stops checking them.
+
+`cargo test --workspace -j 6` still works and runs the same tests, it is just
+several times slower: it runs the workspace's 63 test binaries one after
+another, so on a 24-core machine most of the machine sits idle. Measured on a
+warm `target`: 135s for `cargo test` against 27s for `cargo nextest run`.
+
+Use `-j 6` (or lower) rather than the default: full build parallelism
+saturates RAM during linking on this tree. `-j` caps *build* jobs only — if the
+run itself needs to be gentler on memory, cap the runner instead with
+`cargo nextest run --workspace --test-threads 8`. For reference, a full
+`--workspace` run on a 24-core / 125 GB machine peaks around 17 GB above idle.
+
+To run one crate or one file:
+
+```bash
+cargo nextest run -p rg-core
+cargo nextest run -p rg-http --test oauth_pkce_tests
+cargo nextest run -E 'test(admin_sso)'          # filter by test name
+```
+
+#### Test databases go through the production connect path
+
+`setup_test_db` (in `crates/rg-http/tests/common/mod.rs`) connects via
+`rg_db::connect_with_pool`, **not** a bare `sea_orm::Database::connect`. That
+is deliberate on two counts:
+
+- **Fidelity.** The tests then run against the SQLite configuration the server
+  actually uses — WAL journalling, `synchronous = NORMAL`, `busy_timeout`,
+  the cache/mmap tuning. A bare `Database::connect` leaves sqlx's defaults in
+  place (`journal_mode = DELETE`, `synchronous = FULL`), i.e. tests exercising
+  a different database configuration from production.
+- **Speed.** `synchronous = FULL` on a rollback journal means an fsync per
+  commit, and each test database replays ~75 migrations. Measured, 4 samples
+  per configuration with the configurations interleaved: 2977 ms median to
+  connect + migrate a fresh database, against 455 ms through the production
+  path.
+
+If you add a new test that needs its own database, connect through `rg_db`
+rather than reaching for `Database::connect` directly.
 
 ### Coverage
 

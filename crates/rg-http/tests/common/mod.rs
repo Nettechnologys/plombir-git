@@ -28,17 +28,28 @@ impl rg_core::ci::CiTrigger for NoopCiEngine {
 }
 
 /// Create a temporary file-based SQLite database with all migrations applied.
+///
+/// Connect through `rg_db::connect_with_pool` rather than a bare
+/// `Database::connect`, so the tests exercise the SQLite configuration the
+/// server actually runs with: WAL journalling, `synchronous = NORMAL`, a
+/// `busy_timeout` and the cache/mmap tuning. A raw `Database::connect` leaves
+/// sqlx's defaults in place — `journal_mode = DELETE` and
+/// `synchronous = FULL` — which is both a different configuration from
+/// production and an fsync on every one of the ~75 migration commits.
+///
+/// Measured on this tree, connect + `run_migrations` on a fresh database
+/// (4 samples per configuration, configurations interleaved):
+/// `journal=DELETE`/`synchronous=FULL` 2977 ms median vs WAL/`NORMAL` 455 ms.
+/// Every test pays that once, so it dominated the suite's wall-clock.
 pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
-    use sea_orm::{ConnectOptions, Database};
-    use std::time::Duration;
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path().join("test.db");
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let mut opt = ConnectOptions::new(db_url);
-    opt.max_connections(2)
-        .min_connections(1)
-        .connect_timeout(Duration::from_secs(5));
-    let db = Database::connect(opt).await.expect("failed to connect");
+    // Pool size and connect timeout kept as they were; only the PRAGMA
+    // configuration changes.
+    let db = rg_db::connect_with_pool(&db_url, 5, 60, 2)
+        .await
+        .expect("failed to connect");
     rg_db::run_migrations(&db).await.expect("migration failed");
     (db, dir)
 }

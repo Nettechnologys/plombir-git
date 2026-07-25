@@ -61,3 +61,7 @@ deploy/data/
 # Legacy IronForge config names (pre-rebrand) — still ignored so old local files never get committed
 /ironforge.toml
 /ironforge-simple.toml
+
+# Python bytecode from the scripts/ helpers
+__pycache__/
+*.pyc

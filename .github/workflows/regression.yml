@@ -30,14 +30,33 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check workspace tests compile
-        run: cargo check --workspace --tests
+      # Prebuilt binary — no from-source compile, keeps the gate fast.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
-      - name: Run HTTP integration tests
-        run: cargo test -p rg-http -- --nocapture
-
+      # nextest runs test binaries in parallel with each other; `cargo test`
+      # runs the workspace's 63 test binaries one after another, which on a
+      # multi-core runner leaves most of the machine idle. Measured locally on
+      # a warm target: 135s -> 27s for the same 628 tests.
+      #
+      # No `--nocapture`: nextest captures per test and prints the captured
+      # output of failing tests, which is what --nocapture was there for. Its
+      # nextest spelling (--no-capture) would additionally force the run back
+      # to a single thread.
+      #
+      # There is deliberately no separate `cargo check --workspace --tests` or
+      # `cargo test -p rg-http` step ahead of this one: the first compiles
+      # everything a second time for no extra signal, and the second re-ran
+      # rg-http's 42 integration binaries that `--workspace` already covers.
       - name: Run workspace tests
-        run: cargo test --workspace -- --nocapture
+        run: cargo nextest run --workspace
+
+      # nextest does not run doc-tests (upstream limitation), so they need
+      # their own step or they silently stop being checked.
+      - name: Run doc-tests
+        run: cargo test --workspace --doc
 
       - name: Fresh DB migration smoke
         run: |
