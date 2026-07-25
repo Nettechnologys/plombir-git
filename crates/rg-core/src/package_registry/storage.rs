@@ -8,6 +8,22 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// One actionable error for a filesystem failure on a pre-[`BlobKey`] package
+/// path.
+///
+/// Rows written before the blob-storage migration hold an absolute path instead
+/// of a key, and those paths bypass the backend entirely — so they also bypass
+/// the diagnostics [`BlobStorageError`](crate::blob_storage::BlobStorageError)
+/// attaches, and reach the operator as a naked errno.
+fn legacy_path_error(what: &str, storage_path: &str, error: &std::io::Error) -> Error {
+    crate::platform::fs::path_error(
+        what,
+        Path::new(storage_path),
+        error,
+        crate::platform::fs::BLOB_STORAGE_HINT,
+    )
+}
+
 #[derive(Clone)]
 pub struct PackageStorage {
     backend: Arc<dyn BlobStorage>,
@@ -86,7 +102,12 @@ impl PackageStorage {
     pub async fn read_file(&self, storage_path: &str) -> Result<Vec<u8>> {
         match BlobKey::new(storage_path) {
             Ok(key) => self.backend.get(&key).await.map_err(Into::into),
-            Err(_) => tokio::fs::read(storage_path).await.map_err(Into::into),
+            // Legacy rows hold an absolute path. It is right there in the
+            // argument, yet a bare `io::Error` still reaches the operator as an
+            // errno with no file attached.
+            Err(_) => tokio::fs::read(storage_path)
+                .await
+                .map_err(|error| legacy_path_error("package file", storage_path, &error)),
         }
     }
 
@@ -123,7 +144,9 @@ impl PackageStorage {
             Err(_) => {
                 let path = Path::new(storage_path);
                 if path.exists() {
-                    tokio::fs::remove_file(path).await?;
+                    tokio::fs::remove_file(path)
+                        .await
+                        .map_err(|error| legacy_path_error("package file", storage_path, &error))?;
                 }
             }
         }
@@ -214,6 +237,25 @@ mod tests {
             !storage
                 .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
                 .await
+        );
+    }
+
+    /// The legacy branch bypasses the blob backend, so it also bypasses the
+    /// path the backend attaches to its own I/O errors.
+    #[tokio::test]
+    async fn failing_legacy_read_names_the_absolute_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("gone.bin");
+        let storage = PackageStorage::new(directory.path());
+
+        let error = storage
+            .read_file(missing.to_string_lossy().as_ref())
+            .await
+            .expect_err("the legacy file does not exist");
+
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "{error}"
         );
     }
 

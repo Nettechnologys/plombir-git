@@ -139,7 +139,17 @@ pub(crate) fn cmd_create_repo(
     let cfg = config::load_optional_config_file(config.as_deref())?;
     let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
     let repo_dir = repo_root.join(format!("{}/{}.git", owner, name));
-    std::fs::create_dir_all(&repo_dir)?;
+    // `--repo-root` is optional here: without it the root comes from the config
+    // file or the built-in default, so the directory that failed is not
+    // necessarily one the operator just typed.
+    std::fs::create_dir_all(&repo_dir).map_err(|error| {
+        rg_core::platform::fs::path_error(
+            "repository directory",
+            &repo_dir,
+            &error,
+            rg_core::platform::fs::REPO_ROOT_HINT,
+        )
+    })?;
 
     // Replace git init --bare with gix API
     gix::create::into(
@@ -243,7 +253,14 @@ pub(crate) async fn cmd_import(
     }
 
     let repo_root = PathBuf::from(&repo_root);
-    std::fs::create_dir_all(&repo_root)?;
+    std::fs::create_dir_all(&repo_root).map_err(|error| {
+        rg_core::platform::fs::path_error(
+            "repository storage root",
+            &repo_root,
+            &error,
+            rg_core::platform::fs::REPO_ROOT_HINT,
+        )
+    })?;
 
     // Start import
     println!("\n⏳ Starting import...");

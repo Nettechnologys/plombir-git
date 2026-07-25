@@ -312,6 +312,17 @@ pub const CI_CACHE_DIR_HINT: &str =
     "CI cache archives live in `_ci_cache/<repo_id>/` next to the repository storage root; \
      that directory must be writable by the user running forgekeep";
 
+/// Remediation for a filesystem failure inside the blob storage backend.
+///
+/// The local backend is rooted at `[server].repo_root` and derives every object
+/// path from a [`BlobKey`](crate::blob_storage::BlobKey), so neither the root
+/// nor the object path is named by the request that failed — an artifact
+/// upload, an LFS push, a package publish and a `docker push` all surface the
+/// same anonymous errno.
+pub const BLOB_STORAGE_HINT: &str =
+    "artifacts, packages, OCI images and LFS objects are stored under the `[server].repo_root` \
+     directory; that directory must be writable by the user running forgekeep";
+
 /// Remediation for a filesystem failure on a temporary git working tree.
 ///
 /// Creating a repository, editing a file from the web UI and committing a batch

@@ -74,8 +74,55 @@ pub enum BlobStorageError {
     NotFound(BlobKey),
     #[error("blob path escaped storage root: {0}")]
     OutsideRoot(PathBuf),
-    #[error("blob storage I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// A filesystem failure, carrying the path the bare `io::Error` dropped.
+    ///
+    /// There is deliberately no `#[from] std::io::Error`: automatic conversion
+    /// is what let every `?` in this file report `Permission denied (os error
+    /// 13)` about a path only the backend knows. Build the variant through
+    /// [`BlobStorageError::io`] so each site has to name what it was touching.
+    #[error("blob storage I/O error: {message}")]
+    Io {
+        /// The file or directory the operation failed on.
+        path: PathBuf,
+        /// Rendered diagnostic: the path, the errno and the remediation.
+        message: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl BlobStorageError {
+    /// Attach the failing path — and, on a permission error, the uid/ownership
+    /// diagnostic — to a raw [`std::io::Error`].
+    ///
+    /// `what` names the thing in operator terms (`"blob storage root"`,
+    /// `"blob temporary file"`).
+    pub fn io(what: &str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        let path = path.into();
+        let message = crate::platform::fs::describe_path_error(
+            what,
+            &path,
+            &source,
+            crate::platform::fs::BLOB_STORAGE_HINT,
+        );
+        Self::Io {
+            path,
+            message,
+            source,
+        }
+    }
+}
+
+/// `map_err` adaptor for the sites that only have a raw io error to convert.
+///
+/// Every path in this backend is built from the storage root plus a [`BlobKey`],
+/// so the failing directory appears in neither the request nor the database row
+/// that names the object.
+fn io_at<'a>(
+    what: &'static str,
+    path: &'a Path,
+) -> impl Fn(std::io::Error) -> BlobStorageError + 'a {
+    move |error| BlobStorageError::io(what, path, error)
 }
 
 pub type Result<T> = std::result::Result<T, BlobStorageError>;
@@ -135,17 +182,27 @@ impl LocalBlobStorage {
     }
 
     async fn prepare_parent(&self, path: &Path) -> Result<()> {
-        tokio::fs::create_dir_all(&self.root).await?;
+        // First filesystem touch of any write, and the one that fails on a
+        // bind-mount owned by a host uid the container does not share.
+        tokio::fs::create_dir_all(&self.root)
+            .await
+            .map_err(io_at("blob storage root", &self.root))?;
         let parent = path
             .parent()
             .ok_or_else(|| BlobStorageError::InvalidKey("blob key has no parent".to_string()))?;
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(io_at("blob parent directory", parent))?;
         self.ensure_canonical_under_root(parent).await
     }
 
     async fn ensure_canonical_under_root(&self, path: &Path) -> Result<()> {
-        let root = tokio::fs::canonicalize(&self.root).await?;
-        let candidate = tokio::fs::canonicalize(path).await?;
+        let root = tokio::fs::canonicalize(&self.root)
+            .await
+            .map_err(io_at("blob storage root", &self.root))?;
+        let candidate = tokio::fs::canonicalize(path)
+            .await
+            .map_err(io_at("blob path", path))?;
         if candidate.starts_with(&root) {
             Ok(())
         } else {
@@ -159,23 +216,29 @@ impl LocalBlobStorage {
         let temporary = temporary_sibling(&destination);
 
         let result = async {
-            let mut src = tokio::fs::File::open(source).await?;
+            let staged = io_at("blob temporary file", &temporary);
+            let mut src = tokio::fs::File::open(source)
+                .await
+                .map_err(io_at("blob source file", source))?;
             let mut dst = tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .open(&temporary)
-                .await?;
-            tokio::io::copy(&mut src, &mut dst).await?;
-            dst.flush().await?;
-            dst.sync_all().await?;
+                .await
+                .map_err(&staged)?;
+            tokio::io::copy(&mut src, &mut dst).await.map_err(&staged)?;
+            dst.flush().await.map_err(&staged)?;
+            dst.sync_all().await.map_err(&staged)?;
             drop(dst);
-            tokio::fs::rename(&temporary, &destination).await?;
+            tokio::fs::rename(&temporary, &destination)
+                .await
+                .map_err(io_at("blob file", &destination))?;
             self.metadata(key).await
         }
         .await;
 
         if result.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
+            discard_temporary(&temporary).await;
         }
         result
     }
@@ -186,13 +249,15 @@ impl LocalBlobStorage {
             Ok(mut file) => {
                 self.ensure_canonical_under_root(&path).await?;
                 let mut data = Vec::new();
-                file.read_to_end(&mut data).await?;
+                file.read_to_end(&mut data)
+                    .await
+                    .map_err(io_at("blob file", &path))?;
                 Ok(data)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Err(BlobStorageError::NotFound(key.clone()))
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(BlobStorageError::io("blob file", &path, error)),
         }
     }
 
@@ -204,7 +269,7 @@ impl LocalBlobStorage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(BlobStorageError::NotFound(key.clone()));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(BlobStorageError::io("blob file", &path, error)),
         };
         self.ensure_canonical_under_root(&path).await?;
         Ok(BlobMetadata {
@@ -215,19 +280,31 @@ impl LocalBlobStorage {
     }
 
     async fn list_checked(&self, prefix: Option<&BlobKey>) -> Result<Vec<BlobMetadata>> {
-        tokio::fs::create_dir_all(&self.root).await?;
+        tokio::fs::create_dir_all(&self.root)
+            .await
+            .map_err(io_at("blob storage root", &self.root))?;
         let root = self.root.clone();
         let start = prefix
             .map(|key| self.lexical_path(key))
             .unwrap_or_else(|| root.clone());
-        if !tokio::fs::try_exists(&start).await? {
+        if !tokio::fs::try_exists(&start)
+            .await
+            .map_err(io_at("blob prefix directory", &start))?
+        {
             return Ok(Vec::new());
         }
         self.ensure_canonical_under_root(&start).await?;
 
         tokio::task::spawn_blocking(move || collect_local_metadata(&root, &start))
             .await
-            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .map_err(|error| {
+                // A panicked scan says nothing about which tree it was walking.
+                BlobStorageError::io(
+                    "blob storage root",
+                    &self.root,
+                    std::io::Error::other(error.to_string()),
+                )
+            })?
     }
 }
 
@@ -243,22 +320,26 @@ impl BlobStorage for LocalBlobStorage {
             let temporary = temporary_sibling(&destination);
 
             let result = async {
+                let staged = io_at("blob temporary file", &temporary);
                 let mut file = tokio::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(&temporary)
-                    .await?;
-                file.write_all(data).await?;
-                file.flush().await?;
-                file.sync_all().await?;
+                    .await
+                    .map_err(&staged)?;
+                file.write_all(data).await.map_err(&staged)?;
+                file.flush().await.map_err(&staged)?;
+                file.sync_all().await.map_err(&staged)?;
                 drop(file);
-                tokio::fs::rename(&temporary, &destination).await?;
+                tokio::fs::rename(&temporary, &destination)
+                    .await
+                    .map_err(io_at("blob file", &destination))?;
                 self.metadata_checked(key).await
             }
             .await;
 
             if result.is_err() {
-                let _ = tokio::fs::remove_file(&temporary).await;
+                discard_temporary(&temporary).await;
             }
             result
         })
@@ -296,12 +377,14 @@ impl BlobStorage for LocalBlobStorage {
             match tokio::fs::metadata(&path).await {
                 Ok(metadata) if metadata.is_file() => {
                     self.ensure_canonical_under_root(&path).await?;
-                    tokio::fs::remove_file(path).await?;
+                    tokio::fs::remove_file(&path)
+                        .await
+                        .map_err(io_at("blob file", &path))?;
                     Ok(true)
                 }
                 Ok(_) => Err(BlobStorageError::NotFound(key.clone())),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(error.into()),
+                Err(error) => Err(BlobStorageError::io("blob file", &path, error)),
             }
         })
     }
@@ -352,6 +435,24 @@ fn encode_segment(segment: &str) -> String {
     encoded
 }
 
+/// Drop the staging file of a write that failed.
+///
+/// The write's own error is what the caller needs, so a failed cleanup must not
+/// replace it — but discarding it silently makes a leaked `.tmp` sibling
+/// invisible until the volume fills up, and the name is a UUID nothing else
+/// records.
+async fn discard_temporary(temporary: &Path) {
+    match tokio::fs::remove_file(temporary).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %temporary.display(),
+            %error,
+            "failed to remove the temporary file of an aborted blob write"
+        ),
+    }
+}
+
 fn temporary_sibling(destination: &Path) -> PathBuf {
     let name = destination
         .file_name()
@@ -361,18 +462,21 @@ fn temporary_sibling(destination: &Path) -> PathBuf {
 }
 
 fn collect_local_metadata(root: &Path, start: &Path) -> Result<Vec<BlobMetadata>> {
-    let canonical_root = root.canonicalize()?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(io_at("blob storage root", root))?;
     let mut pending = vec![start.to_path_buf()];
     let mut objects = Vec::new();
 
     while let Some(path) = pending.pop() {
-        let metadata = std::fs::symlink_metadata(&path)?;
+        let entry_error = io_at("blob inventory entry", &path);
+        let metadata = std::fs::symlink_metadata(&path).map_err(&entry_error)?;
         if metadata.file_type().is_symlink() {
             continue;
         }
         if metadata.is_dir() {
-            for entry in std::fs::read_dir(&path)? {
-                pending.push(entry?.path());
+            for entry in std::fs::read_dir(&path).map_err(&entry_error)? {
+                pending.push(entry.map_err(&entry_error)?.path());
             }
             continue;
         }
@@ -380,7 +484,7 @@ fn collect_local_metadata(root: &Path, start: &Path) -> Result<Vec<BlobMetadata>
             continue;
         }
 
-        let canonical = path.canonicalize()?;
+        let canonical = path.canonicalize().map_err(&entry_error)?;
         if !canonical.starts_with(&canonical_root) {
             return Err(BlobStorageError::OutsideRoot(canonical));
         }
@@ -456,6 +560,41 @@ mod tests {
         assert!(storage.delete(&first).await.unwrap());
         assert!(!storage.delete(&first).await.unwrap());
         assert!(!storage.exists(&first).await.unwrap());
+    }
+
+    /// The failing directory is derived from the storage root and the key, so
+    /// it appears in neither the request nor the database row that names the
+    /// object — a bare `io::Error` leaves the operator with an errno and
+    /// nothing to act on.
+    ///
+    /// The trigger is a regular file where the backend needs a directory
+    /// (`ENOTDIR`) rather than a permission error: `describe_path_error` returns
+    /// early on `PermissionDenied` and never appends the remediation, and a
+    /// `chmod`-based setup does not bite when the tests run as root.
+    #[tokio::test]
+    async fn io_failures_name_the_path_the_errno_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("artifacts");
+        tokio::fs::write(&occupied, b"not a directory").await.unwrap();
+        let storage = LocalBlobStorage::new(dir.path());
+        let key = BlobKey::new("artifacts/1/one.bin").unwrap();
+
+        let error = storage
+            .put(&key, b"payload")
+            .await
+            .expect_err("a regular file cannot host a subdirectory");
+
+        let BlobStorageError::Io { path, source, .. } = &error else {
+            panic!("expected an I/O error, got {error:?}");
+        };
+        assert_eq!(path, &occupied.join("1"));
+        assert!(source.raw_os_error().is_some(), "{source}");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&occupied.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
     }
 
     #[cfg(unix)]

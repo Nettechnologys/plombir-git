@@ -244,10 +244,18 @@ async fn read_asset_bytes(
     match storage.get(&key).await {
         Ok(data) => Ok(data),
         Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
+            // `asset_file_path` builds the path from `repo_root` and never
+            // hands it back, so a bare io error names an asset file the
+            // operator cannot locate.
             let file_path = asset_file_path(repo_root, owner, repo_name, asset);
-            tokio::fs::read(&file_path)
-                .await
-                .context("failed to read legacy release asset")
+            tokio::fs::read(&file_path).await.map_err(|error| {
+                crate::platform::fs::path_error(
+                    "legacy release asset",
+                    &file_path,
+                    &error,
+                    crate::platform::fs::BLOB_STORAGE_HINT,
+                )
+            })
         }
         Err(error) => Err(error).context("failed to read release asset"),
     }
