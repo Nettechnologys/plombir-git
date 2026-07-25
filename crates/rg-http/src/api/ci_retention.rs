@@ -156,16 +156,36 @@ async fn artifact_repo_id(state: &AppState, job_id: i64) -> anyhow::Result<Optio
     )
 }
 
+/// One actionable line for a filesystem failure on a CI cache archive.
+///
+/// The cleanup loop only logs `cache_id`, so a bare `io::Error` from the unlink
+/// path leaves an operator with an errno against a `_ci_cache/<repo_id>/` file
+/// that is never named — the same anonymous failure the write half of these
+/// endpoints already spells out via `cache_path_error`.
+fn cache_cleanup_error(what: &str, path: &FsPath, error: &std::io::Error) -> anyhow::Error {
+    rg_core::platform::fs::path_error(what, path, error, rg_core::platform::fs::CI_CACHE_DIR_HINT)
+}
+
 async fn safe_remove_file(path: PathBuf, root: &FsPath) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let canonical_path = tokio::fs::canonicalize(&path).await?;
-    let canonical_root = tokio::fs::canonicalize(root).await?;
+    let canonical_path = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|error| cache_cleanup_error("CI cache archive", &path, &error))?;
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|error| cache_cleanup_error("CI cache directory", root, &error))?;
     if !canonical_path.starts_with(&canonical_root) {
-        anyhow::bail!("stored path is outside managed storage root");
+        anyhow::bail!(
+            "stored path {} is outside managed storage root {}",
+            canonical_path.display(),
+            canonical_root.display()
+        );
     }
-    tokio::fs::remove_file(canonical_path).await?;
+    tokio::fs::remove_file(&canonical_path)
+        .await
+        .map_err(|error| cache_cleanup_error("CI cache archive", &canonical_path, &error))?;
     Ok(())
 }
 

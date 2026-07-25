@@ -391,17 +391,27 @@ async fn parse_artifact_upload(
                 "artifact metadata path must reference an existing file in this job's storage",
             ));
         }
+        // Reporting every errno as "does not exist" sends the runner after the
+        // wrong problem when the file is there but unreadable.
         let size = tokio::fs::metadata(&file_path)
             .await
-            .map_err(|_| AppError::bad_request("artifact metadata file does not exist"))?
+            .map_err(|error| {
+                AppError::bad_request(format!(
+                    "artifact metadata file {} is unusable: {error}",
+                    file_path.display()
+                ))
+            })?
             .len() as i64;
         let name = sanitize_artifact_name(&req.name);
         // Stream the digest over the referenced file instead of buffering it in
         // memory — the metadata path exists precisely to avoid loading the whole
         // artifact into the request body.
-        let sha256 = hash_file(&file_path)
-            .await
-            .map_err(|_| AppError::bad_request("failed to hash artifact metadata file"))?;
+        let sha256 = hash_file(&file_path).await.map_err(|error| {
+            AppError::bad_request(format!(
+                "failed to hash artifact metadata file {}: {error}",
+                file_path.display()
+            ))
+        })?;
         let key = artifact_key(job_id, &name).map_err(AppError::bad_request)?;
         state
             .blob_storage
@@ -462,6 +472,39 @@ fn artifact_key(job_id: i64, name: &str) -> Result<rg_core::blob_storage::BlobKe
         .map_err(|error| error.to_string())
 }
 
+/// One actionable line for a filesystem failure on a legacy artifact file.
+///
+/// Artifacts uploaded before the blob-storage migration keep an absolute path
+/// in `artifacts.file_path`, so these branches bypass the storage backend and
+/// touch the file directly. The path comes out of the database and is never
+/// echoed back, so a bare `io::Error` reaching the download response — or the
+/// retention loop's `refused to clean expired artifact` log line — is an errno
+/// against a file under `_artifacts/` that only the server can name.
+fn artifact_path_error(what: &str, path: &FsPath, error: &std::io::Error) -> String {
+    rg_core::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        rg_core::platform::fs::BLOB_STORAGE_HINT,
+    )
+}
+
+/// True when `path` is a legacy artifact whose file is already gone but whose
+/// directory is still inside the artifact root.
+///
+/// [`is_path_under`] canonicalizes both sides, so it answers `false` for a file
+/// that no longer exists — indistinguishable from a genuine traversal attempt.
+/// That turned a deleted legacy artifact into "outside artifact storage": a 403
+/// on download, and a permanently undeletable row in the retention sweep, which
+/// re-reported the same refusal on every pass. Resolving containment against
+/// the parent directory keeps the check authoritative — a foreign path is still
+/// refused — while letting a vanished file be reported as missing.
+fn legacy_artifact_is_gone(path: &FsPath, root: &FsPath) -> bool {
+    path.parent()
+        .is_some_and(|parent| is_path_under(parent, root))
+        && matches!(path.try_exists(), Ok(false))
+}
+
 async fn read_artifact_bytes(state: &AppState, storage_path: &str) -> Result<Vec<u8>, AppError> {
     match rg_core::blob_storage::BlobKey::new(storage_path) {
         Ok(key) => state.blob_storage.get(&key).await.map_err(|error| {
@@ -474,15 +517,22 @@ async fn read_artifact_bytes(state: &AppState, storage_path: &str) -> Result<Vec
         Err(_) => {
             let file_path = PathBuf::from(storage_path);
             if !is_path_under(&file_path, &artifact_root(state)) {
+                if legacy_artifact_is_gone(&file_path, &artifact_root(state)) {
+                    return Err(AppError::not_found("artifact file not found"));
+                }
                 return Err(AppError::forbidden(
                     "artifact path is outside artifact storage",
                 ));
             }
-            tokio::fs::read(file_path).await.map_err(|error| {
+            tokio::fs::read(&file_path).await.map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     AppError::not_found("artifact file not found")
                 } else {
-                    AppError::internal(error)
+                    AppError::internal(artifact_path_error(
+                        "legacy CI artifact",
+                        &file_path,
+                        &error,
+                    ))
                 }
             })
         }
@@ -500,10 +550,30 @@ pub(crate) async fn delete_artifact_blob(
         Err(_) => {
             let file_path = PathBuf::from(storage_path);
             if !is_path_under(&file_path, &artifact_root(state)) {
-                anyhow::bail!("stored path is outside managed artifact storage");
+                // Nothing to unlink is a success, not a refusal — otherwise the
+                // row outlives its file and every retention sweep fails on it.
+                if legacy_artifact_is_gone(&file_path, &artifact_root(state)) {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "stored path {} is outside managed artifact storage",
+                    file_path.display()
+                );
             }
-            if tokio::fs::try_exists(&file_path).await? {
-                tokio::fs::remove_file(file_path).await?;
+            if tokio::fs::try_exists(&file_path).await.map_err(|error| {
+                anyhow::anyhow!(artifact_path_error(
+                    "legacy CI artifact",
+                    &file_path,
+                    &error
+                ))
+            })? {
+                tokio::fs::remove_file(&file_path).await.map_err(|error| {
+                    anyhow::anyhow!(artifact_path_error(
+                        "legacy CI artifact",
+                        &file_path,
+                        &error
+                    ))
+                })?;
             }
         }
     }
@@ -644,4 +714,78 @@ async fn repo_id_for_job(
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("pipeline not found"))?;
     Ok(pipeline.repo_id)
+}
+
+#[cfg(test)]
+mod legacy_artifact_path_tests {
+    use super::*;
+
+    /// A legacy artifact path is built from `repo_root` and never handed back,
+    /// so the failure has to name the file itself. The failure is staged as
+    /// ENOTDIR (a regular file used as a directory) rather than a permission
+    /// error: that reproduces under any uid, including root, and keeps the
+    /// remedy in the message — `describe_path_error` swaps the remedy for an
+    /// ownership diagnostic on `PermissionDenied`.
+    #[test]
+    fn legacy_read_failure_names_the_file_and_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocker = temp.path().join("artifact.bin");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let file_path = blocker.join("nested.bin");
+        let error = std::fs::read(&file_path).unwrap_err();
+
+        let rendered = artifact_path_error("legacy CI artifact", &file_path, &error);
+
+        assert!(
+            rendered.contains(&file_path.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("legacy CI artifact"), "{rendered}");
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
+
+    /// The file of a legacy artifact can be gone — retention removed it, or an
+    /// operator cleaned the directory by hand. `is_path_under` cannot
+    /// canonicalize it and answers `false`, which used to be reported as a
+    /// path-traversal refusal and left the row undeletable.
+    #[test]
+    fn a_vanished_artifact_inside_the_root_is_missing_not_foreign() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("_artifacts");
+        std::fs::create_dir_all(root.join("jobs").join("7")).unwrap();
+        let file_path = root.join("jobs").join("7").join("report.txt");
+
+        assert!(!is_path_under(&file_path, &root));
+        assert!(legacy_artifact_is_gone(&file_path, &root));
+    }
+
+    /// Containment stays authoritative: forgiving a missing file must not
+    /// forgive a path that was never inside the artifact root.
+    #[test]
+    fn a_path_outside_the_root_is_still_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("_artifacts");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let existing = outside.join("passwd");
+        std::fs::write(&existing, "secret").unwrap();
+        assert!(!legacy_artifact_is_gone(&existing, &root));
+        assert!(!legacy_artifact_is_gone(&outside.join("gone.bin"), &root));
+    }
+
+    /// A file that is still on disk inside the root is not "gone" — the caller
+    /// must go on to read or unlink it.
+    #[test]
+    fn a_present_artifact_is_not_reported_as_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("_artifacts");
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("report.txt");
+        std::fs::write(&file_path, "bytes").unwrap();
+
+        assert!(is_path_under(&file_path, &root));
+        assert!(!legacy_artifact_is_gone(&file_path, &root));
+    }
 }
