@@ -8,6 +8,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::admin;
 use crate::cli::PackageCmd;
+use crate::config;
+use crate::dbconn;
 
 /// Basic stderr logging used by the one-shot subcommands.
 fn init_cli_logging() {
@@ -19,15 +21,45 @@ fn init_cli_logging() {
         .init();
 }
 
+/// Resolve `--db-url` against `--config`, applying `CLI arg > config file >
+/// built-in default`.
+///
+/// Every DB-touching subcommand goes through here so it addresses the same
+/// database the server does. Before this existed, `--db-url` carried a clap
+/// default and the config file was unreachable, so `forgekeep migrate` on a
+/// Postgres deployment migrated a fresh, empty `./forgekeep.db` — with no error.
+fn resolve_db_url(db_url: Option<String>, config: Option<String>) -> anyhow::Result<String> {
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    Ok(config::resolve_db_url(db_url, cfg.as_ref()))
+}
+
+/// [`resolve_db_url`] for the subcommands that need `--repo-root` as well, so a
+/// repository is created/imported/indexed where the server looks for it.
+fn resolve_db_url_and_repo_root(
+    db_url: Option<String>,
+    repo_root: Option<String>,
+    config: Option<String>,
+) -> anyhow::Result<(String, String)> {
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    Ok((
+        config::resolve_db_url(db_url, cfg.as_ref()),
+        config::resolve_repo_root(repo_root, cfg.as_ref()),
+    ))
+}
+
 /// `forgekeep migrate` — run pending database migrations and exit.
-pub(crate) async fn cmd_migrate(db_url: String) -> anyhow::Result<()> {
+pub(crate) async fn cmd_migrate(
+    db_url: Option<String>,
+    config: Option<String>,
+) -> anyhow::Result<()> {
     init_cli_logging();
 
+    let db_url = resolve_db_url(db_url, config)?;
     tracing::info!(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = rg_db::connect(&db_url).await?;
+    let db = dbconn::connect(&db_url).await?;
     tracing::info!("Running database migrations...");
     rg_db::run_migrations(&db).await?;
     tracing::info!("Migrations complete ✅");
@@ -42,14 +74,18 @@ pub(crate) fn cmd_gen_secret() {
 }
 
 /// `forgekeep rebuild-fts` — rebuild full-text search indexes.
-pub(crate) async fn cmd_rebuild_fts(db_url: String) -> anyhow::Result<()> {
+pub(crate) async fn cmd_rebuild_fts(
+    db_url: Option<String>,
+    config: Option<String>,
+) -> anyhow::Result<()> {
     init_cli_logging();
 
+    let db_url = resolve_db_url(db_url, config)?;
     tracing::info!(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = rg_db::connect(&db_url).await?;
+    let db = dbconn::connect(&db_url).await?;
 
     rg_db::rebuild_fts_indexes(&db).await?;
 
@@ -59,20 +95,32 @@ pub(crate) async fn cmd_rebuild_fts(db_url: String) -> anyhow::Result<()> {
 
 /// `forgekeep backup-db` — create a consistent SQLite backup.
 pub(crate) async fn cmd_backup_db(
-    db_url: String,
+    db_url: Option<String>,
+    config: Option<String>,
     output: String,
     force: bool,
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
+    // The worst case of the ignored-config class: with the old clap default, a
+    // `backup-db` that forgot `--db-url` inside the container `VACUUM INTO`'d a
+    // freshly-created empty database and reported success. Discovered only on
+    // restore.
+    let db_url = resolve_db_url(db_url, config)?;
     admin::backup_sqlite_db(&db_url, &PathBuf::from(output), force).await?;
     Ok(())
 }
 
 /// `forgekeep restore-db` — restore a SQLite database from a backup.
-pub(crate) fn cmd_restore_db(db_url: String, input: String, force: bool) -> anyhow::Result<()> {
+pub(crate) fn cmd_restore_db(
+    db_url: Option<String>,
+    config: Option<String>,
+    input: String,
+    force: bool,
+) -> anyhow::Result<()> {
     init_cli_logging();
 
+    let db_url = resolve_db_url(db_url, config)?;
     admin::restore_sqlite_db(&db_url, &PathBuf::from(input), force)?;
     Ok(())
 }
@@ -81,12 +129,14 @@ pub(crate) fn cmd_restore_db(db_url: String, input: String, force: bool) -> anyh
 pub(crate) fn cmd_create_repo(
     owner: String,
     name: String,
-    repo_root: String,
+    repo_root: Option<String>,
+    config: Option<String>,
 ) -> anyhow::Result<()> {
     // Simple logging for create-repo command
     init_cli_logging();
 
-    let repo_root = PathBuf::from(&repo_root);
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
     let repo_dir = repo_root.join(format!("{}/{}.git", owner, name));
     std::fs::create_dir_all(&repo_dir)?;
 
@@ -110,8 +160,9 @@ pub(crate) async fn cmd_import(
     target_owner: String,
     target_name: Option<String>,
     token: Option<String>,
-    repo_root: String,
-    db_url: String,
+    repo_root: Option<String>,
+    db_url: Option<String>,
+    config: Option<String>,
     skip_repo: bool,
     skip_issues: bool,
     skip_prs: bool,
@@ -121,6 +172,8 @@ pub(crate) async fn cmd_import(
     import_wiki: bool,
 ) -> anyhow::Result<()> {
     init_cli_logging();
+
+    let (db_url, repo_root) = resolve_db_url_and_repo_root(db_url, repo_root, config)?;
 
     // SSRF guard (fast, DNS-free): reject an internal/loopback/metadata host or a
     // non-git transport (file://, ext::) before doing any work. The background
@@ -177,7 +230,7 @@ pub(crate) async fn cmd_import(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = rg_db::connect(&db_url).await?;
+    let db = dbconn::connect(&db_url).await?;
     rg_db::run_migrations(&db).await?;
 
     // Verify platform is valid
@@ -336,6 +389,7 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
             repo,
             pkg_type,
             db_url,
+            config,
         } => {
             if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
                 anyhow::bail!(
@@ -345,11 +399,12 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
                 );
             }
 
+            let db_url = resolve_db_url(db_url, config)?;
             tracing::info!(
                 "Connecting to database: {}",
                 rg_db::redact_database_url(&db_url)
             );
-            let db = rg_db::connect(&db_url).await?;
+            let db = dbconn::connect(&db_url).await?;
             rg_db::run_migrations(&db).await?;
 
             match rg_core::package_registry::service::list_packages(&db, &owner, &repo, &pkg_type)
@@ -383,12 +438,15 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
 /// `forgekeep index-repo` — index a repository for code search.
 pub(crate) async fn cmd_index_repo(
     repo_slug: String,
-    repo_root: String,
-    db_url: String,
+    repo_root: Option<String>,
+    db_url: Option<String>,
+    config: Option<String>,
     ref_name: Option<String>,
 ) -> anyhow::Result<()> {
     // Simple logging for index-repo command
     init_cli_logging();
+
+    let (db_url, repo_root) = resolve_db_url_and_repo_root(db_url, repo_root, config)?;
 
     // Parse owner/name from repo_slug
     let parts: Vec<&str> = repo_slug.splitn(2, '/').collect();
@@ -402,7 +460,7 @@ pub(crate) async fn cmd_index_repo(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = rg_db::connect(&db_url).await?;
+    let db = dbconn::connect(&db_url).await?;
 
     // Find owner by username
     let owner = rg_db::ops::user_ops::find_by_username(&db, owner_username)

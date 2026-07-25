@@ -1,5 +1,10 @@
-//! `forgekeep serve` subcommand: TOML configuration model, config resolution,
-//! validation, and the HTTP + SSH server bootstrap.
+//! `forgekeep serve` subcommand: startup validation and the HTTP + SSH server
+//! bootstrap.
+//!
+//! The TOML model and the `CLI arg > config file > built-in default` resolution
+//! live in [`crate::config`], shared with every other subcommand — while they
+//! were private to this module, `migrate` / `backup-db` / `import` and friends
+//! had no way to read `[database].url` or `[server].repo_root` at all.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -7,333 +12,13 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use crate::admin::validate_jwt_secret;
+use crate::config::{
+    default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
+    default_git_stream_timeout, default_git_timeout, ensure_regular_file, load_config_file,
+    resolve_settings, CliSettings, ResolvedSettings, DEFAULT_LOG_MAX_SIZE_MB,
+};
+use crate::dbconn;
 use crate::telemetry;
-
-/// TOML configuration file structure.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct ConfigFile {
-    #[serde(default)]
-    server: ServerConfig,
-    #[serde(default)]
-    database: DatabaseConfig,
-    #[serde(default)]
-    auth: AuthConfig,
-    #[serde(default)]
-    ci: CiConfig,
-    #[serde(default)]
-    releases: ReleasesConfig,
-    #[serde(default)]
-    rate_limit: RateLimitConfig,
-    #[serde(default)]
-    smtp: SmtpConfig,
-    #[serde(default)]
-    tls: TlsConfig,
-    #[serde(default)]
-    logging: LoggingConfig,
-    #[serde(default)]
-    audit: AuditConfig,
-    #[serde(default)]
-    timeouts: TimeoutConfig,
-    #[serde(default)]
-    webhooks: WebhooksConfig,
-    #[serde(default)]
-    observability: ObservabilityConfig,
-    /// Server external URL (e.g., "https://git.example.com"). Used for SSO callbacks.
-    #[serde(default)]
-    external_url: Option<String>,
-}
-
-// No `#[allow(dead_code)]` here on purpose: every field below must actually be
-// consumed by `resolve_settings` / `run_serve`. If a key is added to the struct
-// (and to `forgekeep.example.toml`) but never wired up, the dead-code lint says
-// so at build time instead of the operator finding out that their setting is
-// silently ignored.
-#[derive(Debug, serde::Deserialize, Default)]
-struct ServerConfig {
-    repo_root: Option<String>,
-    http_addr: Option<String>,
-    ssh_addr: Option<String>,
-    host_key: Option<String>,
-    /// External-facing URL for SSO callbacks and links (e.g., "https://git.example.com")
-    external_url: Option<String>,
-    /// Grace window (seconds) for draining in-flight requests and the CI-log
-    /// queue on SIGTERM/ctrl_c before the process is forced down (default: 30).
-    shutdown_grace_secs: Option<u64>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct DatabaseConfig {
-    url: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
-struct AuthConfig {
-    jwt_secret: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct CiConfig {
-    #[serde(default)]
-    docker: Option<bool>,
-    #[serde(default)]
-    external_runners: Option<bool>,
-    /// Allow imageless CI jobs to run as a shell on the host (default false).
-    #[serde(default)]
-    allow_host_runner: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
-struct ReleasesConfig {
-    /// Enable opt-in Ed25519 provenance attestation of release assets (default
-    /// false). Also settable via `FORGEKEEP_ATTESTATION_ENABLED=1`, which wins.
-    #[serde(default)]
-    attestation_enabled: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct RateLimitConfig {
-    max: Option<u32>,
-    window_secs: Option<u64>,
-    #[serde(default)]
-    trusted_proxies: Vec<String>,
-    /// Hard cap on distinct client keys the limiter tracks (memory guard).
-    max_keys: Option<usize>,
-    /// Stricter per-IP cap for credential endpoints (register/login).
-    auth_max: Option<u32>,
-    /// Window (seconds) for the credential-endpoint limiter.
-    auth_window_secs: Option<u64>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct SmtpConfig {
-    host: Option<String>,
-    port: Option<u16>,
-    user: Option<String>,
-    pass: Option<String>,
-    from: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct TlsConfig {
-    cert: Option<String>,
-    key: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct LoggingConfig {
-    file: Option<String>,
-    max_size_mb: Option<u64>,
-    max_files: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct AuditConfig {
-    enabled: Option<bool>,
-    archive_dir: Option<String>,
-    archive_after_days: Option<i64>,
-    interval_minutes: Option<u64>,
-    batch_size: Option<u64>,
-}
-
-/// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
-/// fields optional; with no endpoint set (here or via the `OTEL_EXPORTER_OTLP_*`
-/// env vars) OTel tracing stays off and only Prometheus `/metrics` + logs run.
-#[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
-struct ObservabilityConfig {
-    /// OTLP/HTTP endpoint, e.g. "http://localhost:4318" (the `/v1/traces` path is
-    /// appended automatically). Overridden by `OTEL_EXPORTER_OTLP_ENDPOINT` /
-    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. Unset ⇒ tracing disabled.
-    otlp_endpoint: Option<String>,
-    /// `service.name` resource attribute (default "forgekeep"). Overridden by
-    /// `OTEL_SERVICE_NAME`.
-    service_name: Option<String>,
-    /// Head sampling ratio in 0.0..=1.0 (default 1.0 = sample every trace).
-    sample_ratio: Option<f64>,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
-struct WebhooksConfig {
-    /// Shared secret for verifying HMAC-SHA256 signatures on *inbound* external
-    /// webhooks (`/webhooks/external/*`). Unset = signature checking disabled
-    /// (endpoints rely on JWT/PAT auth alone). Also settable via the
-    /// `FORGEKEEP_EXTERNAL_WEBHOOK_SECRET` environment variable, which wins.
-    external_secret: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct TimeoutConfig {
-    /// CI job timeout in seconds (default: 3600 = 1 hour).
-    #[serde(default = "default_job_timeout")]
-    job_secs: u64,
-    /// Git CLI command timeout in seconds (default: 120).
-    #[serde(default = "default_git_timeout")]
-    git_cmd_secs: u64,
-    /// Wall-clock timeout in seconds for the streaming git transport —
-    /// upload-pack (clone/fetch) and receive-pack (push). Bounds a hung or
-    /// pathologically slow `git` subprocess so it can't hold a connection +
-    /// process indefinitely. More generous than `git_cmd_secs` because pack
-    /// generation over a large repo is legitimately slower than a metadata
-    /// command. 0 disables the bound (default: 300).
-    #[serde(default = "default_git_stream_timeout")]
-    git_stream_secs: u64,
-    /// Idle timeout in seconds for the streaming git transport, layered on top
-    /// of `git_stream_secs`. The git stream is killed if it makes no read/write
-    /// progress for this long — catching a slow-drip push/fetch that dribbles
-    /// bytes to stay under the wall-clock budget. Applies to SSH (stream
-    /// wrapper) and HTTP (request-body buffering). 0 disables the idle watchdog
-    /// (default: 30).
-    #[serde(default = "default_git_idle_timeout")]
-    git_idle_secs: u64,
-    /// Database connect timeout in seconds (default: 10).
-    #[serde(default = "default_db_connect_timeout")]
-    db_connect_secs: u64,
-    /// Database idle timeout in seconds (default: 600).
-    #[serde(default = "default_db_idle_timeout")]
-    db_idle_secs: u64,
-}
-
-// Hand-written so an *entirely omitted* `[timeouts]` table (which routes through
-// `TimeoutConfig::default()` via the parent `#[serde(default)]`, NOT through the
-// per-field `#[serde(default = ...)]` functions) still lands on the documented
-// non-zero defaults. A `#[derive(Default)]` here would silently zero every knob
-// — a 0 acquire/idle timeout makes the DB pool churn/unusable and a 0 git
-// timeout makes every git command elapse instantly.
-impl Default for TimeoutConfig {
-    fn default() -> Self {
-        Self {
-            job_secs: default_job_timeout(),
-            git_cmd_secs: default_git_timeout(),
-            git_stream_secs: default_git_stream_timeout(),
-            git_idle_secs: default_git_idle_timeout(),
-            db_connect_secs: default_db_connect_timeout(),
-            db_idle_secs: default_db_idle_timeout(),
-        }
-    }
-}
-
-fn default_job_timeout() -> u64 {
-    3600
-}
-fn default_git_timeout() -> u64 {
-    120
-}
-fn default_git_stream_timeout() -> u64 {
-    300
-}
-fn default_git_idle_timeout() -> u64 {
-    30
-}
-fn default_db_connect_timeout() -> u64 {
-    10
-}
-fn default_db_idle_timeout() -> u64 {
-    600
-}
-
-/// Check that `path` is an existing, regular file *before* something tries to
-/// read it, so a bad path fails with a message that names the path and says
-/// what to do about it.
-///
-/// The motivating incident: a Docker bind-mount whose source `forgekeep.toml`
-/// did not exist made the daemon auto-create a **directory** at the mount
-/// point, and `read_to_string` reported nothing but `Is a directory (os error
-/// 21)` — no path, no cause. The container crash-looped 268 times on it.
-fn ensure_regular_file(path: &std::path::Path, what: &str, hint: &str) -> anyhow::Result<()> {
-    let shown = path.display();
-    match std::fs::metadata(path) {
-        Ok(md) if md.is_dir() => anyhow::bail!(
-            "{what} path `{shown}` is a directory, not a file — a Docker bind-mount \
-             likely auto-created it because the source file was missing; {hint}"
-        ),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("{what} `{shown}` does not exist — {hint}")
-        }
-        Err(e) => Err(anyhow::Error::new(e))
-            .with_context(|| format!("failed to stat {what} `{shown}`")),
-    }
-}
-
-/// Extract the on-disk file a SQLite URL points at, or `None` for a
-/// non-SQLite/in-memory URL. Used only to turn an opaque "unable to open
-/// database file" into a message naming the directory that has to be writable.
-fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
-    let rest = db_url
-        .strip_prefix("sqlite://")
-        .or_else(|| db_url.strip_prefix("sqlite:"))?;
-    let path = rest.split('?').next().unwrap_or("");
-    if path.is_empty() || path == ":memory:" {
-        return None;
-    }
-    Some(PathBuf::from(path))
-}
-
-/// True when the process can create a file in `dir` right now.
-fn dir_is_writable(dir: &std::path::Path) -> bool {
-    let probe = dir.join(".forgekeep_db_write_test");
-    match std::fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// Attach the uid/ownership diagnostic to a SQLite connection failure caused by
-/// an unwritable data directory.
-///
-/// SQLite reports that case as `unable to open database file` with no path and
-/// no reason, and it is the single most likely first-boot failure of a
-/// container whose `/data` bind-mount is owned by the host uid: the WAL and
-/// `-shm` sidecar files need write access to the *directory*, not just the
-/// database file. Non-permission failures (corrupt file, bad URL, Postgres,
-/// MySQL) are returned untouched.
-fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
-    let Some(path) = sqlite_file_path(db_url) else {
-        return error;
-    };
-    let dir = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    if dir_is_writable(dir) {
-        return error;
-    }
-
-    let mut context = format!(
-        "SQLite database `{}` could not be opened: `{}` is not writable by the server, and SQLite \
-         needs to create the `-wal` / `-shm` sidecar files next to the database",
-        path.display(),
-        dir.display()
-    );
-    if let Some(hint) = rg_core::platform::fs::ownership_hint(dir) {
-        context.push_str(&format!("\n  hint: {hint}"));
-    }
-    error.context(context)
-}
-
-/// Remediation appended to every `--config` failure: the file the deployer was
-/// supposed to create in the first place.
-const CONFIG_FILE_HINT: &str =
-    "create it first: `cp forgekeep.example.toml forgekeep.toml` (and bind-mount that file, \
-     not a directory)";
-
-fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
-    ensure_regular_file(std::path::Path::new(path), "config file", CONFIG_FILE_HINT)?;
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file `{path}`"))?;
-    let config: ConfigFile = toml::from_str(&content)
-        .with_context(|| format!("failed to parse config file `{path}` as TOML"))?;
-    tracing::info!(path = %path, "Loaded configuration file");
-    Ok(config)
-}
 
 /// Wait for the first OS shutdown signal: ctrl_c (SIGINT) on all platforms,
 /// plus SIGTERM on Unix (the signal `kill`/systemd/Docker send on stop).
@@ -487,105 +172,6 @@ fn validate_numeric_ranges(
     require_positive("rate_limit.window_secs", rate_limit_window_secs)?;
     require_positive("rate_limit.auth_window_secs", rate_limit_auth_window_secs)?;
     Ok(())
-}
-
-/// Built-in defaults for the settings that exist both as a CLI flag and as a
-/// config-file key. They live here rather than in clap's `default_value` on
-/// purpose: a clap default is indistinguishable from a value the operator
-/// typed, so with one the config file could never win over "the flag was not
-/// passed" — which is exactly why `[server].repo_root` and `[database].url`
-/// were silently ignored for every `forgekeep serve --config …` deployment.
-const DEFAULT_REPO_ROOT: &str = "./repos";
-const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
-const DEFAULT_SSH_ADDR: &str = "0.0.0.0:2222";
-const DEFAULT_DB_URL: &str = "sqlite://./forgekeep.db?mode=rwc";
-const DEFAULT_SMTP_PORT: u16 = 587;
-const DEFAULT_RATE_LIMIT_MAX: u32 = 0;
-const DEFAULT_RATE_LIMIT_WINDOW: u64 = 60;
-const DEFAULT_LOG_MAX_SIZE_MB: u64 = 10;
-const DEFAULT_LOG_MAX_FILES: usize = 5;
-
-/// The CLI half of every dual-source knob, resolved against the config file by
-/// [`resolve_settings`]. `None` means "flag not passed" — never a default.
-#[derive(Debug, Default)]
-struct CliSettings {
-    repo_root: Option<String>,
-    http_addr: Option<String>,
-    ssh_addr: Option<String>,
-    host_key: Option<String>,
-    db_url: Option<String>,
-    rate_limit_max: Option<u32>,
-    rate_limit_window: Option<u64>,
-    smtp_port: Option<u16>,
-    log_max_size_mb: Option<u64>,
-    log_max_files: Option<usize>,
-}
-
-/// The same knobs after `CLI arg > config file > built-in default` has been
-/// applied.
-#[derive(Debug, PartialEq, Eq)]
-struct ResolvedSettings {
-    repo_root: String,
-    http_addr: String,
-    ssh_addr: String,
-    host_key: Option<String>,
-    db_url: String,
-    rate_limit_max: u32,
-    rate_limit_window: u64,
-    smtp_port: u16,
-    log_max_size_mb: u64,
-    log_max_files: usize,
-}
-
-/// Apply the documented `CLI arg > config file > built-in default` precedence
-/// to every setting that has both a flag and a config key.
-///
-/// Extracted as a pure function so the wiring (which config key feeds which
-/// flag) is unit-testable without booting a server — the original bug was a
-/// missing wire, not a bad value.
-fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> ResolvedSettings {
-    let server = cfg.map(|c| &c.server);
-    ResolvedSettings {
-        repo_root: cli
-            .repo_root
-            .or_else(|| server.and_then(|s| s.repo_root.clone()))
-            .unwrap_or_else(|| DEFAULT_REPO_ROOT.to_string()),
-        http_addr: cli
-            .http_addr
-            .or_else(|| server.and_then(|s| s.http_addr.clone()))
-            .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string()),
-        ssh_addr: cli
-            .ssh_addr
-            .or_else(|| server.and_then(|s| s.ssh_addr.clone()))
-            .unwrap_or_else(|| DEFAULT_SSH_ADDR.to_string()),
-        host_key: cli
-            .host_key
-            .or_else(|| server.and_then(|s| s.host_key.clone())),
-        db_url: cli
-            .db_url
-            .or_else(|| cfg.and_then(|c| c.database.url.clone()))
-            .unwrap_or_else(|| DEFAULT_DB_URL.to_string()),
-        rate_limit_max: cli
-            .rate_limit_max
-            .or_else(|| cfg.and_then(|c| c.rate_limit.max))
-            .unwrap_or(DEFAULT_RATE_LIMIT_MAX),
-        rate_limit_window: cli
-            .rate_limit_window
-            .or_else(|| cfg.and_then(|c| c.rate_limit.window_secs))
-            .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW),
-        smtp_port: cli
-            .smtp_port
-            .or_else(|| cfg.and_then(|c| c.smtp.port))
-            .unwrap_or(DEFAULT_SMTP_PORT),
-        log_max_size_mb: cli
-            .log_max_size_mb
-            .or_else(|| cfg.and_then(|c| c.logging.max_size_mb))
-            .unwrap_or(DEFAULT_LOG_MAX_SIZE_MB),
-        log_max_files: cli
-            .log_max_files
-            .or_else(|| cfg.and_then(|c| c.logging.max_files))
-            .unwrap_or(DEFAULT_LOG_MAX_FILES),
-    }
 }
 
 /// Initialise and run the ForgeKeep server (HTTP + SSH).
@@ -874,13 +460,12 @@ pub(crate) async fn run_serve(
         "Connecting to database: {}",
         rg_db::redact_database_url(&resolved_db_url)
     );
-    let db = rg_db::connect_with_timeouts(
+    let db = dbconn::connect_with_timeouts(
         &resolved_db_url,
         resolved_db_connect_timeout,
         resolved_db_idle_timeout,
     )
-    .await
-    .map_err(|e| annotate_db_open_error(e, &resolved_db_url))?;
+    .await?;
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
 
@@ -1055,228 +640,8 @@ pub(crate) async fn run_serve(
 }
 
 #[cfg(test)]
-mod config_tests {
-    use super::{CliSettings, ConfigFile};
-
-    /// `[server].repo_root` / `[database].url` from the config file were parsed
-    /// and then thrown away: `run_serve` assigned the clap value verbatim. A
-    /// `forgekeep serve --config …` with no flags therefore wrote repos and the
-    /// SQLite file into `./repos` / `./forgekeep.db` relative to the working
-    /// directory (inside the container: an ephemeral `/app`), not where the
-    /// config said.
-    #[test]
-    fn config_file_locations_apply_when_no_cli_flag_is_passed() {
-        let config: ConfigFile = toml::from_str(
-            r#"
-[server]
-repo_root = "/srv/forgekeep/repos"
-http_addr = "127.0.0.1:9000"
-ssh_addr = "127.0.0.1:2323"
-host_key = "/srv/forgekeep/ssh_host_key"
-
-[database]
-url = "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc"
-
-[smtp]
-port = 2525
-
-[rate_limit]
-max = 500
-window_secs = 30
-
-[logging]
-max_size_mb = 42
-max_files = 7
-"#,
-        )
-        .unwrap();
-
-        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
-
-        assert_eq!(resolved.repo_root, "/srv/forgekeep/repos");
-        assert_eq!(resolved.db_url, "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc");
-        assert_eq!(resolved.http_addr, "127.0.0.1:9000");
-        assert_eq!(resolved.ssh_addr, "127.0.0.1:2323");
-        assert_eq!(
-            resolved.host_key.as_deref(),
-            Some("/srv/forgekeep/ssh_host_key")
-        );
-        assert_eq!(resolved.smtp_port, 2525);
-        assert_eq!(resolved.rate_limit_max, 500);
-        assert_eq!(resolved.rate_limit_window, 30);
-        assert_eq!(resolved.log_max_size_mb, 42);
-        assert_eq!(resolved.log_max_files, 7);
-    }
-
-    /// The documented order is `CLI args > config file > defaults`
-    /// (ARCHITECTURE.md §8). A passed flag must beat the config file even when
-    /// the value it carries happens to equal the built-in default — which is
-    /// why none of these flags may have a clap `default_value`.
-    #[test]
-    fn cli_flags_win_over_the_config_file() {
-        let config: ConfigFile = toml::from_str(
-            r#"
-[server]
-repo_root = "/from/config"
-http_addr = "10.0.0.1:1111"
-ssh_addr = "10.0.0.1:2222"
-host_key = "/from/config/key"
-
-[database]
-url = "postgres://config/db"
-
-[smtp]
-port = 2525
-
-[rate_limit]
-max = 500
-window_secs = 30
-
-[logging]
-max_size_mb = 42
-max_files = 7
-"#,
-        )
-        .unwrap();
-
-        let cli = CliSettings {
-            repo_root: Some("/from/cli".to_string()),
-            http_addr: Some(super::DEFAULT_HTTP_ADDR.to_string()),
-            ssh_addr: Some("0.0.0.0:9999".to_string()),
-            host_key: Some("/from/cli/key".to_string()),
-            db_url: Some("mysql://cli/db".to_string()),
-            // Exactly the built-in defaults: an explicit `--rate-limit-max 0`
-            // disables the limiter even though the config file enables it.
-            rate_limit_max: Some(super::DEFAULT_RATE_LIMIT_MAX),
-            rate_limit_window: Some(super::DEFAULT_RATE_LIMIT_WINDOW),
-            smtp_port: Some(super::DEFAULT_SMTP_PORT),
-            log_max_size_mb: Some(super::DEFAULT_LOG_MAX_SIZE_MB),
-            log_max_files: Some(super::DEFAULT_LOG_MAX_FILES),
-        };
-
-        let resolved = super::resolve_settings(cli, Some(&config));
-
-        assert_eq!(resolved.repo_root, "/from/cli");
-        assert_eq!(resolved.db_url, "mysql://cli/db");
-        assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
-        assert_eq!(resolved.ssh_addr, "0.0.0.0:9999");
-        assert_eq!(resolved.host_key.as_deref(), Some("/from/cli/key"));
-        assert_eq!(resolved.smtp_port, super::DEFAULT_SMTP_PORT);
-        assert_eq!(resolved.rate_limit_max, super::DEFAULT_RATE_LIMIT_MAX);
-        assert_eq!(resolved.rate_limit_window, super::DEFAULT_RATE_LIMIT_WINDOW);
-        assert_eq!(resolved.log_max_size_mb, super::DEFAULT_LOG_MAX_SIZE_MB);
-        assert_eq!(resolved.log_max_files, super::DEFAULT_LOG_MAX_FILES);
-    }
-
-    /// Bottom of the chain: no flag, no config file at all.
-    #[test]
-    fn built_in_defaults_apply_without_cli_or_config() {
-        let resolved = super::resolve_settings(CliSettings::default(), None);
-
-        assert_eq!(resolved.repo_root, super::DEFAULT_REPO_ROOT);
-        assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
-        assert_eq!(resolved.ssh_addr, super::DEFAULT_SSH_ADDR);
-        assert_eq!(resolved.host_key, None);
-        assert_eq!(resolved.db_url, super::DEFAULT_DB_URL);
-        assert_eq!(resolved.smtp_port, super::DEFAULT_SMTP_PORT);
-        assert_eq!(resolved.rate_limit_max, super::DEFAULT_RATE_LIMIT_MAX);
-        assert_eq!(resolved.rate_limit_window, super::DEFAULT_RATE_LIMIT_WINDOW);
-        assert_eq!(resolved.log_max_size_mb, super::DEFAULT_LOG_MAX_SIZE_MB);
-        assert_eq!(resolved.log_max_files, super::DEFAULT_LOG_MAX_FILES);
-    }
-
-    /// A config file that sets none of these keys must not shadow the defaults
-    /// with empty values.
-    #[test]
-    fn an_empty_config_file_falls_through_to_the_defaults() {
-        let config: ConfigFile = toml::from_str("[ci]\ndocker = true\n").unwrap();
-        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
-
-        assert_eq!(resolved.repo_root, super::DEFAULT_REPO_ROOT);
-        assert_eq!(resolved.db_url, super::DEFAULT_DB_URL);
-        assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
-        assert_eq!(resolved.ssh_addr, super::DEFAULT_SSH_ADDR);
-    }
-
-    /// The shipped example is the file operators copy — the values it advertises
-    /// must be the values the server actually boots with.
-    #[test]
-    fn example_config_locations_are_actually_applied() {
-        let config: ConfigFile =
-            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
-        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
-
-        assert_eq!(resolved.repo_root, "./repos");
-        assert_eq!(resolved.db_url, "sqlite://./forgekeep.db?mode=rwc");
-        assert_eq!(resolved.http_addr, "0.0.0.0:8080");
-        assert_eq!(resolved.ssh_addr, "0.0.0.0:2222");
-    }
-
-    #[test]
-    fn config_path_pointing_at_a_directory_names_path_and_remediation() {
-        // The exact crash-loop shape: `docker compose` bind-mounted a missing
-        // `forgekeep.toml`, so the daemon created a directory there and the
-        // server died with a bare `Is a directory (os error 21)`.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forgekeep.toml");
-        std::fs::create_dir(&path).unwrap();
-
-        let err = super::load_config_file(path.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
-        assert!(err.contains("is a directory"), "no cause: {err}");
-        assert!(err.contains("bind-mount"), "no diagnosis: {err}");
-        assert!(
-            err.contains("cp forgekeep.example.toml forgekeep.toml"),
-            "no remediation: {err}"
-        );
-    }
-
-    #[test]
-    fn missing_config_file_names_path_and_remediation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.toml");
-
-        let err = super::load_config_file(path.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
-        assert!(err.contains("does not exist"), "no cause: {err}");
-        assert!(
-            err.contains("cp forgekeep.example.toml forgekeep.toml"),
-            "no remediation: {err}"
-        );
-    }
-
-    #[test]
-    fn malformed_config_file_names_the_path_it_failed_to_parse() {
-        // A TOML syntax error otherwise surfaces as a bare parser message with
-        // no clue about *which* file the operator has to fix.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("broken.toml");
-        std::fs::write(&path, "[server\nrepo_root = \"/data/repos\"\n").unwrap();
-
-        let err = format!(
-            "{:#}",
-            super::load_config_file(path.to_str().unwrap()).unwrap_err()
-        );
-
-        assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
-        assert!(err.contains("as TOML"), "no parse context: {err}");
-    }
-
-    #[test]
-    fn a_readable_config_file_still_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forgekeep.toml");
-        std::fs::write(&path, "[rate_limit]\nmax = 0\n").unwrap();
-
-        let config = super::load_config_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(config.timeouts.db_connect_secs, 10);
-    }
+mod serve_tests {
+    use crate::config::{CliSettings, ConfigFile};
 
     #[test]
     fn tls_paths_that_are_directories_are_rejected_before_boot() {
@@ -1306,46 +671,6 @@ max_files = 7
         assert!(err.contains("does not exist"), "unexpected: {err}");
     }
 
-    /// The shipped container config must keep every persistent path inside the
-    /// one bind-mounted directory — a stray relative path would write into the
-    /// image's ephemeral `/app` and vanish on the next `docker compose up`.
-    #[test]
-    fn docker_example_config_keeps_all_state_in_the_data_directory() {
-        let config: ConfigFile =
-            toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
-
-        let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
-        assert_eq!(resolved.repo_root, "/data/repos");
-        assert_eq!(resolved.db_url, "sqlite:///data/forgekeep.db?mode=rwc");
-        assert_eq!(resolved.host_key.as_deref(), Some("/data/ssh_host_key"));
-        // No log file: a container logs to stdout, otherwise `docker compose
-        // logs` shows nothing and the operator debugs a silent box.
-        assert!(config.logging.file.is_none());
-        assert_eq!(config.audit.archive_dir.as_deref(), Some("/data/audit-archive"));
-        // The JWT secret belongs in deploy/.env, never in a file that may be
-        // committed.
-        assert!(config.auth.jwt_secret.is_none());
-    }
-
-    #[test]
-    fn sqlite_urls_resolve_to_the_file_the_directory_check_needs() {
-        use std::path::PathBuf;
-
-        assert_eq!(
-            super::sqlite_file_path("sqlite:///data/forgekeep.db?mode=rwc"),
-            Some(PathBuf::from("/data/forgekeep.db"))
-        );
-        assert_eq!(
-            super::sqlite_file_path("sqlite://./forgekeep.db"),
-            Some(PathBuf::from("./forgekeep.db"))
-        );
-        assert_eq!(super::sqlite_file_path("sqlite::memory:"), None);
-        assert_eq!(
-            super::sqlite_file_path("postgres://user:pw@localhost/forgekeep"),
-            None
-        );
-    }
-
     /// The container runs from `WORKDIR /app` with its volume on `/data`, so
     /// the old cwd-relative `./data/audit-archive` default put the audit
     /// archive inside the image layer — deleted on the next recreate, while the
@@ -1370,62 +695,6 @@ max_files = 7
             super::default_audit_archive_dir(Path::new("/repos")),
             PathBuf::from("./data/audit-archive")
         );
-    }
-
-    /// The `/data` bind-mount case: the directory is unwritable, so the opaque
-    /// SQLite failure gains the path plus the uid to `chown` to.
-    #[cfg(unix)]
-    #[test]
-    fn unwritable_sqlite_directory_is_named_in_the_connect_error() {
-        use std::os::unix::fs::PermissionsExt;
-
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root writes through the mode bits
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", data.display());
-
-        let annotated = format!(
-            "{:#}",
-            super::annotate_db_open_error(anyhow::anyhow!("unable to open database file"), &url)
-        );
-
-        assert!(annotated.contains("unable to open database file"), "{annotated}");
-        assert!(annotated.contains("is not writable"), "{annotated}");
-        assert!(annotated.contains("this process runs as uid="), "{annotated}");
-        assert!(
-            annotated.contains("chmod") || annotated.contains("chown"),
-            "{annotated}"
-        );
-
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    /// A corrupt database or a bad URL must not be blamed on permissions.
-    #[test]
-    fn writable_sqlite_directory_leaves_the_connect_error_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", dir.path().display());
-
-        let annotated = format!(
-            "{:#}",
-            super::annotate_db_open_error(anyhow::anyhow!("file is not a database"), &url)
-        );
-
-        assert_eq!(annotated, "file is not a database");
-    }
-
-    #[test]
-    fn example_config_includes_valid_audit_archive_settings() {
-        let config: ConfigFile =
-            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
-        assert_eq!(config.audit.enabled, Some(true));
-        assert_eq!(config.audit.archive_after_days, Some(90));
-        assert_eq!(config.audit.interval_minutes, Some(60));
-        assert_eq!(config.audit.batch_size, Some(1_000));
     }
 
     #[test]
@@ -1477,5 +746,25 @@ max_files = 7
             60,
         )
         .is_ok());
+    }
+
+    /// `serve` shares one resolution path with the one-shot subcommands, so the
+    /// server and a later `forgekeep migrate --config <same file>` cannot end up
+    /// pointed at two different databases.
+    #[test]
+    fn serve_and_the_one_shot_subcommands_resolve_the_same_database() {
+        let config: ConfigFile =
+            toml::from_str("[database]\nurl = \"postgres://forge@db/forgekeep\"\n[server]\nrepo_root = \"/data/repos\"\n")
+                .unwrap();
+
+        let resolved = crate::config::resolve_settings(CliSettings::default(), Some(&config));
+        assert_eq!(
+            resolved.db_url,
+            crate::config::resolve_db_url(None, Some(&config))
+        );
+        assert_eq!(
+            resolved.repo_root,
+            crate::config::resolve_repo_root(None, Some(&config))
+        );
     }
 }

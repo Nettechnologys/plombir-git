@@ -2,14 +2,20 @@
 //!
 //! The command surface is defined in [`cli`]; each subcommand's implementation
 //! lives in a focused module:
-//!  - [`serve`] — the `serve` command (config model + HTTP/SSH bootstrap)
+//!  - [`serve`] — the `serve` command (startup validation + HTTP/SSH bootstrap)
 //!  - [`runner`] — the `runner` command (CI job polling + execution)
 //!  - [`commands`] — the remaining one-shot subcommands
 //!  - [`admin`] — SQLite backup/restore + JWT secret helpers
+//!  - [`config`] — the TOML config model + `CLI > config > default` resolution,
+//!    shared by `serve` and every one-shot subcommand
+//!  - [`dbconn`] — the single database-connect path, with the SQLite
+//!    unwritable-directory diagnostic
 
 mod admin;
 mod cli;
 mod commands;
+mod config;
+mod dbconn;
 mod runner;
 mod serve;
 mod telemetry;
@@ -77,29 +83,34 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Migrate { db_url } => commands::cmd_migrate(db_url).await?,
+        Commands::Migrate { db_url, config } => commands::cmd_migrate(db_url, config).await?,
 
         Commands::GenSecret => commands::cmd_gen_secret(),
 
-        Commands::RebuildFts { db_url } => commands::cmd_rebuild_fts(db_url).await?,
+        Commands::RebuildFts { db_url, config } => {
+            commands::cmd_rebuild_fts(db_url, config).await?
+        }
 
         Commands::BackupDb {
             db_url,
+            config,
             output,
             force,
-        } => commands::cmd_backup_db(db_url, output, force).await?,
+        } => commands::cmd_backup_db(db_url, config, output, force).await?,
 
         Commands::RestoreDb {
             db_url,
+            config,
             input,
             force,
-        } => commands::cmd_restore_db(db_url, input, force)?,
+        } => commands::cmd_restore_db(db_url, config, input, force)?,
 
         Commands::CreateRepo {
             owner,
             name,
             repo_root,
-        } => commands::cmd_create_repo(owner, name, repo_root)?,
+            config,
+        } => commands::cmd_create_repo(owner, name, repo_root, config)?,
 
         Commands::Runner {
             server,
@@ -117,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
             token,
             repo_root,
             db_url,
+            config,
             skip_repo,
             skip_issues,
             skip_prs,
@@ -133,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                 token,
                 repo_root,
                 db_url,
+                config,
                 skip_repo,
                 skip_issues,
                 skip_prs,
@@ -150,8 +163,9 @@ async fn main() -> anyhow::Result<()> {
             repo_slug,
             repo_root,
             db_url,
+            config,
             ref_name,
-        } => commands::cmd_index_repo(repo_slug, repo_root, db_url, ref_name).await?,
+        } => commands::cmd_index_repo(repo_slug, repo_root, db_url, config, ref_name).await?,
     }
 
     Ok(())

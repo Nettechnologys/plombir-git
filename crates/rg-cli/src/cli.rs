@@ -47,8 +47,14 @@ pub(crate) enum PackageCmd {
         pkg_type: String,
 
         /// Database URL for direct DB access (SQLite, PostgreSQL, or MySQL)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
     },
 }
 
@@ -59,6 +65,12 @@ pub(crate) struct Cli {
     pub(crate) command: Commands,
 }
 
+/// Every subcommand that reads `[database].url` or `[server].repo_root` takes
+/// its own `--config`, and none of the flags those keys feed carries a clap
+/// `default_value` — see the note on [`Commands::Serve`]. Without that, a
+/// deployment whose config file points at Postgres (or at `/data`) had
+/// `forgekeep migrate` quietly create and migrate a *second*, empty
+/// `./forgekeep.db`, and `forgekeep backup-db` "successfully" back up nothing.
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Commands {
@@ -69,7 +81,7 @@ pub(crate) enum Commands {
     // Hence every such flag is an `Option` with no clap `default_value`: a clap
     // default is indistinguishable from a value the operator typed, so with one
     // the config file could never win over "the flag was not passed". The
-    // defaults live in `serve::DEFAULT_*` and are named in each flag's help.
+    // defaults live in `config::DEFAULT_*` and are named in each flag's help.
     Serve {
         /// Root directory for git repositories [config: [server].repo_root]
         /// [default: ./repos]
@@ -180,8 +192,14 @@ pub(crate) enum Commands {
     /// Run database migrations and exit
     Migrate {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
     },
 
     /// Generate a cryptographically strong JWT secret and print it to stdout.
@@ -195,15 +213,27 @@ pub(crate) enum Commands {
     /// Rebuild or refresh full-text search indexes from main tables
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
     },
 
     /// Create a consistent SQLite database backup.
     BackupDb {
         /// SQLite database URL (e.g. sqlite://./forgekeep.db?mode=rwc)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
 
         /// Output backup file path.
         output: String,
@@ -216,8 +246,14 @@ pub(crate) enum Commands {
     /// Restore a SQLite database file from a backup.
     RestoreDb {
         /// SQLite database URL to restore into.
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
 
         /// Backup file path to restore from.
         input: String,
@@ -236,8 +272,14 @@ pub(crate) enum Commands {
         name: String,
 
         /// Root directory for repositories
-        #[arg(long, default_value = "./repos")]
-        repo_root: String,
+        /// [config: [server].repo_root] [default: ./repos]
+        #[arg(long)]
+        repo_root: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
     },
 
     /// Run as a CI Runner — polls jobs and executes them
@@ -285,12 +327,19 @@ pub(crate) enum Commands {
         token: Option<String>,
 
         /// Root directory for repositories
-        #[arg(long, default_value = "./repos")]
-        repo_root: String,
+        /// [config: [server].repo_root] [default: ./repos]
+        #[arg(long)]
+        repo_root: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
 
         /// Skip importing the repository itself
         #[arg(long)]
@@ -327,12 +376,19 @@ pub(crate) enum Commands {
         repo_slug: String,
 
         /// Root directory for repositories
-        #[arg(long, default_value = "./repos")]
-        repo_root: String,
+        /// [config: [server].repo_root] [default: ./repos]
+        #[arg(long)]
+        repo_root: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        #[arg(long, default_value = "sqlite://./forgekeep.db?mode=rwc")]
-        db_url: String,
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
 
         /// Git ref to index (default: repository's default branch)
         #[arg(long)]
@@ -344,4 +400,149 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         cmd: PackageCmd,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, PackageCmd};
+    use clap::Parser;
+
+    /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
+    /// any of the three.
+    fn knobs(cmd: &Commands) -> (Option<&str>, Option<&str>, Option<&str>) {
+        match cmd {
+            Commands::Serve {
+                db_url,
+                repo_root,
+                config,
+                ..
+            } => (db_url.as_deref(), repo_root.as_deref(), config.as_deref()),
+            Commands::Migrate { db_url, config }
+            | Commands::RebuildFts { db_url, config }
+            | Commands::BackupDb { db_url, config, .. }
+            | Commands::RestoreDb { db_url, config, .. } => {
+                (db_url.as_deref(), None, config.as_deref())
+            }
+            Commands::CreateRepo {
+                repo_root, config, ..
+            } => (None, repo_root.as_deref(), config.as_deref()),
+            Commands::Import {
+                db_url,
+                repo_root,
+                config,
+                ..
+            }
+            | Commands::IndexRepo {
+                db_url,
+                repo_root,
+                config,
+                ..
+            } => (db_url.as_deref(), repo_root.as_deref(), config.as_deref()),
+            Commands::Package {
+                cmd: PackageCmd::List { db_url, config, .. },
+            } => (db_url.as_deref(), None, config.as_deref()),
+            _ => panic!("subcommand under test carries no db_url/repo_root/config"),
+        }
+    }
+
+    /// Every one-shot invocation that has to be able to read the config file,
+    /// with no flags beyond its required positionals.
+    const FLAGLESS_INVOCATIONS: &[&[&str]] = &[
+        &["forgekeep", "serve"],
+        &["forgekeep", "migrate"],
+        &["forgekeep", "rebuild-fts"],
+        &["forgekeep", "backup-db", "out.db"],
+        &["forgekeep", "restore-db", "in.db"],
+        &["forgekeep", "create-repo", "alice", "site"],
+        &[
+            "forgekeep",
+            "import",
+            "github",
+            "https://github.com/alice/site",
+            "--target-owner",
+            "alice",
+        ],
+        &["forgekeep", "index-repo", "alice/site"],
+        &["forgekeep", "package", "list", "alice", "site", "cargo"],
+    ];
+
+    /// The root cause of the ignored-config bug: a clap `default_value` on
+    /// `--db-url` / `--repo-root` makes "flag not passed" indistinguishable from
+    /// a value the operator typed, so the config file can never win. Every knob
+    /// with a config-file equivalent must therefore parse to `None`, and the
+    /// built-in default must live in `crate::config::DEFAULT_*` instead.
+    #[test]
+    fn config_backed_flags_have_no_clap_default() {
+        for argv in FLAGLESS_INVOCATIONS {
+            let cli = Cli::try_parse_from(*argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let (db_url, repo_root, config) = knobs(&cli.command);
+            assert_eq!(
+                db_url, None,
+                "{argv:?} db_url must not carry a clap default"
+            );
+            assert_eq!(
+                repo_root, None,
+                "{argv:?} repo_root must not carry a clap default"
+            );
+            assert_eq!(config, None, "{argv:?} must not invent a config path");
+        }
+    }
+
+    /// The other half of the contract: every one of those subcommands accepts
+    /// `--config`, so a config-only deployment can run them without repeating
+    /// the database URL (and getting it wrong).
+    #[test]
+    fn every_config_backed_subcommand_accepts_a_config_flag() {
+        for argv in FLAGLESS_INVOCATIONS {
+            let mut argv: Vec<&str> = argv.to_vec();
+            argv.extend(["--config", "/etc/forgekeep/forgekeep.toml"]);
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let (_, _, config) = knobs(&cli.command);
+            assert_eq!(config, Some("/etc/forgekeep/forgekeep.toml"), "{argv:?}");
+        }
+    }
+
+    /// The card's acceptance check, end to end through clap, the real config
+    /// loader and the real resolver: `forgekeep migrate --config <file>` with no
+    /// `--db-url` must reach the Postgres URL from the file, not the built-in
+    /// SQLite default — and an explicit `--db-url` must still win.
+    #[test]
+    fn migrate_resolves_the_database_url_from_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forgekeep.toml");
+        std::fs::write(
+            &path,
+            "[database]\nurl = \"postgres://forge:pw@db.internal/forgekeep\"\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+
+        let cli = Cli::try_parse_from(["forgekeep", "migrate", "--config", path]).unwrap();
+        let Commands::Migrate { db_url, config } = cli.command else {
+            panic!("expected migrate");
+        };
+        let cfg = crate::config::load_optional_config_file(config.as_deref()).unwrap();
+        assert_eq!(
+            crate::config::resolve_db_url(db_url, cfg.as_ref()),
+            "postgres://forge:pw@db.internal/forgekeep"
+        );
+
+        let cli = Cli::try_parse_from([
+            "forgekeep",
+            "migrate",
+            "--config",
+            path,
+            "--db-url",
+            "sqlite://./explicit.db?mode=rwc",
+        ])
+        .unwrap();
+        let Commands::Migrate { db_url, config } = cli.command else {
+            panic!("expected migrate");
+        };
+        let cfg = crate::config::load_optional_config_file(config.as_deref()).unwrap();
+        assert_eq!(
+            crate::config::resolve_db_url(db_url, cfg.as_ref()),
+            "sqlite://./explicit.db?mode=rwc"
+        );
+    }
 }
