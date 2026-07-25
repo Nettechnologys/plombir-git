@@ -476,9 +476,11 @@ pub async fn trigger_pipeline(
         None => return AppError::bad_request("cannot resolve commit SHA for ref").into_response(),
     };
 
-    // Check if CI config exists
+    // Check if CI config exists. The wording lives in `rg_core::ci` next to the
+    // gate itself: this used to say `no .forgekeep-ci.yml found`, which lied to
+    // every repository driving CI from `.gitea/workflows/`.
     if !state.ci_engine.has_ci_config(&repo_path, &commit_sha) {
-        return AppError::bad_request("no .forgekeep-ci.yml found").into_response();
+        return AppError::bad_request(rg_core::ci::NO_CI_CONFIG_MESSAGE).into_response();
     }
 
     match state
@@ -811,7 +813,21 @@ async fn job_belongs_to_pipeline(state: &AppState, pipeline_id: i64, stage_id: i
 }
 
 fn resolve_commit_sha(repo_path: &std::path::Path, ref_name: &str) -> Option<String> {
-    let repo = gix::open(repo_path).ok()?;
+    // Same class as the CI gate in `rg_core::ci::has_ci_config`: `.ok()?` turned
+    // "the server cannot open this repository" into "your ref is wrong" (the
+    // caller answers 400 `cannot resolve commit SHA for ref`), with nothing in
+    // the log to tell the two apart.
+    let repo = match gix::open(repo_path) {
+        Ok(repo) => repo,
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                "cannot open repository while resolving a commit SHA: {:#}",
+                error
+            );
+            return None;
+        }
+    };
 
     // Try to parse the ref directly
     let ref_name_normalized = if ref_name.starts_with("refs/") {
