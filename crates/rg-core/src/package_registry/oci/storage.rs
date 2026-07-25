@@ -25,6 +25,45 @@ fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow:
     crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
 }
 
+/// The bytes the client sent do not hash to the digest it named.
+///
+/// Finalizing an upload fails for three unrelated reasons — this one, a staging
+/// file the registry cannot read, and a blob store that refuses the publish —
+/// and only this one is the client's fault. Flattened into an `anyhow::Error`
+/// all three look alike, so the HTTP layer had nothing to classify on and
+/// answered `400 DIGEST_INVALID` to every one of them. The distinction has to
+/// travel inside the error, which is what this type is for.
+#[derive(Debug, thiserror::Error)]
+#[error("digest mismatch: expected {expected}, got {actual}")]
+pub struct DigestMismatch {
+    pub expected: String,
+    pub actual: String,
+}
+
+/// The digest string itself is not a well-formed `sha256:<64 hex digits>`.
+///
+/// Also the client's fault, and also `400 DIGEST_INVALID` — see
+/// [`DigestMismatch`] for why it needs a type rather than a message.
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported or invalid OCI digest: {digest}")]
+pub struct InvalidDigest {
+    pub digest: String,
+}
+
+/// Whether a failed blob operation is the client's fault (`400`) or the
+/// registry's (`500`).
+///
+/// `downcast_ref` sees through the `.context()` layers a caller may have added,
+/// the same way [`crate::blob_storage`] errors are classified elsewhere. The
+/// default is deliberately "ours": `docker push` does not retry a `4xx`, it
+/// prints `digest invalid` and stops — so mislabelling a broken `repo_root` as
+/// a corrupt layer sends the operator to inspect an image that was never the
+/// problem.
+pub fn is_client_digest_fault(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DigestMismatch>().is_some()
+        || error.downcast_ref::<InvalidDigest>().is_some()
+}
+
 #[derive(Clone)]
 pub struct OciStorage {
     backend: Arc<dyn BlobStorage>,
@@ -320,7 +359,11 @@ impl OciStorage {
         }
         let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
         if actual != expected_digest {
-            anyhow::bail!("digest mismatch: expected {expected_digest}, got {actual}");
+            return Err(DigestMismatch {
+                expected: expected_digest.to_string(),
+                actual,
+            }
+            .into());
         }
 
         self.backend.put_file(&key, &upload_path).await?;
@@ -357,15 +400,16 @@ impl std::fmt::Debug for OciStorage {
     }
 }
 
-fn digest_parts(digest: &str) -> anyhow::Result<(&str, &str)> {
-    let (algorithm, hash) = digest
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("invalid OCI digest"))?;
+fn digest_parts(digest: &str) -> Result<(&str, &str), InvalidDigest> {
+    let malformed = || InvalidDigest {
+        digest: digest.to_string(),
+    };
+    let (algorithm, hash) = digest.split_once(':').ok_or_else(malformed)?;
     if algorithm != "sha256"
         || hash.len() != 64
         || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        anyhow::bail!("unsupported or invalid OCI digest: {digest}");
+        return Err(malformed());
     }
     Ok((algorithm, hash))
 }
@@ -374,7 +418,11 @@ fn verify_digest(expected: &str, data: &[u8]) -> anyhow::Result<()> {
     digest_parts(expected)?;
     let actual = format!("sha256:{}", hex::encode(Sha256::digest(data)));
     if actual != expected {
-        anyhow::bail!("digest mismatch: expected {expected}, got {actual}");
+        return Err(DigestMismatch {
+            expected: expected.to_string(),
+            actual,
+        }
+        .into());
     }
     Ok(())
 }
@@ -427,6 +475,48 @@ mod tests {
             .expect_err("upload root is a file, not a missing upload");
 
         assert!(format!("{error:#}").contains("uploads"), "{error:#}");
+    }
+
+    /// The three ways `finalize_upload` fails are not interchangeable: two of
+    /// them are the registry's own, and a client told `400 DIGEST_INVALID` for
+    /// those goes looking for a corrupt layer instead of an unwritable
+    /// directory.
+    #[tokio::test]
+    async fn finalize_blames_the_client_only_for_a_digest_it_got_wrong() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = OciStorage::new(directory.path());
+        let data = b"oci layer";
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(data)));
+        let (upload, _) = storage.create_upload("alice", "demo").await.unwrap();
+        storage
+            .append_to_upload("alice", "demo", &upload, data)
+            .await
+            .unwrap();
+
+        // The bytes are fine, the digest naming them is not — the client's.
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        let mismatch = storage
+            .finalize_upload("alice", "demo", &upload, &wrong)
+            .await
+            .expect_err("the staged bytes do not hash to that digest");
+        assert!(super::is_client_digest_fault(&mismatch), "{mismatch:#}");
+
+        // A digest that is not a digest at all — also the client's.
+        let malformed = storage
+            .finalize_upload("alice", "demo", &upload, "not-a-digest")
+            .await
+            .expect_err("malformed digest");
+        assert!(super::is_client_digest_fault(&malformed), "{malformed:#}");
+
+        // The staging file the registry itself owns is unreadable — ours, and
+        // the message has to carry the path the io error dropped.
+        let broken = storage_with_unusable_upload_root(directory.path());
+        let ours = broken
+            .finalize_upload("alice", "demo", &upload, &digest)
+            .await
+            .expect_err("upload root is a file, not a directory");
+        assert!(!super::is_client_digest_fault(&ours), "{ours:#}");
+        assert!(format!("{ours:#}").contains("uploads"), "{ours:#}");
     }
 
     #[tokio::test]

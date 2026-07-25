@@ -18,8 +18,8 @@ use rg_core::auth::oci_token::{
     build_www_authenticate, generate_oci_token, validate_oci_token, ParsedScope,
 };
 use rg_core::package_registry::oci::{
-    error_codes, media_types, ErrorDetail, ErrorResponse, ParsedManifest, Reference,
-    TagListResponse, API_VERSION,
+    error_codes, is_client_digest_fault, media_types, ErrorDetail, ErrorResponse, ParsedManifest,
+    Reference, TagListResponse, API_VERSION,
 };
 
 use crate::AppState;
@@ -1156,9 +1156,21 @@ pub async fn complete_upload(
             )
                 .into_response()
         }
-        Err(e) => oci_err(
+        // Finalizing fails for three unrelated reasons and only one of them is
+        // the client's: a digest that does not match the bytes. An unreadable
+        // staging file (`_oci_uploads/` gone or not writable) and a blob store
+        // that refuses the publish are both ours. `docker push` does not retry
+        // a 400 — it prints `digest invalid` and stops — so answering one for a
+        // broken `repo_root` tells the operator to go inspect an image that was
+        // never the problem. Ask the error which side is at fault.
+        Err(e) if is_client_digest_fault(&e) => oci_err(
             StatusCode::BAD_REQUEST,
             error_codes::DIGEST_INVALID,
+            &format!("{e:#}"),
+        ),
+        Err(e) => oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
             &format!("{e:#}"),
         ),
     }

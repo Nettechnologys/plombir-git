@@ -133,6 +133,35 @@ pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
     (base_url, db)
 }
 
+/// Spawn the test app and hand back `(base_url, repo_root, oci_upload_root)`.
+///
+/// A test can make a registry write fail for a *client-side* reason just by
+/// sending the wrong bytes, but the server-side reasons — an unreadable staging
+/// file, a blob store that cannot host the published blob — live on paths built
+/// from `repo_root` and a generated UUID. Without them a test cannot tell the
+/// two apart, which is exactly the distinction the status code is supposed to
+/// carry.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_oci_root() -> (String, std::path::PathBuf, std::path::PathBuf) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    // Mirrors the layout `build_test_app_state` derives from `repo_root`.
+    let oci_root = dir.path().join("oci-storage");
+    let returned_repo_root = repo_root.clone();
+    let state = build_test_app_state(db, repo_root);
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    (base_url, returned_repo_root, oci_root)
+}
+
 pub async fn register_user(base: &str, username: &str, email: &str, password: &str) -> String {
     let client = reqwest::Client::new();
     let resp = client

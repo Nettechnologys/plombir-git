@@ -1,7 +1,7 @@
 mod common;
 
 use base64::Engine as _;
-use common::{register_full, spawn_test_app_with_db};
+use common::{register_full, spawn_test_app_with_db, spawn_test_app_with_oci_root};
 
 async fn create_repo(base: &str, token: &str, name: &str, is_private: bool) {
     let client = reqwest::Client::new();
@@ -209,4 +209,154 @@ async fn a_created_blob_is_retrievable_right_after_the_push() {
         .unwrap();
     assert_eq!(fetched.status(), 200);
     assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
+}
+
+/// Start an upload session and stage `payload` in it, returning the session
+/// `Location` and its UUID.
+async fn staged_upload(
+    base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    payload: &[u8],
+) -> (String, String) {
+    let client = reqwest::Client::new();
+    let start = client
+        .post(format!("{base}/v2/{owner}/{repo}/blobs/uploads/"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 202, "start upload failed");
+    let location = start
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("start upload must return a Location")
+        .to_string();
+    let uuid = location.rsplit('/').next().unwrap().to_string();
+
+    let chunk = client
+        .patch(format!("{base}{location}"))
+        .bearer_auth(token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk.status(), 202, "chunk upload failed");
+
+    (location, uuid)
+}
+
+/// A failed `PUT .../blobs/uploads/{uuid}?digest=` has to say *whose* fault it
+/// was.
+///
+/// Every way of failing used to answer `400 DIGEST_INVALID`, including the ones
+/// the registry caused itself. `docker push` does not retry a 400: it prints
+/// `digest invalid` and stops, so an unwritable staging directory sent the
+/// operator to inspect an image that was fine. Both halves of the distinction
+/// are checked against the same request shape.
+#[tokio::test]
+async fn a_failed_finalize_separates_a_wrong_digest_from_a_broken_registry() {
+    let (base, repo_root, oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&base, "oci_blame_owner", "oci_blame_owner@example.com").await;
+    create_repo(&base, &token, "blamed-image", false).await;
+
+    let payload = b"forgekeep-oci-blame";
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
+    );
+
+    // 1. The client named a digest its own bytes do not hash to — its fault.
+    let (location, _) = staged_upload(
+        &base,
+        &token,
+        "oci_blame_owner",
+        "blamed-image",
+        b"different bytes",
+    )
+    .await;
+    let mismatch = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        mismatch.status(),
+        400,
+        "a digest mismatch is the client's fault"
+    );
+    let body: serde_json::Value = mismatch.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "DIGEST_INVALID");
+
+    // 2. Same request, correct digest, correct bytes — but the blob store the
+    //    verified upload gets published into cannot host it. That is the
+    //    registry's own failure: `500`, and the body has to name the path so
+    //    the operator can fix the thing that is actually broken.
+    let (location, uuid) =
+        staged_upload(&base, &token, "oci_blame_owner", "blamed-image", payload).await;
+    let occupied = repo_root.join("oci");
+    std::fs::write(&occupied, b"not a directory").unwrap();
+
+    let ours = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ours.status(),
+        500,
+        "a blob store that cannot take the blob is the registry's fault, not a bad digest"
+    );
+    let body: serde_json::Value = ours.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNKNOWN");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&occupied.display().to_string()),
+        "the 500 must name the blob path it could not write: {message}"
+    );
+    std::fs::remove_file(&occupied).unwrap();
+
+    // 3. And the staging file itself, which the registry owns just as much:
+    //    replaced by a directory, the same PUT must still be a 500 naming it.
+    let staged = oci_root
+        .join("oci-uploads")
+        .join("oci_blame_owner")
+        .join("blamed-image")
+        .join(&uuid)
+        .join("data");
+    assert!(
+        staged.is_file(),
+        "staged upload not at {}",
+        staged.display()
+    );
+    std::fs::remove_file(&staged).unwrap();
+    std::fs::create_dir(&staged).unwrap();
+
+    let staging = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        staging.status(),
+        500,
+        "an unusable staging file is the registry's fault, not a bad digest"
+    );
+    let body: serde_json::Value = staging.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNKNOWN");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&staged.display().to_string()),
+        "the 500 must name the staging path: {message}"
+    );
 }
