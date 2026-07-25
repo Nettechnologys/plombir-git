@@ -47,8 +47,9 @@ async fn main() -> Result<()> {
             labels,
             save,
             auth_token,
+            config,
         } => {
-            commands::cmd_register(server, name, labels, save, auth_token).await?;
+            commands::cmd_register(server, name, labels, save, auth_token, config).await?;
         }
 
         Commands::Run {

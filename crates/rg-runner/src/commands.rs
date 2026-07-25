@@ -8,7 +8,8 @@ use crate::api::{
     send_heartbeat, start_job, upload_log,
 };
 use crate::config::{
-    config_not_persisted_warning, load_config, resolve_auth_token, save_config, RunnerConfig,
+    config_not_persisted_warning, load_config, parse_labels, resolve_auth_token, resolve_runner,
+    save_config, ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity,
 };
 use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_local};
 
@@ -42,11 +43,10 @@ pub(crate) async fn cmd_register(
     labels: Option<String>,
     save: bool,
     auth_token: Option<String>,
+    config: String,
 ) -> Result<()> {
     let client = build_runner_client();
-    let labels_vec: Vec<String> = labels
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
+    let labels_vec: Vec<String> = labels.as_deref().map(parse_labels).unwrap_or_default();
     let auth_token = resolve_auth_token(auth_token)
         .context("runner registration requires --auth-token or FORGEKEEP_AUTH_TOKEN")?;
 
@@ -58,16 +58,18 @@ pub(crate) async fn cmd_register(
     println!("  Token: {}", token);
 
     if save {
-        let config = RunnerConfig {
+        let saved = RunnerConfig {
             server: Some(server),
             runner_id: Some(runner_id),
             token: Some(token.clone()),
             name: Some(name),
             labels: Some(labels_vec),
         };
-        let config_path = "~/.forgekeep/runner.toml";
-        save_config(config_path, &config)?;
-        println!("  Config saved to {}", config_path);
+        // `--config`, not a hardcoded `~/.forgekeep/runner.toml`: `run` reads the
+        // path it was given, so writing the identity anywhere else means `run`
+        // never finds it and registers yet another runner on every start.
+        save_config(&config, &saved)?;
+        println!("  Config saved to {}", config);
     }
 
     Ok(())
@@ -76,7 +78,7 @@ pub(crate) async fn cmd_register(
 /// Handle `forgekeep-runner run`: resolve/register the runner, spawn the
 /// heartbeat task, then long-poll for jobs and execute each one.
 pub(crate) async fn cmd_run(
-    server: String,
+    server: Option<String>,
     name: Option<String>,
     labels: Option<String>,
     token: Option<String>,
@@ -93,39 +95,32 @@ pub(crate) async fn cmd_run(
     // degrading to "no config": continuing would re-register the runner under a
     // fresh identity and leave the operator's file quietly ignored.
     let cfg = load_config(&config)?;
-    let resolved_server = server.as_str();
-    let (resolved_id, resolved_token, resolved_name) = match (runner_id, token, name) {
-        (Some(id), Some(tok), Some(n)) => (id, tok, n),
-        (Some(id), Some(tok), None) => (
-            id,
-            tok,
-            cfg.as_ref()
-                .and_then(|c| c.name.clone())
-                .unwrap_or_default(),
-        ),
-        _ => {
-            // Need to register
-            let cfg_name = cfg
-                .as_ref()
-                .and_then(|c| c.name.clone())
-                .unwrap_or_else(|| {
-                    hostname::get().unwrap_or_else(|_| "unnamed-runner".to_string())
-                });
-            let cfg_labels = cfg
-                .as_ref()
-                .and_then(|c| c.labels.clone())
-                .unwrap_or_default();
-            let resolved_labels = labels
-                .map(|s| {
-                    s.split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or(cfg_labels);
+    let ResolvedRunner {
+        server: server_url,
+        identity,
+        name: resolved_name,
+        labels: resolved_labels,
+    } = resolve_runner(
+        RunnerCliArgs {
+            server,
+            name,
+            labels,
+            token,
+            runner_id,
+        },
+        cfg.as_ref(),
+    )?;
+    let resolved_server = server_url.as_str();
 
+    let (resolved_id, resolved_token) = match identity {
+        // The identity came from `--runner-id`/`--token` or from the config file.
+        // Registering again would mint a duplicate runner row and a second token
+        // for a machine that already has both.
+        RunnerIdentity::Existing { runner_id, token } => (runner_id, token),
+        RunnerIdentity::Register => {
             println!(
                 "Registering runner '{}' with {}...",
-                cfg_name, resolved_server
+                resolved_name, resolved_server
             );
             let auth_token = resolve_auth_token(auth_token).context(
                 "runner auto-registration requires --auth-token or FORGEKEEP_AUTH_TOKEN; \
@@ -134,19 +129,21 @@ pub(crate) async fn cmd_run(
             let (id, tok) = register_runner(
                 &client,
                 resolved_server,
-                &cfg_name,
+                &resolved_name,
                 &resolved_labels,
                 &auth_token,
             )
             .await?;
             println!("Registered! ID={}, Token={}", id, tok);
 
-            // Save for future runs
+            // Save for future runs — the half that makes the resolution above
+            // worth anything: the next start reads these back instead of
+            // registering all over again.
             let mut updated_cfg = cfg.clone().unwrap_or_default();
             updated_cfg.server = Some(resolved_server.to_string());
             updated_cfg.runner_id = Some(id);
             updated_cfg.token = Some(tok.clone());
-            updated_cfg.name = Some(cfg_name.clone());
+            updated_cfg.name = Some(resolved_name.clone());
             updated_cfg.labels = Some(resolved_labels);
             match save_config(&config, &updated_cfg) {
                 Ok(()) => println!("Config saved to {}", config),
@@ -157,7 +154,7 @@ pub(crate) async fn cmd_run(
                 Err(error) => tracing::warn!("{}", config_not_persisted_warning(&config, &error)),
             }
 
-            (id, tok, cfg_name)
+            (id, tok)
         }
     };
 
@@ -371,15 +368,5 @@ pub(crate) async fn cmd_run(
                 continue;
             }
         }
-    }
-}
-
-/// Get the system hostname via `hostname` command.
-mod hostname {
-    pub fn get() -> std::io::Result<String> {
-        std::process::Command::new("hostname")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .map_err(std::io::Error::other)
     }
 }

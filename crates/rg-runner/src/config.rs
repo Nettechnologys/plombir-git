@@ -14,6 +14,164 @@ pub(crate) struct RunnerConfig {
     pub(crate) labels: Option<Vec<String>>,
 }
 
+/// Built-in default for `--server`.
+///
+/// It lives here rather than in clap's `default_value` on purpose: a clap
+/// default is indistinguishable from a value the operator typed, so with one the
+/// `server` key of `runner.toml` could never win over "the flag was not passed"
+/// — a runner registered against a remote server silently went back to
+/// localhost on its next start. Same reasoning (and same fix) as
+/// `rg-cli/src/serve.rs::DEFAULT_*`.
+pub(crate) const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+
+/// Last-resort runner name, used when neither the CLI, nor the config file, nor
+/// the system hostname yields one.
+const FALLBACK_NAME: &str = "unnamed-runner";
+
+/// The CLI half of every knob that also lives in `runner.toml`, resolved against
+/// the config file by [`resolve_runner`]. `None` means "flag not passed" — never
+/// a default.
+#[derive(Debug, Default)]
+pub(crate) struct RunnerCliArgs {
+    pub(crate) server: Option<String>,
+    pub(crate) name: Option<String>,
+    /// Raw comma-separated value of `--labels`, parsed by [`parse_labels`].
+    pub(crate) labels: Option<String>,
+    pub(crate) token: Option<String>,
+    pub(crate) runner_id: Option<i64>,
+}
+
+/// How the runner identifies itself to the server.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RunnerIdentity {
+    /// A complete `(runner_id, token)` pair was found — on the CLI or in the
+    /// config file. Registration must be **skipped**.
+    Existing { runner_id: i64, token: String },
+    /// Neither source carried a complete pair: the runner has to register and
+    /// persist the result for the next start.
+    Register,
+}
+
+/// Runner settings after `CLI arg > config file > built-in default`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedRunner {
+    pub(crate) server: String,
+    pub(crate) identity: RunnerIdentity,
+    pub(crate) name: String,
+    pub(crate) labels: Vec<String>,
+}
+
+/// Split a `--labels` value: comma-separated, trimmed, empty entries dropped so
+/// `"docker, ,linux,"` cannot register a runner carrying a blank label.
+pub(crate) fn parse_labels(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Apply the documented `CLI arg > config file > built-in default` precedence to
+/// every runner setting that has both a flag and a config key.
+///
+/// Extracted as a pure function so the wiring is unit-testable without talking
+/// to a server — the bug this replaces was a missing wire, not a bad value:
+/// `cmd_run` read the config file's `name`/`labels` but never its `server`,
+/// `runner_id`, or `token`, so a runner that had already registered and saved
+/// its identity re-registered on **every** start, piling up duplicate runner
+/// rows and tokens on the server (and failing outright without `--auth-token`).
+///
+/// `runner_id` + `token` are resolved as one **atomic pair**, per source: a
+/// token only authenticates the runner id it was issued for, so completing a
+/// CLI-supplied id with a token from the config file would just produce a
+/// confident 401.
+pub(crate) fn resolve_runner(
+    cli: RunnerCliArgs,
+    cfg: Option<&RunnerConfig>,
+) -> Result<ResolvedRunner> {
+    let identity = match (cli.runner_id, cli.token) {
+        (Some(runner_id), Some(token)) => RunnerIdentity::Existing { runner_id, token },
+        (None, None) => resolve_config_identity(cfg),
+        // Half a credential pair is always an operator mistake. Silently
+        // dropping into registration (the previous behaviour) hid it behind a
+        // duplicate runner; say so instead.
+        (id, _) => {
+            let (given, missing) = if id.is_some() {
+                ("--runner-id", "--token")
+            } else {
+                ("--token", "--runner-id")
+            };
+            anyhow::bail!(
+                "`{given}` was passed without `{missing}` — a runner token only authenticates the \
+                 runner id it was issued for, so the two must be given together. Pass both, or \
+                 pass neither and let them come from the config file (or from a fresh \
+                 registration)"
+            );
+        }
+    };
+
+    Ok(ResolvedRunner {
+        server: cli
+            .server
+            .filter(|server| !server.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|c| c.server.clone())
+                    .filter(|server| !server.trim().is_empty())
+            })
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string()),
+        identity,
+        name: cli
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|c| c.name.clone())
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or_else(|| system_hostname().unwrap_or_else(|| FALLBACK_NAME.to_string())),
+        labels: cli
+            .labels
+            .as_deref()
+            .map(parse_labels)
+            .or_else(|| cfg.and_then(|c| c.labels.clone()))
+            .unwrap_or_default(),
+    })
+}
+
+/// Take the `(runner_id, token)` pair out of the config file, if it holds one.
+///
+/// A file carrying exactly one half is broken — hand-edited, or truncated by a
+/// failed write. Registration is the only way forward, but it is announced:
+/// otherwise the operator sees a runner that keeps re-registering while its
+/// config file looks populated.
+fn resolve_config_identity(cfg: Option<&RunnerConfig>) -> RunnerIdentity {
+    let (runner_id, token) = match cfg {
+        Some(cfg) => (cfg.runner_id, cfg.token.clone()),
+        None => return RunnerIdentity::Register,
+    };
+
+    match (runner_id, token) {
+        (Some(runner_id), Some(token)) => RunnerIdentity::Existing { runner_id, token },
+        (None, None) => RunnerIdentity::Register,
+        (id, _) => {
+            let present = if id.is_some() { "runner_id" } else { "token" };
+            let missing = if id.is_some() { "token" } else { "runner_id" };
+            tracing::warn!(
+                "the runner config file has `{present}` but no `{missing}`, so it cannot be used \
+                 to log in; registering a new runner instead — delete the file and re-run \
+                 `forgekeep-runner register --save` to get a consistent one"
+            );
+            RunnerIdentity::Register
+        }
+    }
+}
+
+/// The system hostname, used as the default runner name.
+fn system_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 fn config_path(path: &str) -> PathBuf {
     let expanded = if let Some(remain) = path.strip_prefix('~') {
         match home::home_dir() {
@@ -175,7 +333,10 @@ fn env_var_compat(new: &str, old: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_not_persisted_warning, load_config, save_config, RunnerConfig};
+    use super::{
+        config_not_persisted_warning, load_config, parse_labels, resolve_runner, save_config,
+        ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity, DEFAULT_SERVER,
+    };
 
     fn sample_config() -> RunnerConfig {
         RunnerConfig {
@@ -447,5 +608,189 @@ labels = ["linux", "docker"]
             warning.contains("register a NEW runner"),
             "warning must spell out the consequence: {warning}"
         );
+    }
+
+    /// The bug this card fixes: `cmd_run` never read `server`, `runner_id`, or
+    /// `token` out of the config file, so a runner that had already registered
+    /// and saved its identity went straight back into registration on the next
+    /// start — a new runner row and token on the server every time.
+    #[test]
+    fn a_saved_config_supplies_server_identity_name_and_labels_without_any_flags() {
+        let resolved = resolve_runner(RunnerCliArgs::default(), Some(&sample_config()))
+            .expect("a complete config must resolve");
+
+        assert_eq!(
+            resolved,
+            ResolvedRunner {
+                server: "http://127.0.0.1:8080".to_string(),
+                identity: RunnerIdentity::Existing {
+                    runner_id: 7,
+                    token: "tok".to_string(),
+                },
+                name: "builder-1".to_string(),
+                labels: vec!["linux".to_string()],
+            }
+        );
+    }
+
+    /// A config pointing at a remote server must not lose to the built-in
+    /// localhost default — the clap `default_value` on `--server` made those two
+    /// indistinguishable, so the config always lost.
+    #[test]
+    fn a_config_server_beats_the_built_in_default() {
+        let cfg = RunnerConfig {
+            server: Some("https://ci.example.com".to_string()),
+            ..sample_config()
+        };
+
+        let resolved = resolve_runner(RunnerCliArgs::default(), Some(&cfg)).unwrap();
+
+        assert_eq!(resolved.server, "https://ci.example.com");
+    }
+
+    #[test]
+    fn cli_flags_beat_the_config_file() {
+        let cli = RunnerCliArgs {
+            server: Some("https://ci.example.com".to_string()),
+            name: Some("from-flag".to_string()),
+            labels: Some("docker,amd64".to_string()),
+            token: Some("cli-tok".to_string()),
+            runner_id: Some(42),
+        };
+
+        let resolved = resolve_runner(cli, Some(&sample_config())).unwrap();
+
+        assert_eq!(
+            resolved,
+            ResolvedRunner {
+                server: "https://ci.example.com".to_string(),
+                identity: RunnerIdentity::Existing {
+                    runner_id: 42,
+                    token: "cli-tok".to_string(),
+                },
+                name: "from-flag".to_string(),
+                labels: vec!["docker".to_string(), "amd64".to_string()],
+            }
+        );
+    }
+
+    /// The genuine first-start case: nothing on the CLI, no config file yet.
+    #[test]
+    fn no_config_and_no_flags_registers_against_the_default_server() {
+        let resolved = resolve_runner(RunnerCliArgs::default(), None).unwrap();
+
+        assert_eq!(resolved.server, DEFAULT_SERVER);
+        assert_eq!(resolved.identity, RunnerIdentity::Register);
+        assert!(resolved.labels.is_empty());
+        // Hostname-derived, so the exact value is environment-dependent; what
+        // matters is that the runner never registers under an empty name.
+        assert!(
+            !resolved.name.trim().is_empty(),
+            "the fallback name must not be blank: {:?}",
+            resolved.name
+        );
+    }
+
+    /// `--runner-id` and `--token` are one credential pair: a token only
+    /// authenticates the id it was issued for. Half a pair used to fall through
+    /// into registration, hiding the mistake behind a duplicate runner.
+    #[test]
+    fn half_a_credential_pair_on_the_cli_is_rejected() {
+        for (cli, given, missing) in [
+            (
+                RunnerCliArgs {
+                    runner_id: Some(7),
+                    ..RunnerCliArgs::default()
+                },
+                "--runner-id",
+                "--token",
+            ),
+            (
+                RunnerCliArgs {
+                    token: Some("tok".to_string()),
+                    ..RunnerCliArgs::default()
+                },
+                "--token",
+                "--runner-id",
+            ),
+        ] {
+            let error = resolve_runner(cli, Some(&sample_config()))
+                .expect_err("half a credential pair must not resolve");
+
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(given) && rendered.contains(missing),
+                "error must name both flags: {rendered}"
+            );
+        }
+    }
+
+    /// A hand-edited or half-written config cannot log in, so registration is the
+    /// only way forward — but the identity resolution must still be explicit
+    /// about it rather than looking like a first start.
+    #[test]
+    fn a_config_holding_only_one_half_of_the_pair_falls_back_to_registration() {
+        for cfg in [
+            RunnerConfig {
+                token: None,
+                ..sample_config()
+            },
+            RunnerConfig {
+                runner_id: None,
+                ..sample_config()
+            },
+        ] {
+            let resolved = resolve_runner(RunnerCliArgs::default(), Some(&cfg)).unwrap();
+
+            assert_eq!(resolved.identity, RunnerIdentity::Register);
+            // The rest of the file is still honoured — registration should reuse
+            // the operator's server and name, not fall back to localhost.
+            assert_eq!(resolved.server, "http://127.0.0.1:8080");
+            assert_eq!(resolved.name, "builder-1");
+        }
+    }
+
+    /// An explicitly empty flag means "no labels", and must not silently hand the
+    /// decision back to the config file.
+    #[test]
+    fn an_empty_labels_flag_clears_the_config_labels() {
+        let cli = RunnerCliArgs {
+            labels: Some(String::new()),
+            ..RunnerCliArgs::default()
+        };
+
+        let resolved = resolve_runner(cli, Some(&sample_config())).unwrap();
+
+        assert!(resolved.labels.is_empty());
+    }
+
+    /// A blank `--server` / `--name` is not a value: it must not shadow the
+    /// config file (the shell-expansion case, `--server "$FORGEKEEP_SERVER"`
+    /// with the variable unset).
+    #[test]
+    fn blank_flags_do_not_shadow_the_config() {
+        let cli = RunnerCliArgs {
+            server: Some("   ".to_string()),
+            name: Some(String::new()),
+            ..RunnerCliArgs::default()
+        };
+
+        let resolved = resolve_runner(cli, Some(&sample_config())).unwrap();
+
+        assert_eq!(resolved.server, "http://127.0.0.1:8080");
+        assert_eq!(resolved.name, "builder-1");
+    }
+
+    #[test]
+    fn parse_labels_trims_and_drops_blank_entries() {
+        assert_eq!(
+            parse_labels("docker, linux ,,  ,amd64,"),
+            vec![
+                "docker".to_string(),
+                "linux".to_string(),
+                "amd64".to_string()
+            ]
+        );
+        assert!(parse_labels("  ").is_empty());
     }
 }
