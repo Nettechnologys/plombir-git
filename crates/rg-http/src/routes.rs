@@ -186,11 +186,20 @@ fn build_v2_routes(state: &AppState) -> Router<AppState> {
     // 10 GiB body limit for blob upload requests.
     let upload_body_limit = RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024);
 
-    // Upload sub-router with body size limit
+    // Upload sub-router with body size limit.
+    //
+    // The OCI distribution spec starts every blob push at
+    // `POST /v2/<name>/blobs/uploads/` — **with** the trailing slash (endpoint
+    // end-4a), and that is what docker/podman/containerd actually send. Under
+    // `nest`, axum 0.8 matches the inner `"/"` route at the prefix *without* a
+    // trailing slash and 404s the spec form, so both spellings are registered
+    // explicitly. There is no path-normalizing layer in front of the router to
+    // paper over the difference.
     let upload_routes = Router::new()
-        .route("/", post(oci::start_upload))
+        .route("/{owner}/{repo}/blobs/uploads", post(oci::start_upload))
+        .route("/{owner}/{repo}/blobs/uploads/", post(oci::start_upload))
         .route(
-            "/{uuid}",
+            "/{owner}/{repo}/blobs/uploads/{uuid}",
             patch(oci::chunk_upload).put(oci::complete_upload),
         )
         .layer(upload_body_limit);
@@ -215,7 +224,7 @@ fn build_v2_routes(state: &AppState) -> Router<AppState> {
             get(oci::get_blob).head(oci::head_blob),
         )
         // Uploads (with body size limit)
-        .nest("/{owner}/{repo}/blobs/uploads", upload_routes)
+        .merge(upload_routes)
         .with_state(state.clone())
 }
 

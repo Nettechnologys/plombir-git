@@ -118,3 +118,95 @@ async fn oci_token_endpoint_grants_only_authorized_scopes() {
     .await;
     assert!(other_push.scope.is_none());
 }
+
+/// `201 Created` on a blob push has to mean the blob is retrievable.
+///
+/// The registry writes the bytes to blob storage and the locating row to the
+/// database as two separate steps. When the second one was discarded, the push
+/// still answered `201` with a `Docker-Content-Digest` — and the very next
+/// `HEAD .../blobs/<digest>` returned 404. A client has no reason to retry
+/// something it was told succeeded, so the image stayed broken. This walks the
+/// real push sequence and then reads the blob back.
+#[tokio::test]
+async fn a_created_blob_is_retrievable_right_after_the_push() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&base, "oci_push_owner", "oci_push_owner@example.com").await;
+    create_repo(&base, &token, "pushed-image", false).await;
+
+    let payload = b"forgekeep-oci-blob-roundtrip";
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
+    );
+
+    let start = client
+        .post(format!(
+            "{}/v2/oci_push_owner/pushed-image/blobs/uploads/",
+            base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let start_status = start.status();
+    if start_status != 202 {
+        panic!(
+            "start upload failed: {start_status} body={:?}",
+            start.text().await.unwrap()
+        );
+    }
+    let location = start
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("start upload must return a Location")
+        .to_string();
+
+    let chunk = client
+        .patch(format!("{}{}", base, location))
+        .bearer_auth(&token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk.status(), 202, "chunk upload failed");
+
+    let finish = client
+        .put(format!("{}{}", base, location))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 201, "complete upload failed");
+
+    // The invariant: whatever the push claimed, the blob must now be there.
+    let head = client
+        .head(format!(
+            "{}/v2/oci_push_owner/pushed-image/blobs/{}",
+            base, digest
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.status(),
+        200,
+        "push answered 201 but the blob is not retrievable"
+    );
+
+    let fetched = client
+        .get(format!(
+            "{}/v2/oci_push_owner/pushed-image/blobs/{}",
+            base, digest
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), 200);
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
+}

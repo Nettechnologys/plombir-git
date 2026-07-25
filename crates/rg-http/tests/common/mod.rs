@@ -48,11 +48,15 @@ pub fn build_test_app_state(
     repo_root: std::path::PathBuf,
 ) -> rg_http::AppState {
     let db_for_queue = db.clone();
-    let tmp_dir = std::env::var("TMPDIR")
-        .or_else(|_| std::env::var("TMP"))
-        .or_else(|_| std::env::var("TEMP"))
-        .unwrap_or_else(|_| "/private/tmp".to_string());
-    let oci_storage_path = std::path::Path::new(&tmp_dir).join("forgekeep-test-oci");
+    // Keep the registry inside this test's own temp tree. A fixed
+    // `$TMPDIR/forgekeep-test-oci` is shared by every run on the machine, so the
+    // first user to create it owns it and every other user gets
+    // `Permission denied (os error 13)` — and concurrent runs stomp each
+    // other's uploads even when the uid happens to line up.
+    let oci_storage_path = repo_root
+        .parent()
+        .unwrap_or(repo_root.as_path())
+        .join("oci-storage");
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> =
         Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root));
     rg_http::AppState {
