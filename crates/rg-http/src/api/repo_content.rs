@@ -243,15 +243,35 @@ pub async fn list_tree(
 
 /// Returns true if the repository has no commits yet (unborn HEAD), e.g. a
 /// repo that was just created but never pushed to.
+///
+/// Only an *answerable* "no commits" question returns true: if the repository
+/// can't be opened or `HEAD` can't be read at all, the state is unknown, not
+/// empty — we log why and return false so the caller surfaces the real error
+/// instead of rendering a healthy-looking empty repo (card_6f2a9ab1e623).
 fn is_empty_repo(repo_path: &std::path::Path) -> bool {
-    match gix::open(repo_path) {
-        Ok(repo) => match repo.head() {
-            // `Head::id()` is None when HEAD points at a branch that doesn't
-            // exist yet (no commits).
-            Ok(head) => head.id().is_none(),
-            Err(_) => true,
-        },
-        Err(_) => false,
+    let repo = match gix::open(repo_path) {
+        Ok(repo) => repo,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                error = %format!("{e:#}"),
+                "cannot open repository to check for unborn HEAD"
+            );
+            return false;
+        }
+    };
+    match repo.head() {
+        // `Head::id()` is None when HEAD points at a branch that doesn't
+        // exist yet (no commits).
+        Ok(head) => head.id().is_none(),
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                error = %format!("{e:#}"),
+                "cannot read HEAD — treating repository as non-empty so the real error surfaces"
+            );
+            false
+        }
     }
 }
 
@@ -501,7 +521,18 @@ fn list_tree_entries(
     for entry in tree.iter() {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                // Skipping silently would drop the entry from the listing and
+                // make a corrupt tree look like a short directory.
+                tracing::warn!(
+                    repo = %repo_path.display(),
+                    git_ref = %git_ref,
+                    path = %sub_path,
+                    error = %format!("{e:#}"),
+                    "skipping unreadable tree entry"
+                );
+                continue;
+            }
         };
         let oid = entry.oid();
         let name = entry.filename().to_string();
@@ -1027,7 +1058,7 @@ pub async fn create_or_update_file(
         Ok(_) => {
             // Get the new commit SHA
             let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-            let new_sha = get_latest_commit_sha(&repo_path, &branch).unwrap_or_default();
+            let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
 
             (
                 StatusCode::OK,
@@ -1112,7 +1143,7 @@ pub async fn delete_file(
         Ok(_) => {
             // Get the new commit SHA
             let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-            let new_sha = get_latest_commit_sha(&repo_path, &branch).unwrap_or_default();
+            let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
 
             (
                 StatusCode::OK,
@@ -1136,6 +1167,25 @@ pub async fn delete_file(
     }
 }
 
+/// Best-effort read-back of the commit SHA for the write endpoints. The commit
+/// has already landed, so a failure here must not fail the request — but it
+/// must not be silent either: `.unwrap_or_default()` used to hand the client an
+/// empty `commit_sha` with nothing in the log (card_6f2a9ab1e623).
+fn latest_commit_sha_or_log(repo_path: &std::path::Path, branch: &str) -> String {
+    match get_latest_commit_sha(repo_path, branch) {
+        Ok(sha) => sha,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                branch = %branch,
+                error = %format!("{e:#}"),
+                "commit landed but reading back its SHA failed — responding with an empty commit_sha"
+            );
+            String::new()
+        }
+    }
+}
+
 /// Get the latest commit SHA on a branch.
 fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::Result<String> {
     let repo = gix::open(repo_path)
@@ -1147,4 +1197,57 @@ fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("failed to resolve branch '{}': {}", branch, e))?;
 
     Ok(oid.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_empty_repo;
+
+    /// The ordinary positive case the empty-tree response exists for: a repo
+    /// that was created but never pushed to.
+    #[test]
+    fn a_repository_without_commits_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("fresh.git");
+        gix::init_bare(&repo_path).expect("a bare repo must initialise");
+
+        assert!(
+            is_empty_repo(&repo_path),
+            "an unborn HEAD is the one state that legitimately means `no commits yet`"
+        );
+    }
+
+    /// The bug (card_6f2a9ab1e623): an unreadable `HEAD` used to answer
+    /// "repository is empty", so `list_tree` returned `200 {entries: []}` and
+    /// the `list_tree failed` error line never ran. Unknown is not empty.
+    #[test]
+    fn an_unreadable_head_is_not_reported_as_an_empty_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("broken.git");
+        gix::init_bare(&repo_path).expect("a bare repo must initialise");
+        std::fs::write(repo_path.join("HEAD"), "not a ref at all\n").unwrap();
+
+        // The fixture must exercise the `repo.head()` error branch specifically
+        // — if `gix::open` itself rejected it we would be testing the other,
+        // already-correct arm.
+        let repo = gix::open(&repo_path).expect("a malformed HEAD must still open the repository");
+        assert!(
+            repo.head().is_err(),
+            "fixture must produce a HEAD that cannot be read"
+        );
+
+        assert!(
+            !is_empty_repo(&repo_path),
+            "a HEAD that cannot be read is an unknown state, not an empty repository"
+        );
+    }
+
+    /// A repository that cannot be opened at all is likewise unknown, not
+    /// empty — this arm was already correct and must stay that way.
+    #[test]
+    fn a_path_that_is_not_a_repository_is_not_reported_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!is_empty_repo(&dir.path().join("nothing-here.git")));
+    }
 }
