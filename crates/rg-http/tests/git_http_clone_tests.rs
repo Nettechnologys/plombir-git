@@ -11,7 +11,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{build_test_app_state, setup_test_db};
+use common::{build_test_app_state, setup_test_db, wait_for_listener};
 
 /// Run git through the sanctioned gateway (the `test_no_raw_git_command_in_crates`
 /// regression guard forbids raw git process construction). Returns trimmed stdout.
@@ -27,16 +27,6 @@ fn git(args: &[&str], cwd: Option<&Path>) -> String {
         output.stderr_str().trim()
     );
     output.stdout_str().trim().to_string()
-}
-
-async fn wait_for_listener(addr: &str) {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("HTTP listener did not start on {addr}");
 }
 
 /// A public repo with a multi-frame-sized pack clones cleanly over HTTP: the

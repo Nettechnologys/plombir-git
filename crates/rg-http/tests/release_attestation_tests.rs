@@ -139,13 +139,13 @@ async fn disabled_endpoints_return_404() {
     state.attestation_enabled = false; // opt-in: off
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     let base = format!("http://{addr}");
     tokio::spawn(async move {
         let _dir = dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
 
     let owner = "attuser3".to_string();
     let token = register_user(&base, &owner, "attuser3@example.com", PW).await;

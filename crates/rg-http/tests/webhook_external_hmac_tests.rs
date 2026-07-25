@@ -31,12 +31,13 @@ async fn spawn_with_secret(secret: &str) -> String {
     state.external_webhook_secret = Some(Arc::new(secret.to_string()));
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base_url = format!("http://{addr}");
     tokio::spawn(async move {
         let _dir = dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
     base_url
 }
 

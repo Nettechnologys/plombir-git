@@ -106,7 +106,8 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     let token_calls = Arc::new(AtomicUsize::new(0));
     let last_verifier = Arc::new(Mutex::new(None));
     let oidc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let oidc_base = format!("http://{}", oidc_listener.local_addr().unwrap());
+    let oidc_addr = oidc_listener.local_addr().unwrap().to_string();
+    let oidc_base = format!("http://{oidc_addr}");
     let oidc_state = MockOidcState {
         base_url: oidc_base.clone(),
         token_calls: token_calls.clone(),
@@ -120,6 +121,7 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     let oidc_server = tokio::spawn(async move {
         axum::serve(oidc_listener, oidc_app).await.unwrap();
     });
+    common::wait_for_listener(&oidc_addr).await;
 
     let (db, app_dir) = setup_test_db().await;
     let repo_root = app_dir.path().join("repos");
@@ -148,11 +150,13 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
 
     let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
     let app_server = tokio::spawn(async move {
         let _app_dir = app_dir;
         axum::serve(listener, app).await.unwrap();
     });
+    common::wait_for_listener(&addr).await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()

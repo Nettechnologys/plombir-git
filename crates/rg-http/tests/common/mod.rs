@@ -95,6 +95,31 @@ pub fn build_test_app_state(
     }
 }
 
+/// Block until the freshly spawned server accepts connections on `addr`
+/// (a bare `host:port`, no scheme).
+///
+/// This replaces a fixed `sleep(100ms)` after `tokio::spawn(axum::serve(..))`.
+/// A constant is a bet that 100 ms is always enough: on a loaded machine it is
+/// not, and the first request dies with `connection refused`; on an idle one
+/// the listener is up in single-digit milliseconds and the rest is thrown
+/// away. The bound here is wall-clock rather than an iteration count, so a
+/// process that gets descheduled mid-poll still gets its full budget instead
+/// of burning the budget on the scheduler (`sol_7d16590273ef`).
+#[allow(dead_code)]
+pub async fn wait_for_listener(addr: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "HTTP listener did not start on {addr} within 10s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
 #[allow(dead_code)]
 pub async fn spawn_test_app() -> String {
     let (db, dir) = setup_test_db().await;
@@ -109,7 +134,7 @@ pub async fn spawn_test_app() -> String {
         let _dir = dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    wait_for_listener(&addr.to_string()).await;
     base_url
 }
 
@@ -129,7 +154,7 @@ pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
         let _dir = dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    wait_for_listener(&addr.to_string()).await;
     (base_url, db)
 }
 
@@ -158,7 +183,7 @@ pub async fn spawn_test_app_with_oci_root() -> (String, std::path::PathBuf, std:
         let _dir = dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    wait_for_listener(&addr.to_string()).await;
     (base_url, returned_repo_root, oci_root)
 }
 

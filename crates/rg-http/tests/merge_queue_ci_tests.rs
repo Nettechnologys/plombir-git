@@ -48,12 +48,13 @@ async fn queue_waits_for_speculative_merge_group_ci_before_updating_base() {
     state.ci_engine = Arc::new(PendingMergeGroupCi);
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
     tokio::spawn(async move {
         let _app_dir = app_dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
 
     let (token, _) = register_full(&base, "queue-ci-owner", "queue-ci@example.com").await;
     let created = reqwest::Client::new()
@@ -234,12 +235,13 @@ async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
     state.ci_engine = Arc::new(PendingMergeGroupCi);
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
     tokio::spawn(async move {
         let _app_dir = app_dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
 
     let (token, _) = register_full(&base, "queue-fail-owner", "queue-fail@example.com").await;
     let client = reqwest::Client::new();

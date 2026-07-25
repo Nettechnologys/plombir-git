@@ -411,12 +411,13 @@ async fn creating_pr_requests_matching_codeowner_user() {
     std::fs::create_dir_all(&repo_root).unwrap();
     let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
     let server = tokio::spawn(async move {
         let _app_dir = app_dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
 
     let (owner_token, owner_id) =
         register_full(&base, "owners-owner", "owners-owner@example.com").await;

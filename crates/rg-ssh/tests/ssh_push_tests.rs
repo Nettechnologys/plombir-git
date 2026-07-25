@@ -12,14 +12,25 @@ fn git(args: &[&str], cwd: Option<&Path>) -> String {
     output.stdout_str().trim().to_string()
 }
 
+/// Block until the SSH server bound its port.
+///
+/// The bind happens inside `start_ssh_server`, i.e. in the spawned task, so
+/// unlike the HTTP harness there is a genuine window here where a connect is
+/// refused. The bound is wall-clock rather than an iteration count: a fixed
+/// `N * sleep(ms)` budget is spent by the scheduler too, so on a loaded machine
+/// it gives up early — exactly when the server is slowest to come up.
 async fn wait_for_listener(addr: &str) {
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "SSH listener did not start on {addr} within 10s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    panic!("SSH listener did not start on {addr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

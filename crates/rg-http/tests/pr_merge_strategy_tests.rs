@@ -116,12 +116,13 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
     std::fs::create_dir_all(&repo_root).unwrap();
     let app = rg_http::create_router_for_test(build_test_app_state(db, repo_root.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
     let server = tokio::spawn(async move {
         let _app_dir = app_dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
 
     let (token, _) = register_full(&base, "merge-owner", "merge-owner@example.com").await;
     let client = reqwest::Client::new();
@@ -205,12 +206,13 @@ async fn merge_conflict_keeps_base_ref_and_restores_open_pr_state() {
     std::fs::create_dir_all(&repo_root).unwrap();
     let app = rg_http::create_router_for_test(build_test_app_state(db, repo_root.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
     let server = tokio::spawn(async move {
         let _app_dir = app_dir;
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    common::wait_for_listener(&addr).await;
 
     let (token, _) = register_full(&base, "merge-owner", "merge-owner@example.com").await;
     create_repo_and_pr(&base, &token, "conflict-repo").await;
