@@ -62,7 +62,11 @@ mod tests {
 
         let tracker = delivery_tracker();
         tracker.close();
-        tokio::time::timeout(Duration::from_secs(5), tracker.wait())
+        // Hang-guard, not a deadline — see the same reasoning in
+        // `ci::log_write_queue` (card_2b890485c8d8). The tracked task sleeps
+        // 50ms; a tracker that never drains fails at any finite bound, while a
+        // tight bound turns machine load into a red suite.
+        tokio::time::timeout(Duration::from_secs(120), tracker.wait())
             .await
             .expect("delivery tracker drained within timeout");
 

@@ -243,8 +243,17 @@ mod tests {
         }
         shutdown_tx.send(true).unwrap();
 
-        // Consumer must drain and stop within a bounded window.
-        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        // Consumer must drain and stop. The bound below is a hang-guard, not a
+        // performance assertion: what is under test is that the consumer drains
+        // and *terminates*, and a consumer that never terminates fails at any
+        // finite bound. The wall-clock cost of five SQLite commits, on the other
+        // hand, is set by whatever else is hitting the disk — under a full
+        // `cargo test -j 6 --workspace` this drain has taken over a minute on a
+        // machine where it takes under two seconds alone. A tight budget here
+        // does not measure the drain, it measures the load, and it made the
+        // whole suite non-deterministic (card_2b890485c8d8).
+        const DRAIN_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+        tokio::time::timeout(DRAIN_HANG_GUARD, handle)
             .await
             .expect("consumer did not stop after shutdown")
             .expect("consumer task panicked");

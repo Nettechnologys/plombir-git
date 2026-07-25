@@ -1334,9 +1334,12 @@ mod tests {
         assert!(res.is_err(), "the hanging future should elapse");
 
         let pid = holder.lock().unwrap().expect("child pid captured");
-        // Poll up to ~3s for the kill + reap to land.
+        // Poll for the kill + reap to land. The loop exits the moment it does,
+        // so a generous ceiling costs nothing when the code is correct and only
+        // buys tolerance for a loaded machine — the same wall-clock-as-assertion
+        // trap as card_2b890485c8d8. ~30s.
         let mut killed = false;
-        for _ in 0..30 {
+        for _ in 0..300 {
             match proc_state(pid) {
                 None | Some('Z') => {
                     killed = true;
