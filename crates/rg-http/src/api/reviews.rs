@@ -107,7 +107,7 @@ async fn require_pr_manager(
     let (repo_model, actor_id) = require_authenticated_read(state, headers, owner, repo).await?;
     let pr = rg_core::pull_request::get_pr(&state.db, owner, repo, number)
         .await
-        .map_err(|_| AppError::not_found("pull request not found"))?;
+        .map_err(AppError::from)?;
     let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(actor_id))
         .await
         .unwrap_or(false);
@@ -138,7 +138,7 @@ async fn require_suggestion_source(
     let (_, actor_id) = require_authenticated_read(state, headers, owner, repo).await?;
     let pr = rg_core::pull_request::get_pr(&state.db, owner, repo, number)
         .await
-        .map_err(|error| AppError::not_found(error.to_string()))?;
+        .map_err(AppError::from)?;
     if pr.state != "open" {
         return Err(AppError::conflict("pull request is not open"));
     }
@@ -305,7 +305,7 @@ pub async fn submit_review(
         };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(e) => return AppError::not_found(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     let action = match rg_core::review::service::ReviewAction::parse_action(&req.action) {
@@ -410,7 +410,7 @@ pub async fn get_review(
     };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(e) => return AppError::not_found(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     match rg_core::review::service::get_review(&state.db, id).await {
         Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => {
@@ -452,7 +452,7 @@ pub async fn dismiss_review(
     };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(e) => return AppError::not_found(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let review = match rg_core::review::service::get_review(&state.db, id).await {
         Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => review,
@@ -521,7 +521,7 @@ pub async fn get_review_timeline(
     }
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(error) => return AppError::not_found(error.to_string()).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let data = match load_timeline_data(&state.db, pr).await {
         Ok(data) => data,
@@ -925,7 +925,7 @@ pub async fn create_review_comment(
         };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(e) => return AppError::not_found(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let review = match req.review_id {
         Some(review_id) => match rg_core::review::service::get_review(&state.db, review_id).await {
@@ -1107,7 +1107,7 @@ pub async fn list_requested_reviewers(
     }
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(_) => return AppError::not_found("pull request not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let requests = match rg_db::ops::pr_reviewer_request_ops::list_by_pr(&state.db, pr.id).await {
         Ok(requests) => requests,
@@ -1312,7 +1312,7 @@ pub async fn set_thread_resolution(
         };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(_) => return AppError::not_found("pull request not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let root = match rg_core::review::service::get_thread_root(&state.db, pr.id, comment_id).await {
         Ok(root) => root,

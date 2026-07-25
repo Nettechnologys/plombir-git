@@ -141,7 +141,10 @@ pub async fn get_pr(
 
     match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
-        Err(e) => AppError::not_found(e.to_string()).into_response(),
+        // `AppError::from`, not `not_found`: only a `rg_core::error::NotFound`
+        // means the PR is absent. A failed lookup stays a 5xx and keeps its
+        // detail in the operator log instead of in the response body.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -273,7 +276,7 @@ pub async fn update_pr(
         };
     let existing = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(e) => return AppError::not_found(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(actor_id))
         .await
@@ -360,21 +363,30 @@ pub async fn merge_pr(
         Err(error) => return AppError::bad_request(error).into_response(),
     };
 
-    // Check branch protection before merging
-    if let Ok(pr) = rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
-        if pr.is_draft {
-            return AppError::conflict("draft pull requests cannot be merged").into_response();
-        }
-        if let Err(e) = rg_core::branch_protection::service::check_merge_allowed(
-            &state.db,
-            repo_model.id,
-            &pr.base_branch,
-            pr.id,
-        )
-        .await
-        {
-            return AppError::forbidden(e.to_string()).into_response();
-        }
+    // Check branch protection before merging.
+    //
+    // This is the ONLY site that runs `check_merge_allowed` on the REST merge
+    // path — `rg_core::pull_request::merge_pr` does not re-check it. So the
+    // lookup may not be `if let Ok(pr)`: swallowing a failed read here skips
+    // the protection check entirely and falls through to the merge, and the
+    // merge's own `get_pr` is a *second* query that can succeed where this one
+    // transiently failed (pool acquire timeout, SQLite busy).
+    let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
+        Ok(pr) => pr,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    if pr.is_draft {
+        return AppError::conflict("draft pull requests cannot be merged").into_response();
+    }
+    if let Err(e) = rg_core::branch_protection::service::check_merge_allowed(
+        &state.db,
+        repo_model.id,
+        &pr.base_branch,
+        pr.id,
+    )
+    .await
+    {
+        return AppError::forbidden(e.to_string()).into_response();
     }
 
     match rg_core::pull_request::merge_pr(
@@ -528,7 +540,7 @@ pub async fn enqueue_merge_queue(
     };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(error) => return AppError::not_found(error.to_string()).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
         Ok(strategy) => strategy,
@@ -590,7 +602,7 @@ pub async fn cancel_merge_queue(
     };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
-        Err(error) => return AppError::not_found(error.to_string()).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     match rg_core::pull_request::merge_queue::cancel(
         &state.db,

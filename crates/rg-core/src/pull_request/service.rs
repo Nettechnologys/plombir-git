@@ -5,6 +5,7 @@ use chrono::Utc;
 use sea_orm::{DatabaseConnection, EntityTrait, Set};
 use std::collections::HashMap;
 
+use crate::error::NotFound;
 use rg_db::entities::pull_request::{self, Model as PullRequest};
 use rg_db::entities::repository as repo_entity;
 use rg_db::ops::{pull_request_ops, repo_ops, user_ops};
@@ -245,6 +246,12 @@ pub async fn list_prs_paginated(
 }
 
 /// Get a single PR.
+///
+/// The three "genuinely absent" outcomes — unknown owner, unknown repository,
+/// unknown PR number — are reported as [`NotFound`], so a caller can tell them
+/// apart from a failed query. Every HTTP handler on this path used to answer
+/// `404` to *any* error here, which made a database outage indistinguishable
+/// from a deleted PR; see the type's docs.
 pub async fn get_pr(
     db: &DatabaseConnection,
     owner: &str,
@@ -254,7 +261,7 @@ pub async fn get_pr(
     let repo = resolve_repo(db, owner, repo_name).await?;
     pull_request_ops::find_by_repo_and_number(db, repo.id, number)
         .await?
-        .context("pull request not found")
+        .ok_or_else(|| NotFound::new("pull request").into())
 }
 
 /// Update PR metadata (title, body, state).
@@ -1607,8 +1614,8 @@ async fn resolve_repo(
 ) -> Result<rg_db::entities::repository::Model> {
     let user = user_ops::find_by_username(db, owner)
         .await?
-        .context("owner not found")?;
+        .ok_or_else(|| NotFound::new("owner"))?;
     repo_ops::find_by_owner_and_name(db, user.id, repo_name)
         .await?
-        .context("repository not found")
+        .ok_or_else(|| NotFound::new("repository").into())
 }

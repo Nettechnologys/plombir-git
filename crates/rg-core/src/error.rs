@@ -70,3 +70,32 @@ impl From<anyhow::Error> for CoreError {
         CoreError::Internal(e)
     }
 }
+
+/// The row the caller asked for genuinely is not there.
+///
+/// Services still return `anyhow::Result`, so "no such pull request" and "the
+/// query failed" arrive at the HTTP layer as the same flattened
+/// `anyhow::Error`. Handlers papered over that by answering `404` to both —
+/// which turns a database outage into "the PR was deleted" for the client's
+/// retry logic and puts nothing in the alerts. The distinction has to travel
+/// *inside* the error, which is what this type is for; it is the same move as
+/// [`crate::package_registry::oci::storage::DigestMismatch`], one level up.
+///
+/// `resource` is a `&'static str` on purpose: the rendered message is a fixed
+/// string with no request data and no `.context("db: …")` chain in it, so the
+/// HTTP layer can hand it to the client verbatim without breaching H-05.
+///
+/// Recognised in `rg-http`'s `From<anyhow::Error> for AppError` via
+/// `downcast_ref`, which sees through any `.context(…)` a caller added on the
+/// way up. Anything that does *not* carry it stays a 5xx.
+#[derive(Debug, Error)]
+#[error("{resource} not found")]
+pub struct NotFound {
+    pub resource: &'static str,
+}
+
+impl NotFound {
+    pub const fn new(resource: &'static str) -> Self {
+        Self { resource }
+    }
+}

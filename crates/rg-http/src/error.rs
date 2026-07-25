@@ -166,6 +166,21 @@ impl From<anyhow::Error> for AppError {
             }
         }
 
+        // A service that reports "this row genuinely is not there" carries
+        // `rg_core::error::NotFound`, and that — not "the handler could not
+        // produce an answer" — is the only thing that may become a 404. The
+        // check sits *after* the timeout and outage branches on purpose: those
+        // classify a failed lookup, and a failed lookup must never be reported
+        // as an absent resource, whatever context got layered on top.
+        //
+        // `to_string()` (not `{:#}`) is deliberate here: `NotFound`'s own
+        // `Display` is a fixed "<resource> not found" with no request data and
+        // no `db: ...` chain in it, and unlike the 5xx variants below this
+        // message reaches the client verbatim (H-05).
+        if let Some(not_found) = e.downcast_ref::<rg_core::error::NotFound>() {
+            return Self::NotFound(not_found.to_string());
+        }
+
         // H-05: Log the full error for operators, store a generic message internally.
         // The IntoResponse impl will also sanitize the client-facing message.
         //
@@ -456,6 +471,37 @@ mod tests {
         let err: AppError = anyhow::anyhow!("something unexpected").into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.code(), "INTERNAL_ERROR");
+    }
+
+    /// A service reporting "this row is genuinely absent" is the only thing
+    /// that may become a 404 — and the message the client gets is the type's
+    /// own fixed text, never the caller's context chain.
+    #[test]
+    fn core_not_found_maps_to_404_with_a_fixed_message() {
+        let err = anyhow::Error::from(rg_core::error::NotFound::new("pull request"))
+            .context("db: find_by_repo_and_number(repo_id = 7)");
+        let app_err: AppError = err.into();
+
+        assert_eq!(app_err.status(), StatusCode::NOT_FOUND);
+        let AppError::NotFound(message) = &app_err else {
+            panic!("expected NotFound, got {app_err:?}");
+        };
+        assert_eq!(message, "pull request not found");
+        assert!(!message.contains("db:"), "{message}");
+    }
+
+    /// Ordering guarantee: a *failed* lookup outranks an *absent* resource, no
+    /// matter what got layered on top. If a caller ever wraps a real outage in
+    /// not-found context, the outage classification must still win — a 404 on a
+    /// dead database is the exact bug this branch was added to prevent.
+    #[test]
+    fn db_outage_wrapped_in_not_found_context_stays_503() {
+        let err = anyhow::Error::from(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout))
+            .context(rg_core::error::NotFound::new("pull request"));
+        let app_err: AppError = err.into();
+
+        assert_eq!(app_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(app_err.code(), "DB_UNAVAILABLE");
     }
 
     #[test]
