@@ -322,7 +322,7 @@ runs:
 
 ```bash
 cargo install cargo-nextest --locked   # one-off
-cargo nextest run --workspace -j 6     # 628 tests
+cargo nextest run --workspace -j 6     # 642 tests
 cargo test --workspace --doc           # nextest does not run doc-tests
 ```
 
@@ -330,9 +330,11 @@ Both commands are needed. `cargo nextest` does not run doc-tests at all, so on
 its own it silently stops checking them.
 
 `cargo test --workspace -j 6` still works and runs the same tests, it is just
-several times slower: it runs the workspace's 63 test binaries one after
-another, so on a 24-core machine most of the machine sits idle. Measured on a
-warm `target`: 135s for `cargo test` against 27s for `cargo nextest run`.
+several times slower: it runs the workspace's 14 test binaries one after
+another and only parallelises inside one of them, so on a 24-core machine most
+of the machine sits idle. Measured on a warm `target` and a quiet machine,
+medians of interleaved rounds: 92s for `cargo test` against 21s for
+`cargo nextest run`.
 
 Use `-j 6` (or lower) rather than the default: full build parallelism
 saturates RAM during linking on this tree. `-j` caps *build* jobs only — if the
@@ -344,9 +346,14 @@ To run one crate or one file:
 
 ```bash
 cargo nextest run -p rg-core
-cargo nextest run -p rg-http --test oauth_pkce_tests
-cargo nextest run -E 'test(admin_sso)'          # filter by test name
+cargo nextest run -E 'test(oauth_pkce_tests::)'  # one rg-http integration file
+cargo nextest run -E 'test(admin_sso)'           # filter by test name
 ```
+
+`rg-http`'s integration tests are all one binary (`tests/integration/`), so a
+single file is no longer a `--test` target — it is a module, and its name is
+the prefix of every test in it. Adding a file means adding a `mod` line to
+`tests/integration/main.rs`; a file nothing declares is silently never run.
 
 #### A faster linker is worth having, but keep it local
 
