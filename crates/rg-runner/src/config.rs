@@ -648,6 +648,30 @@ labels = ["linux", "docker"]
         assert_eq!(resolved.server, "https://ci.example.com");
     }
 
+    /// The `register` shape of the same bug: the operator names only the runner
+    /// and expects the server from `runner.toml`. `register` used to resolve
+    /// nothing at all — `--server` carried a clap default, so it registered
+    /// against localhost and, with `--save`, wrote that back over the file.
+    #[test]
+    fn registering_with_only_a_name_takes_the_server_and_labels_from_the_config() {
+        let cfg = RunnerConfig {
+            server: Some("https://git.example.com".to_string()),
+            ..sample_config()
+        };
+        let cli = RunnerCliArgs {
+            name: Some("builder-2".to_string()),
+            ..RunnerCliArgs::default()
+        };
+
+        let resolved = resolve_runner(cli, Some(&cfg)).unwrap();
+
+        assert_eq!(resolved.server, "https://git.example.com");
+        assert_eq!(resolved.name, "builder-2");
+        // `--labels` was not passed, so the file's value has to survive the
+        // registration rather than be replaced by an empty list.
+        assert_eq!(resolved.labels, vec!["linux".to_string()]);
+    }
+
     #[test]
     fn cli_flags_beat_the_config_file() {
         let cli = RunnerCliArgs {

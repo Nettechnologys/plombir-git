@@ -8,8 +8,8 @@ use crate::api::{
     send_heartbeat, start_job, upload_log,
 };
 use crate::config::{
-    config_not_persisted_warning, load_config, parse_labels, resolve_auth_token, resolve_runner,
-    save_config, ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity,
+    config_not_persisted_warning, load_config, resolve_auth_token, resolve_runner, save_config,
+    ResolvedRunner, RunnerCliArgs, RunnerIdentity,
 };
 use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_local};
 
@@ -37,16 +37,47 @@ fn build_runner_client() -> reqwest::Client {
 
 /// Handle `forgekeep-runner register`: register a runner and optionally persist
 /// its token to the config file.
+///
+/// The config file is read first, and every setting resolves `CLI arg > config
+/// file > built-in default` through the same [`resolve_runner`] that `run` uses.
+/// Before that this command ignored `runner.toml` entirely: `--server` carried a
+/// clap default, so a runner whose config already pointed at a remote server
+/// registered against `127.0.0.1:8080` instead — and with `--save` that localhost
+/// was then written back over the operator's own value, taking `name` and
+/// `labels` with it.
 pub async fn cmd_register(
-    server: String,
-    name: String,
+    server: Option<String>,
+    name: Option<String>,
     labels: Option<String>,
     save: bool,
     auth_token: Option<String>,
     config: String,
 ) -> Result<()> {
     let client = build_runner_client();
-    let labels_vec: Vec<String> = labels.as_deref().map(parse_labels).unwrap_or_default();
+
+    // Same read-or-fail contract as `run`: a missing file is the legitimate
+    // "no config yet", anything unreadable aborts rather than quietly becoming
+    // "no config" and registering against the wrong server.
+    let cfg = load_config(&config)?;
+    // `register` mints a fresh identity by definition, so any `runner_id` /
+    // `token` already in the file is deliberately not fed into the resolution —
+    // only `server`, `name` and `labels` are.
+    let ResolvedRunner {
+        server,
+        name,
+        labels: labels_vec,
+        ..
+    } = resolve_runner(
+        RunnerCliArgs {
+            server,
+            name,
+            labels,
+            token: None,
+            runner_id: None,
+        },
+        cfg.as_ref(),
+    )?;
+
     let auth_token = resolve_auth_token(auth_token)
         .context("runner registration requires --auth-token or FORGEKEEP_AUTH_TOKEN")?;
 
@@ -58,13 +89,16 @@ pub async fn cmd_register(
     println!("  Token: {}", token);
 
     if save {
-        let saved = RunnerConfig {
-            server: Some(server),
-            runner_id: Some(runner_id),
-            token: Some(token.clone()),
-            name: Some(name),
-            labels: Some(labels_vec),
-        };
+        // Merge onto what the file already holds instead of writing a fresh
+        // `RunnerConfig`: a wholesale write drops every key this invocation did
+        // not name, so `register --save --name x` used to erase the operator's
+        // `server` and `labels`.
+        let mut saved = cfg.unwrap_or_default();
+        saved.server = Some(server);
+        saved.runner_id = Some(runner_id);
+        saved.token = Some(token.clone());
+        saved.name = Some(name);
+        saved.labels = Some(labels_vec);
         // `--config`, not a hardcoded `~/.forgekeep/runner.toml`: `run` reads the
         // path it was given, so writing the identity anywhere else means `run`
         // never finds it and registers yet another runner on every start.
