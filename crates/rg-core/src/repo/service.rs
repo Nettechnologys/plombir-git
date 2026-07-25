@@ -14,6 +14,24 @@ use rg_db::{
 
 use super::templates;
 
+/// One actionable error for a failure to stage a temporary git working tree.
+///
+/// Creating a repository, editing a file from the web UI and committing a batch
+/// of files all clone into `TMPDIR/forgekeep-*`. That path is generated here and
+/// never reaches the caller, so a bare `?` puts an unqualified `os error 13`
+/// into the editor's HTTP response.
+///
+/// Unlike [`path_error`](crate::platform::fs::path_error) the remedy is appended
+/// unconditionally: on a permission failure the uid diagnostic says which
+/// directory is wrong, but only `TMPDIR` says where to move it.
+fn temp_tree_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
+    let described = crate::platform::fs::describe_path_error(what, path, error, "");
+    anyhow::anyhow!(
+        "{described}\n  hint: {}",
+        crate::platform::fs::TEMP_DIR_HINT
+    )
+}
+
 /// Options for repository creation (aligned with Gitea's CreateRepoOption).
 #[derive(Debug, Clone)]
 pub struct CreateRepoOptions {
@@ -398,8 +416,17 @@ pub async fn create_repo_with_opts(
 
     // Create bare git repo on disk using gix
     let git_path = repo_root.join(format!("{}/{}.git", path_prefix, name));
-    std::fs::create_dir_all(&git_path)
-        .with_context(|| format!("failed to create directory: {:?}", git_path))?;
+    // The path was already named here; what was missing on the deployment that
+    // hits this first — a bind-mounted `repo_root` owned by another uid — is
+    // which knob points elsewhere and which side of the mismatch is wrong.
+    std::fs::create_dir_all(&git_path).map_err(|error| {
+        crate::platform::fs::path_error(
+            "repository directory",
+            &git_path,
+            &error,
+            crate::platform::fs::REPO_ROOT_HINT,
+        )
+    })?;
 
     gix::create::into(
         &git_path,
@@ -549,7 +576,8 @@ fn auto_init_repo(
 
     // Create a temp directory for the working tree
     let tmp = std::env::temp_dir().join(format!("forgekeep-init-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)?;
+    std::fs::create_dir_all(&tmp)
+        .map_err(|error| temp_tree_error("auto-init working tree", &tmp, &error))?;
 
     // Init a non-bare repo in the temp dir
     let gateway =
@@ -1107,7 +1135,8 @@ pub async fn create_or_update_file(
 
     // Create temp working directory
     let tmp = std::env::temp_dir().join(format!("forgekeep-file-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)?;
+    std::fs::create_dir_all(&tmp)
+        .map_err(|error| temp_tree_error("file-edit working tree", &tmp, &error))?;
 
     // Clone the repo
     let clone_url =
@@ -1142,9 +1171,11 @@ pub async fn create_or_update_file(
     // Write the file
     let full_path = tmp.join(file_path);
     if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| temp_tree_error("file-edit working tree", parent, &error))?;
     }
-    std::fs::write(&full_path, content)?;
+    std::fs::write(&full_path, content)
+        .map_err(|error| temp_tree_error("edited file", &full_path, &error))?;
 
     // Git add
     let output = gateway
@@ -1239,7 +1270,8 @@ pub fn update_files_in_commit(
     }
 
     let tmp = std::env::temp_dir().join(format!("forgekeep-files-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)?;
+    std::fs::create_dir_all(&tmp)
+        .map_err(|error| temp_tree_error("commit working tree", &tmp, &error))?;
     let result = (|| -> Result<String> {
         let clone_url = path_to_git_url(&repo_path)?;
         let tmp_str = tmp.to_string_lossy();
@@ -1294,9 +1326,11 @@ pub fn update_files_in_commit(
                 }
             }
             if let Some(parent) = full_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| temp_tree_error("commit working tree", parent, &error))?;
             }
-            std::fs::write(&full_path, &update.content)?;
+            std::fs::write(&full_path, &update.content)
+                .map_err(|error| temp_tree_error("committed file", &full_path, &error))?;
             let add = gateway.run(&["add", "--", &update.path], Some(&tmp))?;
             add.ensure_success()?;
         }
@@ -1355,7 +1389,8 @@ pub async fn delete_file(
 
     // Create temp working directory
     let tmp = std::env::temp_dir().join(format!("forgekeep-file-del-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)?;
+    std::fs::create_dir_all(&tmp)
+        .map_err(|error| temp_tree_error("file-delete working tree", &tmp, &error))?;
 
     // Clone the repo
     let clone_url =
@@ -1427,6 +1462,46 @@ fn get_file_sha(repo_path: &std::path::Path, git_ref: &str, file_path: &str) -> 
     })?;
 
     Ok(object_id.to_string())
+}
+
+#[cfg(test)]
+mod path_diagnostic_tests {
+    use super::*;
+
+    /// The temp-tree path is `TMPDIR`-derived and generated per call, so the
+    /// message has to carry both halves an operator needs: which directory
+    /// failed, and the variable that moves it somewhere writable.
+    #[test]
+    fn temp_tree_error_names_the_directory_and_the_variable_that_moves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"file").unwrap();
+        let tmp = occupied.join("forgekeep-file-1");
+
+        let error = std::fs::create_dir_all(&tmp).expect_err("a file cannot host a subdirectory");
+        let rendered = temp_tree_error("file-edit working tree", &tmp, &error).to_string();
+
+        assert!(rendered.contains(&tmp.display().to_string()), "{rendered}");
+        assert!(rendered.contains("TMPDIR"), "{rendered}");
+    }
+
+    /// A permission failure trades the caller remedy for the uid diagnostic in
+    /// [`describe_path_error`]; for a temp tree both matter, so the `TMPDIR`
+    /// hint has to survive alongside it.
+    #[cfg(unix)]
+    #[test]
+    fn temp_tree_error_keeps_the_tmpdir_hint_on_a_permission_failure() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let rendered = temp_tree_error(
+            "commit working tree",
+            std::path::Path::new("/tmp/forgekeep-files-1"),
+            &error,
+        )
+        .to_string();
+
+        assert!(rendered.contains("this process runs as uid="), "{rendered}");
+        assert!(rendered.contains("TMPDIR"), "{rendered}");
+    }
 }
 
 #[cfg(test)]

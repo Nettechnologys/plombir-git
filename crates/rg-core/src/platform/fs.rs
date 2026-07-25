@@ -291,6 +291,37 @@ pub fn describe_path_error(
     message
 }
 
+/// Remediation for a filesystem failure under the repository storage root.
+///
+/// The server derives every repository path from `repo_root` and creates the
+/// `<owner>/` level below it on demand, so neither directory is ever named by
+/// the request that failed — the operator only sees `os error 13` from a clone
+/// or an import.
+pub const REPO_ROOT_HINT: &str =
+    "repositories live under the `[server].repo_root` directory (`--repo-root` / \
+     `FORGEKEEP_REPO_ROOT`); that directory, and the `<owner>/` level the server creates below \
+     it, must be writable by the user running forgekeep";
+
+/// Remediation for a filesystem failure on a temporary git working tree.
+///
+/// Creating a repository, editing a file from the web UI and committing a batch
+/// of files all stage a working tree in the system temp directory. A container
+/// started with `read_only: true` has no writable `/tmp`, and the resulting
+/// error names neither the directory nor the variable that moves it.
+pub const TEMP_DIR_HINT: &str =
+    "the server stages git working trees in the system temporary directory; point `TMPDIR` at a \
+     writable directory (a container started with `read_only: true` has no writable `/tmp` \
+     unless a tmpfs is mounted there)";
+
+/// [`describe_path_error`] as a ready-to-propagate [`anyhow::Error`].
+///
+/// The `?` on a bare `std::fs` call discards the path — the io error only
+/// carries the errno — so every caller that computes its path internally has to
+/// re-attach it. This is that one line.
+pub fn path_error(what: &str, path: &Path, error: &std::io::Error, remedy: &str) -> anyhow::Error {
+    anyhow::anyhow!("{}", describe_path_error(what, path, error, remedy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +399,24 @@ mod tests {
             message.contains("create the file before starting the container"),
             "{message}"
         );
+    }
+
+    /// A real `std::fs` failure is the interesting input: the io error alone
+    /// knows the errno and nothing else, so `path_error` is the only thing
+    /// standing between the operator and an unqualified `os error 20`.
+    #[test]
+    fn path_error_names_the_path_the_io_error_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("occupied");
+        fs::write(&not_a_dir, b"file").unwrap();
+        let target = not_a_dir.join("alice");
+
+        let error = fs::create_dir_all(&target).expect_err("a file cannot host a subdirectory");
+        let rendered = super::path_error("repo owner directory", &target, &error, REPO_ROOT_HINT)
+            .to_string();
+
+        assert!(rendered.contains(&target.display().to_string()), "{rendered}");
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
     }
 
     #[test]

@@ -200,8 +200,20 @@ pub async fn trigger_sync(db: &DatabaseConnection, repo_id: i64, repo_root: &Pat
 // ── Git helpers ─────────────────────────────────────────────────────────
 
 fn run_git_clone_mirror(url: &str, path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap();
-    std::fs::create_dir_all(parent).context("create mirror dir")?;
+    // `create mirror dir` named the operation but never the directory, and the
+    // directory — `repo_root` — is the only thing an operator can act on when
+    // the mirror row shows nothing but `Permission denied (os error 13)`.
+    let parent = path
+        .parent()
+        .context("mirror path has no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        crate::platform::fs::path_error(
+            "mirror directory",
+            parent,
+            &error,
+            crate::platform::fs::REPO_ROOT_HINT,
+        )
+    })?;
 
     let git = global_gateway()
         .as_ref()

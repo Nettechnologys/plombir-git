@@ -33,6 +33,7 @@ use crate::import::github_client::{
 use crate::import::gitlab_client::{
     GitLabClient, GitLabIssue, GitLabLabel, GitLabMR, GitLabMilestone, GitLabNote, GitLabRelease,
 };
+use crate::platform::fs::{path_error, REPO_ROOT_HINT};
 
 /// Statistics collected during import.
 #[derive(Debug, Default, serde::Serialize)]
@@ -518,7 +519,11 @@ fn clone_repo(
     let parent = target_dir
         .parent()
         .context("import target path has no parent directory")?;
-    std::fs::create_dir_all(parent)?;
+    // The whole path is derived from `repo_root` inside this function, so a bare
+    // `?` here hands the operator an `os error 13` that names neither the
+    // directory the import tried to create nor the setting that moves it.
+    std::fs::create_dir_all(parent)
+        .map_err(|error| path_error("import target directory", parent, &error, REPO_ROOT_HINT))?;
 
     let git = global_gateway()
         .as_ref()
@@ -1444,4 +1449,37 @@ pub async fn start_import(
     import_task_ops::find_by_id(db, task.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("import task not found after creation"))
+}
+
+#[cfg(test)]
+mod clone_path_tests {
+    use super::*;
+
+    /// An import into an unusable `repo_root` is the failure an operator meets
+    /// first, and until this test it reported the errno alone — the directory
+    /// the clone tried to create was computed here and never left the function.
+    #[test]
+    fn clone_repo_names_the_directory_it_could_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file cannot host `<owner>/`, so `create_dir_all` fails
+        // before any git subprocess is spawned.
+        let repo_root = dir.path().join("repo_root");
+        std::fs::write(&repo_root, b"not a directory").unwrap();
+
+        let error = clone_repo(
+            "https://example.invalid/alice/site.git",
+            &repo_root,
+            "alice",
+            "site",
+            "",
+        )
+        .expect_err("repo_root is a file");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&repo_root.join("alice").display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
 }
