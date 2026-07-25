@@ -307,3 +307,13 @@ file is TOML (`forgekeep.toml`; see `forgekeep.example.toml` for all sections:
 `audit`). Environment variables use the `FORGEKEEP_*` prefix; the deprecated
 `IRONFORGE_*` names are still read as a fallback (with a one-time warning) to
 ease migration from the upstream project.
+
+**Path-typed keys are checked at startup, not on first use.** `server.repo_root`,
+`tls.cert` / `tls.key`, `logging.file` and `audit.archive_dir` are created
+and/or write-probed before the servers come up, and a failure aborts the start
+with the path, the uid/ownership diagnostic and the knob to fix
+(`rg_core::platform::fs::describe_path_error`). `server.host_key` is checked the
+same way but only fails the SSH listener — HTTP keeps serving. The rule exists
+because the alternative is silent degradation: `audit.archive_dir` used to be
+touched only by the hourly archiver loop, so an unwritable directory meant audit
+retention never ran and said so in a warning nobody reads.

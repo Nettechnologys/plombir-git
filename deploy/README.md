@@ -111,6 +111,7 @@ failures, prints the uid to `chown` to.
 | `SQLite database … is not writable` | same, for the DB and its `-wal`/`-shm` sidecars | as above — the *directory* must be writable, not just the file |
 | `SSH host key … Permission denied` | key file readable only by another uid | `chown <uid> data/ssh_host_key && chmod 600 data/ssh_host_key` |
 | `SSH host key path … is a directory` | bind-mounted a host key file that did not exist | remove the directory and let the server generate the key |
+| `audit archive_dir … is unusable` | `[audit].archive_dir` not writable by the container uid | `chown` it as above, point the key elsewhere, or set `[audit].enabled = false` |
 | HTTP works, SSH silent | SSH failed on its own; HTTP is unaffected by design | `docker compose logs \| grep 'SSH server error'` |
 
 ### Backup / restore

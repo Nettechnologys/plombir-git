@@ -46,15 +46,53 @@ pub struct ArchiveResult {
     pub count: usize,
 }
 
-/// Start the background audit archive task with default retention settings.
-pub fn spawn_archiver(db: DatabaseConnection, archive_dir: PathBuf) {
-    if let Err(error) =
-        spawn_archiver_with_config(db, AuditArchiveConfig::with_archive_dir(archive_dir))
-    {
-        tracing::warn!(%error, "audit log archiver configuration is invalid");
-    }
+/// Remediation appended to every `archive_dir` failure. The escape hatch is
+/// named on purpose: an operator who does not want audit archival at all should
+/// turn it off explicitly rather than leave a directory the server cannot use.
+const ARCHIVE_DIR_HINT: &str =
+    "point `[audit].archive_dir` at a directory the server can create and write into, or set \
+     `[audit].enabled = false` to turn audit-log archival off";
+
+/// One actionable line for any filesystem failure on the archive path.
+///
+/// [`describe_path_error`](crate::platform::fs::describe_path_error) trades the
+/// caller's remedy for the uid diagnostic on a permission error; here both
+/// matter. A permission failure now refuses the whole server start, so the
+/// operator has to be told which knob to point elsewhere — or how to turn
+/// archival off — and not just which directory to `chown`.
+fn archive_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
+    let described = crate::platform::fs::describe_path_error(what, path, error, "");
+    anyhow::anyhow!("{described}\n  hint: {ARCHIVE_DIR_HINT}")
 }
 
+/// Create `archive_dir` and prove it is writable — at startup, not an hour later.
+///
+/// Without this the first filesystem contact happens inside the archiver loop,
+/// once enough rows have aged past the retention cutoff, and its only failure
+/// channel is a warning nobody reads. An `archive_dir` the server cannot write
+/// (the usual case: a bind-mounted host directory owned by another uid) would
+/// therefore mean the audit log is never trimmed, and the operator finds out
+/// from a full disk rather than from the server.
+pub fn ensure_archive_dir(archive_dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(archive_dir)
+        .map_err(|error| archive_path_error("audit archive_dir", archive_dir, &error))?;
+
+    // `create_dir_all` is happy with an existing directory the process cannot
+    // write into — which is exactly the bind-mount-owned-by-another-uid case —
+    // so prove writability with the same kind of temp file the archiver uses.
+    let probe = temporary_path(archive_dir, uuid::Uuid::new_v4());
+    std::fs::write(&probe, b"")
+        .map_err(|error| archive_path_error("audit archive_dir", archive_dir, &error))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Start the background audit archive task without a shutdown signal.
+///
+/// There is deliberately no `Result`-swallowing convenience wrapper next to
+/// this one: the previous `spawn_archiver` turned a bad `archive_dir` into a
+/// `warn!` and no archiver at all, which is the failure this module exists to
+/// stop being silent. Every entry point returns the error to its caller.
 pub fn spawn_archiver_with_config(
     db: DatabaseConnection,
     config: AuditArchiveConfig,
@@ -73,6 +111,7 @@ pub fn spawn_archiver_with_shutdown(
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     config.validate()?;
+    ensure_archive_dir(&config.archive_dir)?;
     Ok(tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         let mut interval = time::interval(time::Duration::from_secs(
@@ -100,7 +139,15 @@ pub fn spawn_archiver_with_shutdown(
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        tracing::warn!(%error, "audit log archive run failed");
+                        // Name the directory and unwind the whole `anyhow`
+                        // chain (`{:#}` — a bare `%error` prints only the top
+                        // context), and say what the failure costs: an
+                        // archiver that never succeeds means the audit log
+                        // grows unbounded.
+                        tracing::warn!(
+                            archive_dir = %config.archive_dir.display(),
+                            "audit log archive run failed, audit rows are not being trimmed: {error:#}"
+                        );
                         break;
                     }
                 }
@@ -133,7 +180,12 @@ pub async fn run_archive_once(
         return Ok(None);
     }
 
-    tokio::fs::create_dir_all(&config.archive_dir).await?;
+    // Re-created on every run rather than only at startup: the directory can be
+    // removed or unmounted while the server is up, and the error has to name it
+    // either way.
+    tokio::fs::create_dir_all(&config.archive_dir)
+        .await
+        .map_err(|error| archive_path_error("audit archive_dir", &config.archive_dir, &error))?;
     let archive_id = uuid::Uuid::new_v4();
     let filename = format!(
         "audit-{}-{}.ndjson.zst",
@@ -154,7 +206,7 @@ pub async fn run_archive_once(
 
     if let Err(error) = write_archive_atomically(&temp_path, &path, &compressed).await {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(error);
+        return Err(archive_path_error("audit archive file", &path, &error));
     }
 
     let ids = old_entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
@@ -170,11 +222,14 @@ fn temporary_path(archive_dir: &Path, archive_id: uuid::Uuid) -> PathBuf {
     archive_dir.join(format!(".audit-{archive_id}.tmp"))
 }
 
+/// Returns the raw [`std::io::Error`] rather than an `anyhow::Error` so the
+/// caller can hand it to `describe_path_error`, which keys the uid/ownership
+/// diagnostic off `ErrorKind::PermissionDenied`.
 async fn write_archive_atomically(
     temp_path: &Path,
     path: &Path,
     data: &[u8],
-) -> anyhow::Result<()> {
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
     let mut file = tokio::fs::File::create(temp_path).await?;
@@ -188,10 +243,183 @@ async fn write_archive_atomically(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_archive_once, AuditArchiveConfig};
+    use super::{ensure_archive_dir, run_archive_once, AuditArchiveConfig};
     use chrono::{Duration, Utc};
     use sea_orm::{ConnectOptions, Database, NotSet, Set};
     use std::io::Cursor;
+
+    /// Permission bits mean nothing to uid 0, so the read-only-directory tests
+    /// would see a successful write and fail for the wrong reason.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` reads the calling process's own credentials.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    fn make_read_only(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    #[test]
+    fn ensure_archive_dir_creates_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("nested").join("audit-archive");
+
+        ensure_archive_dir(&archive_dir).unwrap();
+
+        assert!(archive_dir.is_dir());
+        // The write probe must not survive as a stray file in the archive dir.
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 0);
+    }
+
+    /// The failure this whole preflight exists for: a bind-mounted host
+    /// directory owned by another uid. `create_dir_all` cannot see it (the
+    /// directory already exists), so only the write probe catches it — and the
+    /// message has to carry the path and the uid diagnostic, because the
+    /// alternative is an hourly warning nobody reads.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_archive_dir_rejects_an_existing_unwritable_directory() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("audit-archive");
+        std::fs::create_dir(&archive_dir).unwrap();
+        make_read_only(&archive_dir);
+
+        let error = ensure_archive_dir(&archive_dir).unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&archive_dir.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("this process runs as uid="), "{rendered}");
+        assert!(rendered.contains("[audit].enabled = false"), "{rendered}");
+    }
+
+    /// The same failure one level up: the directory does not exist yet and its
+    /// parent denies creation.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_archive_dir_rejects_an_uncreatable_directory() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("data");
+        std::fs::create_dir(&parent).unwrap();
+        make_read_only(&parent);
+        let archive_dir = parent.join("audit-archive");
+
+        let error = ensure_archive_dir(&archive_dir).unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&archive_dir.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("this process runs as uid="), "{rendered}");
+    }
+
+    /// A misconfigured `archive_dir` must abort the *spawn*, not degrade into a
+    /// background task that warns once an hour forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_refuses_to_start_with_an_unwritable_archive_dir() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = Database::connect(ConnectOptions::new(db_url))
+            .await
+            .unwrap();
+        let archive_dir = dir.path().join("audit-archive");
+        std::fs::create_dir(&archive_dir).unwrap();
+        make_read_only(&archive_dir);
+
+        let error = super::spawn_archiver_with_shutdown(
+            db,
+            AuditArchiveConfig::with_archive_dir(archive_dir.clone()),
+            None,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&archive_dir.display().to_string()),
+            "{rendered}"
+        );
+    }
+
+    /// The archive directory can lose write access while the server is up (a
+    /// remount, a chown, a full-disk-triggered permission change), and that
+    /// failure reaches the operator only through the loop's warning — so the
+    /// error itself has to name the directory rather than say `os error 13`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_archive_once_names_the_directory_when_the_write_fails() {
+        if running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = Database::connect(ConnectOptions::new(db_url))
+            .await
+            .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        insert_audit_row(&db, "old.action", Utc::now() - Duration::days(91)).await;
+
+        let archive_dir = dir.path().join("audit-archive");
+        std::fs::create_dir(&archive_dir).unwrap();
+        make_read_only(&archive_dir);
+        let config = AuditArchiveConfig::with_archive_dir(archive_dir.clone());
+
+        let error = run_archive_once(&db, &config).await.unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&archive_dir.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("this process runs as uid="), "{rendered}");
+
+        // The row must still be there: nothing is purged unless the archive
+        // was written durably.
+        let remaining = rg_db::ops::audit_log_ops::list_before(&db, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    async fn insert_audit_row(
+        db: &sea_orm::DatabaseConnection,
+        action: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        rg_db::ops::audit_log_ops::insert(
+            db,
+            rg_db::entities::audit_log::ActiveModel {
+                id: NotSet,
+                user_id: Set(None),
+                username: Set(None),
+                action: Set(action.to_string()),
+                resource_type: Set(None),
+                resource_id: Set(None),
+                resource_name: Set(None),
+                ip_address: Set(None),
+                user_agent: Set(None),
+                details: Set(None),
+                created_at: Set(created_at),
+            },
+        )
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn archives_only_expired_rows_as_compressed_ndjson() {

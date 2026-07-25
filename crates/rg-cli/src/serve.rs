@@ -378,6 +378,33 @@ fn parse_rate_limit_trusted_proxies(values: &[String]) -> anyhow::Result<Vec<IpA
         .collect()
 }
 
+/// Default `[audit].archive_dir` — a sibling of `repo_root` rather than a
+/// cwd-relative path.
+///
+/// The container image has `WORKDIR /app` and its persistent volume mounted at
+/// `/data`, so the historical `./data/audit-archive` default resolved to
+/// `/app/data/audit-archive`: inside the container layer, wiped on every
+/// `docker compose up --force-recreate`, taking the archived audit log — the
+/// one artifact whose whole point is to outlive the rows it replaced — with it.
+/// Anchoring on an absolute `repo_root` (`/data/repos` → `/data/audit-archive`)
+/// keeps the archive on the same volume as the data it belongs to.
+///
+/// A relative `repo_root` is left alone: it is already cwd-relative, so there is
+/// no ephemeral/persistent mismatch to fix, and moving the default would only
+/// strand the archives of an existing install.
+fn default_audit_archive_dir(repo_root: &std::path::Path) -> PathBuf {
+    match repo_root.parent() {
+        // `parent.parent().is_some()` rejects a filesystem root (`/repos` →
+        // `/`): writing the archive there needs privileges the server should
+        // not have, and demanding them at startup would turn a working install
+        // into a boot failure.
+        Some(parent) if repo_root.is_absolute() && parent.parent().is_some() => {
+            parent.join("audit-archive")
+        }
+        _ => PathBuf::from("./data/audit-archive"),
+    }
+}
+
 /// Validate critical configuration before starting servers.
 /// Refuses to start with dangerous defaults or invalid settings.
 fn validate_config(
@@ -875,16 +902,26 @@ pub(crate) async fn run_serve(
         .and_then(|config| config.enabled)
         .unwrap_or(true)
     {
-        // Note: the archiver's numeric knobs (archive_after_days /
-        // interval_minutes / batch_size) are range-checked by
-        // `AuditArchiveConfig::validate()`, invoked at the top of
-        // `spawn_archiver_with_shutdown` below, so a 0 there also fails at start.
+        // Note: `spawn_archiver_with_shutdown` below range-checks the numeric
+        // knobs (archive_after_days / interval_minutes / batch_size) and then
+        // creates + write-probes `archive_dir`, so a 0 or an unusable directory
+        // fails the start here rather than an hour later inside the loop.
+        let archive_dir = audit_config
+            .and_then(|config| config.archive_dir.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_audit_archive_dir(&repo_root));
+        // Log the *absolute* destination: the historical default resolved
+        // against the process cwd, so an operator reading `./data/audit-archive`
+        // had no way to tell the archive was landing inside an ephemeral
+        // container layer instead of on the data volume.
+        tracing::info!(
+            archive_dir = %std::path::absolute(&archive_dir)
+                .unwrap_or_else(|_| archive_dir.clone())
+                .display(),
+            "Audit log archival enabled"
+        );
         let archive_config = rg_core::audit::archiver::AuditArchiveConfig {
-            archive_dir: PathBuf::from(
-                audit_config
-                    .and_then(|config| config.archive_dir.as_deref())
-                    .unwrap_or("./data/audit-archive"),
-            ),
+            archive_dir,
             archive_after_days: audit_config
                 .and_then(|config| config.archive_after_days)
                 .unwrap_or(90),
@@ -1306,6 +1343,32 @@ max_files = 7
         assert_eq!(
             super::sqlite_file_path("postgres://user:pw@localhost/forgekeep"),
             None
+        );
+    }
+
+    /// The container runs from `WORKDIR /app` with its volume on `/data`, so
+    /// the old cwd-relative `./data/audit-archive` default put the audit
+    /// archive inside the image layer — deleted on the next recreate, while the
+    /// rows it had replaced were already purged from the database.
+    #[test]
+    fn audit_archive_default_follows_an_absolute_repo_root() {
+        use std::path::{Path, PathBuf};
+
+        assert_eq!(
+            super::default_audit_archive_dir(Path::new("/data/repos")),
+            PathBuf::from("/data/audit-archive")
+        );
+        // A relative repo_root is already cwd-relative — nothing to fix, and
+        // moving the default would strand an existing install's archives.
+        assert_eq!(
+            super::default_audit_archive_dir(Path::new("./repos")),
+            PathBuf::from("./data/audit-archive")
+        );
+        // A repo_root directly under the filesystem root keeps the historical
+        // default rather than demanding write access to `/`.
+        assert_eq!(
+            super::default_audit_archive_dir(Path::new("/repos")),
+            PathBuf::from("./data/audit-archive")
         );
     }
 

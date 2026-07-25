@@ -70,6 +70,14 @@ max_files = 5
 
 [audit]
 enabled = true
+# Where archived audit logs (compressed NDJSON) are written before the rows are
+# purged from the database. The server creates this directory and proves it is
+# writable at startup — it refuses to start otherwise, since a directory it
+# cannot write means the audit log is never trimmed and nothing says so until
+# the disk fills. Set `enabled = false` if you do not want archival at all.
+# Left unset it defaults to a sibling of `[server].repo_root` when that is an
+# absolute path (`/data/repos` → `/data/audit-archive`), so the archive lands on
+# the same volume as the rest of the state; otherwise `./data/audit-archive`.
 archive_dir = "./data/audit-archive"
 archive_after_days = 90
 interval_minutes = 60
