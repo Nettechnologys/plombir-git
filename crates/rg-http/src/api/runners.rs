@@ -300,7 +300,12 @@ pub async fn poll_job(
                     if let Err(e) =
                         rg_db::ops::pipeline_ops::assign_job(&state.db, job.id, runner_id).await
                     {
-                        eprintln!("[poll_job] failed to assign job {}: {}", job.id, e);
+                        tracing::error!(
+                            job_id = job.id,
+                            runner_id,
+                            error = %format!("{e:#}"),
+                            "poll_job: failed to assign job"
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         continue;
                     }
