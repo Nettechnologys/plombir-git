@@ -11,6 +11,20 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
+/// Where a chunked OCI upload is staged and what has to be true about it.
+///
+/// The directory is derived from `repo_root` and a generated UUID, so nothing
+/// in a failed `docker push` names it — the client only ever sees the errno the
+/// registry handed back.
+const UPLOAD_DIR_HINT: &str =
+    "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` directory; \
+     that directory must be writable by the user running forgekeep";
+
+/// One actionable error for a filesystem failure on an OCI upload path.
+fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
+    crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
+}
+
 #[derive(Clone)]
 pub struct OciStorage {
     backend: Arc<dyn BlobStorage>,
@@ -123,7 +137,9 @@ impl OciStorage {
                 let path = self
                     .legacy_blob_path(owner, repo, digest)
                     .ok_or_else(|| anyhow::anyhow!("blob not found: {digest}"))?;
-                tokio::fs::read(path).await.map_err(Into::into)
+                tokio::fs::read(&path)
+                    .await
+                    .map_err(|error| upload_path_error("legacy OCI blob", &path, &error))
             }
             Err(error) => Err(error.into()),
         }
@@ -203,7 +219,9 @@ impl OciStorage {
                 let path = self
                     .legacy_manifest_path(owner, repo, digest)
                     .ok_or_else(|| anyhow::anyhow!("manifest not found: {digest}"))?;
-                tokio::fs::read(path).await.map_err(Into::into)
+                tokio::fs::read(&path)
+                    .await
+                    .map_err(|error| upload_path_error("legacy OCI manifest", &path, &error))
             }
             Err(error) => Err(error.into()),
         }
@@ -212,9 +230,13 @@ impl OciStorage {
     pub async fn create_upload(&self, owner: &str, repo: &str) -> anyhow::Result<(String, String)> {
         let uuid = Uuid::new_v4().to_string();
         let directory = self.upload_dir(owner, repo, &uuid);
-        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .map_err(|error| upload_path_error("OCI upload directory", &directory, &error))?;
         let file = self.upload_file_path(owner, repo, &uuid);
-        tokio::fs::write(&file, &[]).await?;
+        tokio::fs::write(&file, &[])
+            .await
+            .map_err(|error| upload_path_error("OCI upload file", &file, &error))?;
         Ok((uuid, file.to_string_lossy().to_string()))
     }
 
@@ -230,17 +252,37 @@ impl OciStorage {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
-            .await?;
-        file.write_all(data).await?;
-        file.flush().await?;
-        Ok(file.metadata().await?.len() as i64)
+            .open(&path)
+            .await
+            .map_err(|error| upload_path_error("OCI upload file", &path, &error))?;
+        file.write_all(data)
+            .await
+            .map_err(|error| upload_path_error("OCI upload file", &path, &error))?;
+        file.flush()
+            .await
+            .map_err(|error| upload_path_error("OCI upload file", &path, &error))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|error| upload_path_error("OCI upload file", &path, &error))?;
+        Ok(metadata.len() as i64)
     }
 
-    pub fn upload_size(&self, owner: &str, repo: &str, uuid: &str) -> i64 {
-        std::fs::metadata(self.upload_file_path(owner, repo, uuid))
-            .map(|metadata| metadata.len() as i64)
-            .unwrap_or(0)
+    /// Bytes already staged for `uuid`, or `0` when the upload has not been
+    /// written to yet.
+    ///
+    /// Any other failure is an error rather than a zero: an unreadable chunk
+    /// file used to be indistinguishable from an empty one, and the size feeds
+    /// the `Range` header a client resumes from — so answering `0` for a
+    /// directory it cannot stat tells the client to re-send a blob the
+    /// registry will fail on again.
+    pub fn upload_size(&self, owner: &str, repo: &str, uuid: &str) -> anyhow::Result<i64> {
+        let path = self.upload_file_path(owner, repo, uuid);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.len() as i64),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(upload_path_error("OCI upload file", &path, &error)),
+        }
     }
 
     pub async fn finalize_upload(
@@ -259,12 +301,17 @@ impl OciStorage {
             return Ok((expected_digest.to_string(), size, key.to_string()));
         }
 
-        let mut source = tokio::fs::File::open(&upload_path).await?;
+        let mut source = tokio::fs::File::open(&upload_path)
+            .await
+            .map_err(|error| upload_path_error("OCI upload file", &upload_path, &error))?;
         let mut hasher = Sha256::new();
         let mut size = 0_i64;
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
-            let read = source.read(&mut buffer).await?;
+            let read = source
+                .read(&mut buffer)
+                .await
+                .map_err(|error| upload_path_error("OCI upload file", &upload_path, &error))?;
             if read == 0 {
                 break;
             }
@@ -283,8 +330,13 @@ impl OciStorage {
 
     pub async fn delete_upload(&self, owner: &str, repo: &str, uuid: &str) -> anyhow::Result<()> {
         let directory = self.upload_dir(owner, repo, uuid);
-        if tokio::fs::try_exists(&directory).await? {
-            tokio::fs::remove_dir_all(directory).await?;
+        let exists = tokio::fs::try_exists(&directory)
+            .await
+            .map_err(|error| upload_path_error("OCI upload directory", &directory, &error))?;
+        if exists {
+            tokio::fs::remove_dir_all(&directory)
+                .await
+                .map_err(|error| upload_path_error("OCI upload directory", &directory, &error))?;
         }
         Ok(())
     }
@@ -331,6 +383,51 @@ fn verify_digest(expected: &str, data: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::OciStorage;
     use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    /// Build a storage whose upload root cannot host directories, so every
+    /// upload-side filesystem call fails for a reason an operator has to fix.
+    fn storage_with_unusable_upload_root(root: &std::path::Path) -> OciStorage {
+        let upload_root = root.join("uploads");
+        std::fs::write(&upload_root, b"not a directory").unwrap();
+        let backend = Arc::new(crate::blob_storage::LocalBlobStorage::new(root));
+        OciStorage::from_backend(backend, upload_root)
+    }
+
+    /// `docker push` against an unwritable registry directory used to answer
+    /// with the errno alone — the staging path is built from `repo_root` and a
+    /// generated UUID, so nothing else in the exchange could name it.
+    #[tokio::test]
+    async fn create_upload_names_the_directory_and_the_setting_behind_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with_unusable_upload_root(directory.path());
+
+        let error = storage
+            .create_upload("alice", "demo")
+            .await
+            .expect_err("upload root is a file");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("uploads"), "{rendered}");
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
+
+    /// An upload nobody has written to yet is genuinely zero bytes; anything
+    /// else has to be an error, because the size becomes the `Range` a client
+    /// resumes from.
+    #[tokio::test]
+    async fn upload_size_separates_a_missing_upload_from_an_unreadable_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let started = OciStorage::new(directory.path());
+        assert_eq!(started.upload_size("alice", "demo", "no-such").unwrap(), 0);
+
+        let broken = storage_with_unusable_upload_root(directory.path());
+        let error = broken
+            .upload_size("alice", "demo", "no-such")
+            .expect_err("upload root is a file, not a missing upload");
+
+        assert!(format!("{error:#}").contains("uploads"), "{error:#}");
+    }
 
     #[tokio::test]
     async fn publishes_verified_upload_under_stable_key() {

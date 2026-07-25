@@ -1142,21 +1142,40 @@ pub async fn complete_upload(
 /// Stream an Axum `Body` to a file, appending to any existing content.
 /// Never buffers the entire body in memory—each frame is written directly.
 /// Returns the total file size after the write.
+///
+/// This is the write path of every `docker push`: the staging path is derived
+/// from `repo_root` plus a generated upload UUID, so a bare `?` on the io error
+/// hands the client an errno and nothing else. Every failure names the file.
 async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow::Result<i64> {
+    let staged = |error: &std::io::Error| {
+        rg_core::platform::fs::path_error(
+            "OCI upload file",
+            file_path,
+            error,
+            "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` \
+             directory; that directory must be writable by the user running forgekeep",
+        )
+    };
+
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(file_path)
-        .await?;
+        .await
+        .map_err(|error| staged(&error))?;
 
     use futures::StreamExt;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
-        file.write_all(&data).await?;
+        file.write_all(&data).await.map_err(|error| staged(&error))?;
     }
 
-    let size = file.metadata().await?.len() as i64;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|error| staged(&error))?
+        .len() as i64;
     Ok(size)
 }
 
