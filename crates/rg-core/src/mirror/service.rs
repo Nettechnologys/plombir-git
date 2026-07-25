@@ -160,9 +160,13 @@ pub async fn sync_mirror(
             model.status = Set("active".to_string());
         }
         Err(e) => {
-            model.last_sync_error = Set(Some(format!("{e}")));
+            // `{e}` printed the outermost `.context(...)` only, both in the
+            // persisted field the UI shows and in the log — under it sits the
+            // `git clone --mirror` failure that actually explains the outage
+            // (card_a997f30c142c).
+            model.last_sync_error = Set(Some(format!("{e:#}")));
             model.status = Set("error".to_string());
-            tracing::error!("Mirror sync failed for repo {}: {e}", mirror.repo_id);
+            tracing::error!(repo_id = mirror.repo_id, error = %format!("{e:#}"), "mirror sync failed");
         }
     }
 

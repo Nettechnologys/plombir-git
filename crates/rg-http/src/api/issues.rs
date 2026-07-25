@@ -161,9 +161,11 @@ pub async fn validate_issue_config(
             message: String::new(),
         })
         .into_response(),
+        // Telling the caller *why* the config is invalid is this endpoint's
+        // entire job, so it must not drop the inner cause (card_a997f30c142c).
         Ok(Err(error)) => Json(IssueConfigValidation {
             valid: false,
-            message: error.to_string(),
+            message: format!("{error:#}"),
         })
         .into_response(),
         Err(error) => AppError::internal(error).into_response(),

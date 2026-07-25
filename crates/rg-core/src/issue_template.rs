@@ -116,7 +116,9 @@ pub fn discover_issue_templates(
                 .and_then(|content| parse_markdown_template(&path, &content))
             {
                 Ok(template) => discovery.templates.push(template),
-                Err(error) => discovery.errors.push((path, error.to_string())),
+                // Travels on into both the log and the API response, so the
+                // chain has to survive the trip to `String` (card_a997f30c142c).
+                Err(error) => discovery.errors.push((path, format!("{error:#}"))),
             }
         }
     }

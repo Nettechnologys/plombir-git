@@ -252,7 +252,10 @@ async fn process_repository_inner(
         )
         .await
         {
-            result.waiting_reason = Some(error.to_string());
+            // `{:#}` and not `to_string()`: this reason is handed to the user as
+            // the answer to "why is my PR stuck", and the inner cause is the
+            // half that actually answers it (card_a997f30c142c).
+            result.waiting_reason = Some(format!("{error:#}"));
             break;
         }
         if let Some(ci) = ci {
@@ -310,7 +313,9 @@ async fn process_repository_inner(
                 result.merged.push(pr.id);
             }
             Err(error) => {
-                finish_entry(db, repo_root, &entry, "failed", Some(error.to_string())).await?;
+                // Persisted into the queue entry and shown in the UI — the
+                // flattened chain is all the user ever gets to see.
+                finish_entry(db, repo_root, &entry, "failed", Some(format!("{error:#}"))).await?;
                 result.failed.push(pr.id);
             }
         }

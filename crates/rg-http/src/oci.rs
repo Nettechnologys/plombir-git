@@ -32,6 +32,13 @@ const DOCKER_API_VERSION: HeaderName = HeaderName::from_static("docker-distribut
 
 // ── helpers ──────────────────────────────────────────────────
 
+/// Build an OCI `{errors:[{code,message}]}` envelope.
+///
+/// `message` is the only diagnostic a `docker push` / `pull` ever prints, and
+/// this path does not go through `AppError`, so nothing else logs the cause.
+/// Callers must therefore pass `&format!("{e:#}")`, never `&e.to_string()` —
+/// the latter prints the outermost `.context(...)` alone and drops the io /
+/// digest / db error underneath it (card_a997f30c142c).
 fn oci_err(status: StatusCode, code: &str, message: &str) -> Response {
     (
         status,
@@ -208,7 +215,7 @@ async fn require_access(
     match check_access(state, headers, owner, repo, required_action).await {
         Ok((true, user_id)) => Ok(user_id),
         Ok((false, _)) => Err(oci_unauthorized("authentication required")),
-        Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string())),
+        Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"))),
     }
 }
 
@@ -437,12 +444,12 @@ pub async fn list_tags(
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
         Ok(Some(r)) => r,
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     let tags = match rg_db::ops::oci_ops::list_tags(&state.db, oci_repo.id).await {
         Ok(t) => t,
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     (
@@ -488,7 +495,7 @@ async fn get_manifest_impl(
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
         Ok(Some(r)) => r,
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     let rf = Reference::parse(&reference);
@@ -506,7 +513,7 @@ async fn get_manifest_impl(
     let manifest = match manifest {
         Ok(Some(m)) => m,
         Ok(None) => return oci_not_found(error_codes::MANIFEST_UNKNOWN, "manifest not found"),
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     // Compute digest in Docker format
@@ -559,7 +566,7 @@ pub async fn put_manifest(
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
         Ok(Some(r)) => r,
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     // Validate media type
@@ -607,7 +614,7 @@ pub async fn put_manifest(
                 return oci_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "UNKNOWN",
-                    &error.to_string(),
+                    &format!("{error:#}"),
                 );
             }
         };
@@ -626,7 +633,11 @@ pub async fn put_manifest(
         .store_manifest(&owner, &repo, &parsed.digest, body.as_bytes())
         .await
     {
-        return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string());
+        return oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("{e:#}"),
+        );
     }
 
     let rf = Reference::parse(&reference);
@@ -689,7 +700,7 @@ pub async fn put_manifest(
 
     let _manifest = match result {
         Ok(m) => m,
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     // Increment blob ref counts.
@@ -763,7 +774,7 @@ pub async fn head_blob(
             return oci_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "UNKNOWN",
-                &error.to_string(),
+                &format!("{error:#}"),
             );
         }
     };
@@ -840,7 +851,7 @@ pub async fn get_blob(
             Err(error) => oci_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "UNKNOWN",
-                &error.to_string(),
+                &format!("{error:#}"),
             ),
         },
         Ok(None) => match state.oci_storage.read_blob(&owner, &repo, &digest).await {
@@ -868,7 +879,7 @@ pub async fn get_blob(
         Err(error) => oci_err(
             StatusCode::BAD_REQUEST,
             error_codes::DIGEST_INVALID,
-            &error.to_string(),
+            &format!("{error:#}"),
         ),
     }
 }
@@ -894,7 +905,7 @@ pub async fn start_upload(
 
     let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo, user_id).await {
         Ok(r) => r,
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     match state.oci_storage.create_upload(&owner, &repo).await {
@@ -904,7 +915,7 @@ pub async fn start_upload(
                 rg_db::ops::oci_ops::create_upload(&state.db, oci_repo.id, &uuid, &upload_path)
                     .await
             {
-                return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string());
+                return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"));
             }
 
             let location = format!("/v2/{owner}/{repo}/blobs/uploads/{uuid}");
@@ -919,7 +930,11 @@ pub async fn start_upload(
             )
                 .into_response()
         }
-        Err(e) => oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("{e:#}"),
+        ),
     }
 }
 
@@ -978,7 +993,11 @@ async fn handle_mount(
             )
                 .into_response()
         }
-        Err(e) => oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("{e:#}"),
+        ),
     }
 }
 
@@ -1001,7 +1020,7 @@ pub async fn chunk_upload(
         Ok(None) => {
             return oci_not_found(error_codes::BLOB_UPLOAD_UNKNOWN, "upload session not found");
         }
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     }
 
     // Stream body to upload file
@@ -1035,7 +1054,11 @@ pub async fn chunk_upload(
             )
                 .into_response()
         }
-        Err(e) => oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+        Err(e) => oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("{e:#}"),
+        ),
     }
 }
 
@@ -1067,12 +1090,16 @@ pub async fn complete_upload(
     // Check by reading the first frame: if there's data, stream the rest
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
     if let Err(e) = stream_body_to_file(body, &file_path).await {
-        return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string());
+        return oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("{e:#}"),
+        );
     }
 
     let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo, user_id).await {
         Ok(r) => r,
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
     // Finalize: stream-read upload file, verify digest, move to blob storage
@@ -1132,7 +1159,7 @@ pub async fn complete_upload(
         Err(e) => oci_err(
             StatusCode::BAD_REQUEST,
             error_codes::DIGEST_INVALID,
-            &e.to_string(),
+            &format!("{e:#}"),
         ),
     }
 }

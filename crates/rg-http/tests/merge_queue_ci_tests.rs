@@ -219,3 +219,179 @@ async fn queue_waits_for_speculative_merge_group_ci_before_updating_base() {
         base_before
     );
 }
+
+/// card_a997f30c142c: the reason a merge-queue entry failed is persisted into
+/// `failure_reason` and rendered in the UI — it is the whole answer to "why
+/// didn't my PR merge". `error.to_string()` printed only the outermost
+/// `.context(...)` ("failed to resolve merge ref 'feature'") and dropped the
+/// gix error under it, so the operator saw a restatement of the question.
+#[tokio::test]
+async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
+    let (db, app_dir) = setup_test_db().await;
+    let repo_root = app_dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let mut state = build_test_app_state(db.clone(), repo_root.clone());
+    state.ci_engine = Arc::new(PendingMergeGroupCi);
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _app_dir = app_dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let (token, _) = register_full(&base, "queue-fail-owner", "queue-fail@example.com").await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v1/repos"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"name": "flatten", "is_private": true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+
+    let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let bare = repo_root.join("queue-fail-owner/flatten.git");
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree_path = worktree.path();
+    let worktree_arg = worktree_path.to_string_lossy();
+    for args in [
+        vec!["init", "--initial-branch=main", &worktree_arg],
+        vec!["-C", &worktree_arg, "config", "user.name", "Queue Fail"],
+        vec![
+            "-C",
+            &worktree_arg,
+            "config",
+            "user.email",
+            "queue-fail@example.com",
+        ],
+    ] {
+        git.run(&args, None).unwrap().ensure_success().unwrap();
+    }
+    std::fs::write(worktree_path.join("value.txt"), "base\n").unwrap();
+    let bare_arg = bare.to_string_lossy();
+    for args in [
+        vec!["add", "."],
+        vec!["commit", "-m", "base"],
+        vec!["remote", "add", "origin", &bare_arg],
+        vec!["push", "origin", "main"],
+        vec!["checkout", "-b", "feature"],
+    ] {
+        git.run(&args, Some(worktree_path))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+    }
+    std::fs::write(worktree_path.join("value.txt"), "feature\n").unwrap();
+    for args in [
+        vec!["commit", "-am", "feature"],
+        vec!["push", "origin", "feature"],
+    ] {
+        git.run(&args, Some(worktree_path))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+    }
+
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v1/repos/queue-fail-owner/flatten/pulls"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "title": "Doomed merge",
+                "head": "feature",
+                "base": "main"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+
+    let queue_url = format!("{base}/api/v1/repos/queue-fail-owner/flatten/pulls/1/merge-queue");
+    assert_eq!(
+        client
+            .put(&queue_url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"strategy": "merge"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let repo_id = rg_db::ops::repo_ops::find_by_owner_and_name(
+        &db,
+        rg_db::ops::user_ops::find_by_username(&db, "queue-fail-owner")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "flatten",
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .id;
+    let queued = rg_db::ops::merge_queue_ops::list_by_repo(&db, repo_id)
+        .await
+        .unwrap()
+        .remove(0);
+    rg_db::ops::pipeline_ops::update_pipeline_status(
+        &db,
+        queued.merge_group_pipeline_id.unwrap(),
+        "success",
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .unwrap();
+
+    // Drop the branch the merge will need. The merge-group CI step only reads
+    // the base ref and the stored head SHA, so it still reports Ready and the
+    // failure lands where we want it: inside `gix_merge_no_ff`, which wraps the
+    // gix error in a `.context(...)` — exactly the two-layer chain at issue.
+    git.run(&["update-ref", "-d", "refs/heads/feature"], Some(&bare))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+
+    assert_eq!(
+        client
+            .put(&queue_url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"strategy": "merge"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // `list_by_repo` only returns queued/running entries, so a finished one has
+    // to be looked up by PR.
+    let entry = rg_db::ops::merge_queue_ops::find_by_pr(&db, queued.pr_id)
+        .await
+        .unwrap()
+        .expect("the queue entry must still be there");
+    assert_eq!(entry.status, "failed", "the merge was expected to fail");
+    let reason = entry
+        .failure_reason
+        .expect("a failed entry must carry a reason");
+    assert!(
+        reason.contains("failed to resolve merge ref"),
+        "the outer context must survive: {reason}"
+    );
+    assert!(
+        reason.len() > "failed to resolve merge ref 'feature'".len(),
+        "the reason must carry the cause underneath the context, not just the \
+         context itself: {reason}"
+    );
+}

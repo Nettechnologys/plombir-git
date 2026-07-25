@@ -979,8 +979,10 @@ pub async fn try_auto_merge(
     .await
     {
         return Ok(AutoMergeOutcome {
+            // `{:#}` — this reason is the whole payload of the outcome; a bare
+            // `to_string()` drops the cause the user needs (card_a997f30c142c).
             status: "pending".into(),
-            reason: Some(error.to_string()),
+            reason: Some(format!("{error:#}")),
             merge: None,
         });
     }
