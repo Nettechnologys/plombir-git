@@ -534,6 +534,11 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
 ///
 /// For Gitea Actions workflows, multiple files are merged into a single `CiConfig`.
 /// Jobs from different workflow files are placed in separate stages.
+///
+/// The fallback from the first format to the second happens only when
+/// `.gitea/workflows` is absent, or holds no workflow triggered by this event.
+/// A workflow file that *is* there but cannot be read or parsed is an error
+/// naming the file and the reason — never a silent "no CI config found".
 fn read_ci_config(
     repo_path: &std::path::Path,
     commit_sha: &str,
@@ -544,8 +549,10 @@ fn read_ci_config(
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     // Try Gitea Actions format first
-    if let Ok(config) = try_read_gitea_workflows(&repo, commit_sha, ref_name, event) {
-        tracing::info!("Using Gitea Actions workflow from .gitea/workflows/");
+    let gitea = try_read_gitea_workflows(&repo, commit_sha, ref_name, event)?;
+    let workflows_untriggered = matches!(gitea, GiteaWorkflows::NoneTriggered);
+    if let GiteaWorkflows::Config(config) = gitea {
+        tracing::info!("Using Gitea Actions workflow from {}/", WORKFLOW_DIR);
         return Ok(config);
     }
 
@@ -558,10 +565,23 @@ fn read_ci_config(
                 .is_ok()
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no CI config found (.gitea/workflows/*.yml, .forgekeep-ci.yml, or .ironforge-ci.yml) at commit {}",
-                commit_sha
-            )
+            // Workflows that exist but sit out this event are not "no config":
+            // saying so is the difference between fixing an `on:` filter and
+            // hunting for a file that is already there.
+            if workflows_untriggered {
+                anyhow::anyhow!(
+                    "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.forgekeep-ci.yml) at commit {}",
+                    WORKFLOW_DIR,
+                    event,
+                    ref_name,
+                    commit_sha
+                )
+            } else {
+                anyhow::anyhow!(
+                    "no CI config found (.gitea/workflows/*.yml, .forgekeep-ci.yml, or .ironforge-ci.yml) at commit {}",
+                    commit_sha
+                )
+            }
         })?;
 
     let revspec = format!("{}:{}", commit_sha, ci_filename);
@@ -577,28 +597,60 @@ fn read_ci_config(
     let ci_yml = String::from_utf8(blob.data.to_vec())
         .with_context(|| format!("{} is not valid UTF-8", ci_filename))?;
 
+    // The reason (with its line/column) goes into the message, not into a
+    // `with_context` source: callers log this with `Display`. Dumping the whole
+    // file here used to bury the actual complaint.
     let config: CiConfig = serde_yaml::from_str(&ci_yml)
-        .with_context(|| format!("failed to parse {}: {}", ci_filename, ci_yml))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", ci_filename, e))?;
 
     Ok(config)
 }
 
+/// Directory holding Gitea Actions workflow files, relative to the repo root.
+const WORKFLOW_DIR: &str = ".gitea/workflows";
+
+/// Outcome of looking for Gitea Actions workflows at a commit.
+enum GiteaWorkflows {
+    /// The commit has no `.gitea/workflows` directory at all.
+    Absent,
+    /// The directory is there, but no workflow in it is triggered by this event.
+    NoneTriggered,
+    /// Merged configuration of every workflow triggered by this event.
+    Config(CiConfig),
+}
+
 /// Try to find and parse Gitea Actions workflow files in `.gitea/workflows/`.
+///
+/// `Absent` / `NoneTriggered` are the two legitimate fallbacks to the native
+/// `.forgekeep-ci.yml`, and they are told apart so the caller can explain which
+/// one happened.
+///
+/// Anything else — a workflow that is not valid UTF-8, does not parse as YAML,
+/// references a missing reusable workflow, or uses an unsupported action — is an
+/// `Err` naming the offending file, so a typo in a workflow surfaces as a
+/// parsing error instead of being mistaken for "no CI config at all".
 fn try_read_gitea_workflows(
     repo: &gix::Repository,
     commit_sha: &str,
     ref_name: &str,
     event: &str,
-) -> Result<CiConfig> {
-    let tree_revspec = format!("{}:.gitea/workflows", commit_sha);
-    let object_id = repo
-        .rev_parse_single(tree_revspec.as_str())
-        .map_err(|_| anyhow::anyhow!("no .gitea/workflows directory"))?;
+) -> Result<GiteaWorkflows> {
+    let tree_revspec = format!("{}:{}", commit_sha, WORKFLOW_DIR);
+    let Ok(object_id) = repo.rev_parse_single(tree_revspec.as_str()) else {
+        // Nothing at that path in this commit: the native format is next in line.
+        return Ok(GiteaWorkflows::Absent);
+    };
 
-    let object = object_id.object()?;
-    let tree = object
-        .try_into_tree()
-        .map_err(|_| anyhow::anyhow!(".gitea/workflows is not a directory"))?;
+    let object = object_id
+        .object()
+        .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
+    let tree = object.try_into_tree().map_err(|_| {
+        anyhow::anyhow!(
+            "{} exists at commit {} but is a file, not a directory",
+            WORKFLOW_DIR,
+            commit_sha
+        )
+    })?;
 
     let default_branch = get_default_branch(repo)?;
 
@@ -610,36 +662,46 @@ fn try_read_gitea_workflows(
     // Load all workflow sources first so callers can resolve repository-local
     // reusable workflows from the same immutable commit tree.
     for entry in tree.iter() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry
+            .with_context(|| format!("failed to list {} at commit {}", WORKFLOW_DIR, commit_sha))?;
         let name = entry.filename().to_string();
         if !name.ends_with(".yml") && !name.ends_with(".yaml") {
             continue;
         }
+        let mode = entry.mode();
+        if !mode.is_blob() && !mode.is_executable() {
+            // A directory or submodule that happens to be named `*.yml` is not a
+            // workflow; say so instead of failing the whole pipeline over it.
+            tracing::warn!("Skipping {}/{}: not a regular file", WORKFLOW_DIR, name);
+            continue;
+        }
 
-        let entry_id = entry.oid();
-        let entry_object = match repo.find_object(entry_id) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        let blob = match entry_object.try_into_blob() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let yml = String::from_utf8(blob.data.to_vec()).unwrap_or_default();
+        let entry_object = repo.find_object(entry.oid()).with_context(|| {
+            format!(
+                "failed to read {}/{} from the object database",
+                WORKFLOW_DIR, name
+            )
+        })?;
+        let blob = entry_object
+            .try_into_blob()
+            .map_err(|_| anyhow::anyhow!("{}/{} is not a file", WORKFLOW_DIR, name))?;
+        let yml = String::from_utf8(blob.data.to_vec())
+            .with_context(|| format!("{}/{} is not valid UTF-8", WORKFLOW_DIR, name))?;
         workflow_sources.insert(name, yml);
     }
 
-    for (name, yml) in &workflow_sources {
-        let workflow = match gitea_actions::GiteaWorkflow::parse(yml) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::debug!("Skipping .gitea/workflows/{} (parse error: {})", name, e);
-                continue;
-            }
-        };
+    // Deterministic order: stage ordering of the merged config (and which broken
+    // file is reported first) must not depend on hash-map iteration order.
+    let mut workflow_names: Vec<String> = workflow_sources.keys().cloned().collect();
+    workflow_names.sort();
+
+    for name in &workflow_names {
+        let yml = &workflow_sources[name];
+        // The cause is folded into the message instead of being a `with_context`
+        // source: callers log this error with `Display`, and the YAML line/column
+        // is the whole point of reporting it.
+        let workflow = gitea_actions::GiteaWorkflow::parse(yml)
+            .map_err(|e| anyhow::anyhow!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))?;
 
         // Check if this workflow should be triggered
         if !workflow.matches_event(event, ref_name, &default_branch) {
@@ -647,12 +709,12 @@ fn try_read_gitea_workflows(
         }
         let workflow = workflow
             .expand_local_reusable_workflows(&workflow_sources)
-            .with_context(|| format!("failed to expand .gitea/workflows/{name}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to expand {WORKFLOW_DIR}/{name}: {e:#}"))?;
         workflow
             .validate_supported_actions()
-            .with_context(|| format!("unsupported workflow .gitea/workflows/{name}"))?;
+            .map_err(|e| anyhow::anyhow!("unsupported workflow {WORKFLOW_DIR}/{name}: {e:#}"))?;
 
-        tracing::info!("Triggering workflow from .gitea/workflows/{}", name);
+        tracing::info!("Triggering workflow from {}/{}", WORKFLOW_DIR, name);
 
         let ctx = gitea_actions::WorkflowContext {
             ref_name: ref_name.to_string(),
@@ -689,14 +751,20 @@ fn try_read_gitea_workflows(
     }
 
     if all_jobs.is_empty() {
-        anyhow::bail!("no matching workflows found in .gitea/workflows/");
+        tracing::debug!(
+            "No workflow in {}/ is triggered by event {} on {}; trying the native CI config",
+            WORKFLOW_DIR,
+            event,
+            ref_name
+        );
+        return Ok(GiteaWorkflows::NoneTriggered);
     }
 
-    Ok(CiConfig {
+    Ok(GiteaWorkflows::Config(CiConfig {
         stages: Some(all_stages),
         concurrency: None, // per-workflow concurrency not merged
         jobs: all_jobs,
-    })
+    }))
 }
 
 /// Get the default branch name of the repository.
@@ -1012,6 +1080,207 @@ mod matrix_tests {
             .iter()
             .any(|line| line.contains("${INPUT_TARGET}")));
         assert_eq!(job.variables.as_ref().unwrap()["INPUT_TARGET"], "staging");
+    }
+
+    /// Commit `files` (relative path → contents) into a fresh repo and return
+    /// the temp dir plus the commit sha.
+    fn commit_repo(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
+        let temp = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let target = temp.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git.run(&["init"], Some(temp.path())).unwrap().success());
+        assert!(git
+            .run(&["config", "user.name", "CI"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(
+                &["config", "user.email", "ci@example.com"],
+                Some(temp.path())
+            )
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["add", "-A"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["commit", "-m", "fixture"], Some(temp.path()))
+            .unwrap()
+            .success());
+        let sha = git
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        (temp, sha)
+    }
+
+    #[test]
+    fn broken_workflow_yaml_reports_the_file_and_the_parse_error() {
+        // Present-but-broken must never degrade into "no CI config found":
+        // the `.forgekeep-ci.yml` fallback below would otherwise hide the typo.
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/ci.yml",
+                b"on: push\njobs:\n  build:\n   steps:\n  - run: echo broken\n" as &[u8],
+            ),
+            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+        ]);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(".gitea/workflows/ci.yml"),
+            "error must name the offending file: {rendered}"
+        );
+        assert!(
+            !rendered.contains("no CI config found"),
+            "a broken workflow must not be reported as a missing config: {rendered}"
+        );
+        // The YAML reason (with its position) has to survive to the log line.
+        assert!(
+            rendered.contains("line") || rendered.contains("column"),
+            "error must carry the parse reason: {rendered}"
+        );
+    }
+
+    #[test]
+    fn non_utf8_workflow_reports_the_file_instead_of_parsing_an_empty_string() {
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/ci.yml", &[0xff, 0xfe, b'o', b'n', b':']),
+            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+        ]);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("UTF-8"),
+            "error must name the file and the encoding problem: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unsupported_action_in_a_workflow_is_reported_not_swallowed() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/ci.yml",
+            b"on: push\njobs:\n  build:\n    steps:\n      - uses: actions/setup-node@v4\n"
+                as &[u8],
+        )]);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("setup-node"),
+            "error must name the file and the unsupported action: {rendered}"
+        );
+    }
+
+    #[test]
+    fn broken_native_config_reports_the_reason_not_the_whole_file() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo ok]\n   nested: bad\n" as &[u8],
+        )]);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains(".forgekeep-ci.yml") && rendered.contains("line"),
+            "error must name the file and the parse position: {rendered}"
+        );
+        assert!(
+            !rendered.contains("echo ok"),
+            "the file body must not be dumped into the message: {rendered}"
+        );
+    }
+
+    #[test]
+    fn missing_workflow_directory_still_falls_back_to_the_native_config() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo native]\n" as &[u8],
+        )]);
+
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap();
+        assert!(config.jobs.contains_key("build"));
+    }
+
+    #[test]
+    fn workflow_not_matching_the_event_falls_back_to_the_native_config() {
+        // Valid workflow, wrong event: still a legitimate fallback, not an error.
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/tags.yml",
+                b"on:\n  push:\n    tags: [v*]\njobs:\n  build:\n    steps:\n      - run: echo tagged\n" as &[u8],
+            ),
+            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+        ]);
+
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap();
+        assert!(config.jobs.contains_key("build"));
+        assert!(!config.jobs.keys().any(|name| name.starts_with("tags/")));
+    }
+
+    #[test]
+    fn untriggered_workflow_without_native_config_says_so_instead_of_no_config() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/tags.yml",
+            b"on:\n  push:\n    tags: [v*]\njobs:\n  build:\n    steps:\n      - run: echo tagged\n"
+                as &[u8],
+        )]);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains(".gitea/workflows") && rendered.contains("refs/heads/main"),
+            "error must point at the untriggered workflows and the ref: {rendered}"
+        );
+        assert!(
+            !rendered.contains("no CI config found"),
+            "a workflow that exists but is not triggered is not a missing config: {rendered}"
+        );
+    }
+
+    #[test]
+    fn no_config_at_all_still_reports_no_ci_config_found() {
+        let (temp, sha) = commit_repo(&[("README.md", b"nothing to build\n" as &[u8])]);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        assert!(
+            error.to_string().contains("no CI config found"),
+            "genuinely missing config keeps its own message: {error:#}"
+        );
+    }
+
+    #[test]
+    fn merged_workflow_stages_are_ordered_deterministically() {
+        let workflow = |job: &str| {
+            format!("on: push\njobs:\n  {job}:\n    steps:\n      - run: echo {job}\n").into_bytes()
+        };
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/a.yml", &workflow("first")),
+            (".gitea/workflows/b.yml", &workflow("second")),
+            (".gitea/workflows/c.yml", &workflow("third")),
+        ]);
+
+        let expected = read_ci_config(temp.path(), &sha, "refs/heads/main", "push")
+            .unwrap()
+            .stages
+            .unwrap();
+        assert_eq!(expected.len(), 3);
+        for _ in 0..8 {
+            let stages = read_ci_config(temp.path(), &sha, "refs/heads/main", "push")
+                .unwrap()
+                .stages
+                .unwrap();
+            assert_eq!(stages, expected, "stage order must not depend on hashing");
+        }
     }
 
     #[test]

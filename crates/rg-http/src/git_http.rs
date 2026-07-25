@@ -1018,7 +1018,9 @@ async fn trigger_ci_for_push(
     {
         Ok(pipeline_id) => pipeline_id,
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to trigger CI pipeline");
+            // `{:#}` keeps the whole anyhow chain: the outer context names the
+            // workflow file, the cause carries the actual parse/validation reason.
+            tracing::warn!("Failed to trigger CI pipeline: {:#}", e);
             return;
         }
     };

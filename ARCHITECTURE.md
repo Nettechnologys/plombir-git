@@ -244,6 +244,13 @@ Gitea Actions format (`.gitea/workflows/*.yml`). A push to a branch triggers a
 pipeline in the background after `receive-pack`; tags and manual triggers are
 also supported.
 
+The two formats are tried in that order, and the fallback from Gitea Actions to
+the native file happens only when `.gitea/workflows` is missing or holds no
+workflow triggered by this event. A workflow file that exists but is broken —
+not UTF-8, invalid YAML, an unsupported `uses:`, a missing local reusable
+workflow — fails the trigger with an error naming the file and the reason; it is
+never reported as "no CI config found".
+
 ```
 Pipeline triggered
     │
