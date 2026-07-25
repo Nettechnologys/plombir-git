@@ -692,12 +692,32 @@ pub async fn put_manifest(
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &e.to_string()),
     };
 
-    // Increment blob ref counts
+    // Increment blob ref counts.
+    //
+    // A blob whose ref count was not incremented is a blob the GC is free to
+    // delete while this manifest still points at it — a corrupted image
+    // discovered long after the push that caused it. Over-counting on a client
+    // retry is harmless, under-counting is not, so a failure here fails the
+    // push instead of being swallowed.
     for blob_digest in parsed.referenced_blobs() {
-        if let Ok(Some(blob)) =
-            rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &blob_digest).await
-        {
-            let _ = rg_db::ops::oci_ops::increment_blob_ref(&state.db, blob.id).await;
+        let blob =
+            match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &blob_digest).await {
+                Ok(Some(blob)) => blob,
+                Ok(None) => continue,
+                Err(e) => {
+                    return oci_err(
+                        oci_status_for(&e),
+                        "UNKNOWN",
+                        &format!("failed to look up referenced blob {blob_digest}: {e}"),
+                    )
+                }
+            };
+        if let Err(e) = rg_db::ops::oci_ops::increment_blob_ref(&state.db, blob.id).await {
+            return oci_err(
+                oci_status_for(&e),
+                "UNKNOWN",
+                &format!("failed to increment the ref count of blob {blob_digest}: {e}"),
+            );
         }
     }
 
@@ -988,8 +1008,19 @@ pub async fn chunk_upload(
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
     match stream_body_to_file(body, &file_path).await {
         Ok(total_size) => {
-            // Update DB
-            let _ = rg_db::ops::oci_ops::update_upload_progress(&state.db, &uuid, total_size).await;
+            // The `Range` below tells the client where to resume from. Reporting
+            // it while the session row still holds the old offset hands the
+            // client a position the server does not agree with, so a failed
+            // progress write has to fail the chunk rather than be swallowed.
+            if let Err(e) =
+                rg_db::ops::oci_ops::update_upload_progress(&state.db, &uuid, total_size).await
+            {
+                return oci_err(
+                    oci_status_for(&e),
+                    "UNKNOWN",
+                    &format!("failed to record upload progress for session {uuid}: {e}"),
+                );
+            }
 
             let range_end = total_size.saturating_sub(1);
             let location = format!("/v2/{owner}/{repo}/blobs/uploads/{uuid}");
@@ -1051,8 +1082,14 @@ pub async fn complete_upload(
         .await
     {
         Ok((digest, size, storage_path)) => {
-            // Record blob in DB
-            let _ = rg_db::ops::oci_ops::insert_blob(
+            // Record blob in DB.
+            //
+            // The bytes are already in blob storage; without this row nothing
+            // can find them. Answering `201 Created` anyway is how a push
+            // "succeeds" into a repository whose very next `HEAD .../blobs/`
+            // returns 404 — the client has no reason to retry something it was
+            // told worked, so the failure has to reach it.
+            if let Err(e) = rg_db::ops::oci_ops::insert_blob(
                 &state.db,
                 oci_repo.id,
                 &digest,
@@ -1060,10 +1097,26 @@ pub async fn complete_upload(
                 size,
                 &storage_path,
             )
-            .await;
+            .await
+            {
+                return oci_err(
+                    oci_status_for(&e),
+                    "UNKNOWN",
+                    &format!("failed to record blob {digest}: {e}"),
+                );
+            }
 
-            // Clean up upload session
-            let _ = rg_db::ops::oci_ops::delete_upload(&state.db, &uuid).await;
+            // Clean up upload session. The blob is committed at this point, so a
+            // failure here leaks a session row rather than losing data — worth a
+            // warning, not a failed push.
+            if let Err(e) = rg_db::ops::oci_ops::delete_upload(&state.db, &uuid).await {
+                tracing::warn!(
+                    upload_uuid = %uuid,
+                    error = %format!("{e:#}"),
+                    "failed to delete the OCI upload session after committing its blob; \
+                     the session row is orphaned"
+                );
+            }
 
             let location = format!("/v2/{owner}/{repo}/blobs/{digest}");
             (

@@ -85,7 +85,9 @@ async fn run_git_import(
 ) -> Result<()> {
     let repo_id =
         resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
-    let _ = import_task_ops::set_repo_id(db, task.id, repo_id).await;
+    import_task_ops::set_repo_id(db, task.id, repo_id)
+        .await
+        .context("failed to link the import task to its target repository")?;
 
     if task.import_repo {
         update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
@@ -133,7 +135,9 @@ async fn run_github_import(
         resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
 
     // Update task with repo_id
-    let _ = import_task_ops::set_repo_id(db, task.id, repo_id).await;
+    import_task_ops::set_repo_id(db, task.id, repo_id)
+        .await
+        .context("failed to link the import task to its target repository")?;
 
     // Step 1: Clone repository
     if task.import_repo {
@@ -301,7 +305,9 @@ async fn run_gitlab_import(
     let repo_id =
         resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
 
-    let _ = import_task_ops::set_repo_id(db, task.id, repo_id).await;
+    import_task_ops::set_repo_id(db, task.id, repo_id)
+        .await
+        .context("failed to link the import task to its target repository")?;
 
     // Step 1: Clone repository
     if task.import_repo {
@@ -1399,15 +1405,37 @@ pub async fn start_import(
     let db_clone = db.clone();
     let repo_root_clone = repo_root.to_path_buf();
     tokio::spawn(async move {
+        // These two are the last writes the task will ever get — there is no
+        // caller left to notice a failure and no later pass that revisits the
+        // row. Losing one leaves the task in `running` forever, which the UI
+        // renders as an import that never finishes.
         match run_import(&db_clone, &task_clone, &repo_root_clone).await {
             Ok(stats) => {
                 let stats_json = serde_json::to_string(&stats).unwrap_or_default();
-                let _ =
-                    import_task_ops::mark_completed(&db_clone, task_clone.id, &stats_json).await;
+                if let Err(error) =
+                    import_task_ops::mark_completed(&db_clone, task_clone.id, &stats_json).await
+                {
+                    tracing::error!(
+                        task_id = task_clone.id,
+                        error = %format!("{error:#}"),
+                        "import finished but could not be marked completed; \
+                         the task is stuck in `running`"
+                    );
+                }
             }
             Err(e) => {
-                let _ =
-                    import_task_ops::mark_failed(&db_clone, task_clone.id, &format!("{e:#}")).await;
+                let reason = format!("{e:#}");
+                tracing::warn!(task_id = task_clone.id, reason, "import failed");
+                if let Err(error) =
+                    import_task_ops::mark_failed(&db_clone, task_clone.id, &reason).await
+                {
+                    tracing::error!(
+                        task_id = task_clone.id,
+                        error = %format!("{error:#}"),
+                        "import failed and could not be marked failed either; \
+                         the task is stuck in `running` and its reason is lost"
+                    );
+                }
             }
         }
     });

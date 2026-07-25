@@ -472,7 +472,10 @@ pub async fn callback(
     }
 
     // ── Log successful login ─────────────────────────────────────
-    let _ = rg_db::ops::login_log_ops::log_attempt(
+    // A login the audit trail never recorded is a login nobody can review
+    // afterwards. Refusing the sign-in over a failed audit write would be worse
+    // than the gap, so this warns loudly instead — but it must not be silent.
+    if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
         &state.db,
         Some(user_id),
         &user.username,
@@ -482,7 +485,16 @@ pub async fn callback(
         true,
         None,
     )
-    .await;
+    .await
+    {
+        tracing::warn!(
+            user_id,
+            username = %user.username,
+            provider = %provider.slug,
+            error = %format!("{error:#}"),
+            "failed to record a successful SSO login; this sign-in is missing from the audit trail"
+        );
+    }
 
     // ── If MFA enabled, require second factor ────────────────────
     if user.mfa_enabled {
@@ -727,8 +739,10 @@ async fn find_or_create_sso_user(
     {
         // Update stored tokens
         let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+        // `unwrap_or_default()` here would store an empty string in place of the
+        // access token — a row that looks populated and authenticates nothing.
         let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
-            .unwrap_or_default();
+            .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
         let enc_refresh = token_response
             .refresh_token
             .as_ref()
@@ -737,7 +751,10 @@ async fn find_or_create_sso_user(
             .expires_in
             .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
 
-        let _ = rg_db::ops::oauth_account_ops::upsert(
+        // Swallowing this returned a successful login whose refreshed tokens
+        // were never stored: the session works until the access token expires,
+        // then the refresh reads whatever stale row was there before.
+        rg_db::ops::oauth_account_ops::upsert(
             db,
             oauth.user_id,
             provider_slug,
@@ -748,7 +765,8 @@ async fn find_or_create_sso_user(
             enc_refresh.as_deref(),
             expires_at,
         )
-        .await;
+        .await
+        .map_err(|_| AppError::internal("failed to store the OAuth account tokens"))?;
 
         return Ok(oauth.user_id);
     }

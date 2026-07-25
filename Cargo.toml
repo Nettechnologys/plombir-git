@@ -33,6 +33,8 @@ rust-version = "1.85"
 [workspace.lints.clippy]
 await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
+let_underscore_must_use = "warn"
+let_underscore_future = "warn"
 
 [workspace.dependencies]
 # HTTP
