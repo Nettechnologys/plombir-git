@@ -266,10 +266,7 @@ pub async fn list_issues(
                     )
                         .into_response()
                 }
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "handler error");
-                    AppError::from(e).into_response()
-                }
+                Err(e) => AppError::from(e).into_response(),
             };
         }
     }
@@ -292,10 +289,7 @@ pub async fn list_issues(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "handler error");
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -501,10 +495,7 @@ pub async fn list_comments(
             let comments = comments_with_authors(&state.db, comments).await;
             (StatusCode::OK, Json(comments)).into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "handler error");
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -673,20 +664,12 @@ pub async fn list_milestones(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => {
-            return {
-                tracing::error!(error = %format!("{e:#}"), "handler error");
-                AppError::from(e).into_response()
-            }
-        }
+        Err(e) => return AppError::from(e).into_response(),
     };
     match rg_db::ops::milestone_ops::list_by_repo(&state.db, repo.id, params.state.as_deref()).await
     {
         Ok(milestones) => (StatusCode::OK, Json(serde_json::json!(milestones))).into_response(),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "handler error");
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -736,12 +719,7 @@ pub async fn create_milestone(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => {
-            return {
-                tracing::error!(error = %format!("{e:#}"), "handler error");
-                AppError::from(e).into_response()
-            }
-        }
+        Err(e) => return AppError::from(e).into_response(),
     };
     if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
         .await
@@ -794,20 +772,12 @@ pub async fn get_milestone(
     {
         Ok(Some(r)) => r,
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => {
-            return {
-                tracing::error!(error = %format!("{e:#}"), "handler error");
-                AppError::from(e).into_response()
-            }
-        }
+        Err(e) => return AppError::from(e).into_response(),
     };
     match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
         Ok(Some(m)) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
         Ok(None) => AppError::not_found("milestone not found".to_string()).into_response(),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "handler error");
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -862,12 +832,7 @@ pub async fn update_milestone(
     let existing = match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
         Ok(Some(m)) => m,
         Ok(None) => return AppError::not_found("milestone not found".to_string()).into_response(),
-        Err(e) => {
-            return {
-                tracing::error!(error = %format!("{e:#}"), "handler error");
-                AppError::from(e).into_response()
-            }
-        }
+        Err(e) => return AppError::from(e).into_response(),
     };
     // Convert to ActiveModel; use Set() for changed fields (Unchanged means "skip in UPDATE")
     let mut active: rg_db::entities::milestone::ActiveModel = existing.into();
@@ -892,10 +857,7 @@ pub async fn update_milestone(
     active.updated_at = sea_orm::Set(chrono::Utc::now());
     match rg_db::ops::milestone_ops::update(&state.db, active).await {
         Ok(m) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "handler error");
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -940,10 +902,7 @@ pub async fn delete_milestone(
     }
     match rg_db::ops::milestone_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "handler error");
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -971,10 +930,7 @@ pub async fn get_issue_labels(
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => match rg_core::label::service::get_issue_labels(&state.db, issue.id).await {
             Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "handler error");
-                AppError::from(e).into_response()
-            }
+            Err(e) => AppError::from(e).into_response(),
         },
         Err(e) => AppError::not_found(e.to_string()).into_response(),
     }

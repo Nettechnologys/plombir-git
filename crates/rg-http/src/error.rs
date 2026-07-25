@@ -134,8 +134,18 @@ impl From<anyhow::Error> for AppError {
         if let Some(rg_git::cli_gateway::GitCliError::Timeout { command, timeout }) =
             e.downcast_ref::<rg_git::cli_gateway::GitCliError>()
         {
-            tracing::warn!(command = %command, ?timeout, "git command timed out, returning 504");
-            return Self::Timeout(format!("git command timed out after {timeout:?}"));
+            // `{:#}` for the same reason as the 500/503 branches below: a
+            // rebuilt "git command timed out after {timeout:?}" string names
+            // only the deadline, while the `.context(...)` layers the caller
+            // added ("failed to mirror repository", the repo/ref in flight) say
+            // *which* request stalled — and `GitCliError::Timeout`'s own
+            // `Display` already carries the command and the duration, so the
+            // flattened chain is a strict superset. `IntoResponse` still
+            // sanitizes the client-facing message to "Upstream operation timed
+            // out", so nothing internal leaks.
+            let full_msg = format!("{e:#}");
+            tracing::warn!(command = %command, ?timeout, error = %full_msg, "git command timed out, returning 504");
+            return Self::Timeout(full_msg);
         }
 
         // Many `rg_db::ops` helpers return `anyhow::Result`, wrapping the
@@ -357,6 +367,57 @@ mod tests {
         let wrapped = anyhow::Error::from(git_err).context("failed to mirror repository");
         let err: AppError = wrapped.into();
         assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// Same context guarantee as the 500/503 branches, on the 504 one. Handlers
+    /// no longer log the error themselves before `?`, so this funnel is the only
+    /// place the `.context(...)` layers can still reach an operator — a
+    /// `Timeout` message rebuilt from `{timeout:?}` alone would silently drop
+    /// which request stalled.
+    #[test]
+    fn git_timeout_keeps_the_nested_context_chain() {
+        let git_err = rg_git::cli_gateway::GitCliError::Timeout {
+            command: "git -C /srv/repos/acme/widgets.git fetch --prune".to_string(),
+            timeout: std::time::Duration::from_secs(120),
+        };
+        let err: AppError = anyhow::Error::from(git_err)
+            .context("mirroring \"acme/widgets\"")
+            .context("scheduled mirror sync")
+            .into();
+
+        let AppError::Timeout(logged) = &err else {
+            panic!("expected Timeout, got {err:?}");
+        };
+        assert!(logged.contains("scheduled mirror sync"), "{logged}");
+        assert!(logged.contains("mirroring \"acme/widgets\""), "{logged}");
+        assert!(
+            logged.contains("git -C /srv/repos/acme/widgets.git fetch --prune"),
+            "{logged}"
+        );
+        assert!(logged.contains("120s"), "{logged}");
+    }
+
+    /// The 504 body must still be generic — widening the stored message to the
+    /// full chain above must not start leaking git command lines to clients.
+    #[tokio::test]
+    async fn timeout_response_does_not_leak_the_command_line() {
+        use axum::response::IntoResponse;
+        let err = AppError::Timeout(
+            "scheduled mirror sync: git -C /srv/repos/acme/widgets.git fetch: timed out".into(),
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Upstream operation timed out"), "{body}");
+        assert!(
+            !body.contains("/srv/repos"),
+            "leaked internal detail: {body}"
+        );
+        assert!(!body.contains("git -C"), "leaked internal detail: {body}");
     }
 
     #[test]
