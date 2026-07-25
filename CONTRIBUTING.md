@@ -348,6 +348,15 @@ cargo nextest run -p rg-http --test oauth_pkce_tests
 cargo nextest run -E 'test(admin_sso)'          # filter by test name
 ```
 
+#### `target/` needs sweeping out now and then
+
+Cargo never garbage-collects artifacts from earlier builds, and this tree links
+a lot of large binaries — every `cargo build` of the workspace leaves another
+set of test binaries behind. One clean build is about 17 GB; left alone, this
+`target/` reached 316 GB (233 stale copies of the `forgekeep` binary). If the
+disk gets tight, `cargo clean` is the whole fix — the next build is cold
+(~7 min on a 24-core machine), and nothing else is lost.
+
 #### Test databases go through the production connect path
 
 `setup_test_db` (in `crates/rg-http/tests/common/mod.rs`) connects via

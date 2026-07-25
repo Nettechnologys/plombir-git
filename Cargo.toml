@@ -178,6 +178,9 @@ sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres
 # alternative — lowering m_cost/t_cost for tests — buys the same speed by no
 # longer exercising what production runs. blake2 is required as well; argon2
 # 0.5 does its core hashing through it.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package.argon2]
 opt-level = 3
 
