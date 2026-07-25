@@ -264,7 +264,7 @@ ForgeKeep/
 │   ├── rg-http/    # HTTP server + REST API + WebSocket (axum)
 │   ├── rg-db/      # database layer (SeaORM entities + migrations)
 │   ├── rg-ci/      # CI/CD engine (YAML parsing + pipeline executor)
-│   ├── rg-runner/  # standalone CI runner  → forgekeep-runner
+│   ├── rg-runner/  # CI runner agent  → forgekeep-runner
 │   └── rg-mcp/     # MCP server  → forgekeep-mcp
 ├── web/            # SvelteKit frontend (standalone SPA)
 ├── docs/           # design and protocol notes

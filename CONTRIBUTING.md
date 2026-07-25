@@ -59,14 +59,15 @@ ssh-keygen -t ed25519 -f ./forgekeep_host_key -N ""
 
 ```
 rg-cli
-  ├── rg-core ──> rg-db
+  ├── rg-core ──> rg-db, rg-git
   ├── rg-git
-  ├── rg-ssh ──> rg-git
-  ├── rg-http ──> rg-git, rg-core
+  ├── rg-ssh ──> rg-git, rg-core, rg-db
+  ├── rg-http ──> rg-git, rg-core, rg-db
+  ├── rg-ci ──> rg-core, rg-db, rg-git
+  ├── rg-runner   (only so `forgekeep runner` can delegate to the real agent)
   └── rg-db
 
-rg-ci     ──> rg-db
-rg-runner ──> rg-db
+rg-runner ──> (HTTP client of the rg-http runner API)
 rg-mcp    ──> (HTTP client of the rg-http REST API)
 ```
 
@@ -135,13 +136,22 @@ logic (delegate to `rg-core`).
 
 **Forbidden:** business logic (delegate to the other crates).
 
-#### `rg-runner` — CI runner (standalone binary)
+#### `rg-runner` — CI runner (library + the `forgekeep-runner` binary)
 
 **Allowed:** runner registration and heartbeat; polling jobs from the server;
 job execution (local shell or Docker); uploading logs and artifacts.
 
 **Forbidden:** touching HTTP routes directly (it is only an HTTP client of the
 `rg-http` API); business logic.
+
+This is the **only** external-runner implementation: the deprecated
+`forgekeep runner` subcommand of `rg-cli` is a thin alias that delegates here.
+A second copy of the poll-and-execute loop is exactly what that alias used to be,
+and it silently drifted (no `runner.toml`, no heartbeat, no workspace snapshot),
+so new runner behaviour belongs here and nowhere else. The separate
+`rg-ci::PipelineRunner` is not a duplicate — it is the server-side executor for
+deployments that run CI in-process instead of with external runners; the two must
+keep the same fail-closed contract when Docker is unavailable.
 
 #### `rg-mcp` — MCP server (standalone binary)
 

@@ -3,7 +3,7 @@
 //! The command surface is defined in [`cli`]; each subcommand's implementation
 //! lives in a focused module:
 //!  - [`serve`] — the `serve` command (startup validation + HTTP/SSH bootstrap)
-//!  - [`runner`] — the `runner` command (CI job polling + execution)
+//!  - [`runner`] — the deprecated `runner` alias for `forgekeep-runner run`
 //!  - [`commands`] — the remaining one-shot subcommands
 //!  - [`admin`] — SQLite backup/restore + JWT secret helpers
 //!  - [`config`] — the TOML config model + `CLI > config > default` resolution,
@@ -115,10 +115,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Runner {
             server,
             name,
+            labels,
             runner_id,
             token,
             auth_token,
-        } => runner::cmd_runner(server, name, runner_id, token, auth_token).await?,
+            config,
+        } => {
+            runner::cmd_runner(server, name, labels, runner_id, token, auth_token, config).await?
+        }
 
         Commands::Import {
             platform,

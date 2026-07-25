@@ -11,8 +11,9 @@ use crate::cli::PackageCmd;
 use crate::config;
 use crate::dbconn;
 
-/// Basic stderr logging used by the one-shot subcommands.
-fn init_cli_logging() {
+/// Basic stderr logging used by the one-shot subcommands (and by the deprecated
+/// `runner` alias, whose delegate reports through `tracing`).
+pub(crate) fn init_cli_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

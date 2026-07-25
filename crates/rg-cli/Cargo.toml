@@ -18,6 +18,10 @@ rg-ssh = { path = "../rg-ssh" }
 rg-http = { path = "../rg-http" }
 rg-db = { path = "../rg-db" }
 rg-ci = { path = "../rg-ci" }
+# The real CI-runner agent. `forgekeep runner` is a deprecated alias for
+# `forgekeep-runner run` and delegates here instead of carrying its own copy of
+# the poll-and-execute loop.
+rg-runner = { path = "../rg-runner" }
 gix = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

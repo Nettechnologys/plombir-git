@@ -16,11 +16,7 @@
 //! Jobs that specify a container image fail closed when Docker is unavailable.
 //! They are never silently re-run as local shell jobs.
 
-mod api;
 mod cli;
-mod commands;
-mod config;
-mod executor;
 
 use anyhow::Result;
 use clap::Parser;
@@ -49,7 +45,7 @@ async fn main() -> Result<()> {
             auth_token,
             config,
         } => {
-            commands::cmd_register(server, name, labels, save, auth_token, config).await?;
+            rg_runner::cmd_register(server, name, labels, save, auth_token, config).await?;
         }
 
         Commands::Run {
@@ -61,7 +57,7 @@ async fn main() -> Result<()> {
             auth_token,
             config,
         } => {
-            commands::cmd_run(server, name, labels, token, runner_id, auth_token, config).await?;
+            rg_runner::cmd_run(server, name, labels, token, runner_id, auth_token, config).await?;
         }
     }
 

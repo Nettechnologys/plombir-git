@@ -2,6 +2,8 @@
 
 use clap::{Parser, Subcommand};
 
+use crate::runner::DEFAULT_RUNNER_CONFIG;
+
 #[derive(Subcommand)]
 pub(crate) enum PackageCmd {
     /// Publish a package file
@@ -282,27 +284,49 @@ pub(crate) enum Commands {
         config: Option<String>,
     },
 
-    /// Run as a CI Runner — polls jobs and executes them
+    /// [DEPRECATED] Run as a CI runner — use `forgekeep-runner run` instead
+    ///
+    /// Kept as an alias so existing invocations keep working: it now delegates to
+    /// the very same implementation `forgekeep-runner run` uses, flag for flag.
+    /// It used to be a second, much older copy of the runner that never read
+    /// `runner.toml` (so every start registered a new runner) and had no
+    /// heartbeat, workspace snapshot, job timeout or cache.
+    ///
+    /// Settings that also exist as a `--config` key resolve in the order
+    /// CLI arg > config file > built-in default.
+    // Hence `--server` is an `Option` with no clap `default_value`: a clap
+    // default is indistinguishable from a value the operator typed, so with one
+    // the config file's `server` could never win over "the flag was not passed".
     Runner {
-        /// ForgeKeep server URL (e.g. http://127.0.0.1:8080)
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
-        server: String,
+        /// ForgeKeep server URL [config: server]
+        /// [default: http://127.0.0.1:8080]
+        #[arg(long)]
+        server: Option<String>,
 
-        /// Runner name (used for registration if not already registered)
+        /// Runner name [config: name] [default: system hostname]
         #[arg(long)]
         name: Option<String>,
 
-        /// Existing runner ID (skip registration)
+        /// Runner labels (comma-separated) [config: labels]
+        #[arg(long)]
+        labels: Option<String>,
+
+        /// Existing runner ID (used with --token) [config: runner_id]
         #[arg(long)]
         runner_id: Option<i64>,
 
-        /// Existing runner token (skip registration)
+        /// Existing runner token (skip registration) [config: token]
         #[arg(long)]
         token: Option<String>,
 
         /// Admin user JWT used only when this command needs to register a runner
         #[arg(long)]
         auth_token: Option<String>,
+
+        /// Path to the runner config file, written by
+        /// `forgekeep-runner register --save`
+        #[arg(long, default_value = DEFAULT_RUNNER_CONFIG)]
+        config: String,
     },
 
     /// Import a repository from GitHub or GitLab
@@ -404,7 +428,7 @@ pub(crate) enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, PackageCmd};
+    use super::{Cli, Commands, PackageCmd, DEFAULT_RUNNER_CONFIG};
     use clap::Parser;
 
     /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
@@ -500,6 +524,83 @@ mod tests {
             let (_, _, config) = knobs(&cli.command);
             assert_eq!(config, Some("/etc/forgekeep/forgekeep.toml"), "{argv:?}");
         }
+    }
+
+    /// The deprecated `runner` alias must be able to reach `runner.toml` at all:
+    /// it used to have no `--config` whatsoever, so the file written by
+    /// `forgekeep-runner register --save` was unreachable and every start
+    /// registered a brand-new runner. Its `--server` must also parse to `None`,
+    /// for the same reason `--db-url` does — a clap default would shadow the
+    /// file's `server` key forever.
+    #[test]
+    fn the_runner_alias_reads_the_same_config_file_as_forgekeep_runner() {
+        let cli = Cli::try_parse_from(["forgekeep", "runner"]).unwrap();
+        let Commands::Runner {
+            server,
+            runner_id,
+            token,
+            config,
+            ..
+        } = cli.command
+        else {
+            panic!("expected runner");
+        };
+        assert_eq!(
+            config, DEFAULT_RUNNER_CONFIG,
+            "the alias must default to the path `forgekeep-runner register --save` writes"
+        );
+        assert_eq!(server, None, "--server must not carry a clap default");
+        assert_eq!(runner_id, None);
+        assert_eq!(token, None);
+
+        let cli = Cli::try_parse_from(["forgekeep", "runner", "--config", "/data/runner.toml"])
+            .expect("the alias must accept --config");
+        let Commands::Runner { config, .. } = cli.command else {
+            panic!("expected runner");
+        };
+        assert_eq!(config, "/data/runner.toml");
+    }
+
+    /// The alias exists to keep old invocations working, so every flag the
+    /// pre-deprecation command accepted must still parse — plus `--labels`,
+    /// which it lacked and `forgekeep-runner run` has.
+    #[test]
+    fn the_runner_alias_still_accepts_every_flag_it_used_to() {
+        let cli = Cli::try_parse_from([
+            "forgekeep",
+            "runner",
+            "--server",
+            "https://ci.example.com",
+            "--name",
+            "builder-1",
+            "--labels",
+            "docker,linux",
+            "--runner-id",
+            "7",
+            "--token",
+            "tok",
+            "--auth-token",
+            "jwt",
+        ])
+        .expect("the documented pre-deprecation flags must keep parsing");
+        let Commands::Runner {
+            server,
+            name,
+            labels,
+            runner_id,
+            token,
+            auth_token,
+            ..
+        } = cli.command
+        else {
+            panic!("expected runner");
+        };
+        assert_eq!(server.as_deref(), Some("https://ci.example.com"));
+        assert_eq!(name.as_deref(), Some("builder-1"));
+        assert_eq!(labels.as_deref(), Some("docker,linux"));
+        assert_eq!(runner_id, Some(7));
+        assert_eq!(token.as_deref(), Some("tok"));
+        assert_eq!(auth_token.as_deref(), Some("jwt"));
     }
 
     /// The card's acceptance check, end to end through clap, the real config

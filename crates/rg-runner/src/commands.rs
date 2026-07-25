@@ -37,7 +37,7 @@ fn build_runner_client() -> reqwest::Client {
 
 /// Handle `forgekeep-runner register`: register a runner and optionally persist
 /// its token to the config file.
-pub(crate) async fn cmd_register(
+pub async fn cmd_register(
     server: String,
     name: String,
     labels: Option<String>,
@@ -77,7 +77,7 @@ pub(crate) async fn cmd_register(
 
 /// Handle `forgekeep-runner run`: resolve/register the runner, spawn the
 /// heartbeat task, then long-poll for jobs and execute each one.
-pub(crate) async fn cmd_run(
+pub async fn cmd_run(
     server: Option<String>,
     name: Option<String>,
     labels: Option<String>,

@@ -107,7 +107,7 @@ ForgeKeep/
 │   ├── rg-db/                    # SeaORM entities + migrations
 │   ├── rg-ci/                    # CI/CD engine (native + Gitea Actions)
 │   ├── rg-cli/                   # main binary  → forgekeep
-│   ├── rg-runner/                # standalone CI runner  → forgekeep-runner
+│   ├── rg-runner/                # CI runner agent  → forgekeep-runner
 │   └── rg-mcp/                   # MCP server  → forgekeep-mcp
 ├── web/                          # SvelteKit frontend
 ├── forgekeep.example.toml        # sample configuration
@@ -125,10 +125,11 @@ rg-cli ──> rg-core ──> rg-db
    │           └────────┐
    ├──> rg-git          │
    ├──> rg-ssh ──> rg-git
-   └──> rg-http ──> rg-git, rg-core
+   ├──> rg-http ──> rg-git, rg-core
+   ├──> rg-ci ──> rg-core, rg-db, rg-git
+   └──> rg-runner   (the deprecated `forgekeep runner` alias delegates to it)
 
-rg-ci     ──> rg-db
-rg-runner ──> rg-db
+rg-runner ──> (HTTP client of rg-http's runner API)
 rg-mcp    ──> (HTTP client of rg-http's REST API)
 ```
 
