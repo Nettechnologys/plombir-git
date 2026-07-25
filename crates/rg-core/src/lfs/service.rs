@@ -713,7 +713,7 @@ pub async fn compress_existing(
                 let compressed = match compress_data(&data) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!(oid = %obj.oid, err = %e, "failed to compress LFS object");
+                        tracing::error!(oid = %obj.oid, error = %format!("{e:#}"), "failed to compress LFS object");
                         continue;
                     }
                 };
@@ -733,7 +733,7 @@ pub async fn compress_existing(
                 )
                 .await
                 {
-                    tracing::error!(oid = %obj.oid, err = %e, "failed to update DB");
+                    tracing::error!(oid = %obj.oid, error = %format!("{e:#}"), "failed to update DB");
                     // Clean up compressed file on DB error
                     let _ = std::fs::remove_file(&compressed_path);
                     continue;

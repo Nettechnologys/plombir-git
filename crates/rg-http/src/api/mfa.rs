@@ -62,7 +62,7 @@ async fn record_mfa_attempt(
     let locked = if success {
         if let Err(error) = rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await
         {
-            tracing::warn!(user_id = user.id, %error, "failed to record completed MFA login");
+            tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record completed MFA login");
         }
         false
     } else {
@@ -87,7 +87,7 @@ async fn record_mfa_attempt(
     )
     .await
     {
-        tracing::warn!(user_id = user.id, %error, "failed to record MFA login attempt");
+        tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record MFA login attempt");
     }
     locked
 }

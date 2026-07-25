@@ -80,7 +80,7 @@ pub async fn list_protections(
     match rg_core::branch_protection::service::list_protections(&state.db, &owner, &repo).await {
         Ok(protections) => (StatusCode::OK, Json(protections)).into_response(),
         Err(e) => {
-            tracing::error!(%e, "list_protections failed");
+            tracing::error!(error = %format!("{e:#}"), "list_protections failed");
             AppError::from(e).into_response()
         }
     }

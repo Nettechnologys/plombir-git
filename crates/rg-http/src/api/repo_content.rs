@@ -235,7 +235,7 @@ pub async fn list_tree(
                 return (StatusCode::OK, Json(serde_json::json!({ "entries": [] })))
                     .into_response();
             }
-            tracing::error!(%e, "list_tree failed");
+            tracing::error!(error = %format!("{e:#}"), "list_tree failed");
             AppError::from(e).into_response()
         }
     }
@@ -353,7 +353,7 @@ pub async fn get_log(
     match get_commit_log(&repo_path, &git_ref, &file_path, limit) {
         Ok(log) => (StatusCode::OK, Json(serde_json::json!({ "commits": log }))).into_response(),
         Err(e) => {
-            tracing::error!(%e, "get_log failed");
+            tracing::error!(error = %format!("{e:#}"), "get_log failed");
             AppError::from(e).into_response()
         }
     }
@@ -401,7 +401,7 @@ pub async fn list_branches(
     match list_branch_names(&repo_path) {
         Ok(branches) => (StatusCode::OK, Json(branches)).into_response(),
         Err(e) => {
-            tracing::error!(%e, "list_branches failed");
+            tracing::error!(error = %format!("{e:#}"), "list_branches failed");
             AppError::from(e).into_response()
         }
     }
@@ -449,7 +449,7 @@ pub async fn list_tags(
     match list_tag_names(&repo_path) {
         Ok(tags) => (StatusCode::OK, Json(tags)).into_response(),
         Err(e) => {
-            tracing::error!(%e, "list_tags failed");
+            tracing::error!(error = %format!("{e:#}"), "list_tags failed");
             AppError::from(e).into_response()
         }
     }

@@ -146,7 +146,7 @@ pub async fn trigger_event(
                 match deliver(&url, &content_type, &secret, &payload_str).await {
                     Ok(resp_status) => (Some(resp_status), None::<String>),
                     Err(e) => {
-                        tracing::warn!(webhook_id = hook_id, error = %e, "webhook delivery failed");
+                        tracing::warn!(webhook_id = hook_id, error = %format!("{e:#}"), "webhook delivery failed");
                         (None, Some(format!("delivery error: {:#}", e)))
                     }
                 };
@@ -172,7 +172,7 @@ pub async fn trigger_event(
             };
 
             if let Err(e) = webhook_ops::create_delivery(&db_clone, delivery_model).await {
-                tracing::error!(error = %e, "failed to record webhook delivery");
+                tracing::error!(error = %format!("{e:#}"), "failed to record webhook delivery");
             }
         });
     }

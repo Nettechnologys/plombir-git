@@ -450,7 +450,10 @@ pub(crate) async fn run_serve(
     if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
         resolved_git_timeout,
     )) {
-        tracing::warn!(%e, "git gateway init failed — git-dependent features may be unavailable");
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "git gateway init failed — git-dependent features may be unavailable"
+        );
     } else {
         tracing::info!(git_cmd_secs = resolved_git_timeout, "Git CLI gateway ready");
     }

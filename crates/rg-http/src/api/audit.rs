@@ -244,7 +244,7 @@ pub async fn list_login_attempts(
     )
     .await
     .map_err(|error| {
-        tracing::error!(%error, "login attempt list failed");
+        tracing::error!(error = %format!("{error:#}"), "login attempt list failed");
         AppError::internal("database error")
     })?;
     Ok(Json(LoginAttemptResponse {

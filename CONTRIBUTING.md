@@ -179,10 +179,48 @@ pub async fn do_something(path: &Path) -> anyhow::Result<()> {
 
 // ✅ Logging: tracing with structured fields
 tracing::info!(path = %repo_path.display(), user = %username, "starting upload-pack");
-tracing::error!(error = %e, "git index-pack failed");
+
+// ✅ Logging an anyhow error: ALWAYS `{:#}`, never bare `%e`
+tracing::error!(error = %format!("{e:#}"), "git index-pack failed");
 
 // ❌ Do not use println! / eprintln! for logging
 ```
+
+#### Logging an error value
+
+`Display` for `anyhow::Error` prints **only the outermost** `.context(...)` — every
+cause underneath it is dropped. So `error = %e` turns a carefully layered error
+into a one-line summary with the actual reason removed:
+
+```rust
+// ❌ prints "db: failed to load pipeline" and nothing about *why*
+tracing::error!(error = %e, "pipeline lookup failed");
+
+// ✅ `{:#}` flattens the whole chain: "db: failed to load pipeline: pool timed out …"
+tracing::error!(error = %format!("{e:#}"), "pipeline lookup failed");
+```
+
+This matters most in background loops, watchdogs and post-push hooks, where the
+log line is the *only* channel — nobody gets an HTTP response to inspect. Keep the
+structural keys (`job_id`, `repo_id`, paths) as plain fields; only the error value
+needs the `{:#}` treatment.
+
+`{:#}` is **`anyhow`-specific**: on any other error type it renders identically to
+`{}`, so applying it blindly produces a diff that looks fixed but changes nothing.
+Classify the error type first — two cases need different handling:
+
+- **Concrete error types whose `Display` is already self-contained** —
+  `std::io::Error` ("No such file or directory (os error 2)") and thiserror enums
+  that interpolate their source (`#[error("blob storage I/O error: {0}")]`). A bare
+  `%error` is honest there; `{:#}` would just be noise.
+- **Concrete error types that hide their cause behind a generic `Display`** —
+  `reqwest::Error` says "error sending request for url (…)" while the actionable
+  reason (connection refused, DNS failure, TLS rejected) sits one or two `source()`
+  hops down. `{:#}` does *not* help; walk the chain instead. See `error_chain()` in
+  `crates/rg-runner/src/api.rs`.
+
+Same rule applies when *flattening* an error into a `String` for storage or a
+response body: `e.to_string()` truncates, `format!("{e:#}")` does not.
 
 ### Async
 

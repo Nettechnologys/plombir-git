@@ -481,14 +481,14 @@ pub async fn create_repo_with_opts(
         ))
         .await
     {
-        tracing::warn!(repo_id = repo.id, error = %e, "failed to update repos_fts index");
+        tracing::warn!(repo_id = repo.id, error = %format!("{e:#}"), "failed to update repos_fts index");
     }
 
     // Create default issue labels if requested
     if let Some(ref label_set) = opts.issue_labels {
         if label_set != "none" {
             if let Err(e) = create_default_labels(db, repo.id, label_set).await {
-                tracing::warn!(repo_id = repo.id, label_set = %label_set, error = %e,
+                tracing::warn!(repo_id = repo.id, label_set = %label_set, error = %format!("{e:#}"),
                     "failed to create default labels");
             }
         }
@@ -759,7 +759,7 @@ pub async fn delete_repo(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
         ))
         .await
     {
-        tracing::warn!(repo_id = repo_id, error = %e, "failed to remove repo from repos_fts index");
+        tracing::warn!(repo_id = repo_id, error = %format!("{e:#}"), "failed to remove repo from repos_fts index");
     }
 
     invalidate_perm_cache_repo(repo_id);

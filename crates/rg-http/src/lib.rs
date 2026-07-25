@@ -442,7 +442,7 @@ pub fn create_router_for_test(state: AppState) -> Router {
 async fn refresh_entity_gauges(db: &DatabaseConnection) {
     match metrics::time_db("user.count_active", rg_db::ops::user_ops::count_active(db)).await {
         Ok(n) => metrics::recorder::set_users_total(n as i64),
-        Err(e) => tracing::warn!(error = %e, "metrics gauge sink: count_active failed"),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_active failed"),
     }
     match metrics::time_db(
         "repo.count_non_deleted",
@@ -451,7 +451,7 @@ async fn refresh_entity_gauges(db: &DatabaseConnection) {
     .await
     {
         Ok(n) => metrics::recorder::set_repos_total(n as i64),
-        Err(e) => tracing::warn!(error = %e, "metrics gauge sink: count_non_deleted failed"),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_non_deleted failed"),
     }
 }
 
@@ -519,7 +519,7 @@ async fn run_runner_watchdog(
                         "Runner watchdog: resetting stuck job"
                     );
                     if let Err(e) = rg_db::ops::pipeline_ops::reset_stuck_job(&db, job_id).await {
-                        tracing::error!(job_id, error = %e, "Failed to reset stuck job");
+                        tracing::error!(job_id, error = %format!("{e:#}"), "Failed to reset stuck job");
                     } else if job.status == "running" {
                         // Settle the ci_jobs_running gauge: a running job was
                         // counted at start_job, but this watchdog reset returns
@@ -540,7 +540,7 @@ async fn run_runner_watchdog(
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "Runner watchdog: failed to find stuck jobs");
+                tracing::error!(error = %format!("{e:#}"), "Runner watchdog: failed to find stuck jobs");
             }
         }
 
@@ -556,14 +556,22 @@ async fn run_runner_watchdog(
                     if let Err(e) =
                         rg_db::ops::runner_ops::update_status(&db, runner.id, "offline").await
                     {
-                        tracing::error!(runner_id = runner.id, error = %e, "Failed to mark runner offline");
+                        tracing::error!(
+                            runner_id = runner.id,
+                            error = %format!("{e:#}"),
+                            "Failed to mark runner offline"
+                        );
                     }
 
                     // Reset jobs assigned to this offline runner
                     if let Err(e) =
                         rg_db::ops::pipeline_ops::reset_runner_jobs(&db, runner.id).await
                     {
-                        tracing::error!(runner_id = runner.id, error = %e, "Failed to reset jobs for offline runner");
+                        tracing::error!(
+                            runner_id = runner.id,
+                            error = %format!("{e:#}"),
+                            "Failed to reset jobs for offline runner"
+                        );
                     }
                 }
                 if !offline.is_empty() {
@@ -575,7 +583,7 @@ async fn run_runner_watchdog(
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "Runner watchdog: failed to find offline runners");
+                tracing::error!(error = %format!("{e:#}"), "Runner watchdog: failed to find offline runners");
             }
         }
 
@@ -598,7 +606,7 @@ async fn recover_stuck_imports(db: &DatabaseConnection, older_than_secs: i64) {
     let stuck = match rg_db::ops::import_task_ops::find_stuck(db, older_than_secs).await {
         Ok(stuck) => stuck,
         Err(e) => {
-            tracing::error!(error = %e, "Import watchdog: failed to find stuck import tasks");
+            tracing::error!(error = %format!("{e:#}"), "Import watchdog: failed to find stuck import tasks");
             return;
         }
     };
@@ -621,7 +629,11 @@ async fn recover_stuck_imports(db: &DatabaseConnection, older_than_secs: i64) {
             Ok(true) => failed += 1,
             Ok(false) => {} // task advanced/completed between find and fail — leave it
             Err(e) => {
-                tracing::error!(import_task_id = task.id, error = %e, "Failed to fail stuck import task");
+                tracing::error!(
+                    import_task_id = task.id,
+                    error = %format!("{e:#}"),
+                    "Failed to fail stuck import task"
+                );
             }
         }
     }

@@ -262,7 +262,11 @@ async fn login_via_ldap(
         let config = match ldap_config_from_provider(&provider, jwt_secret) {
             Ok(config) => config,
             Err(error) => {
-                tracing::warn!(provider_id = provider.id, %error, "ignoring invalid LDAP provider configuration");
+                tracing::warn!(
+                    provider_id = provider.id,
+                    error = %format!("{error:#}"),
+                    "ignoring invalid LDAP provider configuration"
+                );
                 continue;
             }
         };
@@ -274,7 +278,11 @@ async fn login_via_ldap(
         {
             Ok(Ok(user)) => user,
             Ok(Err(error)) => {
-                tracing::warn!(provider_id = provider.id, %error, "LDAP authentication attempt failed");
+                tracing::warn!(
+                    provider_id = provider.id,
+                    error = %format!("{error:#}"),
+                    "LDAP authentication attempt failed"
+                );
                 continue;
             }
             Err(_) => {
@@ -290,7 +298,11 @@ async fn login_via_ldap(
         {
             Ok(user) => user,
             Err(error) => {
-                tracing::warn!(provider_id = provider.id, %error, "LDAP identity could not be linked");
+                tracing::warn!(
+                    provider_id = provider.id,
+                    error = %format!("{error:#}"),
+                    "LDAP identity could not be linked"
+                );
                 bail!("invalid credentials");
             }
         };

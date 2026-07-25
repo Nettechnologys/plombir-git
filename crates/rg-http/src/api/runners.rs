@@ -124,7 +124,7 @@ pub async fn get_runner_admin(
             .into_response(),
         Ok(None) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
-            tracing::error!(%e, "get_runner_admin failed");
+            tracing::error!(error = %format!("{e:#}"), "get_runner_admin failed");
             AppError::from(e).into_response()
         }
     }
@@ -178,7 +178,7 @@ pub async fn register(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(%e, "register runner failed");
+            tracing::error!(error = %format!("{e:#}"), "register runner failed");
             AppError::from(e).into_response()
         }
     }
@@ -234,7 +234,7 @@ pub async fn deregister(
 ) -> impl IntoResponse {
     // Reset any jobs assigned to this runner so they can be picked up by others
     if let Err(e) = rg_db::ops::pipeline_ops::reset_runner_jobs(&state.db, runner_id).await {
-        tracing::warn!(runner_id, error = %e, "Failed to reset runner jobs during deregistration");
+        tracing::warn!(runner_id, error = %format!("{e:#}"), "Failed to reset runner jobs during deregistration");
     }
 
     match rg_db::ops::runner_ops::delete_runner(&state.db, runner_id).await {
@@ -311,7 +311,11 @@ pub async fn poll_job(
                     )
                     .await
                     {
-                        tracing::error!(job_id = job.id, error = %e, "Failed to update job result to assigned");
+                        tracing::error!(
+                            job_id = job.id,
+                            error = %format!("{e:#}"),
+                            "Failed to update job result to assigned"
+                        );
                     }
 
                     // Fetch stage to get pipeline_id
@@ -356,7 +360,11 @@ pub async fn poll_job(
                                 }
                             }
                             Err(error) => {
-                                tracing::error!(pipeline_id, %error, "failed to load CI secrets for external runner");
+                                tracing::error!(
+                                    pipeline_id,
+                                    error = %format!("{error:#}"),
+                                    "failed to load CI secrets for external runner"
+                                );
                                 return Err(AppError::internal(
                                     "failed to prepare job environment",
                                 )
@@ -427,7 +435,7 @@ pub async fn poll_job(
                 }
                 Err(e) => {
                     // H-05: Log the full error, return sanitized response
-                    tracing::error!(%e, "[poll_job] database error while finding pending job");
+                    tracing::error!(error = %format!("{e:#}"), "[poll_job] database error while finding pending job");
                     return Err(AppError::from(e).into_response());
                 }
             }
@@ -473,7 +481,7 @@ pub async fn start_job(
             return AppError::not_found("job not found").into_response();
         }
         Err(e) => {
-            tracing::error!(%e, "start_job: get_job failed");
+            tracing::error!(error = %format!("{e:#}"), "start_job: get_job failed");
             return AppError::from(e).into_response();
         }
     };
@@ -488,7 +496,7 @@ pub async fn start_job(
     )
     .await
     {
-        tracing::error!(%e, "start_job: update_job_result failed");
+        tracing::error!(error = %format!("{e:#}"), "start_job: update_job_result failed");
         return AppError::from(e).into_response();
     }
 
@@ -497,7 +505,7 @@ pub async fn start_job(
 
     // Mark runner as busy
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "busy").await {
-        tracing::error!(runner_id, error = %e, "Failed to mark runner as busy");
+        tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as busy");
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
@@ -537,7 +545,7 @@ pub async fn upload_log(
             return AppError::not_found("job not found").into_response();
         }
         Err(e) => {
-            tracing::error!(%e, "upload_log: get_job failed");
+            tracing::error!(error = %format!("{e:#}"), "upload_log: get_job failed");
             return AppError::from(e).into_response();
         }
     };
@@ -549,7 +557,7 @@ pub async fn upload_log(
     let body = match secrets_for_job(&state, job.stage_id).await {
         Ok(secrets) => rg_core::auth::encryption::mask_values(&body, &secrets),
         Err(error) => {
-            tracing::error!(job_id, %error, "failed to load secrets while masking runner log");
+            tracing::error!(job_id, error = %format!("{error:#}"), "failed to load secrets while masking runner log");
             return AppError::internal("failed to sanitize job log").into_response();
         }
     };
@@ -1024,7 +1032,7 @@ pub async fn finish_job(
             return AppError::not_found("job not found").into_response();
         }
         Err(e) => {
-            tracing::error!(%e, "finish_job: get_job failed");
+            tracing::error!(error = %format!("{e:#}"), "finish_job: get_job failed");
             return AppError::from(e).into_response();
         }
     };
@@ -1046,7 +1054,7 @@ pub async fn finish_job(
     )
     .await
     {
-        tracing::error!(%e, "finish_job: update_job_result failed");
+        tracing::error!(error = %format!("{e:#}"), "finish_job: update_job_result failed");
         return AppError::from(e).into_response();
     }
 
@@ -1059,7 +1067,7 @@ pub async fn finish_job(
 
     // Mark runner as online (ready for next job)
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "online").await {
-        tracing::error!(runner_id, error = %e, "Failed to mark runner as online");
+        tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as online");
     }
 
     // Cascade: check if stage is done, then if pipeline is done
@@ -1089,7 +1097,11 @@ pub async fn finish_job(
                                 )
                                 .await
                             {
-                                tracing::warn!(pipeline_id = pipeline.id, %error, "auto-merge evaluation after CI failed");
+                                tracing::warn!(
+                                    pipeline_id = pipeline.id,
+                                    error = %format!("{error:#}"),
+                                    "auto-merge evaluation after CI failed"
+                                );
                             }
                             if let Err(error) =
                                 rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
@@ -1108,14 +1120,22 @@ pub async fn finish_job(
                                 )
                                 .await
                             {
-                                tracing::warn!(pipeline_id = pipeline.id, %error, "merge queue evaluation after CI failed");
+                                tracing::warn!(
+                                    pipeline_id = pipeline.id,
+                                    error = %format!("{error:#}"),
+                                    "merge queue evaluation after CI failed"
+                                );
                             }
                         }
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::error!(pipeline_id = stage.pipeline_id, error = %e, "Failed to update pipeline after stage completion");
+                    tracing::error!(
+                        pipeline_id = stage.pipeline_id,
+                        error = %format!("{e:#}"),
+                        "Failed to update pipeline after stage completion"
+                    );
                 }
             }
         }
@@ -1166,7 +1186,7 @@ pub async fn list_runners_admin(
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            tracing::error!(%e, "list_runners_admin failed");
+            tracing::error!(error = %format!("{e:#}"), "list_runners_admin failed");
             AppError::from(e).into_response()
         }
     }
@@ -1215,7 +1235,7 @@ pub async fn authenticate_runner(
         Ok(Some(runner)) if runner.id == runner_id => {
             // Valid token — also update heartbeat
             if let Err(e) = rg_db::ops::runner_ops::update_heartbeat(&state.db, runner_id).await {
-                tracing::error!(runner_id, error = %e, "Failed to update runner heartbeat");
+                tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to update runner heartbeat");
             }
             next.run(request).await
         }
@@ -1230,7 +1250,7 @@ pub async fn authenticate_runner(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(%e, "authenticate_runner: find_by_token failed");
+            tracing::error!(error = %format!("{e:#}"), "authenticate_runner: find_by_token failed");
             AppError::from(e).into_response()
         }
     }
@@ -1277,7 +1297,7 @@ pub async fn delete_runner_admin(
             .into_response(),
         Ok(false) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
-            tracing::error!(%e, "delete_runner_admin failed");
+            tracing::error!(error = %format!("{e:#}"), "delete_runner_admin failed");
             AppError::from(e).into_response()
         }
     }

@@ -53,7 +53,7 @@ async fn record_audit(
     };
 
     if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
-        tracing::warn!(error = %e, "failed to record audit log");
+        tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
     }
 }
 
@@ -741,7 +741,11 @@ pub async fn test_sso_provider_connection(
         }))
         .into_response(),
         Err(error) => {
-            tracing::warn!(provider_id = provider.id, %error, "LDAP provider connection test failed");
+            tracing::warn!(
+                provider_id = provider.id,
+                error = %format!("{error:#}"),
+                "LDAP provider connection test failed"
+            );
             AppError::bad_request("LDAP connection test failed; check server logs for details")
                 .into_response()
         }

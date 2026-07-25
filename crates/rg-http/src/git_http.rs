@@ -943,7 +943,7 @@ async fn post_push_branch_maintenance(
                 )
                 .await
                 {
-                    tracing::warn!(%error, "auto-merge evaluation after push failed");
+                    tracing::warn!(error = %format!("{error:#}"), "auto-merge evaluation after push failed");
                 }
                 if let Err(error) =
                     rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
@@ -962,11 +962,11 @@ async fn post_push_branch_maintenance(
                     )
                     .await
                 {
-                    tracing::warn!(%error, "merge queue evaluation after push failed");
+                    tracing::warn!(error = %format!("{error:#}"), "merge queue evaluation after push failed");
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "failed to refresh PR head SHA after push")
+                tracing::warn!(error = %format!("{error:#}"), "failed to refresh PR head SHA after push")
             }
         }
     }
@@ -980,7 +980,7 @@ async fn post_push_branch_maintenance(
             );
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to check branch protection");
+            tracing::warn!(error = %format!("{e:#}"), "Failed to check branch protection");
         }
         _ => {}
     }
@@ -1062,7 +1062,7 @@ async fn trigger_ci_for_push(
             )
             .await
             {
-                tracing::warn!(error = %e, "Failed to send CI notification email");
+                tracing::warn!(error = %format!("{e:#}"), "Failed to send CI notification email");
             }
         }
     }
@@ -1090,7 +1090,7 @@ async fn trigger_push_webhooks(
     if let Err(e) =
         rg_core::webhook::service::trigger_event(params.db, repo_id, "push", &payload).await
     {
-        tracing::warn!(error = %e, "Failed to trigger push webhook");
+        tracing::warn!(error = %format!("{e:#}"), "Failed to trigger push webhook");
     }
 
     // 3. Trigger branch/tag-specific webhooks

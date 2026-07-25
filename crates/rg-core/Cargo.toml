@@ -56,6 +56,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Lets a test assert on the log line an operator would actually have seen —
+# the only channel a background consumer has (see `log_write_queue` tests).
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

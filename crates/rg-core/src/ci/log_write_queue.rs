@@ -166,7 +166,7 @@ impl LogWriteQueue {
             Err(e) => {
                 tracing::warn!(
                     job_id = req.job_id,
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "log write: failed to read current job log"
                 );
                 return;
@@ -184,7 +184,7 @@ impl LogWriteQueue {
         if let Err(e) = rg_db::ops::pipeline_ops::update_job_log(db, req.job_id, &combined).await {
             tracing::warn!(
                 job_id = req.job_id,
-                error = %e,
+                error = %format!("{e:#}"),
                 "log write: failed to persist"
             );
         }
@@ -271,5 +271,73 @@ mod tests {
                 "missing 'line {i}' in drained log: {persisted:?}"
             );
         }
+    }
+
+    /// Sink that keeps every formatted log line so a test can assert on what the
+    /// operator would actually have seen.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// This consumer swallows every write failure by design — the log line is the
+    /// *only* channel an operator has. `rg_db::ops` wraps each failure in
+    /// `.context("db: ...")`, so a bare `error = %e` would render that context and
+    /// nothing else, turning "the pipeline_job table is missing" into an
+    /// unactionable "log write: failed to read current job log / db: ...".
+    ///
+    /// Asserts on the rendered line, not on the `Result`, because the rendering is
+    /// exactly what regressed before.
+    #[tokio::test]
+    async fn write_failure_log_line_carries_the_underlying_db_cause() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Connected but un-migrated: every `pipeline_job` query fails at the
+        // SQLite level, which is the cause we need to see in the log.
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        LogWriteQueue::process_request(
+            &db,
+            LogWriteRequest {
+                job_id: 42,
+                log_text: "some build output".to_string(),
+            },
+        )
+        .await;
+
+        let rendered = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(
+            rendered.contains("log write: failed to read current job log"),
+            "expected the write-failure warning, got: {rendered}"
+        );
+        // The `.context("db: ...")` layer — what a bare `%e` would have shown.
+        assert!(rendered.contains("db: "), "missing context layer: {rendered}");
+        // …and the actual reason underneath it, which is the whole point.
+        assert!(
+            rendered.contains("no such table"),
+            "the underlying SQLite cause was dropped from the log line: {rendered}"
+        );
     }
 }

@@ -147,7 +147,10 @@ impl From<anyhow::Error> for AppError {
             if Self::is_db_outage(db_err) {
                 // Keep the full anyhow context chain in the operator log; the
                 // IntoResponse impl still sanitizes the client-facing message.
-                let full_msg = e.to_string();
+                // `{:#}` is load-bearing: `to_string()` renders only the
+                // outermost `.context(...)`, so the `DbErr` we just downcast to
+                // would never reach the log.
+                let full_msg = format!("{e:#}");
                 tracing::error!(error = %full_msg, "database unavailable (connection-level error via anyhow), returning 503");
                 return Self::ServiceUnavailable(full_msg);
             }
@@ -155,7 +158,13 @@ impl From<anyhow::Error> for AppError {
 
         // H-05: Log the full error for operators, store a generic message internally.
         // The IntoResponse impl will also sanitize the client-facing message.
-        let full_msg = e.to_string();
+        //
+        // This is the funnel every handler's `?` passes through, so `{:#}` here
+        // is what makes a 500 diagnosable at all: `rg_db::ops` wraps every
+        // failure in `.context("db: ...")`, and a bare `to_string()` prints that
+        // context *only* — the `DbErr` naming the table, column or constraint is
+        // dropped on the floor.
+        let full_msg = format!("{e:#}");
         tracing::error!(error = %full_msg, "anyhow error converted to AppError");
         Self::InternalError(full_msg)
     }
@@ -274,6 +283,56 @@ mod tests {
 
         let err: AppError = DbErr::RecordNotInserted.into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Every handler `?` funnels through `From<anyhow::Error>`, and the message it
+    /// keeps is exactly what reaches the operator log. `Display` for
+    /// `anyhow::Error` renders only the outermost `.context(...)`, so a
+    /// `to_string()` here silently deletes the reason — which is the whole point
+    /// of having layered context in `rg_db::ops` and the services.
+    #[test]
+    fn anyhow_conversion_keeps_the_nested_context_chain() {
+        use anyhow::Context;
+
+        let err = Err::<(), _>(DbErr::Exec(RuntimeErr::Internal(
+            "UNIQUE constraint failed: repos.name".into(),
+        )))
+        .context("db: failed to insert repo")
+        .context("creating repository \"acme/widgets\"")
+        .unwrap_err();
+
+        // Pre-condition: this is what a bare `%e` / `to_string()` would have shown.
+        assert_eq!(err.to_string(), "creating repository \"acme/widgets\"");
+
+        let app_err: AppError = err.into();
+        let AppError::InternalError(logged) = &app_err else {
+            panic!("expected InternalError, got {app_err:?}");
+        };
+        // All three layers survive, innermost cause included.
+        assert!(logged.contains("creating repository \"acme/widgets\""), "{logged}");
+        assert!(logged.contains("db: failed to insert repo"), "{logged}");
+        assert!(logged.contains("UNIQUE constraint failed: repos.name"), "{logged}");
+    }
+
+    /// Same guarantee on the 503 branch, which resolves the message separately
+    /// after downcasting to `DbErr`.
+    #[test]
+    fn db_outage_via_anyhow_keeps_the_nested_context_chain() {
+        use anyhow::Context;
+
+        let err = Err::<(), _>(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout))
+            .context("db: failed to list pending jobs")
+            .context("runner watchdog sweep")
+            .unwrap_err();
+
+        let app_err: AppError = err.into();
+        assert_eq!(app_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let AppError::ServiceUnavailable(logged) = &app_err else {
+            panic!("expected ServiceUnavailable, got {app_err:?}");
+        };
+        assert!(logged.contains("runner watchdog sweep"), "{logged}");
+        assert!(logged.contains("db: failed to list pending jobs"), "{logged}");
+        assert!(logged.contains("Connection pool timed out"), "{logged}");
     }
 
     #[test]

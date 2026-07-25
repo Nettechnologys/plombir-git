@@ -142,7 +142,11 @@ impl PipelineRunner {
         }
         let result = self.run_pipeline().await;
         if let Err(error) = self.cleanup_workspace().await {
-            tracing::warn!(pipeline_id = self.pipeline_id, %error, "failed to clean CI workspace");
+            tracing::warn!(
+                pipeline_id = self.pipeline_id,
+                error = %format!("{error:#}"),
+                "failed to clean CI workspace"
+            );
         }
         result
     }
@@ -358,7 +362,7 @@ impl PipelineRunner {
                 )
                 .await
                 {
-                    tracing::error!(job_id = job.id, error = %e, "Failed to update job result");
+                    tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to update job result");
                 }
                 stage_failed
             }
@@ -376,7 +380,7 @@ impl PipelineRunner {
                 )
                 .await
                 {
-                    tracing::error!(job_id = job.id, error = %e, "Failed to update job result");
+                    tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to update job result");
                 }
                 stage_failed
             }
@@ -402,7 +406,11 @@ impl PipelineRunner {
         )
         .await
         {
-            tracing::warn!(pipeline_id = self.pipeline_id, %error, "auto-merge evaluation after local CI failed");
+            tracing::warn!(
+                pipeline_id = self.pipeline_id,
+                error = %format!("{error:#}"),
+                "auto-merge evaluation after local CI failed"
+            );
         }
         let ci_engine = crate::CiEngine;
         if let Err(error) = rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
@@ -424,7 +432,11 @@ impl PipelineRunner {
         )
         .await
         {
-            tracing::warn!(pipeline_id = self.pipeline_id, %error, "merge queue evaluation after local CI failed");
+            tracing::warn!(
+                pipeline_id = self.pipeline_id,
+                error = %format!("{error:#}"),
+                "merge queue evaluation after local CI failed"
+            );
         }
 
         Ok(())
@@ -462,7 +474,7 @@ impl PipelineRunner {
         )
         .await
         {
-            tracing::error!(job_id, error = %e, "Failed to update job status to running");
+            tracing::error!(job_id, error = %format!("{e:#}"), "Failed to update job status to running");
         }
 
         tracing::info!(job_id, "Running job");
@@ -499,7 +511,11 @@ impl PipelineRunner {
         let mut cache_notices: Vec<String> = Vec::new();
         if let Some((key, _)) = &cache {
             if let Err(error) = self.restore_cache(key).await {
-                tracing::warn!(job_id, error = %format!("{error:#}"), "CI cache restore failed; continuing without cache");
+                tracing::warn!(
+                    job_id,
+                    error = %format!("{error:#}"),
+                    "CI cache restore failed; continuing without cache"
+                );
                 cache_notices.push(format!(
                     "CI cache restore failed; continuing without cache: {error:#}"
                 ));

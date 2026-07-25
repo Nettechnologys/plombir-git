@@ -80,7 +80,7 @@ async fn record_audit(
     };
 
     if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
-        tracing::warn!(error = %e, "failed to record audit log");
+        tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
     }
 }
 
@@ -252,13 +252,17 @@ pub async fn login(
             )
             .await
             {
-                tracing::warn!(%error, "failed to record successful login attempt");
+                tracing::warn!(error = %format!("{error:#}"), "failed to record successful login attempt");
             }
             if !mfa_required {
                 if let Err(error) =
                     rg_db::ops::user_ops::record_successful_login(&state.db, resp.user_id).await
                 {
-                    tracing::warn!(user_id = resp.user_id, %error, "failed to update login state");
+                    tracing::warn!(
+                        user_id = resp.user_id,
+                        error = %format!("{error:#}"),
+                        "failed to update login state"
+                    );
                 }
             }
 

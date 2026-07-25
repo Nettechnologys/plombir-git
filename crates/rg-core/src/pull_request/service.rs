@@ -1032,7 +1032,11 @@ pub async fn try_auto_merges_for_head_commit(
         let namespace = repository_namespace(db, &repository).await?;
         match try_auto_merge(db, repo_root, &namespace, &repository.name, pr.number).await {
             Ok(outcome) => outcomes.push(outcome),
-            Err(error) => tracing::warn!(pr_id = pr.id, %error, "automatic merge attempt failed"),
+            Err(error) => tracing::warn!(
+                pr_id = pr.id,
+                error = %format!("{error:#}"),
+                "automatic merge attempt failed"
+            ),
         }
     }
     Ok(outcomes)
@@ -1088,7 +1092,7 @@ pub async fn merge_pr(
     let result = merge_claimed_pr(db, repo_root, owner, repo_name, pr.clone(), strategy).await;
     if result.is_err() {
         if let Err(error) = pull_request_ops::restore_merge_claim(db, pr.id).await {
-            tracing::error!(pr_id = pr.id, %error, "failed to restore PR merge state");
+            tracing::error!(pr_id = pr.id, error = %format!("{error:#}"), "failed to restore PR merge state");
         }
     } else {
         // Count the merge here (not in the HTTP handler) so the REST path,

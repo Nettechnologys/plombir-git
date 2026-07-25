@@ -137,7 +137,7 @@ pub async fn list_pipelines(
             Json(PaginatedResponse::new(resp, &pagination, total as u64)).into_response()
         }
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -174,7 +174,7 @@ pub async fn get_pipeline(
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             };
         }
@@ -187,7 +187,7 @@ pub async fn get_pipeline(
         Ok(s) => s,
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             };
         }
@@ -200,7 +200,7 @@ pub async fn get_pipeline(
             Ok(j) => j,
             Err(e) => {
                 return {
-                    tracing::error!(%e, "handler error");
+                    tracing::error!(error = %format!("{e:#}"), "handler error");
                     AppError::from(e).into_response()
                 };
             }
@@ -290,7 +290,7 @@ pub async fn get_job(
         Ok(Some(p)) if p.repo_id == repo.id => p,
         Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             return AppError::from(e).into_response();
         }
     };
@@ -322,7 +322,7 @@ pub async fn get_job(
         }
         Ok(None) => AppError::not_found("job not found").into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -512,7 +512,7 @@ pub async fn trigger_pipeline(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -551,7 +551,7 @@ pub async fn retry_pipeline(
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             };
         }
@@ -609,7 +609,7 @@ pub async fn retry_pipeline(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -647,7 +647,7 @@ pub async fn cancel_pipeline(
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             };
         }
@@ -672,7 +672,7 @@ pub async fn cancel_pipeline(
             .await
     {
         return {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         };
     }
@@ -682,7 +682,7 @@ pub async fn cancel_pipeline(
         Ok(s) => s,
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             };
         }
@@ -702,7 +702,7 @@ pub async fn cancel_pipeline(
             )
             .await
             {
-                tracing::error!(stage_id = stage.id, error = %e, "Failed to cancel stage");
+                tracing::error!(stage_id = stage.id, error = %format!("{e:#}"), "Failed to cancel stage");
             }
 
             let jobs = match rg_db::ops::pipeline_ops::list_jobs_by_stage(&state.db, stage.id).await
@@ -727,7 +727,7 @@ pub async fn cancel_pipeline(
                     )
                     .await
                     {
-                        tracing::error!(job_id = job.id, error = %e, "Failed to cancel job");
+                        tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to cancel job");
                     }
                 }
             }
@@ -806,7 +806,12 @@ async fn job_belongs_to_pipeline(state: &AppState, pipeline_id: i64, stage_id: i
     match rg_db::ops::pipeline_ops::list_stages_by_pipeline(&state.db, pipeline_id).await {
         Ok(stages) => stages.iter().any(|stage| stage.id == stage_id),
         Err(e) => {
-            tracing::error!(%e, pipeline_id, stage_id, "failed to verify job pipeline ownership");
+            tracing::error!(
+                error = %format!("{e:#}"),
+                pipeline_id,
+                stage_id,
+                "failed to verify job pipeline ownership"
+            );
             false
         }
     }

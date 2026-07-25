@@ -341,7 +341,11 @@ impl Handler for SshHandler {
             Ok(Some(key)) => {
                 self.authenticated_identity = Some(AuthenticatedIdentity::User(key.user_id));
                 if let Err(error) = rg_db::ops::ssh_key_ops::touch_last_used(db, key.id).await {
-                    tracing::warn!(key_id = key.id, error = %error, "failed to update SSH key usage time");
+                    tracing::warn!(
+                        key_id = key.id,
+                        error = %format!("{error:#}"),
+                        "failed to update SSH key usage time"
+                    );
                 }
                 tracing::info!(user_id = key.user_id, "SSH pubkey auth accepted");
                 Ok(Auth::Accept)
@@ -355,7 +359,11 @@ impl Handler for SshHandler {
                     if let Err(error) =
                         rg_db::ops::deploy_key_ops::touch_last_used(db, key.id).await
                     {
-                        tracing::warn!(key_id = key.id, error = %error, "failed to update deploy key usage time");
+                        tracing::warn!(
+                            key_id = key.id,
+                            error = %format!("{error:#}"),
+                            "failed to update deploy key usage time"
+                        );
                     }
                     tracing::info!(
                         repo_id = key.repo_id,
@@ -372,7 +380,7 @@ impl Handler for SshHandler {
                     })
                 }
                 Err(error) => {
-                    tracing::error!(%error, "DB error during deploy-key lookup");
+                    tracing::error!(error = %format!("{error:#}"), "DB error during deploy-key lookup");
                     Ok(Auth::Reject {
                         proceed_with_methods: None,
                         partial_success: false,
@@ -380,7 +388,7 @@ impl Handler for SshHandler {
                 }
             },
             Err(e) => {
-                tracing::error!(error = %e, "DB error during pubkey lookup");
+                tracing::error!(error = %format!("{e:#}"), "DB error during pubkey lookup");
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
                     partial_success: false,
@@ -411,7 +419,7 @@ impl Handler for SshHandler {
                         })
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "password verify error");
+                        tracing::error!(error = %format!("{e:#}"), "password verify error");
                         Ok(Auth::Reject {
                             proceed_with_methods: None,
                             partial_success: false,
@@ -427,7 +435,7 @@ impl Handler for SshHandler {
                 })
             }
             Err(e) => {
-                tracing::error!(error = %e, "DB error during password auth");
+                tracing::error!(error = %format!("{e:#}"), "DB error during password auth");
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
                     partial_success: false,
@@ -498,7 +506,7 @@ impl Handler for SshHandler {
             .await
             {
                 tracing::warn!(
-                    error = %e,
+                    error = %format!("{e:#}"),
                     identity = ?self.authenticated_identity,
                     %service,
                     %repo_path,
@@ -662,7 +670,7 @@ impl Handler for SshHandler {
                     idle_timeout_secs = git_idle_timeout_secs,
                     "git SSH session idle (no read/write progress within idle window) — killed git, closing channel"
                 ),
-                Err(e) => tracing::error!(error = %e, %service_name, "Git SSH session failed"),
+                Err(e) => tracing::error!(error = %format!("{e:#}"), %service_name, "Git SSH session failed"),
             }
 
             // CRITICAL: SSH stream shutdown order (pitfall)

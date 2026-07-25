@@ -524,7 +524,7 @@ pub async fn callback(
     }
 
     if let Err(error) = rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await {
-        tracing::warn!(user_id = user.id, %error, "failed to record successful SSO login");
+        tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record successful SSO login");
     }
 
     // ── Issue JWT ────────────────────────────────────────────────

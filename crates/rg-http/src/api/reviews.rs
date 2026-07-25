@@ -207,7 +207,7 @@ async fn after_suggestions_applied(
             })
             .await
         {
-            tracing::warn!(pr_id = pr.id, %error, "CI trigger after suggestion failed");
+            tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "CI trigger after suggestion failed");
         }
     }
     if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
@@ -218,7 +218,7 @@ async fn after_suggestions_applied(
     )
     .await
     {
-        tracing::warn!(pr_id = pr.id, %error, "auto-merge evaluation after suggestion failed");
+        tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "auto-merge evaluation after suggestion failed");
     }
     let ci = rg_core::pull_request::merge_queue::MergeQueueCi {
         trigger: &*state.ci_engine,
@@ -237,7 +237,7 @@ async fn after_suggestions_applied(
     )
     .await
     {
-        tracing::warn!(pr_id = pr.id, %error, "merge queue evaluation after suggestion failed");
+        tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "merge queue evaluation after suggestion failed");
     }
 }
 
@@ -346,7 +346,11 @@ pub async fn submit_review(
                         tracing::info!(pr_id = pr.id, status = %outcome.status, "auto-merge evaluated after approval")
                     }
                     Err(error) => {
-                        tracing::warn!(pr_id = pr.id, %error, "auto-merge attempt after approval failed")
+                        tracing::warn!(
+                            pr_id = pr.id,
+                            error = %format!("{error:#}"),
+                            "auto-merge attempt after approval failed"
+                        )
                     }
                 }
                 let ci = rg_core::pull_request::merge_queue::MergeQueueCi {
@@ -365,7 +369,11 @@ pub async fn submit_review(
                 )
                 .await
                 {
-                    tracing::warn!(repo_id = repo_model.id, %error, "merge queue evaluation after approval failed");
+                    tracing::warn!(
+                        repo_id = repo_model.id,
+                        error = %format!("{error:#}"),
+                        "merge queue evaluation after approval failed"
+                    );
                 }
             }
             (StatusCode::CREATED, Json(review)).into_response()

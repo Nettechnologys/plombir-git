@@ -63,7 +63,7 @@ pub async fn create_page(
         ))
         .await
     {
-        tracing::warn!(error = %e, page_id = %page_id, "failed to update wiki_pages_fts index");
+        tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to update wiki_pages_fts index");
     }
 
     Ok(page)
@@ -141,7 +141,7 @@ pub async fn update_page(
         ))
         .await
     {
-        tracing::warn!(error = %e, page_id = %page_id, "failed to update wiki_pages_fts index");
+        tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to update wiki_pages_fts index");
     }
 
     Ok(updated)
@@ -187,7 +187,7 @@ pub async fn delete_page(db: &DatabaseConnection, repo_id: i64, title: &str) -> 
         ))
         .await
     {
-        tracing::warn!(error = %e, page_id = %page_id, "failed to delete from wiki_pages_fts index");
+        tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to delete from wiki_pages_fts index");
     }
 
     wiki_page_ops::delete_by_id(db, page_id).await

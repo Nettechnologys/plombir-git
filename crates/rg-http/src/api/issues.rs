@@ -265,7 +265,7 @@ pub async fn list_issues(
                         .into_response()
                 }
                 Err(e) => {
-                    tracing::error!(%e, "handler error");
+                    tracing::error!(error = %format!("{e:#}"), "handler error");
                     AppError::from(e).into_response()
                 }
             };
@@ -291,7 +291,7 @@ pub async fn list_issues(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -500,7 +500,7 @@ pub async fn list_comments(
             (StatusCode::OK, Json(comments)).into_response()
         }
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -673,7 +673,7 @@ pub async fn list_milestones(
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             }
         }
@@ -682,7 +682,7 @@ pub async fn list_milestones(
     {
         Ok(milestones) => (StatusCode::OK, Json(serde_json::json!(milestones))).into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -736,7 +736,7 @@ pub async fn create_milestone(
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             }
         }
@@ -794,7 +794,7 @@ pub async fn get_milestone(
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             }
         }
@@ -803,7 +803,7 @@ pub async fn get_milestone(
         Ok(Some(m)) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
         Ok(None) => AppError::not_found("milestone not found".to_string()).into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -862,7 +862,7 @@ pub async fn update_milestone(
         Ok(None) => return AppError::not_found("milestone not found".to_string()).into_response(),
         Err(e) => {
             return {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             }
         }
@@ -891,7 +891,7 @@ pub async fn update_milestone(
     match rg_db::ops::milestone_ops::update(&state.db, active).await {
         Ok(m) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -939,7 +939,7 @@ pub async fn delete_milestone(
     match rg_db::ops::milestone_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -970,7 +970,7 @@ pub async fn get_issue_labels(
         Ok(issue) => match rg_core::label::service::get_issue_labels(&state.db, issue.id).await {
             Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),
             Err(e) => {
-                tracing::error!(%e, "handler error");
+                tracing::error!(error = %format!("{e:#}"), "handler error");
                 AppError::from(e).into_response()
             }
         },

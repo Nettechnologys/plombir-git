@@ -180,7 +180,7 @@ async fn load_passkeys(
         match wa::passkey_from_json(&row.passkey) {
             Ok(pk) => out.push((row, pk)),
             Err(error) => {
-                tracing::warn!(passkey_id = row.id, %error, "skipping corrupt stored passkey");
+                tracing::warn!(passkey_id = row.id, error = %format!("{error:#}"), "skipping corrupt stored passkey");
             }
         }
     }
@@ -258,7 +258,7 @@ pub async fn register_finish(
     let webauthn = webauthn_for(&state, &headers)?;
     let passkey =
         wa::finish_registration(&webauthn, &req.credential, &sealed.reg).map_err(|error| {
-            tracing::warn!(user_id, %error, "passkey registration verification failed");
+            tracing::warn!(user_id, error = %format!("{error:#}"), "passkey registration verification failed");
             AppError::bad_request("passkey registration could not be verified")
         })?;
 
@@ -275,7 +275,7 @@ pub async fn register_finish(
     )
     .await
     .map_err(|error| {
-        tracing::warn!(user_id, %error, "failed to store passkey (possible duplicate)");
+        tracing::warn!(user_id, error = %format!("{error:#}"), "failed to store passkey (possible duplicate)");
         AppError::conflict("this passkey is already registered")
     })?;
 
@@ -425,7 +425,7 @@ pub async fn login_finish(
 
     let webauthn = webauthn_for(&state, &headers)?;
     let result = wa::finish_authentication(&webauthn, &credential, &sealed.auth).map_err(|error| {
-        tracing::warn!(user_id = user.id, %error, "passkey authentication verification failed");
+        tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "passkey authentication verification failed");
         AppError::unauthorized("passkey authentication failed")
     })?;
 
@@ -441,13 +441,17 @@ pub async fn login_finish(
         if let Err(error) =
             rg_db::ops::passkey_credential_ops::touch_and_update(&state.db, model.id, &json).await
         {
-            tracing::warn!(user_id = user.id, %error, "failed to update passkey after login");
+            tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to update passkey after login");
         }
     }
 
     // Record the successful login the same way the MFA path does.
     if let Err(error) = rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await {
-        tracing::warn!(user_id = user.id, %error, "failed to update login state after passkey login");
+        tracing::warn!(
+            user_id = user.id,
+            error = %format!("{error:#}"),
+            "failed to update login state after passkey login"
+        );
     }
     let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(&headers);
     if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
@@ -462,7 +466,7 @@ pub async fn login_finish(
     )
     .await
     {
-        tracing::warn!(user_id = user.id, %error, "failed to record passkey login attempt");
+        tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record passkey login attempt");
     }
 
     let token = rg_core::auth::jwt::generate_token(user.id, &user.username, &state.jwt_secret, 7)

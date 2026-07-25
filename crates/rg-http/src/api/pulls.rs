@@ -113,7 +113,7 @@ pub async fn list_prs(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }
@@ -228,11 +228,15 @@ pub async fn create_pr(
                             )
                             .await
                             {
-                                tracing::warn!(pr_id = pr.id, %error, "CODEOWNERS reviewer request failed");
+                                tracing::warn!(
+                                    pr_id = pr.id,
+                                    error = %format!("{error:#}"),
+                                    "CODEOWNERS reviewer request failed"
+                                );
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(pr_id = pr.id, %error, "CODEOWNERS diff unavailable");
+                            tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "CODEOWNERS diff unavailable");
                         }
                     }
                     (StatusCode::CREATED, Json(pr)).into_response()
@@ -324,7 +328,7 @@ pub async fn get_diff(
     {
         Ok(diff) => (StatusCode::OK, Json(diff)).into_response(),
         Err(e) => {
-            tracing::error!(%e, "handler error");
+            tracing::error!(error = %format!("{e:#}"), "handler error");
             AppError::from(e).into_response()
         }
     }

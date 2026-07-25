@@ -344,7 +344,7 @@ async fn evaluate_initial_success(
         rg_core::pull_request::try_auto_merges_for_head_commit(db, repo_root, repo_id, commit_sha)
             .await
     {
-        tracing::warn!(repo_id, %error, "auto-merge evaluation after conditional CI failed");
+        tracing::warn!(repo_id, error = %format!("{error:#}"), "auto-merge evaluation after conditional CI failed");
     }
     let ci_engine = CiEngine;
     if let Err(error) = rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
@@ -363,7 +363,7 @@ async fn evaluate_initial_success(
     )
     .await
     {
-        tracing::warn!(repo_id, %error, "merge queue evaluation after conditional CI failed");
+        tracing::warn!(repo_id, error = %format!("{error:#}"), "merge queue evaluation after conditional CI failed");
     }
 }
 
@@ -398,7 +398,7 @@ fn spawn_internal_runner(
             runner.set_oidc_token_url(url);
         }
         if let Err(error) = runner.run().await {
-            tracing::error!(pipeline_id, %error, "pipeline runner error");
+            tracing::error!(pipeline_id, error = %format!("{error:#}"), "pipeline runner error");
         }
     });
 }

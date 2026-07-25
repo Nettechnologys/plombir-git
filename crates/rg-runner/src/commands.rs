@@ -276,7 +276,11 @@ pub async fn cmd_run(
                     )
                     .await
                     {
-                        tracing::warn!(job_id = job.job_id, %error, "cache restore failed; continuing");
+                        tracing::warn!(
+                            job_id = job.job_id,
+                            error = %format!("{error:#}"),
+                            "cache restore failed; continuing"
+                        );
                     }
                 }
                 let execution = async {
@@ -325,7 +329,11 @@ pub async fn cmd_run(
                         )
                         .await
                         {
-                            tracing::warn!(job_id = job.job_id, %error, "cache save failed; job remains successful");
+                            tracing::warn!(
+                                job_id = job.job_id,
+                                error = %format!("{error:#}"),
+                                "cache save failed; job remains successful"
+                            );
                         }
                     }
                 }

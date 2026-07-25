@@ -5212,6 +5212,7 @@ dependencies = [
  "toml",
  "totp-rs",
  "tracing",
+ "tracing-subscriber",
  "urlencoding",
  "uuid",
  "webauthn-rs",

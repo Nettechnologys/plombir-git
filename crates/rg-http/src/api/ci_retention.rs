@@ -115,7 +115,11 @@ pub async fn cleanup_expired_storage(
             }
             Err(error) => {
                 summary.failures += 1;
-                tracing::error!(artifact_id = artifact.id, %error, "refused to clean expired artifact");
+                tracing::error!(
+                    artifact_id = artifact.id,
+                    error = %format!("{error:#}"),
+                    "refused to clean expired artifact"
+                );
             }
         }
     }
@@ -130,7 +134,7 @@ pub async fn cleanup_expired_storage(
             }
             Err(error) => {
                 summary.failures += 1;
-                tracing::error!(cache_id = cache.id, %error, "refused to clean expired cache");
+                tracing::error!(cache_id = cache.id, error = %format!("{error:#}"), "refused to clean expired cache");
             }
         }
     }
@@ -181,7 +185,7 @@ pub async fn run_cleanup_loop(state: AppState, mut shutdown_rx: tokio::sync::wat
                 )
             }
             Ok(_) => {}
-            Err(error) => tracing::error!(%error, "CI retention cleanup failed"),
+            Err(error) => tracing::error!(error = %format!("{error:#}"), "CI retention cleanup failed"),
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
