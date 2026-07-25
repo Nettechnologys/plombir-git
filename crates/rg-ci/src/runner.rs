@@ -492,9 +492,17 @@ impl PipelineRunner {
             .job_environment(ci_job_token.as_deref(), variables)
             .await?;
         let cache = cache_spec(cache_key, cache_paths, &job_environment)?;
+        // A cache failure never fails the job, so the server log is the only
+        // place it would otherwise appear — and the person who has to act on it
+        // is reading the job log, not the server's. Collected here and appended
+        // to the job output below.
+        let mut cache_notices: Vec<String> = Vec::new();
         if let Some((key, _)) = &cache {
             if let Err(error) = self.restore_cache(key).await {
-                tracing::warn!(job_id, %error, "CI cache restore failed; continuing without cache");
+                tracing::warn!(job_id, error = %format!("{error:#}"), "CI cache restore failed; continuing without cache");
+                cache_notices.push(format!(
+                    "CI cache restore failed; continuing without cache: {error:#}"
+                ));
             }
         }
 
@@ -558,10 +566,14 @@ impl PipelineRunner {
         };
         if let (Ok((0, _)), Some((key, paths))) = (&result, &cache) {
             if let Err(error) = self.save_cache(key, paths).await {
-                tracing::warn!(job_id, %error, "CI cache save failed; job remains successful");
+                tracing::warn!(job_id, error = %format!("{error:#}"), "CI cache save failed; job remains successful");
+                cache_notices.push(format!(
+                    "CI cache save failed; job remains successful: {error:#}"
+                ));
             }
         }
         result.map(|(code, log)| {
+            let log = append_job_notices(log, &cache_notices);
             (
                 code,
                 rg_core::auth::encryption::mask_values(&log, &secret_values),
@@ -832,10 +844,25 @@ impl PipelineRunner {
         let workspace = self.workspace_path();
         tokio::task::spawn_blocking(move || -> Result<()> {
             if workspace.exists() {
-                std::fs::remove_dir_all(&workspace).context("remove stale CI workspace")?;
+                std::fs::remove_dir_all(&workspace).with_context(|| {
+                    format!(
+                        "failed to remove stale CI workspace `{}`",
+                        workspace.display()
+                    )
+                })?;
             }
             if let Some(parent) = workspace.parent() {
-                std::fs::create_dir_all(parent).context("create CI workspace parent")?;
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    anyhow::anyhow!(
+                        "{}",
+                        rg_core::platform::fs::describe_path_error(
+                            "CI workspace parent directory",
+                            parent,
+                            &error,
+                            WORKSPACE_DIR_HINT,
+                        )
+                    )
+                })?;
             }
             let gateway = rg_git::cli_gateway::global_gateway()
                 .as_ref()
@@ -875,7 +902,9 @@ impl PipelineRunner {
                 Some(&repo_path),
             )?;
             if !output.success() && workspace.exists() {
-                std::fs::remove_dir_all(&workspace).context("remove CI workspace")?;
+                std::fs::remove_dir_all(&workspace).with_context(|| {
+                    format!("failed to remove CI workspace `{}`", workspace.display())
+                })?;
             }
             Ok(())
         })
@@ -908,7 +937,7 @@ impl PipelineRunner {
                 .await?;
         if let Some(entry) = &existing {
             if entry.expires_at <= chrono::Utc::now() {
-                let _ = std::fs::remove_file(&archive);
+                remove_cache_archive(&archive, "the cache entry expired");
                 rg_db::ops::ci_retention_ops::delete_cache_entry(&self.db, entry.id).await?;
                 return Ok(());
             }
@@ -916,12 +945,15 @@ impl PipelineRunner {
         if !archive.exists() {
             return Ok(());
         }
-        let size = std::fs::metadata(&archive)?.len() as i64;
+        let size = std::fs::metadata(&archive)
+            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?
+            .len() as i64;
         // Integrity: verify the on-disk archive against the digest recorded when
         // it was saved before unpacking it into the workspace — a poisoned or
         // corrupted cache must never inject files into the build. Legacy entries
         // carry no digest and are restored without this guard.
-        let digest = hash_archive(&archive)?;
+        let digest = hash_archive(&archive)
+            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
         if let Some(expected) = existing.as_ref().and_then(|e| e.sha256.as_deref()) {
             if digest != expected {
                 anyhow::bail!(
@@ -929,9 +961,18 @@ impl PipelineRunner {
                 );
             }
         }
-        tar::Archive::new(std::fs::File::open(&archive)?)
-            .unpack(self.workspace_path())
-            .context("unpack CI cache")?;
+        let workspace = self.workspace_path();
+        let file = std::fs::File::open(&archive)
+            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
+        tar::Archive::new(file)
+            .unpack(&workspace)
+            .with_context(|| {
+                format!(
+                    "failed to unpack CI cache archive `{}` into workspace `{}`",
+                    archive.display(),
+                    workspace.display()
+                )
+            })?;
         rg_db::ops::ci_retention_ops::upsert_cache_entry(
             &self.db,
             self.repo_id,
@@ -948,24 +989,49 @@ impl PipelineRunner {
     async fn save_cache(&self, key: &str, paths: &[String]) -> Result<()> {
         let archive = self.cache_archive_path(key);
         if let Some(parent) = archive.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| cache_path_error("CI cache directory", parent, &error))?;
         }
         let temporary = archive.with_extension("tar.tmp");
-        let file = std::fs::File::create(&temporary)?;
+        let file = std::fs::File::create(&temporary)
+            .map_err(|error| cache_path_error("CI cache archive", &temporary, &error))?;
         let mut builder = tar::Builder::new(file);
         let workspace = self.workspace_path();
         for path in paths {
             let source = workspace.join(path);
             if source.is_dir() {
-                builder.append_dir_all(path, &source)?;
+                builder.append_dir_all(path, &source).with_context(|| {
+                    format!(
+                        "failed to add directory `{}` to CI cache archive `{}`",
+                        source.display(),
+                        temporary.display()
+                    )
+                })?;
             } else if source.is_file() {
-                builder.append_path_with_name(&source, path)?;
+                builder
+                    .append_path_with_name(&source, path)
+                    .with_context(|| {
+                        format!(
+                            "failed to add file `{}` to CI cache archive `{}`",
+                            source.display(),
+                            temporary.display()
+                        )
+                    })?;
             }
         }
-        builder.finish()?;
-        std::fs::rename(temporary, &archive)?;
-        let size = std::fs::metadata(&archive)?.len() as i64;
-        let digest = hash_archive(&archive)?;
+        builder.finish().with_context(|| {
+            format!(
+                "failed to finalize CI cache archive `{}`",
+                temporary.display()
+            )
+        })?;
+        std::fs::rename(&temporary, &archive)
+            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
+        let size = std::fs::metadata(&archive)
+            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?
+            .len() as i64;
+        let digest = hash_archive(&archive)
+            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await?;
         if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
             &self.db,
@@ -978,11 +1044,81 @@ impl PipelineRunner {
         )
         .await
         {
-            let _ = std::fs::remove_file(&archive);
+            remove_cache_archive(&archive, "its database entry could not be written");
             return Err(error);
         }
         Ok(())
     }
+}
+
+/// Where a CI cache archive lives and what has to be true about it.
+///
+/// The directory is derived from the repository storage root, so a bind-mount
+/// owned by another uid — the standard container deployment — takes the cache
+/// down with it while the job log only ever saw `os error 13`.
+const CACHE_DIR_HINT: &str =
+    "CI cache archives live in `_ci_cache/<repo_id>/` next to the repository storage root; \
+     that directory must be writable by the user running forgekeep";
+
+/// Where a CI workspace lives, for the same reason as [`CACHE_DIR_HINT`].
+const WORKSPACE_DIR_HINT: &str =
+    "CI workspaces live in `_ci_workspaces/<repo_id>/` next to the repository storage root; \
+     that directory must be writable by the user running forgekeep";
+
+/// One actionable line for a filesystem failure on a CI cache path.
+///
+/// The path is computed internally — the archive is named after a SHA-256 of
+/// the cache key — so a bare `io::Error` reaching the job log names neither the
+/// file that failed nor the directory an operator would have to fix.
+fn cache_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}",
+        rg_core::platform::fs::describe_path_error(what, path, error, CACHE_DIR_HINT)
+    )
+}
+
+/// Best-effort removal of a cache archive we no longer want on disk.
+///
+/// The caller is already on an error path, so a failure here must not replace
+/// the original error — but swallowing it silently is how an orphaned archive
+/// keeps occupying the cache quota with nothing in the log to explain it.
+fn remove_cache_archive(archive: &std::path::Path, why: &str) {
+    if let Err(error) = std::fs::remove_file(archive) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %archive.display(),
+                %error,
+                "failed to remove CI cache archive after {why}; the orphaned file stays on disk \
+                 until cache retention reclaims it"
+            );
+        }
+    }
+}
+
+/// Prefix used for runner-generated lines so they are distinguishable from the
+/// job script's own output.
+const JOB_NOTICE_PREFIX: &str = "[forgekeep] ";
+
+/// Append runner diagnostics to a job's captured output.
+///
+/// Notices are multi-line (an actionable path error carries a `hint:` line), so
+/// every line is prefixed individually — a diagnostic that blends into script
+/// output is one nobody reads.
+fn append_job_notices(mut log: String, notices: &[String]) -> String {
+    if notices.is_empty() {
+        return log;
+    }
+    if !log.is_empty() && !log.ends_with('\n') {
+        log.push('\n');
+    }
+    for notice in notices {
+        for line in notice.lines() {
+            log.push_str(JOB_NOTICE_PREFIX);
+            log.push_str(line);
+            log.push('\n');
+        }
+    }
+    log
 }
 
 fn cache_key_hash(key: &str) -> String {
@@ -1105,12 +1241,12 @@ mod tests {
         assert!(cache_spec(Some("bad"), Some(r#"["../outside"]"#), &env).is_err());
     }
 
-    #[tokio::test]
-    async fn repository_scoped_cache_round_trips_workspace_paths() {
-        let temp = tempfile::tempdir().unwrap();
+    /// A `PipelineRunner` wired to a migrated throwaway database and a repo
+    /// path under `root`, so cache tests only spell out what they exercise.
+    async fn cache_runner(root: &std::path::Path) -> PipelineRunner {
         let db = rg_db::connect(&format!(
             "sqlite://{}?mode=rwc",
-            temp.path().join("cache.db").display()
+            root.join("cache.db").display()
         ))
         .await
         .unwrap();
@@ -1146,10 +1282,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let repo_path = temp.path().join("repos/owner/repo.git");
+        let repo_path = root.join("repos/owner/repo.git");
         std::fs::create_dir_all(&repo_path).unwrap();
         let mut runner = PipelineRunner::new_local_only(db, &repo_path, 77);
         runner.set_repo_id(repository.id);
+        runner
+    }
+
+    #[tokio::test]
+    async fn repository_scoped_cache_round_trips_workspace_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = cache_runner(temp.path()).await;
         let workspace = runner.workspace_path();
         std::fs::create_dir_all(workspace.join("target")).unwrap();
         std::fs::write(workspace.join("target/cache.txt"), "cached").unwrap();
@@ -1164,6 +1307,53 @@ mod tests {
             std::fs::read_to_string(workspace.join("target/cache.txt")).unwrap(),
             "cached"
         );
+    }
+
+    /// The archive path is a SHA-256 of the cache key under a directory derived
+    /// from the repository storage root — nothing an operator can guess. A save
+    /// failure that only says `Permission denied (os error 13)` names neither
+    /// the file nor the directory to fix, which is exactly what a bind-mounted
+    /// repo root owned by another uid produces.
+    #[tokio::test]
+    async fn cache_save_failure_names_the_archive_directory_and_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = cache_runner(temp.path()).await;
+        let archive = runner.cache_archive_path("build-main");
+        let archive_dir = archive.parent().unwrap().to_path_buf();
+        // A regular file where `_ci_cache/` belongs fails the directory
+        // creation deterministically, independent of the uid the tests run as.
+        std::fs::write(archive_dir.parent().unwrap(), "not a directory").unwrap();
+
+        let error = runner
+            .save_cache("build-main", &["target".into()])
+            .await
+            .expect_err("save must fail when the cache directory cannot be created");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&archive_dir.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("CI cache directory"), "{rendered}");
+        assert!(rendered.contains("_ci_cache/<repo_id>/"), "{rendered}");
+    }
+
+    /// A cache failure never fails the job, so the job log is the only place
+    /// its author will ever see it — the server log belongs to the operator.
+    #[test]
+    fn job_notices_are_appended_to_the_log_line_by_line() {
+        let log = append_job_notices(
+            "building".into(),
+            &["CI cache save failed: /srv/_ci_cache/1/ab.tar\n  hint: chown it".into()],
+        );
+
+        assert_eq!(
+            log,
+            "building\n\
+             [forgekeep] CI cache save failed: /srv/_ci_cache/1/ab.tar\n\
+             [forgekeep]   hint: chown it\n"
+        );
+        assert_eq!(append_job_notices("kept".into(), &[]), "kept");
     }
 
     #[tokio::test]
