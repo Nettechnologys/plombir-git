@@ -159,6 +159,19 @@ home = "0.5"
 # DB migration
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls"] }
 
+# Argon2id at the production parameters (m=19 MiB, t=2) is deliberately
+# expensive, and an unoptimized build makes it roughly an order of magnitude
+# worse — every test that registers or logs in a user pays it, several times.
+# Optimizing just the two hashing crates keeps the test suite honest (same
+# algorithm, same cost parameters as production; nothing about auth changes)
+# while taking the debug-build penalty off the critical path. They are stable
+# dependencies, so this costs one rebuild, not a slower edit loop.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = true
 strip = true
