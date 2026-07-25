@@ -1,6 +1,7 @@
 //! Durable Issue, pull-request and comment attachments.
 
 use crate::blob_storage::{BlobKey, BlobStorage};
+use crate::error::{invalid_request, not_found};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_db::entities::attachment::{ActiveModel, Model as Attachment};
@@ -120,7 +121,7 @@ pub async fn create_attachment_from_file(
 ) -> Result<Attachment> {
     let actual_size = tokio::fs::metadata(source)
         .await
-        .context("failed to inspect attachment upload")?
+        .with_context(|| format!("failed to inspect attachment upload {}", source.display()))?
         .len();
     if actual_size != size {
         anyhow::bail!("attachment upload size changed before storage");
@@ -179,15 +180,16 @@ async fn prepare_attachment(
 ) -> Result<PreparedAttachment> {
     let filename = validate_filename(filename)?;
     if size == 0 {
-        anyhow::bail!("attachment cannot be empty");
+        return Err(invalid_request("attachment cannot be empty"));
     }
     if size > MAX_ATTACHMENT_SIZE as u64 {
-        anyhow::bail!("attachment exceeds the 100 MiB file limit");
+        return Err(invalid_request("attachment exceeds the 100 MiB file limit"));
     }
-    let size = i64::try_from(size).context("attachment size is too large")?;
+    let size = i64::try_from(size)
+        .map_err(|_| invalid_request("attachment exceeds the 100 MiB file limit"))?;
     let current_size = rg_db::ops::attachment_ops::repo_size(db, repo_id).await?;
     if current_size.saturating_add(size) > DEFAULT_REPO_ATTACHMENT_QUOTA {
-        anyhow::bail!("repository attachment quota exceeded");
+        return Err(invalid_request("repository attachment quota exceeded"));
     }
 
     let uuid = Uuid::new_v4().to_string();
@@ -283,11 +285,14 @@ pub async fn get_attachment(
     target: AttachmentTarget,
     attachment_id: i64,
 ) -> Result<Attachment> {
+    // Typed, not a message: the handlers used to sniff `"not found"` out of the
+    // rendered string, which quietly answers 404 to any other error whose text
+    // happens to contain those words.
     let attachment = rg_db::ops::attachment_ops::find_by_id(db, attachment_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("attachment not found"))?;
+        .ok_or_else(|| not_found("attachment"))?;
     if attachment.repo_id != repo_id || !target.matches(&attachment) {
-        anyhow::bail!("attachment not found");
+        return Err(not_found("attachment"));
     }
     Ok(attachment)
 }
@@ -375,20 +380,26 @@ impl AttachmentBackup {
     }
 }
 
+/// Every rejection here is the uploader's to fix, so each one is typed as such:
+/// the handler classifies on [`InvalidRequest`] rather than on "the service
+/// returned an error", which is what used to make an unwritable blob store look
+/// like a bad filename.
 fn validate_filename(filename: &str) -> Result<String> {
     let filename = filename.trim();
     if filename.is_empty() || filename.len() > 255 || filename.chars().any(char::is_control) {
-        anyhow::bail!("invalid attachment filename");
+        return Err(invalid_request("invalid attachment filename"));
     }
     if filename.contains('/') || filename.contains('\\') || matches!(filename, "." | "..") {
-        anyhow::bail!("attachment filename must not contain a path");
+        return Err(invalid_request(
+            "attachment filename must not contain a path",
+        ));
     }
     let extension = filename
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
         .unwrap_or_default();
     if !ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
-        anyhow::bail!("attachment file type is not allowed");
+        return Err(invalid_request("attachment file type is not allowed"));
     }
     Ok(filename.to_string())
 }

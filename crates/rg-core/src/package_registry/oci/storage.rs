@@ -163,6 +163,15 @@ impl OciStorage {
         Ok(key.to_string())
     }
 
+    /// Read a blob's bytes, falling back to the legacy on-disk layout.
+    ///
+    /// "The registry does not have this blob" is typed
+    /// ([`crate::error::NotFound`]) and everything else is left as a plain
+    /// error, because the caller has to answer `404 BLOB_UNKNOWN` to the first
+    /// and `500` to the second. Flattened together they used to be one
+    /// `anyhow::Error`, and `get_blob` answered `BLOB_UNKNOWN` to both — so an
+    /// unreadable blob store told `docker pull` the image referenced a layer
+    /// that does not exist.
     pub async fn read_blob(
         &self,
         owner: &str,
@@ -173,12 +182,16 @@ impl OciStorage {
         match self.backend.get(&key).await {
             Ok(data) => Ok(data),
             Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
-                let path = self
-                    .legacy_blob_path(owner, repo, digest)
-                    .ok_or_else(|| anyhow::anyhow!("blob not found: {digest}"))?;
-                tokio::fs::read(&path)
-                    .await
-                    .map_err(|error| upload_path_error("legacy OCI blob", &path, &error))
+                let Some(path) = self.legacy_blob_path(owner, repo, digest) else {
+                    return Err(crate::error::not_found("blob"));
+                };
+                tokio::fs::read(&path).await.map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        crate::error::not_found("blob")
+                    } else {
+                        upload_path_error("legacy OCI blob", &path, &error)
+                    }
+                })
             }
             Err(error) => Err(error.into()),
         }
@@ -255,12 +268,17 @@ impl OciStorage {
         match self.backend.get(&key).await {
             Ok(data) => Ok(data),
             Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
-                let path = self
-                    .legacy_manifest_path(owner, repo, digest)
-                    .ok_or_else(|| anyhow::anyhow!("manifest not found: {digest}"))?;
-                tokio::fs::read(&path)
-                    .await
-                    .map_err(|error| upload_path_error("legacy OCI manifest", &path, &error))
+                // Same split as `read_blob`: absent is a 404, unreadable is ours.
+                let Some(path) = self.legacy_manifest_path(owner, repo, digest) else {
+                    return Err(crate::error::not_found("manifest"));
+                };
+                tokio::fs::read(&path).await.map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        crate::error::not_found("manifest")
+                    } else {
+                        upload_path_error("legacy OCI manifest", &path, &error)
+                    }
+                })
             }
             Err(error) => Err(error.into()),
         }

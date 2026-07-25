@@ -181,6 +181,21 @@ impl From<anyhow::Error> for AppError {
             return Self::NotFound(not_found.to_string());
         }
 
+        // The mirror of the branch above, for the client's half of the split: a
+        // service that rejected the *request* carries
+        // `rg_core::error::InvalidRequest`, and only that may become a 400. An
+        // upload handler cannot tell "this file type is not allowed" from "the
+        // blob store refused the write" once both are flattened into an
+        // `anyhow::Error`, and calling the second one a bad request stops the
+        // client from ever retrying a failure it did not cause.
+        //
+        // `to_string()` (not `{:#}`) for the same reason as `NotFound`: the
+        // type's own `Display` is the fixed rule text that reaches the client,
+        // with no path or errno from the `.context(…)` layers above it.
+        if let Some(invalid) = e.downcast_ref::<rg_core::error::InvalidRequest>() {
+            return Self::BadRequest(invalid.to_string());
+        }
+
         // H-05: Log the full error for operators, store a generic message internally.
         // The IntoResponse impl will also sanitize the client-facing message.
         //

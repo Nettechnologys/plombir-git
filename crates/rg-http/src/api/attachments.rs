@@ -492,7 +492,13 @@ async fn create(
             Json(response(owner, repo_name, kind, target_id, attachment)),
         )
             .into_response(),
-        Err(error) => AppError::bad_request(error).into_response(),
+        // Publishing the staged file is where the blob store, the quota query
+        // and the filename rules all fail, and only the last of those is the
+        // uploader's fault. `AppError::from` classifies on the typed
+        // `InvalidRequest` / `NotFound` the service attaches, so an unwritable
+        // `repo_root` is a retryable 500 instead of a 400 nobody retries — the
+        // staging half of this handler already made that distinction.
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -517,9 +523,9 @@ async fn download(
             Ok(response) => response,
             Err(error) => AppError::from(error).into_response(),
         },
-        Err(error) if error.to_string().contains("not found") => {
-            AppError::not_found("attachment not found").into_response()
-        }
+        // `get_attachment` carries `rg_core::error::NotFound` for a row that
+        // genuinely is not there, so `AppError::from` produces the same 404
+        // without matching on the rendered message.
         Err(error) => AppError::from(error).into_response(),
     }
 }
@@ -608,9 +614,6 @@ async fn delete(
     .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) if error.to_string().contains("not found") => {
-            AppError::not_found("attachment not found").into_response()
-        }
         Err(error) => AppError::from(error).into_response(),
     }
 }

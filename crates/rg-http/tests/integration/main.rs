@@ -57,5 +57,6 @@ mod runner_auth_tests;
 mod runner_workspace_tests;
 mod ssh_key_tests;
 mod time_tracking_tests;
+mod upload_failure_status_tests;
 mod webhook_external_hmac_tests;
 mod wiki_tests;

@@ -220,7 +220,10 @@ pub async fn get_release(
 
     match rg_core::release::service::get_release(&state.db, id).await {
         Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
-        Err(_) => AppError::not_found("release not found").into_response(),
+        // The service marks a genuine miss with `rg_core::error::NotFound`, so
+        // this still answers 404 for a deleted release — but a database outage
+        // now surfaces as 503 instead of telling the client the release is gone.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -486,7 +489,12 @@ pub async fn upload_asset(
     .await
     {
         Ok(asset) => (StatusCode::CREATED, Json(serde_json::json!(asset))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        // Everything the service can fail on lands here: a missing release, a
+        // dropped database connection, and the blob-store write under
+        // `repo_root`. Only the first is about the request, so classify on the
+        // typed error instead of blaming the uploader for all three — a `400`
+        // is the one answer a client will never retry.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -566,7 +574,7 @@ pub async fn get_asset(
 
     match rg_core::release::service::get_asset(&state.db, asset_id).await {
         Ok(asset) => (StatusCode::OK, Json(serde_json::json!(asset))).into_response(),
-        Err(_) => AppError::not_found("asset not found").into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -662,7 +670,11 @@ pub async fn download_asset(
             )
                 .into_response()
         }
-        Err(e) => AppError::not_found(e).into_response(),
+        // The read half of the same split: a missing asset row is a 404, but an
+        // unreadable blob store is not — and reporting it as one both hides the
+        // outage and (since a 404 body is not sanitized) hands the client the
+        // storage path from the error text.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -736,7 +748,10 @@ pub async fn sign_asset_attestation(
         Ok((_asset, envelope)) => {
             (StatusCode::CREATED, Json(serde_json::json!(envelope))).into_response()
         }
-        Err(e) => AppError::bad_request(e).into_response(),
+        // A legacy asset with no recorded digest is the only client-fixable
+        // failure here (typed `InvalidRequest`); a missing asset is a 404 and a
+        // dropped connection a 503.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -786,7 +801,7 @@ pub async fn get_asset_attestation(
     match rg_core::release::service::get_asset_attestation(&state.db, asset_id).await {
         Ok(Some(envelope)) => (StatusCode::OK, Json(serde_json::json!(envelope))).into_response(),
         Ok(None) => AppError::not_found("asset has no attestation").into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -845,7 +860,10 @@ pub async fn verify_asset_attestation(
     .await
     {
         Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))).into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        // Verification reads the asset's current bytes, so an unreadable blob
+        // store used to be reported as "no such attestation" — with the storage
+        // path in the (unsanitized) 404 body.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

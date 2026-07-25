@@ -99,3 +99,42 @@ impl NotFound {
         Self { resource }
     }
 }
+
+/// Shorthand for the `anyhow` form of [`NotFound`].
+pub fn not_found(resource: &'static str) -> anyhow::Error {
+    anyhow::Error::new(NotFound::new(resource))
+}
+
+/// The request itself is wrong, and no retry of it can succeed.
+///
+/// The mirror image of [`NotFound`], for the other direction of the same
+/// mistake. A service that validates its input and then writes to a blob store
+/// fails for two unrelated reasons — "this file type is not allowed" and "the
+/// storage root is not writable" — and flattened into an `anyhow::Error` the
+/// two look alike. Handlers papered over that by answering `400` to both, which
+/// tells the client to fix a request that was never wrong and hides a broken
+/// `repo_root` behind the uploader's own file. Only an error carrying this type
+/// may become a `400`; anything else is ours, and stays a 5xx the client is
+/// allowed to retry.
+///
+/// Like [`NotFound`], the rendered message reaches the client verbatim, so it
+/// must stay a fixed description of the rule that was broken — never a
+/// filesystem path, an errno or a `db: …` chain (H-05).
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct InvalidRequest {
+    pub message: String,
+}
+
+impl InvalidRequest {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Shorthand for the `anyhow` form of [`InvalidRequest`].
+pub fn invalid_request(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidRequest::new(message))
+}

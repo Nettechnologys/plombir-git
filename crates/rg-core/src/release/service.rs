@@ -87,10 +87,14 @@ pub async fn list_releases(
 }
 
 /// Get a release by ID.
+///
+/// The miss is typed (`rg_core::error::NotFound`) so the HTTP layer can tell it
+/// apart from a failed lookup: a database outage here must not be reported to
+/// the client as "the release was deleted".
 pub async fn get_release(db: &DatabaseConnection, id: i64) -> Result<Release> {
     rg_db::ops::release_ops::find_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("release not found"))
+        .ok_or_else(|| crate::error::not_found("release"))
 }
 
 /// Update a release.
@@ -185,7 +189,16 @@ pub async fn upload_asset(
     };
     let asset = rg_db::ops::release_ops::create_asset(db, model).await?;
 
-    let key = asset_blob_key(owner, repo_name, &asset)?;
+    // The key is derived from the row that was just inserted, so a failure here
+    // leaves the same orphan metadata row a failed `put` would — roll it back on
+    // both paths, not only the one that was noticed first.
+    let key = match asset_blob_key(owner, repo_name, &asset) {
+        Ok(key) => key,
+        Err(error) => {
+            let _ = rg_db::ops::release_ops::delete_asset_by_id(db, asset.id).await;
+            return Err(error);
+        }
+    };
     if let Err(error) = storage.put(&key, data).await {
         let _ = rg_db::ops::release_ops::delete_asset_by_id(db, asset.id).await;
         return Err(error).context("failed to write release asset");
@@ -209,7 +222,7 @@ pub async fn download_asset(
 ) -> Result<(Asset, Vec<u8>)> {
     let asset = rg_db::ops::release_ops::find_asset_by_id(db, asset_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("asset not found"))?;
+        .ok_or_else(|| crate::error::not_found("asset"))?;
 
     // Increment download count
     rg_db::ops::release_ops::increment_download_count(db, asset_id).await?;
@@ -291,7 +304,9 @@ pub async fn sign_asset_attestation(
 ) -> Result<(Asset, crate::attestation::Envelope)> {
     let asset = get_asset(db, asset_id).await?;
     let sha256 = asset.sha256.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("asset has no recorded sha256 digest; re-upload to enable attestation")
+        crate::error::invalid_request(
+            "asset has no recorded sha256 digest; re-upload to enable attestation",
+        )
     })?;
 
     let predicate_extra = serde_json::json!({
@@ -344,7 +359,7 @@ pub async fn verify_asset_attestation(
     let json = asset
         .attestation
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("asset has no attestation"))?;
+        .ok_or_else(|| crate::error::not_found("attestation"))?;
     let envelope: crate::attestation::Envelope =
         serde_json::from_str(json).context("parse stored attestation envelope")?;
 
@@ -374,7 +389,7 @@ pub async fn verify_asset_attestation(
 pub async fn get_asset(db: &DatabaseConnection, asset_id: i64) -> Result<Asset> {
     rg_db::ops::release_ops::find_asset_by_id(db, asset_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("asset not found"))
+        .ok_or_else(|| crate::error::not_found("asset"))
 }
 
 /// List assets for a release.

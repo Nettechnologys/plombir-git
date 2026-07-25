@@ -874,7 +874,15 @@ pub async fn get_blob(
                 )
                     .into_response()
             }
-            Err(_) => oci_not_found(error_codes::BLOB_UNKNOWN, "blob not found"),
+            // Only a blob the registry genuinely does not have is BLOB_UNKNOWN.
+            // Discarding the error made a blob store that is present but
+            // unreachable indistinguishable from a missing layer, and `docker
+            // pull` reports that as a broken image — sending the operator to
+            // inspect the manifest while the storage is what is down.
+            Err(error) if error.downcast_ref::<rg_core::error::NotFound>().is_some() => {
+                oci_not_found(error_codes::BLOB_UNKNOWN, "blob not found")
+            }
+            Err(error) => oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
         },
         Err(error) => oci_err(
             StatusCode::BAD_REQUEST,
@@ -965,14 +973,22 @@ async fn handle_mount(
         return resp;
     }
 
-    // Check source blob exists
-    if !state
+    // Check source blob exists. A backend that cannot answer is not the same as
+    // an answer of "no": `unwrap_or(false)` turned an unreachable blob store
+    // into a 404, which tells the pushing client the source image is missing
+    // layers. `head_blob` and `put_manifest` already keep the two apart.
+    match state
         .oci_storage
         .blob_exists(from_owner, from_repo, mount_digest)
         .await
-        .unwrap_or(false)
     {
-        return oci_not_found(error_codes::BLOB_UNKNOWN, "mount source blob not found");
+        Ok(true) => {}
+        Ok(false) => {
+            return oci_not_found(error_codes::BLOB_UNKNOWN, "mount source blob not found");
+        }
+        Err(error) => {
+            return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"));
+        }
     }
 
     // Copy blob file via hardlink (or fallback to streaming copy) — avoids memory copy
