@@ -258,7 +258,9 @@ pub(crate) async fn cmd_run(
                             -1,
                         )
                         .await;
-                        let _ = tokio::fs::remove_dir_all(&workspace).await;
+                        if let Err(error) = tokio::fs::remove_dir_all(&workspace).await {
+                            tracing::warn!(job_id = job.job_id, %error, "failed to clean runner workspace");
+                        }
                         continue;
                     }
                 };

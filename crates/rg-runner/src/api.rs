@@ -92,6 +92,149 @@ pub(crate) struct PollJobResponse {
 /// survive a server that completes the handshake but then hangs the response.
 const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// A fire-and-forget report from the runner to the server.
+///
+/// These calls must not abort the runner — it has a job in hand and the server
+/// is the unreliable party — but discarding the outcome hides *both* halves of a
+/// failure: the transport error and a non-2xx answer (expired token, deleted
+/// runner, 413 on an oversized log). What the operator sees instead is a job
+/// stuck in `running`, an empty log, or a runner that went `offline` while it
+/// kept building. Each report therefore carries the consequence of losing it,
+/// and that consequence goes into the warning.
+#[derive(Clone, Copy)]
+struct Report {
+    /// Short call name, used as the subject of the log line.
+    call: &'static str,
+    /// What the operator silently loses when this report never lands.
+    consequence: &'static str,
+}
+
+const HEARTBEAT_REPORT: Report = Report {
+    call: "heartbeat",
+    consequence: "the server will mark this runner offline while it keeps running jobs",
+};
+
+const START_JOB_REPORT: Report = Report {
+    call: "job start",
+    consequence: "the job stays pending on the server although the runner is already executing it",
+};
+
+const UPLOAD_LOG_REPORT: Report = Report {
+    call: "job log upload",
+    consequence: "the job output is lost — the job page will show no log at all",
+};
+
+const FINISH_JOB_REPORT: Report = Report {
+    call: "job finish",
+    consequence: "the job stays 'running' on the server forever",
+};
+
+/// Attempts for [`finish_job`] — the one report whose loss corrupts server state
+/// irreversibly (nothing else ever moves that job out of `running`).
+const FINISH_JOB_ATTEMPTS: u32 = 3;
+
+/// Backoff before the first retry of [`finish_job`]; doubled on each further
+/// attempt. Kept short: the runner is holding up its next poll while it retries.
+const FINISH_JOB_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Longest response body echoed into a warning, in characters. A 5xx from a
+/// reverse proxy can be a full HTML page; the first few hundred characters
+/// identify it without flooding the runner's log.
+const MAX_LOGGED_BODY: usize = 512;
+
+/// Why a fire-and-forget call did not land.
+struct SendFailure {
+    /// Human-readable cause: transport error chain, or status + response body.
+    detail: String,
+    /// Whether repeating the call could plausibly succeed. Transport errors and
+    /// 5xx are transient; a 4xx (expired token, unknown runner, oversized log)
+    /// answers the same way no matter how often it is asked.
+    retryable: bool,
+}
+
+/// Flatten an error and its `source` chain into a single line.
+///
+/// `reqwest::Error`'s own `Display` is deliberately generic ("error sending
+/// request for url (…)"); the actionable reason — connection refused, DNS
+/// failure, TLS handshake rejected — lives one or two `source()` hops down.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut chain = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    chain
+}
+
+/// Trim a response body down to something safe to put in a log line.
+fn body_excerpt(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return "<empty body>".to_string();
+    }
+    let mut excerpt: String = body.chars().take(MAX_LOGGED_BODY).collect();
+    if excerpt.len() < body.len() {
+        excerpt.push_str("… (truncated)");
+    }
+    excerpt
+}
+
+/// Perform a request and describe why it failed, or `None` when it landed.
+async fn describe_send_failure(request: reqwest::RequestBuilder) -> Option<SendFailure> {
+    match request.send().await {
+        Ok(response) if response.status().is_success() => None,
+        Ok(response) => {
+            let status = response.status();
+            // Read the body before formatting: `text()` consumes the response.
+            let body = response.text().await.unwrap_or_default();
+            Some(SendFailure {
+                detail: format!("server answered {status}: {}", body_excerpt(&body)),
+                retryable: status.is_server_error(),
+            })
+        }
+        Err(error) => Some(SendFailure {
+            detail: format!("transport error: {}", error_chain(&error)),
+            retryable: true,
+        }),
+    }
+}
+
+/// Log a lost report at warn level, naming the runner, the job and the
+/// consequence. Never propagates — the caller stays fail-soft by design.
+fn warn_report_lost(report: Report, runner_id: i64, job_id: Option<i64>, failure: &SendFailure) {
+    match job_id {
+        Some(job_id) => tracing::warn!(
+            runner_id,
+            job_id,
+            "{} report failed: {}; {}",
+            report.call,
+            failure.detail,
+            report.consequence
+        ),
+        None => tracing::warn!(
+            runner_id,
+            "{} report failed: {}; {}",
+            report.call,
+            failure.detail,
+            report.consequence
+        ),
+    }
+}
+
+/// Send a fire-and-forget report, logging (never propagating) a failure.
+async fn send_report(
+    request: reqwest::RequestBuilder,
+    report: Report,
+    runner_id: i64,
+    job_id: Option<i64>,
+) {
+    if let Some(failure) = describe_send_failure(request).await {
+        warn_report_lost(report, runner_id, job_id, &failure);
+    }
+}
+
 /// Send a heartbeat to keep the runner marked as online.
 pub(crate) async fn send_heartbeat(
     client: &reqwest::Client,
@@ -99,12 +242,11 @@ pub(crate) async fn send_heartbeat(
     runner_id: i64,
     token: &str,
 ) {
-    let _ = client
+    let request = client
         .post(format!("{}/api/v1/runners/{}/heartbeat", server, runner_id))
         .header("Authorization", format!("Bearer {}", token))
-        .timeout(HEARTBEAT_TIMEOUT)
-        .send()
-        .await;
+        .timeout(HEARTBEAT_TIMEOUT);
+    send_report(request, HEARTBEAT_REPORT, runner_id, None).await;
 }
 
 /// Notify the server that job execution has started.
@@ -115,14 +257,13 @@ pub(crate) async fn start_job(
     job_id: i64,
     token: &str,
 ) {
-    let _ = client
+    let request = client
         .post(format!(
             "{}/api/v1/runners/{}/jobs/{}/start",
             server, runner_id, job_id
         ))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await;
+        .header("Authorization", format!("Bearer {}", token));
+    send_report(request, START_JOB_REPORT, runner_id, Some(job_id)).await;
 }
 
 /// Upload job log output.
@@ -134,15 +275,14 @@ pub(crate) async fn upload_log(
     token: &str,
     log: &str,
 ) {
-    let _ = client
+    let request = client
         .post(format!(
             "{}/api/v1/runners/{}/jobs/{}/log",
             server, runner_id, job_id
         ))
         .header("Authorization", format!("Bearer {}", token))
-        .body(log.to_string())
-        .send()
-        .await;
+        .body(log.to_string());
+    send_report(request, UPLOAD_LOG_REPORT, runner_id, Some(job_id)).await;
 }
 
 pub(crate) async fn download_workspace(
@@ -172,18 +312,40 @@ pub(crate) async fn download_workspace(
         .join("jobs")
         .join(job_id.to_string());
     let unpack_path = workspace.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        if unpack_path.exists() {
-            std::fs::remove_dir_all(&unpack_path).context("remove stale runner workspace")?;
-        }
-        std::fs::create_dir_all(&unpack_path).context("create runner workspace")?;
-        tar::Archive::new(std::io::Cursor::new(archive))
-            .unpack(&unpack_path)
-            .context("unpack runner workspace")?;
-        Ok(())
-    })
-    .await??;
+    tokio::task::spawn_blocking(move || unpack_workspace(&archive, &unpack_path)).await??;
     Ok(workspace)
+}
+
+/// Replace `unpack_path` with the contents of a workspace tar archive.
+///
+/// Every message names the path: the workspace lives under `TMPDIR`, so in a
+/// container the failure is usually "that directory is read-only / owned by
+/// another uid", and a bare `Permission denied (os error 13)` doesn't tell the
+/// operator which directory to fix — or that `TMPDIR` is the knob.
+fn unpack_workspace(archive: &[u8], unpack_path: &std::path::Path) -> Result<()> {
+    if unpack_path.exists() {
+        std::fs::remove_dir_all(unpack_path).with_context(|| {
+            format!(
+                "failed to remove stale runner workspace `{}`",
+                unpack_path.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(unpack_path).with_context(|| {
+        format!(
+            "failed to create runner workspace `{}` (set TMPDIR to a writable directory)",
+            unpack_path.display()
+        )
+    })?;
+    tar::Archive::new(std::io::Cursor::new(archive))
+        .unpack(unpack_path)
+        .with_context(|| {
+            format!(
+                "failed to unpack runner workspace into `{}`",
+                unpack_path.display()
+            )
+        })?;
+    Ok(())
 }
 
 pub(crate) async fn restore_cache(
@@ -275,6 +437,12 @@ pub(crate) async fn save_cache(
 }
 
 /// Report job completion.
+///
+/// The only report that is retried: the runner has already moved on to its next
+/// poll, and nothing else on the server ever takes the job out of `running`, so
+/// a lost finish is not eventually consistent — it is permanently wrong. Retries
+/// cover the transient half (transport error, server restarting, 5xx); a 4xx is
+/// reported once and dropped, because repeating it changes nothing.
 pub(crate) async fn finish_job(
     client: &reqwest::Client,
     server: &str,
@@ -284,13 +452,357 @@ pub(crate) async fn finish_job(
     status: &str,
     exit_code: i32,
 ) {
-    let _ = client
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/finish",
-            server, runner_id, job_id
-        ))
-        .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({"status": status, "exit_code": exit_code}))
-        .send()
+    let url = format!(
+        "{}/api/v1/runners/{}/jobs/{}/finish",
+        server, runner_id, job_id
+    );
+    let payload = serde_json::json!({"status": status, "exit_code": exit_code});
+    let mut backoff = FINISH_JOB_RETRY_BACKOFF;
+
+    for attempt in 1..=FINISH_JOB_ATTEMPTS {
+        let request = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&payload);
+        let Some(failure) = describe_send_failure(request).await else {
+            return;
+        };
+        if !failure.retryable || attempt == FINISH_JOB_ATTEMPTS {
+            warn_report_lost(FINISH_JOB_REPORT, runner_id, Some(job_id), &failure);
+            return;
+        }
+        tracing::warn!(
+            runner_id,
+            job_id,
+            attempt,
+            attempts = FINISH_JOB_ATTEMPTS,
+            "{} report failed: {}; retrying in {:?}",
+            FINISH_JOB_REPORT.call,
+            failure.detail,
+            backoff
+        );
+        tokio::time::sleep(backoff).await;
+        backoff *= 2;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{
+        body_excerpt, error_chain, finish_job, send_heartbeat, start_job, unpack_workspace,
+        upload_log, FINISH_JOB_ATTEMPTS, MAX_LOGGED_BODY,
+    };
+
+    /// Sink that keeps every formatted log line so a test can assert on what the
+    /// operator would actually have seen.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install a scoped subscriber capturing warnings on this thread. The guard
+    /// must stay alive for the whole test (`#[tokio::test]` is single-threaded,
+    /// so the awaited code runs on the same thread).
+    fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    struct FakeServer {
+        url: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl FakeServer {
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Read one HTTP request (headers plus the body it declares) off the socket,
+    /// so the client always sees a reply instead of a reset connection.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|at| at + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+            let body_len = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= header_end + body_len {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Minimal HTTP server answering every request with one canned status/body
+    /// and counting how many it served. The workspace carries no HTTP-mock
+    /// dependency, and these calls only need a socket that talks back.
+    async fn spawn_fake_server(status_line: &'static str, body: &'static str) -> FakeServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let served = Arc::clone(&served);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                tokio::spawn(async move {
+                    if read_request(&mut stream).await.is_ok() {
+                        served.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        });
+        FakeServer { url, requests }
+    }
+
+    /// A port nobody listens on — the cheapest way to provoke a transport error.
+    async fn dead_server_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    #[derive(Debug)]
+    struct Layer {
+        message: &'static str,
+        source: Option<Box<Layer>>,
+    }
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn error_chain_keeps_the_causes_a_bare_display_would_drop() {
+        let error = Layer {
+            message: "error sending request",
+            source: Some(Box::new(Layer {
+                message: "tcp connect error",
+                source: Some(Box::new(Layer {
+                    message: "connection refused",
+                    source: None,
+                })),
+            })),
+        };
+
+        assert_eq!(
+            error_chain(&error),
+            "error sending request: tcp connect error: connection refused"
+        );
+    }
+
+    #[test]
+    fn body_excerpt_names_an_empty_body_and_truncates_a_huge_one() {
+        assert_eq!(body_excerpt("   \n "), "<empty body>");
+        assert_eq!(body_excerpt("  token expired  "), "token expired");
+
+        let excerpt = body_excerpt(&"x".repeat(MAX_LOGGED_BODY * 2));
+        assert!(excerpt.ends_with("… (truncated)"), "{excerpt}");
+        assert!(excerpt.len() < MAX_LOGGED_BODY * 2, "{}", excerpt.len());
+    }
+
+    #[test]
+    fn an_uncreatable_workspace_is_reported_with_its_path_and_the_tmpdir_knob() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the parent directory should be — the same shape
+        // as an unwritable / occupied TMPDIR, without needing a hostile FS.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let unpack_path = blocker.join("jobs").join("42");
+
+        let error = unpack_workspace(b"", &unpack_path)
+            .expect_err("creating a workspace under a regular file must fail");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&unpack_path.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("TMPDIR"), "{message}");
+    }
+
+    #[test]
+    fn a_corrupt_workspace_archive_is_reported_with_the_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let unpack_path = dir.path().join("job-7");
+
+        let error = unpack_workspace(b"this is not a tar archive", &unpack_path)
+            .expect_err("a corrupt archive must not unpack");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&unpack_path.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("unpack runner workspace"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn upload_log_reports_a_rejected_upload_with_status_body_and_ids() {
+        let server =
+            spawn_fake_server("413 Payload Too Large", "log exceeds the 5 MiB limit").await;
+        let (logs, _guard) = capture_logs();
+
+        upload_log(
+            &reqwest::Client::new(),
+            &server.url,
+            7,
+            42,
+            "token",
+            "job output",
+        )
         .await;
+
+        let logs = logs.text();
+        assert!(logs.contains("runner_id=7"), "{logs}");
+        assert!(logs.contains("job_id=42"), "{logs}");
+        assert!(logs.contains("413"), "{logs}");
+        assert!(logs.contains("log exceeds the 5 MiB limit"), "{logs}");
+        assert!(logs.contains("the job output is lost"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn start_job_reports_a_rejected_start_and_stays_silent_on_success() {
+        let rejecting = spawn_fake_server("401 Unauthorized", "runner token expired").await;
+        let (logs, _guard) = capture_logs();
+        start_job(&reqwest::Client::new(), &rejecting.url, 3, 9, "token").await;
+        let rejected = logs.text();
+        assert!(rejected.contains("runner_id=3"), "{rejected}");
+        assert!(rejected.contains("job_id=9"), "{rejected}");
+        assert!(rejected.contains("runner token expired"), "{rejected}");
+        assert!(rejected.contains("stays pending"), "{rejected}");
+
+        let accepting = spawn_fake_server("200 OK", "").await;
+        let (logs, _guard) = capture_logs();
+        start_job(&reqwest::Client::new(), &accepting.url, 3, 9, "token").await;
+        assert_eq!(logs.text(), "");
+    }
+
+    #[tokio::test]
+    async fn send_heartbeat_reports_a_transport_failure_with_the_runner_id() {
+        let url = dead_server_url().await;
+        let (logs, _guard) = capture_logs();
+
+        send_heartbeat(&reqwest::Client::new(), &url, 5, "token").await;
+
+        let logs = logs.text();
+        assert!(logs.contains("runner_id=5"), "{logs}");
+        assert!(logs.contains("transport error"), "{logs}");
+        assert!(logs.contains("mark this runner offline"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn finish_job_retries_a_server_error_then_names_the_stuck_job() {
+        let server = spawn_fake_server("500 Internal Server Error", "database is locked").await;
+        let (logs, _guard) = capture_logs();
+
+        finish_job(
+            &reqwest::Client::new(),
+            &server.url,
+            4,
+            77,
+            "token",
+            "success",
+            0,
+        )
+        .await;
+
+        assert_eq!(server.requests(), FINISH_JOB_ATTEMPTS as usize);
+        let logs = logs.text();
+        assert!(logs.contains("retrying in"), "{logs}");
+        assert!(logs.contains("job_id=77"), "{logs}");
+        assert!(logs.contains("database is locked"), "{logs}");
+        assert!(
+            logs.contains("stays 'running' on the server forever"),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_job_does_not_retry_a_client_error() {
+        let server = spawn_fake_server("404 Not Found", "unknown runner").await;
+        let (logs, _guard) = capture_logs();
+
+        finish_job(
+            &reqwest::Client::new(),
+            &server.url,
+            4,
+            77,
+            "token",
+            "failure",
+            1,
+        )
+        .await;
+
+        assert_eq!(server.requests(), 1);
+        let logs = logs.text();
+        assert!(logs.contains("unknown runner"), "{logs}");
+        assert!(!logs.contains("retrying in"), "{logs}");
+    }
 }
