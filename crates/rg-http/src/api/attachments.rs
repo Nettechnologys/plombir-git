@@ -358,6 +358,27 @@ async fn list(
     }
 }
 
+/// Where an in-flight attachment is staged and what has to be true about it.
+const ATTACHMENT_STAGING_HINT: &str =
+    "attachment uploads are staged in `.tmp/attachments/` under the `[server].repo_root` \
+     directory; that directory must be writable by the user running forgekeep";
+
+/// One actionable error for a filesystem failure while staging an upload.
+///
+/// The staging path is `repo_root/.tmp/attachments/<uuid>.upload` — built inside
+/// the handler from a freshly generated UUID, so it appears in neither the
+/// request nor the response. A bare `io::Error` leaves the operator with an
+/// errno and no directory to act on, which is precisely what a repo root
+/// bind-mounted from a host uid other than the container's produces.
+fn upload_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> AppError {
+    AppError::internal(rg_core::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        ATTACHMENT_STAGING_HINT,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create(
     state: &AppState,
@@ -402,7 +423,8 @@ async fn create(
         .unwrap_or_else(|| "application/octet-stream".to_string());
     let upload_dir = state.repo_root.join(".tmp").join("attachments");
     if let Err(error) = tokio::fs::create_dir_all(&upload_dir).await {
-        return AppError::internal(error).into_response();
+        return upload_path_error("attachment staging directory", &upload_dir, &error)
+            .into_response();
     }
     let upload_path = upload_dir.join(format!("{}.upload", uuid::Uuid::new_v4()));
     let mut upload = match tokio::fs::OpenOptions::new()
@@ -412,7 +434,10 @@ async fn create(
         .await
     {
         Ok(upload) => upload,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => {
+            return upload_path_error("attachment staging file", &upload_path, &error)
+                .into_response();
+        }
     };
     let mut size = 0_u64;
     loop {
@@ -437,13 +462,14 @@ async fn create(
         if let Err(error) = upload.write_all(&chunk).await {
             drop(upload);
             let _ = tokio::fs::remove_file(&upload_path).await;
-            return AppError::internal(error).into_response();
+            return upload_path_error("attachment staging file", &upload_path, &error)
+                .into_response();
         }
     }
     if let Err(error) = upload.flush().await {
         drop(upload);
         let _ = tokio::fs::remove_file(&upload_path).await;
-        return AppError::internal(error).into_response();
+        return upload_path_error("attachment staging file", &upload_path, &error).into_response();
     }
     drop(upload);
 
@@ -702,5 +728,40 @@ fn response(
         created_at: attachment.created_at,
         browser_download_url: format!("{base}/{}", attachment.id),
         sha256: attachment.sha256,
+    }
+}
+
+#[cfg(test)]
+mod upload_path_error_tests {
+    use super::*;
+
+    /// The staging path is `repo_root/.tmp/attachments/<uuid>.upload`, built
+    /// from a freshly generated UUID inside the handler: it appears in neither
+    /// the request nor the response, so an errno on its own is unactionable.
+    #[test]
+    fn staging_failure_names_the_directory_and_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        // A regular file where `.tmp/` belongs fails directory creation
+        // deterministically, independent of the uid the tests run as.
+        let blocker = temp.path().join(".tmp");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let upload_dir = blocker.join("attachments");
+        let error = std::fs::create_dir_all(&upload_dir).unwrap_err();
+
+        let AppError::InternalError(rendered) =
+            upload_path_error("attachment staging directory", &upload_dir, &error)
+        else {
+            panic!("a filesystem failure while staging an upload must stay a 500");
+        };
+
+        assert!(
+            rendered.contains(&upload_dir.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("attachment staging directory"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(".tmp/attachments/"), "{rendered}");
     }
 }

@@ -302,6 +302,16 @@ pub const REPO_ROOT_HINT: &str =
      `FORGEKEEP_REPO_ROOT`); that directory, and the `<owner>/` level the server creates below \
      it, must be writable by the user running forgekeep";
 
+/// Remediation for a filesystem failure on a CI cache archive.
+///
+/// The cache lives in `_ci_cache/<repo_id>/` under the repository storage root
+/// and is touched from both ends — the runner writes and reads the archive, the
+/// server stores and serves it — so both halves have to name the same directory
+/// or an operator gets a different story depending on which side failed first.
+pub const CI_CACHE_DIR_HINT: &str =
+    "CI cache archives live in `_ci_cache/<repo_id>/` next to the repository storage root; \
+     that directory must be writable by the user running forgekeep";
+
 /// Remediation for a filesystem failure on a temporary git working tree.
 ///
 /// Creating a repository, editing a file from the web UI and committing a batch

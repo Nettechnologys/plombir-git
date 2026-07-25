@@ -1067,16 +1067,8 @@ impl PipelineRunner {
     }
 }
 
-/// Where a CI cache archive lives and what has to be true about it.
-///
-/// The directory is derived from the repository storage root, so a bind-mount
-/// owned by another uid — the standard container deployment — takes the cache
-/// down with it while the job log only ever saw `os error 13`.
-const CACHE_DIR_HINT: &str =
-    "CI cache archives live in `_ci_cache/<repo_id>/` next to the repository storage root; \
-     that directory must be writable by the user running forgekeep";
-
-/// Where a CI workspace lives, for the same reason as [`CACHE_DIR_HINT`].
+/// Where a CI workspace lives, for the same reason as
+/// [`rg_core::platform::fs::CI_CACHE_DIR_HINT`].
 const WORKSPACE_DIR_HINT: &str =
     "CI workspaces live in `_ci_workspaces/<repo_id>/` next to the repository storage root; \
      that directory must be writable by the user running forgekeep";
@@ -1085,11 +1077,18 @@ const WORKSPACE_DIR_HINT: &str =
 ///
 /// The path is computed internally — the archive is named after a SHA-256 of
 /// the cache key — so a bare `io::Error` reaching the job log names neither the
-/// file that failed nor the directory an operator would have to fix.
+/// file that failed nor the directory an operator would have to fix. The remedy
+/// is shared with the server half of the same directory (`rg-http`'s cache
+/// endpoints), so one bind-mount never yields two different stories.
 fn cache_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "{}",
-        rg_core::platform::fs::describe_path_error(what, path, error, CACHE_DIR_HINT)
+        rg_core::platform::fs::describe_path_error(
+            what,
+            path,
+            error,
+            rg_core::platform::fs::CI_CACHE_DIR_HINT
+        )
     )
 }
 

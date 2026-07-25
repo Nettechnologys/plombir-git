@@ -847,7 +847,7 @@ pub async fn download_cache(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             AppError::not_found("cache entry not found").into_response()
         }
-        Err(error) => AppError::internal(error).into_response(),
+        Err(error) => cache_path_error("CI cache archive", &path, &error).into_response(),
     }
 }
 
@@ -874,7 +874,7 @@ pub async fn upload_cache(
     let path = cache_archive_path(&state, repo_id, key);
     if let Some(parent) = path.parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            return AppError::internal(error).into_response();
+            return cache_path_error("CI cache directory", parent, &error).into_response();
         }
     }
     // Digest the payload before the write consumes `body` — the archive is
@@ -883,10 +883,10 @@ pub async fn upload_cache(
     let sha256 = cache_content_hash(body.as_ref());
     let temporary = path.with_extension("tar.tmp");
     if let Err(error) = tokio::fs::write(&temporary, body).await {
-        return AppError::internal(error).into_response();
+        return cache_path_error("CI cache staging file", &temporary, &error).into_response();
     }
     if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-        return AppError::internal(error).into_response();
+        return cache_path_error("CI cache archive", &path, &error).into_response();
     }
     let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
         Ok(policy) => policy,
@@ -894,7 +894,7 @@ pub async fn upload_cache(
     };
     let size = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta.len() as i64,
-        Err(error) => return AppError::internal(error).into_response(),
+        Err(error) => return cache_path_error("CI cache archive", &path, &error).into_response(),
     };
     if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
         &state.db,
@@ -954,6 +954,24 @@ fn cache_archive_path(state: &AppState, repo_id: i64, key: &str) -> std::path::P
         .join("_ci_cache")
         .join(repo_id.to_string())
         .join(format!("{name}.tar"))
+}
+
+/// One actionable error for a filesystem failure on the server side of the CI
+/// cache.
+///
+/// The archive path is `_ci_cache/<repo_id>/<sha256-of-cache-key>.tar` under
+/// `repo_root`: it is derived inside the handler and never appears in the
+/// request, so a bare `io::Error` hands the operator an errno for a file they
+/// cannot locate. This is the same directory the runner reports through
+/// `rg_ci`'s cache diagnostics — both halves quote one remedy, because one
+/// mis-owned bind-mount is what breaks both.
+fn cache_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> AppError {
+    AppError::internal(rg_core::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        rg_core::platform::fs::CI_CACHE_DIR_HINT,
+    ))
 }
 
 fn cache_key_hash(key: &str) -> String {
@@ -1300,6 +1318,42 @@ pub async fn delete_runner_admin(
             tracing::error!(error = %format!("{e:#}"), "delete_runner_admin failed");
             AppError::from(e).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_path_error_tests {
+    use super::*;
+
+    /// The archive lives at `_ci_cache/<repo_id>/<sha256-of-cache-key>.tar`
+    /// under `repo_root` — derived inside the handler, never echoed back — so a
+    /// cache failure carrying only an errno names nothing an operator can act
+    /// on. The runner half of this directory has said so since a42e694; the
+    /// server half used to answer `Permission denied (os error 13)`.
+    #[test]
+    fn cache_failure_names_the_path_and_the_shared_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        // A regular file where `_ci_cache/` belongs fails directory creation
+        // deterministically, independent of the uid the tests run as.
+        let blocker = temp.path().join("_ci_cache");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let directory = blocker.join("7");
+        let error = std::fs::create_dir_all(&directory).unwrap_err();
+
+        let AppError::InternalError(rendered) =
+            cache_path_error("CI cache directory", &directory, &error)
+        else {
+            panic!("a filesystem failure on the cache path must stay a 500");
+        };
+
+        assert!(
+            rendered.contains(&directory.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("CI cache directory"), "{rendered}");
+        // Byte-identical to what the runner writes into the job log, so one
+        // mis-owned bind-mount never yields two different remedies.
+        assert!(rendered.contains("_ci_cache/<repo_id>/"), "{rendered}");
     }
 }
 

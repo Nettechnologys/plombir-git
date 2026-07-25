@@ -20,6 +20,25 @@ pub struct LfsActionQuery {
     signature: Option<String>,
 }
 
+/// Where LFS objects are stored and what has to be true about the directory.
+const LFS_STORAGE_HINT: &str =
+    "LFS objects live in `<owner>.lfs/<repo>/` under the `[server].repo_root` directory; that \
+     directory must be writable by the user running forgekeep";
+
+/// One actionable error for a filesystem failure on an LFS object path.
+///
+/// `lfs_root(repo_root, owner, repo)` builds the directory from the request but
+/// never echoes it back, so a bare `io::Error` reaching the client is an errno
+/// against a path only the server knows.
+fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> AppError {
+    AppError::internal(rg_core::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        LFS_STORAGE_HINT,
+    ))
+}
+
 fn verify_signed_action(
     state: &AppState,
     repo_id: i64,
@@ -210,10 +229,15 @@ pub async fn upload_object(
     let repo_id = repo_model.id;
     let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);
 
-    // Stream body to temp file
+    // Stream body to temp file. The directory creation used to be discarded
+    // with `let _ =`, so an unwritable LFS root surfaced later as a failure to
+    // *open* the temp file — pointing the operator at the file instead of at
+    // the directory that actually has to be fixed.
     let temp_path = lfs_root.join(format!(".tmp_{}", oid));
     if let Some(parent) = temp_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            return lfs_path_error("LFS object directory", parent, &error).into_response();
+        }
     }
 
     match write_body_to_file(body, &temp_path).await {
@@ -466,17 +490,84 @@ fn respond_with_lfs_bytes(
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Stream an Axum `Body` to a file. Returns the number of bytes written.
+///
+/// This is the write path of every `git lfs push`: the staging path is derived
+/// from `repo_root` plus the object id, so a bare `?` on the io error hands the
+/// client an errno and nothing else. Every failure names the file.
 async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Result<usize> {
-    let mut file = tokio::fs::File::create(path).await?;
+    let staged = |error: &std::io::Error| {
+        rg_core::platform::fs::path_error("LFS staging file", path, error, LFS_STORAGE_HINT)
+    };
+
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|error| staged(&error))?;
 
     use futures::StreamExt;
     let mut written: usize = 0;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
-        file.write_all(&data).await?;
+        file.write_all(&data)
+            .await
+            .map_err(|error| staged(&error))?;
         written += data.len();
     }
 
     Ok(written)
+}
+
+#[cfg(test)]
+mod staging_path_tests {
+    use super::*;
+
+    /// Every `git lfs push` stages its object at
+    /// `<owner>.lfs/<repo>/.tmp_<oid>`. A bare `?` on the io error left the
+    /// client and the log with an errno against a path only the server computes.
+    #[tokio::test]
+    async fn staging_failure_names_the_file_and_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        // A regular file where `<owner>.lfs/` belongs fails the open
+        // deterministically, independent of the uid the tests run as.
+        let blocker = temp.path().join("owner.lfs");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let staged = blocker.join("repo").join(".tmp_abc");
+
+        let error = write_body_to_file(Body::from("payload"), &staged)
+            .await
+            .expect_err("staging must fail when the LFS root is not a directory");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&staged.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("LFS staging file"), "{rendered}");
+        assert!(rendered.contains("<owner>.lfs/<repo>/"), "{rendered}");
+    }
+
+    /// The upload handler used to discard the result of creating this
+    /// directory, so an unwritable LFS root was reported one step later against
+    /// the temp *file* — sending the operator after the wrong path.
+    #[test]
+    fn directory_failure_names_the_directory_not_the_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocker = temp.path().join("owner.lfs");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let directory = blocker.join("repo");
+        let error = std::fs::create_dir_all(&directory).unwrap_err();
+
+        let AppError::InternalError(rendered) =
+            lfs_path_error("LFS object directory", &directory, &error)
+        else {
+            panic!("a filesystem failure on the LFS root must stay a 500");
+        };
+
+        assert!(
+            rendered.contains(&directory.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("LFS object directory"), "{rendered}");
+        assert!(rendered.contains("<owner>.lfs/<repo>/"), "{rendered}");
+    }
 }
