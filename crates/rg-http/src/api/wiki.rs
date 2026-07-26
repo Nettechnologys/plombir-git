@@ -1,12 +1,18 @@
 //! Wiki REST API endpoints.
+//!
+//! The wiki of a private repository is as private as its code, and editing one
+//! is a write to the repository. Every handler here therefore goes through
+//! [`crate::api::repo_access`] — the file used to authenticate the caller on the
+//! mutating routes and then never ask whether that caller had anything to do
+//! with the repository, which left the whole wiki open to any stranger.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -76,21 +82,20 @@ fn page_to_summary(p: &rg_db::entities::wiki_page::Model) -> WikiPageSummary {
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn list_pages(
     State(state): State<AppState>,
-    Path((owner, repo)): Path<(String, String)>,
-    _headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let _user_id = super::auth::extract_user_id(&_headers, &state.jwt_secret);
-    let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
 
-    match rg_core::wiki::service::list_pages(&state.db, repo_id).await {
+    match rg_core::wiki::service::list_pages(&state.db, repo.id).await {
         Ok(pages) => {
             let summaries: Vec<WikiPageSummary> = pages.iter().map(page_to_summary).collect();
             (StatusCode::OK, Json(serde_json::json!(summaries))).into_response()
@@ -111,20 +116,20 @@ pub async fn list_pages(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn get_page(
     State(state): State<AppState>,
-    Path((owner, repo, title)): Path<(String, String, String)>,
-    _headers: HeaderMap,
+    Path((owner, name, title)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
 
-    match rg_core::wiki::service::get_page(&state.db, repo_id, &title).await {
+    match rg_core::wiki::service::get_page(&state.db, repo.id, &title).await {
         Ok(Some(page)) => (
             StatusCode::OK,
             Json(serde_json::json!(page_to_response(&page))),
@@ -148,28 +153,23 @@ pub async fn get_page(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn create_page(
     State(state): State<AppState>,
-    Path((owner, repo)): Path<(String, String)>,
+    Path((owner, name)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<CreateWikiPageRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => return AppError::unauthorized("unauthorized").into_response(),
-    };
-
-    let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let (repo, user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::wiki::service::create_page(
         &state.db,
-        repo_id,
+        repo.id,
         &body.title,
         &body.content,
         body.message.as_deref(),
@@ -199,28 +199,23 @@ pub async fn create_page(
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn update_page(
     State(state): State<AppState>,
-    Path((owner, repo, title)): Path<(String, String, String)>,
+    Path((owner, name, title)): Path<(String, String, String)>,
     headers: HeaderMap,
     Json(body): Json<UpdateWikiPageRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => return AppError::unauthorized("unauthorized").into_response(),
-    };
-
-    let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let (repo, user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::wiki::service::update_page(
         &state.db,
-        repo_id,
+        repo.id,
         &title,
         &body.content,
         body.message.as_deref(),
@@ -250,25 +245,20 @@ pub async fn update_page(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn delete_page(
     State(state): State<AppState>,
-    Path((owner, repo, title)): Path<(String, String, String)>,
+    Path((owner, name, title)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let _user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => return AppError::unauthorized("unauthorized").into_response(),
+    let (repo, _user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
 
-    let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    match rg_core::wiki::service::delete_page(&state.db, repo_id, &title).await {
+    match rg_core::wiki::service::delete_page(&state.db, repo.id, &title).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"message": "page deleted"})),
@@ -291,21 +281,21 @@ pub async fn delete_page(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn list_revisions(
     State(state): State<AppState>,
-    Path((owner, repo, title)): Path<(String, String, String)>,
-    _headers: HeaderMap,
+    Path((owner, name, title)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
 
-    match rg_core::wiki::service::list_revisions(&state.db, repo_id, &title).await {
+    match rg_core::wiki::service::list_revisions(&state.db, repo.id, &title).await {
         Ok(revisions) => (StatusCode::OK, Json(serde_json::json!(revisions))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -325,40 +315,27 @@ pub async fn list_revisions(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn get_revision(
     State(state): State<AppState>,
-    Path((_owner, _repo, _title, rev_id)): Path<(String, String, String, i64)>,
-    _headers: HeaderMap,
+    Path((owner, name, title, rev_id)): Path<(String, String, String, i64)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match rg_core::wiki::service::get_revision(&state.db, rev_id).await {
+    // Every part of the route used to be discarded: the revision was fetched by
+    // its global id alone, so any revision of any repository could be read
+    // through a URL the caller was allowed to open. Owner and name gate the
+    // access, and the title scopes which revisions the id may name.
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
+    };
+
+    match rg_core::wiki::service::get_revision(&state.db, repo.id, &title, rev_id).await {
         Ok(Some(rev)) => (StatusCode::OK, Json(serde_json::json!(rev))).into_response(),
         Ok(None) => AppError::not_found("revision not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────
-
-/// Resolve `owner/repo` to a repository id.
-///
-/// `Ok(None)` means the owner or the repository genuinely is not there. A
-/// lookup that *failed* stays an `Err`: the previous `.ok().flatten()` turned a
-/// dead connection pool into "repository not found", which sends the caller
-/// looking for a typo in a URL that was correct and never gets retried.
-async fn resolve_repo_id(
-    db: &DatabaseConnection,
-    owner: &str,
-    repo_name: &str,
-) -> anyhow::Result<Option<i64>> {
-    let Some(user) = rg_db::ops::user_ops::find_by_username(db, owner).await? else {
-        return Ok(None);
-    };
-    let Some(repo) = rg_db::ops::repo_ops::find_by_owner_and_name(db, user.id, repo_name).await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(repo.id))
 }

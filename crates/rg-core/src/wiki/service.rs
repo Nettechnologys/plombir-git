@@ -162,12 +162,36 @@ pub async fn list_revisions(
     wiki_revision_ops::list_by_page(db, page.id).await
 }
 
-/// Get a specific revision's content.
+/// Get a specific revision's content, scoped to the page that owns it.
+///
+/// `revision_id` is global, so the repository and title from the route decide
+/// which revisions are addressable at all. Taking them here rather than trusting
+/// the caller to compare afterwards is what keeps one repository's history out
+/// of a URL that points at another one; a revision of a different page is
+/// `Ok(None)`, indistinguishable from a revision that does not exist.
 pub async fn get_revision(
     db: &DatabaseConnection,
+    repo_id: i64,
+    title: &str,
     revision_id: i64,
 ) -> Result<Option<wiki_revision::Model>> {
-    wiki_revision_ops::find_by_id(db, revision_id).await
+    let page = wiki_page_ops::find_by_repo_and_title(db, repo_id, title)
+        .await
+        .context("find wiki page for revision")?
+        .ok_or_else(|| crate::error::not_found("wiki page"))?;
+
+    let Some(revision) = wiki_revision_ops::find_by_id(db, revision_id)
+        .await
+        .context("find wiki revision")?
+    else {
+        return Ok(None);
+    };
+
+    if revision.wiki_page_id != page.id {
+        return Ok(None);
+    }
+
+    Ok(Some(revision))
 }
 
 /// Delete a wiki page.
