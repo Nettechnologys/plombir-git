@@ -532,29 +532,64 @@ pub async fn get_user_by_id(db: &DatabaseConnection, user_id: i64) -> Result<Opt
 
 // ── Password reset ──────────────────────────────────────────────
 
+/// Wall-clock budget every [`forgot_password`] call is padded out to.
+///
+/// H-5: the property we owe is "the reply takes the same time whether or not
+/// the address belongs to an account". A per-branch `sleep(100ms)` cannot give
+/// that — it pads only the two cheap branches, while the real one pays for two
+/// row writes on top of the same 100 ms, so the pad *inverts* the signal
+/// instead of erasing it. Padding to a common deadline measured from entry does
+/// give it, as long as the work stays under budget — which is why the SMTP
+/// round-trip (network-bound, unbounded) is detached rather than awaited.
+const FORGOT_PASSWORD_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Initiate a password reset. Generates a token and sends an email.
 /// Silently succeeds even if the email is not found (to prevent user enumeration).
-/// H-5: All code paths perform similar work to prevent timing-based email enumeration.
+/// H-5: every code path returns at the same deadline ([`FORGOT_PASSWORD_BUDGET`]
+/// after entry) and no path awaits the SMTP send, so the response time carries
+/// no signal about whether the address exists.
 pub async fn forgot_password(
     db: &DatabaseConnection,
     email: &str,
     smtp_config: Option<&crate::email::SmtpConfig>,
     base_url: &str,
 ) -> Result<()> {
-    let user = match user_ops::find_by_email(db, email).await? {
-        Some(u) => u,
-        None => {
-            // H-5: Perform dummy token generation + delay to normalize timing
-            let _ = uuid::Uuid::new_v4();
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            return Ok(());
-        }
+    let start = tokio::time::Instant::now();
+    let result = forgot_password_inner(db, email, smtp_config, base_url).await;
+
+    // H-5: pad to the shared deadline. Applies to the error branch too — a DB
+    // fault on the "user exists" path must not answer faster or slower than one
+    // on the lookup itself.
+    let elapsed = start.elapsed();
+    if elapsed > FORGOT_PASSWORD_BUDGET {
+        // Not fatal, but the pad has stopped hiding which branch ran: something
+        // on the request path got slow and needs detaching (or the budget
+        // raising) before enumeration becomes observable again.
+        tracing::warn!(
+            elapsed_ms = elapsed.as_millis() as u64,
+            budget_ms = FORGOT_PASSWORD_BUDGET.as_millis() as u64,
+            "forgot-password outran its anti-enumeration timing budget"
+        );
+    }
+    tokio::time::sleep_until(start + FORGOT_PASSWORD_BUDGET).await;
+
+    result
+}
+
+/// The actual reset work. Kept separate so [`forgot_password`] can pad every
+/// exit — early return, success, and error alike — to one deadline.
+async fn forgot_password_inner(
+    db: &DatabaseConnection,
+    email: &str,
+    smtp_config: Option<&crate::email::SmtpConfig>,
+    base_url: &str,
+) -> Result<()> {
+    let Some(user) = user_ops::find_by_email(db, email).await? else {
+        return Ok(());
     };
 
     // Only local users can reset via email (LDAP/OAuth users use their provider)
     if user.auth_provider != "local" {
-        // H-5: Same delay as the "not found" path to prevent timing-based enumeration
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         return Ok(());
     }
 
@@ -578,22 +613,40 @@ pub async fn forgot_password(
         raw_token
     );
 
-    // Send email
+    // Send the mail off the request path. The SMTP round-trip is network-bound
+    // with no ceiling, so awaiting it here would put this branch — the one that
+    // only runs for addresses that exist — arbitrarily far outside the timing
+    // budget its caller pads to. Routed through the shared delivery tracker
+    // rather than a bare `tokio::spawn` so graceful shutdown drains the send
+    // instead of severing it on SIGTERM.
     if let Some(smtp) = smtp_config {
-        let subject = "Reset your ForgeKeep password";
+        let smtp = smtp.clone();
+        let recipient = user.email.clone();
+        let user_id = user.id;
         let message = format!(
             "We received a request to reset the password for your ForgeKeep account ({}). \
              Click the button below to set a new password. This link expires in 15 minutes.",
             user.username
         );
-        let _ = crate::email::send_html_notification(
-            smtp,
-            &user.email,
-            subject,
-            &message,
-            Some(&reset_url),
-        )
-        .await;
+        crate::task_tracker::delivery_tracker().spawn(async move {
+            let subject = "Reset your ForgeKeep password";
+            if let Err(e) = crate::email::send_html_notification(
+                &smtp,
+                &recipient,
+                subject,
+                &message,
+                Some(&reset_url),
+            )
+            .await
+            {
+                // Log by id, never by address: this endpoint is unauthenticated.
+                tracing::warn!(
+                    user_id,
+                    error = %format!("{e:#}"),
+                    "password reset email delivery failed"
+                );
+            }
+        });
     }
 
     tracing::info!(user_id = user.id, "password reset requested");
@@ -754,5 +807,133 @@ mod tests {
             synced.ldap_dn.as_deref(),
             Some("uid=alice,ou=people,dc=example,dc=com")
         );
+    }
+
+    // ── H-5: forgot-password timing (card_47f0deb254ef) ─────────────
+
+    /// An SMTP endpoint that accepts the TCP connection and then says nothing.
+    /// A client that awaits the send blocks on the missing `220` greeting until
+    /// lettre's own timeout (~60 s) — which is exactly the "slow SMTP" the
+    /// enumeration test needs, without depending on an unreachable host.
+    async fn blackhole_smtp() -> crate::email::SmtpConfig {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold the listener alive for the whole test; never write a greeting.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        crate::email::SmtpConfig::new("127.0.0.1", port, "user", "pass", "forge@example.com")
+    }
+
+    async fn seed_user(db: &DatabaseConnection, username: &str, provider: &str) {
+        let now = Utc::now();
+        user_ops::create(
+            db,
+            UserActiveModel {
+                username: Set(username.to_string()),
+                email: Set(format!("{username}@example.com")),
+                password_hash: Set(String::new()),
+                auth_provider: Set(provider.to_string()),
+                is_admin: Set(false),
+                is_active: Set(true),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The H-5 property: response time must not tell the caller whether the
+    /// address belongs to an account. Every branch is padded to one deadline
+    /// measured from entry, and the SMTP send is detached — so the branch that
+    /// only runs for a *real* local account cannot be the slow one.
+    ///
+    /// The upper bound is a hang-guard, not a deadline (same reasoning as
+    /// `task_tracker::close_then_wait_drains_a_spawned_task`): under the old
+    /// `sleep(100ms)`-per-branch code the existing-user branch awaited the
+    /// blackholed SMTP and took ~60 s, so any finite bound catches the
+    /// regression, while a tight one would just turn machine load into a red
+    /// suite.
+    #[tokio::test]
+    async fn forgot_password_pads_every_branch_to_one_deadline() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        seed_user(&db, "alice", "local").await;
+        seed_user(&db, "ldapuser", "ldap").await;
+
+        let smtp = blackhole_smtp().await;
+        let slack = std::time::Duration::from_secs(5);
+
+        let mut elapsed = Vec::new();
+        for address in [
+            "nobody@example.com",   // no such account
+            "ldapuser@example.com", // exists, but not a local account
+            "alice@example.com",    // exists, local — the branch that sends mail
+        ] {
+            let start = std::time::Instant::now();
+            forgot_password(&db, address, Some(&smtp), "https://forge.example.com")
+                .await
+                .unwrap();
+            let took = start.elapsed();
+
+            assert!(
+                took >= FORGOT_PASSWORD_BUDGET,
+                "{address}: returned in {took:?}, before the {FORGOT_PASSWORD_BUDGET:?} budget"
+            );
+            assert!(
+                took < FORGOT_PASSWORD_BUDGET + slack,
+                "{address}: took {took:?} — the SMTP round-trip is back on the request path"
+            );
+            elapsed.push(took);
+        }
+
+        // Same corollary stated as the card's acceptance check: the existing
+        // address must not answer measurably slower than the unknown one.
+        let (unknown, existing) = (elapsed[0], elapsed[2]);
+        assert!(
+            existing < unknown + slack,
+            "existing address answered in {existing:?} vs {unknown:?} for an unknown one"
+        );
+    }
+
+    /// Detaching the mail must not detach the work that precedes it: the reset
+    /// token is still written before the call returns.
+    #[tokio::test]
+    async fn forgot_password_still_issues_a_token_for_a_local_account() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        seed_user(&db, "alice", "local").await;
+
+        let smtp = blackhole_smtp().await;
+        forgot_password(
+            &db,
+            "alice@example.com",
+            Some(&smtp),
+            "https://forge.example.com",
+        )
+        .await
+        .unwrap();
+
+        use sea_orm::EntityTrait;
+        let user = user_ops::find_by_email(&db, "alice@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        let tokens = rg_db::entities::password_reset_token::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "expected exactly one reset token to be written before the call returned"
+        );
+        assert_eq!(tokens[0].user_id, user.id);
     }
 }
