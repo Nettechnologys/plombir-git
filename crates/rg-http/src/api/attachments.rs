@@ -9,6 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::api::auth::extract_user_id;
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::attachment::AttachmentTarget;
@@ -654,25 +655,7 @@ async fn resolve(
     kind: TargetKind,
     target_id: i64,
 ) -> Result<(rg_db::entities::repository::Model, ResolvedTarget), AppError> {
-    let repo = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo_name)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-    let user_id = extract_user_id(headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, user_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(if user_id.is_some() {
-                AppError::forbidden("access denied")
-            } else {
-                AppError::unauthorized("authentication required")
-            })
-        }
-        // An anonymous caller used to be told "authentication required" when
-        // the read check itself failed, which is the one answer guaranteed not
-        // to help: no token fixes a database that is down.
-        Err(error) => return Err(AppError::from(error)),
-    }
+    let repo = repo_access::require_read(state, headers, owner, repo_name).await?;
 
     let target = match kind {
         TargetKind::Issue => {

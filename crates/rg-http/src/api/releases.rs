@@ -782,20 +782,8 @@ pub async fn get_asset_attestation(
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(repo)) => repo,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    let actor_id = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
-        Ok(true) => {}
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            return AppError::unauthorized("authentication required").into_response()
-        }
-        Ok(false) => return AppError::forbidden("access denied").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
     }
 
     match rg_core::release::service::get_asset_attestation(&state.db, asset_id).await {
@@ -832,20 +820,8 @@ pub async fn verify_asset_attestation(
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(repo)) => repo,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    let actor_id = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
-        Ok(true) => {}
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            return AppError::unauthorized("authentication required").into_response()
-        }
-        Ok(false) => return AppError::forbidden("access denied").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
     }
 
     match rg_core::release::service::verify_asset_attestation(

@@ -25,7 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::auth::{extract_ci_job_claims, extract_user_id};
+use crate::api::auth::extract_user_id;
+use crate::api::repo_access;
 use crate::AppState;
 
 // ── Request / Response types ─────────────────────────────
@@ -114,63 +115,6 @@ fn auth(headers: &axum::http::HeaderMap, secret: &str) -> Result<i64, AppError> 
         .ok_or_else(|| AppError::unauthorized("authentication required"))
 }
 
-async fn resolve_repo(
-    state: &AppState,
-    owner: &str,
-    name: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
-        .await
-        // A DB-outage here must classify as 503 (retryable), not 500: route the
-        // anyhow error through `AppError::from` (which downcasts to `DbErr` and
-        // maps connection-level failures to `ServiceUnavailable`) rather than
-        // the blanket `AppError::internal`. `resolve_repo` is the first DB call
-        // of nearly every packages route, so a 500 here would mask the outage
-        // classification the per-handler error arms provide.
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found("repository not found"))
-}
-
-async fn require_repo_read(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    let repo = resolve_repo(state, owner, name).await?;
-    let actor_id = extract_user_id(headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
-        Ok(true) => Ok(repo),
-        Ok(false)
-            if actor_id.is_none()
-                && extract_ci_job_claims(headers, &state.jwt_secret, repo.id, "packages:read")
-                    .is_some() =>
-        {
-            Ok(repo)
-        }
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            Err(AppError::unauthorized("authentication required"))
-        }
-        Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
-}
-
-async fn require_repo_write(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
-    let user_id = auth(headers, &state.jwt_secret)?;
-    let repo = resolve_repo(state, owner, name).await?;
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => Ok((repo, user_id)),
-        Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
-}
-
 /// Resolve publish metadata: adapter-extracted fields take precedence, then
 /// query-param overrides.
 type PublishPackageTuple = (
@@ -248,7 +192,7 @@ pub async fn publish(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    let (_repo, user_id) = match require_repo_write(&state, &headers, &owner, &name).await {
+    let (_repo, user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
         Ok(access) => access,
         Err(e) => return e.into_response(),
     };
@@ -378,10 +322,13 @@ pub async fn list_registries(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> axum::response::Response {
-    let repo = match require_repo_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
+    let repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read")
+            .await
+        {
+            Ok(repo) => repo,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_db::ops::package_registry_ops::list_by_repo(&state.db, repo.id).await {
         Ok(registries) => Json(RegistryListResponse {
@@ -418,7 +365,9 @@ pub async fn list_packages(
     headers: HeaderMap,
     Path((owner, name, pkg_type)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -452,7 +401,9 @@ pub async fn get_package(
     headers: HeaderMap,
     Path((owner, name, pkg_type, pkg_name)): Path<(String, String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -488,7 +439,9 @@ pub async fn list_versions(
     headers: HeaderMap,
     Path((owner, name, pkg_type, pkg_name)): Path<(String, String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -531,7 +484,9 @@ pub async fn get_version(
         String,
     )>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -574,7 +529,7 @@ pub async fn delete_version(
         String,
     )>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_write(&state, &headers, &owner, &name).await {
+    if let Err(e) = repo_access::require_write(&state, &headers, &owner, &name).await {
         return e.into_response();
     }
 
@@ -609,7 +564,7 @@ pub async fn yank_version(
     )>,
     Json(body): Json<YankRequest>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_write(&state, &headers, &owner, &name).await {
+    if let Err(e) = repo_access::require_write(&state, &headers, &owner, &name).await {
         return e.into_response();
     }
 
@@ -640,7 +595,9 @@ pub async fn download_file(
         String,
     )>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -692,7 +649,9 @@ pub async fn cargo_sparse_index(
     headers: HeaderMap,
     Path((owner, name, pkg_name)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -732,7 +691,9 @@ pub async fn npm_registry_metadata(
     headers: axum::http::HeaderMap,
     Path((owner, name, pkg_name)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -800,7 +761,9 @@ pub async fn pypi_simple_index(
     headers: axum::http::HeaderMap,
     Path((owner, name, pkg_name)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -881,7 +844,9 @@ pub async fn maven_metadata(
     headers: HeaderMap,
     Path((owner, name, group_id, artifact_id)): Path<(String, String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -938,7 +903,9 @@ pub async fn nuget_service_index(
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -961,7 +928,9 @@ pub async fn nuget_registration_index(
     headers: axum::http::HeaderMap,
     Path((owner, name, pkg_name)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -1044,7 +1013,9 @@ pub async fn nuget_search(
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<NuGetSearchParams>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -1117,7 +1088,9 @@ pub async fn rubygems_dependencies(
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<RubyGemsDepsParams>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -1174,7 +1147,9 @@ pub async fn rubygems_gem_info(
     headers: axum::http::HeaderMap,
     Path((owner, name, gem_name)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -1257,7 +1232,9 @@ pub async fn helm_index(
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 
@@ -1347,7 +1324,9 @@ pub async fn composer_packages_json(
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> axum::response::Response {
-    if let Err(e) = require_repo_read(&state, &headers, &owner, &name).await {
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "packages:read").await
+    {
         return e.into_response();
     }
 

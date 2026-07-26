@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -108,7 +109,7 @@ pub async fn list_pipelines(
     let offset = pagination.offset();
     let limit = pagination.limit();
 
-    let repo = match resolve_repo_with_read_access(&state, &headers, &owner, &name).await {
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
@@ -161,7 +162,7 @@ pub async fn get_pipeline(
     headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let repo = match resolve_repo_with_read_access(&state, &headers, &owner, &name).await {
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
@@ -263,7 +264,7 @@ pub async fn get_job(
     headers: HeaderMap,
     Path((owner, name, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
 ) -> impl IntoResponse {
-    let repo = match resolve_repo_with_read_access(&state, &headers, &owner, &name).await {
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
@@ -327,7 +328,7 @@ pub async fn play_job(
     headers: HeaderMap,
     Path((owner, name, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
 ) -> impl IntoResponse {
-    let (repo, _) = match resolve_repo_with_write_access(&state, &headers, &owner, &name).await {
+    let (repo, _) = match repo_access::require_write(&state, &headers, &owner, &name).await {
         Ok(access) => access,
         Err(error) => return error.into_response(),
     };
@@ -416,11 +417,10 @@ pub async fn trigger_pipeline(
     Path((owner, name)): Path<(String, String)>,
     Json(body): Json<TriggerPipelineRequest>,
 ) -> impl IntoResponse {
-    let (repo, actor_id) =
-        match resolve_repo_with_write_access(&state, &headers, &owner, &name).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
+    let (repo, actor_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
+        Ok(access) => access,
+        Err(e) => return e.into_response(),
+    };
 
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,
@@ -513,11 +513,10 @@ pub async fn retry_pipeline(
     headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let (repo, actor_id) =
-        match resolve_repo_with_write_access(&state, &headers, &owner, &name).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
+    let (repo, actor_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
+        Ok(access) => access,
+        Err(e) => return e.into_response(),
+    };
 
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
         Ok(Some(p)) => p,
@@ -602,7 +601,7 @@ pub async fn cancel_pipeline(
     headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let (repo, _) = match resolve_repo_with_write_access(&state, &headers, &owner, &name).await {
+    let (repo, _) = match repo_access::require_write(&state, &headers, &owner, &name).await {
         Ok(access) => access,
         Err(e) => return e.into_response(),
     };
@@ -690,53 +689,6 @@ pub async fn cancel_pipeline(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-async fn resolve_repo(
-    state: &AppState,
-    owner: &str,
-    name: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))
-}
-
-async fn resolve_repo_with_read_access(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    let repo = resolve_repo(state, owner, name).await?;
-    let actor_id = crate::api::auth::extract_user_id(headers, &state.jwt_secret);
-
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
-        Ok(true) => Ok(repo),
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            Err(AppError::unauthorized("authentication required"))
-        }
-        Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
-}
-
-async fn resolve_repo_with_write_access(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
-    let actor_id = crate::api::auth::extract_user_id(headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    let repo = resolve_repo(state, owner, name).await?;
-
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(actor_id)).await {
-        Ok(true) => Ok((repo, actor_id)),
-        Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
-}
 
 async fn resolve_repo_storage_owner(
     state: &AppState,

@@ -8,7 +8,8 @@ use axum::Json;
 use chrono;
 use serde::{Deserialize, Serialize};
 
-use crate::api::auth::{extract_bearer_claims, extract_ci_job_claims, extract_user_id};
+use crate::api::auth::extract_bearer_claims;
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -136,44 +137,6 @@ pub struct GpgSignature {
 
 // ── Handlers ──────────────────────────────────────────────────────────
 
-/// Resolve a repo by owner/name and enforce read access.
-/// Returns the repo model. Public repos are always accessible;
-/// private repos require a valid JWT and the user must have read permission.
-async fn resolve_and_check_access(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    repo: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    let repo_model = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-
-    let actor_id = extract_user_id(headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo_model, actor_id).await {
-        Ok(true) => {}
-        Ok(false)
-            if actor_id.is_none()
-                && extract_ci_job_claims(
-                    headers,
-                    &state.jwt_secret,
-                    repo_model.id,
-                    "repo:read",
-                )
-                .is_some() => {}
-        Ok(false) if repo_model.is_private && actor_id.is_none() => {
-            return Err(AppError::unauthorized("authentication required"));
-        }
-        Ok(false) => {
-            return Err(AppError::forbidden("access denied"));
-        }
-        Err(e) => return Err(AppError::from(e)),
-    }
-
-    Ok(repo_model)
-}
-
 // ── Individual handlers ─────────────────────────────────────────────────
 
 /// List tree entries (directory listing) for a repo.
@@ -206,10 +169,12 @@ pub async fn list_tree(
     }
 
     // H-01: Auth check for private repos
-    let _repo = match resolve_and_check_access(&state, &headers, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let _repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -309,10 +274,12 @@ pub async fn get_blob(
     }
 
     // H-01: Auth check for private repos
-    let _repo = match resolve_and_check_access(&state, &headers, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let _repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -363,10 +330,12 @@ pub async fn get_log(
     }
 
     // H-01: Auth check for private repos
-    let _repo = match resolve_and_check_access(&state, &headers, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let _repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -415,10 +384,12 @@ pub async fn list_branches(
     }
 
     // H-01: Auth check for private repos
-    let _repo = match resolve_and_check_access(&state, &headers, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let _repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -463,10 +434,12 @@ pub async fn list_tags(
     }
 
     // H-01: Auth check for private repos
-    let _repo = match resolve_and_check_access(&state, &headers, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let _repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -900,10 +873,12 @@ pub async fn get_commit_signature(
     }
 
     // H-01: Auth check for private repos
-    let _repo = match resolve_and_check_access(&state, &headers, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
+    let _repo =
+        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_response(),
+        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {

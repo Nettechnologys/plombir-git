@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::auth::extract_bearer_claims;
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -77,7 +78,7 @@ pub async fn list_issue_templates(
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo_model = match resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
         Ok(repo) => repo,
         Err(error) => return error.into_response(),
     };
@@ -111,7 +112,7 @@ pub async fn get_issue_config(
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo_model = match resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
         Ok(repo) => repo,
         Err(error) => return error.into_response(),
     };
@@ -145,7 +146,7 @@ pub async fn validate_issue_config(
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo_model = match resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
         Ok(repo) => repo,
         Err(error) => return error.into_response(),
     };
@@ -186,7 +187,7 @@ pub async fn get_pull_request_template(
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo_model = match resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
         Ok(repo) => repo,
         Err(error) => return error.into_response(),
     };
@@ -232,7 +233,7 @@ pub async fn list_issues(
     headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
         return e.into_response();
     }
 
@@ -312,7 +313,7 @@ pub async fn get_issue(
     Path((owner, repo, number)): Path<(String, String, i64)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
         return e.into_response();
     }
 
@@ -353,7 +354,7 @@ pub async fn create_issue(
         }
     };
 
-    let repo_model = match resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
@@ -498,7 +499,7 @@ pub async fn list_comments(
     Path((owner, repo, number)): Path<(String, String, i64)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
         return e.into_response();
     }
 
@@ -540,7 +541,7 @@ pub async fn add_comment(
         }
     };
 
-    if let Err(e) = resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
         return e.into_response();
     }
 
@@ -619,35 +620,6 @@ async fn comments_with_authors(
     responses
 }
 
-async fn resolve_and_check_read_access(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    repo_name: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    let repo = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo_name)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-
-    if repo.is_private {
-        let claims = extract_bearer_claims(headers, &state.jwt_secret)
-            .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-        let user_id = claims
-            .sub
-            .parse::<i64>()
-            .map_err(|_| AppError::unauthorized("invalid token subject".to_string()))?;
-
-        match rg_core::repo::service::can_read_repo(&state.db, &repo, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => return Err(AppError::forbidden("access denied")),
-            Err(e) => return Err(AppError::from(e)),
-        }
-    }
-
-    Ok(repo)
-}
-
 // ── Milestone handlers ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -674,7 +646,7 @@ pub async fn list_milestones(
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<ListMilestonesQuery>,
 ) -> impl IntoResponse {
-    let repo = match resolve_and_check_read_access(&state, &headers, &owner, &name).await {
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
@@ -784,7 +756,7 @@ pub async fn get_milestone(
     headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let repo = match resolve_and_check_read_access(&state, &headers, &owner, &name).await {
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
@@ -981,7 +953,7 @@ pub async fn get_issue_labels(
     // Same gate as `get_issue` / `list_comments`: the labels of an issue are as
     // private as the issue itself, and without `HeaderMap` this handler could
     // not tell an anonymous caller from the owner at all.
-    if let Err(e) = resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
         return e.into_response();
     }
 

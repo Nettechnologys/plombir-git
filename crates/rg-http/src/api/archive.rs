@@ -10,7 +10,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::api::auth::{extract_ci_job_claims, extract_user_id};
+use crate::api::repo_access;
 use crate::error::AppError;
 
 /// GET /api/v1/repos/{owner}/{name}/archive/{sha}.zip
@@ -47,33 +47,10 @@ pub async fn download_archive(
         return AppError::bad_request("Unsupported format").into_response();
     };
 
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
+    if let Err(e) =
+        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "repo:read").await
     {
-        Ok(Some(repo)) => repo,
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    };
-
-    let actor_id = extract_user_id(&headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
-        Ok(true) => {}
-        Ok(false)
-            if actor_id.is_none()
-                && extract_ci_job_claims(&headers, &state.jwt_secret, repo.id, "repo:read")
-                    .is_some() => {}
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-        Ok(false) => {
-            return AppError::forbidden("access denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+        return e.into_response();
     }
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));

@@ -13,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::api::auth::extract_user_id;
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::ToSchema;
@@ -634,10 +635,7 @@ async fn require_pipeline_read(
     name: &str,
     pipeline_id: i64,
 ) -> Result<rg_db::entities::pipeline::Model, AppError> {
-    let repo = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
+    let repo = repo_access::resolve_repo(state, owner, name).await?;
     let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id)
         .await
         .map_err(AppError::internal)?
@@ -645,7 +643,7 @@ async fn require_pipeline_read(
     if pipeline.repo_id != repo.id {
         return Err(AppError::not_found("pipeline not found"));
     }
-    require_repo_read(state, headers, &repo).await?;
+    repo_access::check_read(state, headers, &repo).await?;
     Ok(pipeline)
 }
 
@@ -681,24 +679,8 @@ async fn require_artifact_read(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("repository not found"))?;
-    require_repo_read(state, headers, &repo).await?;
+    repo_access::check_read(state, headers, &repo).await?;
     Ok(artifact)
-}
-
-async fn require_repo_read(
-    state: &AppState,
-    headers: &HeaderMap,
-    repo: &rg_db::entities::repository::Model,
-) -> Result<(), AppError> {
-    let actor_id = extract_user_id(headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, repo, actor_id).await {
-        Ok(true) => Ok(()),
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            Err(AppError::unauthorized("authentication required"))
-        }
-        Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
 }
 
 async fn repo_id_for_job(

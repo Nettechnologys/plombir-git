@@ -12,7 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 use sea_orm::{ConnectionTrait, Statement};
@@ -90,50 +90,6 @@ pub struct SearchCodeQuery {
     pub limit: Option<i64>,
 }
 
-// ── Helpers ─────────────────────────────────────
-
-async fn resolve_repo(
-    state: &AppState,
-    owner: &str,
-    name: &str,
-) -> Result<rg_db::entities::repository::Model, AppError> {
-    // A failed lookup is ours, not the caller's: it goes through the `AppError`
-    // funnel, which classifies it (503 on an outage, 500 otherwise) and keeps
-    // the `db: ...` chain in the operator log instead of in the response body.
-    // Only a genuinely absent repository is a 404 — with a fixed message, since
-    // 404 bodies are not sanitized on the way out (H-05).
-    rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found("repository not found"))
-}
-
-/// Require read access for a repo. Public repos are always accessible;
-/// private repos require a valid JWT and the user must have read permission.
-async fn require_repo_read_access(
-    state: &AppState,
-    headers: &HeaderMap,
-    repo: &rg_db::entities::repository::Model,
-) -> Result<(), AppError> {
-    if !repo.is_private {
-        return Ok(());
-    }
-    let claims = extract_bearer_claims(headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    let user_id = claims
-        .sub
-        .parse::<i64>()
-        .map_err(|_| AppError::unauthorized("invalid token subject".to_string()))?;
-
-    match rg_core::repo::service::can_read_repo(&state.db, repo, Some(user_id)).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(AppError::forbidden("access denied")),
-        // Not "you may not read this repo" — "we could not find out". A 403
-        // here sends the caller to re-issue a perfectly valid token.
-        Err(e) => Err(AppError::from(e)),
-    }
-}
-
 // ── Handlers ──────────────────────────────────────
 
 /// GET /api/v1/ai/repos/{owner}/{name}/summary
@@ -155,8 +111,7 @@ pub async fn ai_repo_summary(
     Path((owner, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<RepoSummary>), AppError> {
-    let repo = resolve_repo(&state, &owner, &name).await?;
-    require_repo_read_access(&state, &headers, &repo).await?;
+    let repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
 
     let summary = RepoSummary {
         full_name: format!("{}/{}", owner, name),
@@ -193,8 +148,7 @@ pub async fn ai_list_issues(
     headers: HeaderMap,
     Query(params): Query<IssueListQuery>,
 ) -> Result<(StatusCode, Json<Vec<IssueSummary>>), AppError> {
-    let _repo = resolve_repo(&state, &owner, &name).await?;
-    require_repo_read_access(&state, &headers, &_repo).await?;
+    let _repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
 
     let state_filter = params.state.as_deref().unwrap_or("open");
 
@@ -240,8 +194,7 @@ pub async fn ai_list_prs(
     headers: HeaderMap,
     Query(params): Query<PrListQuery>,
 ) -> Result<(StatusCode, Json<Vec<PrSummary>>), AppError> {
-    let _repo = resolve_repo(&state, &owner, &name).await?;
-    require_repo_read_access(&state, &headers, &_repo).await?;
+    let _repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
 
     let state_filter = params.state.as_deref().unwrap_or("open");
 
@@ -293,8 +246,7 @@ pub async fn ai_repo_tree(
     headers: HeaderMap,
     Query(_params): Query<TreeQuery>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let _repo = resolve_repo(&state, &owner, &name).await?;
-    require_repo_read_access(&state, &headers, &_repo).await?;
+    let _repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
     Ok((
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({"error": "repo_tree not yet implemented"})),
@@ -335,8 +287,7 @@ pub async fn ai_search_code(
     headers: HeaderMap,
     Query(params): Query<SearchCodeQuery>,
 ) -> Result<(StatusCode, Json<Vec<CodeSearchResult>>), AppError> {
-    let repo = resolve_repo(&state, &owner, &name).await?;
-    require_repo_read_access(&state, &headers, &repo).await?;
+    let repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
 
     let limit = params.limit.unwrap_or(20).min(100) as u64;
     let offset = 0u64;
@@ -416,15 +367,10 @@ pub async fn ai_index_repository(
     Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Resolve repository
-    let repo = match resolve_repo(&state, &owner, &name).await {
+    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-
-    // Check read access
-    if let Err(e) = require_repo_read_access(&state, &headers, &repo).await {
-        return e.into_response();
-    }
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
     if !repo_path.exists() {
