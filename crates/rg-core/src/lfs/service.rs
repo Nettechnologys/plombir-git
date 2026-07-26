@@ -682,6 +682,23 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>> {
 
 // ── Lazy compression utility ──────────────────────────────────────────────────
 
+/// One actionable line for a filesystem failure on an on-disk LFS object.
+///
+/// [`compress_existing`] logs and continues, so the log line is the only channel
+/// an operator has — and `lfs_object_path` shards the oid under an `lfs_root`
+/// that never reaches the log, which turns a bind-mount owned by the wrong uid
+/// into a bare `Permission denied (os error 13)` next to an oid. Shares
+/// [`LFS_STORAGE_HINT`](crate::platform::fs::LFS_STORAGE_HINT) with the HTTP
+/// handlers so both halves name the same directory the same way.
+fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> String {
+    crate::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        crate::platform::fs::LFS_STORAGE_HINT,
+    )
+}
+
 /// Compress existing uncompressed LFS objects in a repository.
 /// Returns the number of objects compressed.
 pub async fn compress_existing(
@@ -703,7 +720,11 @@ pub async fn compress_existing(
 
         // Skip if original file doesn't exist
         if !obj_path.exists() {
-            tracing::warn!(oid = %obj.oid, "LFS object file not found, skipping");
+            tracing::warn!(
+                oid = %obj.oid,
+                path = %obj_path.display(),
+                "LFS object file not found, skipping"
+            );
             continue;
         }
 
@@ -720,7 +741,11 @@ pub async fn compress_existing(
 
                 let compressed_path = obj_path.with_extension("zst");
                 if let Err(e) = std::fs::write(&compressed_path, &compressed) {
-                    tracing::error!(oid = %obj.oid, err = %e, "failed to write compressed file");
+                    tracing::error!(
+                        oid = %obj.oid,
+                        error = %lfs_path_error("compressed LFS object", &compressed_path, &e),
+                        "failed to write compressed file"
+                    );
                     continue;
                 }
 
@@ -741,7 +766,11 @@ pub async fn compress_existing(
 
                 // Remove original uncompressed file
                 if let Err(e) = std::fs::remove_file(&obj_path) {
-                    tracing::warn!(oid = %obj.oid, err = %e, "failed to remove original file");
+                    tracing::warn!(
+                        oid = %obj.oid,
+                        error = %lfs_path_error("LFS object file", &obj_path, &e),
+                        "failed to remove original file"
+                    );
                 }
 
                 tracing::info!(
@@ -754,7 +783,11 @@ pub async fn compress_existing(
                 count += 1;
             }
             Err(e) => {
-                tracing::error!(oid = %obj.oid, err = %e, "failed to read original file");
+                tracing::error!(
+                    oid = %obj.oid,
+                    error = %lfs_path_error("LFS object file", &obj_path, &e),
+                    "failed to read original file"
+                );
             }
         }
     }
@@ -820,6 +853,171 @@ pub async fn delete_object_from_storage(
         lfs_object_ops::delete_by_id(db, obj.id).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod compress_existing_log_tests {
+    use super::{compress_existing, lfs_object_path};
+    use std::sync::{Arc, Mutex};
+
+    /// Sink that keeps every formatted log line so a test can assert on what
+    /// the operator would actually have seen. `compress_existing` logs and
+    /// `continue`s on every per-object failure, so there is no `Result` to
+    /// inspect — the log line *is* the interface.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A migrated database holding one uploaded, uncompressed object — exactly
+    /// what `list_uncompressed` hands the compressor.
+    async fn db_with_uncompressed_object(
+        dir: &std::path::Path,
+        oid: &str,
+    ) -> sea_orm::DatabaseConnection {
+        let db_url = format!("sqlite://{}?mode=rwc", dir.join("test.db").display());
+        let db = rg_db::connect_with_pool(&db_url, 5, 60, 2).await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        rg_db::ops::lfs_object_ops::create(
+            &db,
+            rg_db::entities::lfs_object::ActiveModel {
+                id: sea_orm::NotSet,
+                repo_id: sea_orm::Set(1),
+                oid: sea_orm::Set(oid.to_string()),
+                size: sea_orm::Set(7),
+                uploaded: sea_orm::Set(true),
+                compression: sea_orm::Set(None),
+                compressed_size: sea_orm::Set(None),
+                created_at: sea_orm::Set(chrono::Utc::now()),
+            },
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// Permission bits mean nothing to uid 0, so a read-only-directory test
+    /// would see a successful write and fail for the wrong reason.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` reads the calling process's own credentials.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// A bind-mount whose source went missing turns the file into a directory —
+    /// the failure this whole phase started from. `exists()` still says yes, the
+    /// read fails with `EISDIR`, and the errno on its own names nothing: the
+    /// `lfs_root` is computed inside the compressor and the DB row only carries
+    /// an oid.
+    #[tokio::test]
+    async fn read_failure_log_line_names_the_object_file_and_the_storage_hint() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lfs_root = dir.path().join("lfs");
+        let oid = "a".repeat(64);
+        let obj_path = lfs_object_path(&lfs_root, &oid);
+        std::fs::create_dir_all(&obj_path).unwrap();
+
+        let db = db_with_uncompressed_object(dir.path(), &oid).await;
+        let compressed = compress_existing(&db, 1, &lfs_root, 10).await.unwrap();
+
+        assert_eq!(compressed, 0, "a directory is not a compressible object");
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("failed to read original file"),
+            "expected the read-failure error, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&obj_path.display().to_string()),
+            "the failing path is missing from the log line: {rendered}"
+        );
+        assert!(
+            rendered.contains("<owner>.lfs/<repo>/"),
+            "the shared LFS storage hint is missing: {rendered}"
+        );
+    }
+
+    /// The compressor writes `<oid>.zst` next to the object, so an unwritable
+    /// shard directory fails on the write and not on the read. Here the errno is
+    /// `EACCES`, which is the case `describe_path_error` answers with the
+    /// uid/ownership diagnostic instead of the storage hint — the container
+    /// bind-mount story.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_failure_log_line_names_the_compressed_file_and_the_uid_mismatch() {
+        if running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lfs_root = dir.path().join("lfs");
+        let oid = "b".repeat(64);
+        let obj_path = lfs_object_path(&lfs_root, &oid);
+        let shard = obj_path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(&obj_path, b"payload").unwrap();
+        std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let db = db_with_uncompressed_object(dir.path(), &oid).await;
+        let compressed = compress_existing(&db, 1, &lfs_root, 10).await.unwrap();
+
+        // Restore before the assertions so `TempDir` can clean up either way.
+        std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(compressed, 0, "the write failed, nothing was compressed");
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("failed to write compressed file"),
+            "expected the write-failure error, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&obj_path.with_extension("zst").display().to_string()),
+            "the failing path is missing from the log line: {rendered}"
+        );
+        assert!(
+            rendered.contains("this process runs as uid="),
+            "a permission failure must carry the ownership diagnostic: {rendered}"
+        );
+    }
 }
 
 #[cfg(test)]

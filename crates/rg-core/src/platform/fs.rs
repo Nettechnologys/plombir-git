@@ -323,6 +323,17 @@ pub const BLOB_STORAGE_HINT: &str =
     "artifacts, packages, OCI images and LFS objects are stored under the `[server].repo_root` \
      directory; that directory must be writable by the user running forgekeep";
 
+/// Remediation for a filesystem failure on an on-disk LFS object.
+///
+/// The directory is derived from the repository, never echoed back, and the oid
+/// is sharded below it, so nothing on either side of the failure names a path:
+/// the HTTP handlers compute it from the request, and the background compressor
+/// from a database row. Both halves share this hint so an operator gets the same
+/// story whichever one failed first.
+pub const LFS_STORAGE_HINT: &str =
+    "LFS objects live in `<owner>.lfs/<repo>/` under the `[server].repo_root` directory; that \
+     directory must be writable by the user running forgekeep";
+
 /// Remediation for a filesystem failure on a temporary git working tree.
 ///
 /// Creating a repository, editing a file from the web UI and committing a batch

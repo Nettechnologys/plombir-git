@@ -14,16 +14,16 @@ use crate::api::auth::extract_bearer_claims;
 use crate::error::AppError;
 use crate::AppState;
 
+/// Where LFS objects live and what has to be true about that directory. Shared
+/// with the background compressor in `rg_core::lfs::service`, so a handler
+/// failure and a maintenance-pass failure name the same directory the same way.
+use rg_core::platform::fs::LFS_STORAGE_HINT;
+
 #[derive(Debug, Default, Deserialize)]
 pub struct LfsActionQuery {
     expires: Option<i64>,
     signature: Option<String>,
 }
-
-/// Where LFS objects are stored and what has to be true about the directory.
-const LFS_STORAGE_HINT: &str =
-    "LFS objects live in `<owner>.lfs/<repo>/` under the `[server].repo_root` directory; that \
-     directory must be writable by the user running forgekeep";
 
 /// One actionable error for a filesystem failure on an LFS object path.
 ///
