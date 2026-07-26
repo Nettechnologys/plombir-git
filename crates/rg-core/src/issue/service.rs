@@ -1,6 +1,6 @@
 //! Issue service — business logic for Issue CRUD, labels, milestones, comments.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait};
 
@@ -20,8 +20,11 @@ pub async fn create_issue(
     labels: Option<Vec<String>>,
     milestone_id: Option<i64>,
 ) -> Result<Issue> {
+    // `InvalidRequest`, not a bare `bail!`: this is the one outcome here the
+    // caller *did* cause, and it is the only one allowed to become a 400. Every
+    // other failure below is a query of ours and stays a 5xx.
     if title.trim().is_empty() {
-        bail!("issue title cannot be empty");
+        return Err(crate::error::invalid_request("issue title cannot be empty"));
     }
 
     let number = issue_ops::next_number(db, repo_id).await?;
@@ -197,7 +200,7 @@ pub async fn update_issue(
 
     if let Some(t) = title {
         if t.trim().is_empty() {
-            bail!("issue title cannot be empty");
+            return Err(crate::error::invalid_request("issue title cannot be empty"));
         }
         active.title = Set(t);
     }
@@ -206,7 +209,9 @@ pub async fn update_issue(
     }
     if let Some(ref s) = state {
         if s != "open" && s != "closed" {
-            bail!("invalid issue state: {}, must be open or closed", s);
+            return Err(crate::error::invalid_request(format!(
+                "invalid issue state: {s}, must be open or closed"
+            )));
         }
         active.state = Set(s.clone());
         if s == "closed" {
@@ -290,7 +295,9 @@ pub async fn add_comment(
     body: String,
 ) -> Result<Comment> {
     if body.trim().is_empty() {
-        bail!("comment body cannot be empty");
+        return Err(crate::error::invalid_request(
+            "comment body cannot be empty",
+        ));
     }
 
     let issue = get_issue(db, owner, repo_name, issue_number).await?;
@@ -350,7 +357,9 @@ pub async fn update_comment(
     body: String,
 ) -> Result<Comment> {
     if body.trim().is_empty() {
-        bail!("comment body cannot be empty");
+        return Err(crate::error::invalid_request(
+            "comment body cannot be empty",
+        ));
     }
 
     let comment = issue_comment_ops::find_by_id(db, comment_id)

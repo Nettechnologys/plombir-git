@@ -97,7 +97,10 @@ pub async fn add_collaborator(
 
     let user_id = match resolve_collaborator_user_id(&state.db, &req).await {
         Ok(user_id) => user_id,
-        Err(e) => return AppError::bad_request(e.to_string()).into_response(),
+        // The helper types the four ways the request itself can be wrong; the
+        // username/email lookups inside it are ours, and a failed one must not
+        // come back as "no such user".
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::collaborator::service::add_collaborator(
@@ -110,7 +113,9 @@ pub async fn add_collaborator(
     .await
     {
         Ok(collab) => (StatusCode::CREATED, Json(collab)).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // An unknown permission or an already-listed user is 400; an unknown
+        // repository is 404; a failed insert is a 5xx.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -122,7 +127,9 @@ async fn resolve_collaborator_user_id(
         if user_id > 0 {
             return Ok(user_id);
         }
-        anyhow::bail!("user_id must be a positive integer");
+        return Err(rg_core::error::invalid_request(
+            "user_id must be a positive integer",
+        ));
     }
 
     if let Some(username) = req
@@ -134,7 +141,9 @@ async fn resolve_collaborator_user_id(
         return rg_db::ops::user_ops::find_by_username(db, username)
             .await?
             .map(|user| user.id)
-            .ok_or_else(|| anyhow::anyhow!("user '{}' not found", username));
+            .ok_or_else(|| {
+                rg_core::error::invalid_request(format!("user '{username}' not found"))
+            });
     }
 
     if let Some(email) = req
@@ -146,10 +155,12 @@ async fn resolve_collaborator_user_id(
         return rg_db::ops::user_ops::find_by_email(db, email)
             .await?
             .map(|user| user.id)
-            .ok_or_else(|| anyhow::anyhow!("user '{}' not found", email));
+            .ok_or_else(|| rg_core::error::invalid_request(format!("user '{email}' not found")));
     }
 
-    anyhow::bail!("user_id, username, or email is required");
+    Err(rg_core::error::invalid_request(
+        "user_id, username, or email is required",
+    ))
 }
 
 /// Update a collaborator's permission.
@@ -231,6 +242,9 @@ pub async fn remove_collaborator(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Nothing here is the caller's to get wrong: the repo was resolved and
+        // authorized above, and the delete is idempotent. What used to answer 400
+        // was the repository lookup and the delete — both ours.
+        Err(e) => AppError::from(e).into_response(),
     }
 }

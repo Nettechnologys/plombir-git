@@ -241,10 +241,16 @@ pub async fn create_pr(
                     }
                     (StatusCode::CREATED, Json(pr)).into_response()
                 }
-                Err(e) => AppError::bad_request(e.to_string()).into_response(),
+                // `create_pr` marks the two client-side rejections (empty title,
+                // head == base) with `InvalidRequest`; its git reads and inserts
+                // are ours and now keep their 5xx instead of being reported as a
+                // malformed request the caller can never fix.
+                Err(e) => AppError::from(e).into_response(),
             }
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Same for `resolve_head_ref`: an unknown head owner or a head repo that
+        // is not a fork is a 400, a failed lookup behind either is not.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -306,7 +312,9 @@ pub async fn update_pr(
     .await
     {
         Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Rejected title/state/draft transition → 400 from the service's own
+        // markers; an absent PR → 404; a failed write → 5xx.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -456,13 +464,18 @@ pub async fn enable_auto_merge(
     )
     .await
     {
-        return AppError::bad_request(error).into_response();
+        // A closed PR, a draft or a queue run in progress are typed `Conflict`
+        // and answer 409; an unknown PR is 404; the update behind them is ours.
+        return AppError::from(error).into_response();
     }
     match rg_core::pull_request::try_auto_merge(&state.db, &state.repo_root, &owner, &repo, number)
         .await
     {
         Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
-        Err(error) => AppError::bad_request(error).into_response(),
+        // `try_auto_merge` returns every *unsatisfied* condition as a pending
+        // `Ok(outcome)`, so an `Err` here is only ever a git or database failure
+        // — precisely the thing that must never be reported as a bad request.
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -490,7 +503,9 @@ pub async fn disable_auto_merge(
         .await
     {
         Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
-        Err(error) => AppError::bad_request(error).into_response(),
+        // Nothing here is the caller's to get wrong — the PR was resolved and the
+        // write is unconditional — so an unknown PR is 404 and the rest is a 5xx.
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 

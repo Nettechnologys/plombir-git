@@ -176,7 +176,12 @@ pub async fn register(
         }
         Err(e) => {
             crate::metrics::recorder::auth_event("register", "failure");
-            AppError::bad_request(e.to_string()).into_response()
+            // The service types every rule the registration can break (taken
+            // name/email, malformed address, weak password) as `InvalidRequest`.
+            // Hashing the password and inserting the row are ours: with the old
+            // blanket `bad_request` a broken database told the visitor to pick a
+            // different username, and the operator log said nothing at all.
+            AppError::from(e).into_response()
         }
     }
 }
@@ -584,6 +589,9 @@ pub async fn create_token(
         body.scopes.as_deref().unwrap_or("repo"),
     ) {
         Ok(scopes) => scopes,
+        // Client-input validator: `normalize_scopes` is a pure parse of the
+        // caller's `scopes` string and does no I/O, so 400 is the only outcome it
+        // can have.
         Err(e) => return AppError::bad_request(e.to_string()).into_response(),
     };
     let expires_at = body
@@ -763,7 +771,11 @@ pub async fn reset_password(
             )
                 .into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // A spent/expired token and a rejected password are typed
+        // `InvalidRequest` and stay 400; the password hash, the row update and
+        // the token bookkeeping are ours and become a retryable 5xx instead of
+        // telling the user their valid reset link is invalid.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

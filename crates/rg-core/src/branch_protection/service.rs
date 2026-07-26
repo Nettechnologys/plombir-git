@@ -31,7 +31,9 @@ pub async fn create_protection(
         .await?
         .is_some()
     {
-        bail!("branch '{}' is already protected", branch_name);
+        return Err(crate::error::invalid_request(format!(
+            "branch '{branch_name}' is already protected"
+        )));
     }
 
     let model = protected_branch::ActiveModel {

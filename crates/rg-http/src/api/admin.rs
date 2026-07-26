@@ -202,7 +202,11 @@ pub async fn update_user(
             .await;
             (StatusCode::OK, Json(serde_json::json!(user))).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // The service reports an unknown target user as `NotFound`, so that is a
+        // 404 here; the update itself is ours and a failed one is a 5xx. Both used
+        // to answer 400 — with the raw `db: update user by admin` chain in the
+        // body (H-05).
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -566,6 +570,23 @@ pub async fn create_sso_provider(
         return AppError::bad_request(error).into_response();
     }
 
+    // `sso_providers.slug` is UNIQUE, and the insert below is the only place that
+    // ever noticed: the constraint violation came back as a `DbErr` that the
+    // handler relabelled a bad request, raw text and all. Check it here so a
+    // duplicate slug is a 400 that says so, and the insert's own failures are
+    // free to be the 5xx they are.
+    match rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &body.slug).await {
+        Ok(Some(_)) => {
+            return AppError::bad_request(format!(
+                "an SSO provider with slug '{}' already exists",
+                body.slug
+            ))
+            .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => return AppError::from(error).into_response(),
+    }
+
     // Encrypt secrets before storing
     let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
     let client_secret_enc = match body
@@ -613,7 +634,10 @@ pub async fn create_sso_provider(
         Ok(provider) => {
             (StatusCode::CREATED, Json(sso_provider_response(&provider))).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Everything the caller could get wrong was checked above, so what is
+        // left is the insert: a dead pool is a retryable 503 and a statement
+        // failure a 500, neither of them the admin's bad request.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -654,6 +678,22 @@ pub async fn update_sso_provider(
         validate_ldap_provider_request(&body, existing_provider.ldap_bind_password_enc.is_some())
     {
         return AppError::bad_request(error).into_response();
+    }
+
+    // Same UNIQUE constraint as on create — but here the row may legitimately
+    // keep its own slug, so only a *different* provider holding it is a conflict.
+    if body.slug != existing_provider.slug {
+        match rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &body.slug).await {
+            Ok(Some(_)) => {
+                return AppError::bad_request(format!(
+                    "an SSO provider with slug '{}' already exists",
+                    body.slug
+                ))
+                .into_response();
+            }
+            Ok(None) => {}
+            Err(error) => return AppError::from(error).into_response(),
+        }
     }
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
@@ -700,7 +740,9 @@ pub async fn update_sso_provider(
     .await
     {
         Ok(provider) => (StatusCode::OK, Json(sso_provider_response(&provider))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // The provider was resolved and the request validated above; the update
+        // itself is ours, so its failures are a 5xx.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -795,7 +837,9 @@ pub async fn delete_sso_provider(
     }
     match rg_db::ops::sso_provider_ops::delete_by_id(&state.db, id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // The two client-side outcomes (unknown provider, provider still linked)
+        // were answered above; a failed DELETE is ours.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

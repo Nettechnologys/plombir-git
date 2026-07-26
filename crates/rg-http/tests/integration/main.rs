@@ -72,6 +72,7 @@ mod repo_write_failure_status_tests;
 mod review_lookup_failure_status_tests;
 mod runner_auth_tests;
 mod runner_workspace_tests;
+mod service_failure_status_sweep_tests;
 mod service_failure_status_tests;
 mod ssh_key_tests;
 mod tail_lookup_failure_status_tests;

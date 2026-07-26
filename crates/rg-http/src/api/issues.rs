@@ -374,7 +374,10 @@ pub async fn create_issue(
             let issue = issue_with_author(&state.db, issue).await;
             (StatusCode::CREATED, Json(issue)).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // The service marks its one client-side outcome (an empty title) with
+        // `InvalidRequest`; the blanket `bad_request` called a failed insert or a
+        // dead connection a malformed request too, so nothing was ever retried.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -468,7 +471,9 @@ pub async fn update_issue(
             let issue = issue_with_author(&state.db, issue).await;
             (StatusCode::OK, Json(issue)).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // An unknown issue is now the 404 the service reports, a rejected title
+        // or state stays 400, and a failed update is finally a 5xx.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -544,7 +549,9 @@ pub async fn add_comment(
             let comment = comment_with_author(&state.db, comment).await;
             (StatusCode::CREATED, Json(comment)).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Empty body → 400 (typed in the service), unknown issue → 404, failed
+        // insert → 5xx. All three used to be 400.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -751,7 +758,10 @@ pub async fn create_milestone(
     };
     match rg_db::ops::milestone_ops::create(&state.db, model).await {
         Ok(m) => (StatusCode::CREATED, Json(serde_json::json!(m))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Nothing about this call can fail on the caller's account — the request
+        // was fully validated above and this is a plain insert. `bad_request`
+        // here turned a dead connection pool into "your milestone is malformed".
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

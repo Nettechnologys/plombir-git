@@ -238,7 +238,12 @@ pub async fn create_repo(
             // and the import subsystem both count through one site.
             (StatusCode::CREATED, Json(serde_json::json!(repo))).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // A rejected name and a name already in use are typed `InvalidRequest`
+        // and stay 400. The `gix init`, the `create_dir_all` under `repo_root`
+        // and the insert are ours: a bind-mounted repo root the process cannot
+        // write used to be reported as the caller's malformed request, with the
+        // errno and the server-side path in the body (H-05).
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -773,7 +778,11 @@ pub async fn fork_repo_handler(
             crate::metrics::recorder::repo_forked();
             (StatusCode::ACCEPTED, Json(serde_json::json!(repo))).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Absent source → 404, private source the caller may not read → 403, name
+        // already taken in their account → 400. The `git clone --bare` behind all
+        // of them is ours and finally reports as a 5xx instead of handing the
+        // client the git command line in a 400 body.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -890,7 +899,10 @@ pub async fn transfer_repo_handler(
 
             (StatusCode::OK, Json(serde_json::json!(repo))).into_response()
         }
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Unknown repository → 404, non-owner → 403, unknown destination owner or
+        // a name already taken there → 400. The directory rename that moves the
+        // repository on disk is ours and no longer masquerades as a bad request.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -973,7 +985,9 @@ pub async fn create_commit_status(
     .await
     {
         Ok(status) => (StatusCode::CREATED, Json(serde_json::json!(status))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // An unknown status state is the only thing the caller can get wrong here
+        // and keeps its 400; the upsert behind it is ours.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

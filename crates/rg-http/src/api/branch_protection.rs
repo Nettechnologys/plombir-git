@@ -130,7 +130,10 @@ pub async fn create_protection(
     .await
     {
         Ok(protection) => (StatusCode::CREATED, Json(protection)).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // An already-protected branch stays 400 (typed in the service), an
+        // unknown repository is the 404 `resolve_repo` reports, and the insert
+        // failing is a 5xx — all three were 400.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -210,7 +213,10 @@ pub async fn update_protection(
     .await
     {
         Ok(protection) => (StatusCode::OK, Json(protection)).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // The scoped lookup already reports a missing (or foreign) rule as
+        // `NotFound`; matching `get_protection` above, that is a 404 here rather
+        // than a bad request, and a failed update is a 5xx.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -246,6 +252,7 @@ pub async fn delete_protection(
     .await
     {
         Ok(()) => (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Same split as the update above: absent rule → 404, failed delete → 5xx.
+        Err(e) => AppError::from(e).into_response(),
     }
 }

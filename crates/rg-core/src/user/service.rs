@@ -61,26 +61,38 @@ pub struct AuthResponse {
 /// - Must not contain path traversal sequences (`..` or `/`)
 ///
 /// Returns `Ok(())` if valid, `Err` with a descriptive message otherwise.
+/// Every rejection here is a rule the *request* broke, so each one carries
+/// `InvalidRequest` and is allowed to reach the client verbatim as a 400. This
+/// function performs no I/O, so it has no other kind of failure to confuse it
+/// with — but its callers do, and they used to answer 400 to those too.
 pub fn validate_username(username: &str) -> Result<()> {
     if username.len() < 3 || username.len() > 30 {
-        bail!("username must be between 3 and 30 characters");
+        return Err(crate::error::invalid_request(
+            "username must be between 3 and 30 characters",
+        ));
     }
 
     let first_char = username.chars().next().unwrap(); // len >= 3, safe to unwrap
     if !first_char.is_ascii_alphanumeric() {
-        bail!("username must start with an alphanumeric character");
+        return Err(crate::error::invalid_request(
+            "username must start with an alphanumeric character",
+        ));
     }
 
     if !username
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        bail!("username must only contain alphanumeric characters, hyphens, and underscores");
+        return Err(crate::error::invalid_request(
+            "username must only contain alphanumeric characters, hyphens, and underscores",
+        ));
     }
 
     // Path traversal prevention
     if username.contains("..") || username.contains('/') {
-        bail!("username contains invalid characters");
+        return Err(crate::error::invalid_request(
+            "username contains invalid characters",
+        ));
     }
 
     Ok(())
@@ -96,16 +108,23 @@ pub async fn register(
     plaintext_password: &str,
     jwt_secret: &str,
 ) -> Result<AuthResponse> {
-    // Validate inputs
-    rg_db::ops::user_ops::find_by_username(db, username)
+    // Validate inputs. The taken-name / taken-email checks are the caller's to
+    // fix and carry `InvalidRequest`; the lookups performing them are ours, and
+    // a failed one now stays a 5xx instead of telling the client its own
+    // registration was malformed.
+    if rg_db::ops::user_ops::find_by_username(db, username)
         .await?
-        .map(|_| ())
-        .map_or(Ok(()), |_| {
-            bail!("username '{}' is already taken", username)
-        })?;
+        .is_some()
+    {
+        return Err(crate::error::invalid_request(format!(
+            "username '{username}' is already taken"
+        )));
+    }
 
     if user_ops::find_by_email(db, email).await?.is_some() {
-        bail!("email '{}' is already registered", email);
+        return Err(crate::error::invalid_request(format!(
+            "email '{email}' is already registered"
+        )));
     }
 
     // ── Username validation ──────────────────────────────────────
@@ -114,14 +133,18 @@ pub async fn register(
     // ── Email validation ─────────────────────────────────────────
     match email.split_once('@') {
         Some((local, domain)) if !local.is_empty() && !domain.is_empty() => {}
-        _ => bail!("email must contain '@' with a non-empty local and domain part"),
+        _ => {
+            return Err(crate::error::invalid_request(
+                "email must contain '@' with a non-empty local and domain part",
+            ))
+        }
     }
 
     // ── Password validation ──────────────────────────────────────
     let password_validator = password::PasswordValidator::standard();
     password_validator
         .validate_with_username(plaintext_password, username)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(|e| crate::error::invalid_request(e.to_string()))?;
 
     let password_hash =
         password::hash_password(plaintext_password).context("failed to hash password")?;
@@ -567,6 +590,14 @@ pub async fn update_user_admin(
     is_admin: Option<bool>,
     is_active: Option<bool>,
 ) -> Result<UserInfo> {
+    // `user_ops::update_by_id` reports an absent row as an untyped
+    // `anyhow!("user {id} not found")`, which one layer up is indistinguishable
+    // from the lookup itself failing — and `rg-db` sits *below* `rg-core`, so it
+    // cannot build the marker. Resolve the row here so "no such user" is a typed
+    // 404 (without the id in the body) and a broken query stays a 5xx.
+    if user_ops::find_by_id(db, target_user_id).await?.is_none() {
+        return Err(crate::error::not_found("user"));
+    }
     let updated =
         user_ops::update_by_id(db, target_user_id, display_name, bio, is_admin, is_active).await?;
     Ok(updated.into())
@@ -726,9 +757,11 @@ pub async fn reset_password(
     let token_hash = hex::encode(sha2::Sha256::digest(raw_token.as_bytes()));
 
     let token_record = rg_db::ops::password_reset_token_ops::find_by_hash(db, &token_hash).await?;
+    // A token that is absent, spent or expired is the caller's problem and
+    // answers 400; the lookup that decides it is ours and answers 5xx.
     let token = match token_record {
         Some(t) if !t.used && t.expires_at > Utc::now() => t,
-        _ => bail!("invalid or expired reset token"),
+        _ => return Err(crate::error::invalid_request("invalid or expired reset token")),
     };
 
     // Validate new password
@@ -741,13 +774,15 @@ pub async fn reset_password(
     // function ends by minting a JWT. Reported as a bad token rather than as
     // "disabled" — the holder of the link has proved nothing yet.
     if !user.is_usable() {
-        bail!("invalid or expired reset token");
+        return Err(crate::error::invalid_request(
+            "invalid or expired reset token",
+        ));
     }
 
     let password_validator = password::PasswordValidator::standard();
     password_validator
         .validate_with_username(new_password, &user.username)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(|e| crate::error::invalid_request(e.to_string()))?;
 
     let new_hash = password::hash_password(new_password).context("failed to hash new password")?;
 

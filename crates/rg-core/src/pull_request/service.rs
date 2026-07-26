@@ -29,11 +29,16 @@ pub async fn create_pr(
     head_repo_id: Option<i64>,
     is_draft: bool,
 ) -> Result<PullRequest> {
+    // The two things the caller can get wrong here carry `InvalidRequest`;
+    // everything after them is a query or a git read of ours, and a failure
+    // there must not be reported as a malformed request.
     if title.trim().is_empty() {
-        bail!("PR title cannot be empty");
+        return Err(crate::error::invalid_request("PR title cannot be empty"));
     }
     if head_branch == base_branch {
-        bail!("head and base branches cannot be the same");
+        return Err(crate::error::invalid_request(
+            "head and base branches cannot be the same",
+        ));
     }
 
     let number = pull_request_ops::next_number(db, repo_id).await?;
@@ -141,9 +146,14 @@ pub async fn resolve_head_ref(
     if let Some((head_owner, head_branch)) = head_ref.split_once(':') {
         // Cross-repo (fork) PR: "owner:branch"
         let head_branch = head_branch.to_string();
+        // The head ref is client input, so an unknown owner in it is the
+        // caller's mistake — `InvalidRequest` keeps it a 400 while a failed
+        // lookup on the same line stays a 5xx.
         let head_owner_user = user_ops::find_by_username(db, head_owner)
             .await?
-            .with_context(|| format!("head owner '{}' not found", head_owner))?;
+            .ok_or_else(|| {
+                crate::error::invalid_request(format!("head owner '{head_owner}' not found"))
+            })?;
 
         // Find the target repo to compare
         let target_repo = repo_entity::Entity::find_by_id(target_repo_id)
@@ -157,20 +167,19 @@ pub async fn resolve_head_ref(
             let fork_repo =
                 repo_ops::find_by_owner_and_name(db, head_owner_user.id, &target_repo.name)
                     .await?
-                    .with_context(|| {
-                        format!(
+                    .ok_or_else(|| {
+                        crate::error::invalid_request(format!(
                             "no repository '{}/{}' found for head owner",
                             head_owner, target_repo.name
-                        )
+                        ))
                     })?;
 
             // Verify it's actually a fork of the target
             if fork_repo.origin_repo_id != Some(target_repo_id) && fork_repo.id != target_repo_id {
-                bail!(
+                return Err(crate::error::invalid_request(format!(
                     "'{}/{}' is not a fork of the target repository",
-                    head_owner,
-                    target_repo.name
-                );
+                    head_owner, target_repo.name
+                )));
             }
 
             return Ok((head_branch, Some(fork_repo.id)));
@@ -283,7 +292,7 @@ pub async fn update_pr(
 
     if let Some(t) = title {
         if t.trim().is_empty() {
-            bail!("PR title cannot be empty");
+            return Err(crate::error::invalid_request("PR title cannot be empty"));
         }
         pr.title = t;
     }
@@ -292,7 +301,9 @@ pub async fn update_pr(
     }
     if let Some(draft) = is_draft {
         if pr.state != "open" {
-            bail!("only an open pull request can change draft status");
+            return Err(crate::error::invalid_request(
+                "only an open pull request can change draft status",
+            ));
         }
         pr.is_draft = draft;
     }
@@ -325,7 +336,11 @@ pub async fn update_pr(
                     }
                 }
             }
-            _ => bail!("invalid PR state: {}", s),
+            _ => {
+                return Err(crate::error::invalid_request(format!(
+                    "invalid PR state: {s}"
+                )))
+            }
         }
     }
 
@@ -888,15 +903,25 @@ pub async fn enable_auto_merge(
     actor_id: i64,
 ) -> Result<PullRequest> {
     let pr = get_pr(db, owner, repo_name, number).await?;
+    // All three refusals are about the PR's *state*, which is what `Conflict`
+    // (409) says: the same request succeeds once the state changes. The merge
+    // endpoint next door already answers this way; here they left as a blanket
+    // 400 together with the queue lookup and the update below.
     if pr.state != "open" {
-        bail!("auto-merge can only be enabled for an open pull request");
+        return Err(crate::error::conflict(
+            "auto-merge can only be enabled for an open pull request",
+        ));
     }
     if pr.is_draft {
-        bail!("auto-merge cannot be enabled for a draft pull request");
+        return Err(crate::error::conflict(
+            "auto-merge cannot be enabled for a draft pull request",
+        ));
     }
     if let Some(entry) = rg_db::ops::merge_queue_ops::find_by_pr(db, pr.id).await? {
         if entry.status == "running" {
-            bail!("cannot enable auto-merge while the merge queue is processing this PR");
+            return Err(crate::error::conflict(
+                "cannot enable auto-merge while the merge queue is processing this PR",
+            ));
         }
         if entry.status == "queued" {
             rg_db::ops::merge_queue_ops::cancel(db, pr.id).await?;

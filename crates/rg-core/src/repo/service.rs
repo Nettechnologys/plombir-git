@@ -169,10 +169,11 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
         return Ok((org.owner_id, Some(org.id), org.name.clone()));
     }
 
-    bail!(
-        "owner '{}' not found (neither user nor organization)",
-        owner
-    )
+    // The owner name is client input (a repo's target namespace), so naming one
+    // that does not exist is a bad request, not a failed query.
+    Err(crate::error::invalid_request(format!(
+        "owner '{owner}' not found (neither user nor organization)"
+    )))
 }
 
 /// Find a repository by owner name (user or org) and repo name.
@@ -389,16 +390,22 @@ pub async fn create_repo_with_opts(
     let owner_id = opts.owner_id;
     let name = &opts.name;
 
-    // Validate repo name (prevents path traversal via repo name)
-    crate::validate_repo_name(name)
-        .with_context(|| format!("invalid repository name: {}", name))?;
+    // Validate repo name (prevents path traversal via repo name). Both this and
+    // the name conflict below are the caller's to fix and carry
+    // `InvalidRequest`; the git init, the `create_dir_all` and every query in
+    // this function are ours and must not be reported as a bad request.
+    crate::validate_repo_name(name).map_err(|error| {
+        crate::error::invalid_request(format!("invalid repository name: {name} ({error})"))
+    })?;
 
     // Check name conflict (per owner)
     if repo_ops::find_by_owner_and_name(db, owner_id, name)
         .await?
         .is_some()
     {
-        bail!("repository '{}' already exists", name);
+        return Err(crate::error::invalid_request(format!(
+            "repository '{name}' already exists"
+        )));
     }
 
     // Determine path prefix: org name or user name
@@ -815,16 +822,21 @@ pub async fn fork_repo(
     repo_name: &str,
     repo_root: &std::path::Path,
 ) -> Result<rg_db::entities::repository::Model> {
+    // Absent source → 404, refused read → 403, name already taken → 400. Each
+    // outcome carries its own type so the clone, the `create_dir_all` and the
+    // queries in between keep their 5xx instead of all four answering 400.
     let source_repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("source repository not found"))?;
+        .ok_or_else(|| crate::error::not_found("repository"))?;
 
-    if source_repo.is_private
-        && !can_read_repo(db, &source_repo, Some(user_id)).await?
-    {
-        bail!("permission denied: cannot read private repository");
+    if source_repo.is_private && !can_read_repo(db, &source_repo, Some(user_id)).await? {
+        return Err(crate::error::forbidden(
+            "cannot read private repository",
+        ));
     }
 
+    // The forker id comes from a verified token, so a missing row here is our
+    // inconsistency, not the caller's — it stays an untyped 500.
     let forker = user_ops::find_by_id(db, user_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("user not found"))?;
@@ -833,7 +845,9 @@ pub async fn fork_repo(
         .await?
         .is_some()
     {
-        bail!("repository '{}' already exists in your account", repo_name);
+        return Err(crate::error::invalid_request(format!(
+            "repository '{repo_name}' already exists in your account"
+        )));
     }
 
     let source_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
@@ -911,10 +925,12 @@ pub async fn transfer_repo(
 ) -> Result<rg_db::entities::repository::Model> {
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+        .ok_or_else(|| crate::error::not_found("repository"))?;
 
     if repo.owner_id != user_id {
-        bail!("only repository owner can transfer");
+        return Err(crate::error::forbidden(
+            "only the repository owner can transfer it",
+        ));
     }
 
     let (new_owner_id, new_org_id, new_owner_name) = resolve_owner(db, new_owner).await?;
@@ -923,7 +939,9 @@ pub async fn transfer_repo(
         .await?
         .is_some()
     {
-        bail!("repository '{}' already exists at destination", repo_name);
+        return Err(crate::error::invalid_request(format!(
+            "repository '{repo_name}' already exists at destination"
+        )));
     }
 
     let old_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
@@ -967,11 +985,9 @@ pub async fn create_commit_status(
 ) -> Result<rg_db::entities::commit_status::Model> {
     let valid_states = ["pending", "success", "failure", "error"];
     if !valid_states.contains(&state) {
-        bail!(
-            "invalid commit status state: '{}', must be one of: {:?}",
-            state,
-            valid_states
-        );
+        return Err(crate::error::invalid_request(format!(
+            "invalid commit status state: '{state}', must be one of: {valid_states:?}"
+        )));
     }
 
     let now = Utc::now();

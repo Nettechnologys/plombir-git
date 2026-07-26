@@ -1,6 +1,6 @@
 //! Collaborator service — repo collaborators + permission management.
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use sea_orm::{DatabaseConnection, Set};
 
@@ -17,24 +17,26 @@ pub async fn add_collaborator(
 ) -> Result<RepoCollaborator> {
     let repo = resolve_repo(db, owner, repo_name).await?;
 
-    // Validate permission
+    // Validate permission. Typed like its sibling in `update_permission`: only
+    // these two outcomes are the caller's fault, and only they may answer 400 —
+    // the `resolve_repo` above and the insert below are ours.
     match permission.as_str() {
         "read" | "write" | "admin" => {}
-        _ => bail!(
-            "invalid permission: {}, must be read/write/admin",
-            permission
-        ),
+        _ => {
+            return Err(crate::error::invalid_request(format!(
+                "invalid permission: {permission}, must be read/write/admin"
+            )))
+        }
     }
 
     // Check if already a collaborator
     if let Some(existing) =
         repo_collaborator_ops::find_by_repo_and_user(db, repo.id, user_id).await?
     {
-        bail!(
+        return Err(crate::error::invalid_request(format!(
             "user {} is already a collaborator (permission: {})",
-            user_id,
-            existing.permission
-        );
+            user_id, existing.permission
+        )));
     }
 
     let model = repo_collaborator::ActiveModel {
@@ -139,10 +141,13 @@ async fn resolve_repo(
     owner: &str,
     repo_name: &str,
 ) -> Result<rg_db::entities::repository::Model> {
+    // `NotFound`, not `.context(...)`: an unknown owner or repository is a 404,
+    // and the untyped context made it indistinguishable from a failed lookup —
+    // which the handlers then reported as the caller's bad request.
     let user = rg_db::ops::user_ops::find_by_username(db, owner)
         .await?
-        .context("owner not found")?;
+        .ok_or_else(|| crate::error::not_found("repository"))?;
     repo_ops::find_by_owner_and_name(db, user.id, repo_name)
         .await?
-        .context("repository not found")
+        .ok_or_else(|| crate::error::not_found("repository"))
 }
