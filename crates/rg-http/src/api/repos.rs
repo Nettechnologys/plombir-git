@@ -3,6 +3,13 @@
 //! POST /api/v1/repos              — create repo (auth required)
 //! GET  /api/v1/repos/:owner       — list repos by owner (user or org)
 //! GET  /api/v1/repos/:owner/:name — get single repo
+//!
+//! Starring and watching are read-scoped actions, so they go through
+//! [`crate::api::repo_access::require_authenticated_read`] rather than merely
+//! authenticating the caller. `watch` in particular subscribes the caller to
+//! notifications that carry the repository's content (PR titles, branch and
+//! milestone names), so an ungated subscribe is a content leak, not just an
+//! existence oracle telling `200` from `404 repository not found`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -389,19 +396,14 @@ pub async fn star_repo(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.jwt_secret) {
-        Some(user_id) => user_id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    // Read-scoped: see the module note on starring/watching a private repo.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::repo::service::toggle_star(&state.db, user_id, repo.id).await {
         Ok(starred) => {
@@ -437,19 +439,14 @@ pub async fn get_starred_status(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.jwt_secret) {
-        Some(user_id) => user_id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    // Read-scoped: see the module note on starring/watching a private repo.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::repo::service::is_starred(&state.db, user_id, repo.id).await {
         Ok(starred) => (
@@ -523,19 +520,14 @@ pub async fn get_watch_status(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.jwt_secret) {
-        Some(user_id) => user_id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    // Read-scoped: see the module note on starring/watching a private repo.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::repo::service::get_watch(&state.db, user_id, repo.id).await {
         Ok(watch_state) => (
@@ -570,19 +562,14 @@ pub async fn watch_repo(
     Path((owner, name)): Path<(String, String)>,
     Json(body): Json<WatchRequest>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.jwt_secret) {
-        Some(user_id) => user_id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    // Read-scoped: see the module note on starring/watching a private repo.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, &body.state).await {
         Ok(watch_state) => (
@@ -613,19 +600,14 @@ pub async fn unwatch_repo(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.jwt_secret) {
-        Some(user_id) => user_id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    // Read-scoped: see the module note on starring/watching a private repo.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, "not_watching").await {
         Ok(_) => (

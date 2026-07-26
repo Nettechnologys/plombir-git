@@ -88,6 +88,15 @@ pub async fn delete_notification_for_user(
 // ── Watch notification helpers ─────────────────────────────────────────
 
 /// Notify all watchers of a repository about an event.
+///
+/// Every watcher is re-checked against [`crate::repo::service::can_read_repo`]
+/// before delivery. A watch row outlives the access that created it — the repo
+/// can be flipped to private, a collaborator removed, or the row predate the
+/// read gate on the subscribe endpoint — and the notification body carries the
+/// repository's content (PR titles, branch and milestone names). Gating only
+/// the subscribe endpoint would keep serving all three cases, so the check
+/// lives here, at the single point every watch notification passes through.
+/// A failed check drops the recipient rather than delivering to them.
 pub async fn notify_watchers(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -99,6 +108,15 @@ pub async fn notify_watchers(
     let watchers = rg_db::ops::repo_watch_ops::list_watchers(db, repo_id, 0, 1000)
         .await?
         .0;
+    if watchers.is_empty() {
+        return Ok(());
+    }
+    // A repo that is gone (or soft-deleted) has nobody left to notify. Loading
+    // it here also gives `can_read_repo` the model it needs, which short-circuits
+    // to `true` for a public repo without touching the DB again.
+    let Some(repo) = rg_db::ops::repo_ops::find_by_id(db, repo_id).await? else {
+        return Ok(());
+    };
     // Resolve author once outside the loop to avoid N+1 queries
     let author_opt = if author_name.is_empty() {
         None
@@ -112,6 +130,25 @@ pub async fn notify_watchers(
         // Don't notify the author themselves
         if let Some(ref author) = author_opt {
             if author.id == watcher.user_id {
+                continue;
+            }
+        }
+        match crate::repo::service::can_read_repo(db, &repo, Some(watcher.user_id)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    "Skipping watcher {} for {notification_type}: no read access to repo {repo_id}",
+                    watcher.user_id
+                );
+                continue;
+            }
+            Err(e) => {
+                // Fail closed: an unreadable permission answer must not become
+                // a delivered notification.
+                tracing::warn!(
+                    "Skipping watcher {} for {notification_type}: read check failed: {e}",
+                    watcher.user_id
+                );
                 continue;
             }
         }
