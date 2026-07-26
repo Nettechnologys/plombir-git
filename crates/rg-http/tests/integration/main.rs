@@ -67,6 +67,7 @@ mod private_repo_issue_metadata_tests;
 mod private_repo_visibility_tests;
 mod push_hook_drain_tests;
 mod release_attestation_tests;
+mod registry_lockout_tests;
 mod release_tests;
 mod repo_content_failure_status_tests;
 mod repo_read_gate_tests;

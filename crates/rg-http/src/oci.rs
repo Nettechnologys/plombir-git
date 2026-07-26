@@ -344,11 +344,34 @@ async fn authenticate_basic(
     )
     .with_context(|| format!("registry basic auth: verifying the password of '{user}'"))?;
 
-    // Checked after the hash, so a disabled account is not distinguishable
-    // from a wrong password by how fast the registry says no.
-    match found {
-        Some(u) if password_ok && u.is_usable() => Ok((user.to_string(), Some(u.id))),
-        _ => anonymous(),
+    // Settled after the hash, so neither a deactivated nor a locked account is
+    // distinguishable from a wrong password by how fast the registry says no.
+    // The same helper runs on the SSH password door: without it `docker login`
+    // was an unmetered, unlogged place to guess passwords the web login stops
+    // after five tries.
+    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
+    let attempt = rg_core::auth::lockout::settle_password_attempt(
+        db,
+        found.as_ref(),
+        password_ok,
+        rg_core::auth::lockout::AttemptOrigin {
+            login: user,
+            channel: "registry",
+            ip_address: ip_address.as_deref(),
+            user_agent: user_agent.as_deref(),
+        },
+    )
+    .await;
+
+    match attempt {
+        rg_core::auth::lockout::PasswordAttempt::Accepted => {
+            let user_id = found
+                .as_ref()
+                .map(|found| found.id)
+                .expect("an accepted password attempt resolved to an account");
+            Ok((user.to_string(), Some(user_id)))
+        }
+        rg_core::auth::lockout::PasswordAttempt::Rejected { .. } => anonymous(),
     }
 }
 

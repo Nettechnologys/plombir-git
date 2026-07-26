@@ -4,6 +4,7 @@ pub mod ci_token;
 pub mod encryption;
 pub mod jwt;
 pub mod ldap;
+pub mod lockout;
 pub mod oci_token;
 pub mod password;
 pub mod pat_scope;

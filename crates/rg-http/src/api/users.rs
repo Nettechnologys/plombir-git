@@ -362,8 +362,15 @@ pub async fn login(
                     // brute-force protection into a no-op with nothing in the
                     // log. Default stays permissive (the login already failed);
                     // only the silence goes away.
-                    locked = match rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5)
-                        .await
+                    // The threshold is shared with the SSH and registry password
+                    // doors, so raising it here cannot leave them counting to a
+                    // different number.
+                    locked = match rg_db::ops::user_ops::record_failed_login(
+                        &state.db,
+                        user.id,
+                        rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS,
+                    )
+                    .await
                     {
                         Ok(locked) => locked,
                         Err(error) => {

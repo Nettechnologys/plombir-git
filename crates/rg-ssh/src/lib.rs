@@ -255,7 +255,7 @@ impl russh::server::Server for SshServer {
         let handler = SshHandler {
             shared: self.shared.clone(),
             id: self.id,
-            _peer: peer,
+            peer,
             channel: None,
             authenticated_identity: None,
             git_protocol_version: "1".to_string(),
@@ -274,7 +274,9 @@ impl russh::server::Server for SshServer {
 struct SshHandler {
     shared: Arc<SharedState>,
     id: usize,
-    _peer: Option<std::net::SocketAddr>,
+    /// Client address, recorded against rejected password attempts so a run of
+    /// failures in `login_log` names where it came from.
+    peer: Option<std::net::SocketAddr>,
     /// The channel opened by the client for this session.
     channel: Option<Channel<Msg>>,
     /// Repository-scoped identity resolved during authentication.
@@ -458,17 +460,37 @@ impl Handler for SshHandler {
             }
         };
 
-        // `is_usable` is read after the hash, never before: skipping the
-        // verification for a disabled account would answer "is this account
-        // disabled?" through the response time.
-        match found {
-            Some(user) if password_ok && user.is_usable() => {
-                self.authenticated_identity = Some(AuthenticatedIdentity::User(user.id));
+        // The lockout is applied after the hash, never before: an early exit
+        // for a locked account would answer "is this account locked?" — and so
+        // "does it exist?" — through the response time. The same helper runs on
+        // the registry's `docker login`, so the SSH port can no longer be used
+        // to walk past a threshold the web login enforces.
+        let peer_ip = self.peer.map(|peer| peer.ip().to_string());
+        let attempt = rg_core::auth::lockout::settle_password_attempt(
+            db,
+            found.as_ref(),
+            password_ok,
+            rg_core::auth::lockout::AttemptOrigin {
+                login: username,
+                channel: "ssh",
+                ip_address: peer_ip.as_deref(),
+                user_agent: None,
+            },
+        )
+        .await;
+
+        match attempt {
+            rg_core::auth::lockout::PasswordAttempt::Accepted => {
+                let user_id = found
+                    .as_ref()
+                    .map(|user| user.id)
+                    .expect("an accepted password attempt resolved to an account");
+                self.authenticated_identity = Some(AuthenticatedIdentity::User(user_id));
                 tracing::info!(username, "SSH password auth accepted");
                 Ok(Auth::Accept)
             }
-            _ => {
-                tracing::warn!(username, "SSH password auth rejected");
+            rg_core::auth::lockout::PasswordAttempt::Rejected { locked } => {
+                tracing::warn!(username, locked, "SSH password auth rejected");
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
                     partial_success: false,
