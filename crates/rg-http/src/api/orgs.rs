@@ -205,12 +205,21 @@ pub async fn create_org(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn get_org(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
-    match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(org)) => Json(org_to_response(&org)).into_response(),
-        Ok(None) => AppError::not_found("organization not found").into_response(),
-        Err(e) => AppError::from(e).into_response(),
+pub async fn get_org(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
+        return e.into_response();
     }
+
+    Json(org_to_response(&org)).into_response()
 }
 
 /// GET /api/v1/orgs
@@ -253,6 +262,7 @@ pub async fn list_orgs(State(state): State<AppState>, headers: HeaderMap) -> imp
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn update_org(
@@ -261,21 +271,17 @@ pub async fn update_org(
     Path(name): Path<String>,
     Json(body): Json<UpdateOrgRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    let user_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
     };
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
     };
+    if let Err(e) = require_org_admin(&state.db, &org, user_id).await {
+        return e.into_response();
+    }
 
     match rg_core::org::update_org(
         &state.db,
@@ -322,6 +328,7 @@ pub async fn update_org(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn delete_org(
@@ -329,22 +336,17 @@ pub async fn delete_org(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    let user_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
     };
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
     };
 
+    // No `require_org_admin` here on purpose: deleting an organization is
+    // owner-only, and `rg_core::org::delete_org` enforces exactly that.
     match rg_core::org::delete_org(&state.db, org.id, user_id).await {
         Ok(()) => {
             let details = serde_json::json!({"name": org.name});
@@ -387,17 +389,17 @@ pub async fn delete_org(
 )]
 pub async fn list_org_members(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
     };
+    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
+        return e.into_response();
+    }
 
     match rg_core::org::list_org_members(&state.db, org.id).await {
         Ok(members) => {
@@ -430,6 +432,7 @@ pub async fn list_org_members(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn add_org_member(
@@ -438,21 +441,17 @@ pub async fn add_org_member(
     Path(name): Path<String>,
     Json(body): Json<AddOrgMemberRequest>,
 ) -> impl IntoResponse {
-    let actor_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    let actor_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
     };
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
     };
+    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
+        return e.into_response();
+    }
 
     let role = body.role.as_deref().unwrap_or("member");
 
@@ -503,6 +502,7 @@ pub async fn add_org_member(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn remove_org_member(
@@ -510,21 +510,17 @@ pub async fn remove_org_member(
     headers: HeaderMap,
     Path((name, user_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    let actor_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    let actor_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
     };
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
     };
+    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
+        return e.into_response();
+    }
 
     match rg_core::org::remove_org_member(&state.db, org.id, user_id).await {
         Ok(()) => {
@@ -565,22 +561,26 @@ pub async fn remove_org_member(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn create_team(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<CreateTeamRequest>,
 ) -> impl IntoResponse {
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let actor_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
     };
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
+        return e.into_response();
+    }
 
     let permission = body.permission.as_deref().unwrap_or("read");
 
@@ -622,17 +622,17 @@ pub async fn create_team(
 )]
 pub async fn list_org_teams(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let org = match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return AppError::not_found("organization not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
     };
+    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
+        return e.into_response();
+    }
 
     match rg_core::org::list_org_teams(&state.db, org.id).await {
         Ok(teams) => {
@@ -670,22 +670,32 @@ pub async fn list_org_teams(
 )]
 pub async fn get_team(
     State(state): State<AppState>,
-    Path((_name, team_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    Path((name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    match rg_core::org::get_team(&state.db, team_id).await {
-        Ok(Some(t)) => Json(TeamResponse {
-            id: t.id,
-            org_id: t.org_id,
-            name: t.name,
-            description: t.description,
-            permission: t.permission,
-            created_at: t.created_at.to_string(),
-            updated_at: t.updated_at.to_string(),
-        })
-        .into_response(),
-        Ok(None) => AppError::not_found("team not found").into_response(),
-        Err(e) => AppError::from(e).into_response(),
+    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
+        return e.into_response();
     }
+    let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
+        Ok(team) => team,
+        Err(e) => return e.into_response(),
+    };
+
+    Json(TeamResponse {
+        id: team.id,
+        org_id: team.org_id,
+        name: team.name,
+        description: team.description,
+        permission: team.permission,
+        created_at: team.created_at.to_string(),
+        updated_at: team.updated_at.to_string(),
+    })
+    .into_response()
 }
 
 /// DELETE /api/v1/orgs/:name/teams/:team_id
@@ -701,13 +711,31 @@ pub async fn get_team(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn delete_team(
     State(state): State<AppState>,
-    Path((_name, team_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    Path((name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    match rg_core::org::delete_team(&state.db, team_id).await {
+    let actor_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
+        return e.into_response();
+    }
+    let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
+        Ok(team) => team,
+        Err(e) => return e.into_response(),
+    };
+
+    match rg_core::org::delete_team(&state.db, team.id).await {
         Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
         // Only the typed `NotFound` the service raises for an absent team may
         // become a `404` here; a failed delete is ours and stays a 5xx (its
@@ -733,9 +761,23 @@ pub async fn delete_team(
 )]
 pub async fn list_team_members(
     State(state): State<AppState>,
-    Path((_name, team_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    Path((name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    match rg_core::org::list_team_members(&state.db, team_id).await {
+    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
+        return e.into_response();
+    }
+    let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
+        Ok(team) => team,
+        Err(e) => return e.into_response(),
+    };
+
+    match rg_core::org::list_team_members(&state.db, team.id).await {
         Ok(members) => {
             let resp: Vec<TeamMemberResponse> = members
                 .into_iter()
@@ -767,16 +809,34 @@ pub async fn list_team_members(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn add_team_member(
     State(state): State<AppState>,
-    Path((_name, team_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    Path((name, team_id)): Path<(String, i64)>,
     Json(body): Json<AddTeamMemberRequest>,
 ) -> impl IntoResponse {
+    let actor_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
+        return e.into_response();
+    }
+    let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
+        Ok(team) => team,
+        Err(e) => return e.into_response(),
+    };
+
     let role = body.role.as_deref().unwrap_or("member");
 
-    match rg_core::org::add_team_member(&state.db, team_id, body.user_id, role).await {
+    match rg_core::org::add_team_member(&state.db, team.id, body.user_id, role).await {
         Ok(m) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
@@ -805,19 +865,137 @@ pub async fn add_team_member(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn remove_team_member(
     State(state): State<AppState>,
-    Path((_name, team_id, user_id)): Path<(String, i64, i64)>,
+    headers: HeaderMap,
+    Path((name, team_id, user_id)): Path<(String, i64, i64)>,
 ) -> impl IntoResponse {
-    match rg_core::org::remove_team_member(&state.db, team_id, user_id).await {
+    let actor_id = match require_user(&headers, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let org = match resolve_org(&state.db, &name).await {
+        Ok(org) => org,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
+        return e.into_response();
+    }
+    let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
+        Ok(team) => team,
+        Err(e) => return e.into_response(),
+    };
+
+    match rg_core::org::remove_team_member(&state.db, team.id, user_id).await {
         Ok(()) => Json(serde_json::json!({"removed": true})).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────
+
+/// Authentication gate for the handlers below.
+///
+/// The `/api/v1` router carries no mandatory-auth layer: `pat_auth_middleware`
+/// only *translates* a PAT into a JWT and lets a request with no credentials
+/// through untouched. Requiring a caller is therefore each handler's own job —
+/// a handler that forgets this is anonymous, not merely unauthorized.
+fn require_user(headers: &HeaderMap, jwt_secret: &str) -> Result<i64, AppError> {
+    super::auth::extract_user_id(headers, jwt_secret)
+        .ok_or_else(|| AppError::unauthorized("authentication required"))
+}
+
+/// Resolve the organization named in the path.
+async fn resolve_org(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+) -> Result<rg_db::entities::organization::Model, AppError> {
+    match rg_core::org::get_org_by_name(db, name).await {
+        Ok(Some(org)) => Ok(org),
+        Ok(None) => Err(AppError::not_found("organization not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+/// Whether `user_id` may administer `org`: its owner, or a member holding the
+/// `owner` / `admin` role.
+async fn is_org_admin(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    if org.owner_id == user_id {
+        return Ok(true);
+    }
+    Ok(rg_core::org::find_org_member(db, org.id, user_id)
+        .await?
+        .is_some_and(|m| m.role == "owner" || m.role == "admin"))
+}
+
+/// Authorization gate for every org mutation — membership changes and the whole
+/// team surface, both of which hand out access to the organization's private
+/// repositories (`rg_core::org::add_team_member` flushes the permission cache
+/// precisely because it can).
+async fn require_org_admin(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: i64,
+) -> Result<(), AppError> {
+    match is_org_admin(db, org, user_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden(
+            "only organization owners and admins can do this",
+        )),
+        // A failed membership lookup is ours, not a refusal: answering `403`
+        // would tell the caller they lack a permission we never managed to read.
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+/// Read gate for org-scoped data. A public org is world-readable; a private one
+/// answers `404` — not `403` — to everyone outside it, so the endpoint cannot be
+/// used to enumerate private organizations by name.
+async fn require_org_visible(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: Option<i64>,
+) -> Result<(), AppError> {
+    if org.visibility != "private" {
+        return Ok(());
+    }
+    let Some(user_id) = user_id else {
+        return Err(AppError::not_found("organization not found"));
+    };
+    if org.owner_id == user_id {
+        return Ok(());
+    }
+    match rg_core::org::is_org_member(db, org.id, user_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::not_found("organization not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+/// Resolve a team *inside* the organization named in the path.
+///
+/// The `org_id` comparison is the whole point: without it `{name}` is decorative
+/// and any org admin can name another organization's `team_id` under their own
+/// path. A team belonging elsewhere is a `404` rather than a `403` — a `403`
+/// would confirm that the id exists.
+async fn resolve_team_in_org(
+    db: &sea_orm::DatabaseConnection,
+    org_id: i64,
+    team_id: i64,
+) -> Result<rg_db::entities::team::Model, AppError> {
+    match rg_core::org::get_team(db, team_id).await {
+        Ok(Some(team)) if team.org_id == org_id => Ok(team),
+        Ok(_) => Err(AppError::not_found("team not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
 
 fn org_to_response(org: &rg_db::entities::organization::Model) -> OrgResponse {
     OrgResponse {
