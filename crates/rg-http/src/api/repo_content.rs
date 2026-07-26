@@ -1102,14 +1102,13 @@ pub async fn create_or_update_file(
             )
                 .into_response()
         }
-        Err(e) => {
-            // Check if it's a SHA mismatch (conflict)
-            if e.to_string().contains("SHA mismatch") {
-                AppError::conflict(e.to_string()).into_response()
-            } else {
-                AppError::bad_request(e.to_string()).into_response()
-            }
-        }
+        // The service now carries its own outcome: a lost race is a typed
+        // `Conflict`, an absent file a `NotFound`, a rejected path an
+        // `InvalidRequest`. Matching on the message text instead made the `409`
+        // hostage to the exact wording, and handed every other failure — an
+        // unwritable `repo_root`, a git clone that died, a push that was
+        // rejected — to the client as a `400` it would never retry.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -1187,14 +1186,8 @@ pub async fn delete_file(
             )
                 .into_response()
         }
-        Err(e) => {
-            // Check if it's a SHA mismatch (conflict)
-            if e.to_string().contains("SHA mismatch") {
-                AppError::conflict(e.to_string()).into_response()
-            } else {
-                AppError::bad_request(e.to_string()).into_response()
-            }
-        }
+        // Same split as `create_or_update_file` above.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

@@ -1103,8 +1103,13 @@ pub async fn create_or_update_file(
     author_email: &str,
     repo_root: &std::path::Path,
 ) -> Result<()> {
+    validate_repo_file_path(file_path)?;
+
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
+    // The repository row exists (the handler resolved it) but its bare tree does
+    // not: a broken `repo_root`, not a broken request. Untyped on purpose, so it
+    // stays a 5xx and the path reaches the operator log only.
     if !repo_path.exists() {
         bail!("repository path not found: {:?}", repo_path);
     }
@@ -1112,24 +1117,24 @@ pub async fn create_or_update_file(
     // Verify the file SHA if this is an update (not a create)
     if let Some(expected_sha) = sha {
         // Check if the file exists and its current SHA matches
-        let current_sha = get_file_sha(&repo_path, branch, file_path).ok();
-        if current_sha.is_none() {
-            bail!("file does not exist: {}", file_path);
-        }
-        if let Some(current) = current_sha {
-            if current != expected_sha {
-                bail!(
-                    "file SHA mismatch: expected {}, got {}",
-                    expected_sha,
-                    current
-                );
+        match get_file_sha(&repo_path, branch, file_path)? {
+            None => return Err(crate::error::not_found("file")),
+            Some(current) if current != expected_sha => {
+                // Someone else wrote the file since the caller read it. A 409
+                // says "re-read and retry"; a 400 would tell the client to fix
+                // a request that was never malformed.
+                return Err(crate::error::conflict(format!(
+                    "file SHA mismatch: expected {expected_sha}, got {current}"
+                )));
             }
+            Some(_) => {}
         }
     } else {
         // This is a create operation - check if file already exists
-        let current_sha = get_file_sha(&repo_path, branch, file_path).ok();
-        if current_sha.is_some() {
-            bail!("file already exists: {} (use update with sha)", file_path);
+        if get_file_sha(&repo_path, branch, file_path)?.is_some() {
+            return Err(crate::error::conflict(format!(
+                "file already exists: {file_path} (use update with sha)"
+            )));
         }
     }
 
@@ -1372,21 +1377,24 @@ pub async fn delete_file(
     author_email: &str,
     repo_root: &std::path::Path,
 ) -> Result<()> {
+    validate_repo_file_path(file_path)?;
+
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
+    // See `create_or_update_file`: a missing bare tree is ours, so it stays 5xx.
     if !repo_path.exists() {
         bail!("repository path not found: {:?}", repo_path);
     }
 
     // Verify the file SHA to prevent accidental deletes
-    let current_sha = get_file_sha(&repo_path, branch, file_path).ok();
-    if current_sha.is_none() {
-        bail!("file does not exist: {}", file_path);
-    }
-    if let Some(current) = current_sha {
-        if current != sha {
-            bail!("file SHA mismatch: expected {}, got {}", sha, current);
+    match get_file_sha(&repo_path, branch, file_path)? {
+        None => return Err(crate::error::not_found("file")),
+        Some(current) if current != sha => {
+            return Err(crate::error::conflict(format!(
+                "file SHA mismatch: expected {sha}, got {current}"
+            )));
         }
+        Some(_) => {}
     }
 
     // Create temp working directory
@@ -1453,17 +1461,54 @@ pub async fn delete_file(
     Ok(())
 }
 
-/// Get the blob SHA of a file at a given ref.
-fn get_file_sha(repo_path: &std::path::Path, git_ref: &str, file_path: &str) -> Result<String> {
+/// Reject a repository-relative file path before it is joined onto a working
+/// tree.
+///
+/// [`update_files_in_commit`] has always validated its paths this way; the
+/// single-file write endpoints joined the client's path onto the temp clone
+/// unchecked, and `PathBuf::join` happily leaves the tree for an absolute path
+/// or a `..` component — so `..%2f..%2fetc%2fcron.d%2fx` reached
+/// `std::fs::write` (H-02). The path is the caller's own input, so this is a
+/// typed [`crate::error::InvalidRequest`]: a real `400`, not a 5xx.
+fn validate_repo_file_path(file_path: &str) -> Result<()> {
+    let path = std::path::Path::new(file_path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        // Fixed text on purpose: the message reaches the client verbatim, and
+        // echoing the rejected path back would put a caller-chosen absolute
+        // path (`/etc/...`, `/tmp/...`) into a response body that H-05 tests
+        // read as a storage-path leak.
+        return Err(crate::error::invalid_request(
+            "invalid repository file path",
+        ));
+    }
+    Ok(())
+}
+
+/// Get the blob SHA of a file at a given ref, or `None` when the ref/path does
+/// not resolve.
+///
+/// The two outcomes have to stay apart at the type level: callers used to write
+/// `get_file_sha(..).ok()`, which turned "this repository cannot be opened"
+/// into "the file is not there" — the same collapse card_aa048c2956b1 fixed on
+/// the read endpoints, one write endpoint over.
+fn get_file_sha(
+    repo_path: &std::path::Path,
+    git_ref: &str,
+    file_path: &str,
+) -> Result<Option<String>> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     let target = format!("{}:{}", git_ref, file_path);
-    let object_id = repo.rev_parse_single(target.as_str()).map_err(|e| {
-        anyhow::anyhow!("file '{}' not found at ref '{}': {}", file_path, git_ref, e)
-    })?;
-
-    Ok(object_id.to_string())
+    Ok(repo
+        .rev_parse_single(target.as_str())
+        .ok()
+        .map(|object_id| object_id.to_string()))
 }
 
 #[cfg(test)]
