@@ -95,18 +95,27 @@ pub async fn mark_notification_read(db: &DatabaseConnection, id: i64) -> Result<
 }
 
 /// Mark a notification as read for its owning user.
+///
+/// Returns `false` when this user has no notification with that id — the row
+/// belongs to somebody else, or never existed. That distinction is the caller's
+/// to name: `rg-db` sits below `rg-core`, so it cannot build the
+/// `rg_core::error::NotFound` marker the HTTP layer classifies on, and an
+/// `anyhow!("… not found")` here would be indistinguishable from a failed query
+/// by the time it reached a handler.
 pub async fn mark_notification_read_for_user(
     db: &DatabaseConnection,
     id: i64,
     user_id: i64,
-) -> Result<()> {
-    let model = notification::Entity::find()
+) -> Result<bool> {
+    let Some(model) = notification::Entity::find()
         .filter(notification::Column::Id.eq(id))
         .filter(notification::Column::UserId.eq(user_id))
         .one(db)
         .await
         .context("db: find notification for user")?
-        .ok_or_else(|| anyhow::anyhow!("notification {} not found", id))?;
+    else {
+        return Ok(false);
+    };
 
     let mut active: notification::ActiveModel = model.into();
     active.is_read = Set(true);
@@ -114,7 +123,7 @@ pub async fn mark_notification_read_for_user(
         .update(db)
         .await
         .context("db: mark notification read")?;
-    Ok(())
+    Ok(true)
 }
 
 /// Mark all notifications as read for a user.
@@ -166,19 +175,24 @@ pub async fn delete_notification(db: &DatabaseConnection, id: i64) -> Result<()>
 }
 
 /// Delete a notification for its owning user.
+/// Returns `false` when this user has no notification with that id — see
+/// [`mark_notification_read_for_user`] for why the absence is reported as a
+/// value rather than as an error.
 pub async fn delete_notification_for_user(
     db: &DatabaseConnection,
     id: i64,
     user_id: i64,
-) -> Result<()> {
-    let model = notification::Entity::find()
+) -> Result<bool> {
+    let Some(model) = notification::Entity::find()
         .filter(notification::Column::Id.eq(id))
         .filter(notification::Column::UserId.eq(user_id))
         .one(db)
         .await
         .context("db: find notification for user delete")?
-        .ok_or_else(|| anyhow::anyhow!("notification {} not found", id))?;
+    else {
+        return Ok(false);
+    };
 
     model.delete(db).await.context("db: delete notification")?;
-    Ok(())
+    Ok(true)
 }

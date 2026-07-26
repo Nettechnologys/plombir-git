@@ -142,7 +142,7 @@ pub async fn mark_read(
 
     match rg_core::notification::mark_read_for_user(&state.db, id, user_id).await {
         Ok(()) => Json(serde_json::json!({"id": id, "is_read": true})).into_response(),
-        Err(e) => AppError::not_found(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -199,6 +199,6 @@ pub async fn delete_notification(
 
     match rg_core::notification::delete_notification_for_user(&state.db, id, user_id).await {
         Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
-        Err(e) => AppError::not_found(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

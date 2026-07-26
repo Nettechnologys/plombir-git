@@ -97,12 +97,15 @@ async fn resolve_repo(
     owner: &str,
     name: &str,
 ) -> Result<rg_db::entities::repository::Model, AppError> {
+    // A failed lookup is ours, not the caller's: it goes through the `AppError`
+    // funnel, which classifies it (503 on an outage, 500 otherwise) and keeps
+    // the `db: ...` chain in the operator log instead of in the response body.
+    // Only a genuinely absent repository is a 404 — with a fixed message, since
+    // 404 bodies are not sanitized on the way out (H-05).
     rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
         .await
-        .map_err(|e| {
-            AppError::not_found(format!("repository not found: {}/{}: {}", owner, name, e))
-        })?
-        .ok_or_else(|| AppError::not_found(format!("repository not found: {}/{}", owner, name)))
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("repository not found"))
 }
 
 /// Require read access for a repo. Public repos are always accessible;

@@ -74,7 +74,7 @@ pub async fn get_protection(
 ) -> Result<ProtectedBranch> {
     protected_branch_ops::find_by_id(db, protection_id)
         .await?
-        .context("protection rule not found")
+        .ok_or_else(|| crate::error::not_found("protection rule"))
 }
 
 /// Get a branch protection rule by ID, scoped to a repository route.
@@ -87,7 +87,7 @@ pub async fn get_protection_for_repo(
     let repo = resolve_repo(db, owner, repo_name).await?;
     let protection = get_protection(db, protection_id).await?;
     if protection.repo_id != repo.id {
-        bail!("protection rule not found");
+        return Err(crate::error::not_found("protection rule"));
     }
     Ok(protection)
 }
@@ -108,7 +108,7 @@ pub async fn update_protection(
 ) -> Result<ProtectedBranch> {
     let mut protection = protected_branch_ops::find_by_id(db, protection_id)
         .await?
-        .context("protection rule not found")?;
+        .ok_or_else(|| crate::error::not_found("protection rule"))?;
 
     if let Some(v) = require_pr {
         protection.require_pr = v;
@@ -259,7 +259,7 @@ pub async fn check_merge_allowed(
         let pr = pull_request::Entity::find_by_id(pr_id)
             .one(db)
             .await?
-            .context("pull request not found")?;
+            .ok_or_else(|| crate::error::not_found("pull request"))?;
         let approval_count =
             pr_review_ops::count_current_approvals(db, pr_id, pr.head_sha.as_deref()).await?;
         if approval_count < required {
@@ -362,8 +362,8 @@ async fn resolve_repo(
 ) -> Result<rg_db::entities::repository::Model> {
     let user = rg_db::ops::user_ops::find_by_username(db, owner)
         .await?
-        .context("owner not found")?;
+        .ok_or_else(|| crate::error::not_found("owner"))?;
     repo_ops::find_by_owner_and_name(db, user.id, repo_name)
         .await?
-        .context("repository not found")
+        .ok_or_else(|| crate::error::not_found("repository"))
 }

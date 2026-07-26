@@ -43,8 +43,16 @@ pub async fn mark_read(db: &DatabaseConnection, id: i64) -> Result<()> {
 }
 
 /// Mark a notification as read for its owning user.
+///
+/// A notification belonging to somebody else is reported as absent on purpose —
+/// confirming that id #4711 exists would leak the shape of another user's
+/// inbox. What must *not* be reported as absent is a failed query, which is why
+/// the ops layer answers with a bool and the marker is built here.
 pub async fn mark_read_for_user(db: &DatabaseConnection, id: i64, user_id: i64) -> Result<()> {
-    notification_ops::mark_notification_read_for_user(db, id, user_id).await
+    notification_ops::mark_notification_read_for_user(db, id, user_id)
+        .await?
+        .then_some(())
+        .ok_or_else(|| crate::error::not_found("notification"))
 }
 
 /// Mark all notifications as read for a user.
@@ -63,12 +71,18 @@ pub async fn delete_notification(db: &DatabaseConnection, id: i64) -> Result<()>
 }
 
 /// Delete a notification for its owning user.
+///
+/// Same masking as [`mark_read_for_user`]: another user's notification is
+/// "not found", a broken query is not.
 pub async fn delete_notification_for_user(
     db: &DatabaseConnection,
     id: i64,
     user_id: i64,
 ) -> Result<()> {
-    notification_ops::delete_notification_for_user(db, id, user_id).await
+    notification_ops::delete_notification_for_user(db, id, user_id)
+        .await?
+        .then_some(())
+        .ok_or_else(|| crate::error::not_found("notification"))
 }
 
 // ── Watch notification helpers ─────────────────────────────────────────

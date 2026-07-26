@@ -162,7 +162,7 @@ pub async fn get_protection(
         .await
     {
         Ok(protection) => (StatusCode::OK, Json(protection)).into_response(),
-        Err(e) => AppError::not_found(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
