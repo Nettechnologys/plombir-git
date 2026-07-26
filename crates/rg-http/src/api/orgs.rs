@@ -188,7 +188,7 @@ pub async fn create_org(
             )
                 .into_response()
         }
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -306,7 +306,7 @@ pub async fn update_org(
             .await;
             Json(org_to_response(&updated)).into_response()
         }
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -362,7 +362,11 @@ pub async fn delete_org(
             .await;
             Json(serde_json::json!({"deleted": true})).into_response()
         }
-        Err(e) => AppError::forbidden(e).into_response(),
+        // Only the owner-mismatch branch is a refusal; it carries
+        // `rg_core::error::Forbidden` and still answers 403. A failed lookup
+        // or a dead pool underneath is ours, and must not be reported as "you
+        // are not allowed to delete this organization".
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -482,7 +486,7 @@ pub async fn add_org_member(
             )
                 .into_response()
         }
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -542,7 +546,7 @@ pub async fn remove_org_member(
             .await;
             Json(serde_json::json!({"removed": true})).into_response()
         }
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -599,7 +603,7 @@ pub async fn create_team(
             })),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -779,7 +783,7 @@ pub async fn add_team_member(
             })),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -805,7 +809,7 @@ pub async fn remove_team_member(
 ) -> impl IntoResponse {
     match rg_core::org::remove_team_member(&state.db, team_id, user_id).await {
         Ok(()) => Json(serde_json::json!({"removed": true})).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

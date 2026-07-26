@@ -789,7 +789,11 @@ async fn creating_pr_requests_matching_codeowner_user() {
         .send()
         .await
         .unwrap();
-    assert_eq!(already_applied.status(), 400);
+    // Already applied is a *state* problem, not a malformed request: the same
+    // call would succeed against a suggestion that has not been applied yet, so
+    // it answers 409 like the sibling "outdated" case rather than telling the
+    // caller to fix a payload that was correct.
+    assert_eq!(already_applied.status(), 409);
 
     let enqueue = client
         .put(format!(

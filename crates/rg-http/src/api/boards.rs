@@ -142,7 +142,7 @@ pub async fn create_board(
     .await
     {
         Ok(board) => (StatusCode::CREATED, Json(serde_json::json!(board))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -233,7 +233,7 @@ pub async fn update_board(
 
     match rg_core::board::service::update_board(&state.db, id, body.name, body.description).await {
         Ok(board) => (StatusCode::OK, Json(serde_json::json!(board))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -299,7 +299,7 @@ pub async fn create_column(
     let _ = claims;
     match rg_core::board::service::create_column(&state.db, board_id, body.name, body.color).await {
         Ok(column) => (StatusCode::CREATED, Json(serde_json::json!(column))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -326,7 +326,7 @@ pub async fn update_column(
 ) -> impl IntoResponse {
     match rg_core::board::service::update_column(&state.db, col_id, body.name, body.color).await {
         Ok(column) => (StatusCode::OK, Json(serde_json::json!(column))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -386,7 +386,7 @@ pub async fn create_card(
     let _ = claims;
     match rg_core::board::service::create_card(&state.db, col_id, body.issue_id, body.note).await {
         Ok(card) => (StatusCode::CREATED, Json(serde_json::json!(card))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -413,7 +413,7 @@ pub async fn update_card(
 ) -> impl IntoResponse {
     match rg_core::board::service::update_card(&state.db, card_id, body.note, body.issue_id).await {
         Ok(card) => (StatusCode::OK, Json(serde_json::json!(card))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -442,7 +442,7 @@ pub async fn move_card(
         .await
     {
         Ok(card) => (StatusCode::OK, Json(serde_json::json!(card))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -468,7 +468,7 @@ pub async fn reorder_cards(
 ) -> impl IntoResponse {
     match rg_core::board::service::reorder_cards(&state.db, body.positions).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

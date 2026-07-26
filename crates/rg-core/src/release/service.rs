@@ -27,10 +27,10 @@ pub async fn create_release(
 ) -> Result<Release> {
     // Validate inputs
     if tag_name.is_empty() {
-        anyhow::bail!("tag_name cannot be empty");
+        return Err(crate::error::invalid_request("tag_name cannot be empty"));
     }
     if title.is_empty() {
-        anyhow::bail!("title cannot be empty");
+        return Err(crate::error::invalid_request("title cannot be empty"));
     }
 
     // Check for duplicate tag
@@ -38,7 +38,9 @@ pub async fn create_release(
         .await?
         .is_some()
     {
-        anyhow::bail!("release with tag '{}' already exists", tag_name);
+        return Err(crate::error::invalid_request(format!(
+            "release with tag '{tag_name}' already exists"
+        )));
     }
 
     let now = Utc::now();
@@ -109,7 +111,7 @@ pub async fn update_release(
 ) -> Result<Release> {
     let existing = rg_db::ops::release_ops::find_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("release not found"))?;
+        .ok_or_else(|| crate::error::not_found("release"))?;
 
     let mut model: ReleaseActiveModel = existing.into();
     if let Some(t) = title {
@@ -134,7 +136,7 @@ pub async fn delete_release(db: &DatabaseConnection, id: i64) -> Result<()> {
     // Get release info for webhook before deleting
     let release = rg_db::ops::release_ops::find_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("release not found"))?;
+        .ok_or_else(|| crate::error::not_found("release"))?;
     let repo_id = release.repo_id;
 
     rg_db::ops::release_ops::delete_by_id(db, id).await?;

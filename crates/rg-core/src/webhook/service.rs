@@ -245,11 +245,11 @@ pub async fn get_delivery(
 pub async fn redeliver(db: &DatabaseConnection, delivery_id: i64) -> Result<()> {
     let delivery = webhook_ops::find_delivery_by_id(db, delivery_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("delivery {} not found", delivery_id))?;
+        .ok_or_else(|| crate::error::not_found("webhook delivery"))?;
 
     let hook = webhook_ops::find_by_id(db, delivery.webhook_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("webhook {} not found", delivery.webhook_id))?;
+        .ok_or_else(|| crate::error::not_found("webhook"))?;
 
     let payload = delivery.request_payload.clone().unwrap_or_default();
 

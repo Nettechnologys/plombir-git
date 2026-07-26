@@ -42,7 +42,9 @@ impl ReviewAction {
             "approve" => Ok(Self::Approve),
             "request_changes" => Ok(Self::RequestChanges),
             "dismiss" => Ok(Self::Dismiss),
-            _ => bail!("invalid review action: {}", s),
+            _ => Err(crate::error::invalid_request(format!(
+                "invalid review action: {s}"
+            ))),
         }
     }
 }
@@ -65,10 +67,13 @@ pub async fn submit_review(
         .ok_or_else(|| crate::error::not_found("pull request"))?;
 
     if pr.state != "open" {
-        bail!(
+        // A closed PR is a *state* problem, not a malformed request: the same
+        // call succeeds once the PR reopens, which is what a 409 says and a 400
+        // does not.
+        return Err(crate::error::conflict(format!(
             "cannot review a PR that is not open (current: {})",
             pr.state
-        );
+        )));
     }
 
     // For dismiss, body is typically about why the review is dismissed
@@ -186,7 +191,9 @@ pub async fn create_review_comment(
         .await?
         .ok_or_else(|| crate::error::not_found("review"))?;
     if review.repo_id != repo_id || review.pr_id != pr.id {
-        bail!("review does not belong to this PR");
+        return Err(crate::error::invalid_request(
+            "review does not belong to this PR",
+        ));
     }
 
     // Validate reply_to if specified
@@ -195,22 +202,30 @@ pub async fn create_review_comment(
             .await?
             .ok_or_else(|| crate::error::not_found("parent comment"))?;
         if parent.pr_id != pr.id {
-            bail!("parent comment does not belong to this PR");
+            return Err(crate::error::invalid_request(
+                "parent comment does not belong to this PR",
+            ));
         }
     }
 
     if body.trim().is_empty() {
-        bail!("comment body cannot be empty");
+        return Err(crate::error::invalid_request(
+            "comment body cannot be empty",
+        ));
     }
     let suggestion = suggestion.map(|value| value.replace("\r\n", "\n"));
     if suggestion.is_some() {
         if reply_to_id.is_some() || line.is_none() || side.as_deref() != Some("RIGHT") {
-            bail!("suggestions require a top-level RIGHT-side line comment");
+            return Err(crate::error::invalid_request(
+                "suggestions require a top-level RIGHT-side line comment",
+            ));
         }
         let end = line.unwrap();
         let start = start_line.unwrap_or(end);
         if start < 1 || start > end || start_side.as_deref().unwrap_or("RIGHT") != "RIGHT" {
-            bail!("suggestion range must be an ordered RIGHT-side range");
+            return Err(crate::error::invalid_request(
+                "suggestion range must be an ordered RIGHT-side range",
+            ));
         }
     }
 
@@ -324,33 +339,44 @@ pub async fn apply_suggestions(
     actor: &rg_db::entities::user::Model,
 ) -> Result<AppliedSuggestions> {
     if comment_ids.is_empty() || comment_ids.len() > 100 {
-        bail!("between 1 and 100 suggestions must be selected");
+        return Err(crate::error::invalid_request(
+            "between 1 and 100 suggestions must be selected",
+        ));
     }
-    let head_sha = pr
-        .head_sha
-        .as_deref()
-        .context("pull request head SHA is missing")?;
+    let head_sha = pr.head_sha.as_deref().ok_or_else(|| {
+        crate::error::conflict("pull request has no head commit to apply suggestions to")
+    })?;
     let mut unique_ids = HashSet::new();
     let mut suggestions_by_path: BTreeMap<String, Vec<ValidatedSuggestion>> = BTreeMap::new();
     for &comment_id in comment_ids {
         if !unique_ids.insert(comment_id) {
-            bail!("duplicate suggestion comment #{comment_id}");
+            return Err(crate::error::invalid_request(format!(
+                "duplicate suggestion comment #{comment_id}"
+            )));
         }
         let comment = review_comment_ops::find_by_id(db, comment_id)
             .await?
             .ok_or_else(|| crate::error::not_found("review comment"))?;
         if comment.pr_id != pr.id || comment.reply_to_id.is_some() {
-            bail!("suggestion does not belong to this pull request");
+            return Err(crate::error::invalid_request(
+                "suggestion does not belong to this pull request",
+            ));
         }
-        let replacement = comment
-            .suggestion
-            .clone()
-            .context("comment does not contain a suggestion")?;
+        let replacement = comment.suggestion.clone().ok_or_else(|| {
+            crate::error::invalid_request("comment does not contain a suggestion")
+        })?;
+        // The next two are *state*, not shape: the same request succeeds again
+        // once the suggestion is un-applied or the head moves back, so a 409
+        // tells the client what to wait for instead of blaming the payload.
         if comment.suggestion_applied_at.is_some() {
-            bail!("suggestion has already been applied");
+            return Err(crate::error::conflict(
+                "suggestion has already been applied",
+            ));
         }
         if comment.commit_id.as_deref() != Some(head_sha) {
-            bail!("suggestion is outdated because the pull request head has changed");
+            return Err(crate::error::conflict(
+                "suggestion is outdated because the pull request head has changed",
+            ));
         }
         let end_line = comment.line.context("suggestion line is missing")?;
         let start_line = comment.start_line.unwrap_or(end_line);
@@ -359,7 +385,9 @@ pub async fn apply_suggestions(
             || comment.side.as_deref() != Some("RIGHT")
             || comment.start_side.as_deref().unwrap_or("RIGHT") != "RIGHT"
         {
-            bail!("suggestion must target a valid RIGHT-side range");
+            return Err(crate::error::invalid_request(
+                "suggestion must target a valid RIGHT-side range",
+            ));
         }
         suggestions_by_path
             .entry(comment.path.clone())
@@ -381,7 +409,9 @@ pub async fn apply_suggestions(
         suggestions.sort_by_key(|suggestion| suggestion.start_line);
         for pair in suggestions.windows(2) {
             if pair[0].end_line >= pair[1].start_line {
-                bail!("suggestion ranges overlap in {path}");
+                return Err(crate::error::invalid_request(format!(
+                    "suggestion ranges overlap in {path}"
+                )));
             }
         }
 
@@ -400,12 +430,10 @@ pub async fn apply_suggestions(
             let start_index = (suggestion.start_line - 1) as usize;
             let end_index = suggestion.end_line as usize;
             if start_index >= lines.len() || end_index > lines.len() {
-                bail!(
+                return Err(crate::error::conflict(format!(
                     "suggestion range {}-{} is outside {}",
-                    suggestion.start_line,
-                    suggestion.end_line,
-                    path
-                );
+                    suggestion.start_line, suggestion.end_line, path
+                )));
             }
             let replacement = suggestion
                 .replacement
@@ -413,10 +441,10 @@ pub async fn apply_suggestions(
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             if lines[start_index..end_index] == replacement {
-                bail!(
+                return Err(crate::error::conflict(format!(
                     "suggestion #{} does not change {path}",
                     suggestion.comment.id
-                );
+                )));
             }
             lines.splice(start_index..end_index, replacement);
         }
@@ -539,7 +567,9 @@ pub async fn get_thread_root(
         .await?
         .ok_or_else(|| crate::error::not_found("review comment"))?;
     if comment.pr_id != pr_id {
-        bail!("review comment does not belong to this PR");
+        return Err(crate::error::invalid_request(
+            "review comment does not belong to this PR",
+        ));
     }
 
     // Resolution is stored on the root. Replies currently form a shallow
@@ -550,10 +580,14 @@ pub async fn get_thread_root(
             .await?
             .ok_or_else(|| crate::error::not_found("review thread root"))?;
         if comment.pr_id != pr_id {
-            bail!("review thread does not belong to this PR");
+            return Err(crate::error::invalid_request(
+                "review thread does not belong to this PR",
+            ));
         }
         hops += 1;
         if hops > 100 {
+            // Not the caller's doing — a reply chain this deep means the stored
+            // tree is broken, so it stays a 5xx.
             bail!("review thread nesting is invalid");
         }
     }

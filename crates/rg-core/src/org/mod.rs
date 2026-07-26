@@ -19,12 +19,16 @@ pub async fn create_org(
 
     // Check visibility
     if visibility != "public" && visibility != "private" {
-        anyhow::bail!("visibility must be 'public' or 'private'");
+        return Err(crate::error::invalid_request(
+            "visibility must be 'public' or 'private'",
+        ));
     }
 
     // Check if org name is already taken
     if org_ops::get_org_by_name(db, name).await?.is_some() {
-        anyhow::bail!("organization name '{}' is already taken", name);
+        return Err(crate::error::invalid_request(format!(
+            "organization name '{name}' is already taken"
+        )));
     }
 
     org_ops::create_org(db, name, display_name, description, owner_id, visibility).await
@@ -69,10 +73,12 @@ pub async fn update_org(
 pub async fn delete_org(db: &DatabaseConnection, id: i64, requesting_user_id: i64) -> Result<()> {
     let org = org_ops::get_org(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("organization not found"))?;
+        .ok_or_else(|| crate::error::not_found("organization"))?;
 
     if org.owner_id != requesting_user_id {
-        anyhow::bail!("only the organization owner can delete it");
+        return Err(crate::error::forbidden(
+            "only the organization owner can delete it",
+        ));
     }
 
     org_ops::delete_org(db, id).await
@@ -86,7 +92,9 @@ pub async fn add_org_member(
     role: &str,
 ) -> Result<rg_db::entities::organization_member::Model> {
     if role != "owner" && role != "admin" && role != "member" {
-        anyhow::bail!("role must be 'owner', 'admin', or 'member'");
+        return Err(crate::error::invalid_request(
+            "role must be 'owner', 'admin', or 'member'",
+        ));
     }
     let member = org_ops::add_org_member(db, org_id, user_id, role).await?;
     // Org membership grants access across all org repos — flush perm cache.
@@ -139,7 +147,9 @@ pub async fn create_team(
     permission: &str,
 ) -> Result<rg_db::entities::team::Model> {
     if permission != "read" && permission != "write" && permission != "admin" {
-        anyhow::bail!("permission must be 'read', 'write', or 'admin'");
+        return Err(crate::error::invalid_request(
+            "permission must be 'read', 'write', or 'admin'",
+        ));
     }
     org_ops::create_team(db, org_id, name, description, permission).await
 }
@@ -175,7 +185,9 @@ pub async fn add_team_member(
     role: &str,
 ) -> Result<rg_db::entities::team_member::Model> {
     if role != "member" && role != "maintainer" {
-        anyhow::bail!("role must be 'member' or 'maintainer'");
+        return Err(crate::error::invalid_request(
+            "role must be 'member' or 'maintainer'",
+        ));
     }
     let member = org_ops::add_team_member(db, team_id, user_id, role).await?;
     // Team membership can grant repo access — flush perm cache.

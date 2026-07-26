@@ -85,8 +85,9 @@ pub async fn list_pages(
 ) -> impl IntoResponse {
     let _user_id = super::auth::extract_user_id(&_headers, &state.jwt_secret);
     let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Some(id) => id,
-        None => return AppError::not_found("repository not found").into_response(),
+        Ok(Some(id)) => id,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::wiki::service::list_pages(&state.db, repo_id).await {
@@ -118,8 +119,9 @@ pub async fn get_page(
     _headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Some(id) => id,
-        None => return AppError::not_found("repository not found").into_response(),
+        Ok(Some(id)) => id,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::wiki::service::get_page(&state.db, repo_id, &title).await {
@@ -160,8 +162,9 @@ pub async fn create_page(
     };
 
     let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Some(id) => id,
-        None => return AppError::not_found("repository not found").into_response(),
+        Ok(Some(id)) => id,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::wiki::service::create_page(
@@ -179,7 +182,7 @@ pub async fn create_page(
             Json(serde_json::json!(page_to_response(&page))),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -210,8 +213,9 @@ pub async fn update_page(
     };
 
     let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Some(id) => id,
-        None => return AppError::not_found("repository not found").into_response(),
+        Ok(Some(id)) => id,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::wiki::service::update_page(
@@ -229,7 +233,7 @@ pub async fn update_page(
             Json(serde_json::json!(page_to_response(&page))),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -259,8 +263,9 @@ pub async fn delete_page(
     };
 
     let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Some(id) => id,
-        None => return AppError::not_found("repository not found").into_response(),
+        Ok(Some(id)) => id,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::wiki::service::delete_page(&state.db, repo_id, &title).await {
@@ -269,7 +274,7 @@ pub async fn delete_page(
             Json(serde_json::json!({"message": "page deleted"})),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -295,13 +300,14 @@ pub async fn list_revisions(
     _headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo_id = match resolve_repo_id(&state.db, &owner, &repo).await {
-        Some(id) => id,
-        None => return AppError::not_found("repository not found").into_response(),
+        Ok(Some(id)) => id,
+        Ok(None) => return AppError::not_found("repository not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::wiki::service::list_revisions(&state.db, repo_id, &title).await {
         Ok(revisions) => (StatusCode::OK, Json(serde_json::json!(revisions))).into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -336,14 +342,23 @@ pub async fn get_revision(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-async fn resolve_repo_id(db: &DatabaseConnection, owner: &str, repo_name: &str) -> Option<i64> {
-    let user = rg_db::ops::user_ops::find_by_username(db, owner)
-        .await
-        .ok()
-        .flatten()?;
-    let repo = rg_db::ops::repo_ops::find_by_owner_and_name(db, user.id, repo_name)
-        .await
-        .ok()
-        .flatten()?;
-    Some(repo.id)
+/// Resolve `owner/repo` to a repository id.
+///
+/// `Ok(None)` means the owner or the repository genuinely is not there. A
+/// lookup that *failed* stays an `Err`: the previous `.ok().flatten()` turned a
+/// dead connection pool into "repository not found", which sends the caller
+/// looking for a typo in a URL that was correct and never gets retried.
+async fn resolve_repo_id(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+) -> anyhow::Result<Option<i64>> {
+    let Some(user) = rg_db::ops::user_ops::find_by_username(db, owner).await? else {
+        return Ok(None);
+    };
+    let Some(repo) = rg_db::ops::repo_ops::find_by_owner_and_name(db, user.id, repo_name).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(repo.id))
 }

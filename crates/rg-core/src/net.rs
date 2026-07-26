@@ -126,21 +126,34 @@ fn is_unicast_link_local(ip: Ipv6Addr) -> bool {
 /// internal **IP-literal** host. Used at webhook create/update time so an
 /// operator gets immediate feedback on `http://localhost`-style mistakes
 /// without a create-path DNS lookup that a transient outage could fail.
+///
+/// Every rejection here is about the URL the caller supplied, so each one
+/// carries [`crate::error::InvalidRequest`] — a handler funnelling the result
+/// through `AppError::from` answers `400` with the rule that was broken, and a
+/// storage or database failure sitting next to the check keeps its own 5xx
+/// instead of being reported as a malformed URL.
 pub fn check_url_static(raw: &str) -> Result<()> {
-    let url = reqwest::Url::parse(raw).context("invalid outbound URL")?;
+    let url = reqwest::Url::parse(raw)
+        .map_err(|e| crate::error::invalid_request(format!("invalid outbound URL: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
-        other => anyhow::bail!("outbound URL scheme '{other}' not allowed (only http/https)"),
+        other => {
+            return Err(crate::error::invalid_request(format!(
+                "outbound URL scheme '{other}' not allowed (only http/https)"
+            )))
+        }
     }
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("outbound URL has no host"))?;
+        .ok_or_else(|| crate::error::invalid_request("outbound URL has no host"))?;
     // `host_str()` keeps brackets for IPv6 literals (`[::1]`); strip them so
     // the literal parses. A domain name never contains brackets.
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = literal.parse::<IpAddr>() {
         if is_forbidden_ip(ip) {
-            anyhow::bail!("outbound URL points at a forbidden (private/loopback/link-local) address: {ip}");
+            return Err(crate::error::invalid_request(format!(
+                "outbound URL points at a forbidden (private/loopback/link-local) address: {ip}"
+            )));
         }
     }
     Ok(())
@@ -209,7 +222,7 @@ pub const ALLOWED_GIT_URL_SCHEMES: &[&str] = &["https", "http", "git", "ssh"];
 fn split_git_remote(raw: &str) -> Result<(String, String)> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("git remote URL is empty");
+        return Err(crate::error::invalid_request("git remote URL is empty"));
     }
     // Standard URL form. scp-like shorthand fails to parse as a URL (the `@` in
     // the authority is not a valid scheme char) and falls through below.
@@ -232,9 +245,9 @@ fn split_git_remote(raw: &str) -> Result<(String, String)> {
             }
         }
     }
-    anyhow::bail!(
+    Err(crate::error::invalid_request(format!(
         "'{raw}' is not a valid git remote (expected an https/http/git/ssh URL or scp-like host:path)"
-    );
+    )))
 }
 
 /// DNS-free static validation of a user-supplied **git remote** URL (mirror /
@@ -242,25 +255,29 @@ fn split_git_remote(raw: &str) -> Result<(String, String)> {
 /// an obviously-internal IP-literal host. The git twin of [`check_url_static`];
 /// use at create/update time for immediate operator feedback without a DNS
 /// lookup that a transient outage could fail.
+///
+/// Typed like [`check_url_static`]: every rejection is about the remote the
+/// caller supplied, so it carries [`crate::error::InvalidRequest`] and stays a
+/// `400` without dragging the storage failure next to it down with it.
 pub fn check_git_url_static(raw: &str) -> Result<()> {
     let (scheme, host) = split_git_remote(raw)?;
     if !ALLOWED_GIT_URL_SCHEMES.contains(&scheme.as_str()) {
-        anyhow::bail!(
+        return Err(crate::error::invalid_request(format!(
             "git remote scheme '{scheme}' not allowed (only https/http/git/ssh) — \
              file://, ext:: and other transports are refused"
-        );
+        )));
     }
     if host.is_empty() {
-        anyhow::bail!("git remote URL has no host");
+        return Err(crate::error::invalid_request("git remote URL has no host"));
     }
     // `host_str()` keeps brackets for IPv6 literals (`[::1]`); strip them so the
     // literal parses. A domain name never contains brackets.
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = literal.parse::<IpAddr>() {
         if is_forbidden_ip(ip) {
-            anyhow::bail!(
+            return Err(crate::error::invalid_request(format!(
                 "git remote points at a forbidden (private/loopback/link-local) address: {ip}"
-            );
+            )));
         }
     }
     Ok(())

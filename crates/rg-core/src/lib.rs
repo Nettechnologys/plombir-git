@@ -58,32 +58,48 @@ pub mod metrics_hook; // Observer hooks so the HTTP layer can meter core-crate e
 use anyhow::Result;
 
 /// Check if a username is valid (alphanumeric + hyphen + underscore, max 39).
+///
+/// Every failure here is the caller's, so each one carries
+/// [`error::InvalidRequest`]: a handler that funnels the result through
+/// `AppError::from` answers `400` with the rule that was broken instead of
+/// blaming itself with a `500`.
 pub fn validate_username(username: &str) -> Result<()> {
     if username.is_empty() {
-        anyhow::bail!("username cannot be empty");
+        return Err(error::invalid_request("username cannot be empty"));
     }
     if username.len() > 39 {
-        anyhow::bail!("username too long (max 39 characters)");
+        return Err(error::invalid_request(
+            "username too long (max 39 characters)",
+        ));
     }
     for c in username.chars() {
         if !c.is_alphanumeric() && c != '-' && c != '_' {
-            anyhow::bail!("username contains invalid character: {}", c);
+            return Err(error::invalid_request(format!(
+                "username contains invalid character: {c}"
+            )));
         }
     }
     Ok(())
 }
 
 /// Check if a repository name is valid.
+///
+/// Typed like [`validate_username`] — the request is what is wrong, and no
+/// retry of it can succeed.
 pub fn validate_repo_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        anyhow::bail!("repository name cannot be empty");
+        return Err(error::invalid_request("repository name cannot be empty"));
     }
     if name.len() > 100 {
-        anyhow::bail!("repository name too long (max 100 characters)");
+        return Err(error::invalid_request(
+            "repository name too long (max 100 characters)",
+        ));
     }
     for c in name.chars() {
         if !c.is_alphanumeric() && c != '-' && c != '_' && c != '.' {
-            anyhow::bail!("repository name contains invalid character: {}", c);
+            return Err(error::invalid_request(format!(
+                "repository name contains invalid character: {c}"
+            )));
         }
     }
     Ok(())

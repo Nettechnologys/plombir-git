@@ -323,7 +323,7 @@ pub async fn submit_review(
 
     let action = match rg_core::review::service::ReviewAction::parse_action(&req.action) {
         Ok(a) => a,
-        Err(e) => return AppError::bad_request(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     if matches!(action.as_str(), "approve" | "request_changes") && pr.author_id == user_id {
         return AppError::bad_request(
@@ -391,7 +391,7 @@ pub async fn submit_review(
             }
             (StatusCode::CREATED, Json(review)).into_response()
         }
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -476,7 +476,7 @@ pub async fn dismiss_review(
     match rg_core::review::service::dismiss_review(&state.db, review.id, user_id, req.message).await
     {
         Ok(review) => (StatusCode::OK, Json(review)).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -958,7 +958,7 @@ pub async fn create_review_comment(
         .await
         {
             Ok(review) => review,
-            Err(e) => return AppError::bad_request(e).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         },
     };
 
@@ -981,7 +981,7 @@ pub async fn create_review_comment(
     .await
     {
         Ok(comment) => (StatusCode::CREATED, Json(comment)).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -1031,13 +1031,12 @@ pub async fn apply_review_suggestion(
             .await;
             (StatusCode::OK, Json(applied)).into_response()
         }
-        Err(error)
-            if error.to_string().contains("outdated")
-                || error.to_string().contains("branch head changed") =>
-        {
-            AppError::conflict(error.to_string()).into_response()
-        }
-        Err(error) => AppError::bad_request(error).into_response(),
+        // "Outdated suggestion" and "branch head changed" carry
+        // `rg_core::error::Conflict` and still answer 409; the shape checks carry
+        // `InvalidRequest` and answer 400. Matching on the rendered message used
+        // to decide both, so a reworded string silently reclassified the outcome
+        // and a git or database failure was answered as a bad request.
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -1087,13 +1086,12 @@ pub async fn apply_review_suggestions(
             .await;
             (StatusCode::OK, Json(applied)).into_response()
         }
-        Err(error)
-            if error.to_string().contains("outdated")
-                || error.to_string().contains("branch head changed") =>
-        {
-            AppError::conflict(error.to_string()).into_response()
-        }
-        Err(error) => AppError::bad_request(error).into_response(),
+        // "Outdated suggestion" and "branch head changed" carry
+        // `rg_core::error::Conflict` and still answer 409; the shape checks carry
+        // `InvalidRequest` and answer 400. Matching on the rendered message used
+        // to decide both, so a reworded string silently reclassified the outcome
+        // and a git or database failure was answered as a bad request.
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -1367,7 +1365,7 @@ pub async fn set_thread_resolution(
     .await
     {
         Ok(comment) => (StatusCode::OK, Json(comment)).into_response(),
-        Err(error) => AppError::bad_request(error).into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 

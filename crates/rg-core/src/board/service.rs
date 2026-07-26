@@ -106,7 +106,7 @@ pub async fn update_board(
 ) -> Result<Board> {
     let existing = rg_db::ops::board_ops::find_board_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("board not found"))?;
+        .ok_or_else(|| crate::error::not_found("board"))?;
 
     let mut model: BoardAM = existing.into();
     if let Some(v) = name {
@@ -160,7 +160,7 @@ pub async fn update_column(
 ) -> Result<Column> {
     let existing = rg_db::ops::board_ops::find_column_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("column not found"))?;
+        .ok_or_else(|| crate::error::not_found("board column"))?;
 
     let mut model: ColumnAM = existing.into();
     if let Some(v) = name {
@@ -212,7 +212,7 @@ pub async fn update_card(
 ) -> Result<Card> {
     let existing = rg_db::ops::board_ops::find_card_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("card not found"))?;
+        .ok_or_else(|| crate::error::not_found("board card"))?;
 
     let mut model: CardAM = existing.into();
     if let Some(v) = note {
@@ -235,7 +235,7 @@ pub async fn move_card(
 ) -> Result<Card> {
     let existing = rg_db::ops::board_ops::find_card_by_id(db, card_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("card not found"))?;
+        .ok_or_else(|| crate::error::not_found("board card"))?;
 
     let mut model: CardAM = existing.into();
     model.column_id = Set(new_column_id);

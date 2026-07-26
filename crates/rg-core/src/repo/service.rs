@@ -1296,7 +1296,11 @@ pub fn update_files_in_commit(
         head.ensure_success()?;
         let actual_head = head.stdout_str().trim().to_string();
         if actual_head != expected_head_sha {
-            bail!("branch head changed: expected {expected_head_sha}, got {actual_head}");
+            // Optimistic-concurrency loss, not a malformed request: someone
+            // else pushed first. A 409 tells the caller to re-read and retry.
+            return Err(crate::error::conflict(format!(
+                "branch head changed: expected {expected_head_sha}, got {actual_head}"
+            )));
         }
 
         for update in updates {
@@ -1305,12 +1309,10 @@ pub fn update_files_in_commit(
             blob.ensure_success()?;
             let actual_blob = blob.stdout_str().trim().to_string();
             if actual_blob != update.expected_blob_sha {
-                bail!(
+                return Err(crate::error::conflict(format!(
                     "file SHA mismatch for {}: expected {}, got {}",
-                    update.path,
-                    update.expected_blob_sha,
-                    actual_blob
-                );
+                    update.path, update.expected_blob_sha, actual_blob
+                )));
             }
 
             let mut full_path = tmp.clone();

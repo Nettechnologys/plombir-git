@@ -184,7 +184,7 @@ pub async fn create_release(
     .await
     {
         Ok(release) => (StatusCode::CREATED, Json(serde_json::json!(release))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -286,7 +286,7 @@ pub async fn update_release(
     .await
     {
         Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -343,7 +343,7 @@ pub async fn delete_release(
             Json(serde_json::json!({ "deleted": true })),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -929,6 +929,6 @@ pub async fn delete_asset(
             Json(serde_json::json!({ "deleted": true })),
         )
             .into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

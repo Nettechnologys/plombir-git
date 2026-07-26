@@ -27,7 +27,7 @@ pub async fn create_mirror(
         .await
         .context("check repo exists")?;
     if repo.is_none() {
-        anyhow::bail!("repository not found");
+        return Err(crate::error::not_found("repository"));
     }
 
     // Reject an obviously-internal / non-git-transport remote at registration
@@ -39,7 +39,9 @@ pub async fn create_mirror(
         .await?
         .is_some()
     {
-        anyhow::bail!("mirror already exists for this repository");
+        return Err(crate::error::invalid_request(
+            "mirror already exists for this repository",
+        ));
     }
 
     let now = Utc::now();
@@ -81,7 +83,7 @@ pub async fn update_mirror(
 ) -> Result<Mirror> {
     let existing = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("mirror not found"))?;
+        .ok_or_else(|| crate::error::not_found("mirror"))?;
 
     let mut model: ActiveModel = existing.into();
     if let Some(v) = url {
@@ -110,7 +112,7 @@ pub async fn update_mirror(
 pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("mirror not found"))?;
+        .ok_or_else(|| crate::error::not_found("mirror"))?;
     rg_db::ops::mirror_ops::delete_by_id(db, mirror.id).await
 }
 
@@ -196,7 +198,7 @@ pub async fn sync_due_mirrors(
 pub async fn trigger_sync(db: &DatabaseConnection, repo_id: i64, repo_root: &Path) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("mirror not found"))?;
+        .ok_or_else(|| crate::error::not_found("mirror"))?;
     sync_mirror(db, &mirror, repo_root).await?;
     Ok(())
 }

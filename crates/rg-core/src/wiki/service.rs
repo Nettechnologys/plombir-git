@@ -30,7 +30,9 @@ pub async fn create_page(
         .context("check existing wiki page")?
         .is_some()
     {
-        anyhow::bail!("wiki page '{}' already exists in this repository", title);
+        return Err(crate::error::invalid_request(format!(
+            "wiki page '{title}' already exists in this repository"
+        )));
     }
 
     let now = Utc::now();
@@ -95,7 +97,7 @@ pub async fn update_page(
     let existing = wiki_page_ops::find_by_repo_and_title(db, repo_id, title)
         .await
         .context("find wiki page for update")?
-        .ok_or_else(|| anyhow::anyhow!("wiki page '{}' not found", title))?;
+        .ok_or_else(|| crate::error::not_found("wiki page"))?;
 
     // Save the current content as a revision before overwriting.
     let next_version = wiki_revision_ops::latest_version(db, existing.id)
@@ -156,7 +158,7 @@ pub async fn list_revisions(
     let page = wiki_page_ops::find_by_repo_and_title(db, repo_id, title)
         .await
         .context("find wiki page for revisions")?
-        .ok_or_else(|| anyhow::anyhow!("wiki page '{}' not found", title))?;
+        .ok_or_else(|| crate::error::not_found("wiki page"))?;
     wiki_revision_ops::list_by_page(db, page.id).await
 }
 
@@ -173,7 +175,7 @@ pub async fn delete_page(db: &DatabaseConnection, repo_id: i64, title: &str) -> 
     let existing = wiki_page_ops::find_by_repo_and_title(db, repo_id, title)
         .await
         .context("find wiki page for delete")?
-        .ok_or_else(|| anyhow::anyhow!("wiki page '{}' not found", title))?;
+        .ok_or_else(|| crate::error::not_found("wiki page"))?;
 
     let page_id = existing.id;
 

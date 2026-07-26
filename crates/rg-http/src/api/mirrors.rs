@@ -108,7 +108,7 @@ pub async fn create_mirror(
     .await
     {
         Ok(mirror) => (StatusCode::CREATED, Json(serde_json::json!(mirror))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -199,7 +199,7 @@ pub async fn update_mirror(
     .await
     {
         Ok(mirror) => (StatusCode::OK, Json(serde_json::json!(mirror))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

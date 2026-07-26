@@ -74,7 +74,7 @@ pub async fn add_time(
     .await
     {
         Ok(entry) => (StatusCode::CREATED, Json(serde_json::json!(entry))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

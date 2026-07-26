@@ -139,7 +139,10 @@ pub async fn start_import(
     .await
     {
         Ok(task) => (StatusCode::CREATED, Json(serde_json::json!(task))).into_response(),
-        Err(e) => AppError::bad_request(e).into_response(),
+        // Both request-shaped checks already ran above. Everything left here is
+        // the row insert, so a failure is ours — not a bad request the caller
+        // could fix by editing the payload.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

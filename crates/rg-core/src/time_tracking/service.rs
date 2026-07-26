@@ -14,7 +14,7 @@ pub async fn add_time(
     description: Option<String>,
 ) -> Result<TimeEntry> {
     if duration_minutes <= 0 {
-        anyhow::bail!("duration must be positive");
+        return Err(crate::error::invalid_request("duration must be positive"));
     }
 
     let now = Utc::now();
