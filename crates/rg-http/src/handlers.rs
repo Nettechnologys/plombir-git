@@ -102,30 +102,167 @@ fn spa_index_error_response(index_path: &Path, error: &std::io::Error) -> Respon
     }
 }
 
+/// How long the `/health` SMTP probe waits for the TCP handshake.
+const SMTP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Remediation for a failed SMTP probe. `[smtp]` is optional and nothing else
+/// touches it until the first email has to go out, so this check is where a
+/// misconfigured section surfaces — it has to name what to look at.
+const SMTP_HINT: &str = "outbound mail is configured in the `[smtp]` section of forgekeep.toml; a \
+                         timeout usually means a firewall or an egress policy is dropping the \
+                         connection, an immediate error means the host does not resolve or \
+                         nothing is listening on that port";
+
+/// One `/health` check: the state that goes into the JSON body plus, when the
+/// check failed, the line that goes to the log.
+///
+/// The two channels deliberately carry different detail. `/health` is reachable
+/// without auth, so the body stays free of filesystem layout, hostnames and
+/// errno; the log — which only the operator sees — gets the whole cause.
+struct Check {
+    status: &'static str,
+    diagnostic: Option<String>,
+}
+
+impl Check {
+    fn ok() -> Self {
+        Self {
+            status: "ok",
+            diagnostic: None,
+        }
+    }
+
+    fn failed(status: &'static str, diagnostic: String) -> Self {
+        Self {
+            status,
+            diagnostic: Some(diagnostic),
+        }
+    }
+
+    fn is_ok(&self) -> bool {
+        self.status == "ok"
+    }
+}
+
+/// Record `check` under `name` and, on failure, put the cause in the log.
+///
+/// `/health` is the endpoint an operator reaches for when the container will not
+/// come up, so this is the one place a cause must never be dropped. A permanent
+/// fault does mean one line per poll — that is the point: the container is in a
+/// restart loop anyway, and the log is where the reason has to be.
+fn record(
+    checks: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    check: Check,
+) -> bool {
+    if let Some(diagnostic) = &check.diagnostic {
+        tracing::error!("health check `{name}` failed: {diagnostic}");
+    }
+    checks.insert(name.to_string(), serde_json::json!(check.status));
+    check.is_ok()
+}
+
+/// Probe the repository storage root for `/health`.
+///
+/// `Path::exists()` answers `false` for *every* `stat` failure, so a bind-mount
+/// the container user cannot traverse (`EACCES` — uid 1000 against a
+/// host-created directory, the first-install scenario) used to be
+/// indistinguishable from a root that was never created, and `read_dir().is_ok()`
+/// dropped the errno on the way out. The two need opposite fixes (`chown` vs
+/// `mkdir`), so the probe keeps the `io::Error`: one `read_dir` answers both
+/// existence and readability, and `NotFound` is the only kind that means
+/// "missing".
+async fn filesystem_check(repo_root: &Path) -> Check {
+    match tokio::fs::read_dir(repo_root).await {
+        Ok(_) => Check::ok(),
+        Err(error) => {
+            let status = if error.kind() == std::io::ErrorKind::NotFound {
+                "missing"
+            } else {
+                "unreadable"
+            };
+            Check::failed(
+                status,
+                rg_core::platform::fs::describe_path_error(
+                    "repo_root",
+                    &absolutize(repo_root),
+                    &error,
+                    rg_core::platform::fs::REPO_ROOT_HINT,
+                ),
+            )
+        }
+    }
+}
+
+/// Outcome of the SMTP TCP probe, kept as a value so the classification can be
+/// tested without a socket (`Elapsed` has no public constructor).
+enum SmtpProbe {
+    Connected,
+    Failed(std::io::Error),
+    TimedOut,
+}
+
+/// Turn an SMTP probe outcome into a `/health` check.
+///
+/// A refused connection and a silent drop are different faults — a wrong port or
+/// a dead host vs. a firewall eating the SYN — and they used to fold into one
+/// bare `"error"` that named neither the host nor the cause.
+fn smtp_check_from(probe: SmtpProbe, host: &str, port: u16) -> Check {
+    match probe {
+        SmtpProbe::Connected => Check::ok(),
+        SmtpProbe::Failed(error) => Check::failed(
+            "error",
+            format!("SMTP connect to {host}:{port} failed: {error}\n  hint: {SMTP_HINT}"),
+        ),
+        SmtpProbe::TimedOut => Check::failed(
+            "timeout",
+            format!(
+                "SMTP connect to {host}:{port} timed out after {}s\n  hint: {SMTP_HINT}",
+                SMTP_PROBE_TIMEOUT.as_secs()
+            ),
+        ),
+    }
+}
+
+/// TCP-connect to the configured SMTP host, bounded by [`SMTP_PROBE_TIMEOUT`].
+async fn smtp_check(host: &str, port: u16) -> Check {
+    let probe = match tokio::time::timeout(
+        SMTP_PROBE_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => SmtpProbe::Connected,
+        Ok(Err(error)) => SmtpProbe::Failed(error),
+        Err(_elapsed) => SmtpProbe::TimedOut,
+    };
+    smtp_check_from(probe, host, port)
+}
+
 pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     use sea_orm::{ConnectionTrait, Statement};
 
     let mut checks = serde_json::Map::new();
 
     // DB ping
-    let db_ok = state
+    let db_check = match state
         .db
         .execute(Statement::from_string(
             state.db.get_database_backend(),
             "SELECT 1".to_string(),
         ))
         .await
-        .is_ok();
-    checks.insert(
-        "database".to_string(),
-        serde_json::json!(if db_ok { "ok" } else { "error" }),
-    );
+    {
+        Ok(_) => Check::ok(),
+        Err(error) => Check::failed("error", format!("database ping `SELECT 1` failed: {error}")),
+    };
+    let db_ok = record(&mut checks, "database", db_check);
 
     // Filesystem check
-    let fs_ok = state.repo_root.exists() && state.repo_root.read_dir().is_ok();
-    checks.insert(
-        "filesystem".to_string(),
-        serde_json::json!(if fs_ok { "ok" } else { "error" }),
+    let fs_ok = record(
+        &mut checks,
+        "filesystem",
+        filesystem_check(&state.repo_root).await,
     );
 
     // Prometheus registry check
@@ -136,30 +273,22 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     );
 
     // Git availability check (gateway already validates git --version at init)
-    let git_ok = rg_git::cli_gateway::global_gateway().is_ok();
-    checks.insert(
-        "git".to_string(),
-        serde_json::json!(if git_ok { "ok" } else { "error" }),
-    );
+    let git_check = match rg_git::cli_gateway::global_gateway() {
+        Ok(_) => Check::ok(),
+        Err(error) => Check::failed("error", format!("git command gateway unusable: {error}")),
+    };
+    let git_ok = record(&mut checks, "git", git_check);
 
     // SMTP connectivity check (TCP connect with timeout)
-    let smtp_ok = if let Some(ref smtp) = state.smtp_config {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::net::TcpStream::connect((smtp.host.as_str(), smtp.port)),
-        )
-        .await
-        {
-            Ok(Ok(_)) => true,
-            Ok(Err(_)) | Err(_) => false,
-        }
-    } else {
-        true // skipped if not configured
+    let smtp_ok = match state.smtp_config {
+        Some(ref smtp) => record(
+            &mut checks,
+            "smtp",
+            smtp_check(smtp.host.as_str(), smtp.port).await,
+        ),
+        // Skipped when unconfigured — no section, nothing to be wrong about.
+        None => record(&mut checks, "smtp", Check::ok()),
     };
-    checks.insert(
-        "smtp".to_string(),
-        serde_json::json!(if smtp_ok { "ok" } else { "error" }),
-    );
 
     // Overall: all critical checks must pass
     let overall = if db_ok && fs_ok && git_ok && smtp_ok {
@@ -307,5 +436,158 @@ mod tests {
     #[test]
     fn the_router_and_the_handler_agree_on_the_bundle_directory() {
         assert!(spa_index_path().starts_with(WEB_BUILD_DIR));
+    }
+
+    #[tokio::test]
+    async fn a_readable_repo_root_reports_ok_and_logs_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let check = filesystem_check(root.path()).await;
+
+        assert_eq!(check.status, "ok");
+        assert!(check.diagnostic.is_none());
+    }
+
+    /// The whole point of the card: `exists()` collapsed these two into one
+    /// `"error"`, and they need opposite fixes — `mkdir` vs. `chown`.
+    #[tokio::test]
+    async fn a_missing_repo_root_and_an_unreadable_one_are_different_states() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let missing = filesystem_check(&root.path().join("never-created")).await;
+        assert_eq!(missing.status, "missing");
+
+        // The deploy scenario: the bind-mount landed a *file* where the storage
+        // root should be, so the directory is there and still unusable.
+        let occupied = root.path().join("occupied");
+        std::fs::write(&occupied, b"not a directory").expect("write");
+        let unreadable = filesystem_check(&occupied).await;
+        assert_eq!(unreadable.status, "unreadable");
+    }
+
+    #[tokio::test]
+    async fn the_repo_root_log_line_carries_the_absolute_path_the_errno_and_the_remediation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("repos");
+
+        let diagnostic = filesystem_check(&missing)
+            .await
+            .diagnostic
+            .expect("a failed check must explain itself");
+
+        assert!(
+            diagnostic.contains(&missing.display().to_string()),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("os error 2"), "{diagnostic}");
+        assert!(diagnostic.contains("repo_root"), "{diagnostic}");
+    }
+
+    /// A relative `--repo-root` is resolved against the process CWD before it
+    /// reaches the log — otherwise the operator has to guess the anchor.
+    #[tokio::test]
+    async fn a_relative_repo_root_is_logged_absolute() {
+        let diagnostic = filesystem_check(Path::new("this-directory-does-not-exist"))
+            .await
+            .diagnostic
+            .expect("a failed check must explain itself");
+        let cwd = std::env::current_dir().expect("cwd");
+
+        assert!(
+            diagnostic.contains(&cwd.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    /// A directory that exists but denies traversal is the first-install case:
+    /// a host-created bind-mount the container uid cannot read. Root ignores the
+    /// mode bits, so the check would report `ok` there — skip rather than lie.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_repo_root_names_the_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let denied = root.path().join("repos");
+        std::fs::create_dir(&denied).expect("create_dir");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("set_permissions");
+
+        if std::fs::read_dir(&denied).is_ok() {
+            return; // running as root — the mode bits do not apply
+        }
+
+        let check = filesystem_check(&denied).await;
+
+        assert_eq!(check.status, "unreadable");
+        let diagnostic = check
+            .diagnostic
+            .expect("a failed check must explain itself");
+        assert!(diagnostic.contains("os error 13"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&denied.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    /// A dropped SYN and a refused connection need different fixes (firewall vs.
+    /// port/host), so they must not both read as `"error"`.
+    #[test]
+    fn a_timed_out_smtp_probe_is_not_the_same_state_as_a_refused_one() {
+        let refused = smtp_check_from(
+            SmtpProbe::Failed(Error::new(
+                ErrorKind::ConnectionRefused,
+                "Connection refused",
+            )),
+            "mail.example.com",
+            587,
+        );
+        assert_eq!(refused.status, "error");
+        let diagnostic = refused
+            .diagnostic
+            .expect("a failed check must explain itself");
+        assert!(diagnostic.contains("mail.example.com:587"), "{diagnostic}");
+        assert!(diagnostic.contains("Connection refused"), "{diagnostic}");
+        assert!(diagnostic.contains("[smtp]"), "{diagnostic}");
+
+        let timed_out = smtp_check_from(SmtpProbe::TimedOut, "mail.example.com", 587);
+        assert_eq!(timed_out.status, "timeout");
+        let diagnostic = timed_out
+            .diagnostic
+            .expect("a failed check must explain itself");
+        assert!(diagnostic.contains("mail.example.com:587"), "{diagnostic}");
+        assert!(diagnostic.contains("timed out"), "{diagnostic}");
+
+        assert!(smtp_check_from(SmtpProbe::Connected, "mail.example.com", 587).is_ok());
+    }
+
+    /// The live path, end to end: nothing listens on port 1 of the loopback, so
+    /// the probe has to come back as a named connect failure.
+    #[tokio::test]
+    async fn a_refused_smtp_connect_reports_the_host_and_the_cause() {
+        let check = smtp_check("127.0.0.1", 1).await;
+
+        assert_eq!(check.status, "error");
+        let diagnostic = check
+            .diagnostic
+            .expect("a failed check must explain itself");
+        assert!(diagnostic.contains("127.0.0.1:1"), "{diagnostic}");
+    }
+
+    /// `record` is the only thing standing between a failed check and a silent
+    /// 503: the JSON keeps the state, the log keeps the cause.
+    #[test]
+    fn a_recorded_failure_keeps_its_state_in_the_body() {
+        let mut checks = serde_json::Map::new();
+
+        assert!(record(&mut checks, "filesystem", Check::ok()));
+        assert_eq!(checks["filesystem"], "ok");
+
+        assert!(!record(
+            &mut checks,
+            "filesystem",
+            Check::failed("missing", "repo_root /srv/repos is unusable".to_string()),
+        ));
+        assert_eq!(checks["filesystem"], "missing");
     }
 }
