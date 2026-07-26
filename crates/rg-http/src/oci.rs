@@ -57,6 +57,22 @@ fn oci_not_found(code: &str, message: &str) -> Response {
     oci_err(StatusCode::NOT_FOUND, code, message)
 }
 
+/// One actionable line for a filesystem failure on a local OCI blob.
+///
+/// `OciStorage::blob_local_path` derives the file from the digest inside the
+/// storage backend, so neither the request nor the OCI error envelope ever
+/// names it — a `docker pull` against a repo_root whose bind-mount lost its
+/// permissions reports `failed to stat blob`, or a bare errno, and the operator
+/// has no file to go and look at.
+fn blob_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> String {
+    rg_core::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        rg_core::platform::fs::BLOB_STORAGE_HINT,
+    )
+}
+
 /// Classify a DB-layer error into the HTTP status for an OCI response, while
 /// leaving the OCI error-envelope untouched.
 ///
@@ -821,12 +837,12 @@ pub async fn get_blob(
             Ok(file) => {
                 let size = match file.metadata().await {
                     Ok(m) => m.len(),
-                    Err(_) => {
-                        return oci_err(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "UNKNOWN",
-                            "failed to stat blob",
-                        );
+                    Err(error) => {
+                        let message = blob_path_error("OCI blob", &path, &error);
+                        // This handler keeps the OCI error envelope and so does
+                        // not route through `AppError` — nothing else logs it.
+                        tracing::error!(error = %message, "failed to stat OCI blob");
+                        return oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &message);
                     }
                 };
                 let stream = tokio_util::io::ReaderStream::new(file);
@@ -848,11 +864,11 @@ pub async fn get_blob(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 oci_not_found(error_codes::BLOB_UNKNOWN, "blob not found")
             }
-            Err(error) => oci_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "UNKNOWN",
-                &format!("{error:#}"),
-            ),
+            Err(error) => {
+                let message = blob_path_error("OCI blob", &path, &error);
+                tracing::error!(error = %message, "failed to open OCI blob");
+                oci_err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &message)
+            }
         },
         Ok(None) => match state.oci_storage.read_blob(&owner, &repo, &digest).await {
             Ok(data) => {
@@ -1294,4 +1310,29 @@ fn get_base_url(headers: &HeaderMap) -> String {
             format!("{}://{}", scheme, host)
         })
         .unwrap_or_else(|| "http://localhost".into())
+}
+
+#[cfg(test)]
+mod blob_path_error_tests {
+    use super::*;
+
+    /// `docker pull` prints the OCI envelope message and nothing else, and this
+    /// handler does not route through `AppError`, so a blob whose file is
+    /// unreadable used to reach the operator as `failed to stat blob` — no
+    /// path, no errno — or as an errno with the path stripped off.
+    #[test]
+    fn blob_failure_names_the_file_and_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("blobs").join("sha256").join("deadbeef");
+        let error = std::fs::File::open(&missing).unwrap_err();
+
+        let rendered = blob_path_error("OCI blob", &missing, &error);
+
+        assert!(
+            rendered.contains(&missing.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("OCI blob"), "{rendered}");
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
 }

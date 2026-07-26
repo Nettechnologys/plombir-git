@@ -530,13 +530,31 @@ async fn download(
     }
 }
 
+/// One actionable error for a filesystem failure on a stored attachment.
+///
+/// The download half is the mirror of [`upload_path_error`]: `local_path`
+/// resolves the file from the row's `blob_key` inside the storage backend, so
+/// the path exists nowhere in the request or the response. A bare `?` on the
+/// open handed the operator an errno against a file only the server can name —
+/// exactly what a repo_root bind-mounted from a foreign uid produces.
+fn download_path_error(path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
+    rg_core::platform::fs::path_error(
+        "attachment file",
+        path,
+        error,
+        rg_core::platform::fs::BLOB_STORAGE_HINT,
+    )
+}
+
 async fn stream_attachment(
     state: &AppState,
     attachment: &rg_db::entities::attachment::Model,
 ) -> anyhow::Result<Response> {
     let key = rg_core::blob_storage::BlobKey::new(attachment.blob_key.clone())?;
     let mut response = if let Some(path) = state.blob_storage.local_path(&key) {
-        let file = tokio::fs::File::open(path).await?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|error| download_path_error(&path, &error))?;
         let stream = ReaderStream::new(file);
         Response::new(Body::from_stream(stream))
     } else {
@@ -766,5 +784,24 @@ mod upload_path_error_tests {
             "{rendered}"
         );
         assert!(rendered.contains(".tmp/attachments/"), "{rendered}");
+    }
+
+    /// The download half: the stored file is resolved from the row's
+    /// `blob_key`, so a bare `?` on the open left the operator with an errno
+    /// and no file — the same blind spot the upload half already fixed.
+    #[test]
+    fn download_failure_names_the_file_and_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("attachments").join("gone.bin");
+        let error = std::fs::File::open(&missing).unwrap_err();
+
+        let rendered = format!("{:#}", download_path_error(&missing, &error));
+
+        assert!(
+            rendered.contains(&missing.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("attachment file"), "{rendered}");
+        assert!(rendered.contains("[server].repo_root"), "{rendered}");
     }
 }

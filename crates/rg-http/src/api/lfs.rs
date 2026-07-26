@@ -318,7 +318,7 @@ pub async fn download_object(
             compressed: is_compressed,
         }) => {
             if is_compressed {
-                stream_compressed_lfs_object(file_path)
+                stream_compressed_lfs_object(file_path).await
             } else {
                 stream_uncompressed_lfs_object(&file_path).await
             }
@@ -370,24 +370,45 @@ async fn authorize_lfs_download(
 
 /// Stream a zstd-compressed LFS object, decompressing on a blocking thread and
 /// piping decoded chunks through a channel into the response body.
-fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::response::Response {
+///
+/// The file is opened *before* the response head is built. Opening it inside
+/// the blocking task meant the `200` was already on the wire, so the only way
+/// left to report the failure was an aborted body: `git lfs pull` saw a
+/// truncated transfer and the operator saw nothing at all — no path, no errno.
+/// A failure that is still reportable is now a 500 naming the file; the errors
+/// that genuinely can only happen mid-stream are logged with the path before
+/// they go into the body channel.
+async fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::response::Response {
+    let file = match tokio::fs::File::open(&file_path).await {
+        Ok(file) => file.into_std().await,
+        Err(error) => {
+            return lfs_path_error("LFS object file", &file_path, &error).into_response();
+        }
+    };
+
     // Stream-decompress via channel: spawn_blocking reads zstd chunks → channel → response body
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(8);
-    let path_for_thread = file_path.clone();
 
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
-        let file = match std::fs::File::open(&path_for_thread) {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(e));
-                return;
-            }
+        // A body-stream error is logged by nobody: the client sees a truncated
+        // transfer and hyper drops the cause, so this is the only place the
+        // file can still be named.
+        let aborted = |error: &std::io::Error| {
+            let message = rg_core::platform::fs::describe_path_error(
+                "LFS object file",
+                &file_path,
+                error,
+                LFS_STORAGE_HINT,
+            );
+            tracing::error!(error = %message, "LFS object stream aborted");
+            std::io::Error::other(message)
         };
+
         let decoder = match zstd::stream::Decoder::new(file) {
             Ok(d) => d,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+            Err(error) => {
+                let _ = tx.blocking_send(Err(aborted(&error)));
                 return;
             }
         };
@@ -404,8 +425,8 @@ fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::response
                         break;
                     }
                 }
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(aborted(&error)));
                     break;
                 }
             }
@@ -424,14 +445,23 @@ fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::response
 }
 
 /// Stream an uncompressed LFS object file directly from disk.
+///
+/// `read_object_source` already confirmed the object exists, so a failure here
+/// is the storage under the server misbehaving — a stale handle, an unreadable
+/// bind-mount, a file yanked between the check and the open. It stays a 500,
+/// but it now names the file instead of handing `git lfs pull` a bare
+/// "failed to open LFS object file" with the path and the errno both dropped.
 async fn stream_uncompressed_lfs_object(file_path: &std::path::Path) -> axum::response::Response {
     match tokio::fs::File::open(file_path).await {
         Ok(file) => {
+            // Size off the open handle: the second, *blocking* `std::fs::metadata`
+            // this used to do sat on the async runtime and re-resolved a path
+            // that could already have changed under it.
+            let estimated_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
             let stream = tokio_util::io::ReaderStream::new(file);
             let frame_stream =
                 futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
             let stream_body = http_body_util::StreamBody::new(frame_stream);
-            let estimated_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
             (
                 StatusCode::OK,
                 [
@@ -445,11 +475,7 @@ async fn stream_uncompressed_lfs_object(file_path: &std::path::Path) -> axum::re
             )
                 .into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to open LFS object file",
-        )
-            .into_response(),
+        Err(error) => lfs_path_error("LFS object file", file_path, &error).into_response(),
     }
 }
 
@@ -569,5 +595,31 @@ mod staging_path_tests {
         );
         assert!(rendered.contains("LFS object directory"), "{rendered}");
         assert!(rendered.contains("<owner>.lfs/<repo>/"), "{rendered}");
+    }
+
+    /// `read_object_source` confirms the object exists before handing back a
+    /// local path, so an open that still fails is the storage misbehaving —
+    /// a 500, not a 404, and it has to survive as a *status* rather than as a
+    /// truncated body.
+    #[tokio::test]
+    async fn a_compressed_object_that_cannot_be_opened_is_a_500_not_a_broken_200() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("owner.lfs").join("repo").join("abc.zst");
+
+        let response = stream_compressed_lfs_object(missing).await;
+
+        // Opening inside the blocking task committed the `200` first, leaving
+        // an aborted body as the only channel for the failure.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn an_uncompressed_object_that_cannot_be_opened_stays_a_500() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("owner.lfs").join("repo").join("abc");
+
+        let response = stream_uncompressed_lfs_object(&missing).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
