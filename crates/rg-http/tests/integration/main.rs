@@ -55,6 +55,7 @@ mod pr_lookup_failure_status_tests;
 mod pr_merge_outcome_status_tests;
 mod pr_merge_strategy_tests;
 mod pr_permission_tests;
+mod private_repo_issue_metadata_tests;
 mod private_repo_visibility_tests;
 mod release_attestation_tests;
 mod release_tests;

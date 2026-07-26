@@ -90,14 +90,24 @@ pub async fn add_time(
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn list_time_entries(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, number)): Path<(String, String, i64)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
+    // Time entries carry a free-form description written by collaborators, so
+    // they are exactly as private as the repository. Without this gate the
+    // handler had no way to see the caller at all.
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
+
     let pagination = params.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
@@ -131,12 +141,22 @@ pub async fn list_time_entries(
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn total_time(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
+    // The aggregate leaks the same thing the listing does — that work happened
+    // on this issue, and how much of it — so it gets the same gate.
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
+
     let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
         Ok(i) => i,
         Err(e) => return AppError::from(e).into_response(),

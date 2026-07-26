@@ -952,7 +952,15 @@ pub async fn delete_milestone(
 pub async fn get_issue_labels(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Same gate as `get_issue` / `list_comments`: the labels of an issue are as
+    // private as the issue itself, and without `HeaderMap` this handler could
+    // not tell an anonymous caller from the owner at all.
+    if let Err(e) = resolve_and_check_read_access(&state, &headers, &owner, &repo).await {
+        return e.into_response();
+    }
+
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => match rg_core::label::service::get_issue_labels(&state.db, issue.id).await {
             Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),

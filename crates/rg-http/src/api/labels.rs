@@ -77,12 +77,21 @@ pub struct UpdateLabelRequest {
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
     ),
 )]
 pub async fn list_labels(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // The three mutating handlers below already resolve the repository and check
+    // the caller; the read pair did not even take `HeaderMap`, which made the
+    // label set of a private repository readable by anyone.
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
+
     match rg_core::label::service::list_labels(&state.db, &owner, &name).await {
         Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -102,13 +111,19 @@ pub async fn list_labels(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn get_label(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
+
     // `Err(_) => not_found(…)` used to swallow the error whole: a failed query
     // was answered as an absent label, and because the value was dropped rather
     // than converted, nothing reached the operator log either. The service now
