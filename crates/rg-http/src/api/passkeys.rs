@@ -350,7 +350,7 @@ pub async fn login_start(
     let user = rg_db::ops::user_ops::find_by_username(&state.db, &req.username)
         .await
         .map_err(AppError::from)?
-        .filter(|u| u.is_active)
+        .filter(|u| u.is_usable())
         .ok_or_else(no_passkey)?;
 
     let passkeys: Vec<wa::Passkey> = load_passkeys(&state, user.id)
@@ -413,7 +413,7 @@ pub async fn login_finish(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
-    if user.username != sealed.username || !user.is_active {
+    if user.username != sealed.username || !user.is_usable() {
         return Err(AppError::unauthorized("invalid credentials"));
     }
     if user

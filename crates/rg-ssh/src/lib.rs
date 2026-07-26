@@ -339,6 +339,30 @@ impl Handler for SshHandler {
 
         match rg_db::ops::ssh_key_ops::find_by_fingerprint(db, &fp_str).await {
             Ok(Some(key)) => {
+                // The key alone says nothing about its owner. Without this the
+                // longest-lived door into a deactivated account stays wide
+                // open: the offboarded developer keeps pushing over SSH until
+                // somebody remembers to delete the key by hand.
+                match rg_db::ops::user_ops::find_by_id(db, key.user_id).await {
+                    Ok(Some(owner)) if owner.is_usable() => {}
+                    Ok(_) => {
+                        tracing::warn!(
+                            user_id = key.user_id,
+                            "SSH pubkey auth rejected: account is disabled or gone"
+                        );
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                            partial_success: false,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %format!("{error:#}"), "DB error during key-owner lookup");
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                            partial_success: false,
+                        });
+                    }
+                }
                 self.authenticated_identity = Some(AuthenticatedIdentity::User(key.user_id));
                 if let Err(error) = rg_db::ops::ssh_key_ops::touch_last_used(db, key.id).await {
                     tracing::warn!(
@@ -418,8 +442,11 @@ impl Handler for SshHandler {
             found.as_ref().map(|user| user.password_hash.as_str()),
         );
 
+        // `is_usable` is read after the hash, never before: skipping the
+        // verification for a disabled account would answer "is this account
+        // disabled?" through the response time.
         match found {
-            Some(user) if password_ok => {
+            Some(user) if password_ok && user.is_usable() => {
                 self.authenticated_identity = Some(AuthenticatedIdentity::User(user.id));
                 tracing::info!(username, "SSH password auth accepted");
                 Ok(Auth::Accept)

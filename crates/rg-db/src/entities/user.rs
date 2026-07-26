@@ -50,6 +50,24 @@ pub struct Model {
     pub deleted_at: Option<DateTimeUtc>,
 }
 
+impl Model {
+    /// Whether this account may still authenticate and act.
+    ///
+    /// The single gate behind every credential check — password, SSH key,
+    /// Personal Access Token, docker login, password reset. Deactivating an
+    /// account is the standard answer to an offboarding or a compromise, so it
+    /// has to close *every* door at once; six independent `is_active` checks
+    /// scattered over six call sites are six chances to forget one, and the
+    /// one that was forgotten is the one an attacker uses.
+    ///
+    /// `deleted_at` is folded in for the same reason: nothing soft-deletes a
+    /// user today, but the column exists, and the day something does, a
+    /// tombstoned account must not keep pushing over SSH.
+    pub fn is_usable(&self) -> bool {
+        self.is_active && self.deleted_at.is_none()
+    }
+}
+
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(has_many = "super::repository::Entity")]

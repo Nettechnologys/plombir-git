@@ -330,8 +330,10 @@ async fn authenticate_basic(db: &DatabaseConnection, headers: &HeaderMap) -> (St
         found.as_ref().map(|u| u.password_hash.as_str()),
     );
 
+    // Checked after the hash, so a disabled account is not distinguishable
+    // from a wrong password by how fast the registry says no.
     match found {
-        Some(u) if password_ok => (user.to_string(), Some(u.id)),
+        Some(u) if password_ok && u.is_usable() => (user.to_string(), Some(u.id)),
         _ => anonymous(),
     }
 }

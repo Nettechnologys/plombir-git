@@ -180,7 +180,7 @@ pub async fn login(
 
     // Checked after the password so that "account is disabled" is only ever
     // disclosed to whoever already knows the credentials.
-    if !user.is_active {
+    if !user.is_usable() {
         bail!("account is disabled");
     }
 
@@ -286,7 +286,7 @@ async fn login_via_ldap_inner(
     if plaintext_password.is_empty() {
         bail!("invalid credentials");
     }
-    if existing.as_ref().is_some_and(|user| !user.is_active) {
+    if existing.as_ref().is_some_and(|user| !user.is_usable()) {
         bail!("account is disabled");
     }
 
@@ -640,6 +640,14 @@ async fn forgot_password_inner(
         return Ok(());
     }
 
+    // A disabled account gets the same silent no-op an unknown address gets.
+    // Otherwise the reset flow is a way back in that needs no administrator:
+    // the mail still lands in the mailbox the offboarded user controls, and
+    // `reset_password` hands out a working session at the end of it.
+    if !user.is_usable() {
+        return Ok(());
+    }
+
     // Invalidate old unused tokens
     rg_db::ops::password_reset_token_ops::invalidate_user_tokens(db, user.id).await?;
 
@@ -721,6 +729,14 @@ pub async fn reset_password(
     let user = user_ops::find_by_id(db, token.user_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("user not found"))?;
+
+    // Re-checked here and not only in `forgot_password`: the account may have
+    // been disabled in the fifteen minutes the token is alive for, and this
+    // function ends by minting a JWT. Reported as a bad token rather than as
+    // "disabled" — the holder of the link has proved nothing yet.
+    if !user.is_usable() {
+        bail!("invalid or expired reset token");
+    }
 
     let password_validator = password::PasswordValidator::standard();
     password_validator

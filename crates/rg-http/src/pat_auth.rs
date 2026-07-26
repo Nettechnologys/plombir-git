@@ -31,11 +31,20 @@ pub(crate) async fn docs_auth_middleware(
     next.run(req).await
 }
 
-/// Resolve a Personal Access Token, honouring expiry.
+/// Resolve a Personal Access Token, honouring expiry and the owner's standing.
+///
+/// Returns the token together with the account it belongs to, so no caller has
+/// to remember to look the owner up: a PAT is a standing delegation of that
+/// account's rights, and deactivating the account has to revoke it. Resolving
+/// the owner here rather than at each call site is what makes that true for
+/// both the REST middleware and git-over-HTTP at once.
 async fn resolve_pat(
     db: &DatabaseConnection,
     token: &str,
-) -> Option<rg_db::entities::access_token::Model> {
+) -> Option<(
+    rg_db::entities::access_token::Model,
+    rg_db::entities::user::Model,
+)> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -49,7 +58,18 @@ async fn resolve_pat(
             return None; // expired
         }
     }
-    Some(tok)
+    let owner = rg_db::ops::user_ops::find_by_id(db, tok.user_id)
+        .await
+        .ok()??;
+    if !owner.is_usable() {
+        tracing::warn!(
+            user_id = tok.user_id,
+            token_id = tok.id,
+            "rejecting personal access token: account is disabled or gone"
+        );
+        return None;
+    }
+    Some((tok, owner))
 }
 
 /// Scope required when a PAT is used for a REST request.
@@ -152,21 +172,18 @@ async fn pat_to_bearer_jwt(
         if rg_core::auth::jwt::validate_token(&cand, &state.jwt_secret).is_some() {
             return Ok(Some(cand));
         }
-        if let Some(pat) = resolve_pat(&state.db, &cand).await {
+        if let Some((pat, owner)) = resolve_pat(&state.db, &cand).await {
             if required_scope
                 .is_some_and(|scope| !rg_core::auth::pat_scope::has_scope(&pat.scopes, scope))
             {
                 return Err(());
             }
-            let username = rg_db::ops::user_ops::find_by_id(&state.db, pat.user_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|u| u.username)
-                .unwrap_or_default();
-            if let Ok(jwt) =
-                rg_core::auth::jwt::generate_token(pat.user_id, &username, &state.jwt_secret, 1)
-            {
+            if let Ok(jwt) = rg_core::auth::jwt::generate_token(
+                pat.user_id,
+                &owner.username,
+                &state.jwt_secret,
+                1,
+            ) {
                 return Ok(Some(jwt));
             }
         }
@@ -194,8 +211,8 @@ pub(crate) async fn extract_actor_id(
         }
         return resolve_pat(db, token)
             .await
-            .filter(|pat| rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo"))
-            .map(|pat| pat.user_id);
+            .filter(|(pat, _)| rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo"))
+            .map(|(pat, _)| pat.user_id);
     }
 
     if let Some(encoded) = auth_str.strip_prefix("Basic ") {
@@ -214,7 +231,7 @@ pub(crate) async fn extract_actor_id(
             if let Some(claims) = rg_core::auth::jwt::validate_token(candidate, jwt_secret) {
                 return claims.sub.parse().ok();
             }
-            if let Some(pat) = resolve_pat(db, candidate).await {
+            if let Some((pat, _)) = resolve_pat(db, candidate).await {
                 if rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo") {
                     return Some(pat.user_id);
                 }

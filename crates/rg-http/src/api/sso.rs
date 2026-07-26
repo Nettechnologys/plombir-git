@@ -461,7 +461,7 @@ pub async fn callback(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::internal("user not found after creation"))?;
-    if !user.is_active {
+    if !user.is_usable() {
         return Err(AppError::unauthorized("account is disabled"));
     }
     if user

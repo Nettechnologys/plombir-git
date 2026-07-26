@@ -283,7 +283,7 @@ pub async fn verify_mfa(
             tracing::warn!(user_id, "MFA verify: user not found");
             AppError::unauthorized("invalid credentials")
         })?;
-    if user.username != challenge.username || !user.is_active {
+    if user.username != challenge.username || !user.is_usable() {
         return Err(AppError::unauthorized("invalid credentials"));
     }
     if user

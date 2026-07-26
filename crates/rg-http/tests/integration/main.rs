@@ -32,6 +32,7 @@ mod ci_permission_tests;
 mod ci_secrets_tag_protection_tests;
 mod collaborator_tests;
 mod db_outage_status_tests;
+mod deactivated_account_tests;
 mod deploy_key_tests;
 mod git_auth_tests;
 mod git_http_clone_tests;
