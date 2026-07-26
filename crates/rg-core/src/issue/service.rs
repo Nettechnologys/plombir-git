@@ -62,7 +62,7 @@ pub async fn create_issue(
         "author_id": issue.author_id,
     });
     if let Err(e) = crate::webhook::service::trigger_issue_opened(db, repo_id, &payload).await {
-        tracing::warn!("Failed to trigger issue.opened webhook: {e}");
+        tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.opened webhook");
     }
 
     // Dual-write: sync labels to issue_labels junction table
@@ -74,7 +74,7 @@ pub async fn create_issue(
                 .map(|l| l.id)
                 .collect();
             if let Err(e) = issue_label_ops::set_labels(db, issue.id, label_ids).await {
-                tracing::warn!("Failed to set labels for issue {}: {e}", issue.id);
+                tracing::warn!(issue_id = %issue.id, error = %format!("{e:#}"), "failed to set issue labels");
             }
         }
     }
@@ -227,7 +227,7 @@ pub async fn update_issue(
                 .map(|id| id.id)
                 .collect();
             if let Err(e) = issue_label_ops::set_labels(db, issue_id, label_ids).await {
-                tracing::warn!("Failed to set labels for issue {}: {e}", issue_id);
+                tracing::warn!(%issue_id, error = %format!("{e:#}"), "failed to set issue labels");
             }
         }
     }
@@ -258,7 +258,7 @@ pub async fn update_issue(
                 crate::webhook::service::trigger_issue_closed(db, issue_repo_id, &close_payload)
                     .await
             {
-                tracing::warn!("Failed to trigger issue.closed webhook: {e}");
+                tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.closed webhook");
             }
 
             if let Some(mid) = issue_milestone_id {
@@ -267,7 +267,7 @@ pub async fn update_issue(
                 {
                     if remaining == 0 {
                         if let Err(e) = notify_milestone_closed(db, issue_repo_id, mid).await {
-                            tracing::warn!("Failed to notify milestone {} closed: {e}", mid);
+                            tracing::warn!(milestone_id = %mid, error = %format!("{e:#}"), "failed to notify milestone closed");
                         }
                     }
                 }
@@ -326,7 +326,7 @@ pub async fn add_comment(
     )
     .await
     {
-        tracing::warn!("Failed to trigger issue.comment webhook: {e}");
+        tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.comment webhook");
     }
 
     Ok(comment)
@@ -383,7 +383,7 @@ async fn notify_milestone_closed(
         "repo_id": repo_id,
     });
     if let Err(e) = crate::webhook::service::trigger_milestone_closed(db, repo_id, &payload).await {
-        tracing::warn!("Failed to trigger milestone.closed webhook: {e}");
+        tracing::warn!(error = %format!("{e:#}"), "failed to trigger milestone.closed webhook");
     }
 
     // Notify watchers about milestone completion
@@ -403,7 +403,7 @@ async fn notify_milestone_closed(
             )
             .await
             {
-                tracing::warn!("Failed to notify watchers about milestone: {e}");
+                tracing::warn!(error = %format!("{e:#}"), "failed to notify watchers about milestone");
             }
         }
     }

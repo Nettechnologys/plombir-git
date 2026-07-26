@@ -186,7 +186,7 @@ pub async fn sync_due_mirrors(
         match sync_mirror(db, mirror, repo_root).await {
             Ok(true) => count += 1,
             Ok(false) => { /* inactive, skip */ }
-            Err(e) => tracing::error!("Mirror sync error: {e}"),
+            Err(e) => tracing::error!(mirror_id = %mirror.id, error = %format!("{e:#}"), "mirror sync failed"),
         }
     }
     Ok(count)

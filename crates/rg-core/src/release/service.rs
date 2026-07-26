@@ -70,7 +70,7 @@ pub async fn create_release(
         "author_id": release.author_id,
     });
     if let Err(e) = crate::webhook::service::trigger_release_created(db, repo_id, &payload).await {
-        tracing::warn!("Failed to trigger release.created webhook: {e}");
+        tracing::warn!(error = %format!("{e:#}"), "failed to trigger release.created webhook");
     }
 
     Ok(release)
@@ -147,7 +147,7 @@ pub async fn delete_release(db: &DatabaseConnection, id: i64) -> Result<()> {
         "title": release.title,
     });
     if let Err(e) = crate::webhook::service::trigger_release_deleted(db, repo_id, &payload).await {
-        tracing::warn!("Failed to trigger release.deleted webhook: {e}");
+        tracing::warn!(error = %format!("{e:#}"), "failed to trigger release.deleted webhook");
     }
 
     Ok(())

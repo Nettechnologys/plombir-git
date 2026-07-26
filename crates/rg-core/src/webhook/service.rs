@@ -262,7 +262,7 @@ pub async fn redeliver(db: &DatabaseConnection, delivery_id: i64) -> Result<()> 
     )
     .await
     {
-        tracing::warn!("Failed to redeliver webhook event: {e}");
+        tracing::warn!(error = %format!("{e:#}"), "failed to redeliver webhook event");
     }
 
     Ok(())

@@ -704,7 +704,7 @@ async fn import_github_labels(
         };
 
         if let Err(e) = label_ops::create(db, model).await {
-            tracing::warn!("Failed to create label '{}': {e}", gl.name);
+            tracing::warn!(label = %gl.name, error = %format!("{e:#}"), "failed to create label");
         } else {
             count += 1;
         }
@@ -754,7 +754,7 @@ async fn import_github_milestones(
                 count += 1;
             }
             Err(e) => {
-                tracing::warn!("Failed to create milestone '{}': {e}", gm.title);
+                tracing::warn!(milestone = %gm.title, error = %format!("{e:#}"), "failed to create milestone");
             }
         }
     }
@@ -843,7 +843,7 @@ async fn import_github_issue(
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!("Failed to import comment on issue #{}: {e}", issue.number);
+            tracing::warn!(issue_number = %issue.number, error = %format!("{e:#}"), "failed to import issue comment");
         }
     }
 
@@ -937,7 +937,7 @@ async fn import_github_pr(
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!("Failed to import PR comment on #{}: {e}", pr.number);
+            tracing::warn!(pr_number = %pr.number, error = %format!("{e:#}"), "failed to import PR comment");
         }
     }
 
@@ -972,7 +972,7 @@ async fn import_github_pr(
         };
 
         if let Err(e) = pr_review_ops::create(db, rv).await {
-            tracing::warn!("Failed to import review on PR #{}: {e}", pr.number);
+            tracing::warn!(pr_number = %pr.number, error = %format!("{e:#}"), "failed to import PR review");
         }
     }
 
@@ -1015,7 +1015,7 @@ async fn import_github_releases(
         {
             Ok(_) => count += 1,
             Err(e) => {
-                tracing::warn!("Failed to import release '{}': {e}", release.tag_name);
+                tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
             }
         }
     }
@@ -1058,7 +1058,7 @@ async fn import_gitlab_labels(
         };
 
         if let Err(e) = label_ops::create(db, model).await {
-            tracing::warn!("Failed to create label '{}': {e}", gl.name);
+            tracing::warn!(label = %gl.name, error = %format!("{e:#}"), "failed to create label");
         } else {
             count += 1;
         }
@@ -1108,7 +1108,7 @@ async fn import_gitlab_milestones(
                 count += 1;
             }
             Err(e) => {
-                tracing::warn!("Failed to create milestone '{}': {e}", gm.title);
+                tracing::warn!(milestone = %gm.title, error = %format!("{e:#}"), "failed to create milestone");
             }
         }
     }
@@ -1195,7 +1195,7 @@ async fn import_gitlab_issue(
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!("Failed to import note on issue !{}: {e}", issue.iid);
+            tracing::warn!(issue_iid = %issue.iid, error = %format!("{e:#}"), "failed to import issue note");
         }
     }
 
@@ -1290,7 +1290,7 @@ async fn import_gitlab_mr(
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!("Failed to import MR note on !{}: {e}", mr.iid);
+            tracing::warn!(mr_iid = %mr.iid, error = %format!("{e:#}"), "failed to import MR note");
         }
     }
 
@@ -1328,7 +1328,7 @@ async fn import_gitlab_releases(
         {
             Ok(_) => count += 1,
             Err(e) => {
-                tracing::warn!("Failed to import release '{}': {e}", release.tag_name);
+                tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
             }
         }
     }
