@@ -264,16 +264,27 @@ pub async fn list_org_teams(db: &DatabaseConnection, org_id: i64) -> Result<Vec<
         .context("db: list org teams")
 }
 
-/// Delete a team.
-pub async fn delete_team(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let model = team::Entity::find_by_id(id)
+/// Delete a team. Returns whether a team was actually removed.
+///
+/// "There is no such team" is reported as `Ok(false)`, not as an error: this
+/// crate cannot depend on `rg-core` (the dependency runs the other way), so it
+/// has no access to `rg_core::error::NotFound`, and an untyped
+/// `anyhow!("team … not found")` here is indistinguishable at the HTTP layer
+/// from the `.context("db: …")` failures below it — which is exactly how a
+/// failed delete came to be answered with `404` (card_a253a34cf2f9). An `Err`
+/// from this function therefore always means the database itself failed; the
+/// absent-row case travels in the value and gets typed one level up.
+pub async fn delete_team(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let Some(model) = team::Entity::find_by_id(id)
         .one(db)
         .await
         .context("db: find team for delete")?
-        .ok_or_else(|| anyhow::anyhow!("team {} not found", id))?;
+    else {
+        return Ok(false);
+    };
 
     model.delete(db).await.context("db: delete team")?;
-    Ok(())
+    Ok(true)
 }
 
 // ── Team Member ops ──────────────────────────────────────────

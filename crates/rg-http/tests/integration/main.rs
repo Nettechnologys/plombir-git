@@ -62,6 +62,7 @@ mod runner_workspace_tests;
 mod service_failure_status_tests;
 mod ssh_key_tests;
 mod tail_lookup_failure_status_tests;
+mod team_delete_failure_status_tests;
 mod time_tracking_tests;
 mod upload_failure_status_tests;
 mod webhook_external_hmac_tests;

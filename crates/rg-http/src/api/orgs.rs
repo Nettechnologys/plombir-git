@@ -709,7 +709,11 @@ pub async fn delete_team(
 ) -> impl IntoResponse {
     match rg_core::org::delete_team(&state.db, team_id).await {
         Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        // Only the typed `NotFound` the service raises for an absent team may
+        // become a `404` here; a failed delete is ours and stays a 5xx (its
+        // `db: …` context would otherwise reach the body verbatim — a `404` is
+        // not sanitized in `IntoResponse`).
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

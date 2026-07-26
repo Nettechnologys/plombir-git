@@ -171,8 +171,15 @@ pub async fn get_team(
 }
 
 /// Delete a team.
+///
+/// Mirrors [`delete_org`]: the "no such team" outcome carries
+/// [`crate::error::NotFound`] so the HTTP layer can answer `404` to *that* and
+/// nothing else — a failed delete stays a 5xx the client retries instead of
+/// reading as "the team was already gone".
 pub async fn delete_team(db: &DatabaseConnection, id: i64) -> Result<()> {
-    org_ops::delete_team(db, id).await?;
+    if !org_ops::delete_team(db, id).await? {
+        return Err(crate::error::not_found("team"));
+    }
     crate::repo::service::invalidate_perm_cache_all();
     Ok(())
 }
