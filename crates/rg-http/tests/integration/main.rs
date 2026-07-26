@@ -24,6 +24,7 @@ mod api_tests;
 mod artifact_file_tests;
 mod attachment_tests;
 mod blob_api_tests;
+mod board_authz_tests;
 mod board_tests;
 mod ci_cache_tests;
 mod ci_job_token_tests;

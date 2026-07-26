@@ -28,7 +28,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
+use crate::api::repo_access::{require_read, require_write};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -92,6 +92,75 @@ pub struct ReorderCardsRequest {
     pub positions: Vec<(i64, i32)>,
 }
 
+// ── Repository-scoped lookups ────────────────────────────────────────────
+//
+// Every id below `/repos/{owner}/{name}/boards` is a global primary key, so a
+// permission check on `owner/name` only guards the object it was asked about
+// once that object has been read back and matched against the repository. The
+// handlers used to skip both halves: none of them resolved the repository, and
+// the ones that did authenticate stopped there — a valid token for any account
+// was full control over the boards of every repository on the instance.
+//
+// A mismatch answers 404, not 403: a 403 would confirm the id exists.
+
+async fn board_in_repo(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    board_id: i64,
+) -> Result<rg_db::entities::board::Model, AppError> {
+    match rg_db::ops::board_ops::find_board_by_id(&state.db, board_id).await {
+        // `repo_id` is nullable because a board may instead belong to an
+        // organization; such a board is not reachable through this route.
+        Ok(Some(board)) if board.repo_id == Some(repo.id) => Ok(board),
+        Ok(_) => Err(AppError::not_found("board not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+async fn column_in_board(
+    state: &AppState,
+    board_id: i64,
+    column_id: i64,
+) -> Result<rg_db::entities::board_column::Model, AppError> {
+    match rg_db::ops::board_ops::find_column_by_id(&state.db, column_id).await {
+        Ok(Some(column)) if column.board_id == board_id => Ok(column),
+        Ok(_) => Err(AppError::not_found("board column not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+async fn card_in_board(
+    state: &AppState,
+    board_id: i64,
+    card_id: i64,
+) -> Result<rg_db::entities::board_card::Model, AppError> {
+    let card = match rg_db::ops::board_ops::find_card_by_id(&state.db, card_id).await {
+        Ok(Some(card)) => card,
+        Ok(None) => return Err(AppError::not_found("board card not found")),
+        Err(e) => return Err(AppError::from(e)),
+    };
+
+    match column_in_board(state, board_id, card.column_id).await {
+        Ok(_) => Ok(card),
+        // The card exists but hangs off another board — same answer as "no such
+        // card", so the endpoint cannot be used to probe for card ids.
+        Err(AppError::NotFound(_)) => Err(AppError::not_found("board card not found")),
+        Err(e) => Err(e),
+    }
+}
+
+/// Confirm a caller-supplied issue link points into the repository that owns
+/// the board. `get_board` embeds the full issue in its response, so an
+/// unchecked link turns a board the caller owns into a reader for the issues
+/// of every private repository on the instance.
+async fn issue_in_repo(state: &AppState, repo_id: i64, issue_id: i64) -> Result<(), AppError> {
+    match rg_db::ops::issue_ops::find_by_id(&state.db, issue_id).await {
+        Ok(Some(issue)) if issue.repo_id == repo_id => Ok(()),
+        Ok(_) => Err(AppError::not_found("issue not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 // ── Board handlers ───────────────────────────────────────────────────────
 
 /// POST /api/v1/repos/{owner}/{name}/boards
@@ -107,6 +176,8 @@ pub struct ReorderCardsRequest {
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn create_board(
@@ -115,20 +186,11 @@ pub async fn create_board(
     Path((owner, name)): Path<(String, String)>,
     Json(body): Json<CreateBoardRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    // Authenticating was the whole check here: any account could add a board to
+    // any repository, private ones included.
+    let (repo, user_id) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::board::service::create_board(
@@ -157,17 +219,21 @@ pub async fn create_board(
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn list_boards(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    // The handler did not even take `HeaderMap`, so the board list of a private
+    // repository was readable by anyone who guessed the owner/name pair.
+    let repo = match require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::board::service::list_boards_by_repo(&state.db, repo.id).await {
@@ -188,13 +254,24 @@ pub async fn list_boards(
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn get_board(
     State(state): State<AppState>,
-    Path((_owner, _name, id)): Path<(String, String, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
+    let repo = match require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = board_in_repo(&state, &repo, id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::get_board(&state.db, id).await {
         Ok(Some(board)) => (StatusCode::OK, Json(serde_json::json!(board))).into_response(),
         Ok(None) => AppError::not_found("board not found").into_response(),
@@ -216,6 +293,8 @@ pub async fn get_board(
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn update_board(
@@ -224,12 +303,15 @@ pub async fn update_board(
     Path((owner, name, id)): Path<(String, String, i64)>,
     Json(body): Json<UpdateBoardRequest>,
 ) -> impl IntoResponse {
-    let _claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
+    // "validated by repo existence in the board" was not a validation: the
+    // board is looked up by a global id, so the route segments never met it.
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
-
-    let _ = (owner, name); // validated by repo existence in the board
+    if let Err(e) = board_in_repo(&state, &repo, id).await {
+        return e.into_response();
+    }
 
     match rg_core::board::service::update_board(&state.db, id, body.name, body.description).await {
         Ok(board) => (StatusCode::OK, Json(serde_json::json!(board))).into_response(),
@@ -250,18 +332,23 @@ pub async fn update_board(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn delete_board(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((_owner, _name, id)): Path<(String, String, i64)>,
+    Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
-    let _ = claims;
+    if let Err(e) = board_in_repo(&state, &repo, id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::delete_board(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -284,19 +371,24 @@ pub async fn delete_board(
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn create_column(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((_owner, _name, board_id)): Path<(String, String, i64)>,
+    Path((owner, name, board_id)): Path<(String, String, i64)>,
     Json(body): Json<CreateColumnRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
-    let _ = claims;
+    if let Err(e) = board_in_repo(&state, &repo, board_id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::create_column(&state.db, board_id, body.name, body.color).await {
         Ok(column) => (StatusCode::CREATED, Json(serde_json::json!(column))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -317,13 +409,29 @@ pub async fn create_column(
     request_body = UpdateColumnRequest,
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn update_column(
     State(state): State<AppState>,
-    Path((_owner, _name, _board_id, col_id)): Path<(String, String, i64, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, board_id, col_id)): Path<(String, String, i64, i64)>,
     Json(body): Json<UpdateColumnRequest>,
 ) -> impl IntoResponse {
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = column_in_board(&state, board.id, col_id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::update_column(&state.db, col_id, body.name, body.color).await {
         Ok(column) => (StatusCode::OK, Json(serde_json::json!(column))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -343,12 +451,28 @@ pub async fn update_column(
     ),
     responses(
         (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn delete_column(
     State(state): State<AppState>,
-    Path((_owner, _name, _board_id, col_id)): Path<(String, String, i64, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, board_id, col_id)): Path<(String, String, i64, i64)>,
 ) -> impl IntoResponse {
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = column_in_board(&state, board.id, col_id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::delete_column(&state.db, col_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -371,19 +495,34 @@ pub async fn delete_column(
     request_body = CreateCardRequest,
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn create_card(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((_owner, _name, _board_id, col_id)): Path<(String, String, i64, i64)>,
+    Path((owner, name, board_id, col_id)): Path<(String, String, i64, i64)>,
     Json(body): Json<CreateCardRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
     };
-    let _ = claims;
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = column_in_board(&state, board.id, col_id).await {
+        return e.into_response();
+    }
+    if let Some(issue_id) = body.issue_id {
+        if let Err(e) = issue_in_repo(&state, repo.id, issue_id).await {
+            return e.into_response();
+        }
+    }
+
     match rg_core::board::service::create_card(&state.db, col_id, body.issue_id, body.note).await {
         Ok(card) => (StatusCode::CREATED, Json(serde_json::json!(card))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -404,13 +543,34 @@ pub async fn create_card(
     request_body = UpdateCardRequest,
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn update_card(
     State(state): State<AppState>,
-    Path((_owner, _name, _board_id, card_id)): Path<(String, String, i64, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, board_id, card_id)): Path<(String, String, i64, i64)>,
     Json(body): Json<UpdateCardRequest>,
 ) -> impl IntoResponse {
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = card_in_board(&state, board.id, card_id).await {
+        return e.into_response();
+    }
+    if let Some(Some(issue_id)) = body.issue_id {
+        if let Err(e) = issue_in_repo(&state, repo.id, issue_id).await {
+            return e.into_response();
+        }
+    }
+
     match rg_core::board::service::update_card(&state.db, card_id, body.note, body.issue_id).await {
         Ok(card) => (StatusCode::OK, Json(serde_json::json!(card))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -431,13 +591,34 @@ pub async fn update_card(
     request_body = MoveCardRequest,
     responses(
         (status = 200, description = "Moved", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn move_card(
     State(state): State<AppState>,
-    Path((_owner, _name, _board_id, card_id)): Path<(String, String, i64, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, board_id, card_id)): Path<(String, String, i64, i64)>,
     Json(body): Json<MoveCardRequest>,
 ) -> impl IntoResponse {
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = card_in_board(&state, board.id, card_id).await {
+        return e.into_response();
+    }
+    // The destination column comes from the request body, so it needs the same
+    // scoping as the path ids — otherwise a card can be pushed onto any board.
+    if let Err(e) = column_in_board(&state, board.id, body.column_id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::move_card(&state.db, card_id, body.column_id, body.position)
         .await
     {
@@ -459,13 +640,34 @@ pub async fn move_card(
     request_body = ReorderCardsRequest,
     responses(
         (status = 200, description = "Reordered", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn reorder_cards(
     State(state): State<AppState>,
-    Path((_owner, _name, _board_id)): Path<(String, String, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, board_id)): Path<(String, String, i64)>,
     Json(body): Json<ReorderCardsRequest>,
 ) -> impl IntoResponse {
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    // Every card id arrives in the body, and the whole batch is rejected if one
+    // of them belongs elsewhere — a partial reorder would leave the caller's
+    // own board half-applied.
+    for (card_id, _) in &body.positions {
+        if let Err(e) = card_in_board(&state, board.id, *card_id).await {
+            return e.into_response();
+        }
+    }
+
     match rg_core::board::service::reorder_cards(&state.db, body.positions).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -485,12 +687,28 @@ pub async fn reorder_cards(
     ),
     responses(
         (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn delete_card(
     State(state): State<AppState>,
-    Path((_owner, _name, _board_id, card_id)): Path<(String, String, i64, i64)>,
+    headers: HeaderMap,
+    Path((owner, name, board_id, card_id)): Path<(String, String, i64, i64)>,
 ) -> impl IntoResponse {
+    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    let board = match board_in_repo(&state, &repo, board_id).await {
+        Ok(board) => board,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = card_in_board(&state, board.id, card_id).await {
+        return e.into_response();
+    }
+
     match rg_core::board::service::delete_card(&state.db, card_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
