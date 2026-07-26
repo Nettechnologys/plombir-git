@@ -235,7 +235,11 @@ pub async fn list_tree(
                 return (StatusCode::OK, Json(serde_json::json!({ "entries": [] })))
                     .into_response();
             }
-            tracing::error!(error = %format!("{e:#}"), "list_tree failed");
+            // Only the typed outcomes of `list_tree_entries` become 4xx; a git
+            // layer that failed is a 5xx, and `From<anyhow::Error>` logs the
+            // full context chain for operators before sanitizing the body. The
+            // unconditional `tracing::error!("list_tree failed")` that used to
+            // sit here logged a mistyped `?ref=` at error level on every miss.
             AppError::from(e).into_response()
         }
     }
@@ -488,10 +492,21 @@ fn list_tree_entries(
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
-    // Resolve ref to commit
-    let commit_id = repo
-        .rev_parse_single(git_ref)
-        .map_err(|e| anyhow::anyhow!("failed to resolve ref '{}': {}", git_ref, e))?;
+    // Exactly two outcomes below belong to the client: the ref does not
+    // resolve, and the sub-path is not in that ref's tree. They carry
+    // `rg_core::error::NotFound` so the HTTP layer can name them; everything
+    // else here — a repository that will not open, a commit that will not
+    // decode, a tree object that is missing — is ours and stays a 5xx. While
+    // no outcome was typed, *all* of them collapsed into one 500, so a browser
+    // asking for a deleted branch was reported as a server fault and logged as
+    // one on every miss (card_784afeaf9603, the mirror of card_aa048c2956b1
+    // one endpoint over).
+    let commit_id = repo.rev_parse_single(git_ref).map_err(|e| {
+        anyhow::Error::new(rg_core::error::NotFound::new("ref")).context(format!(
+            "resolving ref '{}' in {:?}: {}",
+            git_ref, repo_path, e
+        ))
+    })?;
 
     let commit = repo
         .find_commit(commit_id)
@@ -513,7 +528,21 @@ fn list_tree_entries(
                 .iter()
                 .filter_map(|e| e.ok())
                 .find(|e| e.filename() == component);
-            let entry = entry.ok_or_else(|| anyhow::anyhow!("path not found: {}", sub_path))?;
+            let entry = entry.ok_or_else(|| {
+                anyhow::Error::new(rg_core::error::NotFound::new("path")).context(format!(
+                    "sub-path '{}' has no component '{}' in {:?} at '{}'",
+                    sub_path, component, repo_path, git_ref
+                ))
+            })?;
+            if !entry.mode().is_tree() {
+                // The path resolves, it just is not a directory — the mirror of
+                // `get_blob_content`'s "path is not a file", and the fixed text
+                // carries no request data (H-05). Left to `find_tree` below it
+                // came out as a 500, because "the client pointed at a blob" and
+                // "the object store lost a tree" are the same untyped error
+                // once they are both `anyhow!("failed to find sub-tree")`.
+                return Err(rg_core::error::invalid_request("path is not a directory"));
+            }
             tree = repo
                 .find_tree(entry.oid())
                 .map_err(|e| anyhow::anyhow!("failed to find sub-tree: {}", e))?;
@@ -545,16 +574,32 @@ fn list_tree_entries(
             "blob".to_string()
         };
 
-        let size = if kind == "blob" {
-            get_blob_size(repo_path, &oid.to_string()).ok()
-        } else {
-            None
-        };
-
         let full_path = if sub_path.is_empty() {
             name.clone()
         } else {
             format!("{}/{}", sub_path, name)
+        };
+
+        let size = if kind == "blob" {
+            // A missing size stays non-fatal — one unreadable object must not
+            // fail the whole directory listing — but `.ok()` on its own made
+            // the entry look like a file whose size simply was not recorded,
+            // with nothing anywhere saying why (card_6f2a9ab1e623).
+            match get_blob_size(repo_path, &oid.to_string()) {
+                Ok(size) => Some(size),
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo_path.display(),
+                        git_ref = %git_ref,
+                        path = %full_path,
+                        error = %format!("{e:#}"),
+                        "cannot read blob size — listing the entry without one"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         entries.push(TreeEntry {
@@ -1243,7 +1288,8 @@ mod tests {
 
     /// The bug (card_6f2a9ab1e623): an unreadable `HEAD` used to answer
     /// "repository is empty", so `list_tree` returned `200 {entries: []}` and
-    /// the `list_tree failed` error line never ran. Unknown is not empty.
+    /// the real error never reached the client or the log. Unknown is not
+    /// empty.
     #[test]
     fn an_unreadable_head_is_not_reported_as_an_empty_repository() {
         let dir = tempfile::tempdir().unwrap();
