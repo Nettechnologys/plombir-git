@@ -12,12 +12,58 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::auth::extract_bearer_claims;
 use crate::error::AppError;
 use crate::AppState;
+
+/// A mirror as the API reports it.
+///
+/// The entity behind it carries `password_encrypted` — the credential for the
+/// remote — and serializing the row wholesale handed that to every caller of
+/// every mirror endpoint. Nothing outside the sync worker has any business
+/// seeing it, so the wire shape is spelled out by hand: what the settings form
+/// needs is *whether* a password is stored, not what it is.
+#[derive(Serialize, ToSchema)]
+pub struct MirrorResponse {
+    pub id: i64,
+    pub repo_id: i64,
+    pub url: String,
+    /// Username for the remote, if the mirror authenticates.
+    pub username: Option<String>,
+    /// Whether a password is stored for the remote. The value itself never
+    /// leaves the server.
+    pub has_credentials: bool,
+    pub sync_interval_seconds: i64,
+    pub next_sync_at: Option<DateTime<Utc>>,
+    pub last_sync_at: Option<DateTime<Utc>>,
+    pub last_sync_error: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<rg_db::entities::mirror::Model> for MirrorResponse {
+    fn from(m: rg_db::entities::mirror::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            url: m.url,
+            username: m.username,
+            has_credentials: m.password_encrypted.is_some(),
+            sync_interval_seconds: m.sync_interval_seconds,
+            next_sync_at: m.next_sync_at,
+            last_sync_at: m.last_sync_at,
+            last_sync_error: m.last_sync_error,
+            status: m.status,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
 
 /// Request body for creating/updating a mirror.
 #[derive(Deserialize, ToSchema)]
@@ -63,7 +109,7 @@ pub struct UpdateMirrorRequest {
     ),
     request_body = CreateMirrorRequest,
     responses(
-        (status = 201, description = "Mirror created", body = serde_json::Value),
+        (status = 201, description = "Mirror created", body = MirrorResponse),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
@@ -107,7 +153,7 @@ pub async fn create_mirror(
     )
     .await
     {
-        Ok(mirror) => (StatusCode::CREATED, Json(serde_json::json!(mirror))).into_response(),
+        Ok(mirror) => (StatusCode::CREATED, Json(MirrorResponse::from(mirror))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -122,9 +168,9 @@ pub async fn create_mirror(
         ("name" = String, Path, description = "name"),
     ),
     responses(
-        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 200, description = "Success", body = MirrorResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 403, description = "Access denied", body = serde_json::Value),
+        (status = 403, description = "Write access denied", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
@@ -133,13 +179,21 @@ pub async fn get_mirror(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let repo = match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
+    // Write access, not read access: a mirror is repository *administration*,
+    // not repository content. The reply names the remote and its username and
+    // says whether a credential is stored — under `require_read` a public repo
+    // handed all of that to anonymous callers. The other four verbs on this
+    // resource already require write, and the settings UI that consumes this
+    // endpoint lives behind the same door, so read is the odd one out. (GitHub
+    // likewise shows mirror configuration only with push access.)
+    let (repo, _actor_id) =
+        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
+            Ok(access) => access,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::mirror::service::get_mirror(&state.db, repo.id).await {
-        Ok(Some(mirror)) => (StatusCode::OK, Json(serde_json::json!(mirror))).into_response(),
+        Ok(Some(mirror)) => (StatusCode::OK, Json(MirrorResponse::from(mirror))).into_response(),
         Ok(None) => AppError::not_found("no mirror configured for this repository").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -156,7 +210,7 @@ pub async fn get_mirror(
     ),
     request_body = UpdateMirrorRequest,
     responses(
-        (status = 200, description = "Updated", body = serde_json::Value),
+        (status = 200, description = "Updated", body = MirrorResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -199,7 +253,7 @@ pub async fn update_mirror(
     )
     .await
     {
-        Ok(mirror) => (StatusCode::OK, Json(serde_json::json!(mirror))).into_response(),
+        Ok(mirror) => (StatusCode::OK, Json(MirrorResponse::from(mirror))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

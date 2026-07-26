@@ -384,6 +384,7 @@ pub struct PaginatedRepoResponse {
             crate::api::ai::PrSummary,
             crate::api::mirrors::CreateMirrorRequest,
             crate::api::mirrors::UpdateMirrorRequest,
+            crate::api::mirrors::MirrorResponse,
             crate::api::boards::CreateBoardRequest,
             crate::api::boards::UpdateBoardRequest,
             crate::api::boards::CreateColumnRequest,

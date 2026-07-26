@@ -5,6 +5,8 @@ export interface RepositoryMirror {
   repo_id: number;
   url: string;
   username: string | null;
+  /** Whether a password is stored for the remote — the value itself never leaves the server. */
+  has_credentials: boolean;
   sync_interval_seconds: number;
   next_sync_at: string | null;
   last_sync_at: string | null;
