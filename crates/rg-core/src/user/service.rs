@@ -166,10 +166,16 @@ pub async fn login(
     // Always pay for one Argon2 verification, including when there is nothing
     // to verify against: bailing out early on an unknown account would answer
     // "does this account exist?" through the response time.
+    //
+    // The `?` is the point: a hash the verifier cannot use is *our* breakage,
+    // and it leaves here as an error carrying `UnusablePasswordHash` rather
+    // than as the "invalid credentials" below. The account name rides along in
+    // the context so the operator log says which row to go and look at.
     let password_ok = password::verify_password_or_dummy(
         plaintext_password,
         user.as_ref().map(|u| u.password_hash.as_str()),
-    );
+    )
+    .with_context(|| format!("cannot verify the password of '{username_or_email}'"))?;
 
     let Some(user) = user else {
         bail!("invalid credentials");
@@ -226,7 +232,7 @@ pub async fn login_with_configured_auth(
         Some(_) => {
             // Account exists but authenticates through a provider no password
             // reaches — burn the same Argon2 work the local branch would.
-            password::verify_password_or_dummy(plaintext_password, None);
+            password::burn_dummy_verification(plaintext_password);
             bail!("invalid credentials")
         }
     }
@@ -268,7 +274,7 @@ async fn login_via_ldap(
     )
     .await;
     if outcome.is_err() && !attempted_bind {
-        password::verify_password_or_dummy(plaintext_password, None);
+        password::burn_dummy_verification(plaintext_password);
     }
     outcome
 }

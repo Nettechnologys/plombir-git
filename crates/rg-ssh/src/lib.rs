@@ -437,10 +437,26 @@ impl Handler for SshHandler {
         // Verified even when there is no such user, so that a rejection always
         // costs one Argon2 hash — an early return here would let an attacker
         // enumerate accounts by how fast the server says no.
-        let password_ok = rg_core::auth::password::verify_password_or_dummy(
+        let password_ok = match rg_core::auth::password::verify_password_or_dummy(
             password,
             found.as_ref().map(|user| user.password_hash.as_str()),
-        );
+        ) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                // SSH has no way to say "this is our fault, retry later" — the
+                // client only ever learns accept or reject. So the log line is
+                // the whole remedy, and it has to name the account: without it a
+                // hash broken by a migration is indistinguishable from a user
+                // who keeps mistyping their password.
+                tracing::error!(
+                    username,
+                    user_id = ?found.as_ref().map(|user| user.id),
+                    error = %format!("{error:#}"),
+                    "cannot verify SSH password: stored hash is unusable"
+                );
+                false
+            }
+        };
 
         // `is_usable` is read after the hash, never before: skipping the
         // verification for a disabled account would answer "is this account

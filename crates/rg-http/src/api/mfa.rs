@@ -8,6 +8,7 @@
 //!   GET    /users/mfa/backup   — Get backup codes
 //!   POST   /users/mfa/backup   — Verify and use a backup code
 
+use anyhow::Context as _;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -452,9 +453,14 @@ pub async fn disable_mfa(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
-    // Verify password before disabling MFA
+    // Verify password before disabling MFA. `map_err(|_| unauthorized(...))`
+    // used to answer "invalid password" to a hash the verifier could not use
+    // and throw the reason away — the caller here is already authenticated, so
+    // that told a legitimate user their own password was wrong and left the
+    // operator nothing at all. Only a genuine mismatch is a 401 now.
     let password_ok = rg_core::auth::password::verify_password(&req.password, &user.password_hash)
-        .map_err(|_| AppError::unauthorized("invalid password"))?;
+        .with_context(|| format!("cannot verify the password of user {user_id}"))
+        .map_err(AppError::from)?;
     if !password_ok {
         return Err(AppError::unauthorized("invalid password"));
     }

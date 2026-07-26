@@ -313,6 +313,22 @@ pub async fn login(
             }
         }
         Err(error) => {
+            // Not every failure of `login_with_configured_auth` is a rejected
+            // credential. A stored hash the verifier cannot use never produced
+            // a verdict at all, and answering 401 tells the account holder they
+            // mistyped a password that was very possibly right — while the
+            // brute-force counter below racks up strikes against them for our
+            // broken column. Hand it to the error funnel instead: 500 for the
+            // client, the full chain (with the login it happened on) for the
+            // operator.
+            if error
+                .downcast_ref::<rg_core::auth::password::UnusablePasswordHash>()
+                .is_some()
+            {
+                crate::metrics::recorder::auth_event("login", "failure");
+                return AppError::from(error).into_response();
+            }
+
             let user = if body.login.contains('@') {
                 rg_db::ops::user_ops::find_by_email(&state.db, &body.login)
                     .await

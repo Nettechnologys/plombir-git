@@ -5,10 +5,38 @@
 
 use anyhow::Result;
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{
+        Error as PasswordHashError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
     Argon2,
 };
 use rand_core::OsRng;
+use thiserror::Error;
+
+/// The *stored* hash could not be used to decide anything.
+///
+/// This is not a wrong password. A PHC string the verifier refuses to parse, or
+/// one written by an algorithm this build does not have — a half-finished
+/// migration, a truncated column, a restore from a forge that hashed with
+/// bcrypt — is our data being broken, and the account holder can do nothing
+/// about it. Folding it into "invalid credentials" gives that user a login that
+/// fails forever while every log line says they mistyped their password.
+///
+/// Carried inside the `anyhow::Error` so the transport layer can tell the two
+/// apart through any `.context(...)` a caller added, the same way
+/// [`crate::error::NotFound`] travels up to the HTTP status mapping.
+#[derive(Debug, Error)]
+#[error("stored password hash is unusable: {reason}")]
+pub struct UnusablePasswordHash {
+    pub reason: String,
+}
+
+/// Shorthand for the `anyhow` form of [`UnusablePasswordHash`].
+fn unusable_hash(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(UnusablePasswordHash {
+        reason: reason.to_string(),
+    })
+}
 
 /// Hash a plaintext password. Returns a PHC-format string (includes algorithm, params, salt, hash).
 pub fn hash_password(password: &str) -> Result<String> {
@@ -21,12 +49,24 @@ pub fn hash_password(password: &str) -> Result<String> {
 }
 
 /// Verify a plaintext password against a stored PHC hash.
+///
+/// `Ok(false)` means one thing only: the password does not match. Every other
+/// way the verification can end — an unparseable PHC string, an algorithm this
+/// build cannot verify, parameters it rejects — is [`UnusablePasswordHash`] and
+/// comes back as `Err`, because none of them is the caller's doing.
+///
+/// The distinction is load-bearing: `.is_ok()` over the whole verification
+/// reported "wrong password" for a hash that was never checked at all, so a
+/// migration that moved the hashes to different Argon2 parameters (or left a
+/// column half-written) locked accounts out with nothing in the log to say why.
 pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
-    let parsed =
-        PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("invalid password hash: {}", e))?;
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok())
+    let parsed = PasswordHash::new(hash).map_err(unusable_hash)?;
+    match Argon2::default().verify_password(password.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        // The one rejection that is about the password itself.
+        Err(PasswordHashError::Password) => Ok(false),
+        Err(error) => Err(unusable_hash(error)),
+    }
 }
 
 /// Stand-in hash verified when the account does not exist.
@@ -46,21 +86,34 @@ const DUMMY_PASSWORD_HASH: &str =
 /// *body* is unified. Callers that resolve a user before checking the password
 /// must pass `None` instead of short-circuiting, so both outcomes cost the same.
 ///
-/// Returns `false` for every failure — no such account, wrong password, or an
-/// unparseable stored hash (logged, then treated as a failed login).
-pub fn verify_password_or_dummy(password: &str, stored_hash: Option<&str>) -> bool {
+/// `Ok(false)` covers both rejections the caller is allowed to answer with:
+/// there is no such account, or the password is wrong. An unusable stored hash
+/// is [`UnusablePasswordHash`] and comes back as `Err` — every caller must
+/// report it (with the account it happened on) instead of folding it into a
+/// rejection, because a `false` there is an answer we never actually computed.
+///
+/// With `stored_hash = None` the result is always `Ok(false)`: there is nothing
+/// to verify, only work to spend.
+pub fn verify_password_or_dummy(password: &str, stored_hash: Option<&str>) -> Result<bool> {
     match stored_hash {
-        Some(hash) => verify_password(password, hash).unwrap_or_else(|error| {
-            tracing::warn!(error = %format!("{error:#}"), "stored password hash is unusable");
-            false
-        }),
+        Some(hash) => verify_password(password, hash),
         None => {
-            // The point is the work, not the answer — `black_box` keeps the
-            // optimizer from noticing the result is thrown away.
-            std::hint::black_box(verify_password(password, DUMMY_PASSWORD_HASH).is_ok());
-            false
+            burn_dummy_verification(password);
+            Ok(false)
         }
     }
+}
+
+/// Spend one Argon2 verification with nothing to verify against.
+///
+/// For the branches that reject before they ever reach a stored hash — an
+/// account on a provider no password reaches, an LDAP rejection that never got
+/// as far as a bind — and therefore would otherwise answer in microseconds
+/// while a real account pays tens of milliseconds. There is no verdict to
+/// return and nothing that can fail: the work *is* the point.
+pub fn burn_dummy_verification(password: &str) {
+    // `black_box` keeps the optimizer from noticing the result is thrown away.
+    std::hint::black_box(verify_password(password, DUMMY_PASSWORD_HASH).is_ok());
 }
 
 // ── Password Strength Validation (Phase 22-D) ──────────────────────────────
@@ -335,7 +388,7 @@ mod tests {
             (0..3)
                 .map(|_| {
                     let started = Instant::now();
-                    assert!(!verify_password_or_dummy("wrong password", stored));
+                    assert!(!verify_password_or_dummy("wrong password", stored).unwrap());
                     started.elapsed()
                 })
                 .min()
@@ -352,6 +405,51 @@ mod tests {
             "unknown-account verification took {unknown:.4}s vs {known:.4}s for a known one — \
              the branches no longer cost the same"
         );
+    }
+
+    /// A hash that cannot be parsed is not a wrong password. Reporting it as
+    /// one is what let a broken `password_hash` column lock an account out
+    /// while every caller kept answering "invalid credentials".
+    #[test]
+    fn unparseable_stored_hash_is_an_error_not_a_rejection() {
+        let error = verify_password("hunter2", "not-a-phc-string")
+            .expect_err("a hash that is not PHC at all cannot yield a verdict");
+        assert!(
+            error.downcast_ref::<UnusablePasswordHash>().is_some(),
+            "callers classify on the type, not the message: {error:#}"
+        );
+    }
+
+    /// The migration case the classification exists for: a well-formed PHC
+    /// string from *another* algorithm parses fine, and `Argon2` then refuses
+    /// it — for a reason that has nothing to do with the password supplied.
+    #[test]
+    fn foreign_algorithm_hash_is_an_error_not_a_rejection() {
+        // A valid scrypt PHC string (the shape a bcrypt/scrypt-era import or a
+        // half-finished rehash leaves behind), never produced by this build.
+        let foreign = "$scrypt$ln=16,r=8,p=1$aaaaaaaaaaaaaaaa$\
+                       YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
+        // Guards the test's own premise: this must fail *past* the parser, in
+        // the verification, or it is only re-testing the case above.
+        PasswordHash::new(foreign).expect("the fixture must be well-formed PHC");
+        let error = verify_password("hunter2", foreign)
+            .expect_err("a hash this build cannot verify cannot yield a verdict");
+        assert!(
+            error.downcast_ref::<UnusablePasswordHash>().is_some(),
+            "expected UnusablePasswordHash, got: {error:#}"
+        );
+    }
+
+    /// The other half of the split: a hash we *can* verify still answers
+    /// `Ok(false)` for a wrong password, with or without the dummy branch.
+    #[test]
+    fn wrong_password_against_a_usable_hash_stays_a_plain_rejection() {
+        let hash = hash_password("hunter2").unwrap();
+        assert!(!verify_password("wrong", &hash).unwrap());
+        assert!(!verify_password_or_dummy("wrong", Some(hash.as_str())).unwrap());
+        assert!(verify_password_or_dummy("hunter2", Some(hash.as_str())).unwrap());
+        // No account to verify against is a rejection, never an error.
+        assert!(!verify_password_or_dummy("hunter2", None).unwrap());
     }
 
     #[test]

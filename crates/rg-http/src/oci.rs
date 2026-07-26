@@ -3,6 +3,7 @@
 //! Implements OCI Distribution Spec v1.0 endpoints at `/v2/`.
 //! Each handler follows the OCI error response format (RFC 7807).
 
+use anyhow::Context as _;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -294,9 +295,20 @@ pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap
 ///
 /// Returns the authenticated `(username, user_id)` when valid Docker-login
 /// credentials are present, or the anonymous default (`"anonymous"`, `None`)
-/// otherwise (missing header, malformed value, unknown user, bad password).
-async fn authenticate_basic(db: &DatabaseConnection, headers: &HeaderMap) -> (String, Option<i64>) {
-    let anonymous = || ("anonymous".to_string(), None);
+/// when the request carries no usable credentials (missing header, malformed
+/// value, unknown user, bad password).
+///
+/// A credential check that *failed* is `Err`, never the anonymous default: an
+/// unreachable database or a stored hash the verifier cannot parse says nothing
+/// about who is calling, and answering "anonymous" mints a token whose scope was
+/// narrowed for a reason the client can't see. Docker then bounces off the first
+/// pull with a 401 — the one answer that sends it straight back to this endpoint
+/// — and loops instead of surfacing the outage.
+async fn authenticate_basic(
+    db: &DatabaseConnection,
+    headers: &HeaderMap,
+) -> anyhow::Result<(String, Option<i64>)> {
+    let anonymous = || Ok(("anonymous".to_string(), None));
 
     let Some(auth_header) = headers.get(header::AUTHORIZATION) else {
         return anonymous();
@@ -320,20 +332,22 @@ async fn authenticate_basic(db: &DatabaseConnection, headers: &HeaderMap) -> (St
     };
 
     // Verify unconditionally — an unknown username must cost the same Argon2
-    // work as a real one, or the response time enumerates accounts.
+    // work as a real one, or the response time enumerates accounts. (A failed
+    // *lookup* returns early without that work, which leaks nothing: the
+    // database is either up for every account or down for all of them.)
     let found = rg_db::ops::user_ops::find_by_username(db, user)
         .await
-        .ok()
-        .flatten();
+        .with_context(|| format!("registry basic auth: looking up '{user}'"))?;
     let password_ok = rg_core::auth::password::verify_password_or_dummy(
         pass,
         found.as_ref().map(|u| u.password_hash.as_str()),
-    );
+    )
+    .with_context(|| format!("registry basic auth: verifying the password of '{user}'"))?;
 
     // Checked after the hash, so a disabled account is not distinguishable
     // from a wrong password by how fast the registry says no.
     match found {
-        Some(u) if password_ok && u.is_usable() => (user.to_string(), Some(u.id)),
+        Some(u) if password_ok && u.is_usable() => Ok((user.to_string(), Some(u.id))),
         _ => anonymous(),
     }
 }
@@ -425,7 +439,21 @@ pub async fn get_token(
         .unwrap_or_else(|| "forgekeep-registry".to_string());
     let scope = params.get("scope").cloned().unwrap_or_default();
 
-    let (username, authenticated_user_id) = authenticate_basic(&state.db, &headers).await;
+    let (username, authenticated_user_id) = match authenticate_basic(&state.db, &headers).await {
+        Ok(identity) => identity,
+        Err(e) => {
+            // Nothing downstream logs this — `oci_err` only writes the client's
+            // envelope — and the message is deliberately generic: the caller
+            // gets a status it can back off on, the operator gets the account
+            // and the cause.
+            tracing::error!(error = %format!("{e:#}"), "registry basic auth could not be evaluated");
+            return oci_err(
+                oci_status_for(&e),
+                "UNKNOWN",
+                "authentication is temporarily unavailable",
+            );
+        }
+    };
 
     // A token minted while the permission lookups were failing would carry a
     // silently narrowed scope, and the client would spend the next pull being
