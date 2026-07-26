@@ -61,7 +61,7 @@ pub async fn add_time(
 
     let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
         Ok(i) => i,
-        Err(_) => return AppError::not_found("issue not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::time_tracking::service::add_time(
@@ -104,7 +104,7 @@ pub async fn list_time_entries(
 
     let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
         Ok(i) => i,
-        Err(_) => return AppError::not_found("issue not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::time_tracking::service::list_time_entries(&state.db, issue.id, offset, limit)
@@ -139,7 +139,7 @@ pub async fn total_time(
 ) -> impl IntoResponse {
     let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
         Ok(i) => i,
-        Err(_) => return AppError::not_found("issue not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::time_tracking::service::total_time_minutes(&state.db, issue.id).await {

@@ -35,6 +35,7 @@ mod db_outage_status_tests;
 mod deploy_key_tests;
 mod git_auth_tests;
 mod git_http_clone_tests;
+mod issue_lookup_failure_status_tests;
 mod issue_template_tests;
 mod issue_tests;
 mod job_websocket_tests;

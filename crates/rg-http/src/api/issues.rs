@@ -321,7 +321,7 @@ pub async fn get_issue(
             let issue = issue_with_author(&state.db, issue).await;
             (StatusCode::OK, Json(issue)).into_response()
         }
-        Err(e) => AppError::not_found(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -408,7 +408,7 @@ pub async fn update_issue(
 
     let existing = match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => issue,
-        Err(e) => return AppError::not_found(e.to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     let repo_model = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo)
@@ -932,6 +932,6 @@ pub async fn get_issue_labels(
             Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),
             Err(e) => AppError::from(e).into_response(),
         },
-        Err(e) => AppError::not_found(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

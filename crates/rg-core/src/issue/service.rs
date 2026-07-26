@@ -169,7 +169,7 @@ pub async fn get_issue(
     let repo = resolve_repo(db, owner, repo_name).await?;
     issue_ops::find_by_repo_and_number(db, repo.id, number)
         .await?
-        .context("issue not found")
+        .ok_or_else(|| crate::error::not_found("issue"))
 }
 
 /// Update an issue's title, body, state, labels, assignee, or milestone.
@@ -355,7 +355,7 @@ pub async fn update_comment(
 
     let comment = issue_comment_ops::find_by_id(db, comment_id)
         .await?
-        .context("comment not found")?;
+        .ok_or_else(|| crate::error::not_found("comment"))?;
 
     let mut active: issue_comment::ActiveModel = comment.into();
     active.body = Set(body);
@@ -418,5 +418,5 @@ async fn resolve_repo(
 ) -> Result<rg_db::entities::repository::Model> {
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
-        .context("repository not found")
+        .ok_or_else(|| crate::error::not_found("repository"))
 }
