@@ -61,23 +61,39 @@ pub async fn list_collaborators(
 }
 
 /// Update a collaborator's permission.
+///
+/// `repo_id` is the repository the caller was authorized against. The
+/// collaborator id is a global primary key, so scoping the lookup to it is what
+/// stops an admin of one repository from rewriting the access list of another —
+/// and a row belonging to a different repo has to be indistinguishable from one
+/// that does not exist, or the id space itself becomes an existence oracle.
 pub async fn update_permission(
     db: &DatabaseConnection,
+    repo_id: i64,
     collaborator_id: i64,
     permission: String,
 ) -> Result<RepoCollaborator> {
     match permission.as_str() {
         "read" | "write" | "admin" => {}
-        _ => bail!("invalid permission: {}", permission),
+        _ => {
+            return Err(crate::error::invalid_request(format!(
+                "invalid permission: {permission}, must be read/write/admin"
+            )))
+        }
     }
 
-    let mut collab = repo_collaborator_ops::find_by_id(db, collaborator_id)
+    let collab = repo_collaborator_ops::find_by_id(db, collaborator_id)
         .await?
-        .context("collaborator not found")?;
+        .filter(|collab| collab.repo_id == repo_id)
+        .ok_or_else(|| crate::error::not_found("collaborator"))?;
 
-    let (repo_id, user_id) = (collab.repo_id, collab.user_id);
-    collab.permission = permission;
-    let active: repo_collaborator::ActiveModel = collab.into();
+    let user_id = collab.user_id;
+    // `From<Model> for ActiveModel` marks every field `Unchanged`, so mutating
+    // the model first and converting afterwards produced an update with no SET
+    // clause: the call returned the row and changed nothing. The column has to
+    // be `Set` on the ActiveModel itself.
+    let mut active: repo_collaborator::ActiveModel = collab.into();
+    active.permission = Set(permission);
     let updated = repo_collaborator_ops::update(db, active).await?;
     crate::repo::service::invalidate_perm_cache_user(repo_id, user_id);
     Ok(updated)

@@ -78,6 +78,8 @@ pub async fn list_collaborators(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Repository admin access required", body = serde_json::Value),
+        (status = 404, description = "Repository not found", body = serde_json::Value),
     ),
 )]
 pub async fn add_collaborator(
@@ -86,8 +88,11 @@ pub async fn add_collaborator(
     headers: axum::http::HeaderMap,
     Json(req): Json<AddCollaboratorRequest>,
 ) -> impl IntoResponse {
-    if super::auth::extract_user_id(&headers, &state.jwt_secret).is_none() {
-        return AppError::unauthorized("authentication required").into_response();
+    // Granting access to a repository is an admin operation on *that*
+    // repository. Checking only that a token parses authorizes nothing: it lets
+    // any account hand itself `admin` on any repo, private ones included.
+    if let Err(e) = crate::api::repo_access::require_admin(&state, &headers, &owner, &repo).await {
+        return e.into_response();
     }
 
     let user_id = match resolve_collaborator_user_id(&state.db, &req).await {
@@ -161,22 +166,34 @@ async fn resolve_collaborator_user_id(
     request_body(content = serde_json::Value),
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
+        (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Repository admin access required", body = serde_json::Value),
+        (status = 404, description = "Collaborator not found", body = serde_json::Value),
     ),
 )]
 pub async fn update_permission(
     State(state): State<AppState>,
-    Path((_owner, _repo, id)): Path<(String, String, i64)>,
+    Path((owner, repo_name, id)): Path<(String, String, i64)>,
     headers: axum::http::HeaderMap,
     Json(req): Json<UpdatePermissionRequest>,
 ) -> impl IntoResponse {
-    if super::auth::extract_user_id(&headers, &state.jwt_secret).is_none() {
-        return AppError::unauthorized("authentication required").into_response();
-    }
+    // Both path segments used to be discarded, which left `id` — a global
+    // `repo_collaborators` primary key — as the only thing the handler acted on:
+    // no repository was resolved, so nothing was authorized and nothing tied the
+    // row to the repo in the URL. The repo the caller holds admin on is what
+    // scopes the update.
+    let repo =
+        match crate::api::repo_access::require_admin(&state, &headers, &owner, &repo_name).await {
+            Ok((repo, _actor_id)) => repo,
+            Err(e) => return e.into_response(),
+        };
 
-    match rg_core::collaborator::service::update_permission(&state.db, id, req.permission).await {
+    match rg_core::collaborator::service::update_permission(&state.db, repo.id, id, req.permission)
+        .await
+    {
         Ok(collab) => (StatusCode::OK, Json(collab)).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -195,6 +212,8 @@ pub async fn update_permission(
         (status = 204, description = "Removed"),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Repository admin access required", body = serde_json::Value),
+        (status = 404, description = "Repository not found", body = serde_json::Value),
     ),
 )]
 pub async fn remove_collaborator(
@@ -202,8 +221,10 @@ pub async fn remove_collaborator(
     Path((owner, repo, user_id)): Path<(String, String, i64)>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    if super::auth::extract_user_id(&headers, &state.jwt_secret).is_none() {
-        return AppError::unauthorized("authentication required").into_response();
+    // Revoking access is the same admin operation as granting it — without this
+    // any account could strip the collaborators off someone else's repository.
+    if let Err(e) = crate::api::repo_access::require_admin(&state, &headers, &owner, &repo).await {
+        return e.into_response();
     }
 
     match rg_core::collaborator::service::remove_collaborator(&state.db, &owner, &repo, user_id)

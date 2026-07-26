@@ -31,6 +31,7 @@ mod ci_job_token_tests;
 mod ci_oidc_tests;
 mod ci_permission_tests;
 mod ci_secrets_tag_protection_tests;
+mod collaborator_authz_tests;
 mod collaborator_tests;
 mod cross_repo_label_milestone_tests;
 mod db_outage_status_tests;
