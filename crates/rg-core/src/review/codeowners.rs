@@ -144,10 +144,11 @@ pub async fn request_codeowners(
             if user.id == author_id || !user.is_active || user.deleted_at.is_some() {
                 continue;
             }
-            if !crate::repo::service::can_read_repo(db, repository, Some(user.id))
-                .await
-                .unwrap_or(false)
-            {
+            // `?`, not `unwrap_or(false)`: a read check that could not run is
+            // not a codeowner without access. Swallowing it dropped the
+            // reviewer from the PR and still reported success — every other
+            // lookup in this loop propagates, and the caller logs the failure.
+            if !crate::repo::service::can_read_repo(db, repository, Some(user.id)).await? {
                 continue;
             }
             if pr_reviewer_request_ops::find(db, pr_id, user.id)

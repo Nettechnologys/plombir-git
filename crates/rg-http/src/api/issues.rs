@@ -419,12 +419,19 @@ pub async fn update_issue(
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id))
-        .await
-        .unwrap_or(false);
-    let can_read = rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(user_id))
-        .await
-        .unwrap_or(false);
+    // A permission check that could not run is not a permission check that
+    // said "no": `unwrap_or(false)` answered 403 while the database was down,
+    // sending the client off to re-issue a token that was never the problem.
+    let can_write =
+        match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
+            Ok(allowed) => allowed,
+            Err(e) => return AppError::from(e).into_response(),
+        };
+    let can_read =
+        match rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(user_id)).await {
+            Ok(allowed) => allowed,
+            Err(e) => return AppError::from(e).into_response(),
+        };
     let touches_management_fields =
         req.labels.is_some() || req.assignee_id.is_some() || req.milestone_id.is_some();
 
@@ -624,11 +631,10 @@ async fn resolve_and_check_read_access(
             .parse::<i64>()
             .map_err(|_| AppError::unauthorized("invalid token subject".to_string()))?;
 
-        if !rg_core::repo::service::can_read_repo(&state.db, &repo, Some(user_id))
-            .await
-            .unwrap_or(false)
-        {
-            return Err(AppError::forbidden("access denied"));
+        match rg_core::repo::service::can_read_repo(&state.db, &repo, Some(user_id)).await {
+            Ok(true) => {}
+            Ok(false) => return Err(AppError::forbidden("access denied")),
+            Err(e) => return Err(AppError::from(e)),
         }
     }
 
@@ -721,11 +727,12 @@ pub async fn create_milestone(
         Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
         Err(e) => return AppError::from(e).into_response(),
     };
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return AppError::forbidden("forbidden".to_string()).into_response();
+    // The repo model is already in hand, so check against it directly: one
+    // query fewer, and a failed check reports the outage instead of "forbidden".
+    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
     let now = chrono::Utc::now();
     let due_date = body
@@ -823,11 +830,20 @@ pub async fn update_milestone(
         }
     };
 
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
+    // `can_write(owner, name)` reports a missing repository as an `Err`, so it
+    // cannot be matched on directly without turning a 404 into a 500. Resolve
+    // the repository first, then check the permission against the model: an
+    // absent repo stays a 404 and a failed check reports the outage.
+    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
     {
-        return AppError::forbidden("forbidden".to_string()).into_response();
+        Ok(Some(r)) => r,
+        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
     let existing = match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
         Ok(Some(m)) => m,
@@ -894,11 +910,18 @@ pub async fn delete_milestone(
         }
     };
 
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
+    // Same shape as `update_milestone`: resolve the repository so a missing one
+    // stays a 404, then let a failed permission check surface as an outage.
+    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
     {
-        return AppError::forbidden("forbidden".to_string()).into_response();
+        Ok(Some(r)) => r,
+        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
     match rg_db::ops::milestone_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

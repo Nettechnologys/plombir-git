@@ -331,40 +331,41 @@ async fn authenticate_basic(db: &DatabaseConnection, headers: &HeaderMap) -> (St
 }
 
 /// Resolve a single `repository:...` scope request into the granted scope
-/// string, or `None` when the repo is missing or the caller has no access.
+/// string, or `Ok(None)` when the repo is missing or the caller has no access.
+///
+/// A permission query that *failed* is reported as `Err`, not folded into
+/// "no access": silently narrowing the scope hands the client a token that
+/// then bounces off every pull with a 401, so docker re-runs the auth flow in a
+/// loop instead of seeing the outage and backing off.
 async fn grant_repository_scope(
     db: &DatabaseConnection,
     parsed: &ParsedScope,
     authenticated_user_id: Option<i64>,
-) -> Option<String> {
-    let (scope_owner, scope_repo) = parse_namespace(&parsed.name)?;
+) -> anyhow::Result<Option<String>> {
+    let Some((scope_owner, scope_repo)) = parse_namespace(&parsed.name) else {
+        return Ok(None);
+    };
     let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(db, scope_owner, scope_repo).await {
-            Ok(Some(repo)) => repo,
-            _ => return None,
+        match rg_core::repo::service::find_repo_by_owner_name(db, scope_owner, scope_repo).await? {
+            Some(repo) => repo,
+            None => return Ok(None),
         };
 
     let mut allowed_actions = Vec::new();
-    if parsed.has_action("pull") {
-        let can_pull = rg_core::repo::service::can_read_repo(db, &repo_model, authenticated_user_id)
-            .await
-            .unwrap_or(false);
-        if can_pull {
-            allowed_actions.push("pull");
-        }
+    if parsed.has_action("pull")
+        && rg_core::repo::service::can_read_repo(db, &repo_model, authenticated_user_id).await?
+    {
+        allowed_actions.push("pull");
     }
     if parsed.has_action("push") {
         if let Some(user_id) = authenticated_user_id {
-            let can_push = rg_core::repo::service::can_write_repo(db, &repo_model, Some(user_id))
-                .await
-                .unwrap_or(false);
-            if can_push {
+            if rg_core::repo::service::can_write_repo(db, &repo_model, Some(user_id)).await? {
                 allowed_actions.push("push");
             }
         }
     }
 
-    if allowed_actions.is_empty() {
+    Ok(if allowed_actions.is_empty() {
         None
     } else {
         Some(format!(
@@ -372,7 +373,7 @@ async fn grant_repository_scope(
             parsed.name,
             allowed_actions.join(",")
         ))
-    }
+    })
 }
 
 /// Evaluate every requested scope against the caller's permissions and return
@@ -381,7 +382,7 @@ async fn resolve_granted_scopes(
     db: &DatabaseConnection,
     scope: &str,
     authenticated_user_id: Option<i64>,
-) -> Vec<String> {
+) -> anyhow::Result<Vec<String>> {
     let mut granted_scopes = Vec::new();
     for scope_part in scope.split_whitespace() {
         let Some(parsed) = ParsedScope::parse(scope_part) else {
@@ -390,7 +391,7 @@ async fn resolve_granted_scopes(
 
         if parsed.scope_type == "repository" {
             if let Some(granted) =
-                grant_repository_scope(db, &parsed, authenticated_user_id).await
+                grant_repository_scope(db, &parsed, authenticated_user_id).await?
             {
                 granted_scopes.push(granted);
             }
@@ -401,7 +402,7 @@ async fn resolve_granted_scopes(
             granted_scopes.push(scope_part.to_string());
         }
     }
-    granted_scopes
+    Ok(granted_scopes)
 }
 
 /// `GET /v2/auth/token` — issue an OCI Bearer token.
@@ -418,9 +419,15 @@ pub async fn get_token(
 
     let (username, authenticated_user_id) = authenticate_basic(&state.db, &headers).await;
 
-    let granted_scope = resolve_granted_scopes(&state.db, &scope, authenticated_user_id)
-        .await
-        .join(" ");
+    // A token minted while the permission lookups were failing would carry a
+    // silently narrowed scope, and the client would spend the next pull being
+    // told 401 — the one answer that makes it come straight back here. Report
+    // the outage instead so docker/podman can back off and retry.
+    let granted_scope = match resolve_granted_scopes(&state.db, &scope, authenticated_user_id).await
+    {
+        Ok(scopes) => scopes.join(" "),
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+    };
 
     // Generate token (TTL: 300s for normal, 60s for anonymous)
     let ttl = if username == "anonymous" { 60 } else { 300 };

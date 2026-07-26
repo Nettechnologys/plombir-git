@@ -932,11 +932,13 @@ pub async fn create_commit_status(
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return AppError::forbidden("forbidden".to_string()).into_response();
+    // The repo model is already resolved above, so check against it: one query
+    // fewer, and a check that could not run reports the outage instead of
+    // answering 403 to a caller who does have write access.
+    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     }
 
     match rg_core::repo::service::create_commit_status(

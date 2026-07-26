@@ -278,9 +278,19 @@ pub async fn update_pr(
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(actor_id))
-        .await
-        .unwrap_or(false);
+    // `unwrap_or(false)` here told a repository writer "you may not update this
+    // PR" whenever the permission query failed — a 403 that no retry or new
+    // token can clear, for a failure that was ours.
+    let can_write = match rg_core::repo::service::can_write_repo(
+        &state.db,
+        &repo_model,
+        Some(actor_id),
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(e) => return AppError::from(e).into_response(),
+    };
     if existing.author_id != actor_id && !can_write {
         return AppError::forbidden("only the PR author or a repository writer may update this PR")
             .into_response();

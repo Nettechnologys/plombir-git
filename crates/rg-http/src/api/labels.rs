@@ -19,6 +19,32 @@ use crate::api::auth::extract_bearer_claims;
 use crate::error::AppError;
 use crate::AppState;
 
+/// Enforce repository write access for a label mutation.
+///
+/// `can_write(owner, name)` folds "no such repository" into its `Err` arm, so
+/// the repository is resolved first and the check runs against the model. That
+/// keeps the three outcomes apart: an absent repository is a 404, a denied
+/// check is a 403, and a check that could not run at all reports the outage —
+/// where `unwrap_or(false)` used to answer 403 and send the client off to
+/// re-issue a token that was never the problem.
+async fn require_repo_write(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+    user_id: i64,
+) -> Result<(), AppError> {
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("repository not found"))?;
+
+    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden("forbidden")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 /// Request body for creating a label.
 #[derive(Deserialize, ToSchema)]
 pub struct CreateLabelRequest {
@@ -126,11 +152,8 @@ pub async fn create_label(
     };
 
     // Check write permission
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return AppError::forbidden("forbidden").into_response();
+    if let Err(error) = require_repo_write(&state, &owner, &name, user_id).await {
+        return error.into_response();
     }
 
     match rg_core::label::service::create_label(
@@ -186,11 +209,8 @@ pub async fn update_label(
     };
 
     // Check write permission
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return AppError::forbidden("forbidden").into_response();
+    if let Err(error) = require_repo_write(&state, &owner, &name, user_id).await {
+        return error.into_response();
     }
 
     match rg_core::label::service::update_label(
@@ -244,11 +264,8 @@ pub async fn delete_label(
     };
 
     // Check write permission
-    if !rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return AppError::forbidden("forbidden").into_response();
+    if let Err(error) = require_repo_write(&state, &owner, &name, user_id).await {
+        return error.into_response();
     }
 
     match rg_core::label::service::delete_label(&state.db, id).await {

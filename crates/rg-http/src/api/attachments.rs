@@ -398,9 +398,14 @@ async fn create(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id))
-        .await
-        .unwrap_or(false);
+    // A check that could not run is not a check that said "no": while the
+    // database was down `unwrap_or(false)` answered 403 to the repository's own
+    // writers, so the failure read as the caller's fault.
+    let can_write =
+        match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+            Ok(allowed) => allowed,
+            Err(error) => return AppError::from(error).into_response(),
+        };
     if user_id != target.author_id && !can_write {
         return AppError::forbidden("write access denied").into_response();
     }
@@ -616,9 +621,14 @@ async fn delete(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id))
-        .await
-        .unwrap_or(false);
+    // A check that could not run is not a check that said "no": while the
+    // database was down `unwrap_or(false)` answered 403 to the repository's own
+    // writers, so the failure read as the caller's fault.
+    let can_write =
+        match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
+            Ok(allowed) => allowed,
+            Err(error) => return AppError::from(error).into_response(),
+        };
     if user_id != target.author_id && !can_write {
         return AppError::forbidden("write access denied").into_response();
     }
@@ -649,15 +659,19 @@ async fn resolve(
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("repository not found"))?;
     let user_id = extract_user_id(headers, &state.jwt_secret);
-    if !rg_core::repo::service::can_read_repo(&state.db, &repo, user_id)
-        .await
-        .unwrap_or(false)
-    {
-        return Err(if user_id.is_some() {
-            AppError::forbidden("access denied")
-        } else {
-            AppError::unauthorized("authentication required")
-        });
+    match rg_core::repo::service::can_read_repo(&state.db, &repo, user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(if user_id.is_some() {
+                AppError::forbidden("access denied")
+            } else {
+                AppError::unauthorized("authentication required")
+            })
+        }
+        // An anonymous caller used to be told "authentication required" when
+        // the read check itself failed, which is the one answer guaranteed not
+        // to help: no token fixes a database that is down.
+        Err(error) => return Err(AppError::from(error)),
     }
 
     let target = match kind {

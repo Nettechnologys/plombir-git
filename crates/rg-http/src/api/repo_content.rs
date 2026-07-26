@@ -978,11 +978,12 @@ async fn resolve_and_check_write_access(
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("repository not found"))?;
 
-    if !rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return Err(AppError::forbidden("write access denied"));
+    // The read gateway above (`resolve_and_check_access`) already keeps "denied"
+    // and "the check failed" apart; this one used to collapse both into 403.
+    match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
+        Ok(true) => {}
+        Ok(false) => return Err(AppError::forbidden("write access denied")),
+        Err(e) => return Err(AppError::from(e)),
     }
 
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)

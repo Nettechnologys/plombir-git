@@ -125,13 +125,13 @@ async fn require_repo_read_access(
         .parse::<i64>()
         .map_err(|_| AppError::unauthorized("invalid token subject".to_string()))?;
 
-    if !rg_core::repo::service::can_read_repo(&state.db, repo, Some(user_id))
-        .await
-        .unwrap_or(false)
-    {
-        return Err(AppError::forbidden("access denied"));
+    match rg_core::repo::service::can_read_repo(&state.db, repo, Some(user_id)).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden("access denied")),
+        // Not "you may not read this repo" — "we could not find out". A 403
+        // here sends the caller to re-issue a perfectly valid token.
+        Err(e) => Err(AppError::from(e)),
     }
-    Ok(())
 }
 
 // ── Handlers ──────────────────────────────────────

@@ -108,9 +108,19 @@ async fn require_pr_manager(
     let pr = rg_core::pull_request::get_pr(&state.db, owner, repo, number)
         .await
         .map_err(AppError::from)?;
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(actor_id))
-        .await
-        .unwrap_or(false);
+    // A permission check that failed is not a permission check that said "no":
+    // `unwrap_or(false)` handed a repository writer a 403 whenever the query
+    // behind it broke, hiding our outage behind the caller's credentials.
+    let can_write = match rg_core::repo::service::can_write_repo(
+        &state.db,
+        &repo_model,
+        Some(actor_id),
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => return Err(AppError::from(error)),
+    };
     if pr.author_id != actor_id && !can_write {
         return Err(AppError::forbidden(
             "only the PR author or a repository writer may manage reviewers",
@@ -148,9 +158,12 @@ async fn require_suggestion_source(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("source repository not found"))?;
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &source_repo, Some(actor_id))
-        .await
-        .unwrap_or(false);
+    let can_write =
+        match rg_core::repo::service::can_write_repo(&state.db, &source_repo, Some(actor_id)).await
+        {
+            Ok(allowed) => allowed,
+            Err(error) => return Err(AppError::from(error)),
+        };
     if !can_write {
         return Err(AppError::forbidden(
             "write access to the PR source repository is required",
@@ -1173,10 +1186,19 @@ pub async fn request_reviewer(
         return AppError::bad_request("the PR author cannot be requested as a reviewer")
             .into_response();
     }
-    let reviewer_can_read =
-        rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(reviewer.id))
-            .await
-            .unwrap_or(false);
+    // This one leaned even further the wrong way: a failed check became a 400,
+    // telling the requester their *reviewer* lacks access to the repository —
+    // a statement about someone else that we never actually established.
+    let reviewer_can_read = match rg_core::repo::service::can_read_repo(
+        &state.db,
+        &repo_model,
+        Some(reviewer.id),
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     if !reviewer_can_read {
         return AppError::bad_request("reviewer does not have access to this repository")
             .into_response();
@@ -1318,9 +1340,16 @@ pub async fn set_thread_resolution(
         Ok(root) => root,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(actor_id))
-        .await
-        .unwrap_or(false);
+    let can_write = match rg_core::repo::service::can_write_repo(
+        &state.db,
+        &repo_model,
+        Some(actor_id),
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     if root.author_id != actor_id && pr.author_id != actor_id && !can_write {
         return AppError::forbidden(
             "only the thread author, PR author, or a repository writer may resolve this thread",
