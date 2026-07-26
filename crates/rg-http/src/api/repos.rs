@@ -267,12 +267,18 @@ pub struct ListReposQuery {
 )]
 pub async fn list_repos(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(owner): Path<String>,
     Query(params): Query<ListReposQuery>,
 ) -> impl IntoResponse {
     let pagination = params.pagination.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
+    // An owner's shop window is not the same page for everyone: the listing has
+    // to be filtered to what the caller may read, and in SQL, so that page size
+    // and `total` stay honest. `explore` next door already did this by only ever
+    // querying public repos.
+    let viewer_id = extract_user_id(&headers, &state.jwt_secret);
 
     // Try user first
     if let Some(user) = rg_db::ops::user_ops::find_by_username(&state.db, &owner)
@@ -280,7 +286,10 @@ pub async fn list_repos(
         .ok()
         .flatten()
     {
-        match rg_db::ops::repo_ops::list_by_owner_paginated(&state.db, user.id, offset, limit).await
+        match rg_db::ops::repo_ops::list_by_owner_visible_to(
+            &state.db, user.id, viewer_id, offset, limit,
+        )
+        .await
         {
             Ok((data, total)) => {
                 return (
@@ -299,7 +308,11 @@ pub async fn list_repos(
         .ok()
         .flatten()
     {
-        match rg_db::ops::repo_ops::list_by_org_paginated(&state.db, org.id, offset, limit).await {
+        match rg_db::ops::repo_ops::list_by_org_visible_to(
+            &state.db, org.id, viewer_id, offset, limit,
+        )
+        .await
+        {
             Ok((data, total)) => {
                 return (
                     StatusCode::OK,
@@ -325,6 +338,8 @@ pub async fn list_repos(
     ),
     responses(
         (status = 200, description = "Repository details", body = RepoResponse),
+        (status = 401, description = "Authentication required", body = serde_json::Value),
+        (status = 403, description = "Access denied", body = serde_json::Value),
         (status = 404, description = "Repository not found", body = serde_json::Value),
         (status = 500, description = "Internal server error", body = serde_json::Value),
     )
@@ -333,12 +348,12 @@ pub async fn list_repos(
 /// Gets a single repo, supporting both user and org owners.
 pub async fn get_repo(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await {
-        Ok(Some(repo)) => (StatusCode::OK, Json(serde_json::json!(repo))).into_response(),
-        Ok(None) => AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => AppError::from(e).into_response(),
+    match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => (StatusCode::OK, Json(serde_json::json!(repo))).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -457,6 +472,7 @@ pub async fn get_starred_status(
 )]
 pub async fn get_stargazers(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
@@ -464,11 +480,9 @@ pub async fn get_stargazers(
     let offset = pagination.offset();
     let limit = pagination.limit();
 
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let repo = match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::repo::service::list_stargazers(&state.db, repo.id, offset, limit).await {
@@ -779,12 +793,17 @@ pub async fn fork_repo_handler(
 )]
 pub async fn list_forks_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
+
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
 
     match rg_core::repo::service::list_forks(&state.db, &owner, &name, offset, limit).await {
         Ok((forks, total)) => (
@@ -975,8 +994,13 @@ pub async fn create_commit_status(
 )]
 pub async fn list_commit_statuses(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, sha)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
+
     match rg_core::repo::service::list_commit_statuses(&state.db, &owner, &name, &sha).await {
         Ok(statuses) => (StatusCode::OK, Json(serde_json::json!(statuses))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -1000,8 +1024,13 @@ pub async fn list_commit_statuses(
 )]
 pub async fn get_combined_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, sha)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        return e.into_response();
+    }
+
     match rg_core::repo::service::get_combined_status(&state.db, &owner, &name, &sha).await {
         Ok(combined) => (StatusCode::OK, Json(combined)).into_response(),
         Err(e) => AppError::from(e).into_response(),

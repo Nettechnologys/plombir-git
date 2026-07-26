@@ -663,14 +663,13 @@ pub struct ListMilestonesQuery {
 )]
 pub async fn list_milestones(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<ListMilestonesQuery>,
 ) -> impl IntoResponse {
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let repo = match resolve_and_check_read_access(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
     match rg_db::ops::milestone_ops::list_by_repo(&state.db, repo.id, params.state.as_deref()).await
     {
@@ -772,18 +771,22 @@ pub async fn create_milestone(
 )]
 pub async fn get_milestone(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let _repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name)
-        .await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let repo = match resolve_and_check_read_access(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
     match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
-        Ok(Some(m)) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
-        Ok(None) => AppError::not_found("milestone not found".to_string()).into_response(),
+        // The access check above is about `owner/name`, so the milestone it
+        // guards has to be the one that lives there. Without this, the route
+        // reads any milestone id through whatever repo the caller can open —
+        // and a 403 here instead of a 404 would still confirm the id exists.
+        Ok(Some(m)) if m.repo_id == repo.id => {
+            (StatusCode::OK, Json(serde_json::json!(m))).into_response()
+        }
+        Ok(_) => AppError::not_found("milestone not found".to_string()).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

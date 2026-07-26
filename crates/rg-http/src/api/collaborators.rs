@@ -45,12 +45,18 @@ pub struct UpdatePermissionRequest {
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Access denied", body = serde_json::Value),
     ),
 )]
 pub async fn list_collaborators(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &repo).await {
+        return e.into_response();
+    }
+
     match rg_core::collaborator::service::list_collaborators(&state.db, &owner, &repo).await {
         Ok(collaborators) => (StatusCode::OK, Json(collaborators)).into_response(),
         Err(e) => AppError::from(e).into_response(),

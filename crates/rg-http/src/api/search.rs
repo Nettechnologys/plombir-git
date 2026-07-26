@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -50,6 +50,7 @@ fn normalize_search_type(raw: &str) -> Option<&'static str> {
 )]
 pub async fn search(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<SearchQuery>,
 ) -> impl IntoResponse {
     let pagination = PaginationParams::new(params.page, params.per_page);
@@ -65,10 +66,17 @@ pub async fn search(
         .into_response();
     };
 
+    // Global search is a repository read path like any other: an unauthenticated
+    // caller sees the public instance, a signed-in one additionally sees what
+    // they may open. The filtering happens in the service because it owns the
+    // SQL that pages the results.
+    let viewer_id = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+
     match rg_core::search::service::search(
         &state.db,
         &params.q,
         search_type,
+        viewer_id,
         pagination.page,
         pagination.per_page,
     )

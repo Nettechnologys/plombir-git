@@ -87,10 +87,16 @@ impl SearchFilters {
 
 /// Search across repositories, issues, and/or wiki pages.
 /// Supports qualifier-based filtering via `q` parameter.
+///
+/// `viewer_id` (`None` = anonymous) decides which repositories are in scope.
+/// It is a parameter rather than a post-filter on the results because the
+/// backends page in SQL: dropping rows afterwards would return short pages and
+/// a `total` counting repos the caller cannot open.
 pub async fn search(
     db: &DatabaseConnection,
     raw_query: &str,
     search_type: &str,
+    viewer_id: Option<i64>,
     page: u64,
     per_page: u64,
 ) -> Result<(Vec<SearchResult>, i64)> {
@@ -104,19 +110,20 @@ pub async fn search(
     let mut total = 0i64;
 
     if search_type == "all" || search_type == "repos" {
-        let (repos, count) = search_repos(db, raw_text, &filters, offset, limit).await?;
+        let (repos, count) = search_repos(db, raw_text, &filters, viewer_id, offset, limit).await?;
         total += count;
         results.extend(repos);
     }
 
     if search_type == "all" || search_type == "issues" {
-        let (issues, count) = search_issues(db, raw_text, &filters, offset, limit).await?;
+        let (issues, count) =
+            search_issues(db, raw_text, &filters, viewer_id, offset, limit).await?;
         total += count;
         results.extend(issues);
     }
 
     if search_type == "all" || search_type == "wiki" {
-        let (wiki, count) = search_wiki(db, raw_text, &filters, offset, limit).await?;
+        let (wiki, count) = search_wiki(db, raw_text, &filters, viewer_id, offset, limit).await?;
         total += count;
         results.extend(wiki);
     }
@@ -186,6 +193,42 @@ fn build_filter_clauses(
     (clauses, joins, params)
 }
 
+/// Restrict a search to the repositories `viewer_id` (`None` = anonymous) is
+/// allowed to see, `repo_alias` being the alias the `repositories` table is
+/// joined under. Every branch is parameterized — the alias is the only thing
+/// interpolated, and it is a literal at each call site.
+///
+/// Mirrors `rg_core::repo::service::can_read_repo` (owner, collaborator, org
+/// member) and additionally drops soft-deleted repos, which stay in the FTS
+/// tables after deletion because the row itself is never removed.
+fn build_visibility_clause(repo_alias: &str, viewer_id: Option<i64>) -> (String, Vec<Value>) {
+    let mut params = vec![Value::from(false)];
+
+    let visible = match viewer_id {
+        None => format!("{repo_alias}.is_private = ?"),
+        Some(viewer) => {
+            params.extend([
+                Value::from(viewer),
+                Value::from(viewer),
+                Value::from(viewer),
+            ]);
+            format!(
+                "({repo_alias}.is_private = ? \
+                 OR {repo_alias}.owner_id = ? \
+                 OR EXISTS (SELECT 1 FROM repo_collaborators rc_vis \
+                            WHERE rc_vis.repo_id = {repo_alias}.id AND rc_vis.user_id = ?) \
+                 OR EXISTS (SELECT 1 FROM organization_members om_vis \
+                            WHERE om_vis.org_id = {repo_alias}.org_id AND om_vis.user_id = ?))"
+            )
+        }
+    };
+
+    (
+        format!("{visible} AND {repo_alias}.deleted_at IS NULL"),
+        params,
+    )
+}
+
 /// Build issue-specific filter clauses (state, label) — parameterized.
 fn build_issue_filter_clauses(filters: &SearchFilters) -> (Vec<String>, Vec<String>, Vec<Value>) {
     let mut clauses = Vec::new();
@@ -253,11 +296,16 @@ async fn search_repos(
     db: &DatabaseConnection,
     raw_query: &str,
     filters: &SearchFilters,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<SearchResult>, i64)> {
     let backend = db.get_database_backend();
-    let (filter_clauses, extra_joins, filter_params) = build_filter_clauses(filters, "r");
+    let (mut filter_clauses, extra_joins, mut filter_params) = build_filter_clauses(filters, "r");
+
+    let (visibility, visibility_params) = build_visibility_clause("r", viewer_id);
+    filter_clauses.push(visibility);
+    filter_params.extend(visibility_params);
 
     let (match_pred, order_clause, query_values) = if raw_query.is_empty() {
         (String::new(), String::new(), Vec::new())
@@ -346,6 +394,7 @@ async fn search_issues(
     db: &DatabaseConnection,
     raw_query: &str,
     filters: &SearchFilters,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<SearchResult>, i64)> {
@@ -355,6 +404,11 @@ async fn search_issues(
 
     common_clauses.extend(issue_clauses);
     common_params.extend(issue_params);
+
+    let (visibility, visibility_params) = build_visibility_clause("r", viewer_id);
+    common_clauses.push(visibility);
+    common_params.extend(visibility_params);
+
     let all_joins = format!("{}\n{}", common_joins.join("\n"), issue_joins.join("\n"));
 
     let (match_pred, order_clause, query_values) = if raw_query.is_empty() {
@@ -415,6 +469,7 @@ async fn search_issues(
         SELECT COUNT(DISTINCT i.id)
         FROM issues_fts
         JOIN issues i ON i.id = issues_fts.rowid
+        JOIN repositories r ON r.id = i.repo_id
         {}
         WHERE {}
         "#,
@@ -443,11 +498,16 @@ async fn search_wiki(
     db: &DatabaseConnection,
     raw_query: &str,
     filters: &SearchFilters,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<SearchResult>, i64)> {
     let backend = db.get_database_backend();
-    let (filter_clauses, extra_joins, filter_params) = build_filter_clauses(filters, "w");
+    let (mut filter_clauses, extra_joins, mut filter_params) = build_filter_clauses(filters, "w");
+
+    let (visibility, visibility_params) = build_visibility_clause("r", viewer_id);
+    filter_clauses.push(visibility);
+    filter_params.extend(visibility_params);
 
     let (match_pred, order_clause, query_values) = if raw_query.is_empty() {
         (String::new(), String::new(), Vec::new())

@@ -2,8 +2,10 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{ActiveValue::Set, *};
+use sea_orm::{sea_query::Query, ActiveValue::Set, *};
 
+use crate::entities::organization_member::{self, Entity as OrgMemberEntity};
+use crate::entities::repo_collaborator::{self, Entity as RepoCollaboratorEntity};
 use crate::entities::repository::{
     self, ActiveModel as RepoActiveModel, Entity as RepoEntity, Model as Repo,
 };
@@ -52,16 +54,55 @@ pub async fn list_by_owner(db: &DatabaseConnection, owner_id: i64) -> Result<Vec
         .context("db: list repos by owner")
 }
 
-/// Paginated list of non-deleted repos owned by a user.
-pub async fn list_by_owner_paginated(
+/// The repos `viewer_id` (`None` = anonymous) is allowed to see: every public
+/// one, plus the private ones they own, collaborate on, or reach through the
+/// owning organization.
+///
+/// This mirrors `rg_core::repo::service::can_read_repo` — the two must stay in
+/// step. It lives here rather than in the handler because a listing has to
+/// filter *before* LIMIT/OFFSET: dropping invisible rows after the query would
+/// hand the caller short pages and a total that counts repos they cannot see.
+fn visible_to(viewer_id: Option<i64>) -> Condition {
+    let visible = Condition::any().add(repository::Column::IsPrivate.eq(false));
+
+    let Some(viewer) = viewer_id else {
+        return visible;
+    };
+
+    visible
+        .add(repository::Column::OwnerId.eq(viewer))
+        .add(
+            repository::Column::Id.in_subquery(
+                Query::select()
+                    .column(repo_collaborator::Column::RepoId)
+                    .from(RepoCollaboratorEntity)
+                    .and_where(repo_collaborator::Column::UserId.eq(viewer))
+                    .to_owned(),
+            ),
+        )
+        .add(
+            repository::Column::OrgId.in_subquery(
+                Query::select()
+                    .column(organization_member::Column::OrgId)
+                    .from(OrgMemberEntity)
+                    .and_where(organization_member::Column::UserId.eq(viewer))
+                    .to_owned(),
+            ),
+        )
+}
+
+/// Paginated list of non-deleted repos owned by a user that `viewer_id` may see.
+pub async fn list_by_owner_visible_to(
     db: &DatabaseConnection,
     owner_id: i64,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Repo>, i64)> {
     let base = RepoEntity::find()
         .filter(repository::Column::OwnerId.eq(owner_id))
         .filter(repository::Column::DeletedAt.is_null())
+        .filter(visible_to(viewer_id))
         .order_by_asc(repository::Column::Name);
 
     let total = base
@@ -105,16 +146,18 @@ pub async fn list_by_org(db: &DatabaseConnection, org_id: i64) -> Result<Vec<Rep
         .context("db: list repos by org")
 }
 
-/// Paginated list of non-deleted repos belonging to an organization.
-pub async fn list_by_org_paginated(
+/// Paginated list of non-deleted org repos that `viewer_id` may see.
+pub async fn list_by_org_visible_to(
     db: &DatabaseConnection,
     org_id: i64,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Repo>, i64)> {
     let base = RepoEntity::find()
         .filter(repository::Column::OrgId.eq(org_id))
         .filter(repository::Column::DeletedAt.is_null())
+        .filter(visible_to(viewer_id))
         .order_by_asc(repository::Column::Name);
 
     let total = base

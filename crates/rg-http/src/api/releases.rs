@@ -26,6 +26,57 @@ use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
 
+// ── Read gates ────────────────────────────────────────────────────────
+//
+// These routes carry the repository in the path but address the release (or
+// asset) by a *global* id, so the read check and the object it guards are two
+// different things. Checking only the repository proves the caller can open
+// some repo — it says nothing about where the id points, and a public repo of
+// their own is enough to reach a private repo's releases. Both helpers below
+// therefore re-anchor the object to the repository that was checked.
+//
+// A mismatch answers 404, not 403: a 403 would still confirm that the id
+// exists, which is most of what an id-walking caller wants to learn.
+
+/// Require read access to `owner/name` and return the release, which must live
+/// in that repository.
+async fn resolve_release_in_repo(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    release_id: i64,
+) -> Result<rg_db::entities::release::Model, AppError> {
+    let repo = crate::api::repo_access::require_read(state, headers, owner, name).await?;
+
+    let release = rg_core::release::service::get_release(&state.db, release_id).await?;
+    if release.repo_id != repo.id {
+        return Err(AppError::not_found("release not found"));
+    }
+
+    Ok(release)
+}
+
+/// Require read access to `owner/name` and return the asset, whose release must
+/// live in that repository.
+async fn resolve_asset_in_repo(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    asset_id: i64,
+) -> Result<rg_db::entities::release_asset::Model, AppError> {
+    let repo = crate::api::repo_access::require_read(state, headers, owner, name).await?;
+
+    let asset = rg_core::release::service::get_asset(&state.db, asset_id).await?;
+    let release = rg_core::release::service::get_release(&state.db, asset.release_id).await?;
+    if release.repo_id != repo.id {
+        return Err(AppError::not_found("asset not found"));
+    }
+
+    Ok(asset)
+}
+
 /// Request body for creating a release.
 #[derive(Deserialize, ToSchema)]
 pub struct CreateReleaseRequest {
@@ -70,6 +121,7 @@ pub struct UpdateReleaseRequest {
 )]
 pub async fn list_releases(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
@@ -77,16 +129,9 @@ pub async fn list_releases(
     let offset = pagination.offset();
     let limit = pagination.limit();
 
-    // Find repo
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    let repo = match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
+        Ok(repo) => repo,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::release::service::list_releases(&state.db, repo.id, offset, limit).await {
@@ -205,25 +250,15 @@ pub async fn create_release(
 )]
 pub async fn get_release(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    // Verify repo exists
-    match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
-
-    match rg_core::release::service::get_release(&state.db, id).await {
+    // The service marks a genuine miss with `rg_core::error::NotFound`, so this
+    // still answers 404 for a deleted release — but a database outage surfaces
+    // as 503 instead of telling the client the release is gone.
+    match resolve_release_in_repo(&state, &headers, &owner, &name, id).await {
         Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
-        // The service marks a genuine miss with `rg_core::error::NotFound`, so
-        // this still answers 404 for a deleted release — but a database outage
-        // now surfaces as 503 instead of telling the client the release is gone.
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -366,17 +401,11 @@ pub async fn delete_release(
 )]
 pub async fn list_assets(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, release_id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    // Verify repo exists
-    match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    if let Err(e) = resolve_release_in_repo(&state, &headers, &owner, &name, release_id).await {
+        return e.into_response();
     }
 
     match rg_core::release::service::list_assets(&state.db, release_id).await {
@@ -559,22 +588,12 @@ fn hex_val(b: u8) -> Result<u8, ()> {
 )]
 pub async fn get_asset(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    // Verify repo exists
-    match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
-
-    match rg_core::release::service::get_asset(&state.db, asset_id).await {
+    match resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
         Ok(asset) => (StatusCode::OK, Json(serde_json::json!(asset))).into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -600,30 +619,11 @@ pub async fn download_asset(
     headers: HeaderMap,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    // Verify repo exists
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(repo)) => repo,
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    };
-
-    let actor_id = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, actor_id).await {
-        Ok(true) => {}
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-        Ok(false) => {
-            return AppError::forbidden("access denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    // Read access to the repository is only half of it — the asset id is
+    // global, so it also has to belong to this repository or the check guards
+    // the wrong object.
+    if let Err(e) = resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+        return e.into_response();
     }
 
     match rg_core::release::service::download_asset(

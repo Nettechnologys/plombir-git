@@ -103,6 +103,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &db,
         &format!("{wiki_term} repo:{username}/{repo_name}"),
         "wiki",
+        Some(user.id),
         1,
         20,
     )
@@ -115,6 +116,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &db,
         &format!("{repo_name} author:{username}"),
         "repos",
+        Some(user.id),
         1,
         20,
     )
@@ -130,6 +132,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &db,
         &format!("{wiki_term} repo:{username}/{repo_name}"),
         "wiki",
+        Some(user.id),
         1,
         20,
     )
