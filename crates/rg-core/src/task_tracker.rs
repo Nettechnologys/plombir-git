@@ -5,7 +5,10 @@
 //! - webhook delivery (`webhook::service::trigger_event`) — the outbound POST
 //!   plus the `webhook_delivery` audit-row write;
 //! - real-time WebSocket notification (`rg_http::ws::push_notification`) — the
-//!   channel push plus the persisted notification row.
+//!   channel push plus the persisted notification row;
+//! - post-push hooks (`rg_http::git_http::handle_git_receive_pack`) — the
+//!   open-PR head-SHA refresh, the CI trigger and the webhook fan-out that run
+//!   after the client already has its `200 OK`.
 //!
 //! The main graceful-shutdown path drains in-flight HTTP requests and the
 //! long-lived loop workers, but a bare `tokio::spawn` is owned by nobody: on

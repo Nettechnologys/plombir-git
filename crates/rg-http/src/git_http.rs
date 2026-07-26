@@ -833,6 +833,18 @@ pub(crate) async fn handle_git_receive_pack(
             let output = reader_task.await.unwrap_or_default();
 
             // ── Post-push hooks: trigger CI + Webhook ───────────────
+            //
+            // Detached so the client isn't held while CI is triggered and the
+            // webhooks fan out — but tracked, not a bare `tokio::spawn`. The
+            // client already has its `200 OK`, so a SIGTERM in the next few
+            // seconds would sever the task on its first await: no pipeline, no
+            // webhook, no PR head-SHA refresh, and no trace that any of it was
+            // owed. `delivery_tracker()` puts it in the drain `rg_http::run`
+            // performs after the server stops accepting (`close()` + `wait()`),
+            // the same contract webhook delivery and WS notifications use. The
+            // nested spawns those two do from inside this task are tracked as
+            // well — `close()` only blocks `wait()` from returning, it never
+            // rejects a spawn.
             let db = state.db.clone();
             let repo_path_clone = repo_path.clone();
             let repo_root = state.repo_root.clone();
@@ -847,7 +859,7 @@ pub(crate) async fn handle_git_receive_pack(
             let ci_engine = state.ci_engine.clone();
             let external_url = state.external_url.clone();
 
-            tokio::spawn(async move {
+            rg_core::task_tracker::delivery_tracker().spawn(async move {
                 post_push_hooks(
                     &PostPushParams {
                         db: &db,
@@ -1298,6 +1310,36 @@ mod tests {
         // 0 = opt out: the future runs unbounded and its value passes through.
         let res = with_git_timeout(0, async { 5 }).await;
         assert_eq!(res.ok(), Some(5));
+    }
+
+    /// The post-push hooks must stay on the *tracked* spawn path.
+    ///
+    /// The live-push drain test (`push_hook_drain_tests`) asserts the effect,
+    /// but it cannot fail reliably: an untracked task usually still finishes
+    /// before the assertion reads the row, so the regression it guards is
+    /// timing-dependent by nature. This one is not — the drain in
+    /// `rg_http::run` can only await what the tracker owns, so a bare
+    /// `tokio::spawn` here is the bug regardless of how the race lands.
+    #[test]
+    fn post_push_hooks_are_detached_through_the_delivery_tracker() {
+        let source = include_str!("git_http.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        // The call inside the detached closure — not the `async fn` definition.
+        let call = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("post_push_hooks("))
+            .expect("receive-pack must still call post_push_hooks");
+        let spawn = lines[..call]
+            .iter()
+            .rposition(|line| line.contains("spawn("))
+            .expect("the post-push call must sit inside a spawn");
+        assert!(
+            lines[spawn].contains("delivery_tracker()"),
+            "post-push hooks must be spawned via rg_core::task_tracker::delivery_tracker() \
+             so the shutdown drain awaits them; found `{}` at git_http.rs:{}",
+            lines[spawn].trim(),
+            spawn + 1
+        );
     }
 
     /// Read a process's state char from `/proc/<pid>/stat`, or `None` if it no

@@ -351,9 +351,10 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     }
 
     // ── Drain detached delivery tasks ──────────────────────────────────
-    // Webhook deliveries (`webhook::service::trigger_event`) and WS
-    // notifications (`ws::push_notification`) are spawned detached so handlers
-    // don't block on them. The shared tracker lets us await the outstanding
+    // Webhook deliveries (`webhook::service::trigger_event`), WS notifications
+    // (`ws::push_notification`) and the post-push hooks of a `receive-pack`
+    // (`git_http`) are spawned detached so handlers don't block on them. The
+    // shared tracker lets us await the outstanding
     // ones — bounded by the grace window — so a SIGTERM under load doesn't
     // sever an in-flight delivery or leave a half-written `webhook_delivery`
     // row. Each delivery already carries its own outbound-HTTP timeout, so a
