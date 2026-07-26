@@ -448,7 +448,7 @@ pub struct DisableMfaRequest {
     request_body = DisableMfaRequest,
     responses(
         (status = 200, description = "MFA disabled successfully"),
-        (status = 401, description = "Unauthorized or invalid password"),
+        (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -474,8 +474,45 @@ pub async fn disable_mfa(
     let password_ok = rg_core::auth::password::verify_password(&req.password, &user.password_hash)
         .with_context(|| format!("cannot verify the password of user {user_id}"))
         .map_err(AppError::from)?;
-    if !password_ok {
-        return Err(AppError::unauthorized("invalid password"));
+
+    // The fourth password door, and the one that is easiest to miss: it sits
+    // behind a valid session, so it is not a way *in* — it is the way a stolen
+    // session is made permanent. Guessing the owner's password here costs only
+    // Argon2 (~50 ms a try), and until this call the guessing advanced no
+    // counter and left no row, so neither the audit log nor the admin's view of
+    // the account showed a thousand attempts at taking the second factor off.
+    //
+    // It settles through the shared helper, so a strike here is the same strike
+    // `POST /users/login`, SSH and `docker login` record: the whole account
+    // locks, not just this door. Locking the account from a door behind a
+    // session grants an attacker no new denial-of-service — anyone who merely
+    // knows a username can already trip the same lock from the login form — and
+    // a door-local counter would not stop the guessed password from being used
+    // everywhere else, which is the point of guessing it.
+    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(&headers);
+    let attempt = rg_core::auth::lockout::settle_password_attempt(
+        &state.db,
+        Some(&user),
+        password_ok,
+        rg_core::auth::lockout::AttemptOrigin {
+            login: &user.username,
+            channel: "mfa-disable",
+            ip_address: ip_address.as_deref(),
+            user_agent: user_agent.as_deref(),
+        },
+    )
+    .await;
+
+    if let rg_core::auth::lockout::PasswordAttempt::Rejected { locked } = attempt {
+        // The caller is authenticated as this very account, so naming the lock
+        // leaks nothing — it is what `POST /users/mfa/verify` already answers,
+        // and the alternative is telling the owner their password is wrong when
+        // it is not.
+        return Err(AppError::unauthorized(if locked {
+            "account is temporarily locked"
+        } else {
+            "invalid password"
+        }));
     }
 
     rg_db::ops::user_ops::disable_mfa(&state.db, user_id)
