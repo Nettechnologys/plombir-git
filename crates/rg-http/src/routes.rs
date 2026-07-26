@@ -140,7 +140,7 @@ fn build_router(
             // SPA fallback: serve static assets, and for any unmatched path
             // (client-side routes like /login, /dashboard) return index.html
             // with a per-request CSP nonce injected into all <script> tags (H-2).
-            ServeDir::new("web/build").fallback(get(handlers::spa_index_handler)),
+            ServeDir::new(handlers::WEB_BUILD_DIR).fallback(get(handlers::spa_index_handler)),
         )
         // ── Middleware layers (order: bottom-up, last .layer() runs first) ──
         .layer(axum::middleware::from_fn(

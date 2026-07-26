@@ -1,11 +1,23 @@
 //! Miscellaneous non-Git HTTP handlers: health check, SPA fallback, and the
 //! OpenAPI / Swagger UI endpoints.
 
+use std::path::{Path, PathBuf};
+
 use axum::extract::{Extension, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::{openapi, security, AppState};
+
+/// Directory holding the built SvelteKit bundle, **relative to the working
+/// directory of the server process** — the docker image copies it to
+/// `/app/web/build` and sets `WORKDIR /app`.
+pub(crate) const WEB_BUILD_DIR: &str = "web/build";
+
+/// Remediation hint attached to every failure to serve the SPA shell. The bundle
+/// is resolved from the process CWD, so "file missing" and "wrong CWD" look
+/// identical from the outside — name both.
+const WEB_BUILD_HINT: &str = "the frontend bundle is expected in `web/build/` relative to the server's working directory (the docker image copies it to /app/web/build and runs with WORKDIR /app)";
 
 /// H-2: SPA fallback handler — serves `index.html` with a per-request CSP
 /// nonce injected into all `<script>` tags.
@@ -17,7 +29,8 @@ use crate::{openapi, security, AppState};
 pub(crate) async fn spa_index_handler(
     Extension(nonce): Extension<security::CspNonce>,
 ) -> Response {
-    match tokio::fs::read("web/build/index.html").await {
+    let index_path = spa_index_path();
+    match tokio::fs::read(&index_path).await {
         Ok(html_bytes) => {
             let html = String::from_utf8_lossy(&html_bytes).into_owned();
             let modified = security::inject_csp_nonce(&html, &nonce.0);
@@ -28,7 +41,64 @@ pub(crate) async fn spa_index_handler(
             )
                 .into_response()
         }
-        Err(_) => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
+        Err(error) => spa_index_error_response(&index_path, &error),
+    }
+}
+
+fn spa_index_path() -> PathBuf {
+    Path::new(WEB_BUILD_DIR).join("index.html")
+}
+
+/// Resolve a CWD-relative path against the process working directory, so the log
+/// names the file the server actually tried to open instead of a fragment the
+/// operator has to guess the anchor of.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// The line that goes to the log when the SPA shell cannot be served: what went
+/// wrong, the absolute path the server actually tried to open, the errno, and
+/// where the bundle is supposed to come from.
+fn spa_index_diagnostic(index_path: &Path, error: &std::io::Error) -> String {
+    let what = if error.kind() == std::io::ErrorKind::NotFound {
+        "SPA shell is missing"
+    } else {
+        "SPA shell is unreadable"
+    };
+    format!(
+        "{what}: {} — {error}; {WEB_BUILD_HINT}",
+        absolutize(index_path).display()
+    )
+}
+
+/// Map an `index.html` read failure onto a status the operator can act on.
+///
+/// A missing bundle is a genuine 404; anything else (`EACCES` on a bind-mount
+/// owned by another uid, `EIO`, a directory in place of the file) is a server
+/// fault and must not masquerade as "not found". Either way the absolute path
+/// and the errno go to the log — the response body stays free of filesystem
+/// layout.
+fn spa_index_error_response(index_path: &Path, error: &std::io::Error) -> Response {
+    tracing::error!("{}", spa_index_diagnostic(index_path, error));
+
+    if error.kind() == std::io::ErrorKind::NotFound {
+        (
+            StatusCode::NOT_FOUND,
+            format!("index.html not found — {WEB_BUILD_HINT}"),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "index.html could not be read; see the server log for the path and the cause",
+        )
+            .into_response()
     }
 }
 
@@ -159,4 +229,83 @@ fn swagger_ui_response(path: &str) -> Response {
         ),
     }
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_missing_bundle_and_an_unreadable_one_get_different_statuses() {
+        let path = spa_index_path();
+
+        let missing =
+            spa_index_error_response(&path, &Error::new(ErrorKind::NotFound, "No such file"));
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // The bind-mount case from the deploy: the file is there, the container
+        // uid just cannot read it. That is a server fault, not a 404.
+        let denied = spa_index_error_response(
+            &path,
+            &Error::new(ErrorKind::PermissionDenied, "Permission denied"),
+        );
+        assert_eq!(denied.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // `web/build` mounted as a directory named index.html, or a bad device.
+        let other = spa_index_error_response(&path, &Error::other("Is a directory"));
+        assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn the_logged_index_path_is_absolute() {
+        let absolute = absolutize(&spa_index_path());
+        assert!(
+            absolute.is_absolute(),
+            "the log must name the file the server actually opened, got {}",
+            absolute.display()
+        );
+        assert!(absolute.ends_with("web/build/index.html"));
+    }
+
+    #[test]
+    fn the_log_carries_the_absolute_path_the_errno_and_the_remediation() {
+        let path = spa_index_path();
+        let cwd = std::env::current_dir().expect("cwd");
+
+        let missing = spa_index_diagnostic(
+            &path,
+            &Error::new(
+                ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            ),
+        );
+        assert!(missing.contains(&cwd.display().to_string()), "{missing}");
+        assert!(missing.contains("web/build/index.html"), "{missing}");
+        assert!(missing.contains("os error 2"), "{missing}");
+        assert!(missing.contains("working directory"), "{missing}");
+
+        // Same file, different cause: the log must not read as "missing".
+        let denied = spa_index_diagnostic(
+            &path,
+            &Error::new(
+                ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            ),
+        );
+        assert!(denied.contains("unreadable"), "{denied}");
+        assert!(!denied.contains("missing"), "{denied}");
+        assert!(denied.contains("os error 13"), "{denied}");
+    }
+
+    #[test]
+    fn an_already_absolute_path_is_left_alone() {
+        let absolute = Path::new("/app/web/build/index.html");
+        assert_eq!(absolutize(absolute), absolute);
+    }
+
+    #[test]
+    fn the_router_and_the_handler_agree_on_the_bundle_directory() {
+        assert!(spa_index_path().starts_with(WEB_BUILD_DIR));
+    }
 }
