@@ -319,13 +319,19 @@ async fn authenticate_basic(db: &DatabaseConnection, headers: &HeaderMap) -> (St
         return anonymous();
     };
 
-    match rg_db::ops::user_ops::find_by_username(db, user).await {
-        Ok(Some(u))
-            if rg_core::auth::password::verify_password(pass, &u.password_hash)
-                .unwrap_or(false) =>
-        {
-            (user.to_string(), Some(u.id))
-        }
+    // Verify unconditionally — an unknown username must cost the same Argon2
+    // work as a real one, or the response time enumerates accounts.
+    let found = rg_db::ops::user_ops::find_by_username(db, user)
+        .await
+        .ok()
+        .flatten();
+    let password_ok = rg_core::auth::password::verify_password_or_dummy(
+        pass,
+        found.as_ref().map(|u| u.password_hash.as_str()),
+    );
+
+    match found {
+        Some(u) if password_ok => (user.to_string(), Some(u.id)),
         _ => anonymous(),
     }
 }

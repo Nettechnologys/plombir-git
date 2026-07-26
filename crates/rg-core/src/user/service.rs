@@ -163,17 +163,25 @@ pub async fn login(
         user_ops::find_by_username(db, username_or_email).await?
     };
 
-    let user = match user {
-        Some(u) => u,
-        None => bail!("invalid credentials"),
-    };
+    // Always pay for one Argon2 verification, including when there is nothing
+    // to verify against: bailing out early on an unknown account would answer
+    // "does this account exist?" through the response time.
+    let password_ok = password::verify_password_or_dummy(
+        plaintext_password,
+        user.as_ref().map(|u| u.password_hash.as_str()),
+    );
 
-    if !user.is_active {
-        bail!("account is disabled");
+    let Some(user) = user else {
+        bail!("invalid credentials");
+    };
+    if !password_ok {
+        bail!("invalid credentials");
     }
 
-    if !password::verify_password(plaintext_password, &user.password_hash)? {
-        bail!("invalid credentials");
+    // Checked after the password so that "account is disabled" is only ever
+    // disclosed to whoever already knows the credentials.
+    if !user.is_active {
+        bail!("account is disabled");
     }
 
     let token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
@@ -215,7 +223,12 @@ pub async fn login_with_configured_auth(
             )
             .await
         }
-        Some(_) => bail!("invalid credentials"),
+        Some(_) => {
+            // Account exists but authenticates through a provider no password
+            // reaches — burn the same Argon2 work the local branch would.
+            password::verify_password_or_dummy(plaintext_password, None);
+            bail!("invalid credentials")
+        }
     }
 }
 
@@ -230,12 +243,45 @@ async fn find_login_user(
     }
 }
 
+/// Authenticate against the enabled LDAP sources.
+///
+/// Unknown usernames are routed here, so a rejection that never reached an
+/// actual bind must still cost what the local password branch costs — with no
+/// LDAP provider configured this function would otherwise return instantly for
+/// an unknown account while a real one pays for its Argon2 hash, and the
+/// difference answers "does this account exist?".
 async fn login_via_ldap(
     db: &DatabaseConnection,
     existing: Option<rg_db::entities::user::Model>,
     username_or_email: &str,
     plaintext_password: &str,
     jwt_secret: &str,
+) -> Result<LoginOutcome> {
+    let mut attempted_bind = false;
+    let outcome = login_via_ldap_inner(
+        db,
+        existing,
+        username_or_email,
+        plaintext_password,
+        jwt_secret,
+        &mut attempted_bind,
+    )
+    .await;
+    if outcome.is_err() && !attempted_bind {
+        password::verify_password_or_dummy(plaintext_password, None);
+    }
+    outcome
+}
+
+/// Sets `attempted_bind` as soon as a real LDAP round-trip is under way, so the
+/// caller knows whether the elapsed time already came from the network.
+async fn login_via_ldap_inner(
+    db: &DatabaseConnection,
+    existing: Option<rg_db::entities::user::Model>,
+    username_or_email: &str,
+    plaintext_password: &str,
+    jwt_secret: &str,
+    attempted_bind: &mut bool,
 ) -> Result<LoginOutcome> {
     if plaintext_password.is_empty() {
         bail!("invalid credentials");
@@ -270,6 +316,7 @@ async fn login_via_ldap(
                 continue;
             }
         };
+        *attempted_bind = true;
         let ldap_user = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             crate::auth::ldap::authenticate(&config, lookup, plaintext_password),

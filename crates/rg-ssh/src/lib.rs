@@ -403,39 +403,29 @@ impl Handler for SshHandler {
             return Ok(Auth::Accept);
         };
 
-        match rg_db::ops::user_ops::find_by_username(db, username).await {
-            Ok(Some(user)) => {
-                match rg_core::auth::password::verify_password(password, &user.password_hash) {
-                    Ok(true) => {
-                        self.authenticated_identity = Some(AuthenticatedIdentity::User(user.id));
-                        tracing::info!(username, "SSH password auth accepted");
-                        Ok(Auth::Accept)
-                    }
-                    Ok(false) => {
-                        tracing::warn!(username, "SSH password auth rejected");
-                        Ok(Auth::Reject {
-                            proceed_with_methods: None,
-                            partial_success: false,
-                        })
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), "password verify error");
-                        Ok(Auth::Reject {
-                            proceed_with_methods: None,
-                            partial_success: false,
-                        })
-                    }
-                }
-            }
-            Ok(None) => {
-                tracing::warn!(username, "SSH password auth: user not found");
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                })
-            }
+        let found = match rg_db::ops::user_ops::find_by_username(db, username).await {
+            Ok(user) => user,
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "DB error during password auth");
+                None
+            }
+        };
+        // Verified even when there is no such user, so that a rejection always
+        // costs one Argon2 hash — an early return here would let an attacker
+        // enumerate accounts by how fast the server says no.
+        let password_ok = rg_core::auth::password::verify_password_or_dummy(
+            password,
+            found.as_ref().map(|user| user.password_hash.as_str()),
+        );
+
+        match found {
+            Some(user) if password_ok => {
+                self.authenticated_identity = Some(AuthenticatedIdentity::User(user.id));
+                tracing::info!(username, "SSH password auth accepted");
+                Ok(Auth::Accept)
+            }
+            _ => {
+                tracing::warn!(username, "SSH password auth rejected");
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
                     partial_success: false,

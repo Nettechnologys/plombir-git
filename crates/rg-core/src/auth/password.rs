@@ -29,6 +29,40 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
         .is_ok())
 }
 
+/// Stand-in hash verified when the account does not exist.
+///
+/// Produced by [`hash_password`], so it carries exactly the `Argon2::default()`
+/// parameters real hashes are stored with; `dummy_hash_uses_current_default_params`
+/// fails loudly if a dependency bump ever moves those defaults apart.
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$j10MFJnxYC8YdoKn2f0/pw$hiB3C8eJEitR5h7E+0P51MvixnERtz8bhn3hwLOHcq0";
+
+/// Verify `password` against `stored_hash`, spending the same Argon2 work when
+/// there is no hash to verify against.
+///
+/// Argon2 is deliberately expensive — tens of milliseconds — so an
+/// authentication path that skips it for unknown accounts answers "does this
+/// account exist?" in its response time, no matter how carefully the response
+/// *body* is unified. Callers that resolve a user before checking the password
+/// must pass `None` instead of short-circuiting, so both outcomes cost the same.
+///
+/// Returns `false` for every failure — no such account, wrong password, or an
+/// unparseable stored hash (logged, then treated as a failed login).
+pub fn verify_password_or_dummy(password: &str, stored_hash: Option<&str>) -> bool {
+    match stored_hash {
+        Some(hash) => verify_password(password, hash).unwrap_or_else(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "stored password hash is unusable");
+            false
+        }),
+        None => {
+            // The point is the work, not the answer — `black_box` keeps the
+            // optimizer from noticing the result is thrown away.
+            std::hint::black_box(verify_password(password, DUMMY_PASSWORD_HASH).is_ok());
+            false
+        }
+    }
+}
+
 // ── Password Strength Validation (Phase 22-D) ──────────────────────────────
 
 /// Password validation error.
@@ -272,6 +306,52 @@ mod tests {
         let hash = hash_password("hunter2").unwrap();
         assert!(verify_password("hunter2", &hash).unwrap());
         assert!(!verify_password("wrong", &hash).unwrap());
+    }
+
+    /// The dummy hash only masks the "unknown account" branch while it costs
+    /// what a real verification costs — i.e. while its parameters are still the
+    /// ones `hash_password` writes. An `argon2` bump that changes the defaults
+    /// must break here, not silently re-open the oracle.
+    #[test]
+    fn dummy_hash_uses_current_default_params() {
+        let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH).expect("dummy hash must be valid PHC");
+        let params = argon2::Params::try_from(&parsed).expect("dummy hash must carry params");
+        let default = Argon2::default();
+
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        assert_eq!(params.m_cost(), default.params().m_cost());
+        assert_eq!(params.t_cost(), default.params().t_cost());
+        assert_eq!(params.p_cost(), default.params().p_cost());
+    }
+
+    #[test]
+    fn dummy_verification_costs_what_a_real_one_costs() {
+        use std::time::Instant;
+
+        let real = hash_password("correct horse battery staple").unwrap();
+        // Minimum of a few runs: the true cost is the floor, everything above it
+        // is scheduler noise from the parallel test runner.
+        let floor = |stored: Option<&str>| {
+            (0..3)
+                .map(|_| {
+                    let started = Instant::now();
+                    assert!(!verify_password_or_dummy("wrong password", stored));
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+
+        let known = floor(Some(real.as_str())).as_secs_f64();
+        let unknown = floor(None).as_secs_f64();
+
+        // Wide band on purpose — this asserts "one full Argon2 either way",
+        // not a benchmark. The bug it guards against was a ~0x short-circuit.
+        assert!(
+            unknown > known * 0.5 && unknown < known * 2.0,
+            "unknown-account verification took {unknown:.4}s vs {known:.4}s for a known one — \
+             the branches no longer cost the same"
+        );
     }
 
     #[test]

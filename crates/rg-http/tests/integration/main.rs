@@ -41,6 +41,7 @@ mod issue_tests;
 mod job_websocket_tests;
 mod label_lookup_failure_status_tests;
 mod lfs_signed_url_tests;
+mod login_enumeration_tests;
 mod merge_queue_ci_tests;
 mod notification_tests;
 mod oauth_pkce_tests;
