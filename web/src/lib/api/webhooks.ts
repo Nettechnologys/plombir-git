@@ -5,7 +5,8 @@ export interface RepositoryWebhook {
   repo_id: number;
   url: string;
   content_type: 'json' | 'form' | string;
-  secret: string | null;
+  /** Whether an HMAC secret is configured. The value itself never leaves the server. */
+  has_secret: boolean;
   active: boolean;
   events: string;
   created_at: string;

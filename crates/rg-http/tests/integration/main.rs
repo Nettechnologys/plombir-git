@@ -81,6 +81,7 @@ mod tail_lookup_failure_status_tests;
 mod team_delete_failure_status_tests;
 mod time_tracking_tests;
 mod upload_failure_status_tests;
+mod webhook_authz_tests;
 mod webhook_external_hmac_tests;
 mod wiki_authz_tests;
 mod wiki_tests;
