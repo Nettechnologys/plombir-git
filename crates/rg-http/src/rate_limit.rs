@@ -23,6 +23,31 @@ const DEFAULT_MAX_KEYS: usize = 100_000;
 /// most once per second instead of on every request.
 const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Source of "now" for the limiter.
+///
+/// Production always reads the system clock. The test build gets a second
+/// variant so window expiry can be exercised by moving time forward instead of
+/// sleeping through a real window — `Instant` cannot be constructed at an
+/// arbitrary point, so the only way to observe a reset is to control the reads.
+/// Outside `cfg(test)` the enum has a single variant and is zero-sized, so both
+/// the production layout and the emitted code path are unchanged.
+#[derive(Debug, Clone)]
+enum Clock {
+    System,
+    #[cfg(test)]
+    Manual(Arc<Mutex<Instant>>),
+}
+
+impl Clock {
+    fn now(&self) -> Instant {
+        match self {
+            Clock::System => Instant::now(),
+            #[cfg(test)]
+            Clock::Manual(t) => *t.lock().unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+}
+
 /// Per-client rate limit state.
 #[derive(Debug)]
 struct ClientState {
@@ -42,10 +67,10 @@ struct ClientMap {
 }
 
 impl ClientMap {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             entries: HashMap::new(),
-            last_sweep: Instant::now(),
+            last_sweep: now,
         }
     }
 }
@@ -69,6 +94,8 @@ pub struct RateLimiter {
     /// std::sync::Mutex is used because critical sections are very short
     /// (single HashMap lookup/update) and never await.
     clients: Arc<Mutex<ClientMap>>,
+    /// Where `now` comes from. Always the system clock in production.
+    clock: Clock,
 }
 
 impl RateLimiter {
@@ -83,7 +110,8 @@ impl RateLimiter {
             window_secs: window_secs.max(1),
             max_keys: DEFAULT_MAX_KEYS,
             trusted_proxies: Arc::new(Vec::new()),
-            clients: Arc::new(Mutex::new(ClientMap::new())),
+            clients: Arc::new(Mutex::new(ClientMap::new(Instant::now()))),
+            clock: Clock::System,
         }
     }
 
@@ -126,7 +154,7 @@ impl RateLimiter {
                 return true;
             }
         };
-        let now = Instant::now();
+        let now = self.clock.now();
         let window = Duration::from_secs(self.window_secs);
 
         // Fast path: a client we already track — update its bucket in place.
@@ -182,7 +210,7 @@ impl RateLimiter {
                 return;
             }
         };
-        let now = Instant::now();
+        let now = self.clock.now();
         guard.entries.retain(|_, state| now < state.reset_at);
         guard.last_sweep = now;
     }
@@ -229,6 +257,43 @@ impl RateLimiter {
             }
         }
         addr.ip().to_string()
+    }
+}
+
+/// A clock the test drives by hand, shared with the limiter it is injected
+/// into. Lets a window expire in zero wall-clock time.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct ManualClock(Arc<Mutex<Instant>>);
+
+#[cfg(test)]
+impl ManualClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    /// Move the limiter's notion of "now" forward.
+    fn advance(&self, by: Duration) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        *guard += by;
+    }
+}
+
+#[cfg(test)]
+impl RateLimiter {
+    /// Drive this limiter from `clock` instead of the system clock.
+    ///
+    /// Also re-seeds the sweep bookkeeping, which `new()` anchored to a real
+    /// `Instant`, so the throttle interval is measured against the injected
+    /// timeline rather than against construction time.
+    fn with_clock(mut self, clock: ManualClock) -> Self {
+        let now = *clock.0.lock().unwrap_or_else(|p| p.into_inner());
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_sweep = now;
+        self.clock = Clock::Manual(clock.0);
+        self
     }
 }
 
@@ -337,11 +402,14 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_window_reset() {
-        let limiter = RateLimiter::new(1, 1); // 1 second window
+        let clock = ManualClock::new();
+        let limiter = RateLimiter::new(1, 1).with_clock(clock.clone()); // 1 second window
         assert!(limiter.allow("client_a"));
         assert!(!limiter.allow("client_a"));
-        // Wait for window to expire
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Step past the window instead of sleeping through it: the limiter reads
+        // its clock on every call, so this is the same observation without the
+        // 1.1s of wall clock or the dependency on how long the OS actually slept.
+        clock.advance(Duration::from_millis(1100));
         assert!(limiter.allow("client_a")); // reset after window
     }
 
@@ -379,13 +447,17 @@ mod tests {
     #[test]
     fn test_max_keys_cap_reclaims_expired_slots() {
         // 1-second window, room for a single client.
-        let limiter = RateLimiter::new(5, 1).with_max_keys(1);
+        let clock = ManualClock::new();
+        let limiter = RateLimiter::new(5, 1)
+            .with_max_keys(1)
+            .with_clock(clock.clone());
         assert!(limiter.allow("a")); // inserts "a"
         assert!(!limiter.allow("b")); // full, "a" not expired → reject "b"
 
         // After "a"'s window expires, the throttled inline sweep evicts it and
-        // the freed slot admits a genuinely new client.
-        std::thread::sleep(Duration::from_millis(1100));
+        // the freed slot admits a genuinely new client. The step also clears
+        // SWEEP_MIN_INTERVAL, which `with_clock` anchored to the same timeline.
+        clock.advance(Duration::from_millis(1100));
         assert!(limiter.allow("b"));
     }
 
