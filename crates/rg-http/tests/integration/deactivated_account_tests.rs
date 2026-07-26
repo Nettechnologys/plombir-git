@@ -108,6 +108,192 @@ async fn deactivating_an_account_revokes_its_personal_access_token() {
     );
 }
 
+/// The session the account already holds is the one door no credential check
+/// can close: a JWT answers for itself — valid signature, expiry a week out —
+/// and nothing in that answer knows the account was disabled an hour ago. So
+/// the offboarded user's open tab kept working for the rest of the seven days.
+///
+/// Every shape a session can arrive in is probed, because a gate that reads
+/// only `Authorization: Bearer` is a gate with a documented way around it:
+/// browsers send the cookie, some clients spell it `token `, and git carries
+/// the JWT in an HTTP Basic field.
+#[tokio::test]
+async fn deactivating_an_account_kills_the_session_it_already_issued() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "deact_jwt", "deact_jwt@example.com").await;
+    create_private_repo(&base, &jwt, "vault").await;
+    let client = reqwest::Client::new();
+
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("deact_jwt:{}", jwt))
+    );
+    let presentations: Vec<(&'static str, &'static str, String)> = vec![
+        ("Bearer header", "authorization", format!("Bearer {jwt}")),
+        ("Basic field", "authorization", basic.clone()),
+        (
+            "HttpOnly cookie",
+            "cookie",
+            format!("forgekeep_token={jwt}"),
+        ),
+    ];
+
+    let probe = |url: String, header: &'static str, value: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    let me_url = format!("{}/api/v1/users/me", base);
+    let git_url = format!("{}/git/deact_jwt/vault/{}", base, INFO_REFS);
+
+    // Baseline: while the account stands, every shape opens both the REST API
+    // and the private clone — so a rejection below is the deactivation talking
+    // and not a presentation the harness got wrong.
+    for (shape, header, value) in &presentations {
+        assert_eq!(
+            probe(me_url.clone(), header, value.clone()).await,
+            200,
+            "baseline: a live session should be accepted via {shape}"
+        );
+    }
+    assert_eq!(
+        probe(git_url.clone(), "authorization", format!("Bearer {jwt}")).await,
+        200,
+        "baseline: a live session should clone its own private repo"
+    );
+
+    deactivate(&db, user_id).await;
+
+    for (shape, header, value) in &presentations {
+        assert_eq!(
+            probe(me_url.clone(), header, value.clone()).await,
+            401,
+            "a session issued before the deactivation still works via {shape}"
+        );
+    }
+    assert_eq!(
+        probe(git_url, "authorization", format!("Bearer {jwt}")).await,
+        401,
+        "a session issued before the deactivation still clones a private repo"
+    );
+}
+
+/// The notification WebSocket is the one handshake a browser cannot put a
+/// header on, so it grew two header-free ways to carry the session: the
+/// `bearer.<jwt>` subprotocol and a `?token=` query parameter. Both are session
+/// presentations, and a revocation gate that only reads headers would leave the
+/// offboarded user a live push channel.
+#[tokio::test]
+async fn a_revoked_session_cannot_open_the_notification_socket() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "deact_ws", "deact_ws@example.com").await;
+    let client = reqwest::Client::new();
+
+    // The requests below are deliberately not real upgrades — the point is
+    // whether the gate answers before the handler ever sees them, so a live
+    // account must get anything *except* 401 and a revoked one exactly 401.
+    let socket = format!("{}/api/v1/ws/notifications", base);
+    let via_query = format!("{}?token={}", socket, jwt);
+
+    let by_query = || {
+        let client = client.clone();
+        let url = via_query.clone();
+        async move { client.get(url).send().await.unwrap().status().as_u16() }
+    };
+    let by_subprotocol = || {
+        let client = client.clone();
+        let url = socket.clone();
+        let proto = format!("bearer.{jwt}");
+        async move {
+            client
+                .get(url)
+                .header("sec-websocket-protocol", proto)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    assert_ne!(
+        by_query().await,
+        401,
+        "baseline: a live session should not be turned away at the socket via a query parameter"
+    );
+    assert_ne!(
+        by_subprotocol().await,
+        401,
+        "baseline: a live session should not be turned away at the socket via a subprotocol"
+    );
+
+    deactivate(&db, user_id).await;
+
+    assert_eq!(
+        by_query().await,
+        401,
+        "a revoked session still reaches the notification socket via a query parameter"
+    );
+    assert_eq!(
+        by_subprotocol().await,
+        401,
+        "a revoked session still reaches the notification socket via a subprotocol"
+    );
+}
+
+/// Same gate, the other half of `is_usable`: an account that is *gone* must not
+/// be answered for by the session it left behind. `find_by_id` never filtered
+/// `deleted_at`, so before the gate a tombstoned account was indistinguishable
+/// from a live one everywhere the standing was not checked by hand.
+#[tokio::test]
+async fn a_session_of_a_deleted_account_is_rejected() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "deact_gone", "deact_gone@example.com").await;
+    let client = reqwest::Client::new();
+    let me_url = format!("{}/api/v1/users/me", base);
+
+    let status = |jwt: String| {
+        let client = client.clone();
+        let me_url = me_url.clone();
+        async move {
+            client
+                .get(me_url)
+                .bearer_auth(jwt)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    assert_eq!(
+        status(jwt.clone()).await,
+        200,
+        "baseline: the account stands"
+    );
+
+    rg_db::entities::user::Entity::delete_by_id(user_id)
+        .exec(&db)
+        .await
+        .expect("delete user");
+
+    assert_eq!(
+        status(jwt).await,
+        401,
+        "a session outlived the account it was issued to"
+    );
+}
+
 /// `docker login` runs through the registry's Basic-auth path, which resolved
 /// the password without ever looking at the account's standing.
 #[tokio::test]
@@ -145,7 +331,10 @@ async fn deactivating_an_account_blocks_docker_login() {
     };
 
     let before = request_token(basic.clone()).await;
-    assert_eq!(before.sub, "deact_oci", "baseline: credentials are accepted");
+    assert_eq!(
+        before.sub, "deact_oci",
+        "baseline: credentials are accepted"
+    );
     assert_eq!(
         before.scope.as_deref(),
         Some(scope),
@@ -184,7 +373,11 @@ async fn a_deactivated_account_gets_no_password_reset_token() {
             .await
             .unwrap();
         // Uniform 200 either way — the answer must not enumerate accounts.
-        assert_eq!(resp.status(), 200, "forgot-password should always answer 200");
+        assert_eq!(
+            resp.status(),
+            200,
+            "forgot-password should always answer 200"
+        );
     }
 
     assert_eq!(

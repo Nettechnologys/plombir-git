@@ -143,6 +143,13 @@ fn build_router(
             ServeDir::new(handlers::WEB_BUILD_DIR).fallback(get(handlers::spa_index_handler)),
         )
         // ── Middleware layers (order: bottom-up, last .layer() runs first) ──
+        // Innermost, so a rejected session is still counted, traced and given
+        // the security headers — and so rate limiting and maintenance mode both
+        // get to answer before it spends a database read.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::auth::session_standing_middleware,
+        ))
         .layer(axum::middleware::from_fn(
             middleware::http_metrics_middleware,
         ))
@@ -323,10 +330,7 @@ fn build_routes(
     // ── REST API routes ───────────────────────────────────────────────────
     let api_v1 = Router::new()
         // Users
-        .route(
-            "/users/register",
-            apply_auth_rl(post(api::users::register)),
-        )
+        .route("/users/register", apply_auth_rl(post(api::users::register)))
         .route("/users/login", apply_auth_rl(post(api::users::login)))
         .route("/users/logout", post(api::users::logout))
         .route("/users/me", get(api::users::me))
@@ -362,10 +366,7 @@ fn build_routes(
         .route("/users/mfa/backup", get(api::mfa::get_backup_codes))
         .route("/users/mfa/disable", post(api::mfa::disable_mfa))
         // Passkeys (WebAuthn)
-        .route(
-            "/users/passkeys",
-            get(api::passkeys::list_passkeys),
-        )
+        .route("/users/passkeys", get(api::passkeys::list_passkeys))
         .route(
             "/users/passkeys/{id}",
             delete(api::passkeys::delete_passkey),
@@ -939,8 +940,7 @@ fn build_routes(
         )
         .route(
             "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
-            post(api::releases::sign_asset_attestation)
-                .get(api::releases::get_asset_attestation),
+            post(api::releases::sign_asset_attestation).get(api::releases::get_asset_attestation),
         )
         .route(
             "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify",
@@ -1168,6 +1168,12 @@ pub(crate) fn build_test_router(state: AppState) -> Router {
         .merge(docs_routes)
         .route("/health", get(handlers::health))
         // ── Middleware layers (no rate limiter for tests) ──────────────────
+        // Kept in step with `build_router`: the revocation gate is part of the
+        // route table's contract, so the router under test has to carry it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::auth::session_standing_middleware,
+        ))
         .layer(axum::middleware::from_fn(middleware::request_id_middleware))
         .layer(TraceLayer::new_for_http().make_span_with(
             |request: &axum::http::Request<axum::body::Body>| {
