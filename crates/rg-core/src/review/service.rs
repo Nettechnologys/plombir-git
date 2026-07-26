@@ -62,7 +62,7 @@ pub async fn submit_review(
     // Validate PR exists
     let pr = pull_request_ops::find_by_repo_and_number(db, repo_id, pr_number)
         .await?
-        .context("pull request not found")?;
+        .ok_or_else(|| crate::error::not_found("pull request"))?;
 
     if pr.state != "open" {
         bail!(
@@ -107,7 +107,7 @@ pub async fn list_reviews(
     let repo = resolve_repo(db, owner, repo_name).await?;
     let pr = pull_request_ops::find_by_repo_and_number(db, repo.id, pr_number)
         .await?
-        .context("pull request not found")?;
+        .ok_or_else(|| crate::error::not_found("pull request"))?;
 
     pr_review_ops::list_by_pr(db, pr.id).await
 }
@@ -116,7 +116,7 @@ pub async fn list_reviews(
 pub async fn get_review(db: &DatabaseConnection, review_id: i64) -> Result<PrReview> {
     pr_review_ops::find_by_id(db, review_id)
         .await?
-        .context("review not found")
+        .ok_or_else(|| crate::error::not_found("review"))
 }
 
 /// Dismiss a review.
@@ -128,7 +128,7 @@ pub async fn dismiss_review(
 ) -> Result<PrReview> {
     let review = pr_review_ops::find_by_id(db, review_id)
         .await?
-        .context("review not found")?;
+        .ok_or_else(|| crate::error::not_found("review"))?;
 
     // Create a dismiss review entry
     let model = pr_review::ActiveModel {
@@ -179,12 +179,12 @@ pub async fn create_review_comment(
     // Validate PR
     let pr = pull_request_ops::find_by_repo_and_number(db, repo_id, pr_number)
         .await?
-        .context("pull request not found")?;
+        .ok_or_else(|| crate::error::not_found("pull request"))?;
 
     // Validate review exists
     let review = pr_review_ops::find_by_id(db, review_id)
         .await?
-        .context("review not found")?;
+        .ok_or_else(|| crate::error::not_found("review"))?;
     if review.repo_id != repo_id || review.pr_id != pr.id {
         bail!("review does not belong to this PR");
     }
@@ -193,7 +193,7 @@ pub async fn create_review_comment(
     if let Some(rtid) = reply_to_id {
         let parent = review_comment_ops::find_by_id(db, rtid)
             .await?
-            .context("parent comment not found")?;
+            .ok_or_else(|| crate::error::not_found("parent comment"))?;
         if parent.pr_id != pr.id {
             bail!("parent comment does not belong to this PR");
         }
@@ -338,7 +338,7 @@ pub async fn apply_suggestions(
         }
         let comment = review_comment_ops::find_by_id(db, comment_id)
             .await?
-            .context("review comment not found")?;
+            .ok_or_else(|| crate::error::not_found("review comment"))?;
         if comment.pr_id != pr.id || comment.reply_to_id.is_some() {
             bail!("suggestion does not belong to this pull request");
         }
@@ -513,7 +513,7 @@ pub async fn set_thread_resolved(
         pull_request::Entity::find_by_id(pr_id)
             .one(db)
             .await?
-            .context("pull request not found")?
+            .ok_or_else(|| crate::error::not_found("pull request"))?
             .repo_id,
         pr_id,
         Some(actor_id),
@@ -537,7 +537,7 @@ pub async fn get_thread_root(
 ) -> Result<ReviewComment> {
     let mut comment = review_comment_ops::find_by_id(db, comment_id)
         .await?
-        .context("review comment not found")?;
+        .ok_or_else(|| crate::error::not_found("review comment"))?;
     if comment.pr_id != pr_id {
         bail!("review comment does not belong to this PR");
     }
@@ -548,7 +548,7 @@ pub async fn get_thread_root(
     while let Some(parent_id) = comment.reply_to_id {
         comment = review_comment_ops::find_by_id(db, parent_id)
             .await?
-            .context("review thread root not found")?;
+            .ok_or_else(|| crate::error::not_found("review thread root"))?;
         if comment.pr_id != pr_id {
             bail!("review thread does not belong to this PR");
         }
@@ -571,7 +571,7 @@ pub async fn list_review_comments(
     let repo = resolve_repo(db, owner, repo_name).await?;
     let pr = pull_request_ops::find_by_repo_and_number(db, repo.id, pr_number)
         .await?
-        .context("pull request not found")?;
+        .ok_or_else(|| crate::error::not_found("pull request"))?;
 
     review_comment_ops::list_by_pr(db, pr.id).await
 }
@@ -593,7 +593,7 @@ pub async fn check_approval_status(
     let pr = pull_request::Entity::find_by_id(pr_id)
         .one(db)
         .await?
-        .context("pull request not found")?;
+        .ok_or_else(|| crate::error::not_found("pull request"))?;
     let count = pr_review_ops::count_current_approvals(db, pr_id, pr.head_sha.as_deref()).await?;
     Ok(count >= required_approvals)
 }
@@ -607,8 +607,8 @@ async fn resolve_repo(
 ) -> Result<rg_db::entities::repository::Model> {
     let user = rg_db::ops::user_ops::find_by_username(db, owner)
         .await?
-        .context("owner not found")?;
+        .ok_or_else(|| crate::error::not_found("owner"))?;
     repo_ops::find_by_owner_and_name(db, user.id, repo_name)
         .await?
-        .context("repository not found")
+        .ok_or_else(|| crate::error::not_found("repository"))
 }

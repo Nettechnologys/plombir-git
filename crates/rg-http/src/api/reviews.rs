@@ -417,7 +417,7 @@ pub async fn get_review(
             (StatusCode::OK, Json(review)).into_response()
         }
         Ok(_) => AppError::not_found("review not found").into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -457,7 +457,7 @@ pub async fn dismiss_review(
     let review = match rg_core::review::service::get_review(&state.db, id).await {
         Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => review,
         Ok(_) => return AppError::not_found("review not found").into_response(),
-        Err(e) => return AppError::not_found(e).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::review::service::dismiss_review(&state.db, review.id, user_id, req.message).await
@@ -931,7 +931,7 @@ pub async fn create_review_comment(
         Some(review_id) => match rg_core::review::service::get_review(&state.db, review_id).await {
             Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => review,
             Ok(_) => return AppError::not_found("review not found").into_response(),
-            Err(e) => return AppError::not_found(e).into_response(),
+            Err(e) => return AppError::from(e).into_response(),
         },
         None => match rg_core::review::service::submit_review(
             &state.db,
@@ -1316,7 +1316,7 @@ pub async fn set_thread_resolution(
     };
     let root = match rg_core::review::service::get_thread_root(&state.db, pr.id, comment_id).await {
         Ok(root) => root,
-        Err(_) => return AppError::not_found("review thread not found").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
     let can_write = rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(actor_id))
         .await
