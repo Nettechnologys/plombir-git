@@ -1,5 +1,15 @@
 #!/usr/bin/env node
 
+// Runtime interface regression: needs a reachable backend (and for part of it a
+// reachable frontend), so it is a local/manual harness, not a CI job.
+//
+// It is deliberately NOT the entry point for the static `*-contract-check.mjs`
+// gates — those read repository sources only and run in CI via
+// `scripts/run-contract-checks.mjs`. The one contract check invoked below
+// (api-client) is run here a second time on purpose: against a live backend it
+// compares the frontend client with the server's actual /api-docs/openapi.json
+// instead of the spec re-derived from Rust source.
+
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 

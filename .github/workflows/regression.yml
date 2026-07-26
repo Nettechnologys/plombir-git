@@ -207,6 +207,40 @@ jobs:
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -- --ignored --nocapture
 
+  contract-checks:
+    name: Frontend/backend contract checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # scripts/frontend-href-contract-check.mjs enumerates web/src through
+      # ripgrep. It ships with the current ubuntu-latest image, but that is an
+      # image detail rather than a contract — install it so the gate cannot go
+      # red because a runner image dropped a package.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      # The 33 contract checks are pure Node reading repository sources: no npm
+      # install, no build, no running backend. The whole set takes ~1s, so it is
+      # the cheapest gate in this workflow and deliberately has no dependencies
+      # on the other jobs.
+      #
+      # The runner globs scripts/*-contract-check.mjs rather than listing them,
+      # so a check added in a PR gates that same PR. Checks that are red for a
+      # tracked reason are quarantined inside the runner and reported without
+      # failing the job; see its header for the ratchet rules.
+      - name: Run contract checks
+        run: node scripts/run-contract-checks.mjs
+
   frontend:
     name: Frontend check and build
     runs-on: ubuntu-latest
