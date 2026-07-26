@@ -14,10 +14,26 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
+
+/// Resolve an issue *inside* an already-authorized repository.
+///
+/// The permission check at the call site is about `owner/name`, so the issue it
+/// guards has to be the one that lives there — resolving the number against
+/// `repo.id` is what keeps the check and the object it protects pointing at the
+/// same thing.
+async fn issue_in_repo(
+    state: &AppState,
+    repo_id: i64,
+    number: i64,
+) -> Result<rg_db::entities::issue::Model, AppError> {
+    rg_db::ops::issue_ops::find_by_repo_and_number(&state.db, repo_id, number)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("issue not found"))
+}
 
 /// Request body for adding a time entry.
 #[derive(Deserialize, ToSchema)]
@@ -42,6 +58,8 @@ pub struct AddTimeRequest {
         (status = 201, description = "Time entry created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn add_time(
@@ -50,18 +68,19 @@ pub async fn add_time(
     Path((owner, name, number)): Path<(String, String, i64)>,
     Json(body): Json<AddTimeRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
+    // Logging time appends a row to the issue tracker of this repository, so it
+    // is gated like any other issue mutation. The handler used to stop at "the
+    // token parses", which let any account on the instance write hours onto the
+    // issues of a private repository it cannot even read.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
+            Ok(value) => value,
+            Err(e) => return e.into_response(),
+        };
 
-    let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
+    let issue = match issue_in_repo(&state, repo.id, number).await {
         Ok(i) => i,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::time_tracking::service::add_time(
@@ -192,20 +211,35 @@ pub async fn total_time(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn delete_time_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((_owner, _name, _number, id)): Path<(String, String, i64, i64)>,
+    Path((owner, name, number, id)): Path<(String, String, i64, i64)>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let _ = claims;
+    // Three quarters of the route used to be discarded — `_owner`, `_name` and
+    // `_number` were unbound and the claims were extracted only to be dropped,
+    // so any authenticated caller could delete any time entry on the instance
+    // by naming a repository of their own and walking `{id}`. The repository is
+    // what the permission is about, so it has to be the one that is checked...
+    let (repo, _user_id) =
+        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
+            Ok(value) => value,
+            Err(e) => return e.into_response(),
+        };
 
-    match rg_core::time_tracking::service::delete_time_entry(&state.db, id).await {
+    // ...and the issue under it is what re-anchors `{id}`: the service refuses
+    // to delete an entry that belongs to a different issue, so write access
+    // here can no longer reach another repository's rows.
+    let issue = match issue_in_repo(&state, repo.id, number).await {
+        Ok(i) => i,
+        Err(e) => return e.into_response(),
+    };
+
+    match rg_core::time_tracking::service::delete_time_entry(&state.db, issue.id, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

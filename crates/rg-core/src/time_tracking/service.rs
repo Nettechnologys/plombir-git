@@ -45,9 +45,25 @@ pub async fn total_time_minutes(db: &DatabaseConnection, issue_id: i64) -> Resul
     rg_db::ops::time_entry_ops::total_minutes_by_issue(db, issue_id).await
 }
 
-/// Delete a time entry.
-pub async fn delete_time_entry(db: &DatabaseConnection, id: i64) -> Result<()> {
-    rg_db::ops::time_entry_ops::delete_by_id(db, id).await
+/// Delete a time entry that belongs to `issue_id`.
+///
+/// The issue is part of the signature on purpose: `id` is a global
+/// `time_entries` primary key, so a caller authorized for one issue must not be
+/// able to reach another one's rows through it. Taking the entry id alone made
+/// that impossible to enforce at the call site — the handler had nothing to
+/// compare against.
+///
+/// An entry that lives under a different issue reports `not_found`, the same
+/// answer as an entry that does not exist at all: a distinct "exists, but not
+/// yours" would still confirm the id is real, which is most of what an
+/// id-walking caller wants to learn.
+pub async fn delete_time_entry(db: &DatabaseConnection, issue_id: i64, id: i64) -> Result<()> {
+    match rg_db::ops::time_entry_ops::find_by_id(db, id).await? {
+        Some(entry) if entry.issue_id == issue_id => {
+            rg_db::ops::time_entry_ops::delete_by_id(db, id).await
+        }
+        _ => Err(crate::error::not_found("time entry")),
+    }
 }
 
 /// Format minutes into a human-readable string (e.g. "2h 15m").
