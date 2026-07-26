@@ -73,6 +73,7 @@ pub mod m20260724_000001_add_attachment_sha256;
 pub mod m20260724_000002_add_artifact_sha256;
 pub mod m20260724_000003_add_release_asset_attestation;
 pub mod m20260724_000004_add_ci_cache_sha256;
+pub mod m20260726_000001_rename_mirror_table_plural;
 
 use sea_orm_migration::prelude::*;
 
@@ -159,6 +160,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260724_000002_add_artifact_sha256::Migration),
             Box::new(m20260724_000003_add_release_asset_attestation::Migration),
             Box::new(m20260724_000004_add_ci_cache_sha256::Migration),
+            Box::new(m20260726_000001_rename_mirror_table_plural::Migration),
         ]
     }
 }

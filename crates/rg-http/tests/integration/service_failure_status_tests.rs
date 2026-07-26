@@ -299,15 +299,15 @@ async fn webhook_create_separates_a_rejected_url_from_a_broken_insert() {
 /// `POST .../mirror` — a `file://` remote is the caller's; anything past the
 /// URL check is ours.
 ///
-/// The outage half is asserted without dropping a table, because the mirror
-/// table is *already* unreachable: the migration creates `mirror` and the
-/// entity reads `mirrors` (card_d33afb82797f). That drift is a separate bug,
-/// but it makes this endpoint the sharpest possible witness for this one — a
-/// write that cannot reach its table at all must not be reported as the
-/// caller's malformed request.
+/// This test used to induce its outage by doing nothing at all: the mirror
+/// table was unreachable for *every* request, because the migration created
+/// `mirror` while the entity read `mirrors` (card_d33afb82797f). With that
+/// drift fixed the endpoint has a working baseline, so the outage is now
+/// induced the same way as everywhere else in this file — by dropping exactly
+/// the table the write needs.
 #[tokio::test]
 async fn mirror_create_separates_a_rejected_remote_from_a_broken_insert() {
-    let (base, _db, token, _repo_id) = app_with_repo("mirrorfail").await;
+    let (base, db, token, _repo_id) = app_with_repo("mirrorfail").await;
     let client = reqwest::Client::new();
     let url = format!("{base}/api/v1/repos/mirrorfail-owner/mirrorfail-repo/mirror");
 
@@ -329,6 +329,25 @@ async fn mirror_create_separates_a_rejected_remote_from_a_broken_insert() {
         .bearer_auth(&token)
         .json(
             &serde_json::json!({"url": "https://example.com/x.git", "sync_interval_seconds": 3600}),
+        )
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        201,
+        "baseline: a healthy mirror create still works"
+    );
+
+    db.execute_unprepared("DROP TABLE mirrors")
+        .await
+        .expect("drop mirrors");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(
+            &serde_json::json!({"url": "https://example.com/y.git", "sync_interval_seconds": 3600}),
         )
         .send()
         .await

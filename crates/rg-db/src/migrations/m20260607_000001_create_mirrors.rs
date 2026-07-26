@@ -109,6 +109,10 @@ impl MigrationTrait for Migration {
 
 #[derive(Iden)]
 enum Mirror {
+    // Without this the derive names the table `mirror`, while
+    // `entities::mirror` reads `mirrors` — see the corrective
+    // `m20260726_000001_rename_mirror_table_plural`.
+    #[iden = "mirrors"]
     Table,
     Id,
     RepoId,

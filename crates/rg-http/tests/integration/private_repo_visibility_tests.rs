@@ -209,15 +209,6 @@ async fn private_repo_side_endpoints_are_closed_to_outsiders() {
 
         // The owner is unaffected — 404 is fine where nothing was created,
         // 200 where the collection is simply empty.
-        //
-        // `/mirror` is excluded from this half: it answers 500 for *everyone*
-        // because the migration creates a `mirror` table while the entity reads
-        // `mirrors` (card_d33afb82797f). The gate still runs first, which is why
-        // its 401/403 above are meaningful; asserting the owner's status here
-        // would only pin that unrelated bug in place.
-        if path.ends_with("/mirror") {
-            continue;
-        }
         let (owner_status, _) = get(&base, path, Some(&owner_token)).await;
         assert!(
             owner_status == 200 || owner_status == 404,

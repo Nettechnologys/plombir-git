@@ -12,6 +12,8 @@
 //! ```
 
 pub mod entities;
+#[cfg(test)]
+mod entity_schema_guard;
 pub mod migrations;
 pub mod ops;
 
