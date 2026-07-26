@@ -67,9 +67,22 @@ async fn record_mfa_attempt(
         }
         false
     } else {
-        rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5)
-            .await
-            .unwrap_or(false)
+        // `false` means "not locked", and that is also what a failed write would
+        // report — so a silent error turns second-factor brute-force protection
+        // into a no-op with nothing in the log. Keep the permissive default (the
+        // attempt already failed), lose only the silence. The success branch
+        // above has always logged its own failure this way.
+        match rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5).await {
+            Ok(locked) => locked,
+            Err(error) => {
+                tracing::warn!(
+                    user_id = user.id,
+                    error = %format!("{error:#}"),
+                    "failed to record a failed MFA attempt, brute-force counter did not advance"
+                );
+                false
+            }
+        }
     };
     let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
     if let Err(error) = rg_db::ops::login_log_ops::log_attempt(

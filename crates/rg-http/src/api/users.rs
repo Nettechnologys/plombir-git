@@ -329,23 +329,47 @@ pub async fn login(
                 return AppError::from(error).into_response();
             }
 
-            let user = if body.login.contains('@') {
-                rg_db::ops::user_ops::find_by_email(&state.db, &body.login)
-                    .await
-                    .ok()
-                    .flatten()
+            // A lookup that could not run is not a lookup that found nobody.
+            // Flattening the error away turns a degraded database into "no such
+            // user", which skips the brute-force counter below and files the
+            // attempt with no user id — silently, for as long as the outage
+            // lasts. Keep the anonymous fallback, but never lose the reason.
+            let lookup = if body.login.contains('@') {
+                rg_db::ops::user_ops::find_by_email(&state.db, &body.login).await
             } else {
-                rg_db::ops::user_ops::find_by_username(&state.db, &body.login)
-                    .await
-                    .ok()
-                    .flatten()
+                rg_db::ops::user_ops::find_by_username(&state.db, &body.login).await
+            };
+            let user = match lookup {
+                Ok(user) => user,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "failed to resolve the account for a rejected login, brute-force counter skipped"
+                    );
+                    None
+                }
             };
             let mut locked = error.to_string() == "account is temporarily locked";
             if !locked && error.to_string() == "invalid credentials" {
                 if let Some(user) = &user {
-                    locked = rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5)
+                    // `false` means "not locked" — which is also what a failed
+                    // write would report, so a silent error here degrades the
+                    // brute-force protection into a no-op with nothing in the
+                    // log. Default stays permissive (the login already failed);
+                    // only the silence goes away.
+                    locked = match rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5)
                         .await
-                        .unwrap_or(false);
+                    {
+                        Ok(locked) => locked,
+                        Err(error) => {
+                            tracing::warn!(
+                                user_id = user.id,
+                                error = %format!("{error:#}"),
+                                "failed to record a failed login, brute-force counter did not advance"
+                            );
+                            false
+                        }
+                    };
                 }
             }
             let auth_provider = user
