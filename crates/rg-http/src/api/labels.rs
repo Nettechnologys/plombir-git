@@ -102,15 +102,21 @@ pub async fn list_labels(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn get_label(
     State(state): State<AppState>,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
+    // `Err(_) => not_found(…)` used to swallow the error whole: a failed query
+    // was answered as an absent label, and because the value was dropped rather
+    // than converted, nothing reached the operator log either. The service now
+    // carries `rg_core::error::NotFound` on the two branches that really mean
+    // "no such label", so `From` can keep them apart from an outage.
     match rg_core::label::service::get_label(&state.db, &owner, &name, id).await {
         Ok(label) => (StatusCode::OK, Json(serde_json::json!(label))).into_response(),
-        Err(_) => AppError::not_found("label not found").into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 

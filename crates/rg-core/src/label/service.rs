@@ -1,6 +1,6 @@
 //! Label service — business logic for label CRUD.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use chrono::Utc;
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 
@@ -19,6 +19,12 @@ pub async fn list_labels(
 }
 
 /// Get a single label by ID.
+///
+/// Both "no such label" outcomes carry [`crate::error::NotFound`], so the HTTP
+/// layer can answer `404` to them *without* having to answer `404` to a failed
+/// query as well. The mismatched-repo branch stays a plain "label not found" on
+/// purpose: telling the caller that label #7 exists but belongs to someone
+/// else's repository is a leak.
 pub async fn get_label(
     db: &DatabaseConnection,
     owner: &str,
@@ -28,9 +34,9 @@ pub async fn get_label(
     let repo = resolve_repo(db, owner, repo_name).await?;
     let label = label_ops::find_by_id(db, label_id)
         .await?
-        .context("label not found")?;
+        .ok_or_else(|| crate::error::not_found("label"))?;
     if label.repo_id != repo.id {
-        bail!("label not found");
+        return Err(crate::error::not_found("label"));
     }
     Ok(label)
 }
@@ -77,7 +83,7 @@ pub async fn update_label(
 ) -> Result<Label> {
     let mut label = label_ops::find_by_id(db, label_id)
         .await?
-        .context("label not found")?;
+        .ok_or_else(|| crate::error::not_found("label"))?;
 
     if let Some(n) = name {
         if n.trim().is_empty() {
@@ -124,6 +130,11 @@ pub async fn set_issue_labels(
 }
 
 /// Resolve owner/repo_name to a repository model.
+///
+/// The two "no such row" outcomes are typed rather than `.context(…)`-tagged:
+/// every caller of this helper flattens its `anyhow::Error` at the HTTP layer,
+/// and a context string is indistinguishable there from the `db: …` chain
+/// `rg_db::ops` wraps a failed query in.
 async fn resolve_repo(
     db: &DatabaseConnection,
     owner: &str,
@@ -131,8 +142,8 @@ async fn resolve_repo(
 ) -> Result<repository::Model> {
     let user = user_ops::find_by_username(db, owner)
         .await?
-        .context("owner not found")?;
+        .ok_or_else(|| crate::error::not_found("owner"))?;
     repo_ops::find_by_owner_and_name(db, user.id, repo_name)
         .await?
-        .context("repository not found")
+        .ok_or_else(|| crate::error::not_found("repository"))
 }
