@@ -1,6 +1,6 @@
 //! Label service — business logic for label CRUD.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use chrono::Utc;
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 
@@ -53,10 +53,12 @@ pub async fn create_label(
     let repo = resolve_repo(db, owner, repo_name).await?;
 
     if name.trim().is_empty() {
-        bail!("label name cannot be empty");
+        return Err(crate::error::invalid_request("label name cannot be empty"));
     }
     if !color.starts_with('#') || color.len() != 7 {
-        bail!("color must be a hex string like #ff0000");
+        return Err(crate::error::invalid_request(
+            "color must be a hex string like #ff0000",
+        ));
     }
 
     let now = Utc::now();
@@ -74,41 +76,85 @@ pub async fn create_label(
 }
 
 /// Update an existing label.
+///
+/// Takes `owner`/`repo_name` rather than the label id alone: the HTTP layer
+/// checks write access against a repository, so the label it then mutates has to
+/// be the one that lives in it. With a bare id the two halves referred to
+/// different rows, and write access to any one repository was enough to rename a
+/// label in every other. Scoping in the signature makes that unbypassable —
+/// there is no way left to call this without naming the repository.
 pub async fn update_label(
     db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
     label_id: i64,
     name: Option<String>,
     color: Option<String>,
     description: Option<Option<String>>,
 ) -> Result<Label> {
-    let mut label = label_ops::find_by_id(db, label_id)
+    let repo = resolve_repo(db, owner, repo_name).await?;
+    let label = label_ops::find_by_id(db, label_id)
         .await?
         .ok_or_else(|| crate::error::not_found("label"))?;
+    // Same reasoning as `get_label`: a label belonging to another repository is
+    // reported as absent, not forbidden, so the route cannot be used to probe
+    // which label ids exist.
+    if label.repo_id != repo.id {
+        return Err(crate::error::not_found("label"));
+    }
 
+    // The edits go on an `ActiveModel` as `Set(…)`, not on the `Model` before
+    // converting it. `Model::into()` marks every field `Unchanged`, and sea-orm
+    // omits `Unchanged` columns from the `UPDATE` — so mutating the model first
+    // built a statement with nothing to set. `PATCH` then answered `200` with
+    // the *old* row echoed back and wrote nothing at all.
+    let mut active: LabelActiveModel = label.into();
+
+    // Typed rather than `bail!`: the HTTP layer answers `400` only to
+    // `InvalidRequest`, so a plain `anyhow!` here would arrive as a 500 and a
+    // failed query would arrive as a 400.
     if let Some(n) = name {
         if n.trim().is_empty() {
-            bail!("label name cannot be empty");
+            return Err(crate::error::invalid_request("label name cannot be empty"));
         }
-        label.name = n;
+        active.name = Set(n);
     }
     if let Some(c) = color {
         if !c.starts_with('#') || c.len() != 7 {
-            bail!("invalid color: must be a hex string like #ff0000");
+            return Err(crate::error::invalid_request(
+                "invalid color: must be a hex string like #ff0000",
+            ));
         }
-        label.color = c;
+        active.color = Set(c);
     }
     if let Some(d) = description {
-        label.description = d;
+        active.description = Set(d);
     }
 
-    label.updated_at = Utc::now();
+    active.updated_at = Set(Utc::now());
 
-    let active: LabelActiveModel = label.into();
     label_ops::update(db, active).await
 }
 
 /// Delete a label.
-pub async fn delete_label(db: &DatabaseConnection, label_id: i64) -> Result<()> {
+///
+/// Repository-scoped for the same reason as [`update_label`] — and here the
+/// unscoped version was strictly worse: it never read the label at all, so a
+/// `DELETE` through any writable repository removed the row outright.
+pub async fn delete_label(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+    label_id: i64,
+) -> Result<()> {
+    let repo = resolve_repo(db, owner, repo_name).await?;
+    let label = label_ops::find_by_id(db, label_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("label"))?;
+    if label.repo_id != repo.id {
+        return Err(crate::error::not_found("label"));
+    }
+
     // Delete all issue_labels referencing this label first
     issue_label_ops::delete_by_label_id(db, label_id).await?;
     label_ops::delete_by_id(db, label_id).await

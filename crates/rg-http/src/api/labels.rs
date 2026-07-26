@@ -188,7 +188,10 @@ pub async fn create_label(
     .await
     {
         Ok(label) => (StatusCode::CREATED, Json(serde_json::json!(label))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // The service's validation failures carry `InvalidRequest` and still
+        // answer 400; a missing repository answers 404 and a failed query stays
+        // a 5xx, where the blanket `bad_request` called all three malformed.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -234,8 +237,15 @@ pub async fn update_label(
         return error.into_response();
     }
 
+    // The label is looked up *within* `owner/name`, the same repository the
+    // write check above was about — a bare id let write access to one repository
+    // rename a label in any other. `AppError::from` (not a blanket
+    // `bad_request`) is what lets the service's "no such label here" arrive as
+    // the 404 it is instead of a 400 that claims the request was malformed.
     match rg_core::label::service::update_label(
         &state.db,
+        &owner,
+        &name,
         id,
         body.name,
         body.color,
@@ -244,7 +254,7 @@ pub async fn update_label(
     .await
     {
         Ok(label) => (StatusCode::OK, Json(serde_json::json!(label))).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -289,8 +299,9 @@ pub async fn delete_label(
         return error.into_response();
     }
 
-    match rg_core::label::service::delete_label(&state.db, id).await {
+    // Repository-scoped for the same reason as `update_label` above.
+    match rg_core::label::service::delete_label(&state.db, &owner, &name, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }

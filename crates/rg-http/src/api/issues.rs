@@ -848,9 +848,14 @@ pub async fn update_milestone(
         Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
         Err(e) => return AppError::from(e).into_response(),
     }
+    // The write check above was about `owner/name`, so the milestone it guards
+    // has to be the one that lives there — matching `get_milestone`. Without the
+    // `repo_id` comparison, write access to a single repository was enough to
+    // edit the milestones of every other one, and a 403 on the mismatch would
+    // still confirm that the id exists.
     let existing = match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
-        Ok(Some(m)) => m,
-        Ok(None) => return AppError::not_found("milestone not found".to_string()).into_response(),
+        Ok(Some(m)) if m.repo_id == repo.id => m,
+        Ok(_) => return AppError::not_found("milestone not found".to_string()).into_response(),
         Err(e) => return AppError::from(e).into_response(),
     };
     // Convert to ActiveModel; use Set() for changed fields (Unchanged means "skip in UPDATE")
@@ -924,6 +929,15 @@ pub async fn delete_milestone(
     match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
         Ok(true) => {}
         Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
+        Err(e) => return AppError::from(e).into_response(),
+    }
+    // `delete_by_id` deletes whatever row carries that id, so the milestone has
+    // to be read and matched against the repository whose write access was
+    // checked first — otherwise write access to one repository deleted the
+    // milestones of any other, silently and without even a lookup.
+    match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
+        Ok(Some(m)) if m.repo_id == repo.id => {}
+        Ok(_) => return AppError::not_found("milestone not found".to_string()).into_response(),
         Err(e) => return AppError::from(e).into_response(),
     }
     match rg_db::ops::milestone_ops::delete_by_id(&state.db, id).await {
