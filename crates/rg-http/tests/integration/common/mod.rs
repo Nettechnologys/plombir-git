@@ -158,6 +158,33 @@ pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
     (base_url, db)
 }
 
+/// Spawn the test app and hand back `(base_url, repo_root)`.
+///
+/// The repo-browsing endpoints fail for two unrelated reasons — "no such file
+/// at this ref" and "this repository cannot be opened" — and only the second
+/// one lives on disk. A test that wants to break the git layer therefore needs
+/// the `repo_root` the server was built with; closing the database pool instead
+/// fails the *authentication* lookup, so the request never reaches the handler
+/// under test.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_repo_root() -> (String, std::path::PathBuf) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    let returned_repo_root = repo_root.clone();
+    let state = build_test_app_state(db, repo_root);
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    (base_url, returned_repo_root)
+}
+
 /// Spawn the test app and hand back `(base_url, repo_root, oci_upload_root)`.
 ///
 /// A test can make a registry write fail for a *client-side* reason just by

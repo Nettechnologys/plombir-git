@@ -55,6 +55,7 @@ mod pr_merge_strategy_tests;
 mod pr_permission_tests;
 mod release_attestation_tests;
 mod release_tests;
+mod repo_content_failure_status_tests;
 mod review_lookup_failure_status_tests;
 mod runner_auth_tests;
 mod runner_workspace_tests;

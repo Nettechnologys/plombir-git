@@ -319,7 +319,10 @@ pub async fn get_blob(
 
     match get_blob_content(&repo_path, &git_ref, &path) {
         Ok(blob) => (StatusCode::OK, Json(blob)).into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        // Only the two typed outcomes of `get_blob_content` become 4xx; a git
+        // layer that failed is a 5xx, and `From<anyhow::Error>` logs the full
+        // context chain for operators before sanitizing the body.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -576,10 +579,19 @@ fn get_blob_content(
 
     let target = format!("{}:{}", git_ref, path);
 
-    // Resolve ref:path to object ID
-    let object_id = repo
-        .rev_parse_single(target.as_str())
-        .map_err(|e| anyhow::anyhow!("path '{}' not found at ref '{}': {}", path, git_ref, e))?;
+    // Exactly two outcomes below belong to the client: the `ref:path` pair does
+    // not resolve, and it resolves to something that is not a file. They carry
+    // `rg_core::error::NotFound` / `InvalidRequest` so the HTTP layer can name
+    // them; everything else in this function — a repository that will not open,
+    // an unreadable object header, an object whose header lied — is ours and
+    // stays a 5xx. The whole function used to be flattened into one
+    // `AppError::not_found(e)` at the call site, which reported a broken
+    // repository as an absent file *and* put `repo_path` in the response body
+    // (404s are not sanitized by `IntoResponse`, H-05).
+    let object_id = repo.rev_parse_single(target.as_str()).map_err(|e| {
+        anyhow::Error::new(rg_core::error::NotFound::new("file"))
+            .context(format!("resolving '{}' in {:?}: {}", target, repo_path, e))
+    })?;
 
     // Inspect the object header WITHOUT decoding the blob into memory, so an
     // oversized file is rejected before we ever buffer + base64-inflate it.
@@ -587,7 +599,9 @@ fn get_blob_content(
         .find_header(object_id)
         .map_err(|e| anyhow::anyhow!("failed to read object header: {}", e))?;
     if header.kind() != gix::object::Kind::Blob {
-        anyhow::bail!("path '{}' is not a file", path);
+        // The path exists, it just is not a blob — "not found" would be a lie,
+        // and the fixed text carries no request data (H-05).
+        return Err(rg_core::error::invalid_request("path is not a file"));
     }
     let blob_size = header.size();
     if blob_size > MAX_BLOB_API_BYTES {
@@ -608,9 +622,14 @@ fn get_blob_content(
         .find_object(object_id)
         .map_err(|e| anyhow::anyhow!("failed to find object: {}", e))?;
 
-    let blob = object
-        .try_into_blob()
-        .map_err(|e| anyhow::anyhow!("path '{}' is not a file: {}", path, e))?;
+    // Not a client outcome: the header above already said this object is a
+    // blob, so failing here means the object store contradicts itself.
+    let blob = object.try_into_blob().map_err(|e| {
+        anyhow::anyhow!(
+            "object header claimed a blob but the object is not one: {}",
+            e
+        )
+    })?;
 
     let data = blob.data.as_slice();
     let size = data.len() as i64;
@@ -853,7 +872,8 @@ pub async fn get_commit_signature(
 
     match verify_commit_signature(&repo_path, &sha) {
         Ok(sig) => (StatusCode::OK, Json(sig)).into_response(),
-        Err(e) => AppError::not_found(e).into_response(),
+        // See `get_blob`: an unopenable repository is not a missing commit.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -862,10 +882,20 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
-    // Resolve the commit SHA using gix
+    // The same two-client-outcomes split as `get_blob_content`: the SHA does
+    // not resolve, or it resolves to something that is not a commit. A repo
+    // that would not open never reaches here, and must not be reported as a
+    // missing commit.
     let commit_id = match repo.rev_parse_single(sha) {
         Ok(id) => id,
-        Err(_) => anyhow::bail!("commit {} not found", sha),
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(rg_core::error::NotFound::new("commit")).context(format!(
+                    "resolving commit '{}' in {:?}: {}",
+                    sha, repo_path, e
+                )),
+            )
+        }
     };
 
     let full_sha = commit_id.to_string();
@@ -874,7 +904,7 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
     let commit_object = repo.find_object(commit_id)?;
     let commit = commit_object
         .try_into_commit()
-        .map_err(|_| anyhow::anyhow!("not a commit object"))?;
+        .map_err(|_| rg_core::error::invalid_request("object is not a commit"))?;
 
     // Use gix decode() + extra_headers() to check for gpgsig (replaces git cat-file commit)
     let has_gpgsig = commit.decode()?.extra_headers().find("gpgsig").is_some();
