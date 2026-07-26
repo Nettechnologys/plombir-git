@@ -21,6 +21,7 @@ mod admin_settings_tests;
 mod admin_sso_audit_tests;
 mod admin_user_tests;
 mod api_tests;
+mod archive_failure_status_tests;
 mod artifact_file_tests;
 mod attachment_tests;
 mod blob_api_tests;
