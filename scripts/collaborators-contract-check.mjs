@@ -3,9 +3,11 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/collaborators.rs');
-const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 const clientPaths = [
   path.join(root, 'web/src/lib/api/collaborators.ts'),
 ];
@@ -13,7 +15,7 @@ const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settin
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/collaborators/+page.svelte');
 
 const backend = readFileSync(backendPath, 'utf8');
-const routerSource = readFileSync(routerPath, 'utf8');
+const routerSource = stripRustComments(readFileSync(routerPath, 'utf8'));
 const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');

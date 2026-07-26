@@ -3,16 +3,18 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/auth.ts');
 const loginPath = path.join(root, 'web/src/routes/login/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/sso.rs');
-const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const client = readFileSync(clientPath, 'utf8');
 const login = readFileSync(loginPath, 'utf8');
 const backend = readFileSync(backendPath, 'utf8');
-const router = readFileSync(routerPath, 'utf8');
+const router = stripRustComments(readFileSync(routerPath, 'utf8'));
 
 const failures = [];
 

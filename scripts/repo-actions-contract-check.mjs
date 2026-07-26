@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const clientPaths = [
   path.join(root, 'web/src/lib/api/repos.ts'),
@@ -10,10 +12,10 @@ const clientPaths = [
 const headerPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte');
 const repoPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/repos.rs');
-const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const backend = readFileSync(backendPath, 'utf8');
-const router = readFileSync(routerPath, 'utf8');
+const router = stripRustComments(readFileSync(routerPath, 'utf8'));
 const header = readFileSync(headerPath, 'utf8');
 const repoPage = readFileSync(repoPagePath, 'utf8');
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');

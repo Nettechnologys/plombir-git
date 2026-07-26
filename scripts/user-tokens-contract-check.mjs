@@ -3,14 +3,16 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
-const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 const backendPath = path.join(root, 'crates/rg-http/src/api/users.rs');
 const clientPath = path.join(root, 'web/src/lib/api/tokens.ts');
 const pagePath = path.join(root, 'web/src/routes/settings/tokens/+page.svelte');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 
-const router = readFileSync(routerPath, 'utf8');
+const router = stripRustComments(readFileSync(routerPath, 'utf8'));
 const backend = readFileSync(backendPath, 'utf8');
 const client = readFileSync(clientPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');

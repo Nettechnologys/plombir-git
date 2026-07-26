@@ -3,17 +3,19 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/imports.rs');
 const entityPath = path.join(root, 'crates/rg-db/src/entities/import_task.rs');
-const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 const clientPath = path.join(root, 'web/src/lib/api/imports.ts');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 const pagePath = path.join(root, 'web/src/routes/imports/+page.svelte');
 
 const backend = readFileSync(backendPath, 'utf8');
 const entity = readFileSync(entityPath, 'utf8');
-const router = readFileSync(routerPath, 'utf8');
+const router = stripRustComments(readFileSync(routerPath, 'utf8'));
 const client = readFileSync(clientPath, 'utf8');
 const navbar = readFileSync(navbarPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');

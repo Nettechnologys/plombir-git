@@ -3,12 +3,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/mfa.ts');
 const pagePath = path.join(root, 'web/src/routes/settings/security/+page.svelte');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/mfa.rs');
-const routerPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const failures = [];
 
@@ -28,7 +30,7 @@ const client = read(clientPath);
 const page = existsSync(pagePath) ? read(pagePath) : '';
 const navbar = read(navbarPath);
 const backend = read(backendPath);
-const router = read(routerPath);
+const router = stripRustComments(read(routerPath));
 
 for (const [method, route, handler] of [
   ['post', '/users/mfa/setup', 'setup_mfa'],
@@ -60,7 +62,24 @@ for (const [name, route, httpMethod] of [
   }
 }
 
-expect(page, /import\s+\{\s*mfa,\s*type\s+MfaBackupStatus,\s*type\s+MfaSetupResponse\s*\}/, 'Security page must use typed MFA client exports');
+// The page imports MFA helpers alongside unrelated ones (passkeys, ...), so assert on the
+// individual specifiers of the client import instead of on one exact adjacent spelling.
+const clientImport = page.match(
+  /import\s*\{([^}]*)\}\s*from\s*['"]\$lib\/api\/(?:client\.svelte|mfa)['"]/,
+);
+if (!clientImport) {
+  failures.push('Security page must import MFA helpers from the API client');
+} else {
+  const specifiers = clientImport[1]
+    .split(',')
+    .map((entry) => entry.trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+  for (const required of ['mfa', 'type MfaBackupStatus', 'type MfaSetupResponse']) {
+    if (!specifiers.includes(required)) {
+      failures.push(`Security page must use typed MFA client export \`${required}\``);
+    }
+  }
+}
 expect(page, /mfa\.setup\(\)/, 'Security page must call mfa.setup() for QR enrollment');
 expect(page, /mfa\.enable\(verificationCode\.trim\(\)\)/, 'Security page must enable MFA with the entered code');
 expect(page, /mfa\.backup\(\)/, 'Security page must load backup code status');

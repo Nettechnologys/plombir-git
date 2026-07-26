@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/packages.ts');
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/+page.svelte');
@@ -10,7 +12,7 @@ const formatPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[
 const uploadPath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/upload/+page.svelte');
 const packageFormatsPath = path.join(root, 'web/src/lib/packageFormats.ts');
 const backendPackageServicePath = path.join(root, 'crates/rg-core/src/package_registry/service.rs');
-const httpLibPath = path.join(root, 'crates/rg-http/src/lib.rs');
+const httpLibPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
 // packages.ts holds the packages surface; the shared request()/204 handling
@@ -23,7 +25,7 @@ const detailPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[
 const detailPage = readFileSync(detailPagePath, 'utf8');
 const packageFormats = readFileSync(packageFormatsPath, 'utf8');
 const backendPackageService = readFileSync(backendPackageServicePath, 'utf8');
-const httpLib = readFileSync(httpLibPath, 'utf8');
+const httpLib = stripRustComments(readFileSync(httpLibPath, 'utf8'));
 
 const failures = [];
 
