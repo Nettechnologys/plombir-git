@@ -1084,18 +1084,27 @@ pub async fn merge_pr(
         pr = get_pr(db, owner, repo_name, number).await?;
     }
 
+    // These three are states, not bad requests: the caller asked for a merge
+    // that is correct in form and may well succeed once the PR reopens, leaves
+    // draft, or the other attempt finishes. `Conflict` carries that distinction
+    // to the HTTP layer, which would otherwise have to guess it from the
+    // message — and guessed "400" for the storage failures alongside them.
     if pr.state != "open" {
-        bail!(
+        return Err(crate::error::conflict(format!(
             "cannot merge a PR that is not in 'open' state (current: {})",
             pr.state
-        );
+        )));
     }
     if pr.is_draft {
-        bail!("draft pull requests cannot be merged");
+        return Err(crate::error::conflict(
+            "draft pull requests cannot be merged",
+        ));
     }
 
     if !pull_request_ops::claim_merge(db, pr.id).await? {
-        bail!("another merge attempt is already in progress");
+        return Err(crate::error::conflict(
+            "another merge attempt is already in progress",
+        ));
     }
 
     let result = merge_claimed_pr(db, repo_root, owner, repo_name, pr.clone(), strategy).await;
@@ -1589,10 +1598,10 @@ fn gix_merge_commits_to_tree<'repo>(
     let conflicts = outcome.tree_merge.conflicts;
     if !conflicts.is_empty() {
         tracing::warn!("merge has {} conflict(s)", conflicts.len());
-        bail!(
+        return Err(crate::error::conflict(format!(
             "merge conflict detected: {} files with conflicts",
             conflicts.len()
-        );
+        )));
     }
 
     // Write the merged tree to the object database

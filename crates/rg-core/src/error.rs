@@ -138,3 +138,66 @@ impl InvalidRequest {
 pub fn invalid_request(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(InvalidRequest::new(message))
 }
+
+/// The request is fine and the caller may retry it later, but the resource is
+/// in a state that forbids it right now.
+///
+/// The third member of the [`NotFound`] / [`InvalidRequest`] family, for the
+/// cases those two get wrong in the same way: merging a closed pull request,
+/// merging a draft, racing another merge, or hitting a merge conflict are all
+/// *state* problems, and calling them `400 Bad Request` tells the client to fix
+/// a request that was already correct. A `409` says what actually happened —
+/// "try again once the state changes" — and keeps the genuine 400s (an
+/// unparseable merge strategy) meaningful.
+///
+/// Like the other two, the rendered message reaches the client verbatim, so it
+/// must describe the state and nothing else — no `db: …` chain, no git command
+/// line (H-05).
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct Conflict {
+    pub message: String,
+}
+
+impl Conflict {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Shorthand for the `anyhow` form of [`Conflict`].
+pub fn conflict(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Conflict::new(message))
+}
+
+/// A policy the caller is subject to says no.
+///
+/// Distinct from [`Conflict`] (the resource's state) and from
+/// [`InvalidRequest`] (the request's shape): the request is well-formed and the
+/// resource is ready, but a rule — branch protection, a required review, a
+/// required status check — refuses it. A handler that blanket-403s every error
+/// its policy check returns cannot tell that refusal from the check itself
+/// failing, which hides an outage behind "you are not allowed".
+///
+/// The message names the rule that refused and reaches the client verbatim, so
+/// it must stay free of internal detail (H-05).
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct Forbidden {
+    pub message: String,
+}
+
+impl Forbidden {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Shorthand for the `anyhow` form of [`Forbidden`].
+pub fn forbidden(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Forbidden::new(message))
+}

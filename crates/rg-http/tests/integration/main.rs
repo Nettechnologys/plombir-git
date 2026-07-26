@@ -50,6 +50,7 @@ mod package_format_e2e_tests;
 mod package_permission_tests;
 mod pat_api_tests;
 mod pr_lookup_failure_status_tests;
+mod pr_merge_outcome_status_tests;
 mod pr_merge_strategy_tests;
 mod pr_permission_tests;
 mod release_attestation_tests;

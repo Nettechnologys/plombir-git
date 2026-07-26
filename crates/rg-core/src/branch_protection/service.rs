@@ -247,10 +247,10 @@ pub async fn check_merge_allowed(
     };
 
     if protection.require_signed_commits {
-        bail!(
+        return Err(crate::error::forbidden(format!(
             "branch '{}' requires cryptographically signed commits; server-side PR merge commits are not signed, so create and push a signed commit with an allowed identity",
             target_branch
-        );
+        )));
     }
 
     // Check required approvals
@@ -263,12 +263,12 @@ pub async fn check_merge_allowed(
         let approval_count =
             pr_review_ops::count_current_approvals(db, pr_id, pr.head_sha.as_deref()).await?;
         if approval_count < required {
-            bail!(
+            return Err(crate::error::forbidden(format!(
                 "merging into protected branch '{}' requires at least {} approval(s), got {}",
                 target_branch,
                 required,
                 approval_count
-            );
+            )));
         }
     }
 
@@ -286,11 +286,11 @@ pub async fn check_merge_allowed(
                 let head_sha = match pr.and_then(|p| p.head_sha) {
                     Some(s) if !s.is_empty() => s,
                     _ => {
-                        bail!(
+                        return Err(crate::error::forbidden(format!(
                             "branch '{}' requires status checks but no CI pipeline found for PR {}",
                             target_branch,
                             pr_id
-                        );
+                        )));
                     }
                 };
 
@@ -301,19 +301,19 @@ pub async fn check_merge_allowed(
 
                 match pipeline {
                     None => {
-                        bail!(
+                        return Err(crate::error::forbidden(format!(
                             "branch '{}' requires status checks to pass, but no CI pipeline has run for commit {}",
                             target_branch,
                             &head_sha[..8.min(head_sha.len())]
-                        );
+                        )));
                     }
                     Some(p) if p.status != "success" => {
-                        bail!(
+                        return Err(crate::error::forbidden(format!(
                             "branch '{}' requires all status checks to pass, but pipeline #{} is {}",
                             target_branch,
                             p.id,
                             p.status
-                        );
+                        )));
                     }
                     Some(p) => {
                         // All pipeline jobs must have passed — check job names match required list
@@ -330,12 +330,12 @@ pub async fn check_merge_allowed(
                             .collect();
 
                         if !missing.is_empty() {
-                            bail!(
+                            return Err(crate::error::forbidden(format!(
                                 "branch '{}' requires status checks {:?} to pass, but {:?} are missing or failed",
                                 target_branch,
                                 required_checks,
                                 missing
-                            );
+                            )));
                         }
 
                         tracing::info!(

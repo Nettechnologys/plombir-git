@@ -196,6 +196,21 @@ impl From<anyhow::Error> for AppError {
             return Self::BadRequest(invalid.to_string());
         }
 
+        // The state half of the same split: "this pull request is closed",
+        // "another merge is already running", "the merge conflicts". None of
+        // those is a malformed request — answering 400 tells the client to fix
+        // something that was already correct, and answering 400 to the storage
+        // failure sitting next to them hides it completely.
+        if let Some(conflict) = e.downcast_ref::<rg_core::error::Conflict>() {
+            return Self::Conflict(conflict.to_string());
+        }
+
+        // And the policy half: a branch-protection rule that refuses the merge
+        // is a 403, whereas the *check* failing is ours and stays a 5xx.
+        if let Some(forbidden) = e.downcast_ref::<rg_core::error::Forbidden>() {
+            return Self::Forbidden(forbidden.to_string());
+        }
+
         // H-05: Log the full error for operators, store a generic message internally.
         // The IntoResponse impl will also sanitize the client-facing message.
         //
@@ -517,6 +532,58 @@ mod tests {
 
         assert_eq!(app_err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(app_err.code(), "DB_UNAVAILABLE");
+    }
+
+    /// A state problem is a 409 and keeps its own text — the client is told what
+    /// to wait for, not that its request was malformed.
+    #[test]
+    fn core_conflict_maps_to_409_with_a_fixed_message() {
+        let err = anyhow::Error::from(rg_core::error::Conflict::new(
+            "another merge attempt is already in progress",
+        ))
+        .context("db: claim merge for pr 7");
+        let app_err: AppError = err.into();
+
+        assert_eq!(app_err.status(), StatusCode::CONFLICT);
+        let AppError::Conflict(message) = &app_err else {
+            panic!("expected Conflict, got {app_err:?}");
+        };
+        assert_eq!(message, "another merge attempt is already in progress");
+        assert!(!message.contains("db:"), "{message}");
+    }
+
+    /// A policy refusal is a 403 and, like the other two markers, reaches the
+    /// client as the rule's own text rather than the caller's context chain.
+    #[test]
+    fn core_forbidden_maps_to_403_with_a_fixed_message() {
+        let err = anyhow::Error::from(rg_core::error::Forbidden::new(
+            "branch 'main' requires all status checks to pass",
+        ))
+        .context("db: find pipeline for status check");
+        let app_err: AppError = err.into();
+
+        assert_eq!(app_err.status(), StatusCode::FORBIDDEN);
+        let AppError::Forbidden(message) = &app_err else {
+            panic!("expected Forbidden, got {app_err:?}");
+        };
+        assert_eq!(message, "branch 'main' requires all status checks to pass");
+        assert!(!message.contains("db:"), "{message}");
+    }
+
+    /// Same ordering guarantee the `NotFound` branch has: an outage wrapped in a
+    /// state or policy marker is still an outage. A 409 or 403 on a dead
+    /// database would put the blame on the caller and nothing in the alerts.
+    #[test]
+    fn db_outage_wrapped_in_conflict_or_forbidden_context_stays_503() {
+        let err = anyhow::Error::from(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout))
+            .context(rg_core::error::Conflict::new("merge already in progress"));
+        let app_err: AppError = err.into();
+        assert_eq!(app_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let err = anyhow::Error::from(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout))
+            .context(rg_core::error::Forbidden::new("branch is protected"));
+        let app_err: AppError = err.into();
+        assert_eq!(app_err.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

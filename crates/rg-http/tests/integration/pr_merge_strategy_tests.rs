@@ -228,13 +228,13 @@ async fn merge_conflict_keeps_base_ref_and_restores_open_pr_state() {
         .send()
         .await
         .unwrap();
-    assert_eq!(failed.status(), 400);
-    assert!(failed
-        .text()
-        .await
-        .unwrap()
-        .to_lowercase()
-        .contains("conflict"));
+    // 409, not 400: the request was well-formed and the caller may retry it
+    // once the branches stop conflicting. 400 said "you sent something wrong",
+    // which was both untrue and indistinguishable from the storage failures the
+    // same arm used to catch.
+    assert_eq!(failed.status(), 409);
+    let body = failed.text().await.unwrap();
+    assert!(body.to_lowercase().contains("conflict"), "{body}");
     assert_eq!(
         git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
         base_sha

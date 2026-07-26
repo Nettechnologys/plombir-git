@@ -386,7 +386,10 @@ pub async fn merge_pr(
     )
     .await
     {
-        return AppError::forbidden(e.to_string()).into_response();
+        // A rule refusing the merge carries `rg_core::error::Forbidden` and
+        // stays a 403; the check itself failing (the database, the pipeline
+        // lookup) is ours and must not be dressed up as "you are not allowed".
+        return AppError::from(e).into_response();
     }
 
     match rg_core::pull_request::merge_pr(
@@ -402,7 +405,13 @@ pub async fn merge_pr(
         // `pr_merged` is recorded inside `rg_core::pull_request::merge_pr` so the
         // REST, auto-merge, and merge-queue paths all count through one site.
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(e) => AppError::bad_request(e.to_string()).into_response(),
+        // Every way a merge fails used to be the client's fault: a closed PR, a
+        // draft, a racing attempt and a merge conflict all answered 400 — as did
+        // a dead database and a failed git invocation, with the `db: ...`
+        // context or the git command line in the body. The state outcomes now
+        // carry `rg_core::error::Conflict` (409); everything else falls through
+        // to the funnel, which classifies and sanitizes it.
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
