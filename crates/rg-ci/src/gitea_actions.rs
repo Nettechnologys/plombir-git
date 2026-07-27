@@ -276,7 +276,14 @@ impl GiteaWorkflow {
     }
 
     /// Check if this workflow should be triggered for the given event and ref.
-    pub fn matches_event(&self, event: &str, ref_name: &str, default_branch: &str) -> bool {
+    ///
+    /// `base_branch` is the branch the event targets: the PR's base for
+    /// `pull_request` / `merge_group`, and the repository's default branch as
+    /// the fallback for a caller that has no better answer. It is deliberately
+    /// *not* the head ref — a `branches:` filter under `on: pull_request` is
+    /// matched against the target of the PR, which is why `ref_name` is unused
+    /// on that arm.
+    pub fn matches_event(&self, event: &str, ref_name: &str, base_branch: &str) -> bool {
         match &self.on {
             WorkflowTriggers::Simple(name) => name.as_str() == event,
             WorkflowTriggers::Array(names) => names.iter().any(|n| n.as_str() == event),
@@ -292,7 +299,7 @@ impl GiteaWorkflow {
                 match event {
                     "push" => {
                         if let Some(filter) = push {
-                            ref_matches_filter(ref_name, filter, default_branch)
+                            ref_matches_filter(ref_name, filter, base_branch)
                         } else {
                             false
                         }
@@ -301,9 +308,8 @@ impl GiteaWorkflow {
                         if let Some(filter) = pull_request {
                             // For pull_request events, GitHub/Gitea `branches` filters
                             // apply to the PR's base (target) branch, not the head ref.
-                            // The base branch is conveyed via `default_branch`.
-                            let base_ref = format!("refs/heads/{default_branch}");
-                            ref_matches_filter(&base_ref, filter, default_branch)
+                            let base_ref = format!("refs/heads/{base_branch}");
+                            ref_matches_filter(&base_ref, filter, base_branch)
                         } else {
                             false
                         }

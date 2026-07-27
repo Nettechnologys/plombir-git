@@ -373,7 +373,7 @@ pub async fn submit_review(
                     &state.db,
                     &state.repo_root,
                     &repo_model,
-                    &state.merge_queue_ci(),
+                    &state.pipeline_ci(),
                 )
                 .await
                 {

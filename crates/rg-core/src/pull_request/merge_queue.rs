@@ -10,17 +10,8 @@ use sea_orm::{DatabaseConnection, EntityTrait, Set};
 use rg_db::entities::{merge_queue_entry, pull_request, repository};
 use rg_db::ops::{merge_queue_ops, pull_request_ops};
 
+use super::ci::PipelineCi;
 use super::service::{self, MergeStrategy};
-
-pub struct MergeQueueCi<'a> {
-    pub trigger: &'a dyn crate::ci::CiTrigger,
-    pub docker_enabled: bool,
-    pub external_runners: bool,
-    /// See [`crate::ci::TriggerPipelineParams::allow_host_runner`].
-    pub allow_host_runner: bool,
-    pub jwt_secret: Option<&'a str>,
-    pub external_url: Option<&'a str>,
-}
 
 #[derive(Debug, serde::Serialize)]
 pub struct MergeQueueProcessResult {
@@ -169,7 +160,7 @@ pub async fn process_repository_with_ci(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
-    ci: &MergeQueueCi<'_>,
+    ci: &PipelineCi<'_>,
 ) -> Result<MergeQueueProcessResult> {
     process_repository_inner(db, repo_root, repository, Some(ci)).await
 }
@@ -178,7 +169,7 @@ async fn process_repository_inner(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
-    ci: Option<&MergeQueueCi<'_>>,
+    ci: Option<&PipelineCi<'_>>,
 ) -> Result<MergeQueueProcessResult> {
     let namespace = service::repository_namespace(db, repository).await?;
     let mut result = MergeQueueProcessResult {
@@ -344,7 +335,7 @@ async fn ensure_merge_group_ci(
     repository: &repository::Model,
     entry: &merge_queue_entry::Model,
     pr: &pull_request::Model,
-    ci: &MergeQueueCi<'_>,
+    ci: &PipelineCi<'_>,
 ) -> Result<MergeGroupState> {
     let namespace = service::repository_namespace(db, repository).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
@@ -471,6 +462,10 @@ async fn ensure_merge_group_ci(
             commit_sha: &group_sha,
             ref_name: &group_ref,
             trigger_type: "merge_group",
+            // `merge_group` shares the `on: pull_request` filter, and the ref
+            // above is the synthetic group ref — the branch the filter is about
+            // is the one the queue is merging into.
+            base_branch: Some(&pr.base_branch),
             triggered_by: Some(entry.enqueued_by_id),
             docker_enabled: ci.docker_enabled,
             external_runners: ci.external_runners,
@@ -510,7 +505,7 @@ pub async fn process_for_head_commit_with_ci(
     repo_root: &Path,
     source_repo_id: i64,
     commit_sha: &str,
-    ci: &MergeQueueCi<'_>,
+    ci: &PipelineCi<'_>,
 ) -> Result<Vec<MergeQueueProcessResult>> {
     process_for_head_commit_inner(db, repo_root, source_repo_id, commit_sha, Some(ci)).await
 }
@@ -520,7 +515,7 @@ async fn process_for_head_commit_inner(
     repo_root: &Path,
     source_repo_id: i64,
     commit_sha: &str,
-    ci: Option<&MergeQueueCi<'_>>,
+    ci: Option<&PipelineCi<'_>>,
 ) -> Result<Vec<MergeQueueProcessResult>> {
     if let Some(entry) =
         merge_queue_ops::find_by_merge_group_sha(db, source_repo_id, commit_sha).await?

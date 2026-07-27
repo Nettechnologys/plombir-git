@@ -43,6 +43,19 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         true
     }
 
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(
+        &self,
+        _repo_path: &std::path::Path,
+        _commit_sha: &str,
+        _event: &str,
+        _ref_name: &str,
+        _base_branch: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -255,15 +268,28 @@ async fn applying_a_suggestion_runs_the_post_push_hooks() {
     let triggered = ci_engine.triggered.lock().unwrap().clone();
     assert_eq!(
         triggered,
-        vec![(
-            commit_sha.clone(),
-            "refs/heads/main".to_string(),
-            "push".to_string(),
-            Some(user_id),
-        )],
-        "the suggestion commit must trigger exactly one pipeline, on the branch it \
-         landed on, under the `push` event a workflow can actually match — and \
-         attributed to whoever applied it"
+        vec![
+            // The branch is the PR's head, so applying the suggestion
+            // synchronises it — the `pull_request` event, on its own ref
+            // (card_074d93bfe327). This path is the one that made the naive
+            // "did the head-SHA row change" test for a sync wrong: it advances
+            // the PR itself, before the hooks ever see the move.
+            (
+                commit_sha.clone(),
+                "refs/pull/1/head".to_string(),
+                "pull_request".to_string(),
+                Some(user_id),
+            ),
+            (
+                commit_sha.clone(),
+                "refs/heads/main".to_string(),
+                "push".to_string(),
+                Some(user_id),
+            ),
+        ],
+        "the suggestion commit must trigger exactly one pipeline per event it \
+         raises, on the branch it landed on, under event names a workflow can \
+         actually match — and attributed to whoever applied it"
     );
 
     server.abort();

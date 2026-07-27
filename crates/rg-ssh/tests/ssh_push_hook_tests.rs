@@ -41,6 +41,19 @@ impl rg_core::ci::CiTrigger for RecordingCi {
         true
     }
 
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(
+        &self,
+        _repo_path: &std::path::Path,
+        _commit_sha: &str,
+        _event: &str,
+        _ref_name: &str,
+        _base_branch: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -299,13 +312,22 @@ async fn ssh_push_runs_the_post_push_hooks() {
     let triggered = triggered.lock().unwrap().clone();
     assert_eq!(
         triggered,
-        vec![TriggeredPipeline {
-            commit_sha: pushed_sha.clone(),
-            ref_name: "refs/heads/main".to_string(),
-            trigger_type: "push".to_string(),
-        }],
+        vec![
+            // The pushed branch heads an open PR, so the push synchronises it
+            // and raises the `pull_request` event too (card_074d93bfe327).
+            TriggeredPipeline {
+                commit_sha: pushed_sha.clone(),
+                ref_name: "refs/pull/1/head".to_string(),
+                trigger_type: "pull_request".to_string(),
+            },
+            TriggeredPipeline {
+                commit_sha: pushed_sha.clone(),
+                ref_name: "refs/heads/main".to_string(),
+                trigger_type: "push".to_string(),
+            },
+        ],
         "a push over SSH into a repo with CI config must trigger exactly one \
-         pipeline for the pushed commit"
+         pipeline per event the pushed commit raises"
     );
 
     let events = events.lock().unwrap().clone();

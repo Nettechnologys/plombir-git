@@ -65,6 +65,19 @@ pub struct PostPushParams<'a> {
 }
 
 impl PostPushParams<'_> {
+    /// This run's CI wiring, in the borrowed form a pipeline-triggering path
+    /// takes (the merge queue, the pull-request trigger).
+    fn pipeline_ci(&self) -> crate::pull_request::ci::PipelineCi<'_> {
+        crate::pull_request::ci::PipelineCi {
+            trigger: self.ci_engine,
+            docker_enabled: self.docker_enabled,
+            external_runners: self.external_runners,
+            allow_host_runner: self.allow_host_runner,
+            jwt_secret: self.jwt_secret,
+            external_url: self.external_url,
+        }
+    }
+
     /// Fan a real-time event out to `user_id`, or drop it when the caller has
     /// no notification hub.
     fn notify(&self, user_id: i64, event_type: &str, data: serde_json::Value) {
@@ -135,9 +148,10 @@ impl PostPushContext {
         .await;
     }
 
-    /// The merge queue's view of this process's CI wiring.
-    pub fn merge_queue_ci(&self) -> crate::pull_request::merge_queue::MergeQueueCi<'_> {
-        crate::pull_request::merge_queue::MergeQueueCi {
+    /// This process's CI wiring, in the borrowed form a pipeline-triggering
+    /// path takes (the merge queue, the pull-request trigger).
+    pub fn pipeline_ci(&self) -> crate::pull_request::ci::PipelineCi<'_> {
+        crate::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,
             docker_enabled: self.docker_enabled,
             external_runners: self.external_runners,
@@ -167,10 +181,38 @@ impl PostPushContext {
             &self.repo_root,
             source_repo_id,
             commit_sha,
-            &self.merge_queue_ci(),
+            &self.pipeline_ci(),
         )
         .await;
         self.spawn_for_merged_refs(db, actor_id, merged);
+    }
+
+    /// Trigger the `pull_request` pipeline for a PR that just became current,
+    /// detached through the delivery tracker.
+    ///
+    /// Detached for the same reason the push hooks are: the caller has already
+    /// answered its request, and reading the repository's workflows plus
+    /// creating the pipeline rows has no business sitting in that response.
+    /// Tracked rather than a bare `tokio::spawn` so a SIGTERM in the next few
+    /// seconds does not sever it without trace (card_8d4148774f32).
+    pub fn spawn_pull_request_ci(
+        &self,
+        db: &DatabaseConnection,
+        pr: rg_db::entities::pull_request::Model,
+        actor_id: Option<i64>,
+    ) {
+        let context = self.clone();
+        let db = db.clone();
+        crate::task_tracker::delivery_tracker().spawn(async move {
+            crate::pull_request::trigger_pull_request_ci_best_effort(
+                &db,
+                &context.repo_root,
+                &pr,
+                actor_id,
+                &context.pipeline_ci(),
+            )
+            .await;
+        });
     }
 
     /// Run the post-push hooks for base-branch moves merges just made, detached
@@ -229,7 +271,7 @@ pub async fn evaluate_merges_for_head_commit(
     repo_root: &Path,
     source_repo_id: i64,
     commit_sha: &str,
-    ci: &crate::pull_request::merge_queue::MergeQueueCi<'_>,
+    ci: &crate::pull_request::ci::PipelineCi<'_>,
 ) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
     match crate::pull_request::try_auto_merges_for_head_commit(
@@ -537,20 +579,39 @@ async fn post_push_branch_maintenance(
         )
         .await
         {
-            Ok(_) => {
+            Ok(open_prs) => {
+                // The `pull_request` half of the event pair a forge emits for a
+                // branch that has an open PR on it: the push gets its own `push`
+                // pipeline below, and every PR this branch heads has been
+                // synchronised and owes a pipeline of its own. Nothing produced
+                // that event before card_074d93bfe327, so `on: pull_request`
+                // selected workflows that never ran.
+                //
+                // The condition is the *ref move* this run is processing, not
+                // "did the UPDATE above change a row": a server-side path may
+                // have advanced the PR itself before handing the move over
+                // (`advance_open_head_sha`, the applied-suggestion path), and
+                // keying on the row would silently skip exactly those. Repeats
+                // are bounded by the cascade's own `seen` set, which drops a
+                // `(repo, refname, new_sha)` it has already handled.
+                if update.old_sha != update.new_sha {
+                    for pr in &open_prs {
+                        crate::pull_request::trigger_pull_request_ci_best_effort(
+                            params.db,
+                            params.repo_root,
+                            pr,
+                            params.pusher_id,
+                            &params.pipeline_ci(),
+                        )
+                        .await;
+                    }
+                }
                 merged_refs = evaluate_merges_for_head_commit(
                     params.db,
                     params.repo_root,
                     target.repo_id,
                     &update.new_sha,
-                    &crate::pull_request::merge_queue::MergeQueueCi {
-                        trigger: params.ci_engine,
-                        docker_enabled: params.docker_enabled,
-                        external_runners: params.external_runners,
-                        allow_host_runner: params.allow_host_runner,
-                        jwt_secret: params.jwt_secret,
-                        external_url: params.external_url,
-                    },
+                    &params.pipeline_ci(),
                 )
                 .await;
             }
@@ -599,6 +660,8 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             commit_sha: &update.new_sha,
             ref_name: &update.refname,
             trigger_type: "push",
+            // A push targets no branch other than the one it moves.
+            base_branch: None,
             // The transport knows who pushed, and every other trigger path
             // records its actor, so a push pipeline had no reason to be the one
             // anonymous row in the table — `triggered_by` was hardcoded `None`

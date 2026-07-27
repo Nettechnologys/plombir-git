@@ -26,6 +26,19 @@ impl rg_core::ci::CiTrigger for NoCi {
         false
     }
 
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(
+        &self,
+        _repo_path: &std::path::Path,
+        _commit_sha: &str,
+        _event: &str,
+        _ref_name: &str,
+        _base_branch: Option<&str>,
+    ) -> bool {
+        false
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         _params: rg_core::ci::TriggerPipelineParams<'a>,

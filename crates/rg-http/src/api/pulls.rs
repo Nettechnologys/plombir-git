@@ -201,6 +201,12 @@ pub async fn create_pr(
             {
                 Ok(pr) => {
                     crate::metrics::recorder::pr_opened();
+                    // The `pull_request` CI event. Nothing emitted it before
+                    // card_074d93bfe327, so a repository whose CI is a single
+                    // `.gitea/workflows/pr.yml` with `on: pull_request` got a
+                    // matcher that handled the event, unit tests that covered
+                    // it, and no pipeline ever.
+                    state.spawn_pull_request_ci(pr.clone(), Some(user_id));
                     // CODEOWNERS is advisory: a malformed/missing file or an
                     // unavailable diff must not prevent PR creation.
                     match rg_core::pull_request::compute_diff(
@@ -312,7 +318,15 @@ pub async fn update_pr(
     )
     .await
     {
-        Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
+        Ok(pr) => {
+            // Reopening is a `pull_request` event of its own: the head may have
+            // moved (or the base may have) while the PR sat closed, and nothing
+            // ran CI for it in the meantime.
+            if existing.state != "open" && pr.state == "open" {
+                state.spawn_pull_request_ci(pr.clone(), Some(actor_id));
+            }
+            (StatusCode::OK, Json(pr)).into_response()
+        }
         // Rejected title/state/draft transition → 400 from the service's own
         // markers; an absent PR → 404; a failed write → 5xx.
         Err(e) => AppError::from(e).into_response(),
@@ -594,7 +608,7 @@ pub async fn enqueue_merge_queue(
         &state.db,
         &state.repo_root,
         &repository,
-        &state.merge_queue_ci(),
+        &state.pipeline_ci(),
     )
     .await
     {

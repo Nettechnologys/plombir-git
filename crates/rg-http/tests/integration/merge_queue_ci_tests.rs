@@ -11,6 +11,19 @@ impl rg_core::ci::CiTrigger for PendingMergeGroupCi {
         true
     }
 
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(
+        &self,
+        _repo_path: &std::path::Path,
+        _commit_sha: &str,
+        _event: &str,
+        _ref_name: &str,
+        _base_branch: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -300,7 +313,9 @@ async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
 
     assert_eq!(
         client
-            .post(format!("{base}/api/v1/repos/queue-fail-owner/flatten/pulls"))
+            .post(format!(
+                "{base}/api/v1/repos/queue-fail-owner/flatten/pulls"
+            ))
             .bearer_auth(&token)
             .json(&serde_json::json!({
                 "title": "Doomed merge",

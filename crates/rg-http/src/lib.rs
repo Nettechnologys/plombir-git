@@ -177,9 +177,26 @@ impl AppState {
             .await;
     }
 
-    /// The merge queue's view of this process's CI wiring.
-    pub fn merge_queue_ci(&self) -> rg_core::pull_request::merge_queue::MergeQueueCi<'_> {
-        rg_core::pull_request::merge_queue::MergeQueueCi {
+    /// Trigger the `pull_request` pipeline for a PR that just opened or was
+    /// reopened, detached through the delivery tracker.
+    ///
+    /// The push transports reach the same producer through the post-push hooks
+    /// (a pushed head branch synchronises its PRs); this is the other half —
+    /// the PR itself appearing is an event too, and it is the one an
+    /// `on: pull_request` workflow is written for.
+    pub fn spawn_pull_request_ci(
+        &self,
+        pr: rg_db::entities::pull_request::Model,
+        actor_id: Option<i64>,
+    ) {
+        self.post_push_context()
+            .spawn_pull_request_ci(&self.db, pr, actor_id);
+    }
+
+    /// This process's CI wiring, in the borrowed form a pipeline-triggering
+    /// path takes (the merge queue, the pull-request trigger).
+    pub fn pipeline_ci(&self) -> rg_core::pull_request::ci::PipelineCi<'_> {
+        rg_core::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,
             docker_enabled: self.docker_enabled,
             external_runners: self.external_runners,
@@ -530,9 +547,8 @@ async fn load_tls_config(
         .with_context(|| format!("failed to open TLS key: {}", key_path.display()))?;
     let mut key_reader = BufReader::new(key_file);
 
-    let key = PrivateKeyDer::from_pem_reader(&mut key_reader).with_context(|| {
-        format!("failed to parse TLS private key in {}", key_path.display())
-    })?;
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
+        .with_context(|| format!("failed to parse TLS private key in {}", key_path.display()))?;
 
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -564,7 +580,9 @@ pub fn create_router_for_test_with_routes(
 async fn refresh_entity_gauges(db: &DatabaseConnection) {
     match metrics::time_db("user.count_active", rg_db::ops::user_ops::count_active(db)).await {
         Ok(n) => metrics::recorder::set_users_total(n as i64),
-        Err(e) => tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_active failed"),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_active failed")
+        }
     }
     match metrics::time_db(
         "repo.count_non_deleted",
@@ -573,7 +591,9 @@ async fn refresh_entity_gauges(db: &DatabaseConnection) {
     .await
     {
         Ok(n) => metrics::recorder::set_repos_total(n as i64),
-        Err(e) => tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_non_deleted failed"),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_non_deleted failed")
+        }
     }
 }
 
@@ -761,6 +781,9 @@ async fn recover_stuck_imports(db: &DatabaseConnection, older_than_secs: i64) {
     }
 
     if failed > 0 {
-        tracing::info!(count = failed, "Import watchdog: failed {failed} stuck import tasks");
+        tracing::info!(
+            count = failed,
+            "Import watchdog: failed {failed} stuck import tasks"
+        );
     }
 }

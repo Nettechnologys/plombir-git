@@ -55,6 +55,33 @@ impl rg_core::ci::CiTrigger for CiEngine {
         rg_core::ci::has_ci_config(repo_path, commit_sha)
     }
 
+    fn has_workflow_for_event(
+        &self,
+        repo_path: &std::path::Path,
+        commit_sha: &str,
+        event: &str,
+        ref_name: &str,
+        base_branch: Option<&str>,
+    ) -> bool {
+        match workflow_matches_event(repo_path, commit_sha, event, ref_name, base_branch) {
+            Ok(matched) => matched,
+            Err(error) => {
+                // Fail-closed, unlike `has_ci_config`: this gate answers "should
+                // an event nobody asked for produce a pipeline", and the honest
+                // answer to "the workflows are unreadable" is "not this one".
+                // `trigger_pipeline` reports the same failure with its full
+                // context on the paths that do reach it.
+                tracing::warn!(
+                    repo = %repo_path.display(),
+                    event,
+                    "cannot decide whether a workflow is triggered by this event: {:#}",
+                    error
+                );
+                false
+            }
+        }
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -110,6 +137,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
         commit_sha,
         ref_name,
         trigger_type,
+        base_branch,
         triggered_by,
         docker_enabled,
         external_runners,
@@ -119,7 +147,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
     } = params;
 
     // 1. Read CI config from repo
-    let config = read_ci_config(repo_path, commit_sha, ref_name, trigger_type)?;
+    let config = read_ci_config(repo_path, commit_sha, ref_name, trigger_type, base_branch)?;
     validate_execution_semantics(&config)?;
 
     // 2. Concurrency control
@@ -563,12 +591,13 @@ fn read_ci_config(
     commit_sha: &str,
     ref_name: &str,
     event: &str,
+    base_branch: Option<&str>,
 ) -> Result<CiConfig> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     // Try Gitea Actions format first
-    let gitea = try_read_gitea_workflows(&repo, commit_sha, ref_name, event)?;
+    let gitea = try_read_gitea_workflows(&repo, commit_sha, ref_name, event, base_branch)?;
     let workflows_untriggered = matches!(gitea, GiteaWorkflows::NoneTriggered);
     if let GiteaWorkflows::Config(config) = gitea {
         tracing::info!("Using Gitea Actions workflow from {}/", WORKFLOW_DIR);
@@ -653,69 +682,20 @@ fn try_read_gitea_workflows(
     commit_sha: &str,
     ref_name: &str,
     event: &str,
+    base_branch: Option<&str>,
 ) -> Result<GiteaWorkflows> {
-    let tree_revspec = format!("{}:{}", commit_sha, WORKFLOW_DIR);
-    let Ok(object_id) = repo.rev_parse_single(tree_revspec.as_str()) else {
+    let Some(workflow_sources) = load_workflow_sources(repo, commit_sha)? else {
         // Nothing at that path in this commit: the native format is next in line.
         return Ok(GiteaWorkflows::Absent);
     };
 
-    let object = object_id
-        .object()
-        .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
-    let tree = object.try_into_tree().map_err(|_| {
-        anyhow::anyhow!(
-            "{} exists at commit {} but is a file, not a directory",
-            WORKFLOW_DIR,
-            commit_sha
-        )
-    })?;
-
-    let default_branch = get_default_branch(repo)?;
+    let match_branch = event_match_branch(repo, base_branch)?;
 
     let mut all_jobs: std::collections::HashMap<String, config::JobConfig> =
         std::collections::HashMap::new();
     let mut all_stages: Vec<String> = Vec::new();
-    let mut workflow_sources = std::collections::HashMap::new();
 
-    // Load all workflow sources first so callers can resolve repository-local
-    // reusable workflows from the same immutable commit tree.
-    for entry in tree.iter() {
-        let entry = entry
-            .with_context(|| format!("failed to list {} at commit {}", WORKFLOW_DIR, commit_sha))?;
-        let name = entry.filename().to_string();
-        if !name.ends_with(".yml") && !name.ends_with(".yaml") {
-            continue;
-        }
-        let mode = entry.mode();
-        if !mode.is_blob() && !mode.is_executable() {
-            // A directory or submodule that happens to be named `*.yml` is not a
-            // workflow; say so instead of failing the whole pipeline over it.
-            tracing::warn!("Skipping {}/{}: not a regular file", WORKFLOW_DIR, name);
-            continue;
-        }
-
-        let entry_object = repo.find_object(entry.oid()).with_context(|| {
-            format!(
-                "failed to read {}/{} from the object database",
-                WORKFLOW_DIR, name
-            )
-        })?;
-        let blob = entry_object
-            .try_into_blob()
-            .map_err(|_| anyhow::anyhow!("{}/{} is not a file", WORKFLOW_DIR, name))?;
-        let yml = String::from_utf8(blob.data.to_vec())
-            .with_context(|| format!("{}/{} is not valid UTF-8", WORKFLOW_DIR, name))?;
-        workflow_sources.insert(name, yml);
-    }
-
-    // Deterministic order: stage ordering of the merged config (and which broken
-    // file is reported first) must not depend on hash-map iteration order.
-    let mut workflow_names: Vec<String> = workflow_sources.keys().cloned().collect();
-    workflow_names.sort();
-
-    for name in &workflow_names {
-        let yml = &workflow_sources[name];
+    for (name, yml) in sorted_workflows(&workflow_sources) {
         // The cause is folded into the message instead of being a `with_context`
         // source: callers log this error with `Display`, and the YAML line/column
         // is the whole point of reporting it.
@@ -723,7 +703,7 @@ fn try_read_gitea_workflows(
             .map_err(|e| anyhow::anyhow!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))?;
 
         // Check if this workflow should be triggered
-        if !workflow.matches_event(event, ref_name, &default_branch) {
+        if !workflow.matches_event(event, ref_name, &match_branch) {
             continue;
         }
         let workflow = workflow
@@ -784,6 +764,130 @@ fn try_read_gitea_workflows(
         concurrency: None, // per-workflow concurrency not merged
         jobs: all_jobs,
     }))
+}
+
+/// Read every `*.yml` / `*.yaml` blob under [`WORKFLOW_DIR`] at `commit_sha`.
+///
+/// `None` means the directory is not in this commit at all — the one outcome
+/// that legitimately falls back to the native config. Everything else that goes
+/// wrong is an `Err` naming the file: a workflow that exists but cannot be read
+/// must never be mistaken for "no CI config here".
+///
+/// Sources are loaded as a set rather than one at a time so a workflow can
+/// resolve a repository-local reusable workflow from the same immutable tree.
+fn load_workflow_sources(
+    repo: &gix::Repository,
+    commit_sha: &str,
+) -> Result<Option<std::collections::HashMap<String, String>>> {
+    let tree_revspec = format!("{}:{}", commit_sha, WORKFLOW_DIR);
+    let Ok(object_id) = repo.rev_parse_single(tree_revspec.as_str()) else {
+        return Ok(None);
+    };
+
+    let object = object_id
+        .object()
+        .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
+    let tree = object.try_into_tree().map_err(|_| {
+        anyhow::anyhow!(
+            "{} exists at commit {} but is a file, not a directory",
+            WORKFLOW_DIR,
+            commit_sha
+        )
+    })?;
+
+    let mut workflow_sources = std::collections::HashMap::new();
+    for entry in tree.iter() {
+        let entry = entry
+            .with_context(|| format!("failed to list {} at commit {}", WORKFLOW_DIR, commit_sha))?;
+        let name = entry.filename().to_string();
+        if !name.ends_with(".yml") && !name.ends_with(".yaml") {
+            continue;
+        }
+        let mode = entry.mode();
+        if !mode.is_blob() && !mode.is_executable() {
+            // A directory or submodule that happens to be named `*.yml` is not a
+            // workflow; say so instead of failing the whole pipeline over it.
+            tracing::warn!("Skipping {}/{}: not a regular file", WORKFLOW_DIR, name);
+            continue;
+        }
+
+        let entry_object = repo.find_object(entry.oid()).with_context(|| {
+            format!(
+                "failed to read {}/{} from the object database",
+                WORKFLOW_DIR, name
+            )
+        })?;
+        let blob = entry_object
+            .try_into_blob()
+            .map_err(|_| anyhow::anyhow!("{}/{} is not a file", WORKFLOW_DIR, name))?;
+        let yml = String::from_utf8(blob.data.to_vec())
+            .with_context(|| format!("{}/{} is not valid UTF-8", WORKFLOW_DIR, name))?;
+        workflow_sources.insert(name, yml);
+    }
+    Ok(Some(workflow_sources))
+}
+
+/// Workflow sources by filename, in a deterministic order.
+///
+/// Stage ordering of the merged config — and which broken file is reported
+/// first — must not depend on hash-map iteration order.
+fn sorted_workflows(
+    sources: &std::collections::HashMap<String, String>,
+) -> Vec<(&String, &String)> {
+    let mut workflows: Vec<(&String, &String)> = sources.iter().collect();
+    workflows.sort_by_key(|(name, _)| *name);
+    workflows
+}
+
+/// The branch `on:`-filters are matched against for this event.
+///
+/// The caller's `base_branch` when it has one (a PR's target branch), the
+/// repository's default branch otherwise.
+fn event_match_branch(repo: &gix::Repository, base_branch: Option<&str>) -> Result<String> {
+    match base_branch {
+        Some(base_branch) => Ok(base_branch.to_string()),
+        None => get_default_branch(repo),
+    }
+}
+
+/// Whether any workflow at `commit_sha` is triggered by `event`.
+///
+/// Cheaper and narrower than [`read_ci_config`]: it only asks the `on:` block,
+/// so a workflow that this event does not select is never expanded or validated.
+/// A file that fails to parse cannot answer, so it counts as "not triggered" and
+/// says so in the log — the caller is deciding whether an event should produce a
+/// pipeline at all, and a broken unrelated workflow must not conjure one.
+fn workflow_matches_event(
+    repo_path: &std::path::Path,
+    commit_sha: &str,
+    event: &str,
+    ref_name: &str,
+    base_branch: Option<&str>,
+) -> Result<bool> {
+    let repo = gix::open(repo_path)
+        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+    let Some(sources) = load_workflow_sources(&repo, commit_sha)? else {
+        return Ok(false);
+    };
+    let match_branch = event_match_branch(&repo, base_branch)?;
+
+    for (name, yml) in sorted_workflows(&sources) {
+        match gitea_actions::GiteaWorkflow::parse(yml) {
+            Ok(workflow) => {
+                if workflow.matches_event(event, ref_name, &match_branch) {
+                    return Ok(true);
+                }
+            }
+            Err(error) => tracing::warn!(
+                "failed to parse {}/{} while matching event {}: {}",
+                WORKFLOW_DIR,
+                name,
+                event,
+                error
+            ),
+        }
+    }
+    Ok(false)
 }
 
 /// Get the default branch name of the repository.
@@ -931,6 +1035,7 @@ mod matrix_tests {
             commit_sha: &sha,
             ref_name: "refs/heads/main",
             trigger_type: "push",
+            base_branch: None,
             triggered_by: Some(user.id),
             docker_enabled: false,
             external_runners: true,
@@ -1028,6 +1133,7 @@ mod matrix_tests {
             commit_sha: &sha,
             ref_name: "refs/heads/dev",
             trigger_type: "push",
+            base_branch: None,
             triggered_by: Some(user.id),
             docker_enabled: false,
             external_runners: true,
@@ -1092,7 +1198,7 @@ mod matrix_tests {
             .stdout_str()
             .trim()
             .to_owned();
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap();
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap();
         let job = config.jobs.get("main/shared/build").unwrap();
         assert!(job
             .script
@@ -1152,7 +1258,7 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml"),
@@ -1176,7 +1282,7 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("UTF-8"),
@@ -1192,7 +1298,7 @@ mod matrix_tests {
                 as &[u8],
         )]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("setup-node"),
@@ -1207,7 +1313,7 @@ mod matrix_tests {
             b"build:\n  script: [echo ok]\n   nested: bad\n" as &[u8],
         )]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
         let rendered = format!("{error}");
         assert!(
             rendered.contains(".forgekeep-ci.yml") && rendered.contains("line"),
@@ -1226,7 +1332,7 @@ mod matrix_tests {
             b"build:\n  script: [echo native]\n" as &[u8],
         )]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap();
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap();
         assert!(config.jobs.contains_key("build"));
     }
 
@@ -1241,7 +1347,7 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap();
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap();
         assert!(config.jobs.contains_key("build"));
         assert!(!config.jobs.keys().any(|name| name.starts_with("tags/")));
     }
@@ -1254,7 +1360,7 @@ mod matrix_tests {
                 as &[u8],
         )]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
         let rendered = format!("{error}");
         assert!(
             rendered.contains(".gitea/workflows") && rendered.contains("refs/heads/main"),
@@ -1270,7 +1376,7 @@ mod matrix_tests {
     fn no_config_at_all_still_reports_no_ci_config_found() {
         let (temp, sha) = commit_repo(&[("README.md", b"nothing to build\n" as &[u8])]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push").unwrap_err();
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
         assert!(
             error.to_string().contains("no CI config found"),
             "genuinely missing config keeps its own message: {error:#}"
@@ -1288,18 +1394,139 @@ mod matrix_tests {
             (".gitea/workflows/c.yml", &workflow("third")),
         ]);
 
-        let expected = read_ci_config(temp.path(), &sha, "refs/heads/main", "push")
+        let expected = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
             .unwrap()
             .stages
             .unwrap();
         assert_eq!(expected.len(), 3);
         for _ in 0..8 {
-            let stages = read_ci_config(temp.path(), &sha, "refs/heads/main", "push")
+            let stages = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
                 .unwrap()
                 .stages
                 .unwrap();
             assert_eq!(stages, expected, "stage order must not depend on hashing");
         }
+    }
+
+    /// card_074d93bfe327: the repository the whole defect is about — its entire
+    /// CI is one `on: pull_request` workflow. Under the `push` event it has
+    /// nothing to run (that is not a bug, it asked for PRs); under
+    /// `pull_request` it must produce its jobs.
+    #[test]
+    fn a_pull_request_only_workflow_runs_for_the_pull_request_event() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/pr.yml",
+            b"on: pull_request\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n"
+                as &[u8],
+        )]);
+
+        let config = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/1/head",
+            "pull_request",
+            Some("main"),
+        )
+        .expect("an on: pull_request workflow must be selected by the pull_request event");
+        assert!(
+            config.jobs.contains_key("pr/verify"),
+            "the workflow's job must be in the config: {:?}",
+            config.jobs.keys().collect::<Vec<_>>()
+        );
+
+        // The same repository under `push` has nothing to offer, and says so
+        // rather than claiming there is no CI config at all.
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        assert!(
+            error.to_string().contains("pull_request") || error.to_string().contains("triggered"),
+            "the push event must report an untriggered workflow: {error:#}"
+        );
+    }
+
+    /// A `branches:` filter under `on: pull_request` is matched against the
+    /// branch the PR *targets*. Nothing carried that branch into the matcher, so
+    /// it fell back to the repository's default — and a PR into `develop` was
+    /// judged as if it were a PR into `main`.
+    #[test]
+    fn the_pull_request_branch_filter_matches_the_base_branch_not_the_default_one() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/pr.yml",
+            b"on:\n  pull_request:\n    branches: [develop]\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n" as &[u8],
+        )]);
+
+        let config = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/7/head",
+            "pull_request",
+            Some("develop"),
+        )
+        .expect("a PR into develop must select the workflow filtered on develop");
+        assert!(config.jobs.contains_key("pr/verify"));
+
+        // The fixture's default branch is whatever `git init` produced, never
+        // `develop`, so without the base branch the filter used to reject this.
+        let error = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/7/head",
+            "pull_request",
+            Some("main"),
+        )
+        .unwrap_err();
+        assert!(
+            !format!("{error:#}").contains("no CI config found"),
+            "a PR into another branch is untriggered, not configuration-less: {error:#}"
+        );
+    }
+
+    /// The gate the producer asks before creating anything. It must answer for
+    /// the *event*, not for "is there any CI here at all" — a repository with a
+    /// native config and no workflow would otherwise get a duplicate pipeline on
+    /// every PR open and every PR sync.
+    #[test]
+    fn the_event_gate_answers_per_event_not_per_repository() {
+        let (workflow_repo, workflow_sha) = commit_repo(&[(
+            ".gitea/workflows/pr.yml",
+            b"on: pull_request\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n"
+                as &[u8],
+        )]);
+        assert!(workflow_matches_event(
+            workflow_repo.path(),
+            &workflow_sha,
+            "pull_request",
+            "refs/pull/1/head",
+            Some("main")
+        )
+        .unwrap());
+        assert!(!workflow_matches_event(
+            workflow_repo.path(),
+            &workflow_sha,
+            "push",
+            "refs/heads/main",
+            None
+        )
+        .unwrap());
+
+        let (native_repo, native_sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo native]\n" as &[u8],
+        )]);
+        assert!(
+            rg_core::ci::has_ci_config(native_repo.path(), &native_sha),
+            "the fixture must look like a repository with CI"
+        );
+        assert!(
+            !workflow_matches_event(
+                native_repo.path(),
+                &native_sha,
+                "pull_request",
+                "refs/pull/1/head",
+                Some("main")
+            )
+            .unwrap(),
+            "a native config declares no events — it must not answer for pull_request"
+        );
     }
 
     #[test]

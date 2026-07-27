@@ -20,6 +20,15 @@ pub struct TriggerPipelineParams<'a> {
     pub commit_sha: &'a str,
     pub ref_name: &'a str,
     pub trigger_type: &'a str,
+    /// Branch the event targets, for the workflow formats that filter on it.
+    ///
+    /// A `branches:` filter under `on: pull_request` applies to the PR's **base**
+    /// branch, not to `ref_name` (which is the head). Nothing carried that
+    /// branch down here, so the matcher fell back to the repository's default
+    /// branch — correct only for PRs that happen to target it, and silently
+    /// wrong for a PR into `develop`. `None` keeps the old fallback and is the
+    /// right answer for events that have no target branch (a push, a manual run).
+    pub base_branch: Option<&'a str>,
     pub triggered_by: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,
@@ -53,6 +62,26 @@ pub struct ResumePipelineParams<'a> {
 pub trait CiTrigger: Send + Sync {
     /// Check if a repo has CI config at the given commit.
     fn has_ci_config(&self, repo_path: &Path, commit_sha: &str) -> bool;
+
+    /// Whether a workflow at `commit_sha` is actually triggered by `event`.
+    ///
+    /// The gate for events the *native* `.forgekeep-ci.yml` format has no notion
+    /// of. [`has_ci_config`](Self::has_ci_config) answers the weaker question
+    /// "is there a pipeline definition here at all", which for `pull_request`
+    /// is a false yes on every repository driving CI from a native config: it
+    /// describes one push pipeline and would be run a second time, identically,
+    /// on every PR open and every PR sync.
+    ///
+    /// `base_branch` is the PR's target branch (see
+    /// [`TriggerPipelineParams::base_branch`]); `None` for events without one.
+    fn has_workflow_for_event(
+        &self,
+        repo_path: &Path,
+        commit_sha: &str,
+        event: &str,
+        ref_name: &str,
+        base_branch: Option<&str>,
+    ) -> bool;
 
     /// Trigger a CI pipeline. Returns the pipeline ID.
     fn trigger_pipeline<'a>(

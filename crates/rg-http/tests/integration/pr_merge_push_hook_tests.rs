@@ -40,6 +40,19 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         true
     }
 
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(
+        &self,
+        _repo_path: &std::path::Path,
+        _commit_sha: &str,
+        _event: &str,
+        _ref_name: &str,
+        _base_branch: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -182,6 +195,11 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
         .await
         .unwrap();
     assert_eq!(opened.status(), 201, "{}", opened.text().await.unwrap());
+
+    // Opening a PR is a CI event of its own since card_074d93bfe327. Drain and
+    // clear it, so what the merge assertion sees is the merge's own automation.
+    drain_delivery_tracker().await;
+    ci_engine.triggered.lock().unwrap().clear();
 
     let merged = client
         .post(format!(
@@ -454,6 +472,11 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
         .unwrap();
     assert_eq!(opened.status(), 201, "{}", opened.text().await.unwrap());
 
+    // Opening the PR triggers its own `pull_request` pipeline
+    // (card_074d93bfe327); the cascade under test starts at the merge below.
+    drain_delivery_tracker().await;
+    ci_engine.triggered.lock().unwrap().clear();
+
     // The second PR is seeded directly: opening it through the API and enabling
     // auto-merge would merge it immediately (its conditions are already met),
     // and then there would be no cascade left to observe. Its head SHA is
@@ -528,19 +551,29 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
     assert_eq!(
         triggered,
         vec![
+            // `main` is the head branch of the waiting PR #2, so the first merge
+            // synchronises it — one `pull_request` pipeline, on its own ref.
+            (
+                first_merge_sha.clone(),
+                "refs/pull/2/head".to_string(),
+                "pull_request".to_string()
+            ),
             (
                 first_merge_sha,
                 "refs/heads/main".to_string(),
                 "push".to_string()
             ),
+            // `release` is nobody's head branch, so its move is a push and
+            // nothing else.
             (
                 second_merge_sha,
                 "refs/heads/release".to_string(),
                 "push".to_string()
             ),
         ],
-        "each branch the chain moved gets exactly one pipeline, and the chain \
-         stops there — a repeat would mean the work list re-ran a ref move"
+        "each branch the chain moved gets exactly one pipeline per event it \
+         raises, and the chain stops there — a repeat would mean the work list \
+         re-ran a ref move"
     );
 
     server.abort();

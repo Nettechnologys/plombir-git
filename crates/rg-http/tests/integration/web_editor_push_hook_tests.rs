@@ -32,6 +32,19 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         true
     }
 
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(
+        &self,
+        _repo_path: &std::path::Path,
+        _commit_sha: &str,
+        _event: &str,
+        _ref_name: &str,
+        _base_branch: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -166,12 +179,22 @@ async fn a_web_editor_commit_runs_the_post_push_hooks() {
     let triggered = ci_engine.triggered.lock().unwrap().clone();
     assert_eq!(
         triggered,
-        vec![(
-            commit_sha.clone(),
-            "refs/heads/main".to_string(),
-            "push".to_string()
-        )],
-        "the commit must trigger exactly one push pipeline, on the branch it landed on"
+        vec![
+            // The branch is the head of an open PR, so the edit synchronises it
+            // and raises the `pull_request` event too (card_074d93bfe327).
+            (
+                commit_sha.clone(),
+                "refs/pull/1/head".to_string(),
+                "pull_request".to_string()
+            ),
+            (
+                commit_sha.clone(),
+                "refs/heads/main".to_string(),
+                "push".to_string()
+            ),
+        ],
+        "the commit must trigger exactly one pipeline per event it raises: the \
+         push on the branch it landed on, and the sync of the PR that branch heads"
     );
 
     server.abort();
@@ -223,7 +246,9 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
 
     // The blob SHA is the delete endpoint's optimistic-concurrency token.
     let blob = client
-        .get(format!("{base}/api/v1/repos/webdel/del-repo/blob/doomed.txt"))
+        .get(format!(
+            "{base}/api/v1/repos/webdel/del-repo/blob/doomed.txt"
+        ))
         .bearer_auth(&jwt)
         .send()
         .await
@@ -315,12 +340,20 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
     let triggered = ci_engine.triggered.lock().unwrap().clone();
     assert_eq!(
         triggered,
-        vec![(
-            commit_sha.clone(),
-            "refs/heads/main".to_string(),
-            "push".to_string()
-        )],
-        "the delete commit must trigger its own push pipeline"
+        vec![
+            (
+                commit_sha.clone(),
+                "refs/pull/1/head".to_string(),
+                "pull_request".to_string()
+            ),
+            (
+                commit_sha.clone(),
+                "refs/heads/main".to_string(),
+                "push".to_string()
+            ),
+        ],
+        "the delete commit must trigger its own push pipeline, and sync the PR \
+         whose head branch it moved"
     );
 
     server.abort();
