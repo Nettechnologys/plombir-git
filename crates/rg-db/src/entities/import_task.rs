@@ -3,6 +3,21 @@
 //! Tracks the progress of migrating a repository and its metadata
 //! (issues, PRs, labels, milestones, releases, wiki) from
 //! external platforms (GitHub, GitLab) into ForgeKeep.
+//!
+//! ## The source platform's access token is deliberately absent
+//!
+//! The table still carries an `auth_token_encrypted` column (always NULL from
+//! `m20260727_000002` on) and this model deliberately has no field for it: the
+//! import worker is started in-process by `rg_core::import::service::start_import`
+//! and is handed the token in memory, so nothing ever reads it back from the
+//! row. Storing it bought nothing and cost plenty — the name promised
+//! encryption that did not exist, and because handlers serialize this model
+//! wholesale (`GET /imports/{id}` is polled in a loop by the progress page) the
+//! user's GitHub/GitLab PAT was echoed back on every poll.
+//!
+//! Keep it that way: a token that must survive a restart needs real encryption
+//! (`rg_core::auth::encryption`, as `mirrors.password_encrypted` does) plus a
+//! response DTO — not a field re-added here.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -24,8 +39,6 @@ pub struct Model {
     pub target_owner: String,
     /// Target repository name
     pub target_name: String,
-    /// Encrypted API access token
-    pub auth_token_encrypted: Option<String>,
     /// Import status: "pending" | "cloning" | "importing" | "completed" | "failed"
     pub status: String,
     /// Progress percentage (0-100)

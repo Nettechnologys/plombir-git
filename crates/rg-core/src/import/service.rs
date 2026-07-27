@@ -11,6 +11,20 @@
 //!
 //! The import runs asynchronously and updates progress in the
 //! import_tasks database table.
+//!
+//! ## The source platform's access token
+//!
+//! The PAT the user hands us for the source platform lives in memory only, for
+//! exactly as long as the import runs: [`start_import`] passes it straight to
+//! the worker it spawns and never writes it to the task row. It is not stored
+//! because nothing would ever read it back — an interrupted import is failed by
+//! the watchdog, never resumed — and a stored copy is a copy that outlives its
+//! purpose, in the DB and in every polled status response. See the note on
+//! `rg_db::entities::import_task`.
+//!
+//! For the same reason a failure reason is masked with [`failure_reason`]
+//! before it is persisted: the token reaches `git`/the platform API, so it can
+//! come back inside their error text.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -50,10 +64,15 @@ pub struct ImportStats {
 }
 
 /// Run a full import pipeline and update the import task as it progresses.
+///
+/// `auth_token` is the source platform's credential as the user supplied it.
+/// It is a parameter rather than a column of `task` on purpose — see the module
+/// note.
 pub async fn run_import(
     db: &DatabaseConnection,
     task: &ImportTask,
     repo_root: &Path,
+    auth_token: Option<&str>,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
 
@@ -64,10 +83,12 @@ pub async fn run_import(
     // project URL; the actual API-derived clone URL is guarded again below.
     crate::net::guard_git_url(&task.source_url).await?;
 
+    let auth_token = auth_token.unwrap_or("");
+
     match task.platform.as_str() {
-        "github" => run_github_import(db, task, repo_root, &mut stats).await?,
-        "gitlab" => run_gitlab_import(db, task, repo_root, &mut stats).await?,
-        "gitea" | "git" => run_git_import(db, task, repo_root, &mut stats).await?,
+        "github" => run_github_import(db, task, repo_root, auth_token, &mut stats).await?,
+        "gitlab" => run_gitlab_import(db, task, repo_root, auth_token, &mut stats).await?,
+        "gitea" | "git" => run_git_import(db, task, repo_root, auth_token, &mut stats).await?,
         other => anyhow::bail!("unsupported platform: {other}"),
     }
 
@@ -82,6 +103,7 @@ async fn run_git_import(
     db: &DatabaseConnection,
     task: &ImportTask,
     repo_root: &Path,
+    auth_token: &str,
     stats: &mut ImportStats,
 ) -> Result<()> {
     let repo_id =
@@ -97,7 +119,7 @@ async fn run_git_import(
             repo_root,
             &task.target_owner,
             &task.target_name,
-            task.auth_token_encrypted.as_deref().unwrap_or(""),
+            auth_token,
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 90, "Repository cloned").await?;
@@ -123,9 +145,9 @@ async fn run_github_import(
     db: &DatabaseConnection,
     task: &ImportTask,
     repo_root: &Path,
+    token: &str,
     stats: &mut ImportStats,
 ) -> Result<()> {
-    let token = task.auth_token_encrypted.as_deref().unwrap_or("");
     let client = GitHubClient::new(token.to_string(), None)?;
 
     // Parse owner/repo from source URL (https://github.com/owner/repo)
@@ -294,9 +316,9 @@ async fn run_gitlab_import(
     db: &DatabaseConnection,
     task: &ImportTask,
     repo_root: &Path,
+    token: &str,
     stats: &mut ImportStats,
 ) -> Result<()> {
-    let token = task.auth_token_encrypted.as_deref().unwrap_or("");
     let client = GitLabClient::new(token.to_string(), None)?;
 
     // Extract project path from source URL (https://gitlab.com/group/project)
@@ -1355,7 +1377,28 @@ async fn update_stage(
 // Public API: start import task
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Render an import failure for the `error` column (and the log line), with the
+/// source token taken back out of it.
+///
+/// The token is handed to `git` and to the platform's HTTP API, so it can come
+/// back inside their error text — a clone URL echoed by the git gateway, an API
+/// error quoting the request. That text is persisted on the task and served to
+/// the user on every status poll, which is exactly the path this module refuses
+/// to put the token on. Masking is the same last-resort net `mirror::service`
+/// puts in front of `last_sync_error`.
+fn failure_reason(error: &anyhow::Error, auth_token: Option<&str>) -> String {
+    let reason = format!("{error:#}");
+    match auth_token.filter(|token| !token.is_empty()) {
+        Some(token) => crate::auth::encryption::mask_values(&reason, &[token.to_string()]),
+        None => reason,
+    }
+}
+
 /// Create a new import task and start the background import process.
+///
+/// `auth_token` is handed to the spawned worker and to nothing else: it is not
+/// written to the task row, so it cannot outlive the import nor come back out
+/// of a status response. See the module note.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_import(
     db: &DatabaseConnection,
@@ -1384,7 +1427,6 @@ pub async fn start_import(
         source_url: Set(source_url),
         target_owner: Set(target_owner),
         target_name: Set(target_name),
-        auth_token_encrypted: Set(auth_token),
         status: Set("pending".to_string()),
         progress: Set(0),
         stage: Set(None),
@@ -1414,7 +1456,14 @@ pub async fn start_import(
         // caller left to notice a failure and no later pass that revisits the
         // row. Losing one leaves the task in `running` forever, which the UI
         // renders as an import that never finishes.
-        match run_import(&db_clone, &task_clone, &repo_root_clone).await {
+        match run_import(
+            &db_clone,
+            &task_clone,
+            &repo_root_clone,
+            auth_token.as_deref(),
+        )
+        .await
+        {
             Ok(stats) => {
                 let stats_json = serde_json::to_string(&stats).unwrap_or_default();
                 if let Err(error) =
@@ -1429,7 +1478,7 @@ pub async fn start_import(
                 }
             }
             Err(e) => {
-                let reason = format!("{e:#}");
+                let reason = failure_reason(&e, auth_token.as_deref());
                 tracing::warn!(task_id = task_clone.id, reason, "import failed");
                 if let Err(error) =
                     import_task_ops::mark_failed(&db_clone, task_clone.id, &reason).await
@@ -1481,5 +1530,39 @@ mod clone_path_tests {
             "{rendered}"
         );
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::*;
+
+    /// The clone URL GitLab imports build carries the PAT, and the git gateway
+    /// quotes the command line it ran back into its error. Whatever the token
+    /// rode in on, it must not reach the `error` column — that column is served
+    /// to the browser on every status poll.
+    #[test]
+    fn the_token_is_taken_back_out_of_a_failure() {
+        let error = anyhow::anyhow!(
+            "git clone --bare https://oauth2:glpat-SECRET-TOKEN@gitlab.com/a/b.git failed"
+        );
+        let reason = failure_reason(&error, Some("glpat-SECRET-TOKEN"));
+
+        assert!(
+            !reason.contains("glpat-SECRET-TOKEN"),
+            "the source token survived into the persisted reason: {reason}"
+        );
+        // Masking, not swallowing: the operator still learns what failed.
+        assert!(reason.contains("git clone"), "{reason}");
+        assert!(reason.contains("gitlab.com/a/b.git"), "{reason}");
+    }
+
+    /// An anonymous import has nothing to mask, and its reason must come
+    /// through untouched — a `***` there would be a mystery, not a redaction.
+    #[test]
+    fn an_anonymous_import_keeps_its_reason_verbatim() {
+        let error = anyhow::anyhow!("repository not found");
+        assert_eq!(failure_reason(&error, None), "repository not found");
+        assert_eq!(failure_reason(&error, Some("")), "repository not found");
     }
 }

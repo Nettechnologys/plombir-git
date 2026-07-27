@@ -231,7 +231,6 @@ mod tests {
             source_url: Set("https://example.com/x/y".to_string()),
             target_owner: Set("owner".to_string()),
             target_name: Set("name".to_string()),
-            auth_token_encrypted: Set(None),
             status: Set(status.to_string()),
             progress: Set(0),
             stage: Set(None),
