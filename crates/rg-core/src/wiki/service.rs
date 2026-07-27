@@ -113,7 +113,19 @@ pub async fn update_page(
         version: sea_orm::Set(next_version),
         created_at: sea_orm::Set(Utc::now()),
     };
-    let _ = wiki_revision_ops::create(db, rev).await; // non-fatal: revision save failure doesn't block page update
+    // Non-fatal: a lost revision must not block the edit the user asked for.
+    // It is still a lost revision — the pre-edit content becomes unrecoverable
+    // the moment the page below is overwritten, so say which one went missing.
+    if let Err(error) = wiki_revision_ops::create(db, rev).await {
+        tracing::warn!(
+            wiki_page_id = existing.id,
+            repo_id,
+            title = %existing.title,
+            version = next_version,
+            error = %format!("{error:#}"),
+            "wiki revision not saved — the page is still being updated, so its previous content is lost from the history"
+        );
+    }
 
     let model = wiki_page::ActiveModel {
         id: sea_orm::Set(existing.id),

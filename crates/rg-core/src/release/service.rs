@@ -155,6 +155,24 @@ pub async fn delete_release(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Roll back the metadata row inserted before the blob was written.
+///
+/// Compensation on an error path: the caller must still see the original
+/// failure, so a failed rollback can only be reported. When it fails the row
+/// survives describing an asset whose bytes were never stored, and every later
+/// download of it answers "blob not found".
+async fn warn_orphan_asset_row(db: &DatabaseConnection, asset: &Asset, cause: &str) {
+    if let Err(cleanup_error) = rg_db::ops::release_ops::delete_asset_by_id(db, asset.id).await {
+        tracing::warn!(
+            asset_id = asset.id,
+            release_id = asset.release_id,
+            filename = %asset.filename,
+            error = %format!("{cleanup_error:#}"),
+            "orphaned release asset row: {cause} and the rollback delete failed too — the row now describes an asset with no bytes behind it"
+        );
+    }
+}
+
 /// Upload a release asset (saves file to disk + creates DB record).
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_asset(
@@ -197,12 +215,12 @@ pub async fn upload_asset(
     let key = match asset_blob_key(owner, repo_name, &asset) {
         Ok(key) => key,
         Err(error) => {
-            let _ = rg_db::ops::release_ops::delete_asset_by_id(db, asset.id).await;
+            warn_orphan_asset_row(db, &asset, "the asset key could not be built").await;
             return Err(error);
         }
     };
     if let Err(error) = storage.put(&key, data).await {
-        let _ = rg_db::ops::release_ops::delete_asset_by_id(db, asset.id).await;
+        warn_orphan_asset_row(db, &asset, "writing the asset blob failed").await;
         return Err(error).context("failed to write release asset");
     }
 

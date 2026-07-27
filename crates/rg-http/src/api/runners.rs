@@ -776,8 +776,31 @@ pub async fn download_cache(
         .flatten();
     if let Some(entry) = &existing {
         if entry.expires_at <= chrono::Utc::now() {
-            let _ = tokio::fs::remove_file(&path).await;
-            let _ = rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, entry.id).await;
+            // Eviction is a side effect of answering 404 — it cannot change the
+            // response, but a half-done eviction leaves residue that nothing
+            // else will come back for.
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                // Already gone: eviction had nothing to do, not a failure.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    repo_id,
+                    cache_entry_id = entry.id,
+                    path = %path.display(),
+                    error = %error,
+                    "expired CI cache archive not deleted — the file stays on disk after its entry expired"
+                ),
+            }
+            if let Err(error) =
+                rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, entry.id).await
+            {
+                tracing::warn!(
+                    repo_id,
+                    cache_entry_id = entry.id,
+                    error = %format!("{error:#}"),
+                    "expired CI cache entry not deleted — the row survives pointing at an archive that was just removed"
+                );
+            }
             return AppError::not_found("cache entry expired").into_response();
         }
     }
@@ -898,7 +921,20 @@ pub async fn upload_cache(
     )
     .await
     {
-        let _ = tokio::fs::remove_file(&path).await;
+        // Compensation on the error path: the runner must still see the DB
+        // failure, so a failed rollback can only be reported. The archive is
+        // already at its final path — if it survives, nothing references it and
+        // retention (which walks DB rows) will never come back for it.
+        if let Err(cleanup_error) = tokio::fs::remove_file(&path).await {
+            tracing::warn!(
+                repo_id,
+                job_id,
+                cache_key = %key,
+                path = %path.display(),
+                error = %cleanup_error,
+                "orphaned CI cache archive: the cache entry was not recorded and the rollback delete failed too — the file stays on disk with no row pointing at it"
+            );
+        }
         return AppError::from(error).into_response();
     }
     StatusCode::NO_CONTENT.into_response()

@@ -494,7 +494,17 @@ pub async fn store_object(
     model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
     model.compressed_size = sea_orm::Set(Some(compressed_size));
     if let Err(error) = model.update(db).await {
-        let _ = storage.delete(&key).await;
+        // Compensation on the error path: the caller must still see the DB
+        // failure, so a failed rollback can only be reported, never returned.
+        if let Err(cleanup_error) = storage.delete(&key).await {
+            tracing::warn!(
+                oid = %oid,
+                repo_id,
+                blob_key = %key,
+                error = %cleanup_error,
+                "orphaned LFS blob: marking the object uploaded failed and the rollback delete failed too — the blob stays in storage while its row still reads uploaded=false"
+            );
+        }
         return Err(error).context("db: update LFS object after store");
     }
 
@@ -580,7 +590,17 @@ pub async fn store_object_from_file(
     model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
     model.compressed_size = sea_orm::Set(Some(compressed_size));
     if let Err(error) = model.update(db).await {
-        let _ = storage.delete(&key).await;
+        // Compensation on the error path: the caller must still see the DB
+        // failure, so a failed rollback can only be reported, never returned.
+        if let Err(cleanup_error) = storage.delete(&key).await {
+            tracing::warn!(
+                oid = %oid,
+                repo_id,
+                blob_key = %key,
+                error = %cleanup_error,
+                "orphaned LFS blob: marking the object uploaded failed and the rollback delete failed too — the blob stays in storage while its row still reads uploaded=false"
+            );
+        }
         return Err(error).context("db: update LFS object after store");
     }
 

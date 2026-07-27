@@ -188,7 +188,9 @@ pub async fn publish(
         {
             Ok(version) => version,
             Err(error) => {
-                let _ = storage
+                // Compensation on the error path: the caller must still see the
+                // DB failure, so a failed rollback can only be reported here.
+                if let Err(cleanup_error) = storage
                     .delete_version(
                         &info.owner,
                         &info.repo,
@@ -196,7 +198,17 @@ pub async fn publish(
                         &info.name,
                         &info.version,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        package = %format!("{}/{}", info.owner, info.repo),
+                        package_type = %info.package_type,
+                        name = %info.name,
+                        version = %info.version,
+                        error = %format!("{cleanup_error:#}"),
+                        "orphaned package files: the version record was not created and the rollback delete failed too — the uploaded files stay in storage with no version row pointing at them"
+                    );
+                }
                 return Err(error.into());
             }
         };
@@ -213,7 +225,11 @@ pub async fn publish(
             )
             .await
             {
-                let _ = storage
+                // Three-part compensation; each part can fail on its own and
+                // leaves a different kind of residue behind. The caller only
+                // ever sees the original file-record error, so every failed
+                // step has to name what it left behind.
+                if let Err(cleanup_error) = storage
                     .delete_version(
                         &info.owner,
                         &info.repo,
@@ -221,9 +237,39 @@ pub async fn publish(
                         &info.name,
                         &info.version,
                     )
-                    .await;
-                let _ = rg_db::ops::package_file_ops::delete_by_version(db, v.id).await;
-                let _ = rg_db::ops::package_version_ops::delete_by_id(db, v.id).await;
+                    .await
+                {
+                    tracing::warn!(
+                        package = %format!("{}/{}", info.owner, info.repo),
+                        package_type = %info.package_type,
+                        name = %info.name,
+                        version = %info.version,
+                        error = %format!("{cleanup_error:#}"),
+                        "orphaned package files: publish failed and the rollback delete failed too — the uploaded files stay in storage"
+                    );
+                }
+                if let Err(cleanup_error) =
+                    rg_db::ops::package_file_ops::delete_by_version(db, v.id).await
+                {
+                    tracing::warn!(
+                        version_id = v.id,
+                        name = %info.name,
+                        version = %info.version,
+                        error = %format!("{cleanup_error:#}"),
+                        "orphaned package_file rows: publish failed and deleting the already-inserted file records failed too — they point at files the rollback is removing"
+                    );
+                }
+                if let Err(cleanup_error) =
+                    rg_db::ops::package_version_ops::delete_by_id(db, v.id).await
+                {
+                    tracing::warn!(
+                        version_id = v.id,
+                        name = %info.name,
+                        version = %info.version,
+                        error = %format!("{cleanup_error:#}"),
+                        "orphaned package_version row: publish failed and deleting the version record failed too — the version is listed but its files are gone"
+                    );
+                }
                 return Err(error.into());
             }
         }
@@ -419,12 +465,33 @@ pub async fn download_file(
 
     let data = storage.read_file(&file_model.storage_path).await?;
 
-    // Increment download counts
-    let _ = rg_db::ops::package_version_ops::increment_download_count(db, version_detail.id).await;
+    // Increment download counts. A failure here must not fail the download the
+    // client already got — but it does mean the published statistics undercount
+    // from now on, so it cannot pass unnoticed either.
+    if let Err(error) =
+        rg_db::ops::package_version_ops::increment_download_count(db, version_detail.id).await
+    {
+        tracing::warn!(
+            version_id = version_detail.id,
+            name = %name,
+            version = %version_str,
+            error = %format!("{error:#}"),
+            "package version download counter not incremented — the version's download count now undercounts this download"
+        );
+    }
     // Need to get package_id from version — we already know it
     let v = rg_db::ops::package_version_ops::find_by_id(db, version_detail.id).await?;
     if let Some(v) = v {
-        let _ = rg_db::ops::package_ops::increment_download_count(db, v.package_id).await;
+        if let Err(error) = rg_db::ops::package_ops::increment_download_count(db, v.package_id).await
+        {
+            tracing::warn!(
+                package_id = v.package_id,
+                name = %name,
+                version = %version_str,
+                error = %format!("{error:#}"),
+                "package download counter not incremented — the package's download count now undercounts this download"
+            );
+        }
     }
 
     let content_type = mime_guess_for_filename(filename);

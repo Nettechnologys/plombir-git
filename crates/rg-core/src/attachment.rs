@@ -252,7 +252,16 @@ async fn persist_attachment(
     match rg_db::ops::attachment_ops::create(db, model).await {
         Ok(attachment) => Ok(attachment),
         Err(error) => {
-            let _ = storage.delete(&key).await;
+            // Compensation, not the outcome: the original DB error is what the
+            // caller must see, so a failed rollback can only be reported here.
+            if let Err(cleanup_error) = storage.delete(&key).await {
+                tracing::warn!(
+                    blob_key = %key,
+                    repo_id,
+                    error = %cleanup_error,
+                    "orphaned attachment blob: metadata insert failed and the rollback delete failed too — the blob stays in storage with no row pointing at it"
+                );
+            }
             Err(error).context("failed to persist attachment metadata")
         }
     }
@@ -351,14 +360,32 @@ pub async fn delete_attachment(
         return Err(error).context("failed to delete attachment blob");
     }
     if let Err(error) = rg_db::ops::attachment_ops::delete_by_id(db, attachment.id).await {
-        match &backup {
-            AttachmentBackup::File(path) => {
-                let _ = storage.put_file(&key, path).await;
+        // The blob is already gone. If putting it back fails, the row survives
+        // pointing at nothing and the bytes are lost for good — that outcome
+        // must be named in the log, since the caller only ever sees the DB error.
+        let restore_failure: Option<String> = match &backup {
+            AttachmentBackup::File(path) => storage
+                .put_file(&key, path)
+                .await
+                .err()
+                .map(|error| error.to_string()),
+            AttachmentBackup::Bytes(Some(data)) => storage
+                .put(&key, data)
+                .await
+                .err()
+                .map(|error| error.to_string()),
+            AttachmentBackup::Bytes(None) => {
+                Some("no backup was captured before the blob was deleted".to_string())
             }
-            AttachmentBackup::Bytes(Some(data)) => {
-                let _ = storage.put(&key, data).await;
-            }
-            AttachmentBackup::Bytes(None) => {}
+        };
+        if let Some(reason) = restore_failure {
+            tracing::warn!(
+                attachment_id = attachment.id,
+                blob_key = %key,
+                repo_id,
+                error = %reason,
+                "attachment lost: the blob was deleted, the metadata delete failed, and restoring the blob failed too — the row now points at a missing blob"
+            );
         }
         backup.cleanup().await;
         return Err(error).context("failed to delete attachment metadata");

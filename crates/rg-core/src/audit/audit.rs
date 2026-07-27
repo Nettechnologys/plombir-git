@@ -41,6 +41,17 @@ pub async fn record(
     };
 
     if let Err(e) = audit_log::Entity::insert(entry).exec(db).await {
-        tracing::warn!(%action, "failed to write audit log: {}", e);
+        // Never propagated by design — so the log line is the only record that
+        // this event happened at all. Name what it was about, not just that a
+        // write failed.
+        tracing::warn!(
+            %action,
+            user_id = ?user_id,
+            resource_type = ?resource_type,
+            resource_id = ?resource_id,
+            resource_name = ?resource_name,
+            error = %format!("{e:#}"),
+            "audit event not written — this action leaves no trace in the audit log"
+        );
     }
 }

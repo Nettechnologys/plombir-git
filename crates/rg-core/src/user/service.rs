@@ -735,7 +735,7 @@ async fn forgot_password_inner(
                 tracing::warn!(
                     user_id,
                     error = %format!("{e:#}"),
-                    "password reset email delivery failed"
+                    "password reset email not delivered — the token was issued and will expire unused, and the request answered success, so the user is waiting for a link that never arrives"
                 );
             }
         });

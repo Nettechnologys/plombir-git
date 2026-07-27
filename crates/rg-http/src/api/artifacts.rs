@@ -117,8 +117,25 @@ pub async fn upload_artifact(
         )
             .into_response(),
         Err(e) => {
-            if let Ok(key) = rg_core::blob_storage::BlobKey::new(&upload.storage_path) {
-                let _ = state.blob_storage.delete(&key).await;
+            // Compensation on the error path: the client must still get the DB
+            // failure, so a failed rollback can only be reported here.
+            let cleanup = match rg_core::blob_storage::BlobKey::new(&upload.storage_path) {
+                Ok(key) => state
+                    .blob_storage
+                    .delete(&key)
+                    .await
+                    .err()
+                    .map(|error| error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(reason) = cleanup {
+                tracing::warn!(
+                    job_id,
+                    artifact = %upload.name,
+                    storage_path = %upload.storage_path,
+                    error = %reason,
+                    "orphaned CI artifact blob: the artifact row was not created and the rollback delete failed too — the blob stays in storage with no row pointing at it"
+                );
             }
             AppError::from(e).into_response()
         }
