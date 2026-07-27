@@ -56,6 +56,9 @@ pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delive
 pub mod error; // Domain error types (CoreError)
 pub mod metrics_hook; // Observer hooks so the HTTP layer can meter core-crate events
 
+#[cfg(test)]
+pub(crate) mod test_support; // Fixtures shared by unit tests of several services
+
 use anyhow::Result;
 
 /// Check if a username is valid (alphanumeric + hyphen + underscore, max 39).

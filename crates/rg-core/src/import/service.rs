@@ -25,10 +25,17 @@
 //! For the same reason a failure reason is masked with [`failure_reason`]
 //! before it is persisted: the token reaches `git`/the platform API, so it can
 //! come back inside their error text.
+//!
+//! On the way to `git` the token travels through the **environment**, read back
+//! by an inline credential helper — never through argv and never through the
+//! clone URL, which git copies verbatim into the new repository's
+//! `remote.origin.url`. See [`rg_git::credentials::credential_invocation`],
+//! which mirror sync shares: both hand a secret to a user-supplied remote.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_git::cli_gateway::global_gateway;
+use rg_git::credentials::{credential_invocation, GitCredentials};
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use std::collections::HashMap;
 use std::path::Path;
@@ -119,7 +126,7 @@ async fn run_git_import(
             repo_root,
             &task.target_owner,
             &task.target_name,
-            auth_token,
+            source_credentials(&task.platform, auth_token).as_ref(),
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 90, "Repository cloned").await?;
@@ -170,7 +177,7 @@ async fn run_github_import(
             repo_root,
             &task.target_owner,
             &task.target_name,
-            token,
+            source_credentials(&task.platform, token).as_ref(),
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 10, "Repository cloned").await?;
@@ -338,15 +345,14 @@ async fn run_gitlab_import(
         let project = client.get_project(&project_path).await?;
         // The clone URL comes from the GitLab API response, not the user's
         // source_url — re-guard it (a malicious/compromised instance could point
-        // `http_url_to_repo` at an internal host). Guard the token-free URL.
+        // `http_url_to_repo` at an internal host).
         crate::net::guard_git_url(&project.http_url_to_repo).await?;
-        let clone_url = build_gitlab_clone_url(&project.http_url_to_repo, token);
         clone_repo(
-            &clone_url,
+            &project.http_url_to_repo,
             repo_root,
             &task.target_owner,
             &task.target_name,
-            token,
+            source_credentials(&task.platform, token).as_ref(),
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 10, "Repository cloned").await?;
@@ -521,13 +527,42 @@ async fn resolve_or_create_target_repo(
 // Git helpers
 // ═══════════════════════════════════════════════════════════════════════
 
+/// How a source platform expects a personal access token to arrive.
+///
+/// The token always travels as the HTTP Basic *password*; the username is the
+/// fixed placeholder the platform documents — `x-access-token` for GitHub,
+/// `oauth2` for GitLab — because Basic auth has nowhere to put a lone token.
+/// Gitea (and a plain git remote fronted by it) checks the password against its
+/// access tokens and ignores the username, so the GitLab placeholder serves
+/// those too.
+///
+/// An empty token means the user described a public source: the clone stays
+/// anonymous rather than offering an empty password.
+fn source_credentials(platform: &str, token: &str) -> Option<GitCredentials> {
+    if token.is_empty() {
+        return None;
+    }
+    let username = match platform {
+        "github" => "x-access-token",
+        _ => "oauth2",
+    };
+    Some(GitCredentials::token(username, token))
+}
+
 /// Clone a repository (bare) into the ForgeKeep repo root.
+///
+/// The source's token never enters `source_url` and never enters argv — it is
+/// handed to the subprocess through the environment by
+/// [`credential_invocation`]. A URL with the token in it would be copied
+/// verbatim by git into the new repository's `remote.origin.url`, leaving a
+/// plaintext PAT on disk long after the import finished, and would show up in
+/// `ps`, in the gateway's error text, and in its trace span.
 fn clone_repo(
     source_url: &str,
     repo_root: &Path,
     owner: &str,
     name: &str,
-    _token: &str,
+    credentials: Option<&GitCredentials>,
 ) -> Result<()> {
     let target_dir = repo_root.join(format!("{}/{}.git", owner, name));
     if target_dir.join("HEAD").exists() {
@@ -550,11 +585,17 @@ fn clone_repo(
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    git.run_or_bail(
-        &["clone", "--bare", source_url, &target_dir.to_string_lossy()],
-        None,
-    )
-    .context("git clone --bare")?;
+    let (credential_args, env) = credential_invocation(credentials);
+    let destination = target_dir.to_string_lossy();
+    let mut args: Vec<&str> = credential_args.iter().map(String::as_str).collect();
+    args.extend(["clone", "--bare", source_url, &destination]);
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    git.run_with_env(&args, None, &env)?
+        .ensure_success()
+        .context("git clone --bare")?;
 
     tracing::info!(path = %target_dir.display(), "Repository cloned");
     Ok(())
@@ -585,14 +626,6 @@ fn parse_gitlab_url(url: &str) -> Result<String> {
         }
     }
     anyhow::bail!("invalid GitLab URL: {url}")
-}
-
-fn build_gitlab_clone_url(http_url: &str, token: &str) -> String {
-    if token.is_empty() {
-        http_url.to_string()
-    } else {
-        http_url.replacen("://", &format!("://oauth2:{}@", token), 1)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1520,7 +1553,7 @@ mod clone_path_tests {
             &repo_root,
             "alice",
             "site",
-            "",
+            None,
         )
         .expect_err("repo_root is a file");
         let rendered = format!("{error:#}");
@@ -1534,13 +1567,153 @@ mod clone_path_tests {
 }
 
 #[cfg(test)]
+mod clone_credential_tests {
+    use super::*;
+    use crate::test_support::spawn_authenticating_remote;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    const TOKEN: &str = "ghp-SECRET-TOKEN";
+
+    /// A source with no token is public: offering git an empty password would
+    /// turn an anonymous clone into a refused authenticated one.
+    #[test]
+    fn a_public_source_is_cloned_anonymously() {
+        assert!(source_credentials("github", "").is_none());
+        assert!(source_credentials("gitlab", "").is_none());
+    }
+
+    /// Basic auth has nowhere to put a lone token, so each platform's
+    /// placeholder username has to be the one that platform actually accepts.
+    #[test]
+    fn each_platform_gets_the_username_it_documents() {
+        let github = source_credentials("github", TOKEN).expect("a token is a credential");
+        assert_eq!(github.password(), TOKEN);
+        let (_, env) = credential_invocation(Some(&github));
+        let env: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            env.get(rg_git::credentials::USERNAME_ENV)
+                .map(String::as_str),
+            Some("x-access-token")
+        );
+
+        let gitlab = source_credentials("gitlab", TOKEN).expect("a token is a credential");
+        let (_, env) = credential_invocation(Some(&gitlab));
+        let env: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            env.get(rg_git::credentials::USERNAME_ENV)
+                .map(String::as_str),
+            Some("oauth2")
+        );
+    }
+
+    /// The acceptance check of card_64918e1184ff, on-disk half: git copies the
+    /// URL it was handed verbatim into the clone's `remote.origin.url`. When the
+    /// token rode inside that URL, the import left a plaintext PAT in
+    /// `<repo>.git/config` — readable long after the import finished.
+    #[test]
+    fn the_token_is_absent_from_the_cloned_repository_config() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = directory.path().join("source.git");
+        let git = global_gateway().as_ref().expect("git");
+        git.run_or_bail(&["init", "--bare", &source.to_string_lossy()], None)
+            .expect("source repo");
+
+        let repo_root = directory.path().join("repo_root");
+        let credentials = source_credentials("github", TOKEN).expect("a token");
+        clone_repo(
+            &source.to_string_lossy(),
+            &repo_root,
+            "alice",
+            "site",
+            Some(&credentials),
+        )
+        .expect("clone of a local source");
+
+        let config = std::fs::read_to_string(repo_root.join("alice/site.git/config"))
+            .expect("the clone has a config");
+        assert!(
+            !config.contains(TOKEN),
+            "the token was written to the cloned repository's config:\n{config}"
+        );
+        assert!(
+            config.contains(&source.to_string_lossy().to_string()),
+            "the remote URL is missing entirely, so this test proves nothing:\n{config}"
+        );
+    }
+
+    /// The acceptance check of card_64918e1184ff, authentication half: a private
+    /// GitHub source must actually get as far as authenticating. The token used
+    /// to be accepted by `clone_repo` as `_token` and ignored, so every private
+    /// GitHub import answered 401 — the same "stored but unused" half the
+    /// mirrors had.
+    #[test]
+    fn a_private_source_receives_the_supplied_token() {
+        let (address, seen) = spawn_authenticating_remote();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let credentials = source_credentials("github", TOKEN).expect("a token");
+
+        let outcome = clone_repo(
+            &format!("http://{address}/upstream.git"),
+            directory.path(),
+            "alice",
+            "site",
+            Some(&credentials),
+        );
+        assert!(
+            outcome.is_err(),
+            "the stub remote refuses everyone — the clone cannot succeed"
+        );
+
+        let seen = seen.lock().expect("lock");
+        let expected = format!(
+            "Basic {}",
+            STANDARD.encode(format!("x-access-token:{TOKEN}"))
+        );
+        assert!(
+            seen.contains(&expected),
+            "the remote never received the supplied token; it saw {seen:?}"
+        );
+    }
+
+    /// An import runs with no terminal behind it: a source that asks for a login
+    /// has to end the clone, not park it until the gateway's 120-second timeout
+    /// while the user watches "Cloning…".
+    ///
+    /// Honest about its own reach: a test binary has no tty either, so this
+    /// stays green even without `GIT_TERMINAL_PROMPT=0` — it guards the path,
+    /// not the flag. The flag itself is pinned in
+    /// `rg_git::credentials`, where removing it turns two tests red.
+    #[test]
+    fn an_authenticating_source_fails_fast_instead_of_waiting_for_a_login() {
+        let (address, _seen) = spawn_authenticating_remote();
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        let started = std::time::Instant::now();
+        let outcome = clone_repo(
+            &format!("http://{address}/upstream.git"),
+            directory.path(),
+            "alice",
+            "site",
+            None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(outcome.is_err(), "the stub remote demands authentication");
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the clone waited {elapsed:?} — that is a prompt, not a refusal"
+        );
+    }
+}
+
+#[cfg(test)]
 mod failure_reason_tests {
     use super::*;
 
-    /// The clone URL GitLab imports build carries the PAT, and the git gateway
-    /// quotes the command line it ran back into its error. Whatever the token
-    /// rode in on, it must not reach the `error` column — that column is served
-    /// to the browser on every status poll.
+    /// The token no longer rides in the clone URL, but it still reaches the
+    /// platform's API and `git`, and both quote what they were given back into
+    /// their error text. Whatever it rode in on, it must not reach the `error`
+    /// column — that column is served to the browser on every status poll.
     #[test]
     fn the_token_is_taken_back_out_of_a_failure() {
         let error = anyhow::anyhow!(

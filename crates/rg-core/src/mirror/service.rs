@@ -14,13 +14,16 @@
 //! On the way to `git` the plaintext travels through the **environment**, never
 //! through argv and never through the remote URL: argv is world-readable on a
 //! shared box (`ps`), and a URL with credentials in it is what git writes
-//! verbatim into `.git/config` on disk. See [`credential_invocation`].
+//! verbatim into `.git/config` on disk. See
+//! [`rg_git::credentials::credential_invocation`], which the import pipeline
+//! shares — both carry a secret to a user-supplied remote.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_db::entities::mirror::{ActiveModel, Model as Mirror};
 use rg_db::entities::repository;
 use rg_git::cli_gateway::global_gateway;
+use rg_git::credentials::{credential_invocation, GitCredentials};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use std::path::Path;
@@ -260,18 +263,6 @@ pub async fn trigger_sync(
 
 // ── Credentials ─────────────────────────────────────────────────────────
 
-/// Environment variables the credential helper reads the secret out of. Named
-/// after the product so they cannot collide with something the operator has
-/// already exported for their own git usage.
-const USERNAME_ENV: &str = "FORGEKEEP_MIRROR_USERNAME";
-const PASSWORD_ENV: &str = "FORGEKEEP_MIRROR_PASSWORD";
-
-/// The remote's credential, decrypted for the duration of a single sync.
-struct MirrorCredentials {
-    username: Option<String>,
-    password: String,
-}
-
 /// Encrypt an operator-supplied password for storage.
 ///
 /// `None` and `Some("")` both mean "no credential" — the empty string is how
@@ -291,77 +282,24 @@ fn encrypt_password(password: Option<&str>, jwt_secret: &str) -> Result<Option<S
 /// A mirror with a username but no password is *not* a credential: git would
 /// be handed half an answer, be refused, and (with prompting disabled) fail
 /// with a confusing error instead of the honest anonymous-access one.
-fn load_credentials(mirror: &Mirror, jwt_secret: &str) -> Result<Option<MirrorCredentials>> {
+fn load_credentials(mirror: &Mirror, jwt_secret: &str) -> Result<Option<GitCredentials>> {
     let Some(ciphertext) = mirror.password_encrypted.as_deref() else {
         return Ok(None);
     };
     let key = crate::auth::encryption::derive_key(jwt_secret);
     let password = crate::auth::encryption::decrypt(ciphertext, &key)
         .context("mirror credential could not be decrypted")?;
-    Ok(Some(MirrorCredentials {
-        username: mirror
-            .username
-            .clone()
-            .filter(|username| !username.is_empty()),
-        password,
-    }))
+    Ok(Some(GitCredentials::new(mirror.username.clone(), password)))
 }
 
 /// Replace the credential in a message that is about to be persisted or logged.
-fn mask_credential(message: &str, credentials: Option<&Option<MirrorCredentials>>) -> String {
+fn mask_credential(message: &str, credentials: Option<&Option<GitCredentials>>) -> String {
     match credentials.and_then(Option::as_ref) {
-        Some(credentials) => crate::auth::encryption::mask_values(
-            message,
-            std::slice::from_ref(&credentials.password),
-        ),
+        Some(credentials) => {
+            crate::auth::encryption::mask_values(message, &[credentials.password().to_string()])
+        }
         None => message.to_string(),
     }
-}
-
-/// Extra `git` arguments and environment that let the subprocess authenticate.
-///
-/// The secret is passed through the environment and read by an inline
-/// credential helper, so:
-///
-/// - it never appears in argv (`ps` on a shared host would show it, and the
-///   gateway echoes the command line into its error text and trace span);
-/// - it never appears in the remote URL, which git copies verbatim into
-///   `.git/config` — an on-disk plaintext copy that outlives the sync.
-///
-/// The empty `credential.helper=` in front resets the helper list, so a helper
-/// configured system- or user-wide on the host can neither answer first nor be
-/// handed this credential to store.
-///
-/// `GIT_TERMINAL_PROMPT=0` is set whether or not a credential exists: a sync
-/// runs with no terminal behind it, so a remote that asks for authentication
-/// must fail fast instead of blocking until the gateway's timeout.
-fn credential_invocation(
-    credentials: Option<&MirrorCredentials>,
-) -> (Vec<String>, Vec<(String, String)>) {
-    let mut env = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
-    let Some(credentials) = credentials else {
-        return (Vec::new(), env);
-    };
-
-    // git runs a `!`-prefixed helper through `sh -c '<value> "$@"' <value> get`,
-    // so the trailing `f` becomes the call and takes the operation as `$1`.
-    let mut helper = String::from("!f() { ");
-    if credentials.username.is_some() {
-        helper.push_str(&format!("echo username=\"${USERNAME_ENV}\"; "));
-    }
-    helper.push_str(&format!("echo password=\"${PASSWORD_ENV}\"; }}; f"));
-
-    let args = vec![
-        "-c".to_string(),
-        "credential.helper=".to_string(),
-        "-c".to_string(),
-        format!("credential.helper={helper}"),
-    ];
-    if let Some(username) = &credentials.username {
-        env.push((USERNAME_ENV.to_string(), username.clone()));
-    }
-    env.push((PASSWORD_ENV.to_string(), credentials.password.clone()));
-    (args, env)
 }
 
 // ── Git helpers ─────────────────────────────────────────────────────────
@@ -369,7 +307,7 @@ fn credential_invocation(
 fn run_git_clone_mirror(
     url: &str,
     path: &Path,
-    credentials: Option<&MirrorCredentials>,
+    credentials: Option<&GitCredentials>,
 ) -> Result<()> {
     // `create mirror dir` named the operation but never the directory, and the
     // directory — `repo_root` — is the only thing an operator can act on when
@@ -402,7 +340,7 @@ fn run_git_clone_mirror(
         .context("git clone --mirror")
 }
 
-fn run_git_remote_update(path: &Path, credentials: Option<&MirrorCredentials>) -> Result<()> {
+fn run_git_remote_update(path: &Path, credentials: Option<&GitCredentials>) -> Result<()> {
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -421,18 +359,13 @@ fn run_git_remote_update(path: &Path, credentials: Option<&MirrorCredentials>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::spawn_authenticating_remote;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
 
     const SECRET: &str = "test-secret-key";
 
-    fn credentials(username: Option<&str>, password: &str) -> MirrorCredentials {
-        MirrorCredentials {
-            username: username.map(str::to_string),
-            password: password.to_string(),
-        }
+    fn credentials(username: Option<&str>, password: &str) -> GitCredentials {
+        GitCredentials::new(username.map(str::to_string), password.to_string())
     }
 
     fn mirror_row(username: Option<&str>, password_encrypted: Option<String>) -> Mirror {
@@ -465,8 +398,16 @@ mod tests {
         let loaded = load_credentials(&mirror_row(Some("sync-bot"), Some(stored)), SECRET)
             .expect("decrypt")
             .expect("a stored credential is readable");
-        assert_eq!(loaded.password, "hunter2");
-        assert_eq!(loaded.username.as_deref(), Some("sync-bot"));
+        assert_eq!(loaded.password(), "hunter2");
+        // The username is only ever observable where it is used — in what the
+        // credential helper answers with.
+        let (_, env) = credential_invocation(Some(&loaded));
+        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            env.get(rg_git::credentials::USERNAME_ENV)
+                .map(String::as_str),
+            Some("sync-bot")
+        );
     }
 
     /// Two encryptions of one password differ (fresh nonce), so the column can't
@@ -496,7 +437,7 @@ mod tests {
         let stored = encrypt_password(Some("hunter2"), "some-other-secret")
             .unwrap()
             .unwrap();
-        // `MirrorCredentials` deliberately has no `Debug`, so that no stray
+        // `GitCredentials` deliberately has no `Debug`, so that no stray
         // `{:?}` can ever print a password — which is also why this unwraps by
         // hand instead of reaching for `expect_err`.
         let error = match load_credentials(&mirror_row(None, Some(stored)), SECRET) {
@@ -504,52 +445,6 @@ mod tests {
             Ok(_) => panic!("a credential that cannot be decrypted must not be usable"),
         };
         assert!(format!("{error:#}").contains("could not be decrypted"));
-    }
-
-    /// The whole point of the environment hand-off: `ps` (and the gateway's own
-    /// error text, which quotes the command line) must never see the password.
-    #[test]
-    fn the_password_never_reaches_the_command_line() {
-        let credentials = credentials(Some("sync-bot"), "hunter2");
-        let (args, env) = credential_invocation(Some(&credentials));
-
-        let command_line = args.join(" ");
-        assert!(
-            !command_line.contains("hunter2"),
-            "the password leaked into argv: {command_line}"
-        );
-        assert!(
-            !command_line.contains("sync-bot"),
-            "the username leaked into argv: {command_line}"
-        );
-        // The helper list is reset first, then our helper is installed.
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "credential.helper=");
-        assert!(args[3].contains(USERNAME_ENV) && args[3].contains(PASSWORD_ENV));
-
-        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(env.get(PASSWORD_ENV).map(String::as_str), Some("hunter2"));
-        assert_eq!(env.get(USERNAME_ENV).map(String::as_str), Some("sync-bot"));
-        assert_eq!(
-            env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
-            Some("0")
-        );
-    }
-
-    /// With no credential there is nothing to hand over — but prompting still
-    /// has to be off, or an authenticating remote hangs the sync until the
-    /// gateway's timeout instead of failing with "authentication required".
-    #[test]
-    fn an_anonymous_mirror_installs_no_helper_but_still_cannot_prompt() {
-        let (args, env) = credential_invocation(None);
-        assert!(
-            args.is_empty(),
-            "an anonymous sync configured a credential helper"
-        );
-        assert_eq!(
-            env,
-            vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]
-        );
     }
 
     #[test]
@@ -560,56 +455,6 @@ mod tests {
             credentials.as_ref(),
         );
         assert!(!masked.contains("hunter2"), "{masked}");
-    }
-
-    /// A remote that speaks HTTP Basic: 401 until an `Authorization` header
-    /// shows up, then 403 so `git` stops instead of retrying. Returns the bound
-    /// address and the list of credentials the remote actually received.
-    fn spawn_authenticating_remote() -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("addr").to_string();
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&seen);
-
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-                let mut authorization = None;
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                    if line == "\r\n" || line == "\n" {
-                        break;
-                    }
-                    if let Some(value) = line
-                        .strip_prefix("Authorization: ")
-                        .or_else(|| line.strip_prefix("authorization: "))
-                    {
-                        authorization = Some(value.trim().to_string());
-                    }
-                }
-                let response = match authorization {
-                    Some(value) => {
-                        recorder.lock().expect("lock").push(value);
-                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    }
-                    None => {
-                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"forgekeep\"\
-                         \r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    }
-                };
-                if stream.write_all(response.as_bytes()).is_ok() {
-                    drop(stream.flush());
-                }
-            }
-        });
-
-        (address, seen)
     }
 
     /// The acceptance check of card_c29cb3416941: a mirror of a *private* remote
