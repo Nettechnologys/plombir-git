@@ -31,10 +31,6 @@ const root = resolve(scriptsDir, '..');
 //   - nothing gets added here without a card id explaining the red.
 const QUARANTINE = new Map([
   [
-    'api-client-contract-check.mjs',
-    'card_4619acdf95a9 — six passkey endpoints are missing from the OpenAPI spec',
-  ],
-  [
     'release-assets-contract-check.mjs',
     'card_0c926648b67d — the check greps authorization symbols that were renamed',
   ],

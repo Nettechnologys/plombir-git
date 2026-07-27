@@ -157,6 +157,142 @@ pub struct PasskeyInfo {
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Wrapper returned by WebAuthn registration start.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyRegisterStartResponse {
+    pub public_key: PasskeyCreationOptions,
+}
+
+/// WebAuthn credential creation options sent to the browser.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyCreationOptions {
+    pub rp: PasskeyRelyingParty,
+    pub user: PasskeyUserEntity,
+    pub challenge: String,
+    pub pub_key_cred_params: Vec<PasskeyCredentialParameter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_credentials: Option<Vec<PasskeyCredentialDescriptor>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticator_selection: Option<PasskeyAuthenticatorSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_formats: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyRelyingParty {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyUserEntity {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyCredentialParameter {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub alg: i64,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyCredentialDescriptor {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transports: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyAuthenticatorSelection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticator_attachment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_key: Option<String>,
+    pub require_resident_key: bool,
+    pub user_verification: String,
+}
+
+/// Browser credential returned from `navigator.credentials.create()`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyRegistrationCredential {
+    pub id: String,
+    #[serde(rename = "rawId")]
+    pub raw_id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub response: PasskeyAttestationResponse,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyAttestationResponse {
+    #[serde(rename = "attestationObject")]
+    pub attestation_object: String,
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transports: Option<Vec<String>>,
+}
+
+/// Wrapper returned by WebAuthn login start.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyLoginStartResponse {
+    pub public_key: PasskeyRequestOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mediation: Option<String>,
+}
+
+/// WebAuthn credential request options sent to the browser.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyRequestOptions {
+    pub challenge: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    pub rp_id: String,
+    pub allow_credentials: Vec<PasskeyCredentialDescriptor>,
+    pub user_verification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<Vec<String>>,
+}
+
+/// Browser credential returned from `navigator.credentials.get()`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyAuthenticationCredential {
+    pub id: String,
+    #[serde(rename = "rawId")]
+    pub raw_id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub response: PasskeyAssertionResponse,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PasskeyAssertionResponse {
+    #[serde(rename = "authenticatorData")]
+    pub authenticator_data: String,
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
+    pub signature: String,
+    #[serde(rename = "userHandle", skip_serializing_if = "Option::is_none")]
+    pub user_handle: Option<String>,
+}
+
 impl From<rg_db::entities::passkey_credential::Model> for PasskeyInfo {
     fn from(m: rg_db::entities::passkey_credential::Model) -> Self {
         Self {
@@ -190,6 +326,17 @@ async fn load_passkeys(
 // ── Registration ──────────────────────────────────────────────────────────
 
 /// POST /users/passkeys/register/start
+#[utoipa::path(
+    post,
+    path = "/users/passkeys/register/start",
+    tag = "Passkeys",
+    responses(
+        (status = 200, description = "Registration challenge issued", body = PasskeyRegisterStartResponse),
+        (status = 400, description = "Invalid WebAuthn relying-party configuration", body = serde_json::Value),
+        (status = 401, description = "Authentication required", body = serde_json::Value),
+        (status = 404, description = "User not found", body = serde_json::Value),
+    ),
+)]
 pub async fn register_start(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
@@ -207,7 +354,10 @@ pub async fn register_start(
         .map(|(_, pk)| pk.cred_id().clone())
         .collect();
 
-    let display = user.display_name.clone().unwrap_or_else(|| user.username.clone());
+    let display = user
+        .display_name
+        .clone()
+        .unwrap_or_else(|| user.username.clone());
     let (ccr, reg) = wa::start_registration(&webauthn, user_id, &user.username, &display, exclude)
         .map_err(AppError::from)?;
 
@@ -237,11 +387,23 @@ pub struct RegisterFinishRequest {
     #[serde(default)]
     pub name: String,
     /// The browser's `navigator.credentials.create()` result.
-    #[schema(value_type = Object)]
+    #[schema(value_type = PasskeyRegistrationCredential)]
     pub credential: wa::RegisterPublicKeyCredential,
 }
 
 /// POST /users/passkeys/register/finish
+#[utoipa::path(
+    post,
+    path = "/users/passkeys/register/finish",
+    tag = "Passkeys",
+    request_body = RegisterFinishRequest,
+    responses(
+        (status = 200, description = "Passkey registered", body = Vec<PasskeyInfo>),
+        (status = 400, description = "Missing, expired, or invalid registration challenge", body = serde_json::Value),
+        (status = 401, description = "Authentication required", body = serde_json::Value),
+        (status = 409, description = "Passkey already registered", body = serde_json::Value),
+    ),
+)]
 pub async fn register_finish(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
@@ -250,9 +412,13 @@ pub async fn register_finish(
 ) -> Result<impl IntoResponse, AppError> {
     let sealed = extract_cookie(&headers, PASSKEY_REG_COOKIE)
         .and_then(|t| wa::unseal_state::<RegState>(t, "reg", &state.jwt_secret))
-        .ok_or_else(|| AppError::bad_request("passkey registration challenge missing or expired"))?;
+        .ok_or_else(|| {
+            AppError::bad_request("passkey registration challenge missing or expired")
+        })?;
     if sealed.user_id != user_id {
-        return Err(AppError::unauthorized("registration challenge does not match session"));
+        return Err(AppError::unauthorized(
+            "registration challenge does not match session",
+        ));
     }
 
     let webauthn = webauthn_for(&state, &headers)?;
@@ -306,6 +472,15 @@ fn sanitize_name(raw: &str) -> String {
 }
 
 /// GET /users/passkeys
+#[utoipa::path(
+    get,
+    path = "/users/passkeys",
+    tag = "Passkeys",
+    responses(
+        (status = 200, description = "Registered passkeys", body = Vec<PasskeyInfo>),
+        (status = 401, description = "Authentication required", body = serde_json::Value),
+    ),
+)]
 pub async fn list_passkeys(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
@@ -317,6 +492,19 @@ pub async fn list_passkeys(
 }
 
 /// DELETE /users/passkeys/{id}
+#[utoipa::path(
+    delete,
+    path = "/users/passkeys/{id}",
+    tag = "Passkeys",
+    params(
+        ("id" = i64, Path, description = "Passkey id"),
+    ),
+    responses(
+        (status = 204, description = "Passkey deleted"),
+        (status = 401, description = "Authentication required", body = serde_json::Value),
+        (status = 404, description = "Passkey not found", body = serde_json::Value),
+    ),
+)]
 pub async fn delete_passkey(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
@@ -339,6 +527,16 @@ pub struct LoginStartRequest {
 }
 
 /// POST /users/passkeys/login/start
+#[utoipa::path(
+    post,
+    path = "/users/passkeys/login/start",
+    tag = "Passkeys",
+    request_body = LoginStartRequest,
+    responses(
+        (status = 200, description = "Login challenge issued", body = PasskeyLoginStartResponse),
+        (status = 400, description = "No registered passkey or invalid WebAuthn relying-party configuration", body = serde_json::Value),
+    ),
+)]
 pub async fn login_start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -400,6 +598,16 @@ pub struct PasskeyLoginResponse {
 /// A successful passkey assertion is phishing-resistant strong authentication,
 /// so it completes login on its own — it is not gated behind the TOTP second
 /// factor.
+#[utoipa::path(
+    post,
+    path = "/users/passkeys/login/finish",
+    tag = "Passkeys",
+    request_body = PasskeyAuthenticationCredential,
+    responses(
+        (status = 200, description = "Login successful", body = PasskeyLoginResponse),
+        (status = 401, description = "Missing challenge, invalid credential, or locked account", body = serde_json::Value),
+    ),
+)]
 pub async fn login_finish(
     State(state): State<AppState>,
     headers: HeaderMap,
