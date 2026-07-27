@@ -13,6 +13,7 @@ use crate::api::repo_access::RepoRead;
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::attachment::AttachmentTarget;
+use rg_core::platform::fs::discard_file_async;
 
 #[derive(Debug, Deserialize)]
 pub struct UploadQuery {
@@ -469,7 +470,7 @@ async fn create(
             Ok(None) => break,
             Err(error) => {
                 drop(upload);
-                let _ = tokio::fs::remove_file(&upload_path).await;
+                discard_file_async("attachment staging file", &upload_path).await;
                 return AppError::bad_request(error).into_response();
             }
         };
@@ -477,21 +478,21 @@ async fn create(
             Some(size) if size <= rg_core::attachment::MAX_ATTACHMENT_SIZE as u64 => size,
             _ => {
                 drop(upload);
-                let _ = tokio::fs::remove_file(&upload_path).await;
+                discard_file_async("attachment staging file", &upload_path).await;
                 return AppError::bad_request("attachment exceeds the 100 MiB file limit")
                     .into_response();
             }
         };
         if let Err(error) = upload.write_all(&chunk).await {
             drop(upload);
-            let _ = tokio::fs::remove_file(&upload_path).await;
+            discard_file_async("attachment staging file", &upload_path).await;
             return upload_path_error("attachment staging file", &upload_path, &error)
                 .into_response();
         }
     }
     if let Err(error) = upload.flush().await {
         drop(upload);
-        let _ = tokio::fs::remove_file(&upload_path).await;
+        discard_file_async("attachment staging file", &upload_path).await;
         return upload_path_error("attachment staging file", &upload_path, &error).into_response();
     }
     drop(upload);
@@ -508,7 +509,7 @@ async fn create(
         size,
     )
     .await;
-    let _ = tokio::fs::remove_file(&upload_path).await;
+    discard_file_async("attachment staging file", &upload_path).await;
     match result {
         Ok(attachment) => (
             StatusCode::CREATED,

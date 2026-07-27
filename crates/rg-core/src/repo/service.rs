@@ -13,6 +13,7 @@ use rg_db::{
 };
 
 use super::templates;
+use crate::platform::fs::discard_dir;
 
 /// One actionable error for a failure to stage a temporary git working tree.
 ///
@@ -527,9 +528,23 @@ pub async fn create_repo_with_opts(
         );
 
         if let Err(e) = &init_result {
-            // If auto_init fails, clean up the bare repo so we don't leave
-            // an inconsistent state
-            let _ = std::fs::remove_dir_all(&git_path);
+            // If auto_init fails, roll the bare repo back so we don't leave an
+            // inconsistent state. The rollback failing is worse than the usual
+            // orphaned-temp-file case and gets its own line: the directory is
+            // where `create_repo` looks before it does anything, so what the
+            // owner sees on their next attempt is "repository already exists"
+            // for a repository that was never created.
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&git_path) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %git_path.display(),
+                        error = %cleanup_error,
+                        "failed to roll back the bare repository of a failed create; re-creating \
+                         {name} will keep failing with \"repository already exists\" until the \
+                         directory is removed"
+                    );
+                }
+            }
             bail!("auto-initialization failed: {}", e);
         }
 
@@ -714,7 +729,7 @@ fn auto_init_repo(
 
     // If no files were written, skip commit and just clean up
     if !files_written {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("auto-init working tree", &tmp);
         tracing::info!(%repo_name, "auto_init: no template files to commit, skipping");
         return Ok(());
     }
@@ -760,7 +775,7 @@ fn auto_init_repo(
     }
 
     // Clean up temp directory
-    let _ = std::fs::remove_dir_all(&tmp);
+    discard_dir("auto-init working tree", &tmp);
 
     tracing::info!(
         repo = %repo_name,
@@ -1323,14 +1338,14 @@ pub async fn create_or_update_file(
             .run(&["clone", "--no-checkout", &clone_url, &tmp_str], None)
             .context("git clone (no-checkout) failed")?;
         if !nc_out.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
+            discard_dir("file-edit working tree", &tmp);
             bail!("git clone failed: {}", nc_out.stderr_str());
         }
         let co_out = gateway
             .run(&["checkout", "-b", branch], Some(&tmp))
             .context("git checkout failed")?;
         if !co_out.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
+            discard_dir("file-edit working tree", &tmp);
             bail!("git checkout failed: {}", co_out.stderr_str());
         }
     }
@@ -1349,7 +1364,7 @@ pub async fn create_or_update_file(
         .run(&["add", file_path], Some(&tmp))
         .context("git add failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-edit working tree", &tmp);
         bail!("git add failed: {}", output.stderr_str());
     }
 
@@ -1359,7 +1374,7 @@ pub async fn create_or_update_file(
         .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
         .context("git commit failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-edit working tree", &tmp);
         bail!("git commit failed: {}", output.stderr_str());
     }
 
@@ -1370,12 +1385,12 @@ pub async fn create_or_update_file(
         .run(&["push", &push_url, branch], Some(&tmp))
         .context("git push failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-edit working tree", &tmp);
         bail!("git push failed: {}", output.stderr_str());
     }
 
     // Clean up
-    let _ = std::fs::remove_dir_all(&tmp);
+    discard_dir("file-edit working tree", &tmp);
 
     tracing::info!(
         repo = %repo_name,
@@ -1517,7 +1532,7 @@ pub fn update_files_in_commit(
         push.ensure_success()?;
         Ok(commit_sha)
     })();
-    let _ = std::fs::remove_dir_all(&tmp);
+    discard_dir("commit working tree", &tmp);
     result
 }
 
@@ -1576,7 +1591,7 @@ pub async fn delete_file(
         .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
         .context("git clone failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-delete working tree", &tmp);
         bail!("git clone failed: {}", output.stderr_str());
     }
 
@@ -1585,7 +1600,7 @@ pub async fn delete_file(
         .run(&["rm", file_path], Some(&tmp))
         .context("git rm failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-delete working tree", &tmp);
         bail!("git rm failed: {}", output.stderr_str());
     }
 
@@ -1595,7 +1610,7 @@ pub async fn delete_file(
         .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
         .context("git commit failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-delete working tree", &tmp);
         bail!("git commit failed: {}", output.stderr_str());
     }
 
@@ -1606,12 +1621,12 @@ pub async fn delete_file(
         .run(&["push", &push_url, branch], Some(&tmp))
         .context("git push failed")?;
     if !output.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        discard_dir("file-delete working tree", &tmp);
         bail!("git push failed: {}", output.stderr_str());
     }
 
     // Clean up
-    let _ = std::fs::remove_dir_all(&tmp);
+    discard_dir("file-delete working tree", &tmp);
 
     tracing::info!(
         repo = %repo_name,

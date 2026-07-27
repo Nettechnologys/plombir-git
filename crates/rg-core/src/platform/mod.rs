@@ -8,6 +8,8 @@ pub mod path;
 pub mod process;
 
 // Re-export commonly used items
-pub use fs::{is_executable, set_executable};
+pub use fs::{
+    discard_dir, discard_dir_async, discard_file, discard_file_async, is_executable, set_executable,
+};
 pub use path::{expand_home, repo_path, temp_dir, validate_repo_path};
 pub use process::execute_script;

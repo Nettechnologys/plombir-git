@@ -5,6 +5,7 @@
 //! then `put_file` atomically publishes them to the configured backend.
 
 use crate::blob_storage::{BlobKey, BlobStorage, LocalBlobStorage};
+use crate::platform::fs::discard_dir_async;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -354,7 +355,7 @@ impl OciStorage {
 
         if self.backend.exists(&key).await? {
             let size = self.backend.metadata(&key).await?.size as i64;
-            let _ = tokio::fs::remove_dir_all(self.upload_dir(owner, repo, uuid)).await;
+            discard_dir_async("OCI upload directory", &self.upload_dir(owner, repo, uuid)).await;
             return Ok((expected_digest.to_string(), size, key.to_string()));
         }
 
@@ -385,7 +386,7 @@ impl OciStorage {
         }
 
         self.backend.put_file(&key, &upload_path).await?;
-        let _ = tokio::fs::remove_dir_all(self.upload_dir(owner, repo, uuid)).await;
+        discard_dir_async("OCI upload directory", &self.upload_dir(owner, repo, uuid)).await;
         Ok((expected_digest.to_string(), size, key.to_string()))
     }
 

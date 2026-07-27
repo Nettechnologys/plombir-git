@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::blob_storage::{BlobKey, BlobStorage};
+use crate::platform::fs::discard_file;
 use rg_db::entities::lfs_object;
 use rg_db::ops::lfs_object_ops;
 
@@ -563,14 +564,14 @@ pub async fn store_object_from_file(
 
     let key = lfs_object_key(owner, repo, oid, true)?;
     if let Err(error) = storage.put_file(&key, &compressed_path).await {
-        let _ = std::fs::remove_file(&compressed_path);
-        let _ = std::fs::remove_file(uncompressed_path);
+        discard_file("compressed LFS object", &compressed_path);
+        discard_file("uncompressed LFS upload", uncompressed_path);
         return Err(error.into());
     }
 
-    // Remove uncompressed temp file
-    let _ = std::fs::remove_file(uncompressed_path);
-    let _ = std::fs::remove_file(&compressed_path);
+    // Both staging files have been superseded by the stored blob.
+    discard_file("uncompressed LFS upload", uncompressed_path);
+    discard_file("compressed LFS object", &compressed_path);
 
     tracing::info!(
         oid = %oid,
@@ -780,7 +781,7 @@ pub async fn compress_existing(
                 {
                     tracing::error!(oid = %obj.oid, error = %format!("{e:#}"), "failed to update DB");
                     // Clean up compressed file on DB error
-                    let _ = std::fs::remove_file(&compressed_path);
+                    discard_file("compressed LFS object", &compressed_path);
                     continue;
                 }
 

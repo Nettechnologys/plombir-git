@@ -1,6 +1,7 @@
 //! Audit log archival — periodically exports old audit logs to compressed NDJSON
 //! files and purges them from the database only after durable file creation.
 
+use crate::platform::fs::{discard_file, discard_file_async};
 use chrono::{Duration, Utc};
 use sea_orm::DatabaseConnection;
 use std::io::Cursor;
@@ -83,7 +84,7 @@ pub fn ensure_archive_dir(archive_dir: &Path) -> anyhow::Result<()> {
     let probe = temporary_path(archive_dir, uuid::Uuid::new_v4());
     std::fs::write(&probe, b"")
         .map_err(|error| archive_path_error("audit archive_dir", archive_dir, &error))?;
-    let _ = std::fs::remove_file(&probe);
+    discard_file("audit archive_dir writability probe", &probe);
     Ok(())
 }
 
@@ -205,7 +206,7 @@ pub async fn run_archive_once(
             .await??;
 
     if let Err(error) = write_archive_atomically(&temp_path, &path, &compressed).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        discard_file_async("partial audit archive", &temp_path).await;
         return Err(archive_path_error("audit archive file", &path, &error));
     }
 

@@ -402,7 +402,7 @@ enum AttachmentBackup {
 impl AttachmentBackup {
     async fn cleanup(&self) {
         if let Self::File(path) = self {
-            let _ = tokio::fs::remove_file(path).await;
+            crate::platform::fs::discard_file_async("attachment blob backup", path).await;
         }
     }
 }

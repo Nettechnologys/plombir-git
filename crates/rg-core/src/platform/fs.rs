@@ -354,6 +354,60 @@ pub fn path_error(what: &str, path: &Path, error: &std::io::Error, remedy: &str)
     anyhow::anyhow!("{}", describe_path_error(what, path, error, remedy))
 }
 
+/// Report the outcome of a best-effort cleanup without failing on it.
+///
+/// Cleanup of a temporary artifact runs on both the success and the error path,
+/// and on the error path it must never replace the failure the caller is about
+/// to return — so it cannot use `?`. Discarding the result outright is the
+/// other extreme, and the one this project kept reaching for: an orphaned
+/// staging file or working tree keeps its bytes until somebody notices the
+/// volume is full, with nothing in the log connecting the two.
+///
+/// An already-absent path is the normal outcome of a cleanup that ran twice (an
+/// error path that unwinds through a second `discard_*`), so `NotFound` stays
+/// silent.
+fn report_discard(what: &str, path: &Path, outcome: std::io::Result<()>) {
+    match outcome {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed to remove {what}; it stays on disk until an operator removes it"
+        ),
+    }
+}
+
+/// Best-effort removal of a temporary file the caller is done with.
+///
+/// `what` names the thing in operator terms — `"attachment staging file"`,
+/// `"uncompressed LFS object"` — because the path alone is a UUID nothing else
+/// records. See [`report_discard`] for why the failure is warned rather than
+/// returned or swallowed.
+pub fn discard_file(what: &str, path: &Path) {
+    report_discard(what, path, fs::remove_file(path));
+}
+
+/// Best-effort removal of a temporary directory tree the caller is done with.
+///
+/// The directory counterpart of [`discard_file`]; same reporting contract.
+pub fn discard_dir(what: &str, path: &Path) {
+    report_discard(what, path, fs::remove_dir_all(path));
+}
+
+/// [`discard_file`] for call sites already inside an async context.
+///
+/// A blocking `remove_file` on a request-handling task stalls the whole runtime
+/// thread, so async callers get the tokio variant rather than the sync one.
+pub async fn discard_file_async(what: &str, path: &Path) {
+    report_discard(what, path, tokio::fs::remove_file(path).await);
+}
+
+/// [`discard_dir`] for call sites already inside an async context.
+pub async fn discard_dir_async(what: &str, path: &Path) {
+    report_discard(what, path, tokio::fs::remove_dir_all(path).await);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +503,156 @@ mod tests {
 
         assert!(rendered.contains(&target.display().to_string()), "{rendered}");
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
+
+    /// Sink that keeps every formatted log line so a test can assert on what
+    /// the operator would actually have seen. A best-effort cleanup returns
+    /// nothing — the log line *is* its whole interface.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            (logs, guard)
+        }
+
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[test]
+    fn discard_removes_the_file_and_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("staged.upload");
+        fs::write(&file, b"staged").unwrap();
+        let tree = dir.path().join("worktree");
+        fs::create_dir_all(tree.join("nested")).unwrap();
+
+        super::discard_file("attachment staging file", &file);
+        super::discard_dir("file-edit working tree", &tree);
+
+        assert!(!file.exists(), "the staging file survived the discard");
+        assert!(!tree.exists(), "the working tree survived the discard");
+    }
+
+    /// An error path that unwinds through a second cleanup discards an already
+    /// absent path, and a warning per unwind is how a log stops being read.
+    #[test]
+    fn discard_of_an_absent_path_stays_silent() {
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+
+        super::discard_file("attachment staging file", &dir.path().join("gone"));
+        super::discard_dir("file-edit working tree", &dir.path().join("gone-too"));
+
+        assert_eq!(
+            logs.rendered(),
+            "",
+            "an already-absent path is the normal outcome, not a warning"
+        );
+    }
+
+    /// The whole point of the helper: a cleanup that fails must leave the path
+    /// and the operator-facing name of the orphan in the log, because nothing
+    /// downstream records either — the temp names are UUIDs.
+    #[test]
+    fn discard_failure_names_what_was_orphaned_and_where() {
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file is not a directory tree (ENOTDIR) and a directory is
+        // not an unlinkable file (EISDIR/EPERM) — two non-`NotFound` failures
+        // that need no permission games to reproduce, so they hold under root.
+        let file = dir.path().join("staged.upload");
+        fs::write(&file, b"staged").unwrap();
+        let tree = dir.path().join("worktree");
+        fs::create_dir_all(&tree).unwrap();
+
+        super::discard_dir("file-edit working tree", &file);
+        super::discard_file("attachment staging file", &tree);
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("failed to remove file-edit working tree"),
+            "the orphaned tree is unnamed: {rendered}"
+        );
+        assert!(
+            rendered.contains(&file.display().to_string()),
+            "the orphaned tree's path is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("failed to remove attachment staging file"),
+            "the orphaned staging file is unnamed: {rendered}"
+        );
+        assert!(
+            rendered.contains(&tree.display().to_string()),
+            "the orphaned staging file's path is missing: {rendered}"
+        );
+    }
+
+    /// The async variants exist so a request-handling task does not block the
+    /// runtime thread on `remove_file`; they must otherwise report identically.
+    #[tokio::test]
+    async fn async_discard_reports_the_same_failure_as_the_sync_one() {
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("staged.upload");
+        fs::write(&file, b"staged").unwrap();
+
+        let tree = dir.path().join("upload");
+        fs::create_dir_all(&tree).unwrap();
+        super::discard_dir_async("OCI upload directory", &tree).await;
+        assert!(!tree.exists(), "the upload directory survived the discard");
+
+        super::discard_file_async("attachment staging file", &file).await;
+        assert!(!file.exists(), "the staging file survived the discard");
+        super::discard_file_async("attachment staging file", &file).await;
+        super::discard_dir_async("OCI upload directory", &tree).await;
+        assert_eq!(
+            logs.rendered(),
+            "",
+            "a repeated discard of an absent path must stay silent"
+        );
+
+        // ENOTDIR: a regular file is not a tree, and the tokio backend must
+        // surface that the same way the sync one does.
+        fs::write(&file, b"staged").unwrap();
+        super::discard_dir_async("OCI upload directory", &file).await;
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("failed to remove OCI upload directory"),
+            "the async failure went unreported: {rendered}"
+        );
+        assert!(
+            rendered.contains(&file.display().to_string()),
+            "the async failure lost the path: {rendered}"
+        );
     }
 
     #[test]

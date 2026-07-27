@@ -524,8 +524,22 @@ where
 
         // `git index-pack` leaves a plain, immediately-usable pack. The writer
         // may drop a `.keep` alongside it; remove it so the objects are live.
+        //
+        // `rg-git` sits below `rg-core`, so it cannot use the shared
+        // `platform::fs::discard_file` helper — this is the local copy of the
+        // same contract: silent when the file is already gone, a warning naming
+        // the path otherwise.
         if let Some(keep) = outcome.keep_path {
-            let _ = std::fs::remove_file(keep);
+            if let Err(error) = std::fs::remove_file(&keep) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %keep.display(),
+                        %error,
+                        "failed to remove the .keep guard of a freshly indexed pack; git gc will \
+                         keep the pack pinned until the file is removed"
+                    );
+                }
+            }
         }
         Ok(())
     });
