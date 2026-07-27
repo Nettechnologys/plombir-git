@@ -626,7 +626,7 @@ pub(crate) async fn run_serve(
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,
-        jwt_secret: resolved_jwt_secret.clone(),
+        jwt_secret: Some(resolved_jwt_secret.clone()),
         smtp_config,
         ci_engine,
         external_url: resolved_external_url,

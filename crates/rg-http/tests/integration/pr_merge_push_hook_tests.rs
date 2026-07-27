@@ -11,6 +11,12 @@
 //! The second test pins the bound that comes with the fix: the hooks themselves
 //! run auto-merge, so a hook-triggered merge feeds its own ref move back into
 //! the hooks. That has to converge.
+//!
+//! The third covers the half card_87c4912c51ed left behind (card_73a1ec5b32f3):
+//! a merge started by something other than a push or a REST merge. "CI went
+//! green, so the PR goes in" is the flow auto-merge exists for, and it ran the
+//! merge and dropped the ref move — so precisely there, the merge commit on
+//! `main` got no pipeline, no `push` webhook and no watch notification.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -230,6 +236,177 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
         "the payload must carry the pre-merge tip, not a fabricated zero SHA \
          (zeros read as `branch.created` for a branch that is alive)"
     );
+
+    server.abort();
+}
+
+/// The card's headline (card_73a1ec5b32f3): a pipeline reported green by an
+/// external runner auto-merges the PR whose head it built, and *that* merge owes
+/// the post-push hooks just like any other. Before the fix `finish_job` ran the
+/// merge and threw the ref move away, so the merge commit on `main` got no
+/// pipeline and no `push` webhook — in the one flow auto-merge is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let ci_engine = Arc::new(RecordingCiEngine::default());
+    let mut state = build_test_app_state(db.clone(), repo_root.clone());
+    state.ci_engine = ci_engine.clone();
+
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr).await;
+    let base = format!("http://{addr}");
+
+    let (jwt, user_id) = register_full(&base, "cimerge", "cimerge@example.com").await;
+    let repo_id = crate::common::create_repo(&base, &jwt, "ci-repo").await;
+    let bare_path = repo_root.join("cimerge/ci-repo.git");
+    let _worktree = seed_branches(&bare_path, None);
+
+    let hook = rg_core::webhook::service::create_webhook(
+        &db,
+        repo_id,
+        &rg_core::webhook::service::CreateWebhookRequest {
+            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            content_type: None,
+            secret: None,
+            active: Some(true),
+            events: vec!["push".to_string()],
+        },
+    )
+    .await
+    .expect("register push webhook");
+
+    // Seeded rather than opened through the API with auto-merge switched on:
+    // enabling auto-merge on a PR whose conditions are already met merges it on
+    // the spot, through a path this card is not about. What is under test is the
+    // PR that is only waiting for its pipeline.
+    let now = chrono::Utc::now();
+    let feature_sha = git(&["rev-parse", "refs/heads/feature"], Some(&bare_path));
+    let waiting = rg_db::ops::pull_request_ops::create(
+        &db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(1),
+            title: Set("merge me once CI is green".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(true),
+            auto_merge_strategy: Set(Some("merge".to_string())),
+            auto_merge_enabled_by_id: Set(Some(user_id)),
+            auto_merge_enabled_at: Set(Some(now)),
+            author_id: Set(user_id),
+            reviewer_id: Set(None),
+            head_branch: Set("feature".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some(feature_sha.clone())),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed the auto-merge PR");
+
+    // One runner, one job on the PR head — the shape an external-runner CI run
+    // has when its last job reports in.
+    let runner = rg_db::ops::runner_ops::register_runner(&db, "ci-runner", "[]", None, None, None)
+        .await
+        .expect("register runner");
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        &feature_sha,
+        "refs/heads/feature",
+        "push",
+        None,
+    )
+    .await
+    .expect("create pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+        .await
+        .expect("create stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db, stage.id, "test", "true", None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("create job");
+    rg_db::ops::pipeline_ops::assign_job(&db, job.id, runner.id)
+        .await
+        .expect("assign the job to the runner");
+
+    let client = reqwest::Client::new();
+    let finished = client
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/finish",
+            runner.id, job.id
+        ))
+        .bearer_auth(&runner.token)
+        .json(&serde_json::json!({"status": "success", "exit_code": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finished.status(), 200, "{}", finished.text().await.unwrap());
+
+    drain_delivery_tracker().await;
+
+    let merged_pr = rg_db::ops::pull_request_ops::find_by_id(&db, waiting.id)
+        .await
+        .expect("reload the PR")
+        .expect("PR still exists");
+    assert_eq!(
+        merged_pr.state, "merged",
+        "a green pipeline on the PR head must trigger the auto-merge"
+    );
+    let merge_sha = merged_pr
+        .merge_commit_sha
+        .clone()
+        .expect("the merged PR records its merge commit");
+    assert_eq!(
+        git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
+        merge_sha,
+        "the merge must actually be the new tip of the base branch"
+    );
+
+    let triggered = ci_engine.triggered.lock().unwrap().clone();
+    assert_eq!(
+        triggered,
+        vec![(
+            merge_sha.clone(),
+            "refs/heads/main".to_string(),
+            "push".to_string()
+        )],
+        "the merge commit the finished pipeline produced owes a pipeline of its \
+         own — this is the half of the class that survived card_87c4912c51ed"
+    );
+
+    let deliveries = rg_core::webhook::service::list_deliveries(&db, hook.id)
+        .await
+        .expect("list webhook deliveries");
+    let push_delivery = deliveries
+        .iter()
+        .find(|delivery| delivery.event == "push")
+        .expect("the auto-merge must send the `push` webhook for the base branch");
+    let payload: serde_json::Value =
+        serde_json::from_str(push_delivery.request_payload.as_deref().unwrap_or("null"))
+            .expect("delivery payload is JSON");
+    assert_eq!(payload["ref"], "refs/heads/main");
+    assert_eq!(payload["after"], merge_sha);
 
     server.abort();
 }

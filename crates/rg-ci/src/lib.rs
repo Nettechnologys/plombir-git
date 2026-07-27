@@ -340,30 +340,49 @@ async fn evaluate_initial_success(
     let Some(repo_root) = repo_path.parent().and_then(std::path::Path::parent) else {
         return;
     };
-    if let Err(error) =
-        rg_core::pull_request::try_auto_merges_for_head_commit(db, repo_root, repo_id, commit_sha)
-            .await
-    {
-        tracing::warn!(repo_id, error = %format!("{error:#}"), "auto-merge evaluation after conditional CI failed");
-    }
-    let ci_engine = CiEngine;
-    if let Err(error) = rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-        db,
+    post_push_context(
         repo_root,
-        repo_id,
-        commit_sha,
-        &rg_core::pull_request::merge_queue::MergeQueueCi {
-            trigger: &ci_engine,
-            docker_enabled,
-            external_runners,
-            allow_host_runner,
-            jwt_secret,
-            external_url,
-        },
+        docker_enabled,
+        external_runners,
+        allow_host_runner,
+        jwt_secret,
+        external_url,
     )
-    .await
-    {
-        tracing::warn!(repo_id, error = %format!("{error:#}"), "merge queue evaluation after conditional CI failed");
+    .evaluate_merges_and_spawn_hooks(db, repo_id, commit_sha, None)
+    .await;
+}
+
+/// This crate's post-push wiring, for the merges a finished pipeline unblocks.
+///
+/// A pipeline that goes green is the trigger of the most common auto-merge there
+/// is, and the merge commit it puts on the base branch owes the same automation
+/// a push does — a pipeline of its own, the `push` webhook, the watch fan-out.
+/// Until card_73a1ec5b32f3 both CI-completion paths here ran the merge and threw
+/// the ref move away, so that commit was seen by nothing.
+///
+/// Two of the hooks' inputs simply do not exist in this crate: there is no
+/// WebSocket hub (`notifier: None` — the real-time `push` event is the HTTP
+/// layer's) and no SMTP configuration (`smtp_config: None` — no "pipeline
+/// triggered" email). Everything that reaches storage — the pipeline, the
+/// webhooks, the notifications — runs in full.
+fn post_push_context(
+    repo_root: &std::path::Path,
+    docker_enabled: bool,
+    external_runners: bool,
+    allow_host_runner: bool,
+    jwt_secret: Option<&str>,
+    external_url: Option<&str>,
+) -> rg_core::push_hooks::PostPushContext {
+    rg_core::push_hooks::PostPushContext {
+        repo_root: repo_root.to_path_buf(),
+        docker_enabled,
+        external_runners,
+        allow_host_runner,
+        jwt_secret: jwt_secret.map(str::to_string),
+        smtp_config: None,
+        ci_engine: std::sync::Arc::new(CiEngine),
+        external_url: external_url.map(str::to_string),
+        notifier: None,
     }
 }
 

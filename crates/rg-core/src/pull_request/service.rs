@@ -1163,6 +1163,27 @@ pub async fn try_auto_merges_for_head_commit(
     Ok(outcomes)
 }
 
+/// A base-branch move a merge made, named together with the repository whose
+/// branch actually moved.
+///
+/// The repository is not decoration. Merges are evaluated *by head commit*
+/// ([`try_auto_merges_for_head_commit`], [`super::merge_queue::process_for_head_commit`]),
+/// and a fork PR's head lives in one repository while its base lives in
+/// another — so the caller that asked "what does this commit merge?" cannot
+/// assume the answer moved a branch of the repository it named. Running the
+/// hooks against the wrong one would post the merge to another repository's
+/// webhooks and hunt for the merge commit in a git dir that never had it.
+#[derive(Debug, Clone)]
+pub struct MergedRef {
+    /// The repository whose base branch moved (the PR's *base* repository).
+    pub repo_id: i64,
+    /// Namespace of that repository — the user or organization name, i.e. the
+    /// `<owner>` of `<owner>/<repo>.git` under the repo root.
+    pub owner: String,
+    pub repo_name: String,
+    pub update: RefUpdate,
+}
+
 /// Result of a merge operation.
 #[derive(Debug, serde::Serialize)]
 pub struct MergeResult {
@@ -1185,7 +1206,7 @@ pub struct MergeResult {
     /// `#[serde(skip)]`: `MergeResult` is a REST response body and this is
     /// internal plumbing, not part of the API contract.
     #[serde(skip)]
-    pub base_ref_update: Option<RefUpdate>,
+    pub base_ref_update: Option<MergedRef>,
 }
 
 /// The ref move a merge made to its base branch, or `None` when the hooks must
@@ -1358,6 +1379,7 @@ async fn merge_claimed_pr(
 
             return update_pr_merged(
                 db,
+                owner,
                 repo_name,
                 pr,
                 merge_commit_sha,
@@ -1384,6 +1406,7 @@ async fn merge_claimed_pr(
 
     update_pr_merged(
         db,
+        owner,
         repo_name,
         pr,
         merge_commit_sha,
@@ -1423,6 +1446,7 @@ fn merge_from_ref(
 /// [`MergeResult::base_ref_update`], which is built from it.
 async fn update_pr_merged(
     db: &DatabaseConnection,
+    owner: &str,
     repo_name: &str,
     mut pr: PullRequest,
     merge_commit_sha: String,
@@ -1497,7 +1521,13 @@ async fn update_pr_merged(
     Ok(MergeResult {
         base_ref_update: base_sha_before
             .as_deref()
-            .and_then(|before| base_ref_update(&merged_pr.base_branch, before, &merge_commit_sha)),
+            .and_then(|before| base_ref_update(&merged_pr.base_branch, before, &merge_commit_sha))
+            .map(|update| MergedRef {
+                repo_id: merged_pr.repo_id,
+                owner: owner.to_string(),
+                repo_name: repo_name.to_string(),
+                update,
+            }),
         merge_commit_sha,
         strategy: format!("{:?}", strategy).to_lowercase(),
     })

@@ -31,7 +31,7 @@ pub struct MergeQueueProcessResult {
     /// post-push hooks — see [`super::service::MergeResult::base_ref_update`].
     /// `#[serde(skip)]`: this is plumbing, not part of the queue's API payload.
     #[serde(skip)]
-    pub merged_ref_updates: Vec<rg_git::protocol::receive_pack::RefUpdate>,
+    pub merged_ref_updates: Vec<service::MergedRef>,
 }
 
 pub async fn enqueue(

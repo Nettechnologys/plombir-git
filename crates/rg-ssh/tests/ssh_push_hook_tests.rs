@@ -225,7 +225,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
-            jwt_secret: "test-secret".to_string(),
+            jwt_secret: Some("test-secret".to_string()),
             smtp_config: None,
             ci_engine,
             external_url: None,

@@ -223,35 +223,13 @@ async fn after_suggestions_applied(
             tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "CI trigger after suggestion failed");
         }
     }
-    if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
-        &state.db,
-        &state.repo_root,
-        source_repo.id,
-        commit_sha,
-    )
-    .await
-    {
-        tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "auto-merge evaluation after suggestion failed");
-    }
-    let ci = rg_core::pull_request::merge_queue::MergeQueueCi {
-        trigger: &*state.ci_engine,
-        docker_enabled: state.docker_enabled,
-        external_runners: state.external_runners,
-        allow_host_runner: state.allow_host_runner,
-        jwt_secret: Some(&state.jwt_secret),
-        external_url: state.external_url.as_deref(),
-    };
-    if let Err(error) = rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-        &state.db,
-        &state.repo_root,
-        source_repo.id,
-        commit_sha,
-        &ci,
-    )
-    .await
-    {
-        tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "merge queue evaluation after suggestion failed");
-    }
+    // Applying a suggestion writes a commit, so it can unblock an auto-merge or
+    // the queue — and whatever they merge moves a base branch that owes the
+    // post-push hooks, exactly as if the commit had been pushed
+    // (card_73a1ec5b32f3).
+    state
+        .evaluate_merges_and_spawn_hooks(source_repo.id, commit_sha, Some(actor_id))
+        .await;
 }
 
 // ── Review handlers ───────────────────────────────────────────────────
@@ -346,6 +324,11 @@ pub async fn submit_review(
     {
         Ok(review) => {
             if should_attempt_auto_merge {
+                // An approval is the last condition an auto-merge or a queued PR
+                // was waiting on, so this is a merge path like any other: the
+                // base branch it moves owes the post-push hooks, and until
+                // card_73a1ec5b32f3 both ref moves here were dropped.
+                let mut merged = Vec::new();
                 match rg_core::pull_request::try_auto_merge(
                     &state.db,
                     &state.repo_root,
@@ -356,7 +339,8 @@ pub async fn submit_review(
                 .await
                 {
                     Ok(outcome) => {
-                        tracing::info!(pr_id = pr.id, status = %outcome.status, "auto-merge evaluated after approval")
+                        tracing::info!(pr_id = pr.id, status = %outcome.status, "auto-merge evaluated after approval");
+                        merged.extend(outcome.merge.and_then(|merge| merge.base_ref_update));
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -366,28 +350,24 @@ pub async fn submit_review(
                         )
                     }
                 }
-                let ci = rg_core::pull_request::merge_queue::MergeQueueCi {
-                    trigger: &*state.ci_engine,
-                    docker_enabled: state.docker_enabled,
-                    external_runners: state.external_runners,
-                    allow_host_runner: state.allow_host_runner,
-                    jwt_secret: Some(&state.jwt_secret),
-                    external_url: state.external_url.as_deref(),
-                };
-                if let Err(error) = rg_core::pull_request::merge_queue::process_repository_with_ci(
+                match rg_core::pull_request::merge_queue::process_repository_with_ci(
                     &state.db,
                     &state.repo_root,
                     &repo_model,
-                    &ci,
+                    &state.merge_queue_ci(),
                 )
                 .await
                 {
-                    tracing::warn!(
-                        repo_id = repo_model.id,
-                        error = %format!("{error:#}"),
-                        "merge queue evaluation after approval failed"
-                    );
+                    Ok(process) => merged.extend(process.merged_ref_updates),
+                    Err(error) => {
+                        tracing::warn!(
+                            repo_id = repo_model.id,
+                            error = %format!("{error:#}"),
+                            "merge queue evaluation after approval failed"
+                        );
+                    }
                 }
+                state.spawn_merge_push_hooks(Some(user_id), merged);
             }
             (StatusCode::CREATED, Json(review)).into_response()
         }

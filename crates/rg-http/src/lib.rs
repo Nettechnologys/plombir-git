@@ -116,38 +116,76 @@ impl AppState {
         }
 
         let db = self.db.clone();
-        let repo_root = self.repo_root.clone();
-        let docker_enabled = self.docker_enabled;
-        let external_runners = self.external_runners;
-        let allow_host_runner = self.allow_host_runner;
-        let jwt_secret = self.jwt_secret.clone();
-        let hub = self.notification_hub.clone();
-        let smtp_config = self.smtp_config.clone();
-        let ci_engine = self.ci_engine.clone();
-        let external_url = self.external_url.clone();
+        let context = self.post_push_context();
 
         rg_core::task_tracker::delivery_tracker().spawn(async move {
-            rg_core::push_hooks::post_push_hooks(
-                &rg_core::push_hooks::PostPushParams {
-                    db: &db,
-                    repo_path: &repo_path,
-                    repo_root: &repo_root,
-                    owner: &owner,
-                    repo_name: &repo_name,
-                    pusher_id,
-                    docker_enabled,
-                    external_runners,
-                    allow_host_runner,
-                    jwt_secret: &jwt_secret,
-                    notifier: Some(&hub),
-                    smtp_config: &smtp_config,
-                    ci_engine: &*ci_engine,
-                    external_url: external_url.as_deref(),
-                },
-                &ref_updates,
-            )
-            .await;
+            context
+                .run(&db, &repo_path, &owner, &repo_name, pusher_id, &ref_updates)
+                .await;
         });
+    }
+
+    /// This process's post-push wiring, in the owned form the hook runs take.
+    pub fn post_push_context(&self) -> rg_core::push_hooks::PostPushContext {
+        rg_core::push_hooks::PostPushContext {
+            repo_root: self.repo_root.to_path_buf(),
+            docker_enabled: self.docker_enabled,
+            external_runners: self.external_runners,
+            allow_host_runner: self.allow_host_runner,
+            jwt_secret: Some(self.jwt_secret.to_string()),
+            smtp_config: self.smtp_config.clone(),
+            ci_engine: self.ci_engine.clone(),
+            external_url: self.external_url.clone(),
+            notifier: Some(Arc::new(self.notification_hub.clone())),
+        }
+    }
+
+    /// Run the post-push hooks for the base-branch moves merges just made.
+    ///
+    /// A merge advances `refs/heads/<base>` exactly like a `git push` does, so
+    /// it owes the same automation — a pipeline on the merge commit, the `push`
+    /// webhook, the watch fan-out. `rg-core` performs the merge and *reports*
+    /// the move (it has no CI engine or hub of its own); running it is this
+    /// layer's job, and every path here that can merge — REST merge, enabling
+    /// auto-merge, the merge queue, a review approval, a finished CI job —
+    /// hands its moves to this one seam.
+    pub fn spawn_merge_push_hooks(
+        &self,
+        actor_id: Option<i64>,
+        merged: Vec<rg_core::pull_request::MergedRef>,
+    ) {
+        self.post_push_context()
+            .spawn_for_merged_refs(&self.db, actor_id, merged);
+    }
+
+    /// Evaluate the merges a commit that just became a head unblocks, and run
+    /// the hooks for whatever branches they moved.
+    ///
+    /// The pair belongs together: until card_73a1ec5b32f3 the callers that ran
+    /// the evaluation (a finished pipeline, an applied suggestion) threw the ref
+    /// moves away, so the most common auto-merge of all — "CI went green, the PR
+    /// went in" — landed a merge commit on `main` that no automation ever saw.
+    pub async fn evaluate_merges_and_spawn_hooks(
+        &self,
+        source_repo_id: i64,
+        commit_sha: &str,
+        actor_id: Option<i64>,
+    ) {
+        self.post_push_context()
+            .evaluate_merges_and_spawn_hooks(&self.db, source_repo_id, commit_sha, actor_id)
+            .await;
+    }
+
+    /// The merge queue's view of this process's CI wiring.
+    pub fn merge_queue_ci(&self) -> rg_core::pull_request::merge_queue::MergeQueueCi<'_> {
+        rg_core::pull_request::merge_queue::MergeQueueCi {
+            trigger: &*self.ci_engine,
+            docker_enabled: self.docker_enabled,
+            external_runners: self.external_runners,
+            allow_host_runner: self.allow_host_runner,
+            jwt_secret: Some(&self.jwt_secret),
+            external_url: self.external_url.as_deref(),
+        }
     }
 }
 

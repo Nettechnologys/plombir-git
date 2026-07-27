@@ -993,26 +993,29 @@ mod tests {
             "receive-pack must still hand its ref updates to the post-push helper"
         );
 
+        // Anchored on the helper and its first `spawn(`, not on the hook call
+        // itself: the call moved into `PostPushContext::run` (card_73a1ec5b32f3)
+        // and rustfmt is free to reflow it, but "the helper's spawn is the
+        // tracker's" is the invariant, and it survives both.
         let source = include_str!("lib.rs");
         let lines: Vec<&str> = source.lines().collect();
-        // The call inside the detached closure — not the `async fn` definition.
-        let call = lines
+        let helper = lines
             .iter()
             .position(|line| {
                 line.trim_start()
-                    .starts_with("rg_core::push_hooks::post_push_hooks(")
+                    .starts_with("pub fn spawn_post_push_hooks")
             })
-            .expect("the post-push helper must still call post_push_hooks");
-        let spawn = lines[..call]
+            .expect("the post-push helper must still exist");
+        let spawn = lines[helper..]
             .iter()
-            .rposition(|line| line.contains("spawn("))
-            .expect("the post-push call must sit inside a spawn");
+            .position(|line| line.contains("spawn("))
+            .expect("the post-push helper must detach the hook run");
         assert!(
-            lines[spawn].contains("delivery_tracker()"),
+            lines[helper + spawn].contains("delivery_tracker()"),
             "post-push hooks must be spawned via rg_core::task_tracker::delivery_tracker() \
              so the shutdown drain awaits them; found `{}` at lib.rs:{}",
-            lines[spawn].trim(),
-            spawn + 1
+            lines[helper + spawn].trim(),
+            helper + spawn + 1
         );
     }
 

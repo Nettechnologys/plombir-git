@@ -53,7 +53,10 @@ pub struct PostPushParams<'a> {
     pub docker_enabled: bool,
     pub external_runners: bool,
     pub allow_host_runner: bool,
-    pub jwt_secret: &'a str,
+    /// Secret the CI job tokens are signed with. `None` = this caller has none
+    /// (a local CLI run); it is passed through as `None` rather than as an empty
+    /// secret, which would mint tokens signed with "".
+    pub jwt_secret: Option<&'a str>,
     /// Real-time notification sink. `None` = no WebSocket hub in this process.
     pub notifier: Option<&'a dyn PushNotifier>,
     pub smtp_config: &'a Option<SmtpConfig>,
@@ -85,7 +88,8 @@ pub struct PostPushContext {
     pub docker_enabled: bool,
     pub external_runners: bool,
     pub allow_host_runner: bool,
-    pub jwt_secret: String,
+    /// See [`PostPushParams::jwt_secret`].
+    pub jwt_secret: Option<String>,
     pub smtp_config: Option<SmtpConfig>,
     pub ci_engine: Arc<dyn CiTrigger + Send + Sync>,
     pub external_url: Option<String>,
@@ -120,7 +124,7 @@ impl PostPushContext {
                 docker_enabled: self.docker_enabled,
                 external_runners: self.external_runners,
                 allow_host_runner: self.allow_host_runner,
-                jwt_secret: &self.jwt_secret,
+                jwt_secret: self.jwt_secret.as_deref(),
                 notifier: self.notifier.as_deref(),
                 smtp_config: &self.smtp_config,
                 ci_engine: &*self.ci_engine,
@@ -130,6 +134,149 @@ impl PostPushContext {
         )
         .await;
     }
+
+    /// The merge queue's view of this process's CI wiring.
+    pub fn merge_queue_ci(&self) -> crate::pull_request::merge_queue::MergeQueueCi<'_> {
+        crate::pull_request::merge_queue::MergeQueueCi {
+            trigger: &*self.ci_engine,
+            docker_enabled: self.docker_enabled,
+            external_runners: self.external_runners,
+            allow_host_runner: self.allow_host_runner,
+            jwt_secret: self.jwt_secret.as_deref(),
+            external_url: self.external_url.as_deref(),
+        }
+    }
+
+    /// Evaluate the merges a new head commit unblocks and run the post-push
+    /// hooks for every base branch they moved.
+    ///
+    /// This is the whole job of a caller that just made a commit reachable — a
+    /// finished CI pipeline, an applied review suggestion. Doing only the first
+    /// half is the defect of card_73a1ec5b32f3: the merge lands, the merge
+    /// commit on `main` gets no pipeline, no `push` webhook and no watch
+    /// notification, precisely in the flow auto-merge exists for.
+    pub async fn evaluate_merges_and_spawn_hooks(
+        &self,
+        db: &DatabaseConnection,
+        source_repo_id: i64,
+        commit_sha: &str,
+        actor_id: Option<i64>,
+    ) {
+        let merged = evaluate_merges_for_head_commit(
+            db,
+            &self.repo_root,
+            source_repo_id,
+            commit_sha,
+            &self.merge_queue_ci(),
+        )
+        .await;
+        self.spawn_for_merged_refs(db, actor_id, merged);
+    }
+
+    /// Run the post-push hooks for base-branch moves merges just made, detached
+    /// through the delivery tracker.
+    ///
+    /// One hook run per move rather than one for all of them: the moves can
+    /// belong to different repositories (a fork PR merges into the upstream),
+    /// and a run is scoped to a single repository.
+    pub fn spawn_for_merged_refs(
+        &self,
+        db: &DatabaseConnection,
+        actor_id: Option<i64>,
+        merged: Vec<crate::pull_request::MergedRef>,
+    ) {
+        if merged.is_empty() {
+            return;
+        }
+        let context = self.clone();
+        let db = db.clone();
+        crate::task_tracker::delivery_tracker().spawn(async move {
+            for merged_ref in merged {
+                let repo_path = context
+                    .repo_root
+                    .join(format!("{}/{}.git", merged_ref.owner, merged_ref.repo_name));
+                context
+                    .run(
+                        &db,
+                        &repo_path,
+                        &merged_ref.owner,
+                        &merged_ref.repo_name,
+                        actor_id,
+                        std::slice::from_ref(&merged_ref.update),
+                    )
+                    .await;
+            }
+        });
+    }
+}
+
+/// Run both merge evaluations a new head commit can unblock — auto-merge and the
+/// merge queue — and report every base-branch move they made.
+///
+/// The pair was copied byte-for-byte at six call sites (the push hooks below,
+/// both CI-completion paths in `rg-ci`, the external runner's `finish_job`, and
+/// the two review paths), and five of them dropped the ref moves on the floor,
+/// so the most common auto-merge there is — "CI went green, the PR went in" —
+/// produced a merge commit on `main` that no automation ever saw
+/// (card_73a1ec5b32f3). One helper now, and its return value is the thing a
+/// caller must not ignore.
+///
+/// Best-effort by design: a failed evaluation is logged, never propagated. The
+/// caller has already finished the work it was actually asked to do (a CI job, a
+/// review), and a merge that could not run must not turn that into an error.
+pub async fn evaluate_merges_for_head_commit(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    source_repo_id: i64,
+    commit_sha: &str,
+    ci: &crate::pull_request::merge_queue::MergeQueueCi<'_>,
+) -> Vec<crate::pull_request::MergedRef> {
+    let mut merged_refs = Vec::new();
+    match crate::pull_request::try_auto_merges_for_head_commit(
+        db,
+        repo_root,
+        source_repo_id,
+        commit_sha,
+    )
+    .await
+    {
+        Ok(outcomes) => merged_refs.extend(
+            outcomes
+                .into_iter()
+                .filter_map(|outcome| outcome.merge)
+                .filter_map(|merge| merge.base_ref_update),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                repo_id = source_repo_id,
+                commit_sha,
+                error = %format!("{error:#}"),
+                "auto-merge evaluation for a new head commit failed"
+            )
+        }
+    }
+    match crate::pull_request::merge_queue::process_for_head_commit_with_ci(
+        db,
+        repo_root,
+        source_repo_id,
+        commit_sha,
+        ci,
+    )
+    .await
+    {
+        Ok(results) => {
+            merged_refs.extend(results.into_iter().flat_map(|run| run.merged_ref_updates))
+        }
+        Err(error) => {
+            tracing::warn!(
+                repo_id = source_repo_id,
+                commit_sha,
+                error = %format!("{error:#}"),
+                "merge queue evaluation for a new head commit failed"
+            )
+        }
+    }
+    merged_refs
 }
 
 /// How deep a chain of hook-triggered merges may run before it is cut off.
@@ -155,24 +302,46 @@ const MAX_MERGE_CASCADE_DEPTH: usize = 8;
 /// merge produces a *new* commit, so a repeat can only come from a cycle. The
 /// depth limit is the backstop for a cycle that keeps minting fresh commits.
 struct RefUpdateCascade {
-    pending: VecDeque<(RefUpdate, usize)>,
-    seen: HashSet<(String, String)>,
+    pending: VecDeque<(Arc<HookTarget>, RefUpdate, usize)>,
+    seen: HashSet<(i64, String, String)>,
+}
+
+/// The repository a queued ref move belongs to.
+///
+/// A cascade item is a ref move *plus* its repository, not a bare [`RefUpdate`]:
+/// the merges the hooks run are evaluated by head commit, and a fork PR's base
+/// branch lives in a different repository than the one that received the push.
+/// Carrying the identity is what keeps the pipeline, the webhooks and the watch
+/// fan-out pointed at the repository whose branch actually moved.
+struct HookTarget {
+    repo_id: i64,
+    owner_id: i64,
+    /// Namespace — user or organization name.
+    owner: String,
+    name: String,
+    /// Bare repository the ref lives in.
+    path: PathBuf,
 }
 
 impl RefUpdateCascade {
     /// Seed the work list with the updates the transport actually received.
-    fn new(initial: &[RefUpdate]) -> Self {
+    fn new(target: Arc<HookTarget>, initial: &[RefUpdate]) -> Self {
         let mut cascade = Self {
             pending: VecDeque::new(),
             seen: HashSet::new(),
         };
-        cascade.extend(initial.iter().cloned(), 0);
+        cascade.extend(target, initial.iter().cloned(), 0);
         cascade
     }
 
     /// Queue follow-up updates discovered at `depth`, dropping the ones that
     /// break either bound.
-    fn extend(&mut self, updates: impl IntoIterator<Item = RefUpdate>, depth: usize) {
+    fn extend(
+        &mut self,
+        target: Arc<HookTarget>,
+        updates: impl IntoIterator<Item = RefUpdate>,
+        depth: usize,
+    ) {
         for update in updates {
             if depth > MAX_MERGE_CASCADE_DEPTH {
                 tracing::warn!(
@@ -183,36 +352,84 @@ impl RefUpdateCascade {
                 );
                 continue;
             }
-            if !self
-                .seen
-                .insert((update.refname.clone(), update.new_sha.clone()))
-            {
+            if !self.seen.insert((
+                target.repo_id,
+                update.refname.clone(),
+                update.new_sha.clone(),
+            )) {
                 tracing::debug!(
+                    repo_id = target.repo_id,
                     refname = %update.refname,
                     new_sha = %update.new_sha,
                     "post-push cascade skipped a ref move it had already handled in this run"
                 );
                 continue;
             }
-            self.pending.push_back((update, depth));
+            self.pending.push_back((target.clone(), update, depth));
         }
     }
 
     #[allow(clippy::should_implement_trait)]
-    fn next(&mut self) -> Option<(RefUpdate, usize)> {
+    fn next(&mut self) -> Option<(Arc<HookTarget>, RefUpdate, usize)> {
         self.pending.pop_front()
+    }
+}
+
+/// Look up the repository a merge moved a branch in, so its ref move can be
+/// processed under its own identity instead of the pusher's repository.
+async fn resolve_hook_target(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    owner: &str,
+    name: &str,
+) -> Option<HookTarget> {
+    match crate::repo::service::find_repo_by_owner_name(db, owner, name).await {
+        Ok(Some(repo)) => Some(HookTarget {
+            repo_id: repo.id,
+            owner_id: repo.owner_id,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            path: repo_root.join(format!("{owner}/{name}.git")),
+        }),
+        Ok(None) => {
+            tracing::warn!(
+                owner,
+                repo = name,
+                "Post-push: repo not found in DB, skipping hooks"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                owner,
+                repo = name,
+                error = %format!("{error:#}"),
+                "Post-push: repo lookup failed, skipping hooks"
+            );
+            None
+        }
     }
 }
 
 /// Post-push hook: trigger CI pipeline and webhook for push events.
 pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpdate]) {
-    // Find repo_id from DB
-    let repo_model =
-        crate::repo::service::find_repo_by_owner_name(params.db, params.owner, params.repo_name)
-            .await;
-
-    let (repo_id, repo_owner_id) = match repo_model {
-        Ok(Some(r)) => (r.id, r.owner_id),
+    // Find repo_id from DB. The pushed repository keeps the path the transport
+    // handed us; only repositories the cascade discovers get one derived from
+    // the repo root.
+    let seed = match crate::repo::service::find_repo_by_owner_name(
+        params.db,
+        params.owner,
+        params.repo_name,
+    )
+    .await
+    {
+        Ok(Some(repo)) => HookTarget {
+            repo_id: repo.id,
+            owner_id: repo.owner_id,
+            owner: params.owner.to_string(),
+            name: params.repo_name.to_string(),
+            path: params.repo_path.to_path_buf(),
+        },
         _ => {
             tracing::warn!(owner = %params.owner, repo = %params.repo_name, "Post-push: repo not found in DB, skipping hooks");
             return;
@@ -230,13 +447,14 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         None => None,
     };
 
-    let mut cascade = RefUpdateCascade::new(ref_updates);
-    while let Some((update, depth)) = cascade.next() {
+    let mut cascade = RefUpdateCascade::new(Arc::new(seed), ref_updates);
+    while let Some((target, update, depth)) = cascade.next() {
         if update.status != "ok" {
             continue;
         }
 
         tracing::info!(
+            repo_id = target.repo_id,
             refname = %update.refname,
             new_sha = %update.new_sha,
             depth,
@@ -245,18 +463,36 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
 
         // 0. PR head-SHA refresh + auto-merge/merge-queue + protected-branch audit
         if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
-            let merged = post_push_branch_maintenance(params, repo_id, branch_name, &update).await;
+            let merged = post_push_branch_maintenance(params, &target, branch_name, &update).await;
             // A merge the maintenance above performed advanced *another* branch,
             // and that move owes these same hooks. Back into the work list it
-            // goes rather than into a recursive call (card_87c4912c51ed).
-            cascade.extend(merged, depth + 1);
+            // goes rather than into a recursive call (card_87c4912c51ed) — under
+            // the repository whose branch moved, which for a fork PR is not the
+            // one that received the push.
+            for merged_ref in merged {
+                let next = if merged_ref.repo_id == target.repo_id {
+                    Some(target.clone())
+                } else {
+                    resolve_hook_target(
+                        params.db,
+                        params.repo_root,
+                        &merged_ref.owner,
+                        &merged_ref.repo_name,
+                    )
+                    .await
+                    .map(Arc::new)
+                };
+                if let Some(next) = next {
+                    cascade.extend(next, [merged_ref.update], depth + 1);
+                }
+            }
         }
 
         // 1. Trigger CI pipeline if .forgekeep-ci.yml exists
-        trigger_ci_for_push(params, repo_id, repo_owner_id, &update).await;
+        trigger_ci_for_push(params, &target, &update).await;
 
         // 2-3. Push + branch/tag webhooks and the real-time notification
-        trigger_push_webhooks(params, repo_id, repo_owner_id, &update).await;
+        trigger_push_webhooks(params, &target, &update).await;
 
         // 4. Watch fan-out.
         //
@@ -267,8 +503,8 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         // inside `notification::notify_watchers`, so no gate is needed here.
         if let Err(error) = crate::repo::service::notify_watchers_push(
             params.db,
-            repo_id,
-            params.repo_name,
+            target.repo_id,
+            &target.name,
             pusher_name.as_deref().unwrap_or_default(),
             &update.refname,
         )
@@ -287,69 +523,48 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
 /// can run this same hook run over them (card_87c4912c51ed).
 async fn post_push_branch_maintenance(
     params: &PostPushParams<'_>,
-    repo_id: i64,
+    target: &HookTarget,
     branch_name: &str,
     update: &RefUpdate,
-) -> Vec<RefUpdate> {
+) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
     if !update.new_sha.chars().all(|character| character == '0') {
         match rg_db::ops::pull_request_ops::update_open_head_sha(
             params.db,
-            repo_id,
+            target.repo_id,
             branch_name,
             &update.new_sha,
         )
         .await
         {
             Ok(_) => {
-                match crate::pull_request::try_auto_merges_for_head_commit(
+                merged_refs = evaluate_merges_for_head_commit(
                     params.db,
                     params.repo_root,
-                    repo_id,
-                    &update.new_sha,
-                )
-                .await
-                {
-                    Ok(outcomes) => merged_refs.extend(
-                        outcomes
-                            .into_iter()
-                            .filter_map(|outcome| outcome.merge)
-                            .filter_map(|merge| merge.base_ref_update),
-                    ),
-                    Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), "auto-merge evaluation after push failed")
-                    }
-                }
-                match crate::pull_request::merge_queue::process_for_head_commit_with_ci(
-                    params.db,
-                    params.repo_root,
-                    repo_id,
+                    target.repo_id,
                     &update.new_sha,
                     &crate::pull_request::merge_queue::MergeQueueCi {
                         trigger: params.ci_engine,
                         docker_enabled: params.docker_enabled,
                         external_runners: params.external_runners,
                         allow_host_runner: params.allow_host_runner,
-                        jwt_secret: Some(params.jwt_secret),
+                        jwt_secret: params.jwt_secret,
                         external_url: params.external_url,
                     },
                 )
-                .await
-                {
-                    Ok(results) => merged_refs
-                        .extend(results.into_iter().flat_map(|run| run.merged_ref_updates)),
-                    Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), "merge queue evaluation after push failed")
-                    }
-                }
+                .await;
             }
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "failed to refresh PR head SHA after push")
             }
         }
     }
-    match rg_db::ops::protected_branch_ops::find_by_repo_and_branch(params.db, repo_id, branch_name)
-        .await
+    match rg_db::ops::protected_branch_ops::find_by_repo_and_branch(
+        params.db,
+        target.repo_id,
+        branch_name,
+    )
+    .await
     {
         Ok(Some(_protection)) => {
             tracing::info!(
@@ -368,15 +583,10 @@ async fn post_push_branch_maintenance(
 /// Section 1 of the post-push hook: trigger a CI pipeline when a
 /// `.forgekeep-ci.yml` is present at the pushed commit, then fan out the
 /// real-time owner notification and the optional SMTP email.
-async fn trigger_ci_for_push(
-    params: &PostPushParams<'_>,
-    repo_id: i64,
-    repo_owner_id: i64,
-    update: &RefUpdate,
-) {
+async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, update: &RefUpdate) {
     if !params
         .ci_engine
-        .has_ci_config(params.repo_path, &update.new_sha)
+        .has_ci_config(&target.path, &update.new_sha)
     {
         return;
     }
@@ -384,8 +594,8 @@ async fn trigger_ci_for_push(
         .ci_engine
         .trigger_pipeline(crate::ci::TriggerPipelineParams {
             db: params.db,
-            repo_path: params.repo_path,
-            repo_id,
+            repo_path: &target.path,
+            repo_id: target.repo_id,
             commit_sha: &update.new_sha,
             ref_name: &update.refname,
             trigger_type: "push",
@@ -393,7 +603,7 @@ async fn trigger_ci_for_push(
             docker_enabled: params.docker_enabled,
             external_runners: params.external_runners,
             allow_host_runner: params.allow_host_runner,
-            jwt_secret: Some(params.jwt_secret),
+            jwt_secret: params.jwt_secret,
             external_url: params.external_url,
         })
         .await
@@ -411,11 +621,11 @@ async fn trigger_ci_for_push(
 
     // Push real-time notification to repo owner
     params.notify(
-        repo_owner_id,
+        target.owner_id,
         "ci_triggered",
         serde_json::json!({
             "pipeline_id": pipeline_id,
-            "repo": format!("{}/{}", params.owner, params.repo_name),
+            "repo": format!("{}/{}", target.owner, target.name),
             "ref": update.refname,
             "commit": update.new_sha,
         }),
@@ -424,15 +634,15 @@ async fn trigger_ci_for_push(
     // Send email notification if SMTP is configured
     if let Some(smtp) = params.smtp_config {
         if let Ok(Some(owner_user)) =
-            rg_db::ops::user_ops::find_by_id(params.db, repo_owner_id).await
+            rg_db::ops::user_ops::find_by_id(params.db, target.owner_id).await
         {
             let subject = format!(
                 "[ForgeKeep] CI pipeline #{} triggered for {}/{}",
-                pipeline_id, params.owner, params.repo_name
+                pipeline_id, target.owner, target.name
             );
             let body = format!(
                 "A CI pipeline has been triggered for repository {}/{} on branch {}.<br/><br/>Commit: {}<br/>Pipeline ID: {}",
-                params.owner, params.repo_name, update.refname, update.new_sha, pipeline_id
+                target.owner, target.name, update.refname, update.new_sha, pipeline_id
             );
             if let Err(e) =
                 crate::email::send_html_notification(smtp, &owner_user.email, &subject, &body, None)
@@ -448,18 +658,18 @@ async fn trigger_ci_for_push(
 /// branch/tag create/delete webhooks, and the real-time push notification.
 async fn trigger_push_webhooks(
     params: &PostPushParams<'_>,
-    repo_id: i64,
-    repo_owner_id: i64,
+    target: &HookTarget,
     update: &RefUpdate,
 ) {
+    let repo_id = target.repo_id;
     // 2. Trigger push webhook
     let payload = serde_json::json!({
         "ref": update.refname,
         "before": update.old_sha,
         "after": update.new_sha,
         "repository": {
-            "owner": params.owner,
-            "name": params.repo_name,
+            "owner": target.owner,
+            "name": target.name,
         },
     });
 
@@ -526,10 +736,10 @@ async fn trigger_push_webhooks(
 
     // Push real-time notification for push event
     params.notify(
-        repo_owner_id,
+        target.owner_id,
         "push",
         serde_json::json!({
-            "repo": format!("{}/{}", params.owner, params.repo_name),
+            "repo": format!("{}/{}", target.owner, target.name),
             "ref": update.refname,
             "commit": update.new_sha,
         }),
@@ -550,6 +760,16 @@ mod tests {
         }
     }
 
+    fn target(repo_id: i64) -> Arc<HookTarget> {
+        Arc::new(HookTarget {
+            repo_id,
+            owner_id: 1,
+            owner: "owner".to_string(),
+            name: format!("repo-{repo_id}"),
+            path: PathBuf::from(format!("/repos/owner/repo-{repo_id}.git")),
+        })
+    }
+
     /// The hooks run auto-merge, auto-merge moves a branch, and that move is fed
     /// back into the hooks. Modelled here at its worst: *every* update produces
     /// another, forever. The loop must still end — before card_87c4912c51ed this
@@ -557,10 +777,10 @@ mod tests {
     /// would have had no bound.
     #[test]
     fn a_self_feeding_cascade_stops_at_the_depth_limit() {
-        let mut cascade = RefUpdateCascade::new(&[moved("refs/heads/main", "commit-0")]);
+        let mut cascade = RefUpdateCascade::new(target(1), &[moved("refs/heads/main", "commit-0")]);
         let mut processed = 0usize;
 
-        while let Some((_update, depth)) = cascade.next() {
+        while let Some((target, _update, depth)) = cascade.next() {
             processed += 1;
             assert!(
                 processed <= MAX_MERGE_CASCADE_DEPTH + 1,
@@ -570,6 +790,7 @@ mod tests {
             // Each round mints a fresh commit, so the seen-set cannot stop it:
             // only the depth limit can.
             cascade.extend(
+                target,
                 [moved("refs/heads/main", &format!("commit-{}", depth + 1))],
                 depth + 1,
             );
@@ -588,18 +809,69 @@ mod tests {
     /// seeing the same `(refname, new_sha)` twice means the chain closed a loop.
     #[test]
     fn the_same_ref_move_is_never_processed_twice() {
-        let mut cascade = RefUpdateCascade::new(&[moved("refs/heads/main", "merge-commit")]);
+        let mut cascade =
+            RefUpdateCascade::new(target(1), &[moved("refs/heads/main", "merge-commit")]);
         let mut processed = 0usize;
 
-        while let Some((update, depth)) = cascade.next() {
+        while let Some((target, update, depth)) = cascade.next() {
             processed += 1;
             assert!(processed <= 2, "a repeated ref move must not be re-run");
-            cascade.extend([update], depth + 1);
+            cascade.extend(target, [update], depth + 1);
         }
 
         assert_eq!(
             processed, 1,
             "the second sighting of the same (refname, new_sha) must be dropped"
+        );
+    }
+
+    /// The same `(refname, new_sha)` in a *different* repository is a different
+    /// ref move: a fork PR merges into the upstream repository, so the moves a
+    /// cascade discovers are not all in the repository that received the push,
+    /// and deduplicating them by name alone would silently drop the upstream's
+    /// hooks (card_73a1ec5b32f3).
+    #[test]
+    fn the_same_ref_name_in_another_repository_is_not_deduplicated() {
+        let mut cascade =
+            RefUpdateCascade::new(target(1), &[moved("refs/heads/main", "merge-commit")]);
+        cascade.extend(target(2), [moved("refs/heads/main", "merge-commit")], 1);
+
+        let mut repos: Vec<i64> = Vec::new();
+        while let Some((target, _update, _depth)) = cascade.next() {
+            repos.push(target.repo_id);
+        }
+
+        assert_eq!(
+            repos,
+            vec![1, 2],
+            "both repositories owe hooks for their own branch move"
+        );
+    }
+
+    /// The hook run a merge owes must stay on the *tracked* spawn path, for the
+    /// reason the pushed one does: whoever merged already has its response, so a
+    /// bare `tokio::spawn` would be severed by a SIGTERM seconds later with no
+    /// trace that the work was owed (card_8d4148774f32). `rg-http` guards its own
+    /// half of this in `git_http.rs`.
+    #[test]
+    fn merged_ref_hooks_are_detached_through_the_delivery_tracker() {
+        let lines: Vec<&str> = include_str!("push_hooks.rs").lines().collect();
+        let helper = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("pub fn spawn_for_merged_refs")
+            })
+            .expect("the merge hooks must still go through spawn_for_merged_refs");
+        let spawn = lines[helper..]
+            .iter()
+            .position(|line| line.contains("spawn("))
+            .expect("spawn_for_merged_refs must detach the hook run");
+        assert!(
+            lines[helper + spawn].contains("delivery_tracker()"),
+            "the merge hook run must be spawned via task_tracker::delivery_tracker() \
+             so the shutdown drain awaits it; found `{}`",
+            lines[helper + spawn].trim()
         );
     }
 
@@ -610,7 +882,7 @@ mod tests {
         let updates: Vec<RefUpdate> = (0..50)
             .map(|index| moved(&format!("refs/tags/v{index}"), &format!("tag-{index}")))
             .collect();
-        let mut cascade = RefUpdateCascade::new(&updates);
+        let mut cascade = RefUpdateCascade::new(target(1), &updates);
 
         let mut processed = 0usize;
         while cascade.next().is_some() {

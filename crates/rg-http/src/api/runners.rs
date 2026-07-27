@@ -1111,44 +1111,20 @@ pub async fn finish_job(
                             rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
                                 .await
                         {
-                            if let Err(error) =
-                                rg_core::pull_request::try_auto_merges_for_head_commit(
-                                    &state.db,
-                                    &state.repo_root,
+                            // "CI went green, so the PR goes in" is what
+                            // auto-merge is for — and the merge commit it lands
+                            // on the base branch owes the same post-push
+                            // automation a push does. Until card_73a1ec5b32f3
+                            // the merge happened here and its ref move was
+                            // dropped, so that commit got no pipeline, no `push`
+                            // webhook and no watch notification.
+                            state
+                                .evaluate_merges_and_spawn_hooks(
                                     pipeline.repo_id,
                                     &pipeline.commit_sha,
+                                    None,
                                 )
-                                .await
-                            {
-                                tracing::warn!(
-                                    pipeline_id = pipeline.id,
-                                    error = %format!("{error:#}"),
-                                    "auto-merge evaluation after CI failed"
-                                );
-                            }
-                            if let Err(error) =
-                                rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-                                    &state.db,
-                                    &state.repo_root,
-                                    pipeline.repo_id,
-                                    &pipeline.commit_sha,
-                                    &rg_core::pull_request::merge_queue::MergeQueueCi {
-                                        trigger: &*state.ci_engine,
-                                        docker_enabled: state.docker_enabled,
-                                        external_runners: state.external_runners,
-                                        allow_host_runner: state.allow_host_runner,
-                                        jwt_secret: Some(&state.jwt_secret),
-                                        external_url: state.external_url.as_deref(),
-                                    },
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    pipeline_id = pipeline.id,
-                                    error = %format!("{error:#}"),
-                                    "merge queue evaluation after CI failed"
-                                );
-                            }
+                                .await;
                         }
                     }
                 }

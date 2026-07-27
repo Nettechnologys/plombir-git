@@ -398,46 +398,21 @@ impl PipelineRunner {
             return Ok(());
         };
 
-        if let Err(error) = rg_core::pull_request::try_auto_merges_for_head_commit(
-            &self.db,
+        // The merges this unblocks move a base branch, and that move owes the
+        // post-push hooks — a pipeline on the merge commit, the `push` webhook,
+        // the watch fan-out (card_73a1ec5b32f3).
+        crate::post_push_context(
             repo_root,
-            pipeline.repo_id,
-            &pipeline.commit_sha,
+            self.docker_enabled,
+            false,
+            self.allow_host_runner,
+            self.jwt_secret.as_deref(),
+            self.oidc_token_url
+                .as_deref()
+                .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
         )
-        .await
-        {
-            tracing::warn!(
-                pipeline_id = self.pipeline_id,
-                error = %format!("{error:#}"),
-                "auto-merge evaluation after local CI failed"
-            );
-        }
-        let ci_engine = crate::CiEngine;
-        if let Err(error) = rg_core::pull_request::merge_queue::process_for_head_commit_with_ci(
-            &self.db,
-            repo_root,
-            pipeline.repo_id,
-            &pipeline.commit_sha,
-            &rg_core::pull_request::merge_queue::MergeQueueCi {
-                trigger: &ci_engine,
-                docker_enabled: self.docker_enabled,
-                external_runners: false,
-                allow_host_runner: self.allow_host_runner,
-                jwt_secret: self.jwt_secret.as_deref(),
-                external_url: self
-                    .oidc_token_url
-                    .as_deref()
-                    .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
-            },
-        )
-        .await
-        {
-            tracing::warn!(
-                pipeline_id = self.pipeline_id,
-                error = %format!("{error:#}"),
-                "merge queue evaluation after local CI failed"
-            );
-        }
+        .evaluate_merges_and_spawn_hooks(&self.db, pipeline.repo_id, &pipeline.commit_sha, None)
+        .await;
 
         Ok(())
     }

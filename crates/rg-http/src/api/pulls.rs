@@ -14,32 +14,15 @@ use crate::AppState;
 
 /// Run the post-push hooks for the base-branch move a merge just made.
 ///
-/// A merge advances `refs/heads/<base>` exactly like a `git push` does, so it
-/// owes the same automation — a pipeline on the merge commit, the `push`
-/// webhook, the watch fan-out. Until card_87c4912c51ed a merge fired only
-/// `pull_request.merged`, so "CI on every push to main" quietly did not hold for
-/// the way most merges happen: through the UI. The ref move is reported by
-/// `rg-core` (which has no CI engine or hub of its own) and run here, through
-/// the one seam every ref-moving path in this crate shares.
-///
-/// `None` = the merge moved nothing observable; nothing to run.
-fn spawn_merge_push_hooks(
+/// The seam itself lives on [`AppState::spawn_merge_push_hooks`] — every
+/// ref-moving path of this crate shares it (card_73a1ec5b32f3). This wrapper is
+/// only the `Option` → `Vec` adapter for the single-merge callers below.
+fn spawn_hooks_for_merge(
     state: &AppState,
-    owner: &str,
-    repo: &str,
     actor_id: i64,
-    base_ref_update: Option<rg_git::protocol::receive_pack::RefUpdate>,
+    base_ref_update: Option<rg_core::pull_request::MergedRef>,
 ) {
-    let Some(update) = base_ref_update else {
-        return;
-    };
-    state.spawn_post_push_hooks(
-        state.repo_root.join(format!("{owner}/{repo}.git")),
-        owner.to_string(),
-        repo.to_string(),
-        Some(actor_id),
-        vec![update],
-    );
+    state.spawn_merge_push_hooks(Some(actor_id), base_ref_update.into_iter().collect());
 }
 
 // ── Request / Response types ────────────────────────────────────────────
@@ -453,13 +436,7 @@ pub async fn merge_pr(
         // `pr_merged` is recorded inside `rg_core::pull_request::merge_pr` so the
         // REST, auto-merge, and merge-queue paths all count through one site.
         Ok(result) => {
-            spawn_merge_push_hooks(
-                &state,
-                &owner,
-                &repo,
-                actor_id,
-                result.base_ref_update.clone(),
-            );
+            spawn_hooks_for_merge(&state, actor_id, result.base_ref_update.clone());
             (StatusCode::OK, Json(result)).into_response()
         }
         // Every way a merge fails used to be the client's fault: a closed PR, a
@@ -514,10 +491,8 @@ pub async fn enable_auto_merge(
             // Enabling auto-merge on a PR whose conditions are already met
             // merges it right here, moving the base branch — same debt as the
             // explicit merge above.
-            spawn_merge_push_hooks(
+            spawn_hooks_for_merge(
                 &state,
-                &owner,
-                &repo,
                 actor_id,
                 outcome
                     .merge
@@ -646,25 +621,20 @@ pub async fn enqueue_merge_queue(
         Ok(entry) => entry,
         Err(error) => return AppError::bad_request(error).into_response(),
     };
-    let ci = rg_core::pull_request::merge_queue::MergeQueueCi {
-        trigger: &*state.ci_engine,
-        docker_enabled: state.docker_enabled,
-        external_runners: state.external_runners,
-        allow_host_runner: state.allow_host_runner,
-        jwt_secret: Some(&state.jwt_secret),
-        external_url: state.external_url.as_deref(),
-    };
     let process = match rg_core::pull_request::merge_queue::process_repository_with_ci(
         &state.db,
         &state.repo_root,
         &repository,
-        &ci,
+        &state.merge_queue_ci(),
     )
     .await
     {
         Ok(process) => process,
         Err(error) => return AppError::from(error).into_response(),
     };
+    // Enqueueing runs the queue, and a queue run merges: the branches it moved
+    // owe the hooks just like any other merge does (card_73a1ec5b32f3).
+    state.spawn_merge_push_hooks(Some(actor_id), process.merged_ref_updates.clone());
     (
         StatusCode::OK,
         Json(serde_json::json!({"entry": entry, "process": process})),

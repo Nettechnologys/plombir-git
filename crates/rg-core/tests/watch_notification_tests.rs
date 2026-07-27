@@ -107,7 +107,7 @@ async fn run_post_push_hooks(
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
-            jwt_secret: "test-secret",
+            jwt_secret: Some("test-secret"),
             notifier: None,
             smtp_config: &None,
             ci_engine: &ci,
