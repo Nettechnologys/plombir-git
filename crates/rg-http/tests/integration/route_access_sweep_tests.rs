@@ -40,9 +40,10 @@
 //!   but it is not vacuous either.
 //! - **A gate that resolves the right repository and then acts on a global
 //!   `id`** passes here, because the gate did answer. That is a second
-//!   mechanism (`card_e704fe5ca25f`), not a hole in this one — see
-//!   `cross_repo_release_tests` and `cross_repo_label_milestone_tests` for the
-//!   instances closed by hand so far.
+//!   mechanism, not a hole in this one, and it has its own pass:
+//!   `cross_repo_id_scope_sweep_tests` drives every repository-scoped route
+//!   that carries an instance-wide id against a repository the id does not
+//!   belong to.
 
 use std::collections::{BTreeSet, HashMap};
 

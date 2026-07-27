@@ -174,6 +174,34 @@ pub async fn spawn_test_app_with_routes() -> (String, Vec<rg_http::route_table::
     (base_url, facts)
 }
 
+/// Spawn the test app and hand back `(base_url, route_facts, db)`.
+///
+/// The cross-repository id-scope sweep needs both halves at once: the route
+/// table to walk, and the database to seed the few resources this harness has
+/// no API for — a pull request needs commits on two branches, a pipeline needs
+/// a CI engine, a webhook delivery needs a webhook that actually fired.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_routes_and_db() -> (
+    String,
+    Vec<rg_http::route_table::RouteFact>,
+    rg_db::DatabaseConnection,
+) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    let state = build_test_app_state(db.clone(), repo_root);
+    let (app, facts) = rg_http::create_router_for_test_with_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    (base_url, facts, db)
+}
+
 /// Spawn the test app and keep the db handle alive for tests that need
 /// to manipulate data directly (e.g. promoting admin users).
 #[allow(dead_code)]

@@ -190,10 +190,11 @@ pub async fn create_review_comment(
     let review = pr_review_ops::find_by_id(db, review_id)
         .await?
         .ok_or_else(|| crate::error::not_found("review"))?;
+    // Both ids below are instance-wide primary keys, so a row belonging to
+    // another pull request must read as absent rather than as a bad request:
+    // the two answers together tell an id-walking caller which ids exist.
     if review.repo_id != repo_id || review.pr_id != pr.id {
-        return Err(crate::error::invalid_request(
-            "review does not belong to this PR",
-        ));
+        return Err(crate::error::not_found("review"));
     }
 
     // Validate reply_to if specified
@@ -202,9 +203,7 @@ pub async fn create_review_comment(
             .await?
             .ok_or_else(|| crate::error::not_found("parent comment"))?;
         if parent.pr_id != pr.id {
-            return Err(crate::error::invalid_request(
-                "parent comment does not belong to this PR",
-            ));
+            return Err(crate::error::not_found("parent comment"));
         }
     }
 
@@ -357,9 +356,18 @@ pub async fn apply_suggestions(
         let comment = review_comment_ops::find_by_id(db, comment_id)
             .await?
             .ok_or_else(|| crate::error::not_found("review comment"))?;
-        if comment.pr_id != pr.id || comment.reply_to_id.is_some() {
+        // Belonging to another pull request is indistinguishable from not
+        // existing, and must answer the same way: `comment_ids` comes from the
+        // request body, so a `400`/`404` split here would enumerate every
+        // review comment on the instance from a pull request of one's own.
+        if comment.pr_id != pr.id {
+            return Err(crate::error::not_found("review comment"));
+        }
+        // A reply is a different complaint: the id names a comment of *this*
+        // pull request, it simply cannot carry a suggestion.
+        if comment.reply_to_id.is_some() {
             return Err(crate::error::invalid_request(
-                "suggestion does not belong to this pull request",
+                "a reply cannot carry a suggestion",
             ));
         }
         let replacement = comment.suggestion.clone().ok_or_else(|| {
@@ -566,10 +574,14 @@ pub async fn get_thread_root(
     let mut comment = review_comment_ops::find_by_id(db, comment_id)
         .await?
         .ok_or_else(|| crate::error::not_found("review comment"))?;
+    // A comment id is an instance-wide primary key, so "belongs to another pull
+    // request" is the same answer as "there is no such comment" — and it has to
+    // be *said* the same way. A `400` here answered `404` for an id that does
+    // not exist and `400` for one that does, which is an existence oracle over
+    // every review comment on the instance, reachable from any repository the
+    // caller can read.
     if comment.pr_id != pr_id {
-        return Err(crate::error::invalid_request(
-            "review comment does not belong to this PR",
-        ));
+        return Err(crate::error::not_found("review comment"));
     }
 
     // Resolution is stored on the root. Replies currently form a shallow
@@ -580,9 +592,7 @@ pub async fn get_thread_root(
             .await?
             .ok_or_else(|| crate::error::not_found("review thread root"))?;
         if comment.pr_id != pr_id {
-            return Err(crate::error::invalid_request(
-                "review thread does not belong to this PR",
-            ));
+            return Err(crate::error::not_found("review thread root"));
         }
         hops += 1;
         if hops > 100 {

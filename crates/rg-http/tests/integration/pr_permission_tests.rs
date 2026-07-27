@@ -365,6 +365,153 @@ async fn review_id_must_belong_to_the_pr_in_the_route() {
     assert_eq!(response.status(), 404);
 }
 
+/// The same scoping, for the ids that arrive in the *body* rather than the path.
+///
+/// `review_id` and `reply_to_id` are instance-wide primary keys posted by the
+/// client, so a pull request of one's own is all it takes to name a review or a
+/// comment thread of a private repository. The service does check — but it used
+/// to say so with `400 "review does not belong to this PR"` while an id that
+/// does not exist answered `404`. The pair is an existence oracle over every
+/// review and review comment on the instance, which is most of what an
+/// id-walking caller wants to learn; the route-level lookups
+/// (`review_id_must_belong_to_the_pr_in_the_route`) already answered `404` for
+/// exactly that reason.
+#[tokio::test]
+async fn review_and_parent_ids_in_the_body_are_scoped_to_their_pull_request() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "body-owner", "body-owner@example.com").await;
+    let vault = create_private_repo(&base, &owner_token, "body-vault").await;
+    let host = create_private_repo(&base, &owner_token, "body-host").await;
+    let vault_pr = insert_pr(&db, vault, owner_id, 1).await;
+    insert_pr(&db, host, owner_id, 1).await;
+
+    let review = rg_db::ops::pr_review_ops::create(
+        &db,
+        rg_db::entities::pr_review::ActiveModel {
+            id: sea_orm::NotSet,
+            pr_id: Set(vault_pr.id),
+            repo_id: Set(vault),
+            reviewer_id: Set(owner_id),
+            action: Set("comment".to_string()),
+            body: Set(Some("belongs to the vault".to_string())),
+            commit_id: Set(None),
+            created_at: Set(Utc::now()),
+        },
+    )
+    .await
+    .unwrap();
+    let comment = rg_db::ops::review_comment_ops::create(
+        &db,
+        rg_db::entities::review_comment::ActiveModel {
+            id: sea_orm::NotSet,
+            review_id: Set(review.id),
+            pr_id: Set(vault_pr.id),
+            author_id: Set(owner_id),
+            path: Set("src/lib.rs".to_string()),
+            position: Set(None),
+            line: Set(Some(1)),
+            start_line: Set(None),
+            side: Set(Some("RIGHT".to_string())),
+            start_side: Set(None),
+            body: Set("belongs to the vault".to_string()),
+            suggestion: Set(None),
+            suggestion_applied_at: Set(None),
+            suggestion_applied_by_id: Set(None),
+            suggestion_commit_sha: Set(None),
+            commit_id: Set(None),
+            reply_to_id: Set(None),
+            resolved_at: Set(None),
+            resolved_by_id: Set(None),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    let host_comments = format!("{base}/api/v1/repos/body-owner/body-host/pulls/1/comments");
+
+    // A foreign review id, posted through a pull request the caller owns.
+    let foreign_review = client
+        .post(&host_comments)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "review_id": review.id,
+            "path": "src/lib.rs",
+            "line": 1,
+            "side": "RIGHT",
+            "body": "planted",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign_review.status(),
+        404,
+        "a review id from another pull request must read as absent, not as a bad request"
+    );
+
+    // Same for a reply target.
+    let foreign_parent = client
+        .post(&host_comments)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "path": "src/lib.rs",
+            "body": "planted",
+            "reply_to_id": comment.id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign_parent.status(),
+        404,
+        "a parent comment from another pull request must read as absent"
+    );
+
+    // The baseline: an id that does not exist answers the same way, which is
+    // the whole point — the two cases must be indistinguishable.
+    let absent = client
+        .post(&host_comments)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "review_id": 999_999,
+            "path": "src/lib.rs",
+            "line": 1,
+            "side": "RIGHT",
+            "body": "planted",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(absent.status(), 404, "an unknown review id must answer 404");
+
+    // And the live control: the same call succeeds where the review belongs.
+    let own = client
+        .post(format!(
+            "{base}/api/v1/repos/body-owner/body-vault/pulls/1/comments"
+        ))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "review_id": review.id,
+            "path": "src/lib.rs",
+            "line": 2,
+            "side": "RIGHT",
+            "body": "legitimate",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own.status(),
+        201,
+        "the owner cannot comment on their own review — the fixture is broken, \
+         so the 404s above prove nothing"
+    );
+}
+
 #[tokio::test]
 async fn inline_comment_can_create_its_comment_review_implicitly() {
     let (base, db) = spawn_test_app_with_db().await;
