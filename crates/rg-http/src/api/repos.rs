@@ -708,13 +708,15 @@ pub async fn fork_repo_handler(
         .await
     {
         Ok(repo) => {
-            // Record audit log
+            // Record audit log. The fork is named the way every other record in
+            // this module names a repository — `owner/name` — not `<user id>/name`:
+            // an audit row is read by a human looking for a path that exists.
             let details = serde_json::json!({
                 "source_owner": owner,
                 "source_name": name,
-                "fork_owner": claims.sub
+                "fork_owner": claims.username
             });
-            let resource_name = format!("{}/{}", claims.sub, name);
+            let resource_name = format!("{}/{}", claims.username, name);
             record_audit(
                 &state.db,
                 user_id,
@@ -729,7 +731,11 @@ pub async fn fork_repo_handler(
             .await;
 
             crate::metrics::recorder::repo_forked();
-            (StatusCode::ACCEPTED, Json(serde_json::json!(repo))).into_response()
+            // `201`, not `202`: the clone and the row are both done by the time
+            // this returns, and the body is the created repository. The route
+            // has always *declared* `201` above — nothing could notice the
+            // disagreement while every fork was a 500.
+            (StatusCode::CREATED, Json(serde_json::json!(repo))).into_response()
         }
         // Absent source → 404, private source the caller may not read → 403, name
         // already taken in their account → 400. The `git clone --bare` behind all

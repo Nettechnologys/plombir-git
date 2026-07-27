@@ -115,12 +115,6 @@ const NO_FIXTURE: &[(&str, &str)] = &[
 /// removed from it.
 const FALLS_OVER: &[(&str, &str)] = &[
     (
-        "POST /api/v1/repos/{owner}/{name}/fork",
-        "`fork_repo` canonicalizes the *target* path before the clone creates it \
-         (`path_to_git_url` → `fs::canonicalize`), so every fork of every repository is a \
-         500 — see card_3b3525983401",
-    ),
-    (
         "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
         "'package type not enabled for this repo' is a bare `anyhow!`, so a repository \
          without that registry answers 500 instead of 404 — see card_6db8f22d6b61",

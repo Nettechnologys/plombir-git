@@ -618,6 +618,27 @@ fn path_to_git_url(path: &std::path::Path) -> Result<String> {
     }
 }
 
+/// Absolute filesystem path for an entry that does **not exist yet** — the
+/// destination of a `git clone`, say, which the clone itself creates.
+///
+/// [`std::fs::canonicalize`] requires every component of the path to exist, so
+/// the final one cannot be resolved *before* the operation that creates it;
+/// asking anyway is how forking answered 500 to everyone. Resolve the parent
+/// instead — the caller has just created it — and re-append the name: symlinks
+/// above the entry are still collapsed and the result is absolute regardless of
+/// the process working directory.
+fn path_for_new_entry(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("path has no parent directory: {:?}", path))?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("path has no final component: {:?}", path))?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("failed to canonicalize parent directory: {:?}", parent))?;
+    Ok(canonical_parent.join(name))
+}
+
 /// Auto-initialize a bare repo with initial files (README, LICENSE, .gitignore)
 /// by creating a temp working tree, committing, and pushing to the bare repo.
 // Wide by design: threads the full initial-commit context (paths, names, author identity).
@@ -974,14 +995,21 @@ pub async fn fork_repo(
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Convert paths to git-compatible URL format to avoid Windows path issues
+    // The source is a clone *source*, so it goes through the URL form to avoid
+    // Windows path issues. The target is a clone *destination*, which git reads
+    // as a plain filesystem path and never as a URL: handed `file:///…` it
+    // creates a literal `file:` directory under its own working directory
+    // instead of the repository root. Canonicalizing it is impossible in any
+    // case — the clone is what brings it into existence — so resolve the parent
+    // `create_dir_all` just made and re-append the name.
     let source_url =
         path_to_git_url(&source_path).context("failed to convert source path to git URL")?;
-    let target_url =
-        path_to_git_url(&target_path).context("failed to convert target path to git URL")?;
+    let target_dir =
+        path_for_new_entry(&target_path).context("failed to resolve fork target directory")?;
+    let target_arg = target_dir.to_string_lossy();
 
     let out = git
-        .run(&["clone", "--bare", &source_url, &target_url], None)
+        .run(&["clone", "--bare", &source_url, &target_arg], None)
         .context("git clone --bare failed")?;
     out.ensure_success()?;
 
