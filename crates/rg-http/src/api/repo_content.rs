@@ -1088,6 +1088,13 @@ pub async fn create_or_update_file(
         };
 
     let branch = req.branch.unwrap_or(repo_model.default_branch.clone());
+    let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
+    // Read *before* the write: the hooks below need the ref's previous value,
+    // and once the commit lands it is gone. A branch that does not exist yet
+    // (the editor may create one) legitimately resolves to nothing — that is
+    // the all-zero SHA a push sends for a created ref, which is what makes the
+    // `branch.created` webhook fire instead of a plain `push`.
+    let old_sha = previous_branch_sha(&repo_path, &branch);
 
     // Call business logic
     match rg_core::repo::service::create_or_update_file(
@@ -1108,8 +1115,18 @@ pub async fn create_or_update_file(
     {
         Ok(_) => {
             // Get the new commit SHA
-            let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
             let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
+
+            spawn_post_push_hooks_for_edit(
+                &state,
+                repo_path,
+                &owner,
+                &repo,
+                &branch,
+                &old_sha,
+                &new_sha,
+                user.id,
+            );
 
             (
                 StatusCode::OK,
@@ -1173,6 +1190,10 @@ pub async fn delete_file(
         };
 
     let branch = params.branch.unwrap_or(repo_model.default_branch.clone());
+    let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
+    // Same as `create_or_update_file`: the ref's old value has to be read
+    // before the commit that replaces it.
+    let old_sha = previous_branch_sha(&repo_path, &branch);
 
     // Call business logic
     match rg_core::repo::service::delete_file(
@@ -1192,8 +1213,18 @@ pub async fn delete_file(
     {
         Ok(_) => {
             // Get the new commit SHA
-            let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
             let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
+
+            spawn_post_push_hooks_for_edit(
+                &state,
+                repo_path,
+                &owner,
+                &repo,
+                &branch,
+                &old_sha,
+                &new_sha,
+                user.id,
+            );
 
             (
                 StatusCode::OK,
@@ -1209,6 +1240,81 @@ pub async fn delete_file(
         // Same split as `create_or_update_file` above.
         Err(e) => AppError::from(e).into_response(),
     }
+}
+
+/// The all-zero object id git uses on the wire for "this ref had no value".
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// The branch's SHA *before* an edit, in the form a push reports it: the
+/// all-zero id when the branch does not exist yet.
+///
+/// An unresolvable branch is the normal case for an editor that creates one, so
+/// this is not an error path — but it is not silent either, since the same
+/// failure also covers an unreadable repository, and the hooks downstream would
+/// then mistake an existing branch for a newly created one.
+fn previous_branch_sha(repo_path: &std::path::Path, branch: &str) -> String {
+    match get_latest_commit_sha(repo_path, branch) {
+        Ok(sha) => sha,
+        Err(e) => {
+            tracing::debug!(
+                repo = %repo_path.display(),
+                branch = %branch,
+                error = %format!("{e:#}"),
+                "no pre-edit SHA for branch — treating the edit as a branch creation"
+            );
+            ZERO_SHA.to_string()
+        }
+    }
+}
+
+/// Hand a web-editor commit to the same post-push automation a `git push` gets.
+///
+/// The editor writes a real commit onto a real branch (`rg_core::repo::service`
+/// clones, commits and pushes into the bare repo), so everything a push
+/// triggers is owed here too: CI, the `push` / `branch.*` webhooks, the
+/// open-PR head-SHA refresh that auto-merge and the merge queue read, and the
+/// watch fan-out. None of it ran until card_13202be354ac.
+///
+/// Skipped when the read-back of the new SHA failed or the branch did not
+/// actually move. That guard is load-bearing, not defensive noise: an empty
+/// `new_sha` reaching the hooks reads as a *deleted* ref and would fire
+/// `branch.deleted` for a branch that is alive and well.
+#[allow(clippy::too_many_arguments)]
+fn spawn_post_push_hooks_for_edit(
+    state: &AppState,
+    repo_path: std::path::PathBuf,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    old_sha: &str,
+    new_sha: &str,
+    pusher_id: i64,
+) {
+    if new_sha.is_empty() || new_sha == ZERO_SHA || new_sha == old_sha {
+        tracing::warn!(
+            repo = %format!("{owner}/{repo}"),
+            branch = %branch,
+            old_sha = %old_sha,
+            new_sha = %new_sha,
+            "web-editor commit landed but its new head SHA is unusable — \
+             skipping post-push hooks rather than reporting a bogus ref update"
+        );
+        return;
+    }
+
+    state.spawn_post_push_hooks(
+        repo_path,
+        owner.to_string(),
+        repo.to_string(),
+        Some(pusher_id),
+        vec![rg_git::protocol::receive_pack::RefUpdate {
+            old_sha: old_sha.to_string(),
+            new_sha: new_sha.to_string(),
+            refname: format!("refs/heads/{branch}"),
+            status: "ok".to_string(),
+            message: String::new(),
+        }],
+    );
 }
 
 /// Best-effort read-back of the commit SHA for the write endpoints. The commit

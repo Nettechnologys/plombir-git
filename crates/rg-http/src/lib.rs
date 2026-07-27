@@ -85,6 +85,72 @@ pub struct AppState {
     pub attestation_enabled: bool,
 }
 
+impl AppState {
+    /// Run every post-push hook for refs this process just moved, detached
+    /// through the delivery tracker.
+    ///
+    /// **Every path that advances a ref must call this**, not just the git
+    /// transports. A commit is a commit regardless of what wrote it: the web
+    /// editor's `POST /contents/*` moves `refs/heads/<branch>` exactly like a
+    /// `git push` does, and until card_13202be354ac it ran none of the
+    /// automation — no CI pipeline, no `push` webhook, no open-PR head-SHA
+    /// refresh, so merge-queue and auto-merge kept deciding on a commit that
+    /// was no longer the head. The same defect had already been fixed twice for
+    /// the two git transports (card_b4fefeee8abf); this helper exists so the
+    /// next caller inherits the wiring instead of hand-rolling a fourth copy.
+    ///
+    /// Detached because the client already holds its response, but **tracked**:
+    /// `delivery_tracker()` is what the shutdown drain in [`run`] awaits, so a
+    /// SIGTERM in the next few seconds cannot sever the work silently
+    /// (card_8d4148774f32).
+    pub fn spawn_post_push_hooks(
+        &self,
+        repo_path: PathBuf,
+        owner: String,
+        repo_name: String,
+        pusher_id: Option<i64>,
+        ref_updates: Vec<rg_git::protocol::receive_pack::RefUpdate>,
+    ) {
+        if ref_updates.is_empty() {
+            return;
+        }
+
+        let db = self.db.clone();
+        let repo_root = self.repo_root.clone();
+        let docker_enabled = self.docker_enabled;
+        let external_runners = self.external_runners;
+        let allow_host_runner = self.allow_host_runner;
+        let jwt_secret = self.jwt_secret.clone();
+        let hub = self.notification_hub.clone();
+        let smtp_config = self.smtp_config.clone();
+        let ci_engine = self.ci_engine.clone();
+        let external_url = self.external_url.clone();
+
+        rg_core::task_tracker::delivery_tracker().spawn(async move {
+            rg_core::push_hooks::post_push_hooks(
+                &rg_core::push_hooks::PostPushParams {
+                    db: &db,
+                    repo_path: &repo_path,
+                    repo_root: &repo_root,
+                    owner: &owner,
+                    repo_name: &repo_name,
+                    pusher_id,
+                    docker_enabled,
+                    external_runners,
+                    allow_host_runner,
+                    jwt_secret: &jwt_secret,
+                    notifier: Some(&hub),
+                    smtp_config: &smtp_config,
+                    ci_engine: &*ci_engine,
+                    external_url: external_url.as_deref(),
+                },
+                &ref_updates,
+            )
+            .await;
+        });
+    }
+}
+
 /// HTTP server configuration.
 pub struct HttpServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080").

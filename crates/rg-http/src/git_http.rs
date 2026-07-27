@@ -13,10 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rg_core::branch_protection::push_rules::{
     branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
 };
-// The hooks themselves live in `rg-core` so the SSH transport runs the same
-// ones (card_b4fefeee8abf); this module only wires them to the HTTP push path.
-use rg_core::push_hooks::{post_push_hooks, PostPushParams};
-
 use crate::pat_auth::extract_actor_id;
 use crate::{git_v2, AppState};
 
@@ -837,53 +833,20 @@ pub(crate) async fn handle_git_receive_pack(
 
             // ── Post-push hooks: trigger CI + Webhook ───────────────
             //
-            // Detached so the client isn't held while CI is triggered and the
-            // webhooks fan out — but tracked, not a bare `tokio::spawn`. The
-            // client already has its `200 OK`, so a SIGTERM in the next few
-            // seconds would sever the task on its first await: no pipeline, no
-            // webhook, no PR head-SHA refresh, and no trace that any of it was
-            // owed. `delivery_tracker()` puts it in the drain `rg_http::run`
-            // performs after the server stops accepting (`close()` + `wait()`),
-            // the same contract webhook delivery and WS notifications use. The
-            // nested spawns those two do from inside this task are tracked as
-            // well — `close()` only blocks `wait()` from returning, it never
-            // rejects a spawn.
-            let db = state.db.clone();
-            let repo_path_clone = repo_path.clone();
-            let repo_root = state.repo_root.clone();
-            let owner_clone = owner.clone();
-            let repo_clone = repo.clone();
-            let docker_enabled = state.docker_enabled;
-            let external_runners = state.external_runners;
-            let allow_host_runner = state.allow_host_runner;
-            let jwt_secret = state.jwt_secret.clone();
-            let hub = state.notification_hub.clone();
-            let smtp = state.smtp_config.clone();
-            let ci_engine = state.ci_engine.clone();
-            let external_url = state.external_url.clone();
-
-            rg_core::task_tracker::delivery_tracker().spawn(async move {
-                post_push_hooks(
-                    &PostPushParams {
-                        db: &db,
-                        repo_path: &repo_path_clone,
-                        repo_root: &repo_root,
-                        owner: &owner_clone,
-                        repo_name: &repo_clone,
-                        pusher_id: actor_id,
-                        docker_enabled,
-                        external_runners,
-                        allow_host_runner,
-                        jwt_secret: &jwt_secret,
-                        notifier: Some(&hub),
-                        smtp_config: &smtp,
-                        ci_engine: &*ci_engine,
-                        external_url: external_url.as_deref(),
-                    },
-                    &ref_updates,
-                )
-                .await;
-            });
+            // Shared with every other path that moves a ref (SSH's
+            // `receive-pack`, the web editor's `POST /contents/*`) through
+            // `AppState::spawn_post_push_hooks`, which owns the detach: the
+            // work is tracked by `delivery_tracker()`, not a bare
+            // `tokio::spawn`, so the shutdown drain in `rg_http::run` awaits it
+            // instead of a SIGTERM severing the pipeline / webhook / PR
+            // head-SHA refresh the client was already told it got.
+            state.spawn_post_push_hooks(
+                repo_path.clone(),
+                owner.clone(),
+                repo.clone(),
+                actor_id,
+                ref_updates,
+            );
 
             (
                 StatusCode::OK,
@@ -1022,13 +985,24 @@ mod tests {
     /// `tokio::spawn` here is the bug regardless of how the race lands.
     #[test]
     fn post_push_hooks_are_detached_through_the_delivery_tracker() {
-        let source = include_str!("git_http.rs");
+        // Two halves since the hooks moved behind `AppState::spawn_post_push_hooks`
+        // (card_13202be354ac): receive-pack must still hand its ref updates over,
+        // and the shared helper must still detach them through the tracker.
+        assert!(
+            include_str!("git_http.rs").contains("state.spawn_post_push_hooks("),
+            "receive-pack must still hand its ref updates to the post-push helper"
+        );
+
+        let source = include_str!("lib.rs");
         let lines: Vec<&str> = source.lines().collect();
         // The call inside the detached closure — not the `async fn` definition.
         let call = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("post_push_hooks("))
-            .expect("receive-pack must still call post_push_hooks");
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("rg_core::push_hooks::post_push_hooks(")
+            })
+            .expect("the post-push helper must still call post_push_hooks");
         let spawn = lines[..call]
             .iter()
             .rposition(|line| line.contains("spawn("))
@@ -1036,7 +1010,7 @@ mod tests {
         assert!(
             lines[spawn].contains("delivery_tracker()"),
             "post-push hooks must be spawned via rg_core::task_tracker::delivery_tracker() \
-             so the shutdown drain awaits them; found `{}` at git_http.rs:{}",
+             so the shutdown drain awaits them; found `{}` at lib.rs:{}",
             lines[spawn].trim(),
             spawn + 1
         );
