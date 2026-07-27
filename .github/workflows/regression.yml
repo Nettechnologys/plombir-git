@@ -11,6 +11,30 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Formatting is a ratchet, not a preference: before this gate existed the
+  # workspace drifted to 51 non-rustfmt-clean files, and the working rule became
+  # "never run `cargo fmt --all`" because one command would drag dozens of
+  # unrelated files into your diff. The drift came from our own recent edits
+  # (23% of the files touched on 2026-07-27 were unformatted, against 1.7% of
+  # the ones untouched since the fork import), so it regrows within days unless
+  # something checks it. Deliberately its own job: it needs no build, finishes
+  # in seconds, and must report independently of whether the test job is red.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   rust:
     name: Rust tests and migration smoke
     runs-on: ubuntu-latest
