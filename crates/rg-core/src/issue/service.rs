@@ -268,7 +268,7 @@ pub async fn update_issue(
 
             if let Some(mid) = issue_milestone_id {
                 if let Ok(remaining) =
-                    rg_db::ops::milestone_ops::count_open_by_milestone(db, mid).await
+                    rg_db::ops::milestone_ops::count_open_by_milestone(db, issue_repo_id, mid).await
                 {
                     if remaining == 0 {
                         if let Err(e) = notify_milestone_closed(db, issue_repo_id, mid).await {

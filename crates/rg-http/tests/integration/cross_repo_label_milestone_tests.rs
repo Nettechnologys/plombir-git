@@ -283,6 +283,180 @@ async fn test_owner_can_still_edit_and_delete_own_label_and_milestone() {
     assert_eq!(resp.status(), 204);
 }
 
+/// The same mismatch, one layer down: the milestone id arrives in the *body* of
+/// an issue write rather than in the path, and the route's own access check has
+/// nothing to say about it. Attaching an issue to a foreign milestone is a write
+/// into the victim's repository — their milestone stops counting down to zero.
+#[tokio::test]
+async fn test_issue_milestone_is_scoped_to_its_repository() {
+    let (
+        base,
+        attacker_token,
+        attacker,
+        attacker_repo,
+        _victim_token,
+        _victim,
+        _victim_repo,
+        _label_id,
+        victim_milestone_id,
+    ) = setup("5").await;
+    let client = reqwest::Client::new();
+
+    // Baseline first, so a 404 below proves the scoping check and not a broken
+    // fixture: the attacker's own milestone attaches exactly as before.
+    let own_milestone: serde_json::Value = client
+        .post(format!(
+            "{base}/api/v1/repos/{attacker}/{attacker_repo}/milestones"
+        ))
+        .bearer_auth(&attacker_token)
+        .json(&serde_json::json!({"title": "own-milestone"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let own_milestone_id = own_milestone["id"].as_i64().expect("milestone id");
+
+    let resp = client
+        .post(format!(
+            "{base}/api/v1/repos/{attacker}/{attacker_repo}/issues"
+        ))
+        .bearer_auth(&attacker_token)
+        .json(&serde_json::json!({"title": "mine", "milestone_id": own_milestone_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "own milestone must still attach");
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(issue["milestone_id"], own_milestone_id);
+    let number = issue["number"].as_i64().expect("issue number");
+
+    // POST with a milestone that lives in the victim's repository.
+    let resp = client
+        .post(format!(
+            "{base}/api/v1/repos/{attacker}/{attacker_repo}/issues"
+        ))
+        .bearer_auth(&attacker_token)
+        .json(&serde_json::json!({"title": "pwn", "milestone_id": victim_milestone_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "creating an issue under a foreign milestone must be 404"
+    );
+
+    // PATCH is the same hole through the other verb.
+    let resp = client
+        .patch(format!(
+            "{base}/api/v1/repos/{attacker}/{attacker_repo}/issues/{number}"
+        ))
+        .bearer_auth(&attacker_token)
+        .json(&serde_json::json!({"milestone_id": victim_milestone_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "moving an issue onto a foreign milestone must be 404"
+    );
+
+    // The rejected PATCH left the issue on its own milestone, and a PATCH that
+    // names that milestone again still goes through.
+    let resp = client
+        .patch(format!(
+            "{base}/api/v1/repos/{attacker}/{attacker_repo}/issues/{number}"
+        ))
+        .bearer_auth(&attacker_token)
+        .json(&serde_json::json!({"title": "renamed", "milestone_id": own_milestone_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "own milestone must still be settable");
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(issue["milestone_id"], own_milestone_id);
+    assert_eq!(issue["title"], "renamed");
+}
+
+/// `update_issue` keeps labels / assignee / milestone behind `can_write`;
+/// `create_issue` did not, so a reader of a public repository could set them on
+/// the way in. Filing the issue itself stays a read-access right.
+#[tokio::test]
+async fn test_issue_management_fields_on_create_require_write() {
+    let (
+        base,
+        outsider_token,
+        _outsider,
+        _outsider_repo,
+        victim_token,
+        victim,
+        victim_repo,
+        _label_id,
+        victim_milestone_id,
+    ) = setup("6").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/v1/repos/{victim}/{victim_repo}/issues"))
+        .bearer_auth(&outsider_token)
+        .json(&serde_json::json!({"title": "report", "labels": ["victim-label"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "a reader must not set labels on an issue they file"
+    );
+
+    let resp = client
+        .post(format!("{base}/api/v1/repos/{victim}/{victim_repo}/issues"))
+        .bearer_auth(&outsider_token)
+        .json(&serde_json::json!({"title": "report", "milestone_id": victim_milestone_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "a reader must not set a milestone on an issue they file"
+    );
+
+    // Baseline on live access, in the same test: filing a plain issue with only
+    // read access is the behaviour the gate must not have taken away.
+    let resp = client
+        .post(format!("{base}/api/v1/repos/{victim}/{victim_repo}/issues"))
+        .bearer_auth(&outsider_token)
+        .json(&serde_json::json!({"title": "report"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "filing an issue on read access must still work"
+    );
+
+    // And the owner still sets both fields.
+    let resp = client
+        .post(format!("{base}/api/v1/repos/{victim}/{victim_repo}/issues"))
+        .bearer_auth(&victim_token)
+        .json(&serde_json::json!({
+            "title": "owner issue",
+            "labels": ["victim-label"],
+            "milestone_id": victim_milestone_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(issue["milestone_id"], victim_milestone_id);
+}
+
 /// An invalid update body is still a `400` — the switch from a blanket
 /// `bad_request` to the typed conversion must keep validation failures at 400
 /// rather than folding them into the 500 bucket.

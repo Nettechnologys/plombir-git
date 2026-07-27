@@ -51,10 +51,22 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Count open (non-closed) issues in a milestone.
-pub async fn count_open_by_milestone(db: &DatabaseConnection, milestone_id: i64) -> Result<i64> {
+/// Count open (non-closed) issues filed under a milestone of `repo_id`.
+///
+/// A milestone belongs to exactly one repository, so the `repo_id` filter is
+/// redundant on clean data — and that is the point. Filtering on the milestone
+/// id alone let an issue in *another* repository keep this count above zero
+/// forever, which is what kept the owning repository's milestone from ever
+/// being reported closed. The handlers now refuse to create such a row; this
+/// keeps any row written before they did from poisoning the count.
+pub async fn count_open_by_milestone(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    milestone_id: i64,
+) -> Result<i64> {
     use crate::entities::issue;
     let count = issue::Entity::find()
+        .filter(issue::Column::RepoId.eq(repo_id))
         .filter(issue::Column::MilestoneId.eq(milestone_id))
         .filter(issue::Column::State.ne("closed"))
         .count(db)

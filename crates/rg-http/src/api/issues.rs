@@ -326,6 +326,30 @@ pub async fn get_issue(
     }
 }
 
+/// Resolve a `milestone_id` taken from a *request body* against the repository
+/// the route was authorized for.
+///
+/// `get_milestone` / `update_milestone` already do this for the id in the
+/// **path**; the id in the body is just as global and was written straight into
+/// the issue. Attaching an issue to a foreign milestone is a write into someone
+/// else's repository: `count_open_by_milestone` then never reaches zero there,
+/// so the victim's `notify_milestone_closed` never fires — and the ids are
+/// guessable, private repositories included.
+///
+/// A mismatch answers 404 rather than 403 for the same reason as the milestone
+/// routes: a 403 would confirm that the id exists.
+async fn require_milestone_in_repo(
+    state: &AppState,
+    repo_id: i64,
+    milestone_id: i64,
+) -> Result<(), AppError> {
+    match rg_db::ops::milestone_ops::find_by_id(&state.db, milestone_id).await {
+        Ok(Some(m)) if m.repo_id == repo_id => Ok(()),
+        Ok(_) => Err(AppError::not_found("milestone not found".to_string())),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/repos/{owner}/{name}/issues",
@@ -358,6 +382,24 @@ pub async fn create_issue(
         Ok(repo) => repo,
         Err(e) => return e.into_response(),
     };
+
+    // Filing an issue on read access is deliberate; deciding its labels and
+    // milestone is not. `update_issue` already keeps those two behind
+    // `can_write` — create let a reader of a public repository set them on the
+    // way in, which is the same edit through a different door.
+    if req.labels.is_some() || req.milestone_id.is_some() {
+        match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
+            Ok(true) => {}
+            Ok(false) => return AppError::forbidden("write access required").into_response(),
+            Err(e) => return AppError::from(e).into_response(),
+        }
+    }
+
+    if let Some(milestone_id) = req.milestone_id {
+        if let Err(e) = require_milestone_in_repo(&state, repo_model.id, milestone_id).await {
+            return e.into_response();
+        }
+    }
 
     match rg_core::issue::create_issue(
         &state.db,
@@ -445,6 +487,12 @@ pub async fn update_issue(
 
     if !can_write && (existing.author_id != user_id || touches_management_fields) {
         return AppError::forbidden("write access required").into_response();
+    }
+
+    if let Some(Some(milestone_id)) = req.milestone_id {
+        if let Err(e) = require_milestone_in_repo(&state, repo_model.id, milestone_id).await {
+            return e.into_response();
+        }
     }
 
     // Capture the open→closed transition before `req.state` moves into the call
