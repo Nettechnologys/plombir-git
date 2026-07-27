@@ -48,7 +48,7 @@ pub async fn add_collaborator(
     };
 
     let created = repo_collaborator_ops::create(db, model).await?;
-    crate::repo::service::invalidate_perm_cache_user(repo.id, user_id);
+    crate::repo::service::invalidate_perm_cache_user(db, repo.id, user_id);
     Ok(created)
 }
 
@@ -97,7 +97,7 @@ pub async fn update_permission(
     let mut active: repo_collaborator::ActiveModel = collab.into();
     active.permission = Set(permission);
     let updated = repo_collaborator_ops::update(db, active).await?;
-    crate::repo::service::invalidate_perm_cache_user(repo_id, user_id);
+    crate::repo::service::invalidate_perm_cache_user(db, repo_id, user_id);
     Ok(updated)
 }
 
@@ -110,7 +110,7 @@ pub async fn remove_collaborator(
 ) -> Result<()> {
     let repo = resolve_repo(db, owner, repo_name).await?;
     repo_collaborator_ops::delete_by_repo_and_user(db, repo.id, user_id).await?;
-    crate::repo::service::invalidate_perm_cache_user(repo.id, user_id);
+    crate::repo::service::invalidate_perm_cache_user(db, repo.id, user_id);
     Ok(())
 }
 

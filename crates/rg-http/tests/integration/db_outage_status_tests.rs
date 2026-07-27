@@ -205,7 +205,7 @@ async fn break_permission_lookup(db: &rg_db::DatabaseConnection) {
     db.execute_unprepared("DROP TABLE repo_collaborators")
         .await
         .expect("drop repo_collaborators");
-    rg_core::repo::service::invalidate_perm_cache_all();
+    rg_core::repo::service::invalidate_perm_cache_all(db);
 }
 
 fn bearer(user_id: i64, username: &str) -> axum::http::HeaderMap {

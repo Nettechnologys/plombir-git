@@ -403,6 +403,24 @@ is deliberate on two counts:
 If you add a new test that needs its own database, connect through `rg_db`
 rather than reaching for `Database::connect` directly.
 
+#### Process-wide state keyed by row ids needs the database in the key
+
+Every test opens its own database and every one of them hands out the same
+small autoincrement ids, so `(repo_id = 1, user_id = 2)` names a different pair
+in each of them. A process-global map keyed on ids alone therefore answers one
+test's question with another test's answer — and since the whole suite of a
+crate compiles into a single binary, `--test-threads=1` does not help: the
+state outlives the test, not just the thread.
+
+The permission cache in `crates/rg-core/src/repo/service.rs` is the worked
+example. Its key carries a `rg_db::InstanceId` obtained from
+`rg_db::instance_id(&db)`, which identifies the *pool* — two connects to
+`sqlite::memory:` are two different databases behind one URL, so the URL cannot
+be the identity. If you add process-wide state derived from database rows, key
+it the same way. What you should **not** do is paper over it by flushing the
+state at the start of each test: the test that poisons you runs in parallel and
+poisons you again halfway through.
+
 ### Coverage
 
 The project uses `cargo-llvm-cov`:

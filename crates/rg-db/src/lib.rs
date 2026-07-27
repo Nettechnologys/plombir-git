@@ -17,7 +17,11 @@ mod entity_schema_guard;
 pub mod migrations;
 pub mod ops;
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -133,6 +137,116 @@ pub fn prepare_sql(backend: sea_orm::DatabaseBackend, sql: &str) -> String {
     }
 
     result
+}
+
+// ── Identity of a live database instance ────────────────────────────────
+
+/// Identity of one live database instance, as returned by [`instance_id`].
+///
+/// Opaque and only ever compared for equality — the numbering is an internal
+/// allocation order, not something to persist or expose.
+pub type InstanceId = u64;
+
+/// The identity of the database instance `db` talks to.
+///
+/// Callers that keep process-wide state keyed by database row ids need this:
+/// a row id is only unique *within* one database, so a cache keyed by id alone
+/// silently merges two databases that both start their autoincrement at 1.
+/// That is not hypothetical — the test suite compiles into one binary per
+/// crate and every test opens its own database, so `(repo_id = 1, user_id = 2)`
+/// means something different in each of them.
+///
+/// Guarantees:
+/// - Every handle onto the same pool — including clones of the
+///   `DatabaseConnection` — reports the same id.
+/// - Two separate pools never share an id, *even when their URLs are
+///   identical*. `sqlite::memory:` is the case that matters: each connect
+///   creates a private database behind the same URL, so the URL cannot be the
+///   identity.
+/// - `None` for a handle with no pool to identify (mock, proxy, disconnected).
+///   Such a handle answers no queries, so callers should treat it as
+///   "not cacheable" rather than lumping it in with a real database.
+///
+/// Cheap enough for a per-request call: a read-locked hash lookup on the
+/// established path.
+pub fn instance_id(db: &DatabaseConnection) -> Option<InstanceId> {
+    let handle = connect_options_handle(db)?;
+    // The address of the pool's connect-options allocation. Stable for the
+    // pool's whole life, and unique among live pools — see `InstanceEntry` for
+    // why a *dead* pool can never lend its address to a new one unnoticed.
+    let key = Arc::as_ptr(&handle) as *const () as usize;
+
+    let registry = instance_registry();
+    if let Some(entry) = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return Some(entry.id);
+    }
+
+    let mut registry = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Lost the race to another thread registering the same pool.
+    if let Some(entry) = registry.get(&key) {
+        return Some(entry.id);
+    }
+    // Release the addresses of pools that have since been dropped, so the
+    // registry tracks live databases rather than every one the process ever
+    // opened. Safe to do here: `handle` is alive, so its own entry is never
+    // the one being released.
+    registry.retain(|_, entry| entry.guard.strong_count() > 0);
+
+    let id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+    registry.insert(
+        key,
+        InstanceEntry {
+            id,
+            guard: Arc::downgrade(&handle),
+        },
+    );
+    Some(id)
+}
+
+/// A pool's address, and the id handed out for it.
+struct InstanceEntry {
+    id: InstanceId,
+    /// Pins the allocation the map is keyed by. Never upgraded: a `Weak` keeps
+    /// the allocation reserved after the value inside it is dropped, so while
+    /// this entry exists no other `Arc` can be handed that address — which is
+    /// what makes the address a durable identity instead of a coincidence.
+    /// Dropping the entry and this guard together (see the `retain` above) is
+    /// therefore the only way an address is ever recycled, and it takes the
+    /// stale id with it.
+    guard: Weak<dyn Any + Send + Sync>,
+}
+
+static INSTANCE_REGISTRY: OnceLock<RwLock<HashMap<usize, InstanceEntry>>> = OnceLock::new();
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn instance_registry() -> &'static RwLock<HashMap<usize, InstanceEntry>> {
+    INSTANCE_REGISTRY.get_or_init(Default::default)
+}
+
+/// The connect options behind `db`'s pool, type-erased.
+///
+/// Matched on the variant rather than [`sea_orm::ConnectionTrait::get_database_backend`]
+/// because that panics on a disconnected handle, and the `get_*_connection_pool`
+/// accessors panic on a mock one.
+fn connect_options_handle(db: &DatabaseConnection) -> Option<Arc<dyn Any + Send + Sync>> {
+    match db {
+        DatabaseConnection::SqlxSqlitePoolConnection(_) => {
+            Some(db.get_sqlite_connection_pool().connect_options())
+        }
+        DatabaseConnection::SqlxPostgresPoolConnection(_) => {
+            Some(db.get_postgres_connection_pool().connect_options())
+        }
+        DatabaseConnection::SqlxMySqlPoolConnection(_) => {
+            Some(db.get_mysql_connection_pool().connect_options())
+        }
+        _ => None,
+    }
 }
 
 /// Default DB connect (acquire) timeout (seconds).
@@ -384,6 +498,69 @@ pub async fn rebuild_fts_indexes(db: &DatabaseConnection) -> Result<()> {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    /// The identity has to survive being asked twice and being asked through a
+    /// clone, or process-wide state keyed on it would split per call site.
+    #[tokio::test]
+    async fn one_database_has_one_identity() {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+
+        let id = instance_id(&db).expect("a pooled connection has an identity");
+        assert_eq!(Some(id), instance_id(&db), "asking twice must not renumber");
+        assert_eq!(
+            Some(id),
+            instance_id(&db.clone()),
+            "a clone shares the pool, so it shares the identity"
+        );
+    }
+
+    /// The case the callers actually need: two databases behind one URL.
+    /// `sqlite::memory:` gives each connect a private database, so anything that
+    /// identified a database by its URL would merge the two.
+    #[tokio::test]
+    async fn two_databases_behind_the_same_url_have_different_identities() {
+        let first = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect first");
+        let second = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect second");
+
+        assert_ne!(instance_id(&first), instance_id(&second));
+        assert!(instance_id(&first).is_some());
+    }
+
+    /// A closed database must not bequeath its identity to the next one. The
+    /// allocator will happily hand the fresh pool the address the dead one had;
+    /// what stops the id coming with it is the guard held in the registry.
+    #[tokio::test]
+    async fn a_new_database_never_inherits_a_dropped_one_s_identity() {
+        let mut retired = Vec::new();
+        for _ in 0..8 {
+            let db = sea_orm::Database::connect("sqlite::memory:")
+                .await
+                .expect("connect");
+            retired.push(instance_id(&db).expect("identity"));
+            drop(db);
+        }
+
+        let live = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect live");
+        let live_id = instance_id(&live).expect("identity");
+        assert!(
+            !retired.contains(&live_id),
+            "identity {live_id} was already handed out to a closed database"
+        );
+    }
+
+    #[test]
+    fn a_handle_with_no_pool_has_no_identity() {
+        // Nothing to identify, and no queries to cache the answers of either.
+        assert_eq!(instance_id(&DatabaseConnection::Disconnected), None);
+    }
 
     #[test]
     fn database_urls_are_redacted_before_diagnostics() {

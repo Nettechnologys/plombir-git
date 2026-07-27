@@ -120,7 +120,6 @@ async fn run_post_push_hooks(
 
 #[tokio::test]
 async fn a_push_notifies_subscribed_watchers_but_not_the_pusher() {
-    rg_core::repo::service::invalidate_perm_cache_all();
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(dir.path()).await;
     let repo_root = dir.path().join("repos");
@@ -182,7 +181,6 @@ async fn a_push_notifies_subscribed_watchers_but_not_the_pusher() {
 
 #[tokio::test]
 async fn a_rejected_ref_update_notifies_nobody() {
-    rg_core::repo::service::invalidate_perm_cache_all();
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(dir.path()).await;
     let repo_root = dir.path().join("repos");
@@ -224,7 +222,6 @@ async fn a_rejected_ref_update_notifies_nobody() {
 
 #[tokio::test]
 async fn a_watcher_without_read_access_is_not_notified_about_a_push() {
-    rg_core::repo::service::invalidate_perm_cache_all();
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(dir.path()).await;
     let repo_root = dir.path().join("repos");
@@ -262,7 +259,7 @@ async fn a_watcher_without_read_access_is_not_notified_about_a_push() {
     // access to the repository whose branch names the body leaks.
     watch(&db, collaborator.id, repo.id, "watching").await;
     watch(&db, outsider.id, repo.id, "watching").await;
-    rg_core::repo::service::invalidate_perm_cache_all();
+    rg_core::repo::service::invalidate_perm_cache_all(&db);
 
     run_post_push_hooks(
         &db,
@@ -289,7 +286,6 @@ async fn a_watcher_without_read_access_is_not_notified_about_a_push() {
 
 #[tokio::test]
 async fn pull_request_transitions_notify_watchers_but_not_the_actor() {
-    rg_core::repo::service::invalidate_perm_cache_all();
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(dir.path()).await;
     let repo_root = dir.path().join("repos");

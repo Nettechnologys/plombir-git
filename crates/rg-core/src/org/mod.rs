@@ -98,14 +98,14 @@ pub async fn add_org_member(
     }
     let member = org_ops::add_org_member(db, org_id, user_id, role).await?;
     // Org membership grants access across all org repos — flush perm cache.
-    crate::repo::service::invalidate_perm_cache_all();
+    crate::repo::service::invalidate_perm_cache_all(db);
     Ok(member)
 }
 
 /// Remove a member from an organization.
 pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<()> {
     org_ops::remove_org_member(db, org_id, user_id).await?;
-    crate::repo::service::invalidate_perm_cache_all();
+    crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())
 }
 
@@ -180,7 +180,7 @@ pub async fn delete_team(db: &DatabaseConnection, id: i64) -> Result<()> {
     if !org_ops::delete_team(db, id).await? {
         return Err(crate::error::not_found("team"));
     }
-    crate::repo::service::invalidate_perm_cache_all();
+    crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())
 }
 
@@ -198,14 +198,14 @@ pub async fn add_team_member(
     }
     let member = org_ops::add_team_member(db, team_id, user_id, role).await?;
     // Team membership can grant repo access — flush perm cache.
-    crate::repo::service::invalidate_perm_cache_all();
+    crate::repo::service::invalidate_perm_cache_all(db);
     Ok(member)
 }
 
 /// Remove a member from a team.
 pub async fn remove_team_member(db: &DatabaseConnection, team_id: i64, user_id: i64) -> Result<()> {
     org_ops::remove_team_member(db, team_id, user_id).await?;
-    crate::repo::service::invalidate_perm_cache_all();
+    crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())
 }
 

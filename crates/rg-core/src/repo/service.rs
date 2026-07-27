@@ -64,12 +64,24 @@ pub struct CreateRepoOptions {
 
 const PERM_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Permission cache key: (repo_id, actor_id, for_write).
+/// Permission cache key: (database instance, repo_id, actor_id, for_write).
 /// for_write=false → read check, for_write=true → write check.
-type PermKey = (i64, Option<i64>, bool);
+///
+/// `repo_id` and `actor_id` are only unique *within* one database, so the
+/// instance has to be part of the key — see [`PermCache`].
+type PermKey = (rg_db::InstanceId, i64, Option<i64>, bool);
 type PermEntry = (bool, Instant);
 
-/// A permission-decision cache with a 30s TTL, keyed by `(repo_id, actor_id, for_write)`.
+/// A permission-decision cache with a 30s TTL, keyed by
+/// `(database instance, repo_id, actor_id, for_write)`.
+///
+/// The instance component is what keeps the cache honest when a process talks
+/// to more than one database. A server talks to exactly one, but every test
+/// opens its own, and each of those starts its autoincrement ids at 1 — so
+/// `(repo 1, user 2, read)` is a different question in each database and the
+/// answers are frequently opposite. Keyed on ids alone, one test's correct
+/// "outsider may not read repo 1" answered another test's "collaborator may
+/// read repo 1" with a 403, and vice versa, for as long as the TTL held.
 ///
 /// Production uses a single process-global instance (`perm_cache()`), but the
 /// type is standalone so the invalidation logic can be unit-tested against a
@@ -82,41 +94,60 @@ struct PermCache {
 }
 
 impl PermCache {
-    fn check(&self, repo_id: i64, actor_id: Option<i64>, for_write: bool) -> Option<bool> {
+    fn check(
+        &self,
+        instance: rg_db::InstanceId,
+        repo_id: i64,
+        actor_id: Option<i64>,
+        for_write: bool,
+    ) -> Option<bool> {
         let cache = self.entries.read().unwrap_or_else(|e| e.into_inner());
         cache
-            .get(&(repo_id, actor_id, for_write))
+            .get(&(instance, repo_id, actor_id, for_write))
             .filter(|(_, ts)| ts.elapsed() < PERM_CACHE_TTL)
             .map(|(v, _)| *v)
     }
 
-    fn set(&self, repo_id: i64, actor_id: Option<i64>, for_write: bool, value: bool) {
+    fn set(
+        &self,
+        instance: rg_db::InstanceId,
+        repo_id: i64,
+        actor_id: Option<i64>,
+        for_write: bool,
+        value: bool,
+    ) {
         let mut cache = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        // This also reaps the entries of databases that are gone entirely: a
+        // test's database dies with its test, and nothing would otherwise
+        // invalidate what it left here before the process exits.
         cache.retain(|_, (_, ts)| ts.elapsed() < PERM_CACHE_TTL);
-        cache.insert((repo_id, actor_id, for_write), (value, Instant::now()));
+        cache.insert(
+            (instance, repo_id, actor_id, for_write),
+            (value, Instant::now()),
+        );
     }
 
     /// Drop the cached read+write decisions for a specific user on a repo.
-    fn invalidate_user(&self, repo_id: i64, user_id: i64) {
+    fn invalidate_user(&self, instance: rg_db::InstanceId, repo_id: i64, user_id: i64) {
         let mut cache = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        cache.remove(&(repo_id, Some(user_id), false));
-        cache.remove(&(repo_id, Some(user_id), true));
+        cache.remove(&(instance, repo_id, Some(user_id), false));
+        cache.remove(&(instance, repo_id, Some(user_id), true));
     }
 
     /// Drop every cached entry belonging to a repo.
-    fn invalidate_repo(&self, repo_id: i64) {
+    fn invalidate_repo(&self, instance: rg_db::InstanceId, repo_id: i64) {
         self.entries
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|(rid, _, _), _| *rid != repo_id);
+            .retain(|(inst, rid, _, _), _| (*inst, *rid) != (instance, repo_id));
     }
 
-    /// Drop the entire cache.
-    fn invalidate_all(&self) {
+    /// Drop every entry belonging to one database.
+    fn invalidate_all(&self, instance: rg_db::InstanceId) {
         self.entries
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .retain(|(inst, _, _, _), _| *inst != instance);
     }
 }
 
@@ -126,32 +157,58 @@ fn perm_cache() -> &'static PermCache {
     PERM_CACHE.get_or_init(PermCache::default)
 }
 
-fn check_perm_cache(repo_id: i64, actor_id: Option<i64>, for_write: bool) -> Option<bool> {
-    perm_cache().check(repo_id, actor_id, for_write)
+fn check_perm_cache(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: Option<i64>,
+    for_write: bool,
+) -> Option<bool> {
+    let instance = rg_db::instance_id(db)?;
+    perm_cache().check(instance, repo_id, actor_id, for_write)
 }
 
-fn set_perm_cache(repo_id: i64, actor_id: Option<i64>, for_write: bool, value: bool) {
-    perm_cache().set(repo_id, actor_id, for_write, value);
+fn set_perm_cache(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: Option<i64>,
+    for_write: bool,
+    value: bool,
+) {
+    // No identity, no caching: an unidentifiable handle (mock/disconnected)
+    // must not share a key space with a real database.
+    if let Some(instance) = rg_db::instance_id(db) {
+        perm_cache().set(instance, repo_id, actor_id, for_write, value);
+    }
 }
 
 /// Invalidate cached read+write permission for a specific user on a repo.
 ///
 /// Call after a collaborator is added/updated/removed so that granted or
 /// revoked access takes effect immediately instead of after the 30s TTL.
-pub fn invalidate_perm_cache_user(repo_id: i64, user_id: i64) {
-    perm_cache().invalidate_user(repo_id, user_id);
+///
+/// `db` selects whose entries to drop: the cache is keyed per database
+/// instance, so an invalidation reaches the database it is handed and no other.
+/// A server has exactly one, so there it drops what it always dropped.
+pub fn invalidate_perm_cache_user(db: &DatabaseConnection, repo_id: i64, user_id: i64) {
+    if let Some(instance) = rg_db::instance_id(db) {
+        perm_cache().invalidate_user(instance, repo_id, user_id);
+    }
 }
 
 /// Invalidate every cached permission entry for a repo (e.g. owner transfer
 /// or deletion, which changes who can read/write).
-pub fn invalidate_perm_cache_repo(repo_id: i64) {
-    perm_cache().invalidate_repo(repo_id);
+pub fn invalidate_perm_cache_repo(db: &DatabaseConnection, repo_id: i64) {
+    if let Some(instance) = rg_db::instance_id(db) {
+        perm_cache().invalidate_repo(instance, repo_id);
+    }
 }
 
-/// Clear the entire permission cache. Used for org/team membership changes
-/// that can affect access across many repositories at once.
-pub fn invalidate_perm_cache_all() {
-    perm_cache().invalidate_all();
+/// Clear the permission cache for one database. Used for org/team membership
+/// changes that can affect access across many repositories at once.
+pub fn invalidate_perm_cache_all(db: &DatabaseConnection) {
+    if let Some(instance) = rg_db::instance_id(db) {
+        perm_cache().invalidate_all(instance);
+    }
 }
 
 /// Resolve an "owner" string to either a user ID or an org ID.
@@ -208,7 +265,7 @@ pub async fn can_read_repo(
     }
 
     // Check permission cache (30s TTL) to avoid repeated DB queries
-    if let Some(cached) = check_perm_cache(repo.id, actor_id, false) {
+    if let Some(cached) = check_perm_cache(db, repo.id, actor_id, false) {
         return Ok(cached);
     }
 
@@ -231,7 +288,7 @@ pub async fn can_read_repo(
         None => false,
     };
 
-    set_perm_cache(repo.id, actor_id, false, result);
+    set_perm_cache(db, repo.id, actor_id, false, result);
     Ok(result)
 }
 
@@ -260,7 +317,7 @@ pub async fn can_write_repo(
 ) -> Result<bool> {
     // Use a separate cache key prefix pattern: (repo_id, Some(user_id) or None)
     // We use the same cache key space as can_read_repo to reuse results.
-    if let Some(cached) = check_perm_cache(repo.id, actor_id, true) {
+    if let Some(cached) = check_perm_cache(db, repo.id, actor_id, true) {
         return Ok(cached);
     }
 
@@ -294,7 +351,7 @@ pub async fn can_write_repo(
         None => false,
     };
 
-    set_perm_cache(repo.id, actor_id, true, result);
+    set_perm_cache(db, repo.id, actor_id, true, result);
     Ok(result)
 }
 
@@ -797,7 +854,7 @@ pub async fn delete_repo(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
         tracing::warn!(repo_id = repo_id, error = %format!("{e:#}"), "failed to remove repo from repos_fts index");
     }
 
-    invalidate_perm_cache_repo(repo_id);
+    invalidate_perm_cache_repo(db, repo_id);
     Ok(())
 }
 
@@ -961,7 +1018,7 @@ pub async fn transfer_repo(
 
     repo_ops::update_owner(db, repo.id, new_owner_id, new_org_id).await?;
     // Ownership (and thus who can read/write) changed — drop cached decisions.
-    invalidate_perm_cache_repo(repo.id);
+    invalidate_perm_cache_repo(db, repo.id);
 
     repo_ops::find_by_owner_and_name(db, new_owner_id, repo_name)
         .await?
@@ -1585,47 +1642,75 @@ mod perm_cache_tests {
     // the suite shares (all of which compiles into one test binary). No cross-test
     // serialization is needed — each test owns its instance.
 
+    /// Stand-in for two databases open in one process.
+    const DB_A: rg_db::InstanceId = 1;
+    const DB_B: rg_db::InstanceId = 2;
+
     #[test]
     fn invalidate_user_drops_only_that_user_read_and_write() {
         let cache = PermCache::default();
         let (repo, user, other) = (910_001, 42, 43);
-        cache.set(repo, Some(user), false, true);
-        cache.set(repo, Some(user), true, true);
-        cache.set(repo, Some(other), false, true);
+        cache.set(DB_A, repo, Some(user), false, true);
+        cache.set(DB_A, repo, Some(user), true, true);
+        cache.set(DB_A, repo, Some(other), false, true);
 
-        cache.invalidate_user(repo, user);
+        cache.invalidate_user(DB_A, repo, user);
 
-        assert_eq!(cache.check(repo, Some(user), false), None);
-        assert_eq!(cache.check(repo, Some(user), true), None);
+        assert_eq!(cache.check(DB_A, repo, Some(user), false), None);
+        assert_eq!(cache.check(DB_A, repo, Some(user), true), None);
         // Other users on the same repo are untouched.
-        assert_eq!(cache.check(repo, Some(other), false), Some(true));
+        assert_eq!(cache.check(DB_A, repo, Some(other), false), Some(true));
     }
 
     #[test]
     fn invalidate_repo_drops_all_entries_for_that_repo_only() {
         let cache = PermCache::default();
         let (repo, keep) = (910_002, 910_003);
-        cache.set(repo, None, false, true);
-        cache.set(repo, Some(7), true, true);
-        cache.set(keep, Some(7), true, true);
+        cache.set(DB_A, repo, None, false, true);
+        cache.set(DB_A, repo, Some(7), true, true);
+        cache.set(DB_A, keep, Some(7), true, true);
 
-        cache.invalidate_repo(repo);
+        cache.invalidate_repo(DB_A, repo);
 
-        assert_eq!(cache.check(repo, None, false), None);
-        assert_eq!(cache.check(repo, Some(7), true), None);
-        assert_eq!(cache.check(keep, Some(7), true), Some(true));
+        assert_eq!(cache.check(DB_A, repo, None, false), None);
+        assert_eq!(cache.check(DB_A, repo, Some(7), true), None);
+        assert_eq!(cache.check(DB_A, keep, Some(7), true), Some(true));
     }
 
     #[test]
-    fn invalidate_all_clears_everything() {
+    fn invalidate_all_clears_everything_of_that_database() {
         let cache = PermCache::default();
-        cache.set(910_004, Some(1), false, true);
-        cache.set(910_005, Some(2), true, true);
+        cache.set(DB_A, 910_004, Some(1), false, true);
+        cache.set(DB_A, 910_005, Some(2), true, true);
+        cache.set(DB_B, 910_004, Some(1), false, true);
 
-        cache.invalidate_all();
+        cache.invalidate_all(DB_A);
 
-        assert_eq!(cache.check(910_004, Some(1), false), None);
-        assert_eq!(cache.check(910_005, Some(2), true), None);
+        assert_eq!(cache.check(DB_A, 910_004, Some(1), false), None);
+        assert_eq!(cache.check(DB_A, 910_005, Some(2), true), None);
+        // Another database's entries are not this database's business.
+        assert_eq!(cache.check(DB_B, 910_004, Some(1), false), Some(true));
+    }
+
+    /// The bug the instance component of the key exists to prevent: two
+    /// databases whose row ids collide (which is every pair of them, since ids
+    /// restart at 1) must not answer each other's questions.
+    #[test]
+    fn identical_ids_in_two_databases_are_separate_decisions() {
+        let cache = PermCache::default();
+        let (repo, actor) = (1, Some(2));
+
+        // Same repo id, same actor id, opposite correct answers.
+        cache.set(DB_A, repo, actor, false, false);
+        cache.set(DB_B, repo, actor, false, true);
+
+        assert_eq!(cache.check(DB_A, repo, actor, false), Some(false));
+        assert_eq!(cache.check(DB_B, repo, actor, false), Some(true));
+
+        // Nor may invalidating one reach into the other.
+        cache.invalidate_user(DB_A, repo, 2);
+        assert_eq!(cache.check(DB_A, repo, actor, false), None);
+        assert_eq!(cache.check(DB_B, repo, actor, false), Some(true));
     }
 }
 
@@ -1640,14 +1725,13 @@ mod permission_matrix_tests {
     use rg_db::ops::{org_ops, repo_collaborator_ops};
     use sea_orm::{ConnectOptions, Database};
 
-    // The permission cache is a process-global static shared by every test in
-    // this binary, and each in-memory DB reuses the same small autoincrement
-    // ids (repo 1, user 1, …). Serialize these tests and clear the cache at the
-    // start of each so a cached decision from one can never satisfy a lookup in
-    // another. A `tokio::sync::Mutex` is held across `.await` deliberately —
-    // unlike a `std` guard it is safe there and does not trip
-    // `clippy::await_holding_lock`.
-    static CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Each test opens its own in-memory database and every one of them reuses
+    // the same small autoincrement ids (repo 1, user 1, …). What keeps these
+    // tests out of each other's way is the instance component of the cache key:
+    // a decision cached for one database is unreachable from another, so the
+    // tests need neither a shared lock nor a cache flush on entry — including
+    // the one below that deliberately reads a stale entry, which nothing else
+    // in the process can now clear.
 
     async fn setup_db() -> DatabaseConnection {
         let mut opt = ConnectOptions::new("sqlite::memory:");
@@ -1710,8 +1794,6 @@ mod permission_matrix_tests {
 
     #[tokio::test]
     async fn owner_has_full_access_others_denied_on_private() {
-        let _g = CACHE_LOCK.lock().await;
-        invalidate_perm_cache_all();
         let db = setup_db().await;
         let owner = mk_user(&db).await;
         let repo = mk_repo(&db, owner, None, true).await;
@@ -1735,8 +1817,6 @@ mod permission_matrix_tests {
 
     #[tokio::test]
     async fn public_repo_is_world_readable_but_write_stays_restricted() {
-        let _g = CACHE_LOCK.lock().await;
-        invalidate_perm_cache_all();
         let db = setup_db().await;
         let owner = mk_user(&db).await;
         let stranger = mk_user(&db).await;
@@ -1754,8 +1834,6 @@ mod permission_matrix_tests {
 
     #[tokio::test]
     async fn collaborator_levels_grant_expected_access() {
-        let _g = CACHE_LOCK.lock().await;
-        invalidate_perm_cache_all();
         let db = setup_db().await;
         let owner = mk_user(&db).await;
         let repo = mk_repo(&db, owner, None, true).await;
@@ -1784,8 +1862,6 @@ mod permission_matrix_tests {
 
     #[tokio::test]
     async fn org_roles_and_team_permissions_control_access() {
-        let _g = CACHE_LOCK.lock().await;
-        invalidate_perm_cache_all();
         let db = setup_db().await;
 
         let org_owner = mk_user(&db).await;
@@ -1849,8 +1925,6 @@ mod permission_matrix_tests {
     /// access linger.
     #[tokio::test]
     async fn revoked_collaborator_access_clears_only_after_invalidation() {
-        let _g = CACHE_LOCK.lock().await;
-        invalidate_perm_cache_all();
         let db = setup_db().await;
         let owner = mk_user(&db).await;
         let repo = mk_repo(&db, owner, None, true).await;
@@ -1876,8 +1950,53 @@ mod permission_matrix_tests {
 
         // Invalidation is what actually makes the revocation take effect —
         // exactly what add/update/remove-collaborator call in production.
-        invalidate_perm_cache_user(repo.id, collab);
+        invalidate_perm_cache_user(&db, repo.id, collab);
         assert!(!can_read_repo(&db, &repo, Some(collab)).await.unwrap());
         assert!(!can_write_repo(&db, &repo, Some(collab)).await.unwrap());
+    }
+
+    /// Two databases in one process, with colliding row ids and opposite correct
+    /// answers for the very same `(repo_id, actor_id, read)` question — the
+    /// shape that made the private-repo integration tests answer each other's
+    /// question and fail in both directions.
+    ///
+    /// The ids are asserted to collide rather than assumed to: a fresh database
+    /// hands out `repo 1` and `user 2` to both sides, and if that ever stopped
+    /// being true this test would quietly stop testing anything.
+    #[tokio::test]
+    async fn a_decision_cached_for_one_database_does_not_answer_for_another() {
+        // Database A: an outsider must NOT read the private repo.
+        let db_a = setup_db().await;
+        let owner_a = mk_user(&db_a).await;
+        let repo_a = mk_repo(&db_a, owner_a, None, true).await;
+        let outsider = mk_user(&db_a).await;
+
+        // Database B: the same ids, but here the actor is a collaborator and
+        // must read it.
+        let db_b = setup_db().await;
+        let owner_b = mk_user(&db_b).await;
+        let repo_b = mk_repo(&db_b, owner_b, None, true).await;
+        let collab = mk_user(&db_b).await;
+        add_collab(&db_b, repo_b.id, collab, "read").await;
+
+        assert_eq!(
+            (repo_a.id, outsider),
+            (repo_b.id, collab),
+            "the two databases must hand out colliding ids for this to test anything"
+        );
+
+        // Poison first, in the order that used to break: the negative decision
+        // is cached, then the other database asks the same key.
+        assert!(!can_read_repo(&db_a, &repo_a, Some(outsider)).await.unwrap());
+        assert!(
+            can_read_repo(&db_b, &repo_b, Some(collab)).await.unwrap(),
+            "database B's collaborator was answered with database A's refusal"
+        );
+
+        // And the other way round, now that B holds a positive decision.
+        assert!(
+            !can_read_repo(&db_a, &repo_a, Some(outsider)).await.unwrap(),
+            "database A's outsider was let in by database B's grant"
+        );
     }
 }
