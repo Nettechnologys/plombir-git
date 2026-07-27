@@ -96,6 +96,15 @@ pub struct SshServerConfig {
     /// connection. 0 disables the idle watchdog (default: 30). See
     /// [`rg_git::io_timeout::IdleTimeout`].
     pub git_idle_timeout_secs: u64,
+    /// Post-push automation (CI trigger, webhook fan-out, open-PR head-SHA
+    /// refresh, auto-merge / merge-queue evaluation) run after an accepted
+    /// `git-receive-pack`.
+    ///
+    /// The identical hooks the Smart-HTTP transport runs — they were private to
+    /// `rg-http` until card_b4fefeee8abf, so a push over SSH silently ran none
+    /// of them. `None` disables the hooks (no automation configured, or no
+    /// database at all); the push itself still succeeds.
+    pub post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
 }
 
 /// Shared state passed to every SshHandler.
@@ -109,6 +118,9 @@ struct SharedState {
     /// [`IdleTimeout`]. 0 = disabled. See
     /// [`SshServerConfig::git_idle_timeout_secs`].
     git_idle_timeout_secs: u64,
+    /// Post-push hooks shared with the HTTP transport. See
+    /// [`SshServerConfig::post_push`].
+    post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
 }
 
 /// The ForgeKeep SSH server — implements `russh::server::Server`.
@@ -224,6 +236,7 @@ impl SshServer {
             db: ssh_config.db.map(Arc::new),
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
             git_idle_timeout_secs: ssh_config.git_idle_timeout_secs,
+            post_push: ssh_config.post_push,
         });
 
         Ok(Self {
@@ -284,6 +297,19 @@ struct SshHandler {
     /// Git protocol version requested by the client (default: "1").
     /// Set to "2" when the client sends GIT_PROTOCOL=version=2 via env_request.
     git_protocol_version: String,
+}
+
+/// Per-push state the `git-receive-pack` branch needs beyond the byte stream:
+/// the protection rules enforced before the refs move, and the `owner`/`repo`
+/// the post-push hooks are keyed on.
+struct ReceivePackContext {
+    protection_rules: Vec<rg_db::entities::protected_branch::Model>,
+    tag_protection_rules: Vec<rg_db::entities::protected_tag::Model>,
+    /// Pusher's user id, or `None` for a deploy key (protection rules treat an
+    /// unidentified actor as "not on any allow-list").
+    actor_id: Option<i64>,
+    owner: String,
+    repo_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -585,13 +611,16 @@ impl Handler for SshHandler {
                     rg_db::ops::protected_branch_ops::list_by_repo(db, repo.id).await?;
                 let tag_protection_rules =
                     rg_db::ops::protected_tag_ops::list_by_repo(db, repo.id).await?;
-                Some((
+                Some(ReceivePackContext {
                     protection_rules,
                     tag_protection_rules,
-                    self.authenticated_identity
+                    actor_id: self
+                        .authenticated_identity
                         .as_ref()
                         .and_then(AuthenticatedIdentity::user_id),
-                ))
+                    owner,
+                    repo_name,
+                })
             } else {
                 None
             }
@@ -634,6 +663,15 @@ impl Handler for SshHandler {
         let git_stream_timeout_secs = self.shared.git_stream_timeout_secs;
         let git_idle_timeout_secs = self.shared.git_idle_timeout_secs;
 
+        // Post-push hook inputs, captured before `receive_pack_context` moves
+        // into the streaming future below.
+        let post_push = self.shared.post_push.clone();
+        let hook_db = self.shared.db.clone();
+        let hook_repo_path = repo_full_path.clone();
+        let hook_target = receive_pack_context
+            .as_ref()
+            .map(|context| (context.owner.clone(), context.repo_name.clone()));
+
         tokio::spawn(async move {
             tracing::info!(%service_name, path = %repo_full_path.display(), "Starting git SSH session");
 
@@ -657,51 +695,82 @@ impl Handler for SshHandler {
             // own `stream` afterwards (the borrow ends when the future is
             // dropped), so we can report the exit status + shut the channel down
             // cleanly below.
+            //
+            // It resolves to `Ok(Some(updates))` only for an accepted push —
+            // that is what feeds the post-push hooks; fetch / ls-refs give
+            // `Ok(None)`.
             let handler_fut = async {
-                if git_protocol_version == "2" {
-                    tracing::info!(%service_name, "Using Protocol V2");
-                    handle_v2_stream(&repo_full_path, &mut stream).await
-                } else {
-                    match service_name.as_str() {
-                        "git-upload-pack" => {
-                            handle_upload_pack_stream(&repo_full_path, &mut stream)
-                                .await
-                                .map(|_| ())
-                        }
-                        "git-receive-pack" => {
-                            if let Some((protection_rules, tag_protection_rules, actor_id)) =
-                                receive_pack_context
-                            {
-                                let require_signed_refs =
-                                    signed_commit_required_refs(&protection_rules);
-                                let mut rejected_refs =
-                                    branch_protection_rejected_refs(protection_rules, actor_id);
-                                rejected_refs.extend(tag_protection_rejected_refs(
-                                    tag_protection_rules,
-                                    actor_id,
-                                ));
-                                handle_receive_pack_stream_with_rejections(
-                                    &repo_full_path,
-                                    &mut stream,
-                                    rejected_refs,
-                                    require_signed_refs,
-                                )
-                                .await
-                                .map(|_| ())
-                            } else {
-                                handle_receive_pack_stream(&repo_full_path, &mut stream)
-                                    .await
-                                    .map(|_| ())
-                            }
-                        }
-                        _ => Err(anyhow::anyhow!("Unknown git service: {}", service_name)),
+                match service_name.as_str() {
+                    // Protocol V2 defines no `receive-pack` command — git itself
+                    // downgrades a push to v0 — so a push always takes the V1
+                    // path, `GIT_PROTOCOL=version=2` env request or not. Routing
+                    // it into the V2 handler would answer a send-pack client with
+                    // a capability advertisement and drop the ref updates on the
+                    // floor, taking every post-push hook with them.
+                    "git-receive-pack" => {
+                        let ref_updates = if let Some(context) = receive_pack_context {
+                            let require_signed_refs =
+                                signed_commit_required_refs(&context.protection_rules);
+                            let mut rejected_refs = branch_protection_rejected_refs(
+                                context.protection_rules,
+                                context.actor_id,
+                            );
+                            rejected_refs.extend(tag_protection_rejected_refs(
+                                context.tag_protection_rules,
+                                context.actor_id,
+                            ));
+                            handle_receive_pack_stream_with_rejections(
+                                &repo_full_path,
+                                &mut stream,
+                                rejected_refs,
+                                require_signed_refs,
+                            )
+                            .await?
+                        } else {
+                            handle_receive_pack_stream(&repo_full_path, &mut stream).await?
+                        };
+                        Ok(Some(ref_updates))
                     }
+                    "git-upload-pack" if git_protocol_version == "2" => {
+                        tracing::info!(%service_name, "Using Protocol V2");
+                        handle_v2_stream(&repo_full_path, &mut stream)
+                            .await
+                            .map(|_| None)
+                    }
+                    "git-upload-pack" => handle_upload_pack_stream(&repo_full_path, &mut stream)
+                        .await
+                        .map(|_| None),
+                    _ => Err(anyhow::anyhow!("Unknown git service: {}", service_name)),
                 }
             };
 
             let result: Result<(), anyhow::Error> =
                 match with_git_timeout(git_stream_timeout_secs, handler_fut).await {
-                    Ok(r) => r,
+                    Ok(Ok(ref_updates)) => {
+                        // ── Post-push hooks: CI, webhooks, PR head-SHA ─────────
+                        //
+                        // The same hooks the Smart-HTTP transport runs, from the
+                        // same `rg-core` entry point. Detached so the client isn't
+                        // held while CI is triggered and the webhooks fan out —
+                        // but *tracked*: the client is about to get its exit
+                        // status, so a bare `tokio::spawn` would be severed by a
+                        // SIGTERM in the next few seconds with no pipeline, no
+                        // webhook and no trace that any of it was owed.
+                        // `delivery_tracker()` is drained by `rg_http::run` after
+                        // it stops accepting, the same contract the HTTP push path
+                        // relies on.
+                        if let (Some(ref_updates), Some(hooks), Some(db), Some((owner, repo_name))) =
+                            (ref_updates, post_push, hook_db, hook_target)
+                        {
+                            rg_core::task_tracker::delivery_tracker().spawn(async move {
+                                hooks
+                                    .run(&db, &hook_repo_path, &owner, &repo_name, &ref_updates)
+                                    .await;
+                            });
+                        }
+                        Ok(())
+                    }
+                    Ok(Err(e)) => Err(e),
                     Err(_elapsed) => {
                         tracing::warn!(
                             %service_name,
@@ -856,6 +925,35 @@ mod tests {
         parse_repo_owner_name, with_git_timeout,
     };
     use std::time::Duration;
+
+    /// The post-push hooks must stay on the *tracked* spawn path.
+    ///
+    /// `ssh_push_hook_tests` asserts the effect, but a bare `tokio::spawn`
+    /// usually still finishes before that test reads the row, so the regression
+    /// it guards is timing-dependent by nature. This one is not: only what the
+    /// tracker owns can be drained on shutdown, so an untracked spawn here is
+    /// the bug regardless of how the race lands. Mirrors the HTTP transport's
+    /// `post_push_hooks_are_detached_through_the_delivery_tracker`.
+    #[test]
+    fn post_push_hooks_are_detached_through_the_delivery_tracker() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let call = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("hooks"))
+            .expect("the receive-pack branch must still run the post-push hooks");
+        let spawn = lines[..call]
+            .iter()
+            .rposition(|line| line.contains("spawn("))
+            .expect("the post-push call must sit inside a spawn");
+        assert!(
+            lines[spawn].contains("delivery_tracker()"),
+            "post-push hooks must be spawned via rg_core::task_tracker::delivery_tracker() \
+             so the shutdown drain awaits them; found `{}` at lib.rs:{}",
+            lines[spawn].trim(),
+            spawn + 1
+        );
+    }
 
     /// The bind-mount trap: `docker compose up` with a missing `./ssh_host_key`
     /// leaves a *directory* at the mount point. `ensure_host_key` sees an

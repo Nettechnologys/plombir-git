@@ -152,6 +152,12 @@ pub struct HttpServerConfig {
     /// Enable opt-in Ed25519 provenance attestation of release assets. Default
     /// `false` (feature off; endpoints 404).
     pub attestation_enabled: bool,
+    /// WebSocket notification hub to serve clients from. Pass an existing hub
+    /// when another transport in the same process must reach the same clients —
+    /// the SSH server's post-push hooks push `ci_triggered` / `push` events
+    /// through it, and a hub of their own would fan out to nobody. `None`
+    /// creates a private hub (the standalone-HTTP default).
+    pub notification_hub: Option<ws::NotificationHub>,
 }
 
 /// Start the HTTP server and run forever.
@@ -179,7 +185,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
     auth_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
 
-    let notification_hub = ws::NotificationHub::new();
+    let notification_hub = config.notification_hub.unwrap_or_default();
 
     // ── Initialize Prometheus metrics registry ──────────────────
     metrics::init_registry().expect("Failed to initialize Prometheus metrics registry");

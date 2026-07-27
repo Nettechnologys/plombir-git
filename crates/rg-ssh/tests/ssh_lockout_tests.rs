@@ -121,6 +121,7 @@ async fn harness(username: &str) -> Harness {
         db: Some(db.clone()),
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
+        post_push: None,
     };
     let server = tokio::spawn(async move {
         rg_ssh::start_ssh_server(server_config).await.unwrap();

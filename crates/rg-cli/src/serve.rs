@@ -573,6 +573,14 @@ pub(crate) async fn run_serve(
 
     validate_config(&resolved_jwt_secret, &repo_root, &tls_config)?;
 
+    // One CI engine and one WebSocket hub for the whole process: the SSH
+    // transport's post-push hooks trigger pipelines and push `ci_triggered` /
+    // `push` events to the very clients the HTTP server's sockets belong to, so
+    // a second hub of its own would fan out to nobody (card_b4fefeee8abf).
+    let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> =
+        std::sync::Arc::new(rg_ci::CiEngine);
+    let notification_hub = rg_http::ws::NotificationHub::new();
+
     let http_config = rg_http::HttpServerConfig {
         listen_addr: resolved_http_addr,
         repo_root: repo_root.clone(),
@@ -588,18 +596,19 @@ pub(crate) async fn run_serve(
         rate_limit_max_keys: resolved_rate_limit_max_keys,
         rate_limit_auth_max: resolved_rate_limit_auth_max,
         rate_limit_auth_window_secs: resolved_rate_limit_auth_window,
-        smtp_config,
+        smtp_config: smtp_config.clone(),
         tls_config,
         oci_storage_path: None,
-        external_url: resolved_external_url,
+        external_url: resolved_external_url.clone(),
         job_timeout_secs: resolved_job_timeout,
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,
         // M-14: Inject CiEngine via trait object, decoupling rg-http from rg-ci.
-        ci_engine: std::sync::Arc::new(rg_ci::CiEngine),
+        ci_engine: ci_engine.clone(),
         shutdown_rx: shutdown_rx.clone(),
         shutdown_grace_secs: resolved_shutdown_grace,
         attestation_enabled: resolved_attestation_enabled,
+        notification_hub: Some(notification_hub.clone()),
     };
 
     // ── SSH server ────────────────────────────────────────────────
@@ -608,6 +617,22 @@ pub(crate) async fn run_serve(
         format!("{}/.ssh/id_ed25519", home)
     });
 
+    // A push over SSH must run the same automation as a push over HTTPS — CI,
+    // webhooks, open-PR head-SHA refresh, auto-merge / merge-queue. These hooks
+    // used to be private to `rg-http`, so SSH (the default once a key is
+    // registered) ran none of them (card_b4fefeee8abf).
+    let post_push_context = rg_core::push_hooks::PostPushContext {
+        repo_root: repo_root.clone(),
+        docker_enabled: resolved_docker,
+        external_runners: resolved_external_runners,
+        allow_host_runner: resolved_allow_host_runner,
+        jwt_secret: resolved_jwt_secret.clone(),
+        smtp_config,
+        ci_engine,
+        external_url: resolved_external_url,
+        notifier: Some(std::sync::Arc::new(notification_hub)),
+    };
+
     let ssh_config = rg_ssh::SshServerConfig {
         host_key_path: PathBuf::from(&host_key_path),
         listen_addr: resolved_ssh_addr,
@@ -615,6 +640,7 @@ pub(crate) async fn run_serve(
         db: Some(db.clone()),
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,
+        post_push: Some(std::sync::Arc::new(post_push_context)),
     };
 
     let http_handle = tokio::spawn(async move {

@@ -28,6 +28,7 @@ pub mod issue_template;
 pub mod label;
 pub mod notification;
 pub mod pull_request;
+pub mod push_hooks; // Transport-neutral post-push hooks (HTTP + SSH both call these)
 pub mod repo;
 pub mod review;
 pub mod time_tracking;

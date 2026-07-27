@@ -342,6 +342,16 @@ pub fn push_notification(
     });
 }
 
+/// The hub is the concrete sink behind `rg-core`'s transport-neutral
+/// [`rg_core::push_hooks::PushNotifier`] seam: the post-push hooks live in
+/// `rg-core` (so the SSH transport runs them too) and cannot name an HTTP type,
+/// but they still have to reach the WebSocket clients this hub owns.
+impl rg_core::push_hooks::PushNotifier for NotificationHub {
+    fn notify(&self, user_id: i64, event_type: &str, data: serde_json::Value) {
+        push_notification(self, user_id, event_type, data);
+    }
+}
+
 /// Broadcast a job log update to subscribers of that job.
 pub async fn push_job_log(hub: &NotificationHub, job_id: i64, log: &str) {
     hub.push_job_log(job_id, log).await;
