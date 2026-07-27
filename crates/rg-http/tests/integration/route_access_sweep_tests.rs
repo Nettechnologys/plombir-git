@@ -25,6 +25,24 @@
 //! so the same run checks that the owner is *not* denied, and re-checks the
 //! owner's session at the end of the pass so a dead fixture is reported as a
 //! dead fixture instead of as a passing security test.
+//!
+//! # What the three passes cannot see
+//!
+//! Both blind spots are here rather than in a card, because a reader deciding
+//! whether a green run means anything needs them in front of them:
+//!
+//! - **`Access::Public` is owed `Expect::Allowed`**, and everything short of a
+//!   denial satisfies that — so a public row cannot fail the persona passes
+//!   whatever it answers. Most of those rows are static content, but a few are
+//!   *self-filtering* data gates whose entire security property is that the
+//!   answer depends on who asks. [`no_public_route_names_the_private_repo`]
+//!   gives that class the one mechanism a generic sweep can: it is not a proof,
+//!   but it is not vacuous either.
+//! - **A gate that resolves the right repository and then acts on a global
+//!   `id`** passes here, because the gate did answer. That is a second
+//!   mechanism (`card_e704fe5ca25f`), not a hole in this one — see
+//!   `cross_repo_release_tests` and `cross_repo_label_milestone_tests` for the
+//!   instances closed by hand so far.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -899,4 +917,96 @@ async fn the_route_table_covers_the_whole_server() {
             );
         }
     }
+}
+
+/// No route declared [`Access::Public`] names a private repository to an
+/// anonymous caller.
+///
+/// This is the narrow half of the sweep's `Public` blind spot. `expectation`
+/// owes a public route `Expect::Allowed` and every non-denial satisfies that,
+/// so the persona passes cannot fail a public row however it answers — and yet
+/// a handful of those rows are not static content but *self-filtering* data
+/// gates, where filtering the answer by what the caller may see is the entire
+/// security property. `/repos/explore`, `/repos/{owner}` and `/search` are that
+/// shape, and all three are where `card_76e22c3a8364` found a private
+/// repository on show to anonymous callers.
+///
+/// So: seed one private repository, drive every public `GET`/`HEAD` with no
+/// credentials, and fail if its name comes back. What this catches is a leak
+/// through a route nobody wrote a bespoke test for — including one added
+/// tomorrow, since it walks the table rather than a list.
+///
+/// It is deliberately weaker than a bespoke test and should not be mistaken for
+/// one. A route that answers `400` for want of a query parameter is not proven
+/// to filter anything; it is only proven not to have leaked *here*. The
+/// per-route tests (`private_repo_visibility_tests`) remain the real coverage —
+/// this is the net under them.
+#[tokio::test]
+async fn no_public_route_names_the_private_repo() {
+    let (base, facts) = spawn_test_app_with_routes().await;
+    let client = Client::builder().build().expect("http client");
+
+    let owner_token = register_user(&base, OWNER, &format!("{OWNER}@example.com"), PW).await;
+    let fx = Fixture {
+        base,
+        client,
+        owner_token,
+        // Never used: every probe below is anonymous.
+        outsider_token: String::new(),
+    };
+    create_repo(&fx, PRIVATE_REPO, true).await;
+    let seed = RepoSeed {
+        name: PRIVATE_REPO.to_string(),
+        comment_id: "1".to_string(),
+    };
+
+    // The owner can see it — otherwise "nobody mentioned it" would just mean
+    // the fixture never created anything.
+    assert_eq!(
+        fx.repo_readable_by_owner(PRIVATE_REPO).await,
+        StatusCode::OK,
+        "fixture is dead: the owner cannot read their own private repository, so no \
+         route could name it and this test would pass vacuously"
+    );
+
+    let mut probed = 0usize;
+    let mut leaks: Vec<String> = Vec::new();
+    for fact in facts.iter().filter(|f| f.access == Access::Public) {
+        // Only the safe verbs: a public `POST` here is login / register /
+        // password reset, and driving those adds accounts and mail instead of
+        // reading anything back.
+        if !matches!(fact.method, "GET" | "HEAD") {
+            continue;
+        }
+        let url = format!("{}{}", fx.base, fill(&fact.path, &seed));
+        let req = if fact.method == "HEAD" {
+            fx.client.head(url)
+        } else {
+            fx.client.get(url)
+        };
+        let resp = req.send().await.expect("public leak probe");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        probed += 1;
+        if body.contains(PRIVATE_REPO) {
+            leaks.push(format!(
+                "  {} — anonymous reply ({status}) names '{PRIVATE_REPO}':\n      {}",
+                fact.label(),
+                body.chars().take(240).collect::<String>(),
+            ));
+        }
+    }
+
+    assert!(
+        probed > 5,
+        "only {probed} public route(s) were probed — the filter is wrong, not the server"
+    );
+    assert!(
+        leaks.is_empty(),
+        "{} route(s) declared `Access::Public` handed a private repository to an \
+         anonymous caller. A public route either serves content that does not depend on \
+         who asks, or filters by what the caller may see — these did neither.\n{}",
+        leaks.len(),
+        leaks.join("\n"),
+    );
 }
