@@ -45,10 +45,10 @@ pub struct PostPushParams<'a> {
     pub repo_name: &'a str,
     /// The account that pushed, when the transport authenticated one.
     ///
-    /// Only the watch fan-out needs it: it names the pusher in the notification
-    /// and is how the pusher is kept off their own recipient list. `None` (an
-    /// unauthenticated push on an open-access server) simply means nobody is
-    /// excluded.
+    /// The watch fan-out names the pusher in the notification and uses this to
+    /// keep them off their own recipient list, and the CI pipeline records it as
+    /// `triggered_by`. `None` (an unauthenticated push on an open-access server)
+    /// means nobody is excluded and the pipeline has no attributed actor.
     pub pusher_id: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,
@@ -599,7 +599,11 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             commit_sha: &update.new_sha,
             ref_name: &update.refname,
             trigger_type: "push",
-            triggered_by: None,
+            // The transport knows who pushed, and every other trigger path
+            // records its actor, so a push pipeline had no reason to be the one
+            // anonymous row in the table — `triggered_by` was hardcoded `None`
+            // even when the push was authenticated.
+            triggered_by: params.pusher_id,
             docker_enabled: params.docker_enabled,
             external_runners: params.external_runners,
             allow_host_runner: params.allow_host_runner,

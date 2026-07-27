@@ -194,7 +194,25 @@ async fn require_suggestion_source(
     Ok((actor_id, actor, pr, source_repo, source_namespace))
 }
 
-async fn after_suggestions_applied(
+/// Hand a suggestion commit to the same post-push automation a `git push` gets.
+///
+/// Applying a suggestion writes a real commit onto the PR's head branch
+/// (`rg_core::review::service` clones the bare repo, commits and pushes back),
+/// so everything a push owes is owed here too: CI, the `push` webhook, the
+/// real-time and watch fan-outs, and the auto-merge / merge-queue evaluation a
+/// new head can unblock. This used to be a hand-written partial copy of the hook
+/// run — a CI trigger plus the merge evaluation, nothing else, both awaited
+/// inside the request instead of detached through `delivery_tracker()`
+/// (card_e324a9281789).
+///
+/// The CI event name changes with the move, `suggestion` → `push`, and that is a
+/// repair rather than a loss: `Workflow::matches_event` knows only `push`,
+/// `pull_request` and `merge_group`, so a repository whose CI lives in
+/// `.gitea/workflows/` matched *no* workflow for `suggestion` and got a log line
+/// where it expected a pipeline. The actor is not lost with it — it rides along
+/// as the hook run's `pusher_id`, which is what the pipeline records as
+/// `triggered_by`.
+fn after_suggestions_applied(
     state: &AppState,
     actor_id: i64,
     pr: &rg_db::entities::pull_request::Model,
@@ -202,39 +220,41 @@ async fn after_suggestions_applied(
     source_namespace: &str,
     commit_sha: &str,
 ) {
-    let source_repo_path = state
-        .repo_root
-        .join(format!("{source_namespace}/{}.git", source_repo.name));
-    if state.ci_engine.has_ci_config(&source_repo_path, commit_sha) {
-        let ref_name = format!("refs/heads/{}", pr.head_branch);
-        if let Err(error) = state
-            .ci_engine
-            .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
-                db: &state.db,
-                repo_path: &source_repo_path,
-                repo_id: source_repo.id,
+    // `apply_suggestions` refuses a PR without a head SHA and always writes a
+    // fresh commit, so neither guard should ever fire. They are here because the
+    // failure mode is silent and wrong rather than loud: an all-zero `old_sha`
+    // reads as a *created* branch and an unchanged pair as a no-op push, so a
+    // bad ref update would fire `branch.created` for a branch that has existed
+    // for months.
+    let old_sha = match pr.head_sha.as_deref() {
+        Some(old_sha) if !old_sha.is_empty() && old_sha != commit_sha => old_sha,
+        _ => {
+            tracing::warn!(
+                pr_id = pr.id,
+                head_sha = ?pr.head_sha,
                 commit_sha,
-                ref_name: &ref_name,
-                trigger_type: "suggestion",
-                triggered_by: Some(actor_id),
-                docker_enabled: state.docker_enabled,
-                external_runners: state.external_runners,
-                allow_host_runner: state.allow_host_runner,
-                jwt_secret: Some(&state.jwt_secret),
-                external_url: state.external_url.as_deref(),
-            })
-            .await
-        {
-            tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "CI trigger after suggestion failed");
+                "suggestion commit has no usable previous head — skipping post-push hooks \
+                 rather than reporting a bogus ref update"
+            );
+            return;
         }
-    }
-    // Applying a suggestion writes a commit, so it can unblock an auto-merge or
-    // the queue — and whatever they merge moves a base branch that owes the
-    // post-push hooks, exactly as if the commit had been pushed
-    // (card_73a1ec5b32f3).
-    state
-        .evaluate_merges_and_spawn_hooks(source_repo.id, commit_sha, Some(actor_id))
-        .await;
+    };
+
+    state.spawn_post_push_hooks(
+        state
+            .repo_root
+            .join(format!("{source_namespace}/{}.git", source_repo.name)),
+        source_namespace.to_string(),
+        source_repo.name.clone(),
+        Some(actor_id),
+        vec![rg_git::protocol::receive_pack::RefUpdate {
+            old_sha: old_sha.to_string(),
+            new_sha: commit_sha.to_string(),
+            refname: format!("refs/heads/{}", pr.head_branch),
+            status: "ok".to_string(),
+            message: String::new(),
+        }],
+    );
 }
 
 // ── Review handlers ───────────────────────────────────────────────────
@@ -995,8 +1015,7 @@ pub async fn apply_review_suggestion(
                 &source_repo,
                 &source_namespace,
                 &applied.commit_sha,
-            )
-            .await;
+            );
             (StatusCode::OK, Json(applied)).into_response()
         }
         // "Outdated suggestion" and "branch head changed" carry
@@ -1053,8 +1072,7 @@ pub async fn apply_review_suggestions(
                 &source_repo,
                 &source_namespace,
                 &applied.commit_sha,
-            )
-            .await;
+            );
             (StatusCode::OK, Json(applied)).into_response()
         }
         // "Outdated suggestion" and "branch head changed" carry
