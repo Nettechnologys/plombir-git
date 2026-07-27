@@ -17,7 +17,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -25,6 +25,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::repo_access::RepoWrite;
 use crate::AppState;
 
 /// HTTP header carrying the hex HMAC-SHA256 signature of the raw webhook body,
@@ -91,31 +92,33 @@ pub struct ExternalCiResponse {
         (status = 200, description = "Commit status created", body = ExternalCiResponse),
         (status = 400, description = "Invalid state or input"),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Write access to the repository required"),
         (status = 404, description = "Repository not found"),
     ),
 )]
 pub async fn external_ci_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    // The gate. Writing a commit status is a write on the repository named in
+    // the path, so this endpoint owes exactly what `POST /repos/{owner}/{name}/
+    // statuses/{sha}` owes — it used to authenticate and stop there, which let
+    // any account paint any repository's commits, private ones included.
+    // The shared HMAC secret below is not a substitute: it is optional and
+    // instance-wide, so every CI wired to this server knows it.
+    RepoWrite { repo, actor_id }: RepoWrite,
     // Raw body: we must verify the HMAC over the exact bytes the client sent,
     // so JSON parsing is deferred until after the signature check.
     raw_body: Bytes,
 ) -> impl IntoResponse {
-    // Authenticate
-    let Some(user_id) = crate::api::auth::extract_user_id(&headers, &state.jwt_secret) else {
-        return crate::error::AppError::unauthorized("authentication required").into_response();
-    };
-
     // Defense-in-depth: when an inbound-webhook secret is configured, require a
     // valid HMAC-SHA256 signature over the raw body. Opt-in — with no secret the
-    // endpoint behaves exactly as before (auth-only).
+    // endpoint relies on the access gate alone.
     if let Some(secret) = state.external_webhook_secret.as_ref() {
         if let Err(reason) = verify_hub_signature(secret, &headers, &raw_body) {
             tracing::warn!(
                 reason,
-                %owner,
-                %name,
+                repo_id = repo.id,
+                repo = %repo.name,
                 "external CI webhook rejected: HMAC signature verification failed"
             );
             return crate::error::AppError::unauthorized("invalid webhook signature")
@@ -142,16 +145,6 @@ pub async fn external_ci_webhook(
         .into_response();
     }
 
-    // Resolve repo
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return crate::error::AppError::not_found("repository not found").into_response()
-        }
-        Err(e) => return crate::error::AppError::from(e).into_response(),
-    };
-
     // Create commit status (without sha — will be associated later via push)
     // Clone fields before moving into ActiveModel
     let context = body.context.clone();
@@ -172,7 +165,7 @@ pub async fn external_ci_webhook(
             state: sea_orm::Set(state_val),
             description: sea_orm::Set(description),
             target_url: sea_orm::Set(target_url),
-            creator_id: sea_orm::Set(user_id),
+            creator_id: sea_orm::Set(actor_id),
             created_at: sea_orm::Set(chrono::Utc::now()),
             updated_at: sea_orm::Set(chrono::Utc::now()),
         },

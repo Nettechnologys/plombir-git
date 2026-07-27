@@ -190,7 +190,6 @@ const EXTRACTOR_BEFORE_GATE: &[&str] = &[
     "POST /api/v1/repos/{owner}/{name}/mirror",
     "POST /api/v1/repos/{owner}/{name}/statuses/{sha}",
     "POST /api/v1/repos/{owner}/{name}/transfer",
-    "POST /api/v1/repos/{owner}/{name}/webhooks/external/ci",
     "GET /api/v1/ai/repos/{owner}/{name}/search/code",
 ];
 

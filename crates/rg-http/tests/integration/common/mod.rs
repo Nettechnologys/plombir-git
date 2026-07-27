@@ -194,6 +194,33 @@ pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
     (base_url, db)
 }
 
+/// Spawn the test app with an inbound-webhook HMAC secret configured.
+///
+/// The secret is instance-wide: every external CI wired to this server holds
+/// the same one, which is why the `/webhooks/external/*` endpoints treat a
+/// valid signature as defense-in-depth on top of their access gate rather than
+/// as the gate itself. Tests on either side of that line need this state.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_webhook_secret(
+    secret: &str,
+) -> (String, rg_db::DatabaseConnection) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    let mut state = build_test_app_state(db.clone(), repo_root);
+    state.external_webhook_secret = Some(std::sync::Arc::new(secret.to_string()));
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    (base_url, db)
+}
+
 /// Spawn the test app and hand back `(base_url, repo_root)`.
 ///
 /// The repo-browsing endpoints fail for two unrelated reasons — "no such file
