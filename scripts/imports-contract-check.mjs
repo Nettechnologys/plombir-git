@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/imports.rs');
@@ -15,7 +15,7 @@ const pagePath = path.join(root, 'web/src/routes/imports/+page.svelte');
 
 const backend = readFileSync(backendPath, 'utf8');
 const entity = readFileSync(entityPath, 'utf8');
-const router = stripRustComments(readFileSync(routerPath, 'utf8'));
+const routes = loadRouteTable(routerPath);
 const client = readFileSync(clientPath, 'utf8');
 const navbar = readFileSync(navbarPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');
@@ -33,13 +33,16 @@ for (const [method, route] of [
   }
 }
 
-if (!/route\(\s*"\/imports"[\s\S]*post\(api::imports::start_import\)\.get\(api::imports::list_imports\)/.test(router)) {
-  failures.push('HTTP router must register POST/GET /imports');
-}
-
-if (!/route\(\s*"\/imports\/\{id\}"[\s\S]*get\(api::imports::get_import_status\)\.delete\(api::imports::delete_import\)/.test(router)) {
-  failures.push('HTTP router must register GET/DELETE /imports/{id}');
-}
+// Imports are per-user tasks carrying source credentials — every route is
+// authenticated, none of them is `Public`.
+failures.push(
+  ...routeFailures(routes, [
+    { method: 'POST', path: '/imports', handler: 'api::imports::start_import', access: 'User' },
+    { method: 'GET', path: '/imports', handler: 'api::imports::list_imports', access: 'User' },
+    { method: 'GET', path: '/imports/{id}', handler: 'api::imports::get_import_status', access: 'User' },
+    { method: 'DELETE', path: '/imports/{id}', handler: 'api::imports::delete_import', access: 'User' },
+  ]),
+);
 
 if (!/pub async fn get_import_status\([\s\S]*headers: HeaderMap,[\s\S]*extract_bearer_claims\(&headers, &state\.jwt_secret\)[\s\S]*task\.user_id == user_id/.test(backend)) {
   failures.push('GET /imports/{id} must authenticate and only return the current user task');

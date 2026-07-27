@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -11,19 +11,20 @@ const backendPath = path.join(root, 'crates/rg-http/src/api/audit.rs');
 const clientPath = path.join(root, 'web/src/lib/api/admin.ts');
 const pagePath = path.join(root, 'web/src/routes/admin/audit/+page.svelte');
 
-const router = stripRustComments(readFileSync(routerPath, 'utf8'));
+const routes = loadRouteTable(routerPath);
 const backend = readFileSync(backendPath, 'utf8');
 const client = readFileSync(clientPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');
 const failures = [];
 
-if (!/\.route\(\s*"\/admin\/audit\/logs",\s*get\(api::audit::list_audit_logs\)/.test(router)) {
-  failures.push('Backend router must expose GET /admin/audit/logs');
-}
-
-if (!/\.route\(\s*"\/admin\/audit\/logs\/\{id\}",\s*get\(api::audit::get_audit_log\)/.test(router)) {
-  failures.push('Backend router must expose GET /admin/audit/logs/{id}');
-}
+// The audit log is instance-admin territory: reading it is reading everyone
+// else's activity, so the declared access level is part of the contract.
+failures.push(
+  ...routeFailures(routes, [
+    { method: 'GET', path: '/admin/audit/logs', handler: 'api::audit::list_audit_logs', access: 'InstanceAdmin' },
+    { method: 'GET', path: '/admin/audit/logs/{id}', handler: 'api::audit::get_audit_log', access: 'InstanceAdmin' },
+  ]),
+);
 
 if (!/pub async fn list_audit_logs/.test(backend) || !/pub async fn get_audit_log/.test(backend)) {
   failures.push('Backend audit API must keep list and detail handlers');

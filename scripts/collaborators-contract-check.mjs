@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/collaborators.rs');
@@ -15,7 +15,7 @@ const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settin
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/collaborators/+page.svelte');
 
 const backend = readFileSync(backendPath, 'utf8');
-const routerSource = stripRustComments(readFileSync(routerPath, 'utf8'));
+const routes = loadRouteTable(routerPath);
 const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');
@@ -29,11 +29,27 @@ if (!/delete,\s*\n\s*path\s*=\s*"\/repos\/\{owner\}\/\{name\}\/collaborators\/\{
   failures.push('Backend collaborator DELETE route is missing or changed');
 }
 
-if (!/\/repos\/\{owner\}\/\{name\}\/collaborators\/\{id\}"[\s\S]*patch\(api::collaborators::update_permission\)[\s\S]*\.delete\(api::collaborators::remove_collaborator\)/.test(routerSource ?? '')) {
-  failures.push('Backend router must expose DELETE /collaborators/{user_id} alongside PATCH permission updates');
-}
+// Changing or revoking someone's access is repo administration — both routes
+// must say so, or the sweep would be checking a level the router never claims.
+failures.push(
+  ...routeFailures(routes, [
+    {
+      method: 'PATCH',
+      path: '/repos/{owner}/{name}/collaborators/{id}',
+      handler: 'api::collaborators::update_permission',
+      access: 'RepoAdmin',
+    },
+    {
+      method: 'DELETE',
+      path: '/repos/{owner}/{name}/collaborators/{id}',
+      handler: 'api::collaborators::remove_collaborator',
+      access: 'RepoAdmin',
+    },
+  ]),
+);
 
-if (/\/repos\/\{owner\}\/\{name\}\/collaborators\/\{user_id\}\/remove/.test(routerSource ?? '')) {
+// Any method on the legacy path, not just POST: the point is that the path is gone.
+if (routes.some((route) => route.path === '/repos/{owner}/{name}/collaborators/{user_id}/remove')) {
   failures.push('Backend router must not expose legacy POST /collaborators/{user_id}/remove');
 }
 

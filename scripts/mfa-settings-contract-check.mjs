@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/mfa.ts');
@@ -30,8 +30,11 @@ const client = read(clientPath);
 const page = existsSync(pagePath) ? read(pagePath) : '';
 const navbar = read(navbarPath);
 const backend = read(backendPath);
-const router = stripRustComments(read(routerPath));
+const routes = loadRouteTable(routerPath);
 
+// Managing your own second factor requires being the first factor: every one
+// of these is `User`. `/users/mfa/verify` is deliberately `Public` (it runs
+// mid-login, before a session exists) and is not part of this set.
 for (const [method, route, handler] of [
   ['post', '/users/mfa/setup', 'setup_mfa'],
   ['post', '/users/mfa/enable', 'enable_mfa'],
@@ -43,10 +46,8 @@ for (const [method, route, handler] of [
     new RegExp(`${method},[\\s\\S]*path\\s*=\\s*"${route.replaceAll('/', '\\/')}"`),
     `Backend MFA ${method.toUpperCase()} ${route} annotation is missing or changed`,
   );
-  expect(
-    router,
-    new RegExp(`\\.route\\("${route.replaceAll('/', '\\/')}",\\s*${method}\\(api::mfa::${handler}\\)\\)`),
-    `Backend router no longer mounts ${method.toUpperCase()} ${route}`,
+  failures.push(
+    ...routeFailures(routes, [{ method, path: route, handler: `api::mfa::${handler}`, access: 'User' }]),
   );
 }
 

@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -12,20 +12,22 @@ const clientPath = path.join(root, 'web/src/lib/api/tokens.ts');
 const pagePath = path.join(root, 'web/src/routes/settings/tokens/+page.svelte');
 const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 
-const router = stripRustComments(readFileSync(routerPath, 'utf8'));
+const routes = loadRouteTable(routerPath);
 const backend = readFileSync(backendPath, 'utf8');
 const client = readFileSync(clientPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');
 const navbar = readFileSync(navbarPath, 'utf8');
 const failures = [];
 
-if (!/\.route\(\s*"\/users\/tokens",\s*get\(api::users::list_tokens\)\.post\(api::users::create_token\)/.test(router)) {
-  failures.push('Backend router must expose GET/POST /users/tokens');
-}
-
-if (!/\.route\(\s*"\/users\/tokens\/\{id\}",\s*delete\(api::users::delete_token\)/.test(router)) {
-  failures.push('Backend router must expose DELETE /users/tokens/{id}');
-}
+// Personal access tokens are the caller's own credentials: `User`, never
+// anonymous — an unauthenticated route here would hand out other people's PATs.
+failures.push(
+  ...routeFailures(routes, [
+    { method: 'GET', path: '/users/tokens', handler: 'api::users::list_tokens', access: 'User' },
+    { method: 'POST', path: '/users/tokens', handler: 'api::users::create_token', access: 'User' },
+    { method: 'DELETE', path: '/users/tokens/{id}', handler: 'api::users::delete_token', access: 'User' },
+  ]),
+);
 
 if (!/pub async fn list_tokens/.test(backend) || !/pub async fn create_token/.test(backend) || !/pub async fn delete_token/.test(backend)) {
   failures.push('Backend users API must keep token list/create/delete handlers');

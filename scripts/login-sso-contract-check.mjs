@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/auth.ts');
@@ -14,7 +14,7 @@ const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 const client = readFileSync(clientPath, 'utf8');
 const login = readFileSync(loginPath, 'utf8');
 const backend = readFileSync(backendPath, 'utf8');
-const router = stripRustComments(readFileSync(routerPath, 'utf8'));
+const routes = loadRouteTable(routerPath);
 
 const failures = [];
 
@@ -22,9 +22,13 @@ if (!/pub\s+struct\s+SsoProviderInfo\s*\{[\s\S]*slug:\s*String[\s\S]*name:\s*Str
   failures.push('Backend public SSO provider response must include slug, name, provider_type, and icon_url');
 }
 
-if (!/route\("\/auth\/sso\/providers",\s*get\(api::sso::list_providers\)\)/.test(router)) {
-  failures.push('Router must expose GET /auth/sso/providers');
-}
+// The login page fetches this before anyone is logged in, so `Public` is the
+// contract — not an oversight the sweep should later "tighten".
+failures.push(
+  ...routeFailures(routes, [
+    { method: 'GET', path: '/auth/sso/providers', handler: 'api::sso::list_providers', access: 'Public' },
+  ]),
+);
 
 if (!/export\s+interface\s+PublicSsoProvider\s*\{[\s\S]*slug:\s*string[\s\S]*name:\s*string[\s\S]*provider_type:\s*string[\s\S]*icon_url:\s*string\s*\|\s*null[\s\S]*\}/.test(client)) {
   failures.push('API client must type public SSO providers');

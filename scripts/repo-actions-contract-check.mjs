@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPaths = [
@@ -15,7 +15,7 @@ const backendPath = path.join(root, 'crates/rg-http/src/api/repos.rs');
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const backend = readFileSync(backendPath, 'utf8');
-const router = stripRustComments(readFileSync(routerPath, 'utf8'));
+const routes = loadRouteTable(routerPath);
 const header = readFileSync(headerPath, 'utf8');
 const repoPage = readFileSync(repoPagePath, 'utf8');
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
@@ -33,18 +33,49 @@ for (const route of [
   }
 }
 
-for (const [label, pattern] of [
-  ['PUT /star', /\.route\(\s*"\/repos\/\{owner\}\/\{name\}\/star",\s*put\(api::repos::star_repo\)\s*\)/],
-  ['GET /starred', /\.route\(\s*"\/repos\/\{owner\}\/\{name\}\/starred",\s*get\(api::repos::get_starred_status\),?\s*\)/],
-  ['GET /watch', /"\/repos\/\{owner\}\/\{name\}\/watch"[\s\S]*get\(api::repos::get_watch_status\)/],
-  ['PUT /watch', /"\/repos\/\{owner\}\/\{name\}\/watch"[\s\S]*\.put\(api::repos::watch_repo\)/],
-  ['DELETE /watch', /"\/repos\/\{owner\}\/\{name\}\/watch"[\s\S]*\.delete\(api::repos::unwatch_repo\)/],
-  ['DELETE /repos/{owner}/{name}', /"\/repos\/\{owner\}\/\{name\}"[\s\S]*delete\(api::repos::delete_repo_handler\)/],
-]) {
-  if (!pattern.test(router)) {
-    failures.push(`Backend repo action router binding missing: ${label}`);
-  }
-}
+// Starring and watching are per-user state on a repository the caller may read,
+// hence `RepoAuthRead` — anonymous reads of a public repo must not be able to
+// star it. Deleting the repository is `RepoOwner`, a level above admin.
+failures.push(
+  ...routeFailures(routes, [
+    {
+      method: 'PUT',
+      path: '/repos/{owner}/{name}/star',
+      handler: 'api::repos::star_repo',
+      access: 'RepoAuthRead',
+    },
+    {
+      method: 'GET',
+      path: '/repos/{owner}/{name}/starred',
+      handler: 'api::repos::get_starred_status',
+      access: 'RepoAuthRead',
+    },
+    {
+      method: 'GET',
+      path: '/repos/{owner}/{name}/watch',
+      handler: 'api::repos::get_watch_status',
+      access: 'RepoAuthRead',
+    },
+    {
+      method: 'PUT',
+      path: '/repos/{owner}/{name}/watch',
+      handler: 'api::repos::watch_repo',
+      access: 'RepoAuthRead',
+    },
+    {
+      method: 'DELETE',
+      path: '/repos/{owner}/{name}/watch',
+      handler: 'api::repos::unwatch_repo',
+      access: 'RepoAuthRead',
+    },
+    {
+      method: 'DELETE',
+      path: '/repos/{owner}/{name}',
+      handler: 'api::repos::delete_repo_handler',
+      access: 'RepoOwner',
+    },
+  ]),
+);
 
 const deleteHandlerBlock = backend.match(/pub async fn delete_repo_handler[\s\S]*?\n\}/);
 if (!deleteHandlerBlock) {
