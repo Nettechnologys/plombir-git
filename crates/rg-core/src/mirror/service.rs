@@ -2,6 +2,19 @@
 //!
 //! Supports creating a mirror of an external Git repository, periodic
 //! sync via cron-like scheduling, and manual sync triggers.
+//!
+//! ## The remote's credential
+//!
+//! `mirrors.password_encrypted` holds the password/token for the upstream
+//! remote. It is AES-256-GCM ciphertext, keyed the same way as every other
+//! secret at rest in ForgeKeep (`derive_key(jwt_secret)` — see
+//! `crate::auth::encryption`), and it is decrypted for exactly the duration of
+//! one sync. That is why every entry point here takes `jwt_secret`.
+//!
+//! On the way to `git` the plaintext travels through the **environment**, never
+//! through argv and never through the remote URL: argv is world-readable on a
+//! shared box (`ps`), and a URL with credentials in it is what git writes
+//! verbatim into `.git/config` on disk. See [`credential_invocation`].
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -13,6 +26,10 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use std::path::Path;
 
 /// Create a new mirror for a repository.
+///
+/// `password` is the plaintext credential as the operator typed it; it is
+/// encrypted here and never stored as given. An empty string means "no
+/// credential", the same as `None`.
 pub async fn create_mirror(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -20,6 +37,7 @@ pub async fn create_mirror(
     username: Option<String>,
     password: Option<String>,
     sync_interval_seconds: i64,
+    jwt_secret: &str,
 ) -> Result<Mirror> {
     // Ensure the repository exists
     let repo = repository::Entity::find_by_id(repo_id)
@@ -51,7 +69,7 @@ pub async fn create_mirror(
         repo_id: Set(repo_id),
         url: Set(url),
         username: Set(username),
-        password_encrypted: Set(password),
+        password_encrypted: Set(encrypt_password(password.as_deref(), jwt_secret)?),
         sync_interval_seconds: Set(sync_interval_seconds),
         next_sync_at: Set(Some(next_sync)),
         last_sync_at: Set(None),
@@ -72,6 +90,12 @@ pub async fn get_mirror(db: &DatabaseConnection, repo_id: i64) -> Result<Option<
 }
 
 /// Update mirror settings.
+///
+/// `password` follows the same rule as on create: plaintext in, ciphertext
+/// stored. An explicit empty string clears the stored credential — without it
+/// there would be no way to take a credential back off a mirror short of
+/// deleting the whole row.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_mirror(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -80,6 +104,7 @@ pub async fn update_mirror(
     password: Option<String>,
     sync_interval_seconds: Option<i64>,
     status: Option<String>,
+    jwt_secret: &str,
 ) -> Result<Mirror> {
     let existing = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
@@ -95,7 +120,7 @@ pub async fn update_mirror(
         model.username = Set(Some(v));
     }
     if let Some(v) = password {
-        model.password_encrypted = Set(Some(v));
+        model.password_encrypted = Set(encrypt_password(Some(&v), jwt_secret)?);
     }
     if let Some(v) = sync_interval_seconds {
         model.sync_interval_seconds = Set(v);
@@ -123,6 +148,7 @@ pub async fn sync_mirror(
     db: &DatabaseConnection,
     mirror: &Mirror,
     repo_root: &Path,
+    jwt_secret: &str,
 ) -> Result<bool> {
     if mirror.status != "active" {
         return Ok(false);
@@ -130,22 +156,36 @@ pub async fn sync_mirror(
 
     let repo_path = repo_root.join(format!("{}.mirror", mirror.repo_id));
 
+    // Decrypt before the guard so a credential that can no longer be read is
+    // reported as such, rather than as a plain authentication failure from the
+    // remote. Like every other failure here it lands in `last_sync_error`.
+    let credentials = load_credentials(mirror, jwt_secret);
+
     // SSRF guard (with DNS resolution) immediately before the git subprocess.
     // Re-checked here — not only at create/update — so a URL that resolved
     // public earlier, an old mirror predating this guard, or a DNS-rebind to an
     // internal address is caught right before the network call. A failure is
     // recorded as a normal sync error below (status=error), not propagated.
-    let result = match crate::net::guard_git_url(&mirror.url).await {
-        Ok(()) => {
-            if repo_path.join("HEAD").exists() {
-                // Existing mirror: git remote update
-                run_git_remote_update(&repo_path)
-            } else {
-                // First time: git clone --mirror
-                run_git_clone_mirror(&mirror.url, &repo_path)
+    let result = match &credentials {
+        Ok(credentials) => match crate::net::guard_git_url(&mirror.url).await {
+            Ok(()) => {
+                if repo_path.join("HEAD").exists() {
+                    // Existing mirror: git remote update
+                    run_git_remote_update(&repo_path, credentials.as_ref())
+                } else {
+                    // First time: git clone --mirror
+                    run_git_clone_mirror(&mirror.url, &repo_path, credentials.as_ref())
+                }
             }
-        }
-        Err(e) => Err(e.context("mirror remote URL failed SSRF validation")),
+            Err(e) => Err(e.context("mirror remote URL failed SSRF validation")),
+        },
+        // `anyhow::Error` is not `Clone`, and the borrow above needs the
+        // credentials to stay put, so re-word the failure instead of moving it.
+        Err(_) => Err(anyhow::anyhow!(
+            "the stored credential for this mirror could not be decrypted \
+             (it predates encryption at rest, or the server's secret changed) — \
+             re-enter it in the mirror settings"
+        )),
     };
 
     let now = Utc::now();
@@ -166,9 +206,16 @@ pub async fn sync_mirror(
             // persisted field the UI shows and in the log — under it sits the
             // `git clone --mirror` failure that actually explains the outage
             // (card_a997f30c142c).
-            model.last_sync_error = Set(Some(format!("{e:#}")));
+            //
+            // Belt and braces on the way out: the credential is kept out of
+            // argv and out of the URL, so git has nothing to echo — but this
+            // string is persisted and rendered in the settings UI, which is
+            // the last place a secret should surface if that ever stops
+            // holding.
+            let reason = mask_credential(&format!("{e:#}"), credentials.as_ref().ok());
+            model.last_sync_error = Set(Some(reason.clone()));
             model.status = Set("error".to_string());
-            tracing::error!(repo_id = mirror.repo_id, error = %format!("{e:#}"), "mirror sync failed");
+            tracing::error!(repo_id = mirror.repo_id, error = %reason, "mirror sync failed");
         }
     }
 
@@ -181,31 +228,149 @@ pub async fn sync_due_mirrors(
     db: &DatabaseConnection,
     repo_root: &Path,
     limit: u64,
+    jwt_secret: &str,
 ) -> Result<usize> {
     let mirrors = rg_db::ops::mirror_ops::list_due_sync(db, limit).await?;
     let mut count = 0;
     for mirror in &mirrors {
-        match sync_mirror(db, mirror, repo_root).await {
+        match sync_mirror(db, mirror, repo_root, jwt_secret).await {
             Ok(true) => count += 1,
             Ok(false) => { /* inactive, skip */ }
-            Err(e) => tracing::error!(mirror_id = %mirror.id, error = %format!("{e:#}"), "mirror sync failed"),
+            Err(e) => {
+                tracing::error!(mirror_id = %mirror.id, error = %format!("{e:#}"), "mirror sync failed")
+            }
         }
     }
     Ok(count)
 }
 
 /// Manually trigger a sync for a mirror.
-pub async fn trigger_sync(db: &DatabaseConnection, repo_id: i64, repo_root: &Path) -> Result<()> {
+pub async fn trigger_sync(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    repo_root: &Path,
+    jwt_secret: &str,
+) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
-    sync_mirror(db, &mirror, repo_root).await?;
+    sync_mirror(db, &mirror, repo_root, jwt_secret).await?;
     Ok(())
+}
+
+// ── Credentials ─────────────────────────────────────────────────────────
+
+/// Environment variables the credential helper reads the secret out of. Named
+/// after the product so they cannot collide with something the operator has
+/// already exported for their own git usage.
+const USERNAME_ENV: &str = "FORGEKEEP_MIRROR_USERNAME";
+const PASSWORD_ENV: &str = "FORGEKEEP_MIRROR_PASSWORD";
+
+/// The remote's credential, decrypted for the duration of a single sync.
+struct MirrorCredentials {
+    username: Option<String>,
+    password: String,
+}
+
+/// Encrypt an operator-supplied password for storage.
+///
+/// `None` and `Some("")` both mean "no credential" — the empty string is how
+/// the API clears one.
+fn encrypt_password(password: Option<&str>, jwt_secret: &str) -> Result<Option<String>> {
+    let Some(password) = password.filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let key = crate::auth::encryption::derive_key(jwt_secret);
+    crate::auth::encryption::encrypt(password, &key)
+        .context("failed to encrypt the mirror credential")
+        .map(Some)
+}
+
+/// Read the stored credential back for a sync.
+///
+/// A mirror with a username but no password is *not* a credential: git would
+/// be handed half an answer, be refused, and (with prompting disabled) fail
+/// with a confusing error instead of the honest anonymous-access one.
+fn load_credentials(mirror: &Mirror, jwt_secret: &str) -> Result<Option<MirrorCredentials>> {
+    let Some(ciphertext) = mirror.password_encrypted.as_deref() else {
+        return Ok(None);
+    };
+    let key = crate::auth::encryption::derive_key(jwt_secret);
+    let password = crate::auth::encryption::decrypt(ciphertext, &key)
+        .context("mirror credential could not be decrypted")?;
+    Ok(Some(MirrorCredentials {
+        username: mirror
+            .username
+            .clone()
+            .filter(|username| !username.is_empty()),
+        password,
+    }))
+}
+
+/// Replace the credential in a message that is about to be persisted or logged.
+fn mask_credential(message: &str, credentials: Option<&Option<MirrorCredentials>>) -> String {
+    match credentials.and_then(Option::as_ref) {
+        Some(credentials) => crate::auth::encryption::mask_values(
+            message,
+            std::slice::from_ref(&credentials.password),
+        ),
+        None => message.to_string(),
+    }
+}
+
+/// Extra `git` arguments and environment that let the subprocess authenticate.
+///
+/// The secret is passed through the environment and read by an inline
+/// credential helper, so:
+///
+/// - it never appears in argv (`ps` on a shared host would show it, and the
+///   gateway echoes the command line into its error text and trace span);
+/// - it never appears in the remote URL, which git copies verbatim into
+///   `.git/config` — an on-disk plaintext copy that outlives the sync.
+///
+/// The empty `credential.helper=` in front resets the helper list, so a helper
+/// configured system- or user-wide on the host can neither answer first nor be
+/// handed this credential to store.
+///
+/// `GIT_TERMINAL_PROMPT=0` is set whether or not a credential exists: a sync
+/// runs with no terminal behind it, so a remote that asks for authentication
+/// must fail fast instead of blocking until the gateway's timeout.
+fn credential_invocation(
+    credentials: Option<&MirrorCredentials>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut env = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let Some(credentials) = credentials else {
+        return (Vec::new(), env);
+    };
+
+    // git runs a `!`-prefixed helper through `sh -c '<value> "$@"' <value> get`,
+    // so the trailing `f` becomes the call and takes the operation as `$1`.
+    let mut helper = String::from("!f() { ");
+    if credentials.username.is_some() {
+        helper.push_str(&format!("echo username=\"${USERNAME_ENV}\"; "));
+    }
+    helper.push_str(&format!("echo password=\"${PASSWORD_ENV}\"; }}; f"));
+
+    let args = vec![
+        "-c".to_string(),
+        "credential.helper=".to_string(),
+        "-c".to_string(),
+        format!("credential.helper={helper}"),
+    ];
+    if let Some(username) = &credentials.username {
+        env.push((USERNAME_ENV.to_string(), username.clone()));
+    }
+    env.push((PASSWORD_ENV.to_string(), credentials.password.clone()));
+    (args, env)
 }
 
 // ── Git helpers ─────────────────────────────────────────────────────────
 
-fn run_git_clone_mirror(url: &str, path: &Path) -> Result<()> {
+fn run_git_clone_mirror(
+    url: &str,
+    path: &Path,
+    credentials: Option<&MirrorCredentials>,
+) -> Result<()> {
     // `create mirror dir` named the operation but never the directory, and the
     // directory — `repo_root` — is the only thing an operator can act on when
     // the mirror row shows nothing but `Permission denied (os error 13)`.
@@ -224,14 +389,258 @@ fn run_git_clone_mirror(url: &str, path: &Path) -> Result<()> {
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    git.run_or_bail(&["clone", "--mirror", url, &path.to_string_lossy()], None)
+    let (credential_args, env) = credential_invocation(credentials);
+    let destination = path.to_string_lossy();
+    let mut args: Vec<&str> = credential_args.iter().map(String::as_str).collect();
+    args.extend(["clone", "--mirror", url, &destination]);
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    git.run_with_env(&args, None, &env)?
+        .ensure_success()
         .context("git clone --mirror")
 }
 
-fn run_git_remote_update(path: &Path) -> Result<()> {
+fn run_git_remote_update(path: &Path, credentials: Option<&MirrorCredentials>) -> Result<()> {
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    git.run_or_bail(&["remote", "update", "--prune"], Some(path))
+    let (credential_args, env) = credential_invocation(credentials);
+    let mut args: Vec<&str> = credential_args.iter().map(String::as_str).collect();
+    args.extend(["remote", "update", "--prune"]);
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    git.run_with_env(&args, Some(path), &env)?
+        .ensure_success()
         .context("git remote update")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    const SECRET: &str = "test-secret-key";
+
+    fn credentials(username: Option<&str>, password: &str) -> MirrorCredentials {
+        MirrorCredentials {
+            username: username.map(str::to_string),
+            password: password.to_string(),
+        }
+    }
+
+    fn mirror_row(username: Option<&str>, password_encrypted: Option<String>) -> Mirror {
+        Mirror {
+            id: 1,
+            repo_id: 7,
+            url: "https://example.com/upstream.git".to_string(),
+            username: username.map(str::to_string),
+            password_encrypted,
+            sync_interval_seconds: 3600,
+            next_sync_at: None,
+            last_sync_at: None,
+            last_sync_error: None,
+            status: "active".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The column is named `password_encrypted`; this is the test that keeps the
+    /// name honest at the one place that fills it.
+    #[test]
+    fn a_stored_password_is_ciphertext_and_reads_back() {
+        let stored = encrypt_password(Some("hunter2"), SECRET)
+            .expect("encrypt")
+            .expect("a password produces a value");
+        assert_ne!(stored, "hunter2", "the password was stored verbatim");
+        assert!(!stored.contains("hunter2"));
+
+        let loaded = load_credentials(&mirror_row(Some("sync-bot"), Some(stored)), SECRET)
+            .expect("decrypt")
+            .expect("a stored credential is readable");
+        assert_eq!(loaded.password, "hunter2");
+        assert_eq!(loaded.username.as_deref(), Some("sync-bot"));
+    }
+
+    /// Two encryptions of one password differ (fresh nonce), so the column can't
+    /// be used as an oracle for "do these two mirrors share a password?".
+    #[test]
+    fn the_same_password_encrypts_differently_every_time() {
+        let first = encrypt_password(Some("hunter2"), SECRET).unwrap().unwrap();
+        let second = encrypt_password(Some("hunter2"), SECRET).unwrap().unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn an_empty_password_is_no_credential_at_all() {
+        assert_eq!(encrypt_password(Some(""), SECRET).unwrap(), None);
+        assert_eq!(encrypt_password(None, SECRET).unwrap(), None);
+        assert!(
+            load_credentials(&mirror_row(Some("sync-bot"), None), SECRET)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A credential written under a different server secret must fail loudly at
+    /// sync time rather than be silently treated as a usable password.
+    #[test]
+    fn a_credential_from_another_secret_is_refused() {
+        let stored = encrypt_password(Some("hunter2"), "some-other-secret")
+            .unwrap()
+            .unwrap();
+        // `MirrorCredentials` deliberately has no `Debug`, so that no stray
+        // `{:?}` can ever print a password — which is also why this unwraps by
+        // hand instead of reaching for `expect_err`.
+        let error = match load_credentials(&mirror_row(None, Some(stored)), SECRET) {
+            Err(error) => error,
+            Ok(_) => panic!("a credential that cannot be decrypted must not be usable"),
+        };
+        assert!(format!("{error:#}").contains("could not be decrypted"));
+    }
+
+    /// The whole point of the environment hand-off: `ps` (and the gateway's own
+    /// error text, which quotes the command line) must never see the password.
+    #[test]
+    fn the_password_never_reaches_the_command_line() {
+        let credentials = credentials(Some("sync-bot"), "hunter2");
+        let (args, env) = credential_invocation(Some(&credentials));
+
+        let command_line = args.join(" ");
+        assert!(
+            !command_line.contains("hunter2"),
+            "the password leaked into argv: {command_line}"
+        );
+        assert!(
+            !command_line.contains("sync-bot"),
+            "the username leaked into argv: {command_line}"
+        );
+        // The helper list is reset first, then our helper is installed.
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], "credential.helper=");
+        assert!(args[3].contains(USERNAME_ENV) && args[3].contains(PASSWORD_ENV));
+
+        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(env.get(PASSWORD_ENV).map(String::as_str), Some("hunter2"));
+        assert_eq!(env.get(USERNAME_ENV).map(String::as_str), Some("sync-bot"));
+        assert_eq!(
+            env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    /// With no credential there is nothing to hand over — but prompting still
+    /// has to be off, or an authenticating remote hangs the sync until the
+    /// gateway's timeout instead of failing with "authentication required".
+    #[test]
+    fn an_anonymous_mirror_installs_no_helper_but_still_cannot_prompt() {
+        let (args, env) = credential_invocation(None);
+        assert!(
+            args.is_empty(),
+            "an anonymous sync configured a credential helper"
+        );
+        assert_eq!(
+            env,
+            vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_sync_error_never_carries_the_password_onward() {
+        let credentials = Some(Some(credentials(None, "hunter2")));
+        let masked = mask_credential(
+            "fatal: could not read Password for 'https://x': hunter2",
+            credentials.as_ref(),
+        );
+        assert!(!masked.contains("hunter2"), "{masked}");
+    }
+
+    /// A remote that speaks HTTP Basic: 401 until an `Authorization` header
+    /// shows up, then 403 so `git` stops instead of retrying. Returns the bound
+    /// address and the list of credentials the remote actually received.
+    fn spawn_authenticating_remote() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut authorization = None;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(value) = line
+                        .strip_prefix("Authorization: ")
+                        .or_else(|| line.strip_prefix("authorization: "))
+                    {
+                        authorization = Some(value.trim().to_string());
+                    }
+                }
+                let response = match authorization {
+                    Some(value) => {
+                        recorder.lock().expect("lock").push(value);
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                    None => {
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"forgekeep\"\
+                         \r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                };
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    drop(stream.flush());
+                }
+            }
+        });
+
+        (address, seen)
+    }
+
+    /// The acceptance check of card_c29cb3416941: a mirror of a *private* remote
+    /// gets as far as authenticating. Before the fix the credential was stored
+    /// and then dropped on the floor — `git` was handed a bare URL and every
+    /// private remote answered 401 forever.
+    ///
+    /// This drives `run_git_clone_mirror` directly rather than `sync_mirror`,
+    /// because the SSRF guard in front of it (rightly) refuses a loopback
+    /// remote; the guard has its own tests in `crate::net`.
+    #[test]
+    fn a_private_remote_receives_the_stored_credential() {
+        let (address, seen) = spawn_authenticating_remote();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let credentials = credentials(Some("sync-bot"), "hunter2");
+
+        let outcome = run_git_clone_mirror(
+            &format!("http://{address}/upstream.git"),
+            &directory.path().join("7.mirror"),
+            Some(&credentials),
+        );
+        assert!(
+            outcome.is_err(),
+            "the stub remote refuses everyone — the clone cannot succeed"
+        );
+
+        let seen = seen.lock().expect("lock");
+        let expected = format!("Basic {}", STANDARD.encode("sync-bot:hunter2"));
+        assert!(
+            seen.contains(&expected),
+            "the remote never received the stored credential; it saw {seen:?}"
+        );
+    }
 }

@@ -71,6 +71,8 @@ pub struct CreateMirrorRequest {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Password or access token for the remote. Encrypted before storage and
+    /// handed to the `git` subprocess only for the duration of a sync.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     #[serde(default = "default_interval")]
@@ -88,6 +90,8 @@ pub struct UpdateMirrorRequest {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Replacement password or access token. An empty string clears the stored
+    /// credential; omitting the field leaves it as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +154,7 @@ pub async fn create_mirror(
         body.username,
         body.password,
         body.sync_interval_seconds,
+        &state.jwt_secret,
     )
     .await
     {
@@ -250,6 +255,7 @@ pub async fn update_mirror(
         body.password,
         body.sync_interval_seconds,
         body.status,
+        &state.jwt_secret,
     )
     .await
     {
@@ -348,7 +354,14 @@ pub async fn trigger_mirror_sync(
         Err(e) => return AppError::from(e).into_response(),
     }
 
-    match rg_core::mirror::service::trigger_sync(&state.db, repo.id, &state.repo_root).await {
+    match rg_core::mirror::service::trigger_sync(
+        &state.db,
+        repo.id,
+        &state.repo_root,
+        &state.jwt_secret,
+    )
+    .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "sync_triggered"})),
