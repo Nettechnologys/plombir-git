@@ -7,12 +7,12 @@
 //! with the repository, which left the whole wiki open to any stranger.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::api::repo_access;
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -87,14 +87,8 @@ fn page_to_summary(p: &rg_db::entities::wiki_page::Model) -> WikiPageSummary {
 )]
 pub async fn list_pages(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::wiki::service::list_pages(&state.db, repo.id).await {
         Ok(pages) => {
             let summaries: Vec<WikiPageSummary> = pages.iter().map(page_to_summary).collect();
@@ -121,14 +115,9 @@ pub async fn list_pages(
 )]
 pub async fn get_page(
     State(state): State<AppState>,
-    Path((owner, name, title)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_, _, title)): Path<(String, String, String)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::wiki::service::get_page(&state.db, repo.id, &title).await {
         Ok(Some(page)) => (
             StatusCode::OK,
@@ -158,15 +147,12 @@ pub async fn get_page(
 )]
 pub async fn create_page(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(body): Json<CreateWikiPageRequest>,
 ) -> impl IntoResponse {
-    let (repo, user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::wiki::service::create_page(
         &state.db,
         repo.id,
@@ -204,15 +190,13 @@ pub async fn create_page(
 )]
 pub async fn update_page(
     State(state): State<AppState>,
-    Path((owner, name, title)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_, _, title)): Path<(String, String, String)>,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(body): Json<UpdateWikiPageRequest>,
 ) -> impl IntoResponse {
-    let (repo, user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::wiki::service::update_page(
         &state.db,
         repo.id,
@@ -250,14 +234,9 @@ pub async fn update_page(
 )]
 pub async fn delete_page(
     State(state): State<AppState>,
-    Path((owner, name, title)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_, _, title)): Path<(String, String, String)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, _user_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::wiki::service::delete_page(&state.db, repo.id, &title).await {
         Ok(()) => (
             StatusCode::OK,
@@ -287,14 +266,9 @@ pub async fn delete_page(
 )]
 pub async fn list_revisions(
     State(state): State<AppState>,
-    Path((owner, name, title)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_, _, title)): Path<(String, String, String)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::wiki::service::list_revisions(&state.db, repo.id, &title).await {
         Ok(revisions) => (StatusCode::OK, Json(serde_json::json!(revisions))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -321,18 +295,13 @@ pub async fn list_revisions(
 )]
 pub async fn get_revision(
     State(state): State<AppState>,
-    Path((owner, name, title, rev_id)): Path<(String, String, String, i64)>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+    Path((_, _, title, rev_id)): Path<(String, String, String, i64)>,
     // Every part of the route used to be discarded: the revision was fetched by
     // its global id alone, so any revision of any repository could be read
     // through a URL the caller was allowed to open. Owner and name gate the
     // access, and the title scopes which revisions the id may name.
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
-
+    RepoRead { repo }: RepoRead,
+) -> impl IntoResponse {
     match rg_core::wiki::service::get_revision(&state.db, repo.id, &title, rev_id).await {
         Ok(Some(rev)) => (StatusCode::OK, Json(serde_json::json!(rev))).into_response(),
         Ok(None) => AppError::not_found("revision not found").into_response(),

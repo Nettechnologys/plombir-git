@@ -7,7 +7,7 @@ use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
-use super::repo_access::{require_authenticated_read, require_read, require_write};
+use crate::api::repo_access::{RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -101,13 +101,9 @@ pub struct ListQuery {
 pub async fn list_prs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
     Query(params): Query<ListQuery>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     let state_filter = params.state.as_deref();
     let pagination = params.pagination.clamp();
     match rg_core::pull_request::list_prs_paginated(
@@ -146,12 +142,8 @@ pub async fn list_prs(
 pub async fn get_pr(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
         // `AppError::from`, not `not_found`: only a `rg_core::error::NotFound`
@@ -179,14 +171,12 @@ pub async fn get_pr(
 pub async fn create_pr(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Json(req): Json<CreatePrRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, user_id) =
-        match require_authenticated_read(&state, &headers, &owner, &repo).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
     let repo_id = repo_model.id;
 
     if req.head.trim().is_empty() || req.base.trim().is_empty() {
@@ -285,14 +275,12 @@ pub async fn create_pr(
 pub async fn update_pr(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
     Json(req): Json<UpdatePrRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, actor_id) =
-        match require_authenticated_read(&state, &headers, &owner, &repo).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
     let existing = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -348,12 +336,8 @@ pub async fn update_pr(
 pub async fn get_diff(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::pull_request::compute_diff(&state.db, &state.repo_root, &owner, &repo, number)
         .await
     {
@@ -381,14 +365,12 @@ pub async fn get_diff(
 pub async fn merge_pr(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
     Json(req): Json<MergePrRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, actor_id) = match require_write(&state, &headers, &owner, &repo).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
         Ok(strategy) => strategy,
         Err(error) => return AppError::bad_request(error).into_response(),
@@ -464,13 +446,9 @@ pub async fn merge_pr(
 pub async fn enable_auto_merge(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoWrite { actor_id, .. }: RepoWrite,
     Json(req): Json<EnableAutoMergeRequest>,
 ) -> impl IntoResponse {
-    let (_, actor_id) = match require_write(&state, &headers, &owner, &repo).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
         Ok(strategy) => strategy,
         Err(error) => return AppError::bad_request(error).into_response(),
@@ -522,12 +500,8 @@ pub async fn enable_auto_merge(
 pub async fn disable_auto_merge(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoWrite { actor_id, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (_, actor_id) = match require_write(&state, &headers, &owner, &repo).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     match rg_core::pull_request::disable_auto_merge(&state.db, &owner, &repo, number, actor_id)
         .await
     {
@@ -547,13 +521,9 @@ pub async fn disable_auto_merge(
 )]
 pub async fn list_merge_queue(
     State(state): State<AppState>,
-    Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoRead { repo: repository }: RepoRead,
 ) -> impl IntoResponse {
-    let repository = match require_read(&state, &headers, &owner, &repo).await {
-        Ok(repository) => repository,
-        Err(error) => return error.into_response(),
-    };
     let entries = match rg_db::ops::merge_queue_ops::list_by_repo(&state.db, repository.id).await {
         Ok(entries) => entries,
         Err(error) => return AppError::from(error).into_response(),
@@ -594,13 +564,12 @@ pub async fn list_merge_queue(
 pub async fn enqueue_merge_queue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoWrite {
+        repo: repository,
+        actor_id,
+    }: RepoWrite,
     Json(req): Json<EnableAutoMergeRequest>,
 ) -> impl IntoResponse {
-    let (repository, actor_id) = match require_write(&state, &headers, &owner, &repo).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),
@@ -652,12 +621,11 @@ pub async fn enqueue_merge_queue(
 pub async fn cancel_merge_queue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoWrite {
+        repo: repository,
+        actor_id,
+    }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repository, actor_id) = match require_write(&state, &headers, &owner, &repo).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),

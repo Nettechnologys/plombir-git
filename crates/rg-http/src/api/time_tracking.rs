@@ -7,13 +7,14 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
 
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -64,19 +65,17 @@ pub struct AddTimeRequest {
 )]
 pub async fn add_time(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, number)): Path<(String, String, i64)>,
+    Path((_, _, number)): Path<(String, String, i64)>,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(body): Json<AddTimeRequest>,
 ) -> impl IntoResponse {
     // Logging time appends a row to the issue tracker of this repository, so it
     // is gated like any other issue mutation. The handler used to stop at "the
     // token parses", which let any account on the instance write hours onto the
     // issues of a private repository it cannot even read.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
-            Ok(value) => value,
-            Err(e) => return e.into_response(),
-        };
 
     let issue = match issue_in_repo(&state, repo.id, number).await {
         Ok(i) => i,
@@ -116,16 +115,13 @@ pub async fn add_time(
 )]
 pub async fn list_time_entries(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, number)): Path<(String, String, i64)>,
     Query(params): Query<PaginationParams>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     // Time entries carry a free-form description written by collaborators, so
     // they are exactly as private as the repository. Without this gate the
     // handler had no way to see the caller at all.
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
 
     let pagination = params.clamp();
     let offset = pagination.offset();
@@ -167,14 +163,11 @@ pub async fn list_time_entries(
 )]
 pub async fn total_time(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, number)): Path<(String, String, i64)>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     // The aggregate leaks the same thing the listing does — that work happened
     // on this issue, and how much of it — so it gets the same gate.
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
 
     let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
         Ok(i) => i,
@@ -217,19 +210,14 @@ pub async fn total_time(
 )]
 pub async fn delete_time_entry(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, number, id)): Path<(String, String, i64, i64)>,
+    Path((_, _, number, id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
     // Three quarters of the route used to be discarded — `_owner`, `_name` and
     // `_number` were unbound and the claims were extracted only to be dropped,
     // so any authenticated caller could delete any time entry on the instance
     // by naming a repository of their own and walking `{id}`. The repository is
     // what the permission is about, so it has to be the one that is checked...
-    let (repo, _user_id) =
-        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
-            Ok(value) => value,
-            Err(e) => return e.into_response(),
-        };
 
     // ...and the issue under it is what re-anchors `{id}`: the service refuses
     // to delete an entry that belongs to a different issue, so write access

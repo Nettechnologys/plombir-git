@@ -71,7 +71,7 @@ pub struct UpdateUserRequest {
 
 /// Extract the current user ID from cookie or Bearer token and verify is_admin=true.
 /// Returns None if not authenticated or not an admin.
-pub(crate) async fn require_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+pub(crate) async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
     let user_id = extract_user_id(headers, &state.jwt_secret)?;
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
@@ -100,7 +100,7 @@ pub async fn list_users(
     headers: HeaderMap,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     let params = params.clamp();
@@ -132,7 +132,7 @@ pub async fn get_user(
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     match rg_core::user::service::get_user_by_id(&state.db, user_id).await {
@@ -162,7 +162,7 @@ pub async fn update_user(
     Path(user_id): Path<i64>,
     Json(body): Json<UpdateUserRequest>,
 ) -> impl IntoResponse {
-    let current_id = match require_admin(&state, &headers).await {
+    let current_id = match require_instance_admin(&state, &headers).await {
         Some(id) => id,
         None => return AppError::forbidden("admin required").into_response(),
     };
@@ -227,7 +227,7 @@ pub async fn unlock_user(
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
-    let current_id = match require_admin(&state, &headers).await {
+    let current_id = match require_instance_admin(&state, &headers).await {
         Some(id) => id,
         None => return AppError::forbidden("admin required").into_response(),
     };
@@ -285,7 +285,7 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
-    let current_id = match require_admin(&state, &headers).await {
+    let current_id = match require_instance_admin(&state, &headers).await {
         Some(id) => id,
         None => return AppError::forbidden("admin required").into_response(),
     };
@@ -330,7 +330,7 @@ pub async fn list_orgs(
     headers: HeaderMap,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     let params = params.clamp();
@@ -362,7 +362,7 @@ pub async fn get_org(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     match rg_core::org::get_org_by_name(&state.db, &name).await {
@@ -393,7 +393,7 @@ pub async fn delete_org(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let current_id = match require_admin(&state, &headers).await {
+    let current_id = match require_instance_admin(&state, &headers).await {
         Some(id) => id,
         None => return AppError::forbidden("admin required").into_response(),
     };
@@ -438,7 +438,7 @@ pub async fn list_sso_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     match rg_db::ops::sso_provider_ops::list_all(&state.db).await {
@@ -466,7 +466,7 @@ pub async fn get_sso_provider(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
@@ -557,7 +557,7 @@ pub async fn create_sso_provider(
     headers: HeaderMap,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
 
@@ -659,7 +659,7 @@ pub async fn update_sso_provider(
     Path(id): Path<i64>,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
 
@@ -763,7 +763,7 @@ pub async fn test_sso_provider_connection(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     let provider = match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
@@ -810,7 +810,7 @@ pub async fn delete_sso_provider(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     let provider = match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
@@ -877,7 +877,7 @@ fn sso_provider_response(p: &rg_db::entities::sso_provider::Model) -> serde_json
     ),
 )]
 pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     let settings = crate::instance::get_settings();
@@ -900,7 +900,7 @@ pub async fn update_settings(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
     crate::instance::update_settings(|s| {

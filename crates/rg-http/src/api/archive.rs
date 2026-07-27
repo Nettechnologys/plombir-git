@@ -6,11 +6,11 @@
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, StatusCode},
     response::IntoResponse,
 };
 
-use crate::api::repo_access;
+use crate::api::repo_access::{CiRead, RepoContents};
 use crate::error::AppError;
 
 /// The one 4xx message this endpoint has for a tree-ish it could not resolve.
@@ -59,8 +59,11 @@ fn is_bad_tree_ish(stderr: &str) -> bool {
 )]
 pub async fn download_archive(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, archive)): Path<(String, String, String)>,
+    // The gate now runs before the filename is parsed, so an unreadable
+    // repository answers 401/403 rather than telling a stranger which archive
+    // extensions it would have accepted.
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // axum 0.8 allows only one parameter per path segment, so the filename
     // (`<sha>.<ext>`) arrives as a single `{archive}` segment that we split
@@ -74,12 +77,6 @@ pub async fn download_archive(
     } else {
         return AppError::bad_request("Unsupported format").into_response();
     };
-
-    if let Err(e) =
-        repo_access::require_read_with_ci(&state, &headers, &owner, &name, "repo:read").await
-    {
-        return e.into_response();
-    }
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
     if !repo_path.exists() {
@@ -176,7 +173,9 @@ mod tests {
     /// were captured from a bare repository rather than written from memory.
     #[test]
     fn a_ref_git_cannot_resolve_is_the_callers_mistake() {
-        assert!(is_bad_tree_ish("fatal: not a valid object name: nosuchref\n"));
+        assert!(is_bad_tree_ish(
+            "fatal: not a valid object name: nosuchref\n"
+        ));
         // An empty repository answers the same way for its default branch.
         assert!(is_bad_tree_ish("fatal: not a valid object name: main\n"));
         // Resolved, but to a blob (`main:README.md`) or a tag of one.

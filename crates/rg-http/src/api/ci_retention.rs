@@ -1,8 +1,8 @@
-use super::repo_access::require_admin;
+use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -30,13 +30,9 @@ pub struct CleanupResponse {
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/retention", tag = "CI/CD", responses((status = 200, body = RetentionPolicyResponse)))]
 pub async fn get_policy(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
     match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo.id).await {
         Ok(policy) => Json(RetentionPolicyResponse {
             artifact_retention_days: policy.artifact_retention_days,
@@ -50,14 +46,10 @@ pub async fn get_policy(
 #[utoipa::path(put, path = "/repos/{owner}/{name}/actions/retention", tag = "CI/CD", request_body = RetentionPolicyRequest, responses((status = 200, body = RetentionPolicyResponse)))]
 pub async fn update_policy(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<RetentionPolicyRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
     if !(1..=3650).contains(&body.artifact_retention_days)
         || !(1..=3650).contains(&body.cache_retention_days)
     {
@@ -83,13 +75,9 @@ pub async fn update_policy(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/retention/expired", tag = "CI/CD", responses((status = 200, body = CleanupResponse)))]
 pub async fn cleanup(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
     match cleanup_expired_storage(&state, Some(repo.id)).await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(error) => AppError::from(error).into_response(),
@@ -189,7 +177,10 @@ async fn safe_remove_file(path: PathBuf, root: &FsPath) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn run_cleanup_loop(state: AppState, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+pub async fn run_cleanup_loop(
+    state: AppState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
         match cleanup_expired_storage(&state, None).await {
             Ok(summary)
@@ -205,7 +196,9 @@ pub async fn run_cleanup_loop(state: AppState, mut shutdown_rx: tokio::sync::wat
                 )
             }
             Ok(_) => {}
-            Err(error) => tracing::error!(error = %format!("{error:#}"), "CI retention cleanup failed"),
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "CI retention cleanup failed")
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}

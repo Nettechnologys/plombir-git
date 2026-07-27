@@ -21,14 +21,14 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::repo_access::{require_read, require_write};
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -182,16 +182,15 @@ async fn issue_in_repo(state: &AppState, repo_id: i64, issue_id: i64) -> Result<
 )]
 pub async fn create_board(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(body): Json<CreateBoardRequest>,
 ) -> impl IntoResponse {
     // Authenticating was the whole check here: any account could add a board to
     // any repository, private ones included.
-    let (repo, user_id) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
 
     match rg_core::board::service::create_board(
         &state.db,
@@ -226,15 +225,11 @@ pub async fn create_board(
 )]
 pub async fn list_boards(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     // The handler did not even take `HeaderMap`, so the board list of a private
     // repository was readable by anyone who guessed the owner/name pair.
-    let repo = match require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
 
     match rg_core::board::service::list_boards_by_repo(&state.db, repo.id).await {
         Ok(boards) => (StatusCode::OK, Json(serde_json::json!(boards))).into_response(),
@@ -261,13 +256,9 @@ pub async fn list_boards(
 )]
 pub async fn get_board(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
     if let Err(e) = board_in_repo(&state, &repo, id).await {
         return e.into_response();
     }
@@ -299,16 +290,12 @@ pub async fn get_board(
 )]
 pub async fn update_board(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<UpdateBoardRequest>,
 ) -> impl IntoResponse {
     // "validated by repo existence in the board" was not a validation: the
     // board is looked up by a global id, so the route segments never met it.
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     if let Err(e) = board_in_repo(&state, &repo, id).await {
         return e.into_response();
     }
@@ -338,13 +325,9 @@ pub async fn update_board(
 )]
 pub async fn delete_board(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     if let Err(e) = board_in_repo(&state, &repo, id).await {
         return e.into_response();
     }
@@ -377,14 +360,10 @@ pub async fn delete_board(
 )]
 pub async fn create_column(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id)): Path<(String, String, i64)>,
+    Path((_, _, board_id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<CreateColumnRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     if let Err(e) = board_in_repo(&state, &repo, board_id).await {
         return e.into_response();
     }
@@ -416,14 +395,10 @@ pub async fn create_column(
 )]
 pub async fn update_column(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id, col_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, board_id, col_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<UpdateColumnRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),
@@ -458,13 +433,9 @@ pub async fn update_column(
 )]
 pub async fn delete_column(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id, col_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, board_id, col_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),
@@ -502,14 +473,10 @@ pub async fn delete_column(
 )]
 pub async fn create_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id, col_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, board_id, col_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<CreateCardRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),
@@ -550,14 +517,10 @@ pub async fn create_card(
 )]
 pub async fn update_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id, card_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, board_id, card_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<UpdateCardRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),
@@ -598,14 +561,10 @@ pub async fn update_card(
 )]
 pub async fn move_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id, card_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, board_id, card_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<MoveCardRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),
@@ -647,14 +606,10 @@ pub async fn move_card(
 )]
 pub async fn reorder_cards(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id)): Path<(String, String, i64)>,
+    Path((_, _, board_id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<ReorderCardsRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),
@@ -694,13 +649,9 @@ pub async fn reorder_cards(
 )]
 pub async fn delete_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, board_id, card_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, board_id, card_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_write(&state, &headers, &owner, &name).await {
-        Ok(pair) => pair,
-        Err(e) => return e.into_response(),
-    };
     let board = match board_in_repo(&state, &repo, board_id).await {
         Ok(board) => board,
         Err(e) => return e.into_response(),

@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{api::admin::require_admin, error::AppError, AppState};
+use crate::{api::admin::require_instance_admin, error::AppError, AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct AuditLogQuery {
@@ -105,7 +105,7 @@ pub async fn list_audit_logs(
     headers: HeaderMap,
     Query(q): Query<AuditLogQuery>,
 ) -> Result<Json<AuditLogResponse>, AppError> {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return Err(AppError::unauthorized("admin required"));
     }
 
@@ -188,7 +188,7 @@ pub async fn list_login_attempts(
     headers: HeaderMap,
     Query(q): Query<LoginAttemptQuery>,
 ) -> Result<Json<LoginAttemptResponse>, AppError> {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return Err(AppError::unauthorized("admin required"));
     }
     let page = q.page.unwrap_or(1).max(1);
@@ -288,7 +288,7 @@ pub async fn get_audit_log(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<AuditLogEntry>, AppError> {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return Err(AppError::unauthorized("admin required"));
     }
 

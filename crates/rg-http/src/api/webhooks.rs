@@ -11,7 +11,7 @@
 //! `secret` with them.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -19,7 +19,7 @@ use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use super::repo_access::require_admin;
+use crate::api::repo_access::RepoAdmin;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -84,14 +84,9 @@ impl From<rg_db::entities::webhook::Model> for WebhookResponse {
 )]
 pub async fn list_webhooks(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::webhook::service::list_webhooks(&state.db, repo.id).await {
         Ok(hooks) => {
             let body: Vec<WebhookResponse> = hooks.into_iter().map(WebhookResponse::from).collect();
@@ -121,15 +116,10 @@ pub async fn list_webhooks(
 )]
 pub async fn create_webhook(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     match rg_core::webhook::service::create_webhook(&state.db, repo.id, &body).await {
         Ok(hook) => (StatusCode::CREATED, Json(WebhookResponse::from(hook))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -155,14 +145,9 @@ pub async fn create_webhook(
 )]
 pub async fn get_webhook(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     match webhook_in_repo(&state.db, repo.id, id).await {
         Ok(hook) => (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response(),
         Err(e) => e.into_response(),
@@ -189,15 +174,10 @@ pub async fn get_webhook(
 )]
 pub async fn update_webhook(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     let existing = match webhook_in_repo(&state.db, repo.id, id).await {
         Ok(hook) => hook,
         Err(e) => return e.into_response(),
@@ -228,14 +208,9 @@ pub async fn update_webhook(
 )]
 pub async fn delete_webhook(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     if let Err(e) = webhook_in_repo(&state.db, repo.id, id).await {
         return e.into_response();
     }
@@ -269,14 +244,9 @@ pub async fn delete_webhook(
 )]
 pub async fn list_deliveries(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     if let Err(e) = webhook_in_repo(&state.db, repo.id, id).await {
         return e.into_response();
     }
@@ -308,14 +278,9 @@ pub async fn list_deliveries(
 )]
 pub async fn redeliver(
     State(state): State<AppState>,
-    Path((owner, name, id, delivery_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id, delivery_id)): Path<(String, String, i64, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     let hook = match webhook_in_repo(&state.db, repo.id, id).await {
         Ok(hook) => hook,
         Err(e) => return e.into_response(),

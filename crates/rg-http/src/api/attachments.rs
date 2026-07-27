@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::api::auth::extract_user_id;
-use crate::api::repo_access;
+use crate::api::repo_access::RepoRead;
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::attachment::AttachmentTarget;
@@ -51,9 +51,9 @@ struct ResolvedTarget {
 pub async fn list_issue_attachments(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
-    list(&state, &headers, &owner, &repo, TargetKind::Issue, number).await
+    list(&state, repo_model, &owner, &repo, TargetKind::Issue, number).await
 }
 
 #[utoipa::path(post, path = "/repos/{owner}/{name}/issues/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
@@ -62,10 +62,12 @@ pub async fn create_issue_attachment(
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -81,11 +83,11 @@ pub async fn create_issue_attachment(
 pub async fn get_issue_attachment(
     State(state): State<AppState>,
     Path((owner, repo, number, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     download(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::Issue,
@@ -100,9 +102,11 @@ pub async fn delete_issue_attachment(
     State(state): State<AppState>,
     Path((owner, repo, number, attachment_id)): Path<(String, String, i64, i64)>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     delete(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -117,11 +121,11 @@ pub async fn delete_issue_attachment(
 pub async fn list_pull_request_attachments(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     list(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::PullRequest,
@@ -136,10 +140,12 @@ pub async fn create_pull_request_attachment(
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -155,11 +161,11 @@ pub async fn create_pull_request_attachment(
 pub async fn get_pull_request_attachment(
     State(state): State<AppState>,
     Path((owner, repo, number, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     download(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::PullRequest,
@@ -174,9 +180,11 @@ pub async fn delete_pull_request_attachment(
     State(state): State<AppState>,
     Path((owner, repo, number, attachment_id)): Path<(String, String, i64, i64)>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     delete(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -191,11 +199,11 @@ pub async fn delete_pull_request_attachment(
 pub async fn list_issue_comment_attachments(
     State(state): State<AppState>,
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     list(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::IssueComment,
@@ -210,10 +218,12 @@ pub async fn create_issue_comment_attachment(
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -229,11 +239,11 @@ pub async fn create_issue_comment_attachment(
 pub async fn get_issue_comment_attachment(
     State(state): State<AppState>,
     Path((owner, repo, comment_id, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     download(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::IssueComment,
@@ -248,9 +258,11 @@ pub async fn delete_issue_comment_attachment(
     State(state): State<AppState>,
     Path((owner, repo, comment_id, attachment_id)): Path<(String, String, i64, i64)>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     delete(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -265,11 +277,11 @@ pub async fn delete_issue_comment_attachment(
 pub async fn list_review_comment_attachments(
     State(state): State<AppState>,
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     list(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::ReviewComment,
@@ -284,10 +296,12 @@ pub async fn create_review_comment_attachment(
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -303,11 +317,11 @@ pub async fn create_review_comment_attachment(
 pub async fn get_review_comment_attachment(
     State(state): State<AppState>,
     Path((owner, repo, comment_id, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     download(
         &state,
-        &headers,
+        repo_model,
         &owner,
         &repo,
         TargetKind::ReviewComment,
@@ -322,9 +336,11 @@ pub async fn delete_review_comment_attachment(
     State(state): State<AppState>,
     Path((owner, repo, comment_id, attachment_id)): Path<(String, String, i64, i64)>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> Response {
     delete(
         &state,
+        repo_model,
         &headers,
         &owner,
         &repo,
@@ -337,13 +353,13 @@ pub async fn delete_review_comment_attachment(
 
 async fn list(
     state: &AppState,
-    headers: &HeaderMap,
+    repo_model: rg_db::entities::repository::Model,
     owner: &str,
     repo_name: &str,
     kind: TargetKind,
     target_id: i64,
 ) -> Response {
-    let (repo, target) = match resolve(state, headers, owner, repo_name, kind, target_id).await {
+    let (repo, target) = match resolve(state, repo_model, kind, target_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -383,6 +399,7 @@ fn upload_path_error(what: &str, path: &std::path::Path, error: &std::io::Error)
 #[allow(clippy::too_many_arguments)]
 async fn create(
     state: &AppState,
+    repo_model: rg_db::entities::repository::Model,
     headers: &HeaderMap,
     owner: &str,
     repo_name: &str,
@@ -395,7 +412,7 @@ async fn create(
         Some(id) => id,
         None => return AppError::unauthorized("authentication required").into_response(),
     };
-    let (repo, target) = match resolve(state, headers, owner, repo_name, kind, target_id).await {
+    let (repo, target) = match resolve(state, repo_model, kind, target_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -511,14 +528,14 @@ async fn create(
 #[allow(clippy::too_many_arguments)]
 async fn download(
     state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    repo_name: &str,
+    repo_model: rg_db::entities::repository::Model,
+    _owner: &str,
+    _repo_name: &str,
     kind: TargetKind,
     target_id: i64,
     attachment_id: i64,
 ) -> Response {
-    let (repo, target) = match resolve(state, headers, owner, repo_name, kind, target_id).await {
+    let (repo, target) = match resolve(state, repo_model, kind, target_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -607,9 +624,10 @@ async fn stream_attachment(
 #[allow(clippy::too_many_arguments)]
 async fn delete(
     state: &AppState,
+    repo_model: rg_db::entities::repository::Model,
     headers: &HeaderMap,
-    owner: &str,
-    repo_name: &str,
+    _owner: &str,
+    _repo_name: &str,
     kind: TargetKind,
     target_id: i64,
     attachment_id: i64,
@@ -618,7 +636,7 @@ async fn delete(
         Some(id) => id,
         None => return AppError::unauthorized("authentication required").into_response(),
     };
-    let (repo, target) = match resolve(state, headers, owner, repo_name, kind, target_id).await {
+    let (repo, target) = match resolve(state, repo_model, kind, target_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -647,16 +665,15 @@ async fn delete(
     }
 }
 
+/// Scope the attachment target to the repository the caller was already
+/// admitted to. The read gate itself now lives in the handler signature
+/// (`RepoRead`), so this only has to resolve the target inside `repo`.
 async fn resolve(
     state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    repo_name: &str,
+    repo: rg_db::entities::repository::Model,
     kind: TargetKind,
     target_id: i64,
 ) -> Result<(rg_db::entities::repository::Model, ResolvedTarget), AppError> {
-    let repo = repo_access::require_read(state, headers, owner, repo_name).await?;
-
     let target = match kind {
         TargetKind::Issue => {
             let issue =

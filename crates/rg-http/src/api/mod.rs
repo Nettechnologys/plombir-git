@@ -26,7 +26,7 @@ pub mod packages;
 pub mod passkeys;
 pub mod pulls;
 pub mod releases;
-pub(crate) mod repo_access;
+pub mod repo_access;
 pub mod repo_content;
 pub mod repos;
 pub mod reviews;

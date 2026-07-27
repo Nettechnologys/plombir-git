@@ -1,5 +1,28 @@
 //! Shared repository-scoped authorization helpers for REST handlers.
+//!
+//! Two layers live here, and handlers are expected to use the second one:
+//!
+//! - The `require_*` functions below are the single implementation of every
+//!   repository access rule. They stay `pub(crate)` only so the extractors can
+//!   call them; a handler that calls one directly is caught by the source guard
+//!   in `tests/integration/authz_extractor_guard.rs`.
+//! - The extractors ([`RepoRead`], [`RepoAuthRead`], [`RepoWrite`],
+//!   [`RepoAdmin`], [`CiRead`]) put that rule in the handler's *signature*.
+//!   A handler that forgets its gate no longer compiles into a working route —
+//!   it simply has no repository to work with.
+//!
+//! ```ignore
+//! pub async fn delete_page(
+//!     State(state): State<AppState>,
+//!     RepoWrite { repo, actor_id }: RepoWrite,
+//! ) -> impl IntoResponse { ... }
+//! ```
 
+use std::collections::HashMap;
+use std::marker::PhantomData;
+
+use axum::extract::{FromRequestParts, Path};
+use axum::http::request::Parts;
 use axum::http::HeaderMap;
 
 use crate::error::AppError;
@@ -157,5 +180,177 @@ pub(crate) async fn require_admin(
         Ok(true) => Ok((repo, actor_id)),
         Ok(false) => Err(AppError::forbidden("repository admin access required")),
         Err(error) => Err(AppError::from(error)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed access extractors
+// ---------------------------------------------------------------------------
+//
+// Every extractor below delegates to the `require_*` function above it. That is
+// deliberate: there is exactly one implementation of each access rule, and the
+// extractor only decides *where* the rule is stated. Re-implementing the check
+// inside the extractor is how the copies this phase exists to remove got made
+// in the first place.
+
+/// Pull the `owner` / repository-name pair a repository-scoped route carries.
+///
+/// Read through `Path<HashMap<_, _>>` rather than a positional
+/// `Path<(String, String)>`, because the same gate has to work on
+/// `/repos/{owner}/{name}` and on
+/// `/repos/{owner}/{name}/issues/{number}/comments/{comment_id}` alike — a
+/// tuple would demand the exact arity of each individual route.
+///
+/// Extracting `Path` here does not consume it: axum reads the captures out of
+/// the request extensions, so the handler can still take its own `Path<...>`
+/// for the segments it actually needs.
+async fn route_repo(parts: &mut Parts, state: &AppState) -> Result<(String, String), AppError> {
+    let Path(params) = Path::<HashMap<String, String>>::from_request_parts(parts, state)
+        .await
+        .map_err(|_| AppError::internal("route carries no path parameters to authorize against"))?;
+
+    let owner = params.get("owner");
+    // REST names the second segment `{name}`; git-over-HTTP and the OCI
+    // registry name it `{repo}`. Accept both so a route cannot silently fall
+    // through the gate over a naming choice.
+    let name = params.get("name").or_else(|| params.get("repo"));
+
+    match (owner, name) {
+        (Some(owner), Some(name)) => Ok((owner.clone(), name.clone())),
+        _ => Err(AppError::internal(
+            "route is not repository-scoped: no {owner}/{name} captures",
+        )),
+    }
+}
+
+/// Read access to the repository, anonymous callers included — a public
+/// repository stays readable without a token, a private one does not.
+///
+/// Mirrors [`require_read`].
+pub struct RepoRead {
+    pub repo: rg_db::entities::repository::Model,
+}
+
+impl FromRequestParts<AppState> for RepoRead {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (owner, name) = route_repo(parts, state).await?;
+        let repo = require_read(state, &parts.headers, &owner, &name).await?;
+        Ok(Self { repo })
+    }
+}
+
+/// The CI job-token scope a read gate accepts as a second key.
+///
+/// A running job talks to a handful of endpoints with its job token instead of
+/// a user session; the scope names which family it is allowed to reach.
+pub trait CiScope {
+    const SCOPE: &'static str;
+}
+
+/// `repo:read` — repository contents (tree, blobs, log, branches, tags).
+pub struct RepoContents;
+impl CiScope for RepoContents {
+    const SCOPE: &'static str = "repo:read";
+}
+
+/// `packages:read` — the package registry surfaces.
+pub struct Packages;
+impl CiScope for Packages {
+    const SCOPE: &'static str = "packages:read";
+}
+
+/// [`RepoRead`] that also accepts a CI job token scoped to this repository.
+///
+/// Mirrors [`require_read_with_ci`]. Generic over the scope rather than
+/// duplicated per scope, so the two variants cannot drift apart.
+pub struct CiRead<S: CiScope> {
+    pub repo: rg_db::entities::repository::Model,
+    _scope: PhantomData<S>,
+}
+
+impl<S: CiScope> FromRequestParts<AppState> for CiRead<S> {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (owner, name) = route_repo(parts, state).await?;
+        let repo = require_read_with_ci(state, &parts.headers, &owner, &name, S::SCOPE).await?;
+        Ok(Self {
+            repo,
+            _scope: PhantomData,
+        })
+    }
+}
+
+/// An authenticated caller who can read the repository.
+///
+/// Mirrors [`require_authenticated_read`], including its order: a missing token
+/// is a `401` *before* the repository is looked up, so the gate does not double
+/// as an existence oracle for private repositories.
+pub struct RepoAuthRead {
+    pub repo: rg_db::entities::repository::Model,
+    pub actor_id: i64,
+}
+
+impl FromRequestParts<AppState> for RepoAuthRead {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (owner, name) = route_repo(parts, state).await?;
+        let (repo, actor_id) =
+            require_authenticated_read(state, &parts.headers, &owner, &name).await?;
+        Ok(Self { repo, actor_id })
+    }
+}
+
+/// An authenticated caller with repository write access.
+///
+/// Mirrors [`require_write`].
+pub struct RepoWrite {
+    pub repo: rg_db::entities::repository::Model,
+    pub actor_id: i64,
+}
+
+impl FromRequestParts<AppState> for RepoWrite {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (owner, name) = route_repo(parts, state).await?;
+        let (repo, actor_id) = require_write(state, &parts.headers, &owner, &name).await?;
+        Ok(Self { repo, actor_id })
+    }
+}
+
+/// An authenticated repository administrator.
+///
+/// Mirrors [`require_admin`].
+pub struct RepoAdmin {
+    pub repo: rg_db::entities::repository::Model,
+    pub actor_id: i64,
+}
+
+impl FromRequestParts<AppState> for RepoAdmin {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (owner, name) = route_repo(parts, state).await?;
+        let (repo, actor_id) = require_admin(state, &parts.headers, &owner, &name).await?;
+        Ok(Self { repo, actor_id })
     }
 }

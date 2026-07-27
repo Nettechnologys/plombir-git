@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
 
-use super::repo_access::{require_authenticated_read, require_read, require_write};
+use crate::api::repo_access::{RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
 use rg_db::entities::{
@@ -90,9 +90,13 @@ pub struct ReviewTimelineEvent {
     pub metadata: serde_json::Value,
 }
 
+/// The read gate itself is stated in the handler signature (`RepoAuthRead`);
+/// what is left here is the part a type cannot express — the caller must also
+/// be the pull request's author or a writer on the repository.
 async fn require_pr_manager(
     state: &AppState,
-    headers: &axum::http::HeaderMap,
+    repo_model: rg_db::entities::repository::Model,
+    actor_id: i64,
     owner: &str,
     repo: &str,
     number: i64,
@@ -104,7 +108,6 @@ async fn require_pr_manager(
     ),
     AppError,
 > {
-    let (repo_model, actor_id) = require_authenticated_read(state, headers, owner, repo).await?;
     let pr = rg_core::pull_request::get_pr(&state.db, owner, repo, number)
         .await
         .map_err(AppError::from)?;
@@ -129,9 +132,12 @@ async fn require_pr_manager(
     Ok((repo_model, actor_id, pr))
 }
 
+/// As with [`require_pr_manager`], authentication and repository read access
+/// are already proven by the handler's `RepoAuthRead`; this resolves the
+/// suggestion's source and checks write access on the *head* repository.
 async fn require_suggestion_source(
     state: &AppState,
-    headers: &axum::http::HeaderMap,
+    actor_id: i64,
     owner: &str,
     repo: &str,
     number: i64,
@@ -145,7 +151,6 @@ async fn require_suggestion_source(
     ),
     AppError,
 > {
-    let (_, actor_id) = require_authenticated_read(state, headers, owner, repo).await?;
     let pr = rg_core::pull_request::get_pr(&state.db, owner, repo, number)
         .await
         .map_err(AppError::from)?;
@@ -253,12 +258,8 @@ async fn after_suggestions_applied(
 pub async fn list_reviews(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::review::service::list_reviews(&state.db, &owner, &repo, number).await {
         Ok(reviews) => (StatusCode::OK, Json(reviews)).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -286,14 +287,12 @@ pub async fn list_reviews(
 pub async fn submit_review(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Json(req): Json<SubmitReviewRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, user_id) =
-        match require_authenticated_read(&state, &headers, &owner, &repo).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -395,12 +394,8 @@ pub async fn submit_review(
 pub async fn get_review(
     State(state): State<AppState>,
     Path((owner, repo, number, id)): Path<(String, String, i64, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> impl IntoResponse {
-    let repo_model = match require_read(&state, &headers, &owner, &repo).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -436,13 +431,12 @@ pub async fn get_review(
 pub async fn dismiss_review(
     State(state): State<AppState>,
     Path((owner, repo, number, id)): Path<(String, String, i64, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoWrite {
+        repo: repo_model,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(req): Json<DismissReviewRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, user_id) = match require_write(&state, &headers, &owner, &repo).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -481,12 +475,8 @@ pub async fn dismiss_review(
 pub async fn list_review_comments(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::review::service::list_review_comments(&state.db, &owner, &repo, number).await {
         Ok(comments) => (StatusCode::OK, Json(comments)).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -507,11 +497,8 @@ pub async fn list_review_comments(
 pub async fn get_review_timeline(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(error) = require_read(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),
@@ -908,14 +895,12 @@ impl TimelineBuilder {
 pub async fn create_review_comment(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Json(req): Json<CreateReviewCommentRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, user_id) =
-        match require_authenticated_read(&state, &headers, &owner, &repo).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -980,10 +965,13 @@ pub async fn create_review_comment(
 pub async fn apply_review_suggestion(
     State(state): State<AppState>,
     Path((owner, repo, number, id)): Path<(String, String, i64, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        actor_id: actor_gate,
+        ..
+    }: RepoAuthRead,
 ) -> impl IntoResponse {
     let (actor_id, actor, pr, source_repo, source_namespace) =
-        match require_suggestion_source(&state, &headers, &owner, &repo, number).await {
+        match require_suggestion_source(&state, actor_gate, &owner, &repo, number).await {
             Ok(access) => access,
             Err(error) => return error.into_response(),
         };
@@ -1035,11 +1023,14 @@ pub async fn apply_review_suggestion(
 pub async fn apply_review_suggestions(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        actor_id: actor_gate,
+        ..
+    }: RepoAuthRead,
     Json(request): Json<ApplySuggestionsRequest>,
 ) -> impl IntoResponse {
     let (actor_id, actor, pr, source_repo, source_namespace) =
-        match require_suggestion_source(&state, &headers, &owner, &repo, number).await {
+        match require_suggestion_source(&state, actor_gate, &owner, &repo, number).await {
             Ok(access) => access,
             Err(error) => return error.into_response(),
         };
@@ -1091,11 +1082,8 @@ pub async fn apply_review_suggestions(
 pub async fn list_requested_reviewers(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(error) = require_read(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -1143,11 +1131,14 @@ pub async fn list_requested_reviewers(
 pub async fn request_reviewer(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_gate,
+        actor_id: actor_gate,
+    }: RepoAuthRead,
     Json(body): Json<RequestReviewerRequest>,
 ) -> impl IntoResponse {
     let (repo_model, actor_id, pr) =
-        match require_pr_manager(&state, &headers, &owner, &repo, number).await {
+        match require_pr_manager(&state, repo_gate, actor_gate, &owner, &repo, number).await {
             Ok(result) => result,
             Err(error) => return error.into_response(),
         };
@@ -1247,10 +1238,13 @@ pub async fn request_reviewer(
 pub async fn remove_requested_reviewer(
     State(state): State<AppState>,
     Path((owner, repo, number, username)): Path<(String, String, i64, String)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_gate,
+        actor_id: actor_gate,
+    }: RepoAuthRead,
 ) -> impl IntoResponse {
     let (repo_model, actor_id, pr) =
-        match require_pr_manager(&state, &headers, &owner, &repo, number).await {
+        match require_pr_manager(&state, repo_gate, actor_gate, &owner, &repo, number).await {
             Ok(result) => result,
             Err(error) => return error.into_response(),
         };
@@ -1302,14 +1296,12 @@ pub async fn remove_requested_reviewer(
 pub async fn set_thread_resolution(
     State(state): State<AppState>,
     Path((owner, repo, number, comment_id)): Path<(String, String, i64, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
     Json(body): Json<SetThreadResolutionRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, actor_id) =
-        match require_authenticated_read(&state, &headers, &owner, &repo).await {
-            Ok(result) => result,
-            Err(error) => return error.into_response(),
-        };
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),

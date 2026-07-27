@@ -1,12 +1,12 @@
 //! REST API handlers for CI/CD pipelines.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::api::repo_access;
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -101,18 +101,13 @@ pub struct ListPipelinesQuery {
 )]
 pub async fn list_pipelines(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
     Query(params): Query<ListPipelinesQuery>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.pagination.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
-
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
 
     match rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
         &state.db, repo.id, offset, limit,
@@ -159,14 +154,9 @@ pub async fn list_pipelines(
 )]
 pub async fn get_pipeline(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
-
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
         Ok(Some(p)) => p,
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),
@@ -261,14 +251,9 @@ pub async fn get_pipeline(
 )]
 pub async fn get_job(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
+    Path((_, _, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
-
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
         Ok(Some(p)) if p.repo_id == repo.id => p,
         Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
@@ -325,13 +310,9 @@ pub async fn get_job(
 )]
 pub async fn play_job(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, _) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
         Ok(Some(pipeline)) if pipeline.repo_id == repo.id => pipeline,
         Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
@@ -413,15 +394,10 @@ pub async fn play_job(
 )]
 pub async fn trigger_pipeline(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
     Json(body): Json<TriggerPipelineRequest>,
 ) -> impl IntoResponse {
-    let (repo, actor_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,
         Err(e) => return e.into_response(),
@@ -510,14 +486,9 @@ pub async fn trigger_pipeline(
 )]
 pub async fn retry_pipeline(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, actor_id) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
         Ok(Some(p)) => p,
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),
@@ -598,14 +569,9 @@ pub async fn retry_pipeline(
 )]
 pub async fn cancel_pipeline(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let (repo, _) = match repo_access::require_write(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(e) => return e.into_response(),
-    };
-
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
         Ok(Some(p)) => p,
         Ok(None) => return AppError::not_found("pipeline not found").into_response(),

@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -10,7 +10,7 @@ use sea_orm::Set;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::repo_access::require_admin;
+use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -62,13 +62,9 @@ impl From<rg_db::entities::deploy_key::Model> for DeployKeyResponse {
 )]
 pub async fn list_deploy_keys(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     match rg_db::ops::deploy_key_ops::list_by_repo(&state.db, repo.id).await {
         Ok(keys) => (
             StatusCode::OK,
@@ -98,14 +94,10 @@ pub async fn list_deploy_keys(
 )]
 pub async fn create_deploy_key(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
     Json(body): Json<CreateDeployKeyRequest>,
 ) -> impl IntoResponse {
-    let (repo, actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     let title = body.title.trim();
     if title.is_empty() || title.chars().count() > 100 {
         return AppError::bad_request("deploy key title must contain 1-100 characters")
@@ -163,13 +155,9 @@ pub async fn create_deploy_key(
 )]
 pub async fn delete_deploy_key(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(access) => access,
-        Err(error) => return error.into_response(),
-    };
     let key = match rg_db::ops::deploy_key_ops::find_by_id(&state.db, id).await {
         Ok(Some(key)) if key.repo_id == repo.id => key,
         Ok(_) => return AppError::not_found("deploy key not found").into_response(),

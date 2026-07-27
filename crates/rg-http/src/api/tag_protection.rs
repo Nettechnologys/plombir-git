@@ -1,8 +1,8 @@
-use super::repo_access::{require_admin, require_read};
+use super::repo_access::{RepoAdmin, RepoRead};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -50,15 +50,7 @@ fn valid_pattern(pattern: &str) -> bool {
 }
 
 #[utoipa::path(get, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [TagProtectionResponse])))]
-pub async fn list(
-    State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let repo = match require_read(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
+pub async fn list(State(state): State<AppState>, RepoRead { repo }: RepoRead) -> impl IntoResponse {
     match rg_db::ops::protected_tag_ops::list_by_repo(&state.db, repo.id).await {
         Ok(items) => (
             StatusCode::OK,
@@ -72,14 +64,9 @@ pub async fn list(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", request_body = CreateTagProtectionRequest, params(("owner" = String, Path), ("name" = String, Path)), responses((status = 201, body = TagProtectionResponse)))]
 pub async fn create(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<CreateTagProtectionRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
     let pattern = body.pattern.trim();
     if !valid_pattern(pattern) {
         return AppError::bad_request(
@@ -110,14 +97,10 @@ pub async fn create(
 #[utoipa::path(patch, path = "/repos/{owner}/{name}/tags/protection/{id}", tag = "Tag Protection", request_body = UpdateTagProtectionRequest, params(("owner" = String, Path), ("name" = String, Path), ("id" = i64, Path)), responses((status = 200, body = TagProtectionResponse)))]
 pub async fn update(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<UpdateTagProtectionRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
     let model = match rg_db::ops::protected_tag_ops::find_by_id(&state.db, id).await {
         Ok(Some(v)) if v.repo_id == repo.id => v,
         Ok(_) => return AppError::not_found("tag protection not found").into_response(),
@@ -137,13 +120,9 @@ pub async fn update(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/tags/protection/{id}", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path), ("id" = i64, Path)), responses((status = 204)))]
 pub async fn delete(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
     match rg_db::ops::protected_tag_ops::find_by_id(&state.db, id).await {
         Ok(Some(v)) if v.repo_id == repo.id => {}
         Ok(_) => return AppError::not_found("tag protection not found").into_response(),

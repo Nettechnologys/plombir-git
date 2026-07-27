@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::api::repo_access::{RepoAdmin, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -72,11 +73,8 @@ pub struct UpdateProtectionRequest {
 pub async fn list_protections(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(error) = super::repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
     match rg_core::branch_protection::service::list_protections(&state.db, &owner, &repo).await {
         Ok(protections) => (StatusCode::OK, Json(protections)).into_response(),
         Err(e) => {
@@ -106,13 +104,9 @@ pub async fn list_protections(
 pub async fn create_protection(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+    RepoAdmin { .. }: RepoAdmin,
     Json(req): Json<CreateProtectionRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = super::repo_access::require_admin(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
-
     match rg_core::branch_protection::service::create_protection(
         &state.db,
         &owner,
@@ -156,11 +150,8 @@ pub async fn create_protection(
 pub async fn get_protection(
     State(state): State<AppState>,
     Path((owner, repo, id)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(error) = super::repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
     match rg_core::branch_protection::service::get_protection_for_repo(&state.db, &owner, &repo, id)
         .await
     {
@@ -189,13 +180,9 @@ pub async fn get_protection(
 pub async fn update_protection(
     State(state): State<AppState>,
     Path((owner, repo, id)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAdmin { .. }: RepoAdmin,
     Json(req): Json<UpdateProtectionRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = super::repo_access::require_admin(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
-
     match rg_core::branch_protection::service::update_protection_for_repo(
         &state.db,
         &owner,
@@ -240,12 +227,8 @@ pub async fn update_protection(
 pub async fn delete_protection(
     State(state): State<AppState>,
     Path((owner, repo, id)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
+    RepoAdmin { .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    if let Err(error) = super::repo_access::require_admin(&state, &headers, &owner, &repo).await {
-        return error.into_response();
-    }
-
     match rg_core::branch_protection::service::delete_protection_for_repo(
         &state.db, &owner, &repo, id,
     )

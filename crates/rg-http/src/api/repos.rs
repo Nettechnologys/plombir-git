@@ -20,6 +20,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
+use crate::api::repo_access::{RepoAuthRead, RepoRead};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::{
@@ -358,15 +359,8 @@ pub async fn list_repos(
 )]
 /// GET /api/v1/repos/:owner/:name
 /// Gets a single repo, supporting both user and org owners.
-pub async fn get_repo(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
-) -> impl IntoResponse {
-    match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => (StatusCode::OK, Json(serde_json::json!(repo))).into_response(),
-        Err(e) => e.into_response(),
-    }
+pub async fn get_repo(RepoRead { repo }: RepoRead) -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!(repo))).into_response()
 }
 
 // ── Star/Watch/Delete handlers ───────────────────────────────────────────────
@@ -393,17 +387,13 @@ pub struct WatchRequest {
 )]
 pub async fn star_repo(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoAuthRead {
+        repo,
+        actor_id: user_id,
+    }: RepoAuthRead,
 ) -> impl IntoResponse {
     // Read-scoped: see the module note on starring/watching a private repo.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => return e.into_response(),
-        };
 
     match rg_core::repo::service::toggle_star(&state.db, user_id, repo.id).await {
         Ok(starred) => {
@@ -436,17 +426,13 @@ pub async fn star_repo(
 )]
 pub async fn get_starred_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoAuthRead {
+        repo,
+        actor_id: user_id,
+    }: RepoAuthRead,
 ) -> impl IntoResponse {
     // Read-scoped: see the module note on starring/watching a private repo.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => return e.into_response(),
-        };
 
     match rg_core::repo::service::is_starred(&state.db, user_id, repo.id).await {
         Ok(starred) => (
@@ -474,18 +460,13 @@ pub async fn get_starred_status(
 )]
 pub async fn get_stargazers(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
-
-    let repo = match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
 
     match rg_core::repo::service::list_stargazers(&state.db, repo.id, offset, limit).await {
         Ok((stargazers, total)) => (
@@ -517,17 +498,13 @@ pub async fn get_stargazers(
 )]
 pub async fn get_watch_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoAuthRead {
+        repo,
+        actor_id: user_id,
+    }: RepoAuthRead,
 ) -> impl IntoResponse {
     // Read-scoped: see the module note on starring/watching a private repo.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => return e.into_response(),
-        };
 
     match rg_core::repo::service::get_watch(&state.db, user_id, repo.id).await {
         Ok(watch_state) => (
@@ -559,18 +536,14 @@ pub async fn get_watch_status(
 )]
 pub async fn watch_repo(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoAuthRead {
+        repo,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Json(body): Json<WatchRequest>,
 ) -> impl IntoResponse {
     // Read-scoped: see the module note on starring/watching a private repo.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => return e.into_response(),
-        };
 
     match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, &body.state).await {
         Ok(watch_state) => (
@@ -598,17 +571,13 @@ pub async fn watch_repo(
 )]
 pub async fn unwatch_repo(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoAuthRead {
+        repo,
+        actor_id: user_id,
+    }: RepoAuthRead,
 ) -> impl IntoResponse {
     // Read-scoped: see the module note on starring/watching a private repo.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_authenticated_read(&state, &headers, &owner, &name)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => return e.into_response(),
-        };
 
     let unwatched = rg_core::repo::service::WatchState::NotWatching;
     match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, unwatched.as_str()).await {
@@ -786,17 +755,13 @@ pub async fn fork_repo_handler(
 )]
 pub async fn list_forks_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
-
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
 
     match rg_core::repo::service::list_forks(&state.db, &owner, &name, offset, limit).await {
         Ok((forks, total)) => (
@@ -992,13 +957,9 @@ pub async fn create_commit_status(
 )]
 pub async fn list_commit_statuses(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, sha)): Path<(String, String, String)>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
-
     match rg_core::repo::service::list_commit_statuses(&state.db, &owner, &name, &sha).await {
         Ok(statuses) => (StatusCode::OK, Json(serde_json::json!(statuses))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -1022,13 +983,9 @@ pub async fn list_commit_statuses(
 )]
 pub async fn get_combined_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, sha)): Path<(String, String, String)>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
-
     match rg_core::repo::service::get_combined_status(&state.db, &owner, &name, &sha).await {
         Ok(combined) => (StatusCode::OK, Json(combined)).into_response(),
         Err(e) => AppError::from(e).into_response(),

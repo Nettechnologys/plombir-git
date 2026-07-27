@@ -57,13 +57,12 @@ async fn db_outage_in_packages_handler_returns_503_not_500() {
     // Close the pool to simulate a connection-level outage.
     db.close().await.expect("close pool");
 
-    let response = rg_http::api::packages::list_packages(
-        State(state),
+    let response = get_through_router(
+        state,
+        "/api/v1/repos/owner/repo/packages/cargo/list",
         axum::http::HeaderMap::new(),
-        Path(("owner".to_string(), "repo".to_string(), "cargo".to_string())),
     )
-    .await
-    .into_response();
+    .await;
 
     assert_eq!(
         response.status(),
@@ -208,6 +207,34 @@ async fn break_permission_lookup(db: &rg_db::DatabaseConnection) {
     rg_core::repo::service::invalidate_perm_cache_all(db);
 }
 
+/// Drive a GET through the real router rather than calling the handler as a
+/// function.
+///
+/// The repository access gate is an axum extractor now (`RepoRead` and friends
+/// in `api::repo_access`), so it runs *before* the handler body and cannot be
+/// constructed by hand — which is the point: a handler can no longer be invoked
+/// without its gate. Going through the router exercises the same classification
+/// these tests were written for, one layer earlier.
+async fn get_through_router(
+    state: rg_http::AppState,
+    path: &str,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use tower::ServiceExt as _;
+
+    let mut request = axum::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    request.headers_mut().extend(headers);
+
+    rg_http::create_router_for_test(state)
+        .oneshot(request)
+        .await
+        .expect("router response")
+}
+
 fn bearer(user_id: i64, username: &str) -> axum::http::HeaderMap {
     let token = rg_core::auth::jwt::generate_token(user_id, username, "test-secret-key", 7)
         .expect("generate token");
@@ -267,13 +294,12 @@ async fn failed_read_permission_check_is_not_reported_as_forbidden() {
     let state = build_test_app_state(db.clone(), repo_root);
     break_permission_lookup(&db).await;
 
-    let response = rg_http::api::issues::list_issue_templates(
-        State(state),
-        Path((owner.to_string(), repo.to_string())),
+    let response = get_through_router(
+        state,
+        &format!("/api/v1/repos/{owner}/{repo}/issue_templates"),
         bearer(outsider_id, outsider),
     )
-    .await
-    .into_response();
+    .await;
 
     assert_ne!(
         response.status(),

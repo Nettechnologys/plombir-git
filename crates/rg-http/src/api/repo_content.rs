@@ -9,7 +9,7 @@ use chrono;
 use serde::{Deserialize, Serialize};
 
 use crate::api::auth::extract_bearer_claims;
-use crate::api::repo_access;
+use crate::api::repo_access::{CiRead, RepoContents};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -157,8 +157,8 @@ pub struct GpgSignature {
 pub async fn list_tree(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
     Query(params): Query<TreeQuery>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -169,12 +169,6 @@ pub async fn list_tree(
     }
 
     // H-01: Auth check for private repos
-    let _repo =
-        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
-        {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -262,8 +256,8 @@ fn is_empty_repo(repo_path: &std::path::Path) -> bool {
 pub async fn get_blob(
     State(state): State<AppState>,
     Path((owner, repo, path)): Path<(String, String, String)>,
-    headers: HeaderMap,
     Query(params): Query<BlobQuery>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -274,12 +268,6 @@ pub async fn get_blob(
     }
 
     // H-01: Auth check for private repos
-    let _repo =
-        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
-        {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -318,8 +306,8 @@ pub async fn get_blob(
 pub async fn get_log(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
     Query(params): Query<LogQuery>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -330,12 +318,6 @@ pub async fn get_log(
     }
 
     // H-01: Auth check for private repos
-    let _repo =
-        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
-        {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -373,7 +355,7 @@ pub async fn get_log(
 pub async fn list_branches(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -384,12 +366,6 @@ pub async fn list_branches(
     }
 
     // H-01: Auth check for private repos
-    let _repo =
-        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
-        {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -423,7 +399,7 @@ pub async fn list_branches(
 pub async fn list_tags(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -434,12 +410,6 @@ pub async fn list_tags(
     }
 
     // H-01: Auth check for private repos
-    let _repo =
-        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
-        {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -862,7 +832,7 @@ fn list_tag_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
 pub async fn get_commit_signature(
     State(state): State<AppState>,
     Path((owner, repo, sha)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -873,12 +843,6 @@ pub async fn get_commit_signature(
     }
 
     // H-01: Auth check for private repos
-    let _repo =
-        match repo_access::require_read_with_ci(&state, &headers, &owner, &repo, "repo:read").await
-        {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if !repo_path.exists() {
@@ -1118,14 +1082,7 @@ pub async fn create_or_update_file(
             let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
 
             spawn_post_push_hooks_for_edit(
-                &state,
-                repo_path,
-                &owner,
-                &repo,
-                &branch,
-                &old_sha,
-                &new_sha,
-                user.id,
+                &state, repo_path, &owner, &repo, &branch, &old_sha, &new_sha, user.id,
             );
 
             (
@@ -1216,14 +1173,7 @@ pub async fn delete_file(
             let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
 
             spawn_post_push_hooks_for_edit(
-                &state,
-                repo_path,
-                &owner,
-                &repo,
-                &branch,
-                &old_sha,
-                &new_sha,
-                user.id,
+                &state, repo_path, &owner, &repo, &branch, &old_sha, &new_sha, user.id,
             );
 
             (

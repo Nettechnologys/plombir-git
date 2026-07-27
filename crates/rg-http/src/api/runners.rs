@@ -9,24 +9,10 @@ use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
-use super::auth::extract_user_id;
+use crate::api::admin::require_instance_admin;
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::{IntoParams, ToSchema};
-
-/// Verify the current request is from an authenticated admin user.
-/// Returns `Some(user_id)` on success, `None` otherwise.
-async fn require_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
-    let user_id = extract_user_id(headers, &state.jwt_secret)?;
-    let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
-        .await
-        .ok()??;
-    if user.is_admin {
-        Some(user_id)
-    } else {
-        None
-    }
-}
 
 // ── Request/Response types ─────────────────────────────────
 
@@ -103,7 +89,7 @@ pub async fn get_runner_admin(
     headers: HeaderMap,
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::unauthorized("admin authentication required").into_response();
     }
 
@@ -150,7 +136,7 @@ pub async fn register(
     headers: HeaderMap,
     Json(req): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin authentication required to register runners")
             .into_response();
     }
@@ -1083,9 +1069,9 @@ pub async fn finish_job(
 
     // Metrics: job left the running set — count its outcome and, if we know when
     // it started, its execution duration.
-    let job_duration = job.started_at.and_then(|started| {
-        (chrono::Utc::now().naive_utc() - started).to_std().ok()
-    });
+    let job_duration = job
+        .started_at
+        .and_then(|started| (chrono::Utc::now().naive_utc() - started).to_std().ok());
     crate::metrics::recorder::ci_job_finished(&req.status, job_duration);
 
     // Mark runner as online (ready for next job)
@@ -1164,7 +1150,7 @@ pub async fn list_runners_admin(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::unauthorized("admin authentication required").into_response();
     }
     match rg_db::ops::runner_ops::list_all(&state.db).await {
@@ -1285,7 +1271,7 @@ pub async fn delete_runner_admin(
     headers: HeaderMap,
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_admin(&state, &headers).await.is_none() {
+    if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::unauthorized("admin authentication required").into_response();
     }
     match rg_db::ops::runner_ops::delete_runner(&state.db, runner_id).await {

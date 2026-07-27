@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::api::repo_access::{RepoAdmin, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -51,12 +52,8 @@ pub struct UpdatePermissionRequest {
 pub async fn list_collaborators(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::collaborator::service::list_collaborators(&state.db, &owner, &repo).await {
         Ok(collaborators) => (StatusCode::OK, Json(collaborators)).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -85,16 +82,12 @@ pub async fn list_collaborators(
 pub async fn add_collaborator(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<AddCollaboratorRequest>,
-) -> impl IntoResponse {
     // Granting access to a repository is an admin operation on *that*
     // repository. Checking only that a token parses authorizes nothing: it lets
     // any account hand itself `admin` on any repo, private ones included.
-    if let Err(e) = crate::api::repo_access::require_admin(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
+    RepoAdmin { .. }: RepoAdmin,
+    Json(req): Json<AddCollaboratorRequest>,
+) -> impl IntoResponse {
     let user_id = match resolve_collaborator_user_id(&state.db, &req).await {
         Ok(user_id) => user_id,
         // The helper types the four ways the request itself can be wrong; the
@@ -185,21 +178,15 @@ async fn resolve_collaborator_user_id(
 )]
 pub async fn update_permission(
     State(state): State<AppState>,
-    Path((owner, repo_name, id)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<UpdatePermissionRequest>,
-) -> impl IntoResponse {
+    Path((_, _, id)): Path<(String, String, i64)>,
     // Both path segments used to be discarded, which left `id` — a global
     // `repo_collaborators` primary key — as the only thing the handler acted on:
     // no repository was resolved, so nothing was authorized and nothing tied the
     // row to the repo in the URL. The repo the caller holds admin on is what
     // scopes the update.
-    let repo =
-        match crate::api::repo_access::require_admin(&state, &headers, &owner, &repo_name).await {
-            Ok((repo, _actor_id)) => repo,
-            Err(e) => return e.into_response(),
-        };
-
+    RepoAdmin { repo, .. }: RepoAdmin,
+    Json(req): Json<UpdatePermissionRequest>,
+) -> impl IntoResponse {
     match rg_core::collaborator::service::update_permission(&state.db, repo.id, id, req.permission)
         .await
     {
@@ -230,14 +217,10 @@ pub async fn update_permission(
 pub async fn remove_collaborator(
     State(state): State<AppState>,
     Path((owner, repo, user_id)): Path<(String, String, i64)>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
     // Revoking access is the same admin operation as granting it — without this
     // any account could strip the collaborators off someone else's repository.
-    if let Err(e) = crate::api::repo_access::require_admin(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
+    RepoAdmin { .. }: RepoAdmin,
+) -> impl IntoResponse {
     match rg_core::collaborator::service::remove_collaborator(&state.db, &owner, &repo, user_id)
         .await
     {

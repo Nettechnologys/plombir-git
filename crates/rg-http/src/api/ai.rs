@@ -5,14 +5,14 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::repo_access;
+use crate::api::repo_access::RepoRead;
 use crate::error::AppError;
 use crate::AppState;
 use sea_orm::{ConnectionTrait, Statement};
@@ -107,12 +107,9 @@ pub struct SearchCodeQuery {
     tag = "ai",
 )]
 pub async fn ai_repo_summary(
-    State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoRead { repo }: RepoRead,
 ) -> Result<(StatusCode, Json<RepoSummary>), AppError> {
-    let repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
-
     let summary = RepoSummary {
         full_name: format!("{}/{}", owner, name),
         description: repo.description,
@@ -145,11 +142,9 @@ pub async fn ai_repo_summary(
 pub async fn ai_list_issues(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
     Query(params): Query<IssueListQuery>,
+    RepoRead { .. }: RepoRead,
 ) -> Result<(StatusCode, Json<Vec<IssueSummary>>), AppError> {
-    let _repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
-
     let state_filter = params.state.as_deref().unwrap_or("open");
 
     let issues = rg_core::issue::service::list_issues(&state.db, &owner, &name, Some(state_filter))
@@ -191,11 +186,9 @@ pub async fn ai_list_issues(
 pub async fn ai_list_prs(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
     Query(params): Query<PrListQuery>,
+    RepoRead { .. }: RepoRead,
 ) -> Result<(StatusCode, Json<Vec<PrSummary>>), AppError> {
-    let _repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
-
     let state_filter = params.state.as_deref().unwrap_or("open");
 
     let prs =
@@ -241,12 +234,10 @@ pub async fn ai_list_prs(
     tag = "ai",
 )]
 pub async fn ai_repo_tree(
-    State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
     Query(_params): Query<TreeQuery>,
+    RepoRead { .. }: RepoRead,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let _repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
     Ok((
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({"error": "repo_tree not yet implemented"})),
@@ -283,12 +274,10 @@ pub struct CodeSearchResult {
 )]
 pub async fn ai_search_code(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
     Query(params): Query<SearchCodeQuery>,
+    RepoRead { repo }: RepoRead,
 ) -> Result<(StatusCode, Json<Vec<CodeSearchResult>>), AppError> {
-    let repo = repo_access::require_read(&state, &headers, &owner, &name).await?;
-
     let limit = params.limit.unwrap_or(20).min(100) as u64;
     let offset = 0u64;
 
@@ -310,9 +299,7 @@ pub async fn ai_search_code(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::internal("Failed to check index status".to_string()))?;
-    let indexed_count: i64 = check_result
-        .try_get_by_index(0)
-        .map_err(AppError::from)?;
+    let indexed_count: i64 = check_result.try_get_by_index(0).map_err(AppError::from)?;
 
     if indexed_count == 0 {
         return Err(AppError::bad_request(
@@ -363,14 +350,10 @@ pub struct IndexResponse {
 pub async fn ai_index_repository(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+    RepoRead { repo }: RepoRead,
     Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Resolve repository
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
     if !repo_path.exists() {

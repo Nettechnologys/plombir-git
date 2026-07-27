@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::auth::extract_bearer_claims;
+use crate::api::repo_access::RepoWrite;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -181,22 +182,15 @@ pub async fn create_mirror(
 )]
 pub async fn get_mirror(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
-) -> impl IntoResponse {
     // Write access, not read access: a mirror is repository *administration*,
     // not repository content. The reply names the remote and its username and
-    // says whether a credential is stored — under `require_read` a public repo
+    // says whether a credential is stored — under `RepoRead` a public repo
     // handed all of that to anonymous callers. The other four verbs on this
     // resource already require write, and the settings UI that consumes this
     // endpoint lives behind the same door, so read is the odd one out. (GitHub
     // likewise shows mirror configuration only with push access.)
-    let (repo, _actor_id) =
-        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
-            Ok(access) => access,
-            Err(e) => return e.into_response(),
-        };
-
+    RepoWrite { repo, .. }: RepoWrite,
+) -> impl IntoResponse {
     match rg_core::mirror::service::get_mirror(&state.db, repo.id).await {
         Ok(Some(mirror)) => (StatusCode::OK, Json(MirrorResponse::from(mirror))).into_response(),
         Ok(None) => AppError::not_found("no mirror configured for this repository").into_response(),

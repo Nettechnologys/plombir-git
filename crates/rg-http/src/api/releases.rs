@@ -21,6 +21,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -68,62 +69,6 @@ async fn asset_in_repo(
     Ok(asset)
 }
 
-/// Require read access to `owner/name` and return the release, which must live
-/// in that repository.
-async fn resolve_release_in_repo(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-    release_id: i64,
-) -> Result<rg_db::entities::release::Model, AppError> {
-    let repo = crate::api::repo_access::require_read(state, headers, owner, name).await?;
-    release_in_repo(state, &repo, release_id).await
-}
-
-/// Require read access to `owner/name` and return the asset, whose release must
-/// live in that repository.
-async fn resolve_asset_in_repo(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-    asset_id: i64,
-) -> Result<rg_db::entities::release_asset::Model, AppError> {
-    let repo = crate::api::repo_access::require_read(state, headers, owner, name).await?;
-    asset_in_repo(state, &repo, asset_id).await
-}
-
-/// Require write access to `owner/name` and return the release living in it,
-/// together with the acting user id.
-async fn resolve_release_in_repo_write(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-    release_id: i64,
-) -> Result<(rg_db::entities::release::Model, i64), AppError> {
-    let (repo, user_id) =
-        crate::api::repo_access::require_write(state, headers, owner, name).await?;
-    let release = release_in_repo(state, &repo, release_id).await?;
-    Ok((release, user_id))
-}
-
-/// Require write access to `owner/name` and return the asset living in it,
-/// together with the acting user id.
-async fn resolve_asset_in_repo_write(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-    asset_id: i64,
-) -> Result<(rg_db::entities::release_asset::Model, i64), AppError> {
-    let (repo, user_id) =
-        crate::api::repo_access::require_write(state, headers, owner, name).await?;
-    let asset = asset_in_repo(state, &repo, asset_id).await?;
-    Ok((asset, user_id))
-}
-
 /// Request body for creating a release.
 #[derive(Deserialize, ToSchema)]
 pub struct CreateReleaseRequest {
@@ -168,18 +113,13 @@ pub struct UpdateReleaseRequest {
 )]
 pub async fn list_releases(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
-
-    let repo = match crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
 
     match rg_core::release::service::list_releases(&state.db, repo.id, offset, limit).await {
         Ok((releases, total)) => (
@@ -209,18 +149,16 @@ pub async fn list_releases(
 )]
 pub async fn create_release(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(body): Json<CreateReleaseRequest>,
 ) -> impl IntoResponse {
     // The release is created *in* the resolved repository, so this route carries
     // no foreign id — the shared gate is enough, and it keeps one copy of the
     // resolve-then-check sequence instead of a second hand-rolled one.
-    let (repo, user_id) =
-        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
-            Ok(resolved) => resolved,
-            Err(e) => return e.into_response(),
-        };
 
     // H-02: Validate owner/name before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -268,13 +206,13 @@ pub async fn create_release(
 )]
 pub async fn get_release(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     // The service marks a genuine miss with `rg_core::error::NotFound`, so this
     // still answers 404 for a deleted release — but a database outage surfaces
     // as 503 instead of telling the client the release is gone.
-    match resolve_release_in_repo(&state, &headers, &owner, &name, id).await {
+    match release_in_repo(&state, &repo, id).await {
         Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -298,14 +236,14 @@ pub async fn get_release(
 )]
 pub async fn update_release(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<UpdateReleaseRequest>,
 ) -> impl IntoResponse {
     // Write access to `owner/name` says nothing about where `id` points: the
     // release has to live in the repository the permission was checked against.
-    let release = match resolve_release_in_repo_write(&state, &headers, &owner, &name, id).await {
-        Ok((release, _user_id)) => release,
+    let release = match release_in_repo(&state, &repo, id).await {
+        Ok(release) => release,
         Err(e) => return e.into_response(),
     };
 
@@ -342,11 +280,11 @@ pub async fn update_release(
 )]
 pub async fn delete_release(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let release = match resolve_release_in_repo_write(&state, &headers, &owner, &name, id).await {
-        Ok((release, _user_id)) => release,
+    let release = match release_in_repo(&state, &repo, id).await {
+        Ok(release) => release,
         Err(e) => return e.into_response(),
     };
 
@@ -379,10 +317,10 @@ pub async fn delete_release(
 )]
 pub async fn list_assets(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, release_id)): Path<(String, String, i64)>,
+    Path((_, _, release_id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = resolve_release_in_repo(&state, &headers, &owner, &name, release_id).await {
+    if let Err(e) = release_in_repo(&state, &repo, release_id).await {
         return e.into_response();
     }
 
@@ -417,16 +355,19 @@ pub async fn upload_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name, release_id)): Path<(String, String, i64)>,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     body: Body,
 ) -> impl IntoResponse {
     // Gate before reading the body: the release must belong to the repository
     // whose write permission was just checked, otherwise the asset lands in
     // someone else's release.
-    let (release, user_id) =
-        match resolve_release_in_repo_write(&state, &headers, &owner, &name, release_id).await {
-            Ok(resolved) => resolved,
-            Err(e) => return e.into_response(),
-        };
+    let release = match release_in_repo(&state, &repo, release_id).await {
+        Ok(release) => release,
+        Err(e) => return e.into_response(),
+    };
 
     let filename = headers
         .get(header::CONTENT_DISPOSITION)
@@ -549,10 +490,10 @@ fn hex_val(b: u8) -> Result<u8, ()> {
 )]
 pub async fn get_asset(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    Path((_, _, asset_id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    match resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+    match asset_in_repo(&state, &repo, asset_id).await {
         Ok(asset) => (StatusCode::OK, Json(serde_json::json!(asset))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -577,13 +518,13 @@ pub async fn get_asset(
 )]
 pub async fn download_asset(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     // Read access to the repository is only half of it — the asset id is
     // global, so it also has to belong to this repository or the check guards
     // the wrong object.
-    if let Err(e) = resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+    if let Err(e) = asset_in_repo(&state, &repo, asset_id).await {
         return e.into_response();
     }
 
@@ -673,15 +614,15 @@ fn attestation_builder_id(state: &AppState) -> String {
 )]
 pub async fn sign_asset_attestation(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    Path((_, _, asset_id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
     if !state.attestation_enabled {
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let asset = match resolve_asset_in_repo_write(&state, &headers, &owner, &name, asset_id).await {
-        Ok((asset, _user_id)) => asset,
+    let asset = match asset_in_repo(&state, &repo, asset_id).await {
+        Ok(asset) => asset,
         Err(e) => return e.into_response(),
     };
 
@@ -724,8 +665,8 @@ pub async fn sign_asset_attestation(
 )]
 pub async fn get_asset_attestation(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    Path((_, _, asset_id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     if !state.attestation_enabled {
         return AppError::not_found("attestation is not enabled").into_response();
@@ -735,7 +676,7 @@ pub async fn get_asset_attestation(
     // envelope belongs to a globally addressed asset, and it carries the
     // filename and digest of a release that may live in a private repository
     // the caller cannot open.
-    let asset = match resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+    let asset = match asset_in_repo(&state, &repo, asset_id).await {
         Ok(asset) => asset,
         Err(e) => return e.into_response(),
     };
@@ -767,14 +708,14 @@ pub async fn get_asset_attestation(
 )]
 pub async fn verify_asset_attestation(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     if !state.attestation_enabled {
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let asset = match resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+    let asset = match asset_in_repo(&state, &repo, asset_id).await {
         Ok(asset) => asset,
         Err(e) => return e.into_response(),
     };
@@ -816,13 +757,13 @@ pub async fn verify_asset_attestation(
 )]
 pub async fn delete_asset(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
     // `owner`/`name` below only build the storage path — on their own they never
     // constrain which asset row is deleted, so the id has to be anchored first.
-    let asset = match resolve_asset_in_repo_write(&state, &headers, &owner, &name, asset_id).await {
-        Ok((asset, _user_id)) => asset,
+    let asset = match asset_in_repo(&state, &repo, asset_id).await {
+        Ok(asset) => asset,
         Err(e) => return e.into_response(),
     };
 

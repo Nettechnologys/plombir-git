@@ -1,8 +1,8 @@
-use super::repo_access::require_admin;
+use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -52,13 +52,9 @@ pub(crate) fn valid_secret_name(name: &str) -> bool {
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/secrets", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [SecretResponse]), (status = 403, body = serde_json::Value)))]
 pub async fn list(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
     match rg_db::ops::ci_secret_ops::list_by_repo(&state.db, repo.id).await {
         Ok(items) => (
             StatusCode::OK,
@@ -72,14 +68,10 @@ pub async fn list(
 #[utoipa::path(put, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", request_body = PutSecretRequest, params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 201, body = SecretResponse), (status = 400, body = serde_json::Value), (status = 403, body = serde_json::Value)))]
 pub async fn put(
     State(state): State<AppState>,
-    Path((owner, name, secret_name)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_, _, secret_name)): Path<(String, String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
     Json(body): Json<PutSecretRequest>,
 ) -> impl IntoResponse {
-    let (repo, actor_id) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
     if !valid_secret_name(&secret_name) {
         return AppError::bad_request("secret names must match [A-Z_][A-Z0-9_]*, be at most 100 characters, and not use reserved CI names").into_response();
     }
@@ -102,13 +94,9 @@ pub async fn put(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 204), (status = 403, body = serde_json::Value), (status = 404, body = serde_json::Value)))]
 pub async fn delete(
     State(state): State<AppState>,
-    Path((owner, name, secret_name)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Path((_, _, secret_name)): Path<(String, String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
     match rg_db::ops::ci_secret_ops::delete_by_repo_and_name(&state.db, repo.id, &secret_name).await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

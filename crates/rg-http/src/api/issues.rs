@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::auth::extract_bearer_claims;
-use crate::api::repo_access;
+use crate::api::repo_access::RepoRead;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -76,12 +76,8 @@ pub struct IssueResponse {
 pub async fn list_issue_templates(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> impl IntoResponse {
-    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
-        Ok(repo) => repo,
-        Err(error) => return error.into_response(),
-    };
     let path = state.repo_root.join(format!("{owner}/{repo}.git"));
     let default_branch = repo_model.default_branch;
     match tokio::task::spawn_blocking(move || {
@@ -110,12 +106,8 @@ pub async fn list_issue_templates(
 pub async fn get_issue_config(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> impl IntoResponse {
-    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
-        Ok(repo) => repo,
-        Err(error) => return error.into_response(),
-    };
     let path = state.repo_root.join(format!("{owner}/{repo}.git"));
     let default_branch = repo_model.default_branch;
     match tokio::task::spawn_blocking(move || {
@@ -144,12 +136,8 @@ pub struct IssueConfigValidation {
 pub async fn validate_issue_config(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> impl IntoResponse {
-    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
-        Ok(repo) => repo,
-        Err(error) => return error.into_response(),
-    };
     let path = state.repo_root.join(format!("{owner}/{repo}.git"));
     let default_branch = repo_model.default_branch;
     match tokio::task::spawn_blocking(move || {
@@ -185,12 +173,8 @@ pub async fn validate_issue_config(
 pub async fn get_pull_request_template(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
 ) -> impl IntoResponse {
-    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
-        Ok(repo) => repo,
-        Err(error) => return error.into_response(),
-    };
     let path = state.repo_root.join(format!("{owner}/{repo}.git"));
     let default_branch = repo_model.default_branch;
     match tokio::task::spawn_blocking(move || {
@@ -230,13 +214,9 @@ pub struct CommentResponse {
 pub async fn list_issues(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
     Query(params): Query<ListQuery>,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     let state_filter = params.state.as_deref();
     let pagination = params.pagination.clamp();
 
@@ -311,12 +291,8 @@ pub async fn list_issues(
 pub async fn get_issue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => {
             let issue = issue_with_author(&state.db, issue).await;
@@ -367,8 +343,9 @@ async fn require_milestone_in_repo(
 )]
 pub async fn create_issue(
     State(state): State<AppState>,
-    Path((owner, repo)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
     headers: HeaderMap,
+    RepoRead { repo: repo_model }: RepoRead,
     Json(req): Json<CreateIssueRequest>,
 ) -> impl IntoResponse {
     let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
@@ -376,11 +353,6 @@ pub async fn create_issue(
         None => {
             return AppError::unauthorized("authentication required".to_string()).into_response()
         }
-    };
-
-    let repo_model = match repo_access::require_read(&state, &headers, &owner, &repo).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
     };
 
     // Filing an issue on read access is deliberate; deciding its labels and
@@ -545,12 +517,8 @@ pub async fn update_issue(
 pub async fn list_comments(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
-
     match rg_core::issue::list_comments(&state.db, &owner, &repo, number).await {
         Ok(comments) => {
             let comments = comments_with_authors(&state.db, comments).await;
@@ -580,6 +548,7 @@ pub async fn add_comment(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     headers: HeaderMap,
+    RepoRead { .. }: RepoRead,
     Json(req): Json<CreateCommentRequest>,
 ) -> impl IntoResponse {
     let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
@@ -588,10 +557,6 @@ pub async fn add_comment(
             return AppError::unauthorized("authentication required".to_string()).into_response()
         }
     };
-
-    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
 
     match rg_core::issue::add_comment(&state.db, &owner, &repo, number, user_id, req.body).await {
         Ok(comment) => {
@@ -690,14 +655,10 @@ pub struct ListMilestonesQuery {
 )]
 pub async fn list_milestones(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
     Query(params): Query<ListMilestonesQuery>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
     match rg_db::ops::milestone_ops::list_by_repo(&state.db, repo.id, params.state.as_deref()).await
     {
         Ok(milestones) => (StatusCode::OK, Json(serde_json::json!(milestones))).into_response(),
@@ -801,13 +762,9 @@ pub async fn create_milestone(
 )]
 pub async fn get_milestone(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match repo_access::require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(e) => return e.into_response(),
-    };
     match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
         // The access check above is about `owner/name`, so the milestone it
         // guards has to be the one that lives there. Without this, the route
@@ -996,14 +953,11 @@ pub async fn delete_milestone(
 pub async fn get_issue_labels(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     // Same gate as `get_issue` / `list_comments`: the labels of an issue are as
     // private as the issue itself, and without `HeaderMap` this handler could
     // not tell an anonymous caller from the owner at all.
-    if let Err(e) = repo_access::require_read(&state, &headers, &owner, &repo).await {
-        return e.into_response();
-    }
 
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => match rg_core::label::service::get_issue_labels(&state.db, issue.id).await {

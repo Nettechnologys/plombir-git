@@ -1,8 +1,8 @@
-use super::repo_access::{require_admin, require_authenticated_read, require_read};
+use crate::api::repo_access::{RepoAdmin, RepoAuthRead, RepoRead};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -93,13 +93,9 @@ async fn validate_request(state: &AppState, body: &EnvironmentRequest) -> Result
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/environments", tag = "CI/CD", responses((status = 200, body = [EnvironmentResponse])))]
 pub async fn list(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let repo = match require_read(&state, &headers, &owner, &name).await {
-        Ok(repo) => repo,
-        Err(error) => return error.into_response(),
-    };
     match rg_db::ops::ci_environment_ops::list(&state.db, repo.id).await {
         Ok(items) => Json(items.into_iter().map(response).collect::<Vec<_>>()).into_response(),
         Err(error) => AppError::from(error).into_response(),
@@ -109,14 +105,10 @@ pub async fn list(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/actions/environments", tag = "CI/CD", request_body = EnvironmentRequest, responses((status = 201, body = EnvironmentResponse)))]
 pub async fn create(
     State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
     if let Err(error) = validate_request(&state, &body).await {
         return error.into_response();
     }
@@ -145,14 +137,10 @@ pub async fn create(
 #[utoipa::path(put, path = "/repos/{owner}/{name}/actions/environments/{id}", tag = "CI/CD", request_body = EnvironmentRequest, responses((status = 200, body = EnvironmentResponse)))]
 pub async fn update(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
     if let Err(error) = validate_request(&state, &body).await {
         return error.into_response();
     }
@@ -181,13 +169,9 @@ pub async fn update(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/environments/{id}", tag = "CI/CD", responses((status = 204)))]
 pub async fn delete(
     State(state): State<AppState>,
-    Path((owner, name, id)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let (repo, _) = match require_admin(&state, &headers, &owner, &name).await {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
     match rg_db::ops::ci_environment_ops::find_by_id(&state.db, id).await {
         Ok(Some(model)) if model.repo_id == repo.id => {}
         Ok(_) => return AppError::not_found("environment not found").into_response(),
@@ -218,10 +202,10 @@ pub struct ApprovalResponse {
 #[utoipa::path(post, path = "/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve", tag = "CI/CD", responses((status = 200, body = ApprovalResponse)))]
 pub async fn approve(
     State(state): State<AppState>,
-    Path((owner, name, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
+    Path((owner, _, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
+    RepoAuthRead { repo, actor_id }: RepoAuthRead,
 ) -> impl IntoResponse {
-    let ctx = match authorize_approval(&state, &headers, &owner, &name, pipeline_id, job_id).await {
+    let ctx = match authorize_approval(&state, repo, actor_id, pipeline_id, job_id).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
@@ -271,15 +255,11 @@ struct ApprovalContext {
 /// that the caller is allowed to approve it. Errors are already `Response`s.
 async fn authorize_approval(
     state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
+    repo: rg_db::entities::repository::Model,
+    actor_id: i64,
     pipeline_id: i64,
     job_id: i64,
 ) -> Result<ApprovalContext, axum::response::Response> {
-    let (repo, actor_id) = require_authenticated_read(state, headers, owner, name)
-        .await
-        .map_err(|error| error.into_response())?;
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
         Ok(Some(pipeline)) if pipeline.repo_id == repo.id => pipeline,
         Ok(_) => return Err(AppError::not_found("pipeline not found").into_response()),
@@ -350,12 +330,11 @@ async fn release_if_ready(
     pipeline_id: i64,
     job_id: i64,
 ) -> Result<bool, axum::response::Response> {
-    let released = match rg_db::ops::ci_environment_ops::release_approved_job(&state.db, job_id)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => return Err(AppError::from(error).into_response()),
-    };
+    let released =
+        match rg_db::ops::ci_environment_ops::release_approved_job(&state.db, job_id).await {
+            Ok(value) => value,
+            Err(error) => return Err(AppError::from(error).into_response()),
+        };
     let stage_ready = match rg_db::ops::pipeline_ops::stage_has_job_status(
         &state.db,
         ctx.stage.id,

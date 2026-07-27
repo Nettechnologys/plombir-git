@@ -301,10 +301,7 @@ pub async fn download_artifact(
     // Expose the upload-time digest so clients can verify the payload end-to-end.
     if let Some(sha) = artifact.sha256.as_deref() {
         if let Ok(value) = HeaderValue::from_str(sha) {
-            headers.insert(
-                header::HeaderName::from_static("x-checksum-sha256"),
-                value,
-            );
+            headers.insert(header::HeaderName::from_static("x-checksum-sha256"), value);
         }
     }
     // Hand the verified buffer to the socket as a backpressure-sensitive,
