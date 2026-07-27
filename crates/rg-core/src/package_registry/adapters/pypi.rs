@@ -21,7 +21,13 @@
 //! ```
 //!
 //! ForgeKeep serves this at:
-//!   `GET /api/v1/repos/{owner}/{repo}/packages/pypi/simple/{pkg_name}`
+//!   `GET /api/v1/repos/{owner}/{repo}/packages/pypi/simple/{pkg_name}/`
+//!
+//! The trailing slash is part of the spec, not decoration: a client builds the
+//! project URL as `<index-url>/<normalized name>/`, so both that spelling and
+//! the root index `.../simple/` have to be served. The name in the URL is the
+//! PEP 503 *normalized* one — see [`normalize_project_name`] — which is rarely
+//! the spelling the project was published under.
 
 use flate2::read::GzDecoder;
 use std::io::{Cursor, Read};
@@ -318,6 +324,52 @@ fn validate_sdist(data: &[u8]) -> Result<(), anyhow::Error> {
 
 // ── Simple Repository API helpers ─────────────────────────
 
+/// Normalize a project name the way PEP 503 defines it: every run of `-`, `_`
+/// or `.` collapses to a single `-`, and the result is lower-cased.
+///
+/// This is the spelling a client puts in the URL. pip, poetry and uv all
+/// normalize before requesting, whatever case the project was published under,
+/// so `Matrix_PyPI` is fetched as `matrix-pypi` — and a registry that only
+/// answers to the stored spelling answers nothing at all.
+pub fn normalize_project_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut in_separator = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !in_separator {
+                out.push('-');
+                in_separator = true;
+            }
+        } else {
+            out.extend(ch.to_lowercase());
+            in_separator = false;
+        }
+    }
+    out
+}
+
+/// Escape text for inclusion in HTML, in element text and in a quoted
+/// attribute alike.
+///
+/// Package names and filenames are whatever the publisher put in the metadata
+/// or the `Content-Disposition` header. Interpolated raw, a `"` in a filename
+/// silently truncates the `href` next to it — the link pip is supposed to
+/// follow — long before anyone gets to the security argument.
+fn escape_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Generate the Simple Repository API HTML page (PEP 503).
 ///
 /// `versions` is a list of (version, filename, sha256, download_url).
@@ -326,7 +378,7 @@ pub fn build_simple_repository_html(package_name: &str, versions: &[PyPIVersionE
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
     html.push_str(&format!(
         "<title>Simple index for {}</title>\n",
-        package_name
+        escape_html(package_name)
     ));
     html.push_str("<meta name=\"api-version\" content=\"2\" />\n");
     html.push_str("</head>\n<body>\n");
@@ -339,7 +391,33 @@ pub fn build_simple_repository_html(package_name: &str, versions: &[PyPIVersionE
             .unwrap_or_default();
         html.push_str(&format!(
             "  <a href=\"{}{}\">{}</a><br/>\n",
-            entry.download_url, sha_frag, entry.filename,
+            escape_html(&entry.download_url),
+            escape_html(&sha_frag),
+            escape_html(&entry.filename),
+        ));
+    }
+
+    html.push_str("</body>\n</html>\n");
+    html
+}
+
+/// Generate the root of the Simple Repository API (PEP 503) — the page that
+/// lists every project in the index, each linking to its own project page.
+///
+/// The href carries the trailing slash the spec mandates, so a client that
+/// follows the link lands on the project page rather than on the SPA fallback.
+pub fn build_simple_root_html(projects: &[PyPIProjectEntry]) -> String {
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
+    html.push_str("<title>Simple index</title>\n");
+    html.push_str("<meta name=\"api-version\" content=\"2\" />\n");
+    html.push_str("</head>\n<body>\n");
+
+    for project in projects {
+        html.push_str(&format!(
+            "  <a href=\"{}\">{}</a><br/>\n",
+            escape_html(&project.url),
+            escape_html(&project.name),
         ));
     }
 
@@ -353,4 +431,65 @@ pub struct PyPIVersionEntry {
     pub filename: String,
     pub sha256: Option<String>,
     pub download_url: String,
+}
+
+/// One project row of the Simple Repository API root index.
+pub struct PyPIProjectEntry {
+    /// The project name as published.
+    pub name: String,
+    /// Absolute URL of the project page, trailing slash included.
+    pub url: String,
+}
+
+#[cfg(test)]
+mod simple_repository_tests {
+    use super::*;
+
+    /// The examples PEP 503 itself gives for the normalization rule.
+    #[test]
+    fn project_names_normalize_the_way_pep_503_spells_them() {
+        for (raw, normalized) in [
+            ("Matrix_PyPI", "matrix-pypi"),
+            ("friendly-bard", "friendly-bard"),
+            ("Friendly-Bard", "friendly-bard"),
+            ("FRIENDLY-BARD", "friendly-bard"),
+            ("friendly.bard", "friendly-bard"),
+            ("friendly_bard", "friendly-bard"),
+            ("friendly--bard", "friendly-bard"),
+            ("FrIeNdLy-._.-bArD", "friendly-bard"),
+        ] {
+            assert_eq!(normalize_project_name(raw), normalized, "{raw}");
+        }
+    }
+
+    /// A filename is publisher-controlled input; a bare `"` in it used to end
+    /// the `href` early and hand pip a link to nowhere.
+    #[test]
+    fn publisher_controlled_text_cannot_break_out_of_the_markup() {
+        let html = build_simple_repository_html(
+            "evil",
+            &[PyPIVersionEntry {
+                version: "1.0.0".into(),
+                filename: "x\"><script>alert(1)</script>.whl".into(),
+                sha256: None,
+                download_url: "https://example.test/a\"b".into(),
+            }],
+        );
+
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&quot;"), "{html}");
+    }
+
+    #[test]
+    fn the_root_index_links_every_project_with_its_trailing_slash() {
+        let html = build_simple_root_html(&[PyPIProjectEntry {
+            name: "Matrix_PyPI".into(),
+            url: "https://example.test/simple/matrix-pypi/".into(),
+        }]);
+
+        assert!(
+            html.contains("<a href=\"https://example.test/simple/matrix-pypi/\">Matrix_PyPI</a>"),
+            "{html}"
+        );
+    }
 }

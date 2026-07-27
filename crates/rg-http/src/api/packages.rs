@@ -691,37 +691,76 @@ pub async fn npm_registry_metadata(
 
 // ── PyPI Protocol Endpoints ───────────────────────────────
 
+/// Base of the PyPI Simple Repository API for one repository, trailing slash
+/// excluded — `{base}/simple`, the prefix a client is pointed at.
+fn pypi_simple_base(base_url: &str, owner: &str, repo: &str) -> String {
+    format!(
+        "{}/api/v1/repos/{}/{}/packages/pypi/simple",
+        base_url.trim_end_matches('/'),
+        owner,
+        repo,
+    )
+}
+
+/// Resolve the project a client asked for to the name it was published under.
+///
+/// PEP 503 has the *client* normalize the name before putting it in the URL, so
+/// `pip install Matrix_PyPI` asks for `matrix-pypi/`, while the registry stores
+/// whatever `Name:` the wheel metadata carried. Only reached after a lookup on
+/// the literal spelling missed, so the common case still costs one query.
+async fn resolve_pypi_project(
+    db: &sea_orm::DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    requested: &str,
+) -> Option<String> {
+    let wanted = rg_core::package_registry::normalize_project_name(requested);
+
+    rg_core::package_registry::service::list_packages(db, owner, repo, "pypi")
+        .await
+        .ok()?
+        .into_iter()
+        .find(|pkg| rg_core::package_registry::normalize_project_name(&pkg.name) == wanted)
+        .map(|pkg| pkg.name)
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/
 /// GET /api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}
 ///
-/// PyPI Simple Repository API (PEP 503).
+/// PyPI Simple Repository API (PEP 503) — the project page.
 /// Returns an HTML page with download links for all versions.
+///
+/// Both spellings are routed here because PEP 503 defines the project URL
+/// *with* the trailing slash and that is what pip, poetry and uv send; the bare
+/// one is kept for a hand-typed URL or a proxy that strips the slash.
 pub async fn pypi_simple_index(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((owner, name, pkg_name)): Path<(String, String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    let versions = match rg_core::package_registry::service::list_versions(
+    // The spelling in the URL first — one query, and the common case. Only a
+    // miss pays for the normalized scan.
+    let (project, versions) = match rg_core::package_registry::service::list_versions(
         &state.db, &owner, &name, "pypi", &pkg_name,
     )
     .await
     {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Ok(versions) => (pkg_name.clone(), versions),
+        Err(miss) => match resolve_pypi_project(&state.db, &owner, &name, &pkg_name).await {
+            Some(stored) => match rg_core::package_registry::service::list_versions(
+                &state.db, &owner, &name, "pypi", &stored,
+            )
+            .await
+            {
+                Ok(versions) => (stored, versions),
+                Err(e) => return err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+            },
+            None => return err(StatusCode::NOT_FOUND, &format!("{miss:#}")),
+        },
     };
 
-    let base_url = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|host| {
-            let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{}://{}", scheme, host)
-        })
-        .unwrap_or_else(|| "http://localhost".into());
+    let base_url = build_base_url(&headers);
 
     let entries: Vec<rg_core::package_registry::PyPIVersionEntry> = versions
         .iter()
@@ -737,14 +776,17 @@ pub async fn pypi_simple_index(
 
             let filename = primary_file
                 .map(|f| f.filename.clone())
-                .unwrap_or_else(|| format!("{}-{}.tar.gz", pkg_name, v.version));
+                .unwrap_or_else(|| format!("{}-{}.tar.gz", project, v.version));
 
+            // The download route matches on the *stored* package name, so the
+            // link has to carry that one and not the normalized spelling the
+            // client asked with.
             let download_url = format!(
                 "{}/api/v1/repos/{}/{}/packages/pypi/{}/{}/{}",
                 base_url.trim_end_matches('/'),
                 owner,
                 name,
-                pkg_name,
+                project,
                 v.version,
                 filename,
             );
@@ -758,7 +800,52 @@ pub async fn pypi_simple_index(
         })
         .collect();
 
-    let html = rg_core::package_registry::build_simple_repository_html(&pkg_name, &entries);
+    let html = rg_core::package_registry::build_simple_repository_html(&project, &entries);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/pypi/simple/
+/// GET /api/v1/repos/{owner}/{name}/packages/pypi/simple
+///
+/// PyPI Simple Repository API (PEP 503) — the root index: one link per project,
+/// each pointing at that project's page.
+///
+/// This is the URL a user configures as `--index-url`, so it has to answer even
+/// when the repository has no PyPI packages yet: an empty index is a valid
+/// answer, a 404 (which in production falls through to the SPA and returns
+/// HTML) is not.
+pub async fn pypi_simple_root_index(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let packages =
+        rg_core::package_registry::service::list_packages(&state.db, &owner, &name, "pypi")
+            .await
+            .unwrap_or_default();
+
+    let base = pypi_simple_base(&build_base_url(&headers), &owner, &name);
+
+    let projects: Vec<rg_core::package_registry::PyPIProjectEntry> = packages
+        .iter()
+        .map(|pkg| rg_core::package_registry::PyPIProjectEntry {
+            name: pkg.name.clone(),
+            url: format!(
+                "{}/{}/",
+                base,
+                rg_core::package_registry::normalize_project_name(&pkg.name)
+            ),
+        })
+        .collect();
+
+    let html = rg_core::package_registry::build_simple_root_html(&projects);
 
     (
         StatusCode::OK,

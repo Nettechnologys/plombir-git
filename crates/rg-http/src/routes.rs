@@ -1515,6 +1515,29 @@ pub(crate) fn build_all_routes(
             api::packages::npm_registry_metadata,
         )
         // PyPI Simple Repository API (PEP 503)
+        //
+        // The spec spells both of its URLs with a trailing slash — the root
+        // index is `.../simple/` and a project page is `.../simple/<name>/` —
+        // and that is what pip, poetry and uv build. Axum matches paths
+        // literally, so the slashed spelling has to be registered too: without
+        // it the request misses the router, falls through to the SPA fallback,
+        // and pip is handed HTML that is not an index. Same failure as `GET
+        // /v2/` in [`build_v2_routes`], one directory up.
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/pypi/simple/",
+            api::packages::pypi_simple_root_index,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/pypi/simple",
+            api::packages::pypi_simple_root_index,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/",
+            api::packages::pypi_simple_index,
+        )
         .get(
             RepoRead,
             "/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}",

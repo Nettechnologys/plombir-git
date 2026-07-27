@@ -73,6 +73,7 @@ mod private_repo_issue_metadata_tests;
 mod private_repo_visibility_tests;
 mod pull_request_ci_tests;
 mod push_hook_drain_tests;
+mod pypi_simple_index_tests;
 mod registry_lockout_tests;
 mod release_attestation_tests;
 mod release_tests;

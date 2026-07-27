@@ -14,7 +14,10 @@ pub use adapters::nuget::{
     build_registration_index, build_search_results, build_service_index, NuGetRegistrationEntry,
     NuGetSearchResult,
 };
-pub use adapters::pypi::{build_simple_repository_html, PyPIVersionEntry};
+pub use adapters::pypi::{
+    build_simple_repository_html, build_simple_root_html, normalize_project_name, PyPIProjectEntry,
+    PyPIVersionEntry,
+};
 pub use adapters::rubygems::{
     build_dependencies_json, build_gem_info_json, RubyGemsDep, RubyGemsDependencyEntry,
     RubyGemsVersionEntry,
