@@ -5,6 +5,8 @@ use sea_orm::DatabaseConnection;
 
 use rg_db::ops::notification_ops;
 
+use crate::repo::service::WatchState;
+
 /// Create a notification for a user.
 pub async fn notify(
     db: &DatabaseConnection,
@@ -87,16 +89,14 @@ pub async fn delete_notification_for_user(
 
 // ── Watch notification helpers ─────────────────────────────────────────
 
-/// The one `repo_watch.watch_state` value that means "send me things".
+/// The one [`WatchState`] that means "send me things".
 ///
-/// The subscribe endpoint accepts three states (`watching`, `not_watching`,
-/// `ignoring` — see `web/src/lib/api/repos.ts`) and `DELETE .../watch` is
+/// The subscribe endpoint accepts three states and `DELETE .../watch` is
 /// implemented as `set_watch(.., "not_watching")` rather than a row delete, so
-/// the row survives an unwatch. `repo_watch_ops::list_watchers` returns *every*
-/// row for the repo, which makes it a list of subscriptions, not of subscribers
-/// — hence the allowlist here rather than a `!= "not_watching"` test: an
-/// unrecognised state must not be read as consent.
-const WATCH_STATE_SUBSCRIBED: &str = "watching";
+/// the row survives an unwatch. `repo_watch_ops::list_watch_rows` returns
+/// *every* row for the repo — subscriptions, not subscribers — hence the
+/// allowlist here rather than a `!= "not_watching"` test.
+const WATCH_STATE_SUBSCRIBED: WatchState = WatchState::Watching;
 
 /// Notify all watchers of a repository about an event.
 ///
@@ -119,7 +119,7 @@ pub async fn notify_watchers(
     notification_type: &str,
     body: Option<String>,
 ) -> Result<()> {
-    let watchers = rg_db::ops::repo_watch_ops::list_watchers(db, repo_id, 0, 1000)
+    let watchers = rg_db::ops::repo_watch_ops::list_watch_rows(db, repo_id, 0, 1000)
         .await?
         .0;
     if watchers.is_empty() {
@@ -142,7 +142,7 @@ pub async fn notify_watchers(
     };
     for watcher in watchers {
         // An unwatched / ignored subscription is a row, not a recipient.
-        if watcher.watch_state != WATCH_STATE_SUBSCRIBED {
+        if watcher.watch_state != WATCH_STATE_SUBSCRIBED.as_str() {
             continue;
         }
         // Don't notify the author themselves

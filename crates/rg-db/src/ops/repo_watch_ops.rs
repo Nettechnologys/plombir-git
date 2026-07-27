@@ -7,6 +7,11 @@ use crate::entities::repo_watch::{self, ActiveModel, Entity as RepoWatchEntity, 
 
 /// Set watch state for a repo (upsert).
 /// Returns the new watch_state.
+///
+/// Raw write: `state` is stored verbatim. The allowlist lives one layer up in
+/// `rg_core::repo::service::WatchState` — go through
+/// `rg_core::repo::service::set_watch` for anything carrying a client-supplied
+/// value.
 pub async fn set_watch_state(
     db: &DatabaseConnection,
     user_id: i64,
@@ -61,14 +66,18 @@ pub async fn get_watch_state(
     Ok(result.map(|r| r.watch_state))
 }
 
-/// Remove watch (set back to not_watching).
-pub async fn remove_watch(db: &DatabaseConnection, user_id: i64, repo_id: i64) -> Result<()> {
-    set_watch_state(db, user_id, repo_id, "not_watching").await?;
-    Ok(())
-}
-
-/// List watchers of a repo with pagination.
-pub async fn list_watchers(
+/// List the watch *rows* of a repo with pagination — subscriptions, not
+/// subscribers.
+///
+/// Deliberately unfiltered: `DELETE .../watch` is implemented as a write of
+/// `not_watching` rather than a row delete, so an unwatched and an ignoring
+/// user both keep a row here. This used to be called `list_watchers`, which
+/// read as "the people subscribed to this repo" and is exactly what it is not —
+/// its one caller had to re-filter by `watch_state` to avoid notifying people
+/// who had unsubscribed. Any consumer wanting subscribers (a watcher count, a
+/// watchers endpoint) must filter by
+/// `rg_core::repo::service::WatchState::Watching`.
+pub async fn list_watch_rows(
     db: &DatabaseConnection,
     repo_id: i64,
     offset: u64,
@@ -78,14 +87,18 @@ pub async fn list_watchers(
         .filter(repo_watch::Column::RepoId.eq(repo_id))
         .order_by_desc(repo_watch::Column::UpdatedAt);
 
-    let total = base.clone().count(db).await.context("db: count watchers")? as i64;
+    let total = base
+        .clone()
+        .count(db)
+        .await
+        .context("db: count watch rows")? as i64;
 
-    let watchers = base
+    let rows = base
         .offset(offset)
         .limit(limit)
         .all(db)
         .await
-        .context("db: list watchers")?;
+        .context("db: list watch rows")?;
 
-    Ok((watchers, total))
+    Ok((rows, total))
 }

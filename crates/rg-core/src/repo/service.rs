@@ -818,14 +818,66 @@ pub async fn list_stargazers(
     rg_db::ops::repo_star_ops::list_stargazers(db, repo_id, offset, limit).await
 }
 
+/// The three values `repo_watch.watch_state` is allowed to hold.
+///
+/// The column is a bare `String`, and the subscribe endpoint used to write the
+/// request body into it unchecked: `{"state": "wathcing"}` answered `200 OK`
+/// with `{"watch_state": "wathcing"}`, the row was written, and the user was
+/// never notified about anything again — a typo silently unsubscribed them,
+/// with the API reporting success. The delivery side reads the state through an
+/// allowlist (see [`crate::notification`]), so anything outside these three is
+/// not "some other subscription", it is a permanently dead row.
+///
+/// Kept as a parsed type rather than a `matches!` at the handler so both doors
+/// — `PUT /watch` and any future caller of [`set_watch`] — go through the same
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchState {
+    /// Send me notifications for this repository.
+    Watching,
+    /// Subscribed to nothing — what `DELETE /watch` writes.
+    NotWatching,
+    /// Explicitly muted.
+    Ignoring,
+}
+
+impl WatchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Watching => "watching",
+            Self::NotWatching => "not_watching",
+            Self::Ignoring => "ignoring",
+        }
+    }
+
+    /// Parse a client-supplied state, rejecting anything else as a 400.
+    ///
+    /// The message is a fixed description of the rule (H-05) and deliberately
+    /// does not echo the offending value back to the client.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "watching" => Ok(Self::Watching),
+            "not_watching" => Ok(Self::NotWatching),
+            "ignoring" => Ok(Self::Ignoring),
+            _ => Err(crate::error::invalid_request(
+                "invalid watch state: expected one of watching, not_watching, ignoring",
+            )),
+        }
+    }
+}
+
 /// Set watch state for a repo. Returns new watch_state.
+///
+/// Validates `state` against [`WatchState`] — an unrecognised state is a
+/// rejected request, never a stored row.
 pub async fn set_watch(
     db: &DatabaseConnection,
     user_id: i64,
     repo_id: i64,
     state: &str,
 ) -> Result<String> {
-    rg_db::ops::repo_watch_ops::set_watch_state(db, user_id, repo_id, state).await
+    let state = WatchState::parse(state)?;
+    rg_db::ops::repo_watch_ops::set_watch_state(db, user_id, repo_id, state.as_str()).await
 }
 
 /// Get watch state.

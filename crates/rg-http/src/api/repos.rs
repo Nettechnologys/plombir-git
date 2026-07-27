@@ -553,6 +553,7 @@ pub async fn get_watch_status(
     request_body(content = serde_json::Value),
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
+        (status = 400, description = "Unknown watch state", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -609,10 +610,11 @@ pub async fn unwatch_repo(
             Err(e) => return e.into_response(),
         };
 
-    match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, "not_watching").await {
+    let unwatched = rg_core::repo::service::WatchState::NotWatching;
+    match rg_core::repo::service::set_watch(&state.db, user_id, repo.id, unwatched.as_str()).await {
         Ok(_) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "watch_state": "not_watching" })),
+            Json(serde_json::json!({ "watch_state": unwatched.as_str() })),
         )
             .into_response(),
         Err(e) => AppError::from(e).into_response(),

@@ -143,6 +143,98 @@ async fn public_repo_star_and_watch_stay_open_to_any_account() {
     }
 }
 
+// ── card_37ef65a84cec: the state itself must be validated ────────────────────
+//
+// `PUT /watch` wrote `body.state` into `repo_watch.watch_state` verbatim, and
+// the delivery side reads that column through an allowlist. So `{"state":
+// "wathcing"}` answered `200 OK` with `{"watch_state": "wathcing"}` — the user
+// believed they had subscribed and received nothing, for good. A typo must be
+// a rejected request, not a silently dead subscription.
+
+/// The stored `watch_state` for (user, repo), read straight from the DB.
+async fn stored_watch_state(db: &sea_orm::DatabaseConnection, repo_id: i64) -> Option<String> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    rg_db::entities::repo_watch::Entity::find()
+        .filter(rg_db::entities::repo_watch::Column::RepoId.eq(repo_id))
+        .one(db)
+        .await
+        .expect("query watch row")
+        .map(|row| row.watch_state)
+}
+
+/// `PUT /watch` with the given state; returns (status, `watch_state` echoed).
+async fn put_watch_state(
+    base: &str,
+    owner: &str,
+    repo: &str,
+    token: &str,
+    state: &str,
+) -> (u16, Option<String>) {
+    let resp = reqwest::Client::new()
+        .put(format!("{base}/api/v1/repos/{owner}/{repo}/watch"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "state": state }))
+        .send()
+        .await
+        .expect("watch request");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.expect("json");
+    (
+        status,
+        body["watch_state"].as_str().map(ToString::to_string),
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_watch_state_is_rejected_and_leaves_the_row_untouched() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let owner = "watchtypoowner";
+    let repo = "watchtyporepo";
+
+    let token = register_user(&base, owner, &format!("{owner}@example.com"), PW).await;
+    let repo_id = create_repo_with_visibility(&base, &token, repo, false).await;
+
+    // A real subscription first, so the rejection has something to not clobber.
+    let (status, echoed) = put_watch_state(&base, owner, repo, &token, "watching").await;
+    assert_eq!(status, 200, "subscribing with a legal state must work");
+    assert_eq!(echoed.as_deref(), Some("watching"));
+
+    for typo in ["wathcing", "WATCHING", "watching ", "", "subscribed"] {
+        let (status, _) = put_watch_state(&base, owner, repo, &token, typo).await;
+        assert_eq!(
+            status, 400,
+            "watch state {typo:?} is not one of the three and must be a 400, \
+             not a stored row"
+        );
+        assert_eq!(
+            stored_watch_state(&db, repo_id).await.as_deref(),
+            Some("watching"),
+            "a rejected state {typo:?} must not have touched the existing row"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_three_legal_watch_states_are_still_accepted() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let owner = "watchstatesowner";
+    let repo = "watchstatesrepo";
+
+    let token = register_user(&base, owner, &format!("{owner}@example.com"), PW).await;
+    let repo_id = create_repo_with_visibility(&base, &token, repo, false).await;
+
+    for state in ["watching", "ignoring", "not_watching"] {
+        let (status, echoed) = put_watch_state(&base, owner, repo, &token, state).await;
+        assert_eq!(status, 200, "{state} is a legal watch state");
+        assert_eq!(echoed.as_deref(), Some(state), "response must echo {state}");
+        assert_eq!(
+            stored_watch_state(&db, repo_id).await.as_deref(),
+            Some(state),
+            "{state} must be what lands in the row"
+        );
+    }
+}
+
 /// Count the notifications a user can see.
 async fn notification_count(base: &str, token: &str) -> usize {
     let body: serde_json::Value = reqwest::Client::new()
