@@ -223,7 +223,11 @@ mod tests {
     }
 
     /// Insert an import task with an explicit status and `updated_at`.
-    async fn insert_task(db: &DatabaseConnection, status: &str, updated_at: chrono::DateTime<Utc>) -> Model {
+    async fn insert_task(
+        db: &DatabaseConnection,
+        status: &str,
+        updated_at: chrono::DateTime<Utc>,
+    ) -> Model {
         let model = ActiveModel {
             user_id: Set(1),
             repo_id: Set(None),
@@ -285,7 +289,11 @@ mod tests {
         // Second call is a no-op: the task is no longer in a running status.
         assert!(!fail_stuck(&db, task.id, 600, "again").await.unwrap());
         let after2 = find_by_id(&db, task.id).await.unwrap().unwrap();
-        assert_eq!(after2.error.as_deref(), Some("interrupted"), "not clobbered");
+        assert_eq!(
+            after2.error.as_deref(),
+            Some("interrupted"),
+            "not clobbered"
+        );
     }
 
     #[tokio::test]

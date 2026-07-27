@@ -510,7 +510,10 @@ impl GiteaWorkflow {
                             paths,
                         });
                     } else {
-                        script.push("echo \"actions/cache requires both 'path' and 'key'\" >&2; exit 78".into());
+                        script.push(
+                            "echo \"actions/cache requires both 'path' and 'key'\" >&2; exit 78"
+                                .into(),
+                        );
                     }
                     continue;
                 }

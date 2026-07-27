@@ -975,9 +975,7 @@ pub async fn fork_repo(
         .ok_or_else(|| crate::error::not_found("repository"))?;
 
     if source_repo.is_private && !can_read_repo(db, &source_repo, Some(user_id)).await? {
-        return Err(crate::error::forbidden(
-            "cannot read private repository",
-        ));
+        return Err(crate::error::forbidden("cannot read private repository"));
     }
 
     // The forker id comes from a verified token, so a missing row here is our
@@ -1838,10 +1836,16 @@ mod permission_matrix_tests {
 
     async fn mk_user(db: &DatabaseConnection) -> i64 {
         let tag = uuid::Uuid::new_v4().simple().to_string();
-        user_ops::create_user(db, &format!("u_{tag}"), &format!("{tag}@example.test"), "", "")
-            .await
-            .expect("create user")
-            .id
+        user_ops::create_user(
+            db,
+            &format!("u_{tag}"),
+            &format!("{tag}@example.test"),
+            "",
+            "",
+        )
+        .await
+        .expect("create user")
+        .id
     }
 
     async fn mk_repo(

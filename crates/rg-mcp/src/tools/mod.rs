@@ -640,7 +640,14 @@ fn tool_update_issue(state: &AppState, args: &Value) -> String {
     let api_path = format!("/repos/{}/{}/issues/{}", owner, repo, number);
     let body = body_from(
         args,
-        &["title", "body", "state", "labels", "assignee_id", "milestone_id"],
+        &[
+            "title",
+            "body",
+            "state",
+            "labels",
+            "assignee_id",
+            "milestone_id",
+        ],
     );
     let client = crate::client::ApiClient::new(state);
     run(async move { client.patch_raw(&api_path, &body).await })
@@ -843,10 +850,7 @@ fn tool_get_ci_job(state: &AppState, args: &Value) -> String {
     if job_id == 0 {
         return "Error: job_id is required".into();
     }
-    let api_path = format!(
-        "/repos/{}/{}/pipelines/{}/jobs/{}",
-        owner, repo, id, job_id
-    );
+    let api_path = format!("/repos/{}/{}/pipelines/{}/jobs/{}", owner, repo, id, job_id);
     let client = crate::client::ApiClient::new(state);
     run(async move { client.get_raw(&api_path).await })
 }
@@ -1000,7 +1004,10 @@ mod tests {
     fn call_text(name: &str, arguments: Value) -> String {
         let r = call_tool(
             &state(),
-            &req("tools/call", serde_json::json!({ "name": name, "arguments": arguments })),
+            &req(
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": arguments }),
+            ),
         );
         r.result
             .and_then(|v| v.get("content").cloned())
@@ -1055,7 +1062,10 @@ mod tests {
             "ai_repo_tree",
             "ai_search_code",
         ] {
-            assert!(names.contains(&expected.to_string()), "missing tool: {expected}");
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing tool: {expected}"
+            );
         }
         // No duplicate tool names.
         let mut sorted = names.clone();
@@ -1068,7 +1078,10 @@ mod tests {
     fn unknown_tool_is_rejected() {
         let resp = call_tool(
             &state(),
-            &req("tools/call", serde_json::json!({ "name": "does_not_exist" })),
+            &req(
+                "tools/call",
+                serde_json::json!({ "name": "does_not_exist" }),
+            ),
         );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32601);
@@ -1078,21 +1091,42 @@ mod tests {
     fn write_tools_validate_required_args_before_any_network_call() {
         // Each returns a validation error string without touching the network,
         // so these run with no live backend.
-        assert!(call_text("create_issue", serde_json::json!({ "owner": "o", "repo": "r" }))
-            .starts_with("Error:"));
-        assert!(call_text("comment_issue", serde_json::json!({ "owner": "o", "repo": "r", "number": 1 }))
-            .starts_with("Error:"));
-        assert!(call_text("merge_pr", serde_json::json!({ "owner": "o", "repo": "r", "number": 1 }))
-            .starts_with("Error:"));
-        assert!(call_text("create_review", serde_json::json!({ "owner": "o", "repo": "r", "number": 1 }))
-            .starts_with("Error:"));
-        assert!(call_text("create_pr", serde_json::json!({ "owner": "o", "repo": "r", "title": "t" }))
-            .starts_with("Error:"));
-        assert!(call_text("get_ci_job", serde_json::json!({ "owner": "o", "repo": "r", "id": 1 }))
-            .starts_with("Error:"));
+        assert!(call_text(
+            "create_issue",
+            serde_json::json!({ "owner": "o", "repo": "r" })
+        )
+        .starts_with("Error:"));
+        assert!(call_text(
+            "comment_issue",
+            serde_json::json!({ "owner": "o", "repo": "r", "number": 1 })
+        )
+        .starts_with("Error:"));
+        assert!(call_text(
+            "merge_pr",
+            serde_json::json!({ "owner": "o", "repo": "r", "number": 1 })
+        )
+        .starts_with("Error:"));
+        assert!(call_text(
+            "create_review",
+            serde_json::json!({ "owner": "o", "repo": "r", "number": 1 })
+        )
+        .starts_with("Error:"));
+        assert!(call_text(
+            "create_pr",
+            serde_json::json!({ "owner": "o", "repo": "r", "title": "t" })
+        )
+        .starts_with("Error:"));
+        assert!(call_text(
+            "get_ci_job",
+            serde_json::json!({ "owner": "o", "repo": "r", "id": 1 })
+        )
+        .starts_with("Error:"));
         assert!(call_text("search", serde_json::json!({})).starts_with("Error:"));
-        assert!(call_text("set_issue_labels", serde_json::json!({ "owner": "o", "repo": "r", "number": 1 }))
-            .starts_with("Error:"));
+        assert!(call_text(
+            "set_issue_labels",
+            serde_json::json!({ "owner": "o", "repo": "r", "number": 1 })
+        )
+        .starts_with("Error:"));
     }
 
     #[test]

@@ -358,7 +358,10 @@ mod tests {
         }
         // IPv4-mapped loopback must fold back to the v4 check.
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(is_forbidden_ip(mapped), "mapped loopback should be forbidden");
+        assert!(
+            is_forbidden_ip(mapped),
+            "mapped loopback should be forbidden"
+        );
     }
 
     #[test]
@@ -384,9 +387,11 @@ mod tests {
     #[tokio::test]
     async fn guard_blocks_ip_literal_targets() {
         assert!(guard_outbound_url("http://127.0.0.1/hook").await.is_err());
-        assert!(guard_outbound_url("http://169.254.169.254/latest/meta-data")
-            .await
-            .is_err());
+        assert!(
+            guard_outbound_url("http://169.254.169.254/latest/meta-data")
+                .await
+                .is_err()
+        );
         assert!(guard_outbound_url("http://[::1]/hook").await.is_err());
         // Public IP literal: passes the guard (no DNS needed).
         assert!(guard_outbound_url("https://1.1.1.1/hook").await.is_ok());

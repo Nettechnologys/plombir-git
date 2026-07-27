@@ -95,9 +95,14 @@ impl Harness {
 async fn harness(username: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = rg_db::connect_with_pool(&format!("sqlite://{}?mode=rwc", db_path.display()), 5, 60, 2)
-        .await
-        .unwrap();
+    let db = rg_db::connect_with_pool(
+        &format!("sqlite://{}?mode=rwc", db_path.display()),
+        5,
+        60,
+        2,
+    )
+    .await
+    .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
 
     let password_hash = rg_core::auth::password::hash_password(PASSWORD).unwrap();
@@ -223,7 +228,11 @@ async fn rejected_ssh_passwords_reach_the_login_log() {
     assert!(!h.try_password("nobody_here", "wrong-3").await);
 
     let known = h.failed_log_rows("ssh_logged").await;
-    assert_eq!(known.len(), 2, "SSH password failures missing from login_log");
+    assert_eq!(
+        known.len(),
+        2,
+        "SSH password failures missing from login_log"
+    );
     for row in &known {
         assert_eq!(row.auth_provider, "ssh", "the door is not named in the log");
         assert_eq!(row.user_id, Some(h.user_id));
@@ -236,7 +245,11 @@ async fn rejected_ssh_passwords_reach_the_login_log() {
     }
 
     let unknown = h.failed_log_rows("nobody_here").await;
-    assert_eq!(unknown.len(), 1, "an attempt on an unknown login went unrecorded");
+    assert_eq!(
+        unknown.len(),
+        1,
+        "an attempt on an unknown login went unrecorded"
+    );
     assert_eq!(unknown[0].user_id, None);
 
     h.server.abort();
@@ -251,7 +264,11 @@ async fn a_successful_ssh_password_clears_the_strikes() {
 
     assert!(!h.try_password("ssh_reset", "wrong-1").await);
     assert!(!h.try_password("ssh_reset", "wrong-2").await);
-    assert_eq!(h.user().await.login_attempts, 2, "baseline: strikes recorded");
+    assert_eq!(
+        h.user().await.login_attempts,
+        2,
+        "baseline: strikes recorded"
+    );
 
     assert!(h.try_password("ssh_reset", PASSWORD).await);
     assert_eq!(

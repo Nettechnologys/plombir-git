@@ -171,9 +171,9 @@ pub fn verify_envelope(
 
     match statement.subject_sha256() {
         Some(sha) if sha == expected_sha256 => {}
-        Some(sha) => bail!(
-            "attestation subject digest {sha} does not match asset digest {expected_sha256}"
-        ),
+        Some(sha) => {
+            bail!("attestation subject digest {sha} does not match asset digest {expected_sha256}")
+        }
         None => bail!("attestation statement has no sha256 subject digest"),
     }
 
@@ -191,8 +191,7 @@ mod tests {
 
     const SECRET: &str = "instance-secret";
     // SHA-256 of the empty string — a convenient fixed digest for vectors.
-    const EMPTY_SHA256: &str =
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn sample_statement() -> Statement {
         Statement::new(

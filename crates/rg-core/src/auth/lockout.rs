@@ -110,22 +110,22 @@ pub async fn settle_password_attempt(
         // says nothing about whether anybody is guessing, and counting those
         // would keep an account locked forever on its owner's own retries.
         if !password_ok && !locked {
-            locked =
-                match user_ops::record_failed_login(db, user.id, MAX_FAILED_PASSWORD_ATTEMPTS).await
-                {
-                    Ok(locked) => locked,
-                    Err(error) => {
-                        // `false` is also what a successful write reports for
-                        // "not locked yet", so without this line a broken write
-                        // degrades the lockout into a no-op that looks fine.
-                        tracing::warn!(
-                            user_id = user.id,
-                            error = %format!("{error:#}"),
-                            "failed to record a failed password attempt, brute-force counter did not advance"
-                        );
-                        false
-                    }
-                };
+            locked = match user_ops::record_failed_login(db, user.id, MAX_FAILED_PASSWORD_ATTEMPTS)
+                .await
+            {
+                Ok(locked) => locked,
+                Err(error) => {
+                    // `false` is also what a successful write reports for
+                    // "not locked yet", so without this line a broken write
+                    // degrades the lockout into a no-op that looks fine.
+                    tracing::warn!(
+                        user_id = user.id,
+                        error = %format!("{error:#}"),
+                        "failed to record a failed password attempt, brute-force counter did not advance"
+                    );
+                    false
+                }
+            };
         }
     }
 

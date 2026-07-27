@@ -23,8 +23,8 @@ use webauthn_rs::prelude::*;
 
 pub use webauthn_rs::prelude::{
     AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey, PasskeyAuthentication,
-    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse,
-    Url, Uuid, Webauthn,
+    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse, Url, Uuid, Webauthn,
 };
 
 /// Fixed namespace for deriving a stable per-user WebAuthn user handle from the
@@ -56,8 +56,8 @@ pub fn user_handle(user_id: i64) -> Uuid {
 /// `rp_id` must be a registrable suffix of the origin host (e.g. `git.example.com`
 /// for `https://git.example.com`, or `localhost` for `http://localhost:5173`).
 pub fn build(rp_id: &str, rp_origin: &str) -> Result<Webauthn> {
-    let origin = Url::parse(rp_origin)
-        .with_context(|| format!("invalid webauthn origin: {rp_origin}"))?;
+    let origin =
+        Url::parse(rp_origin).with_context(|| format!("invalid webauthn origin: {rp_origin}"))?;
     let builder = WebauthnBuilder::new(rp_id, &origin)
         .map_err(|e| anyhow!("webauthn builder init failed: {e}"))?
         .rp_name(RP_NAME);

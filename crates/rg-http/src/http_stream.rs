@@ -122,7 +122,10 @@ mod tests {
             .collect();
         let body = buffered_body_with_idle(output.clone(), 30);
         let got = drain_body(body).await;
-        assert_eq!(got, output, "prompt reader must get the exact buffered bytes");
+        assert_eq!(
+            got, output,
+            "prompt reader must get the exact buffered bytes"
+        );
     }
 
     /// `idle_secs == 0` disables the bound; delivery still completes intact.

@@ -255,9 +255,7 @@ pub async fn download_asset(
     if let Some(expected) = asset.sha256.as_deref() {
         let actual = hex::encode(Sha256::digest(&data));
         if actual != expected {
-            anyhow::bail!(
-                "asset integrity check failed: expected sha256 {expected}, got {actual}"
-            );
+            anyhow::bail!("asset integrity check failed: expected sha256 {expected}, got {actual}");
         }
     }
 

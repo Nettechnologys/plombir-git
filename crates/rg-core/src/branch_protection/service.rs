@@ -274,9 +274,7 @@ pub async fn check_merge_allowed(
         if approval_count < required {
             return Err(crate::error::forbidden(format!(
                 "merging into protected branch '{}' requires at least {} approval(s), got {}",
-                target_branch,
-                required,
-                approval_count
+                target_branch, required, approval_count
             )));
         }
     }
@@ -297,8 +295,7 @@ pub async fn check_merge_allowed(
                     _ => {
                         return Err(crate::error::forbidden(format!(
                             "branch '{}' requires status checks but no CI pipeline found for PR {}",
-                            target_branch,
-                            pr_id
+                            target_branch, pr_id
                         )));
                     }
                 };

@@ -1,7 +1,7 @@
 //! Regression coverage for repository-scoped PR and review authorization.
 
-use chrono::Utc;
 use crate::common::{build_test_app_state, register_full, setup_test_db, spawn_test_app_with_db};
+use chrono::Utc;
 use sea_orm::Set;
 
 async fn create_private_repo(base: &str, token: &str, name: &str) -> i64 {

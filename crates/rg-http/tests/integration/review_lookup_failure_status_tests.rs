@@ -53,8 +53,12 @@ async fn insert_pr(db: &sea_orm::DatabaseConnection, repo_id: i64, author_id: i6
 
 async fn repo_with_pr(prefix: &str) -> (String, sea_orm::DatabaseConnection, String) {
     let (base, db) = spawn_test_app_with_db().await;
-    let (token, user_id) =
-        register_full(&base, &format!("{prefix}-owner"), &format!("{prefix}@example.com")).await;
+    let (token, user_id) = register_full(
+        &base,
+        &format!("{prefix}-owner"),
+        &format!("{prefix}@example.com"),
+    )
+    .await;
     let repo_id = reqwest::Client::new()
         .post(format!("{base}/api/v1/repos"))
         .bearer_auth(&token)
@@ -79,7 +83,9 @@ fn assert_broken_lookup(status: reqwest::StatusCode, body: &serde_json::Value, w
     );
     let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        !message.contains("db:") && !message.contains("pr_reviews") && !message.contains("review_comments"),
+        !message.contains("db:")
+            && !message.contains("pr_reviews")
+            && !message.contains("review_comments"),
         "the {what} response body must not carry internal error detail, got: {message}"
     );
 }

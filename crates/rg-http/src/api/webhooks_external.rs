@@ -61,7 +61,8 @@ fn verify_hub_signature(
         HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| "HMAC key init failed")?;
     mac.update(body);
     // `verify_slice` is a constant-time comparison (guards against timing oracles).
-    mac.verify_slice(&provided).map_err(|_| "signature mismatch")
+    mac.verify_slice(&provided)
+        .map_err(|_| "signature mismatch")
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

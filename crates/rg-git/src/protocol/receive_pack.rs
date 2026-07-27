@@ -446,7 +446,10 @@ where
         if let Some(mut stderr) = stderr {
             let mut err_msg = Vec::new();
             stderr.read_to_end(&mut err_msg).await?;
-            bail!("git index-pack failed: {}", String::from_utf8_lossy(&err_msg));
+            bail!(
+                "git index-pack failed: {}",
+                String::from_utf8_lossy(&err_msg)
+            );
         }
         bail!("git index-pack failed with status {}", status);
     }
@@ -939,7 +942,11 @@ mod native_index_pack_tests {
     /// Sorted list of every object id physically present in `dir` (across all packs + loose).
     fn all_object_ids(dir: &Path) -> Vec<String> {
         let mut ids: Vec<String> = git_ok(
-            &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
             dir,
         )
         .lines()
@@ -1006,11 +1013,17 @@ mod native_index_pack_tests {
 
         // Build the thin pack: objects in B but not A, deltas against A (not in pack).
         let revs = format!("^{a}\n{b}\n");
-        let (ok, thin) =
-            git_stdin(&["pack-objects", "--thin", "--revs", "--stdout"], &work, revs.as_bytes())
-                .await;
+        let (ok, thin) = git_stdin(
+            &["pack-objects", "--thin", "--revs", "--stdout"],
+            &work,
+            revs.as_bytes(),
+        )
+        .await;
         assert!(ok, "pack-objects failed");
-        assert!(thin.windows(4).any(|w| w == b"PACK"), "expected a PACK stream");
+        assert!(
+            thin.windows(4).any(|w| w == b"PACK"),
+            "expected a PACK stream"
+        );
 
         // Path 1 — git index-pack --fix-thin into t_git.
         let (git_ok_status, _) =
@@ -1037,12 +1050,16 @@ mod native_index_pack_tests {
         for dst in [&t_git, &t_native] {
             git_ok(&["update-ref", "refs/heads/main", &b], dst);
             assert!(
-                gw().run(&["cat-file", "-e", &b], Some(dst)).unwrap().success(),
+                gw().run(&["cat-file", "-e", &b], Some(dst))
+                    .unwrap()
+                    .success(),
                 "B unreachable in {}",
                 dst.display()
             );
             assert!(
-                gw().run(&["fsck", "--strict"], Some(dst)).unwrap().success(),
+                gw().run(&["fsck", "--strict"], Some(dst))
+                    .unwrap()
+                    .success(),
                 "fsck failed in {}",
                 dst.display()
             );
@@ -1079,13 +1096,19 @@ mod native_index_pack_tests {
         let head = git_ok(&["rev-parse", "HEAD"], &work);
 
         // A full (non-thin) pack of HEAD.
-        let (ok, pack) =
-            git_stdin(&["pack-objects", "--revs", "--stdout"], &work, format!("{head}\n").as_bytes())
-                .await;
+        let (ok, pack) = git_stdin(
+            &["pack-objects", "--revs", "--stdout"],
+            &work,
+            format!("{head}\n").as_bytes(),
+        )
+        .await;
         assert!(ok, "pack-objects failed");
 
         let target = tmp.path().join("t.git");
-        git_ok(&["init", "-q", "--bare", target.to_str().unwrap()], tmp.path());
+        git_ok(
+            &["init", "-q", "--bare", target.to_str().unwrap()],
+            tmp.path(),
+        );
 
         // Drive write_to_directory directly with an already-tripped interrupt.
         let repo_path = target.clone();

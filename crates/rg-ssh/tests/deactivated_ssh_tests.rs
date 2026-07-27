@@ -68,9 +68,14 @@ struct Harness {
 async fn harness(username: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = rg_db::connect_with_pool(&format!("sqlite://{}?mode=rwc", db_path.display()), 5, 60, 2)
-        .await
-        .unwrap();
+    let db = rg_db::connect_with_pool(
+        &format!("sqlite://{}?mode=rwc", db_path.display()),
+        5,
+        60,
+        2,
+    )
+    .await
+    .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
 
     let password_hash = rg_core::auth::password::hash_password(PASSWORD).unwrap();

@@ -136,7 +136,10 @@ async fn mfa_disable_shares_one_counter_with_the_login_form() {
 
     // ...and the last one on the MFA-disable door. If the two doors counted
     // separately this would be strike 1 of 5 and the account would stay open.
-    assert_eq!(disable_attempt(&base, &token, "not-the-password").await, 401);
+    assert_eq!(
+        disable_attempt(&base, &token, "not-the-password").await,
+        401
+    );
 
     let account = user(&db, user_id).await;
     assert_eq!(account.login_attempts, threshold);
@@ -163,7 +166,10 @@ async fn rejected_mfa_disable_passwords_reach_the_login_log() {
 
     let threshold = rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS;
     for _ in 1..=threshold {
-        assert_eq!(disable_attempt(&base, &token, "not-the-password").await, 401);
+        assert_eq!(
+            disable_attempt(&base, &token, "not-the-password").await,
+            401
+        );
     }
     // The right password, refused by the lock the run above created.
     assert_eq!(disable_attempt(&base, &token, PASSWORD).await, 401);
@@ -192,7 +198,10 @@ async fn rejected_mfa_disable_passwords_reach_the_login_log() {
     let mut expected = vec![Some("invalid_credentials"); threshold as usize - 1];
     expected.push(Some("account_locked")); // the strike that trips the threshold
     expected.push(Some("account_locked")); // the right password, refused by it
-    assert_eq!(reasons, expected, "the door did not file the lock it created");
+    assert_eq!(
+        reasons, expected,
+        "the door did not file the lock it created"
+    );
 }
 
 /// The counterweight to locking the whole account from here: nothing decays
@@ -207,7 +216,10 @@ async fn a_successful_mfa_disable_clears_the_strikes() {
         .expect("enable mfa");
 
     for _ in 0..2 {
-        assert_eq!(disable_attempt(&base, &token, "not-the-password").await, 401);
+        assert_eq!(
+            disable_attempt(&base, &token, "not-the-password").await,
+            401
+        );
     }
     assert_eq!(user(&db, user_id).await.login_attempts, 2);
 

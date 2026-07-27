@@ -263,7 +263,11 @@ async fn the_owning_repository_still_deletes_its_own_entry() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204, "the owner must still delete their entry");
+    assert_eq!(
+        resp.status(),
+        204,
+        "the owner must still delete their entry"
+    );
 
     assert_eq!(victim_entry_count(&f).await, 0, "the entry survived");
 }
@@ -346,7 +350,11 @@ async fn the_private_write_surface_is_closed_to_outsiders() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204, "the owner must still delete their entry");
+    assert_eq!(
+        resp.status(),
+        204,
+        "the owner must still delete their entry"
+    );
 
     assert_eq!(
         victim_entry_count(&f).await,

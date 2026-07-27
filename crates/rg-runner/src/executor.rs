@@ -264,21 +264,28 @@ mod tests {
         );
 
         // Defense-in-depth flags aligned with rg-ci PipelineRunner.
-        let window = |flag: &str, value: &str| {
-            args.windows(2)
-                .any(|w| w[0] == flag && w[1] == value)
-        };
-        assert!(window("--cap-drop", "ALL"), "missing --cap-drop=ALL: {args:?}");
+        let window =
+            |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert!(
+            window("--cap-drop", "ALL"),
+            "missing --cap-drop=ALL: {args:?}"
+        );
         assert!(
             window("--security-opt", "no-new-privileges"),
             "missing no-new-privileges: {args:?}"
         );
-        assert!(window("--pids-limit", DOCKER_PIDS_LIMIT), "missing --pids-limit");
+        assert!(
+            window("--pids-limit", DOCKER_PIDS_LIMIT),
+            "missing --pids-limit"
+        );
         assert!(window("--memory", DOCKER_MEMORY_LIMIT), "missing --memory");
         assert!(window("--cpus", DOCKER_CPU_LIMIT), "missing --cpus");
 
         // Never grant a path to the host daemon / devices.
-        assert!(!args.iter().any(|a| a == "--privileged"), "--privileged leaked in");
+        assert!(
+            !args.iter().any(|a| a == "--privileged"),
+            "--privileged leaked in"
+        );
         assert!(
             !args.iter().any(|a| a.contains("docker.sock")),
             "docker socket mounted"
@@ -286,10 +293,16 @@ mod tests {
 
         // Secret values must not appear on the command line — only the name.
         assert!(args.iter().any(|a| a == "CI_JOB_TOKEN"));
-        assert!(!args.iter().any(|a| a == "secret"), "secret value leaked into argv");
+        assert!(
+            !args.iter().any(|a| a == "secret"),
+            "secret value leaked into argv"
+        );
 
         // Image and script still terminate the invocation.
-        assert_eq!(&args[args.len() - 4..], &["alpine:3.20", "sh", "-c", "echo hi"]);
+        assert_eq!(
+            &args[args.len() - 4..],
+            &["alpine:3.20", "sh", "-c", "echo hi"]
+        );
     }
 
     #[tokio::test]

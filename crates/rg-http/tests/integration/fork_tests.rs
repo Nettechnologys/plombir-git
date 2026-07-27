@@ -184,7 +184,8 @@ async fn outsider_cannot_fork_a_private_repository() {
     let (owner_token, _) = register_full(&base, "privowner", "privowner@example.com").await;
     create_seeded_repo(&base, &owner_token, "privme", true).await;
     create_seeded_repo(&base, &owner_token, "publicme", false).await;
-    let (outsider_token, _) = register_full(&base, "privoutsider", "privoutsider@example.com").await;
+    let (outsider_token, _) =
+        register_full(&base, "privoutsider", "privoutsider@example.com").await;
 
     let client = reqwest::Client::new();
     let resp = client

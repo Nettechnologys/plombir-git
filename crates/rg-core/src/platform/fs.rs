@@ -498,10 +498,13 @@ mod tests {
         let target = not_a_dir.join("alice");
 
         let error = fs::create_dir_all(&target).expect_err("a file cannot host a subdirectory");
-        let rendered = super::path_error("repo owner directory", &target, &error, REPO_ROOT_HINT)
-            .to_string();
+        let rendered =
+            super::path_error("repo owner directory", &target, &error, REPO_ROOT_HINT).to_string();
 
-        assert!(rendered.contains(&target.display().to_string()), "{rendered}");
+        assert!(
+            rendered.contains(&target.display().to_string()),
+            "{rendered}"
+        );
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
     }
 

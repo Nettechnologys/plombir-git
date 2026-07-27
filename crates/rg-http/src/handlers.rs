@@ -26,9 +26,7 @@ const WEB_BUILD_HINT: &str = "the frontend bundle is expected in `web/build/` re
 /// request extensions. This handler reads it and injects `nonce="<value>"`
 /// into every `<script>` tag so the browser allows inline scripts under
 /// the strict `script-src 'self' 'nonce-<value>'` CSP.
-pub(crate) async fn spa_index_handler(
-    Extension(nonce): Extension<security::CspNonce>,
-) -> Response {
+pub(crate) async fn spa_index_handler(Extension(nonce): Extension<security::CspNonce>) -> Response {
     let index_path = spa_index_path();
     match tokio::fs::read(&index_path).await {
         Ok(html_bytes) => {

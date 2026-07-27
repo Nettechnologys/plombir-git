@@ -120,9 +120,7 @@ async fn main() -> anyhow::Result<()> {
             token,
             auth_token,
             config,
-        } => {
-            runner::cmd_runner(server, name, labels, runner_id, token, auth_token, config).await?
-        }
+        } => runner::cmd_runner(server, name, labels, runner_id, token, auth_token, config).await?,
 
         Commands::Import {
             platform,

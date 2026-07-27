@@ -332,7 +332,8 @@ mod tests {
     #[test]
     fn db_statement_error_stays_500() {
         // Exec/Query are statement-level (constraint/type/logic) — not an outage.
-        let err: AppError = DbErr::Exec(RuntimeErr::Internal("UNIQUE constraint failed".into())).into();
+        let err: AppError =
+            DbErr::Exec(RuntimeErr::Internal("UNIQUE constraint failed".into())).into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.code(), "INTERNAL_ERROR");
 
@@ -364,9 +365,15 @@ mod tests {
             panic!("expected InternalError, got {app_err:?}");
         };
         // All three layers survive, innermost cause included.
-        assert!(logged.contains("creating repository \"acme/widgets\""), "{logged}");
+        assert!(
+            logged.contains("creating repository \"acme/widgets\""),
+            "{logged}"
+        );
         assert!(logged.contains("db: failed to insert repo"), "{logged}");
-        assert!(logged.contains("UNIQUE constraint failed: repos.name"), "{logged}");
+        assert!(
+            logged.contains("UNIQUE constraint failed: repos.name"),
+            "{logged}"
+        );
     }
 
     /// Same guarantee on the 503 branch, which resolves the message separately
@@ -386,7 +393,10 @@ mod tests {
             panic!("expected ServiceUnavailable, got {app_err:?}");
         };
         assert!(logged.contains("runner watchdog sweep"), "{logged}");
-        assert!(logged.contains("db: failed to list pending jobs"), "{logged}");
+        assert!(
+            logged.contains("db: failed to list pending jobs"),
+            "{logged}"
+        );
         assert!(logged.contains("Connection pool timed out"), "{logged}");
     }
 

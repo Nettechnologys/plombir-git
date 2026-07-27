@@ -1683,7 +1683,10 @@ mod tests {
             .unwrap()
             .success());
         assert!(git
-            .run(&["config", "user.email", "ci@example.com"], Some(&repo_path))
+            .run(
+                &["config", "user.email", "ci@example.com"],
+                Some(&repo_path)
+            )
             .unwrap()
             .success());
         std::fs::write(repo_path.join("README.md"), "hi").unwrap();
@@ -1764,10 +1767,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let allow_stage =
-            rg_db::ops::pipeline_ops::create_stage(&db, allow_pipeline.id, "test", 0)
-                .await
-                .unwrap();
+        let allow_stage = rg_db::ops::pipeline_ops::create_stage(&db, allow_pipeline.id, "test", 0)
+            .await
+            .unwrap();
         let allow_job = rg_db::ops::pipeline_ops::create_job(
             &db,
             allow_stage.id,

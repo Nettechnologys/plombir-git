@@ -1066,8 +1066,14 @@ mod oid_validation_tests {
 
     #[test]
     fn rejects_uppercase_and_non_hex() {
-        assert!(!is_valid_oid(&"A".repeat(64)), "uppercase hex must be rejected");
-        assert!(!is_valid_oid(&"g".repeat(64)), "'g' is out of the hex range");
+        assert!(
+            !is_valid_oid(&"A".repeat(64)),
+            "uppercase hex must be rejected"
+        );
+        assert!(
+            !is_valid_oid(&"g".repeat(64)),
+            "'g' is out of the hex range"
+        );
 
         // A path-traversal attempt padded to length 64 must never validate.
         let mut traversal = "a".repeat(60);

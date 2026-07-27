@@ -143,13 +143,7 @@ async fn a_push_notifies_subscribed_watchers_but_not_the_pusher() {
     let unwatcher = user(&db, "pushunwatcher").await;
 
     let repo = rg_core::repo::service::create_repo(
-        &db,
-        pusher.id,
-        "pushrepo",
-        None,
-        false,
-        &repo_root,
-        None,
+        &db, pusher.id, "pushrepo", None, false, &repo_root, None,
     )
     .await
     .expect("create repo");

@@ -263,7 +263,13 @@ async fn register_separates_a_taken_username_from_a_broken_insert() {
     let client = reqwest::Client::new();
     let url = format!("{base}/api/v1/users/register");
 
-    register_user(&base, "regfail-first", "regfail-first@example.com", "Qz7$wRtm").await;
+    register_user(
+        &base,
+        "regfail-first",
+        "regfail-first@example.com",
+        "Qz7$wRtm",
+    )
+    .await;
 
     let resp = client
         .post(&url)

@@ -218,15 +218,32 @@ mod tests {
         rg_db::run_migrations(&db).await.unwrap();
 
         // Minimal pipeline → stage → job chain so there is a real row to append to.
-        let pipeline =
-            rg_db::ops::pipeline_ops::create_pipeline(&db, 1, "deadbeef", "refs/heads/main", "push", None)
-                .await
-                .unwrap();
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            1,
+            "deadbeef",
+            "refs/heads/main",
+            "push",
+            None,
+        )
+        .await
+        .unwrap();
         let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "build", 0)
             .await
             .unwrap();
         let job = rg_db::ops::pipeline_ops::create_job(
-            &db, stage.id, "compile", "cargo build", None, None, None, None, None, false, None, None,
+            &db,
+            stage.id,
+            "compile",
+            "cargo build",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
             None,
         )
         .await
@@ -331,7 +348,10 @@ mod tests {
             "expected the write-failure warning, got: {rendered}"
         );
         // The `.context("db: ...")` layer — what a bare `%e` would have shown.
-        assert!(rendered.contains("db: "), "missing context layer: {rendered}");
+        assert!(
+            rendered.contains("db: "),
+            "missing context layer: {rendered}"
+        );
         // …and the actual reason underneath it, which is the whole point.
         assert!(
             rendered.contains("no such table"),

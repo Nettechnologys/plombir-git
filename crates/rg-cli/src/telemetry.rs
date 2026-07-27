@@ -114,8 +114,7 @@ pub(crate) fn init(
     appender_guard: Option<WorkerGuard>,
     otel: Option<OtelConfig>,
 ) -> anyhow::Result<TelemetryGuard> {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // `.with_target(false)` preserves the terser log format the server used
     // before the registry refactor.

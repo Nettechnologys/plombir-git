@@ -795,7 +795,10 @@ mod token_tests {
     fn pat_has_expected_prefix_and_length() {
         let token = generate_token();
         // `ifp_` (4) + 32 bytes as hex (64) = 68 chars.
-        assert!(token.starts_with("ifp_"), "PAT must carry the ifp_ prefix: {token}");
+        assert!(
+            token.starts_with("ifp_"),
+            "PAT must carry the ifp_ prefix: {token}"
+        );
         assert_eq!(token.len(), 68, "unexpected PAT length: {token}");
     }
 
@@ -808,7 +811,11 @@ mod token_tests {
             "PAT body must be pure hex: {body}"
         );
         let bytes = hex::decode(body).expect("PAT body must be valid hex");
-        assert_eq!(bytes.len(), 32, "PAT must carry 32 bytes (256 bits) of entropy");
+        assert_eq!(
+            bytes.len(),
+            32,
+            "PAT must carry 32 bytes (256 bits) of entropy"
+        );
     }
 
     #[test]
@@ -817,7 +824,10 @@ mod token_tests {
         // minted in a tight loop within the same process/instant.
         let mut seen = HashSet::new();
         for _ in 0..1000 {
-            assert!(seen.insert(generate_token()), "PAT collision — entropy too weak");
+            assert!(
+                seen.insert(generate_token()),
+                "PAT collision — entropy too weak"
+            );
         }
     }
 

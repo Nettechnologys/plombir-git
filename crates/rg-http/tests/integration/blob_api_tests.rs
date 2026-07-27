@@ -51,7 +51,10 @@ async fn oversized_blob_is_reported_too_large_not_buffered() {
     // ── Seed a commit with one file above the cap and one small text file. ──
     let worktree = tempfile::tempdir().unwrap();
     git(&["init", "--initial-branch=main"], Some(worktree.path()));
-    git(&["config", "user.name", "Blob Integration"], Some(worktree.path()));
+    git(
+        &["config", "user.name", "Blob Integration"],
+        Some(worktree.path()),
+    );
     git(
         &["config", "user.email", "blob-integration@example.com"],
         Some(worktree.path()),
@@ -66,7 +69,13 @@ async fn oversized_blob_is_reported_too_large_not_buffered() {
     let bare_str = bare_path.to_string_lossy().to_string();
     git(&["push", &bare_str, "main"], Some(worktree.path()));
     git(
-        &["--git-dir", &bare_str, "symbolic-ref", "HEAD", "refs/heads/main"],
+        &[
+            "--git-dir",
+            &bare_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
         None,
     );
 
@@ -93,10 +102,22 @@ async fn oversized_blob_is_reported_too_large_not_buffered() {
         .json()
         .await
         .unwrap();
-    assert_eq!(big["too_large"], serde_json::json!(true), "big.bin must be flagged too_large");
-    assert_eq!(big["content"], serde_json::json!(""), "oversized body must not be buffered");
+    assert_eq!(
+        big["too_large"],
+        serde_json::json!(true),
+        "big.bin must be flagged too_large"
+    );
+    assert_eq!(
+        big["content"],
+        serde_json::json!(""),
+        "oversized body must not be buffered"
+    );
     assert_eq!(big["encoding"], serde_json::json!("none"));
-    assert_eq!(big["size"], serde_json::json!(big_len as i64), "size metadata is still reported");
+    assert_eq!(
+        big["size"],
+        serde_json::json!(big_len as i64),
+        "size metadata is still reported"
+    );
 
     // Small blob: served in full, unchanged.
     let small: serde_json::Value = client
@@ -107,9 +128,17 @@ async fn oversized_blob_is_reported_too_large_not_buffered() {
         .json()
         .await
         .unwrap();
-    assert_eq!(small["too_large"], serde_json::json!(false), "small.txt must not be flagged");
+    assert_eq!(
+        small["too_large"],
+        serde_json::json!(false),
+        "small.txt must not be flagged"
+    );
     assert_eq!(small["encoding"], serde_json::json!("utf-8"));
-    assert_eq!(small["content"], serde_json::json!("hello blob\n"), "small blob served byte-for-byte");
+    assert_eq!(
+        small["content"],
+        serde_json::json!("hello blob\n"),
+        "small blob served byte-for-byte"
+    );
 
     server.abort();
 }

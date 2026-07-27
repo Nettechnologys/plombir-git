@@ -49,7 +49,10 @@ async fn broken_team_delete_is_not_reported_as_a_missing_team() {
     // `404`, with the fixed message. Without this the assertion further down
     // cannot tell "the status got fixed" from "this endpoint 500s on anything".
     let resp = client
-        .delete(format!("{base}/api/v1/orgs/teamdel-org/teams/{}", team_id + 1))
+        .delete(format!(
+            "{base}/api/v1/orgs/teamdel-org/teams/{}",
+            team_id + 1
+        ))
         .bearer_auth(&token)
         .send()
         .await

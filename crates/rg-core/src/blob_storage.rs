@@ -575,7 +575,9 @@ mod tests {
     async fn io_failures_name_the_path_the_errno_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let occupied = dir.path().join("artifacts");
-        tokio::fs::write(&occupied, b"not a directory").await.unwrap();
+        tokio::fs::write(&occupied, b"not a directory")
+            .await
+            .unwrap();
         let storage = LocalBlobStorage::new(dir.path());
         let key = BlobKey::new("artifacts/1/one.bin").unwrap();
 

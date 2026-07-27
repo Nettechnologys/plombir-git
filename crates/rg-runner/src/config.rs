@@ -355,7 +355,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runner.toml");
 
-        let loaded = load_config(path.to_str().unwrap()).expect("missing file must not be an error");
+        let loaded =
+            load_config(path.to_str().unwrap()).expect("missing file must not be an error");
 
         assert!(loaded.is_none());
     }
@@ -396,7 +397,11 @@ labels = ["linux", "docker"]
     fn a_malformed_config_file_is_reported_with_path_and_cause() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runner.toml");
-        std::fs::write(&path, "server = \"http://127.0.0.1:8080\"\nthis is not toml\n").unwrap();
+        std::fs::write(
+            &path,
+            "server = \"http://127.0.0.1:8080\"\nthis is not toml\n",
+        )
+        .unwrap();
 
         let error = load_config(path.to_str().unwrap())
             .expect_err("a malformed config must not be silently treated as absent");

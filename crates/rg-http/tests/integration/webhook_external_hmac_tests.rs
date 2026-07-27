@@ -49,7 +49,10 @@ async fn external_ci_webhook_enforces_hmac_when_secret_configured() {
         .post(&url)
         .bearer_auth(&token)
         .header("content-type", "application/json")
-        .header("X-Hub-Signature-256", sign("attacker-secret", body.as_bytes()))
+        .header(
+            "X-Hub-Signature-256",
+            sign("attacker-secret", body.as_bytes()),
+        )
         .body(body.to_string())
         .send()
         .await

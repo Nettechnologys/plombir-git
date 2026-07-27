@@ -1,5 +1,5 @@
-use base64::Engine as _;
 use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_oci_root};
+use base64::Engine as _;
 
 async fn create_repo(base: &str, token: &str, name: &str, is_private: bool) {
     let client = reqwest::Client::new();
@@ -145,7 +145,8 @@ async fn the_registry_answers_the_spec_version_check_path() {
             "GET {path} must identify itself as a registry"
         );
         assert!(
-            resp.headers().contains_key(reqwest::header::WWW_AUTHENTICATE),
+            resp.headers()
+                .contains_key(reqwest::header::WWW_AUTHENTICATE),
             "GET {path} must carry the auth challenge that starts the token flow"
         );
     }

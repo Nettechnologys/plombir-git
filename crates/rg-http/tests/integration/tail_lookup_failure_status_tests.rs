@@ -83,8 +83,7 @@ async fn broken_notification_lookup_is_not_reported_as_a_missing_notification() 
 #[tokio::test]
 async fn another_users_notification_is_still_reported_as_absent() {
     let (base, db) = spawn_test_app_with_db().await;
-    let (owner_token, owner_id) =
-        register_full(&base, "notiowner", "notiowner@example.com").await;
+    let (owner_token, owner_id) = register_full(&base, "notiowner", "notiowner@example.com").await;
     let (other_token, _) = register_full(&base, "notiother", "notiother@example.com").await;
 
     let created = rg_db::ops::notification_ops::create_notification(
@@ -133,8 +132,7 @@ async fn broken_protection_lookup_is_not_reported_as_a_missing_rule() {
     let (token, _) = register_full(&base, "protfail-owner", "protfail@example.com").await;
     create_repo(&base, &token, "protfail-repo").await;
 
-    let url =
-        format!("{base}/api/v1/repos/protfail-owner/protfail-repo/branches/protection/1");
+    let url = format!("{base}/api/v1/repos/protfail-owner/protfail-repo/branches/protection/1");
     let client = reqwest::Client::new();
 
     let resp = client
@@ -143,7 +141,11 @@ async fn broken_protection_lookup_is_not_reported_as_a_missing_rule() {
         .send()
         .await
         .expect("request");
-    assert_eq!(resp.status(), 404, "an absent protection rule is still a 404");
+    assert_eq!(
+        resp.status(),
+        404,
+        "an absent protection rule is still a 404"
+    );
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(
         body["error"]["message"], "protection rule not found",

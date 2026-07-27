@@ -284,7 +284,11 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
             oci::put_manifest,
         )
         // Blobs
-        .get(OCI_TOKEN, "/v2/{owner}/{repo}/blobs/{digest}", oci::get_blob)
+        .get(
+            OCI_TOKEN,
+            "/v2/{owner}/{repo}/blobs/{digest}",
+            oci::get_blob,
+        )
         .head(
             OCI_TOKEN,
             "/v2/{owner}/{repo}/blobs/{digest}",

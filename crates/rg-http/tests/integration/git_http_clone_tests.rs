@@ -45,17 +45,9 @@ async fn public_repo_clones_over_live_http() {
     .await
     .unwrap();
     // Public (is_private = false) so an anonymous clone is authorized.
-    rg_core::repo::service::create_repo(
-        &db,
-        user.id,
-        "clone-repo",
-        None,
-        false,
-        &repo_root,
-        None,
-    )
-    .await
-    .unwrap();
+    rg_core::repo::service::create_repo(&db, user.id, "clone-repo", None, false, &repo_root, None)
+        .await
+        .unwrap();
     let bare_path = repo_root.join("http-owner/clone-repo.git");
 
     // ── Seed the bare repo with a commit whose pack spans several 64 KiB
@@ -63,7 +55,10 @@ async fn public_repo_clones_over_live_http() {
     //    response genuinely exercises multi-chunk streaming + backpressure. ──
     let worktree = tempfile::tempdir().unwrap();
     git(&["init", "--initial-branch=main"], Some(worktree.path()));
-    git(&["config", "user.name", "HTTP Integration"], Some(worktree.path()));
+    git(
+        &["config", "user.name", "HTTP Integration"],
+        Some(worktree.path()),
+    );
     git(
         &["config", "user.email", "http-integration@example.com"],
         Some(worktree.path()),
@@ -85,7 +80,13 @@ async fn public_repo_clones_over_live_http() {
     let bare_str = bare_path.to_string_lossy().to_string();
     git(&["push", &bare_str, "main"], Some(worktree.path()));
     git(
-        &["--git-dir", &bare_str, "symbolic-ref", "HEAD", "refs/heads/main"],
+        &[
+            "--git-dir",
+            &bare_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
         None,
     );
     let expected_sha = git(&["rev-parse", "HEAD"], Some(worktree.path()));
@@ -111,7 +112,10 @@ async fn public_repo_clones_over_live_http() {
     let cloned_blob = std::fs::read(clone_path.join("big.bin")).expect("big.bin must be cloned");
     assert_eq!(cloned_blob, blob, "cloned blob must match byte-for-byte");
     let cloned_sha = git(&["rev-parse", "HEAD"], Some(clone_path.as_path()));
-    assert_eq!(cloned_sha, expected_sha, "cloned HEAD must match origin tip");
+    assert_eq!(
+        cloned_sha, expected_sha,
+        "cloned HEAD must match origin tip"
+    );
 
     server.abort();
 }

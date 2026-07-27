@@ -1,5 +1,5 @@
-use chrono::Utc;
 use crate::common::{register_full, spawn_test_app_with_db};
+use chrono::Utc;
 use sea_orm::{ActiveValue, Set};
 
 #[tokio::test]

@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::common::{build_test_app_state, setup_test_db};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use crate::common::{build_test_app_state, setup_test_db};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]

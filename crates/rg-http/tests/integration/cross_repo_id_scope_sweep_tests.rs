@@ -316,9 +316,7 @@ async fn insert_pr(
             // refuses a pull request without one *before* it looks a comment
             // up, so a null head would stop the probe at a `409` and prove
             // nothing about the id.
-            head_sha: Set(Some(
-                "0000000000000000000000000000000000000000".to_string(),
-            )),
+            head_sha: Set(Some("0000000000000000000000000000000000000000".to_string())),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
             head_repo_id: Set(None),
@@ -683,11 +681,7 @@ async fn seed_vault(
         .await;
     let asset = fx
         .client
-        .post(fx.url(
-            VICTIM,
-            VAULT,
-            &format!("/releases/{}/assets", ids.release),
-        ))
+        .post(fx.url(VICTIM, VAULT, &format!("/releases/{}/assets", ids.release)))
         .bearer_auth(token)
         .header("content-type", "text/plain")
         .header("content-disposition", "attachment; filename=scope.txt")
@@ -1044,7 +1038,9 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
             });
             if !maven_segment
                 && !GLOBAL_ID_PLACEHOLDERS.contains(&name)
-                && !PER_REPO_PLACEHOLDERS.iter().any(|(known, _)| *known == name)
+                && !PER_REPO_PLACEHOLDERS
+                    .iter()
+                    .any(|(known, _)| *known == name)
             {
                 unknown.insert(format!("  {{{name}}} in {}", fact.label()));
             }
@@ -1130,16 +1126,8 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
 
     // ── Pass one: the attacker's repository, the victim's ids ──────────────
     for (fact, targets) in &probes {
-        let (status, body) = drive(
-            &fx,
-            fact,
-            ATTACKER,
-            HOST,
-            &fx.attacker_token,
-            targets,
-            &ids,
-        )
-        .await;
+        let (status, body) =
+            drive(&fx, fact, ATTACKER, HOST, &fx.attacker_token, targets, &ids).await;
         verdicts.insert(fact.label(), status);
         if denied(status) {
             continue;

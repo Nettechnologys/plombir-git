@@ -796,18 +796,18 @@ pub async fn put_manifest(
     // retry is harmless, under-counting is not, so a failure here fails the
     // push instead of being swallowed.
     for blob_digest in parsed.referenced_blobs() {
-        let blob =
-            match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &blob_digest).await {
-                Ok(Some(blob)) => blob,
-                Ok(None) => continue,
-                Err(e) => {
-                    return oci_err(
-                        oci_status_for(&e),
-                        "UNKNOWN",
-                        &format!("failed to look up referenced blob {blob_digest}: {e}"),
-                    )
-                }
-            };
+        let blob = match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &blob_digest).await
+        {
+            Ok(Some(blob)) => blob,
+            Ok(None) => continue,
+            Err(e) => {
+                return oci_err(
+                    oci_status_for(&e),
+                    "UNKNOWN",
+                    &format!("failed to look up referenced blob {blob_digest}: {e}"),
+                )
+            }
+        };
         if let Err(e) = rg_db::ops::oci_ops::increment_blob_ref(&state.db, blob.id).await {
             return oci_err(
                 oci_status_for(&e),
@@ -1308,14 +1308,12 @@ async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow:
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
-        file.write_all(&data).await.map_err(|error| staged(&error))?;
+        file.write_all(&data)
+            .await
+            .map_err(|error| staged(&error))?;
     }
 
-    let size = file
-        .metadata()
-        .await
-        .map_err(|error| staged(&error))?
-        .len() as i64;
+    let size = file.metadata().await.map_err(|error| staged(&error))?.len() as i64;
     Ok(size)
 }
 

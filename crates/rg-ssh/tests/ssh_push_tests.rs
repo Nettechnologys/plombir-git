@@ -40,9 +40,14 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
     // Production connect path (WAL + synchronous=NORMAL + busy_timeout), not a
     // bare `Database::connect` on sqlx's DELETE/FULL defaults — same
     // configuration as the server, and ~6x less time in the migration run.
-    let db = rg_db::connect_with_pool(&format!("sqlite://{}?mode=rwc", db_path.display()), 5, 60, 2)
-        .await
-        .unwrap();
+    let db = rg_db::connect_with_pool(
+        &format!("sqlite://{}?mode=rwc", db_path.display()),
+        5,
+        60,
+        2,
+    )
+    .await
+    .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
 
     let user = rg_db::ops::user_ops::create_user(

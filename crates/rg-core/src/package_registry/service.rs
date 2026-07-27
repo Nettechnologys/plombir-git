@@ -482,7 +482,8 @@ pub async fn download_file(
     // Need to get package_id from version — we already know it
     let v = rg_db::ops::package_version_ops::find_by_id(db, version_detail.id).await?;
     if let Some(v) = v {
-        if let Err(error) = rg_db::ops::package_ops::increment_download_count(db, v.package_id).await
+        if let Err(error) =
+            rg_db::ops::package_ops::increment_download_count(db, v.package_id).await
         {
             tracing::warn!(
                 package_id = v.package_id,

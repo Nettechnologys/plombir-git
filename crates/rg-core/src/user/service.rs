@@ -761,7 +761,11 @@ pub async fn reset_password(
     // answers 400; the lookup that decides it is ours and answers 5xx.
     let token = match token_record {
         Some(t) if !t.used && t.expires_at > Utc::now() => t,
-        _ => return Err(crate::error::invalid_request("invalid or expired reset token")),
+        _ => {
+            return Err(crate::error::invalid_request(
+                "invalid or expired reset token",
+            ))
+        }
     };
 
     // Validate new password
