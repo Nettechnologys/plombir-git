@@ -266,6 +266,17 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
     .await
     .expect("seed open PR");
 
+    // Drain *before* clearing. The seed write's hooks are detached, so under a
+    // loaded parallel run they can still be queued at this point and land in the
+    // recorder after the clear — leaving two entries for the assertion below to
+    // trip over. Observed as a flake in a 35-test filter; the clear silently
+    // assumed the seed's hook had already run.
+    let tracker = rg_core::task_tracker::delivery_tracker();
+    tracker.close();
+    tokio::time::timeout(Duration::from_secs(120), tracker.wait())
+        .await
+        .expect("the seed write's hooks drained within timeout");
+    tracker.reopen();
     ci_engine.triggered.lock().unwrap().clear();
 
     let resp = client

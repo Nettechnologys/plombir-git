@@ -13,6 +13,7 @@
 //! layer. [`PushNotifier`] is the seam — `rg_http::ws::NotificationHub`
 //! implements it, and a caller without a hub passes `None`.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -131,6 +132,78 @@ impl PostPushContext {
     }
 }
 
+/// How deep a chain of hook-triggered merges may run before it is cut off.
+///
+/// Each step of a legitimate chain closes a pull request, so a real workflow
+/// converges in a couple of hops; anything longer is a cycle somebody built by
+/// accident. Eight is far above any sane fan-out and still a hard stop.
+const MAX_MERGE_CASCADE_DEPTH: usize = 8;
+
+/// The work list of ref updates one hook run has left to process.
+///
+/// The hooks can *cause* ref updates: they run auto-merge and the merge queue,
+/// and a merge advances the base branch. That move owes the same hooks — but
+/// running them by recursion would be a cycle with no visible bound
+/// (hook → merge → hook → …) and, in an `async fn`, would not even compile
+/// without boxing. So the cycle is a loop here, with both of its bounds written
+/// down in one place where a test can hold them:
+///
+/// * every `(refname, new_sha)` is processed **at most once** per run, and
+/// * a chain of merges may not run deeper than [`MAX_MERGE_CASCADE_DEPTH`].
+///
+/// The first bound is what actually makes an infinite cascade impossible: a
+/// merge produces a *new* commit, so a repeat can only come from a cycle. The
+/// depth limit is the backstop for a cycle that keeps minting fresh commits.
+struct RefUpdateCascade {
+    pending: VecDeque<(RefUpdate, usize)>,
+    seen: HashSet<(String, String)>,
+}
+
+impl RefUpdateCascade {
+    /// Seed the work list with the updates the transport actually received.
+    fn new(initial: &[RefUpdate]) -> Self {
+        let mut cascade = Self {
+            pending: VecDeque::new(),
+            seen: HashSet::new(),
+        };
+        cascade.extend(initial.iter().cloned(), 0);
+        cascade
+    }
+
+    /// Queue follow-up updates discovered at `depth`, dropping the ones that
+    /// break either bound.
+    fn extend(&mut self, updates: impl IntoIterator<Item = RefUpdate>, depth: usize) {
+        for update in updates {
+            if depth > MAX_MERGE_CASCADE_DEPTH {
+                tracing::warn!(
+                    refname = %update.refname,
+                    new_sha = %update.new_sha,
+                    depth,
+                    "post-push cascade cut off at the depth limit — a merge chain this long is a loop, not a workflow"
+                );
+                continue;
+            }
+            if !self
+                .seen
+                .insert((update.refname.clone(), update.new_sha.clone()))
+            {
+                tracing::debug!(
+                    refname = %update.refname,
+                    new_sha = %update.new_sha,
+                    "post-push cascade skipped a ref move it had already handled in this run"
+                );
+                continue;
+            }
+            self.pending.push_back((update, depth));
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    fn next(&mut self) -> Option<(RefUpdate, usize)> {
+        self.pending.pop_front()
+    }
+}
+
 /// Post-push hook: trigger CI pipeline and webhook for push events.
 pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpdate]) {
     // Find repo_id from DB
@@ -157,7 +230,8 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         None => None,
     };
 
-    for update in ref_updates {
+    let mut cascade = RefUpdateCascade::new(ref_updates);
+    while let Some((update, depth)) = cascade.next() {
         if update.status != "ok" {
             continue;
         }
@@ -165,19 +239,24 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         tracing::info!(
             refname = %update.refname,
             new_sha = %update.new_sha,
+            depth,
             "Post-push: triggering hooks"
         );
 
         // 0. PR head-SHA refresh + auto-merge/merge-queue + protected-branch audit
         if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
-            post_push_branch_maintenance(params, repo_id, branch_name, update).await;
+            let merged = post_push_branch_maintenance(params, repo_id, branch_name, &update).await;
+            // A merge the maintenance above performed advanced *another* branch,
+            // and that move owes these same hooks. Back into the work list it
+            // goes rather than into a recursive call (card_87c4912c51ed).
+            cascade.extend(merged, depth + 1);
         }
 
         // 1. Trigger CI pipeline if .forgekeep-ci.yml exists
-        trigger_ci_for_push(params, repo_id, repo_owner_id, update).await;
+        trigger_ci_for_push(params, repo_id, repo_owner_id, &update).await;
 
         // 2-3. Push + branch/tag webhooks and the real-time notification
-        trigger_push_webhooks(params, repo_id, repo_owner_id, update).await;
+        trigger_push_webhooks(params, repo_id, repo_owner_id, &update).await;
 
         // 4. Watch fan-out.
         //
@@ -203,12 +282,16 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
 /// Section 0 of the post-push hook (branch updates only): refresh open-PR head
 /// SHAs, run the auto-merge / merge-queue evaluations for the new commit, and
 /// emit the protected-branch acceptance audit log.
+///
+/// Returns the base-branch moves the merges it performed produced, so the caller
+/// can run this same hook run over them (card_87c4912c51ed).
 async fn post_push_branch_maintenance(
     params: &PostPushParams<'_>,
     repo_id: i64,
     branch_name: &str,
     update: &RefUpdate,
-) {
+) -> Vec<RefUpdate> {
+    let mut merged_refs = Vec::new();
     if !update.new_sha.chars().all(|character| character == '0') {
         match rg_db::ops::pull_request_ops::update_open_head_sha(
             params.db,
@@ -219,7 +302,7 @@ async fn post_push_branch_maintenance(
         .await
         {
             Ok(_) => {
-                if let Err(error) = crate::pull_request::try_auto_merges_for_head_commit(
+                match crate::pull_request::try_auto_merges_for_head_commit(
                     params.db,
                     params.repo_root,
                     repo_id,
@@ -227,26 +310,37 @@ async fn post_push_branch_maintenance(
                 )
                 .await
                 {
-                    tracing::warn!(error = %format!("{error:#}"), "auto-merge evaluation after push failed");
+                    Ok(outcomes) => merged_refs.extend(
+                        outcomes
+                            .into_iter()
+                            .filter_map(|outcome| outcome.merge)
+                            .filter_map(|merge| merge.base_ref_update),
+                    ),
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "auto-merge evaluation after push failed")
+                    }
                 }
-                if let Err(error) =
-                    crate::pull_request::merge_queue::process_for_head_commit_with_ci(
-                        params.db,
-                        params.repo_root,
-                        repo_id,
-                        &update.new_sha,
-                        &crate::pull_request::merge_queue::MergeQueueCi {
-                            trigger: params.ci_engine,
-                            docker_enabled: params.docker_enabled,
-                            external_runners: params.external_runners,
-                            allow_host_runner: params.allow_host_runner,
-                            jwt_secret: Some(params.jwt_secret),
-                            external_url: params.external_url,
-                        },
-                    )
-                    .await
+                match crate::pull_request::merge_queue::process_for_head_commit_with_ci(
+                    params.db,
+                    params.repo_root,
+                    repo_id,
+                    &update.new_sha,
+                    &crate::pull_request::merge_queue::MergeQueueCi {
+                        trigger: params.ci_engine,
+                        docker_enabled: params.docker_enabled,
+                        external_runners: params.external_runners,
+                        allow_host_runner: params.allow_host_runner,
+                        jwt_secret: Some(params.jwt_secret),
+                        external_url: params.external_url,
+                    },
+                )
+                .await
                 {
-                    tracing::warn!(error = %format!("{error:#}"), "merge queue evaluation after push failed");
+                    Ok(results) => merged_refs
+                        .extend(results.into_iter().flat_map(|run| run.merged_ref_updates)),
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "merge queue evaluation after push failed")
+                    }
                 }
             }
             Err(error) => {
@@ -268,6 +362,7 @@ async fn post_push_branch_maintenance(
         }
         _ => {}
     }
+    merged_refs
 }
 
 /// Section 1 of the post-push hook: trigger a CI pipeline when a
@@ -439,4 +534,93 @@ async fn trigger_push_webhooks(
             "commit": update.new_sha,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moved(refname: &str, new_sha: &str) -> RefUpdate {
+        RefUpdate {
+            old_sha: "1".repeat(40),
+            new_sha: new_sha.to_string(),
+            refname: refname.to_string(),
+            status: "ok".to_string(),
+            message: String::new(),
+        }
+    }
+
+    /// The hooks run auto-merge, auto-merge moves a branch, and that move is fed
+    /// back into the hooks. Modelled here at its worst: *every* update produces
+    /// another, forever. The loop must still end — before card_87c4912c51ed this
+    /// shape did not exist at all, and the obvious way to write it (recursion)
+    /// would have had no bound.
+    #[test]
+    fn a_self_feeding_cascade_stops_at_the_depth_limit() {
+        let mut cascade = RefUpdateCascade::new(&[moved("refs/heads/main", "commit-0")]);
+        let mut processed = 0usize;
+
+        while let Some((_update, depth)) = cascade.next() {
+            processed += 1;
+            assert!(
+                processed <= MAX_MERGE_CASCADE_DEPTH + 1,
+                "the cascade ran past its own bound — this is the infinite \
+                 hook → merge → hook loop the work list exists to prevent"
+            );
+            // Each round mints a fresh commit, so the seen-set cannot stop it:
+            // only the depth limit can.
+            cascade.extend(
+                [moved("refs/heads/main", &format!("commit-{}", depth + 1))],
+                depth + 1,
+            );
+        }
+
+        assert_eq!(
+            processed,
+            MAX_MERGE_CASCADE_DEPTH + 1,
+            "the chain must run exactly the allowed depth (the seed plus \
+             {MAX_MERGE_CASCADE_DEPTH} follow-ups) and then stop"
+        );
+    }
+
+    /// A cycle that returns to a ref move already handled is the cheaper half of
+    /// the bound, and the one that actually fires: a merge commit is unique, so
+    /// seeing the same `(refname, new_sha)` twice means the chain closed a loop.
+    #[test]
+    fn the_same_ref_move_is_never_processed_twice() {
+        let mut cascade = RefUpdateCascade::new(&[moved("refs/heads/main", "merge-commit")]);
+        let mut processed = 0usize;
+
+        while let Some((update, depth)) = cascade.next() {
+            processed += 1;
+            assert!(processed <= 2, "a repeated ref move must not be re-run");
+            cascade.extend([update], depth + 1);
+        }
+
+        assert_eq!(
+            processed, 1,
+            "the second sighting of the same (refname, new_sha) must be dropped"
+        );
+    }
+
+    /// The bound must not punish a legitimate push: `git push --tags` carries one
+    /// update per tag, all of them at depth 0.
+    #[test]
+    fn a_wide_push_batch_is_not_mistaken_for_a_cascade() {
+        let updates: Vec<RefUpdate> = (0..50)
+            .map(|index| moved(&format!("refs/tags/v{index}"), &format!("tag-{index}")))
+            .collect();
+        let mut cascade = RefUpdateCascade::new(&updates);
+
+        let mut processed = 0usize;
+        while cascade.next().is_some() {
+            processed += 1;
+        }
+
+        assert_eq!(
+            processed, 50,
+            "every ref of a wide push must be processed — the depth limit bounds \
+             chains of merges, not the size of one push"
+        );
+    }
 }

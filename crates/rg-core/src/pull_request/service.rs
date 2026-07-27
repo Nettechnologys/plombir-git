@@ -6,6 +6,8 @@ use sea_orm::{DatabaseConnection, EntityTrait, Set};
 use std::collections::HashMap;
 
 use crate::error::NotFound;
+use rg_git::protocol::receive_pack::RefUpdate;
+
 use rg_db::entities::pull_request::{self, Model as PullRequest};
 use rg_db::entities::repository as repo_entity;
 use rg_db::ops::{pull_request_ops, repo_ops, user_ops};
@@ -1166,6 +1168,50 @@ pub async fn try_auto_merges_for_head_commit(
 pub struct MergeResult {
     pub merge_commit_sha: String,
     pub strategy: String,
+    /// How this merge moved `refs/heads/<base>`, for the caller's post-push
+    /// hooks. `None` = nothing observably moved (see [`base_ref_update`]).
+    ///
+    /// A merge advances the base branch exactly like a `git push` does, so it
+    /// owes the same automation: a CI pipeline on the merge commit, the `push`
+    /// webhook, the watch fan-out. Until card_87c4912c51ed a merge fired only
+    /// `pull_request.merged`, so "run CI on every push to main" silently did
+    /// not hold for the way most merges happen — through the UI.
+    ///
+    /// `rg-core` cannot run the hooks itself: they need the process's CI engine
+    /// and notification hub, which live in the transport layer. So the merge
+    /// reports the ref move and every caller holding that wiring feeds it into
+    /// [`crate::push_hooks::post_push_hooks`].
+    ///
+    /// `#[serde(skip)]`: `MergeResult` is a REST response body and this is
+    /// internal plumbing, not part of the API contract.
+    #[serde(skip)]
+    pub base_ref_update: Option<RefUpdate>,
+}
+
+/// The ref move a merge made to its base branch, or `None` when the hooks must
+/// not run for it.
+///
+/// Both guards are correctness, not defensive noise: an empty/zero `after` reads
+/// to [`crate::push_hooks::trigger_push_webhooks`] as a *deleted* branch and
+/// would fire `branch.deleted` for a branch that is alive, and an empty/zero
+/// `before` reads as a *created* one. `before` is only ever unknown when the
+/// pre-merge read of the base tip failed, and inventing zeros there would turn a
+/// missing pipeline into a wrong webhook.
+fn base_ref_update(base_branch: &str, before: &str, after: &str) -> Option<RefUpdate> {
+    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+    if before.is_empty() || before == ZERO_SHA || after.is_empty() || after == ZERO_SHA {
+        return None;
+    }
+    if before == after {
+        return None;
+    }
+    Some(RefUpdate {
+        old_sha: before.to_string(),
+        new_sha: after.to_string(),
+        refname: format!("refs/heads/{base_branch}"),
+        status: "ok".to_string(),
+        message: String::new(),
+    })
 }
 
 /// Merge a pull request using the specified strategy.
@@ -1243,6 +1289,23 @@ async fn merge_claimed_pr(
         bail!("repository path does not exist: {:?}", repo_path);
     }
 
+    // Read the base tip *before* the merge: afterwards the old commit is only
+    // reachable through the reflog, and the post-push hooks need the `before`
+    // half of the ref move to tell "branch advanced" from "branch created".
+    // A failed read costs the hooks for this merge, never the merge itself.
+    let base_sha_before = match get_ref_sha(&repo_path, &pr.base_branch) {
+        Ok(sha) => Some(sha),
+        Err(error) => {
+            tracing::warn!(
+                pr_id = pr.id,
+                base_branch = %pr.base_branch,
+                error = %format!("{error:#}"),
+                "could not read the base branch tip before merging — post-push hooks will be skipped for this merge"
+            );
+            None
+        }
+    };
+
     // For fork PRs, fetch head branch into target repo
     if let Some(head_repo_id) = pr.head_repo_id {
         let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
@@ -1293,7 +1356,15 @@ async fn merge_claimed_pr(
                 .await??
             };
 
-            return update_pr_merged(db, repo_name, pr, merge_commit_sha, strategy).await;
+            return update_pr_merged(
+                db,
+                repo_name,
+                pr,
+                merge_commit_sha,
+                strategy,
+                base_sha_before,
+            )
+            .await;
         }
     }
 
@@ -1311,7 +1382,15 @@ async fn merge_claimed_pr(
         .await??
     };
 
-    update_pr_merged(db, repo_name, pr, merge_commit_sha, strategy).await
+    update_pr_merged(
+        db,
+        repo_name,
+        pr,
+        merge_commit_sha,
+        strategy,
+        base_sha_before,
+    )
+    .await
 }
 
 /// Merge from an arbitrary ref (used for fork PRs).
@@ -1339,12 +1418,16 @@ fn merge_from_ref(
 }
 
 /// Update PR state after successful merge.
+///
+/// `base_sha_before` is the base branch tip read before the merge — see
+/// [`MergeResult::base_ref_update`], which is built from it.
 async fn update_pr_merged(
     db: &DatabaseConnection,
     repo_name: &str,
     mut pr: PullRequest,
     merge_commit_sha: String,
     strategy: MergeStrategy,
+    base_sha_before: Option<String>,
 ) -> Result<MergeResult> {
     pr.state = "merged".to_string();
     pr.merge_strategy = Some(format!("{:?}", strategy).to_lowercase());
@@ -1412,6 +1495,9 @@ async fn update_pr_merged(
     .await;
 
     Ok(MergeResult {
+        base_ref_update: base_sha_before
+            .as_deref()
+            .and_then(|before| base_ref_update(&merged_pr.base_branch, before, &merge_commit_sha)),
         merge_commit_sha,
         strategy: format!("{:?}", strategy).to_lowercase(),
     })

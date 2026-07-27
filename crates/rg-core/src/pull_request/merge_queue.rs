@@ -27,6 +27,11 @@ pub struct MergeQueueProcessResult {
     pub merged: Vec<i64>,
     pub failed: Vec<i64>,
     pub waiting_reason: Option<String>,
+    /// The base-branch moves this run produced, one per merge, for the caller's
+    /// post-push hooks — see [`super::service::MergeResult::base_ref_update`].
+    /// `#[serde(skip)]`: this is plumbing, not part of the queue's API payload.
+    #[serde(skip)]
+    pub merged_ref_updates: Vec<rg_git::protocol::receive_pack::RefUpdate>,
 }
 
 pub async fn enqueue(
@@ -180,6 +185,7 @@ async fn process_repository_inner(
         merged: Vec::new(),
         failed: Vec::new(),
         waiting_reason: None,
+        merged_ref_updates: Vec::new(),
     };
 
     loop {
@@ -308,9 +314,12 @@ async fn process_repository_inner(
         )
         .await
         {
-            Ok(_) => {
+            Ok(merge) => {
                 finish_entry(db, repo_root, &entry, "merged", None).await?;
                 result.merged.push(pr.id);
+                // The queue moved the base branch; the hooks for that move are
+                // the caller's to run (card_87c4912c51ed).
+                result.merged_ref_updates.extend(merge.base_ref_update);
             }
             Err(error) => {
                 // Persisted into the queue entry and shown in the UI — the

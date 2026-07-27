@@ -12,6 +12,36 @@ use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
 
+/// Run the post-push hooks for the base-branch move a merge just made.
+///
+/// A merge advances `refs/heads/<base>` exactly like a `git push` does, so it
+/// owes the same automation — a pipeline on the merge commit, the `push`
+/// webhook, the watch fan-out. Until card_87c4912c51ed a merge fired only
+/// `pull_request.merged`, so "CI on every push to main" quietly did not hold for
+/// the way most merges happen: through the UI. The ref move is reported by
+/// `rg-core` (which has no CI engine or hub of its own) and run here, through
+/// the one seam every ref-moving path in this crate shares.
+///
+/// `None` = the merge moved nothing observable; nothing to run.
+fn spawn_merge_push_hooks(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    actor_id: i64,
+    base_ref_update: Option<rg_git::protocol::receive_pack::RefUpdate>,
+) {
+    let Some(update) = base_ref_update else {
+        return;
+    };
+    state.spawn_post_push_hooks(
+        state.repo_root.join(format!("{owner}/{repo}.git")),
+        owner.to_string(),
+        repo.to_string(),
+        Some(actor_id),
+        vec![update],
+    );
+}
+
 // ── Request / Response types ────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -371,7 +401,7 @@ pub async fn merge_pr(
     headers: axum::http::HeaderMap,
     Json(req): Json<MergePrRequest>,
 ) -> impl IntoResponse {
-    let (repo_model, _actor_id) = match require_write(&state, &headers, &owner, &repo).await {
+    let (repo_model, actor_id) = match require_write(&state, &headers, &owner, &repo).await {
         Ok(access) => access,
         Err(e) => return e.into_response(),
     };
@@ -422,7 +452,16 @@ pub async fn merge_pr(
     {
         // `pr_merged` is recorded inside `rg_core::pull_request::merge_pr` so the
         // REST, auto-merge, and merge-queue paths all count through one site.
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Ok(result) => {
+            spawn_merge_push_hooks(
+                &state,
+                &owner,
+                &repo,
+                actor_id,
+                result.base_ref_update.clone(),
+            );
+            (StatusCode::OK, Json(result)).into_response()
+        }
         // Every way a merge fails used to be the client's fault: a closed PR, a
         // draft, a racing attempt and a merge conflict all answered 400 — as did
         // a dead database and a failed git invocation, with the `db: ...`
@@ -471,7 +510,22 @@ pub async fn enable_auto_merge(
     match rg_core::pull_request::try_auto_merge(&state.db, &state.repo_root, &owner, &repo, number)
         .await
     {
-        Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
+        Ok(outcome) => {
+            // Enabling auto-merge on a PR whose conditions are already met
+            // merges it right here, moving the base branch — same debt as the
+            // explicit merge above.
+            spawn_merge_push_hooks(
+                &state,
+                &owner,
+                &repo,
+                actor_id,
+                outcome
+                    .merge
+                    .as_ref()
+                    .and_then(|merge| merge.base_ref_update.clone()),
+            );
+            (StatusCode::OK, Json(outcome)).into_response()
+        }
         // `try_auto_merge` returns every *unsatisfied* condition as a pending
         // `Ok(outcome)`, so an `Err` here is only ever a git or database failure
         // — precisely the thing that must never be reported as a bad request.
