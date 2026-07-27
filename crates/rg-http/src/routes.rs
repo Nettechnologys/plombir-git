@@ -1,17 +1,39 @@
 //! Axum router construction: the CORS layer, the full REST/Git/OCI route table,
 //! and the production vs. test router assembly.
+//!
+//! Every route is registered through [`RouteTable`], which has no `route()`:
+//! the only way in is a method that takes an [`Access`] level. Registering a
+//! route and declaring who may call it are therefore the same statement, and
+//! the table of `(method, path, access)` rows that falls out of the build is
+//! what the sweep test walks. See [`crate::route_table`].
 
 use axum::http::{header, HeaderValue, Method};
-use axum::routing::{delete, get, patch, post, put, MethodRouter};
+use axum::routing::MethodRouter;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
+use crate::route_table::Access::{
+    self, Foreign, InstanceAdmin, OrgAdmin, OrgRead, Public, RepoAdmin, RepoAuthRead, RepoOwner,
+    RepoRead, RepoWrite, User,
+};
+use crate::route_table::{RouteFact, RouteTable};
 use crate::{
     api, git_http, handlers, metrics, middleware, oci, pat_auth, rate_limit, security, ws, AppState,
 };
+
+/// Sign-off for the routes whose credentials are not a ForgeKeep session, so
+/// the sweep cannot drive them with one. Spelled out here rather than at each
+/// call site so the whole set reads in one place.
+const GIT_HTTP: Access = Foreign("git-over-HTTP: PAT / HTTP-Basic, `check_git_access` gate");
+const OCI_TOKEN: Access = Foreign("OCI registry: registry-scoped bearer token");
+const LFS_PROTOCOL: Access = Foreign("Git LFS batch protocol: per-operation gate, own envelope");
+const RUNNER_TOKEN: Access = Foreign("CI runner: runner token via `authenticate_runner`");
+const CI_JOB_TOKEN: Access = Foreign("CI job token minted for a running job");
+const WS_TICKET: Access = Foreign("WebSocket: token in `Sec-WebSocket-Protocol` or `?token=`");
+const DOCS_AUTH: Access = Foreign("API docs: `docs_auth_middleware` over PAT/JWT");
 
 /// Build a restrictive CORS layer.
 ///
@@ -75,6 +97,26 @@ fn build_cors_layer() -> CorsLayer {
     }
 }
 
+/// Every sub-router the server exposes, plus the access level of every route in
+/// them.
+///
+/// The facts travel with the routers rather than being rebuilt on the side:
+/// a second enumeration is a second thing to forget to update.
+pub(crate) struct Routers {
+    /// `/api/v1`
+    api_v1: Router<AppState>,
+    /// `/git`
+    git: Router<AppState>,
+    /// Root-level Git Smart HTTP, health and metrics.
+    root: Router<AppState>,
+    /// `/v2` — OCI distribution.
+    v2: Router<AppState>,
+    /// OpenAPI JSON and the Swagger UI.
+    docs: Router<AppState>,
+    /// `(method, path, access)` for every route above.
+    facts: Vec<RouteFact>,
+}
+
 /// Create the Axum router (Git + REST API + health).
 ///
 /// `rate_limiter` is the global per-IP limiter applied to every request;
@@ -112,35 +154,16 @@ fn build_router(
     rate_limiter: rate_limit::RateLimiter,
     auth_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
-    let (api_v1, git_routes) = build_routes(&state, Some(&auth_rate_limiter));
-    let v2_routes = build_v2_routes(&state);
-    let docs_routes = build_docs_routes(&state);
+    let routers = build_all_routes(&state, Some(&auth_rate_limiter));
 
-    Router::new()
-        .nest("/git", git_routes)
-        // ── Root-level Git Smart HTTP routes (standard git client format) ───
-        // Git clients request /{owner}/{repo}.git/info/refs etc.
-        // These must be at root level (no /git prefix) for compatibility.
-        .route("/{owner}/{repo}/info/refs", get(git_http::handle_info_refs))
-        .route(
-            "/{owner}/{repo}/git-upload-pack",
-            post(git_http::handle_git_upload_pack),
-        )
-        .route(
-            "/{owner}/{repo}/git-receive-pack",
-            post(git_http::handle_git_receive_pack),
-        )
-        .nest("/api/v1", api_v1)
-        .nest("/v2", v2_routes)
-        .route("/health", get(handlers::health))
-        .route("/metrics", get(metrics::metrics_handler))
-        .merge(docs_routes)
+    assemble(&routers)
         // Serve SvelteKit static assets if the build directory exists
         .fallback_service(
             // SPA fallback: serve static assets, and for any unmatched path
             // (client-side routes like /login, /dashboard) return index.html
             // with a per-request CSP nonce injected into all <script> tags (H-2).
-            ServeDir::new(handlers::WEB_BUILD_DIR).fallback(get(handlers::spa_index_handler)),
+            ServeDir::new(handlers::WEB_BUILD_DIR)
+                .fallback(axum::routing::get(handlers::spa_index_handler)),
         )
         // ── Middleware layers (order: bottom-up, last .layer() runs first) ──
         // Innermost, so a rejected session is still counted, traced and given
@@ -188,60 +211,110 @@ fn build_router(
         .with_state(state)
 }
 
-/// Build OCI Distribution v2 routes (Docker/OCI container registry).
-fn build_v2_routes(state: &AppState) -> Router<AppState> {
-    // 10 GiB body limit for blob upload requests.
-    let upload_body_limit = RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024);
-
-    // Upload sub-router with body size limit.
-    //
-    // The OCI distribution spec starts every blob push at
-    // `POST /v2/<name>/blobs/uploads/` — **with** the trailing slash (endpoint
-    // end-4a), and that is what docker/podman/containerd actually send. Under
-    // `nest`, axum 0.8 matches the inner `"/"` route at the prefix *without* a
-    // trailing slash and 404s the spec form, so both spellings are registered
-    // explicitly. There is no path-normalizing layer in front of the router to
-    // paper over the difference.
-    let upload_routes = Router::new()
-        .route("/{owner}/{repo}/blobs/uploads", post(oci::start_upload))
-        .route("/{owner}/{repo}/blobs/uploads/", post(oci::start_upload))
-        .route(
-            "/{owner}/{repo}/blobs/uploads/{uuid}",
-            patch(oci::chunk_upload).put(oci::complete_upload),
-        )
-        .layer(upload_body_limit);
-
+/// Nest every sub-router at the prefix its [`RouteFact`]s were recorded with.
+///
+/// Production and test routers differ in their middleware stack, never in their
+/// route set — so the mounting lives in one place and both call it.
+fn assemble(routers: &Routers) -> Router<AppState> {
     Router::new()
+        .nest("/git", routers.git.clone())
+        .nest("/api/v1", routers.api_v1.clone())
+        .nest("/v2", routers.v2.clone())
+        .merge(routers.root.clone())
+        .merge(routers.docs.clone())
+}
+
+/// Build the OCI Distribution v2 routes (Docker/OCI container registry).
+///
+/// The registry authenticates with its own bearer tokens and answers in its own
+/// error envelope, so every route here is signed off as [`OCI_TOKEN`].
+fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
+    // 10 GiB body limit for blob upload requests.
+    let upload_limit = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
+    };
+
+    let (router, facts) = RouteTable::new("/v2")
         // API version check
-        .route("/", get(oci::api_version_check))
+        // The spec's version check: answers `401` with a
+        // `WWW-Authenticate` challenge to an anonymous client, which is how a
+        // registry client discovers where to get its token.
+        .get(OCI_TOKEN, "/", oci::api_version_check)
         // Token authentication
-        .route("/auth/token", get(oci::get_token))
+        .get(Public, "/auth/token", oci::get_token)
         // Tags
-        .route("/{owner}/{repo}/tags/list", get(oci::list_tags))
+        .get(OCI_TOKEN, "/{owner}/{repo}/tags/list", oci::list_tags)
         // Manifests
-        .route(
+        .get(
+            OCI_TOKEN,
             "/{owner}/{repo}/manifests/{reference}",
-            get(oci::get_manifest)
-                .head(oci::head_manifest)
-                .put(oci::put_manifest),
+            oci::get_manifest,
+        )
+        .head(
+            OCI_TOKEN,
+            "/{owner}/{repo}/manifests/{reference}",
+            oci::head_manifest,
+        )
+        .put(
+            OCI_TOKEN,
+            "/{owner}/{repo}/manifests/{reference}",
+            oci::put_manifest,
         )
         // Blobs
-        .route(
-            "/{owner}/{repo}/blobs/{digest}",
-            get(oci::get_blob).head(oci::head_blob),
-        )
+        .get(OCI_TOKEN, "/{owner}/{repo}/blobs/{digest}", oci::get_blob)
+        .head(OCI_TOKEN, "/{owner}/{repo}/blobs/{digest}", oci::head_blob)
         // Uploads (with body size limit)
-        .merge(upload_routes)
-        .with_state(state.clone())
+        //
+        // The OCI distribution spec starts every blob push at
+        // `POST /v2/<name>/blobs/uploads/` — **with** the trailing slash
+        // (endpoint end-4a), and that is what docker/podman/containerd actually
+        // send. Under `nest`, axum 0.8 matches the inner `"/"` route at the
+        // prefix *without* a trailing slash and 404s the spec form, so both
+        // spellings are registered explicitly. There is no path-normalizing
+        // layer in front of the router to paper over the difference.
+        .post_with(
+            OCI_TOKEN,
+            "/{owner}/{repo}/blobs/uploads",
+            oci::start_upload,
+            &upload_limit,
+        )
+        .post_with(
+            OCI_TOKEN,
+            "/{owner}/{repo}/blobs/uploads/",
+            oci::start_upload,
+            &upload_limit,
+        )
+        .patch_with(
+            OCI_TOKEN,
+            "/{owner}/{repo}/blobs/uploads/{uuid}",
+            oci::chunk_upload,
+            &upload_limit,
+        )
+        .put_with(
+            OCI_TOKEN,
+            "/{owner}/{repo}/blobs/uploads/{uuid}",
+            oci::complete_upload,
+            &upload_limit,
+        )
+        .finish();
+
+    (router.with_state(state.clone()), facts)
 }
 
 /// Build API docs routes with authentication required.
-fn build_docs_routes(state: &AppState) -> Router<AppState> {
-    Router::new()
-        .route("/api-docs/openapi.json", get(handlers::openapi_handler))
-        .route("/api-docs", get(handlers::swagger_ui_root_handler))
-        .route("/api-docs/", get(handlers::swagger_ui_root_handler))
-        .route("/api-docs/{*tail}", get(handlers::swagger_ui_handler))
+fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
+    let (router, facts) = RouteTable::new("")
+        .get(
+            DOCS_AUTH,
+            "/api-docs/openapi.json",
+            handlers::openapi_handler,
+        )
+        .get(DOCS_AUTH, "/api-docs", handlers::swagger_ui_root_handler)
+        .get(DOCS_AUTH, "/api-docs/", handlers::swagger_ui_root_handler)
+        .get(DOCS_AUTH, "/api-docs/{*tail}", handlers::swagger_ui_handler)
+        .finish();
+
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             pat_auth::docs_auth_middleware,
@@ -250,26 +323,27 @@ fn build_docs_routes(state: &AppState) -> Router<AppState> {
             state.clone(),
             pat_auth::pat_auth_middleware,
         ))
-        .with_state(state.clone())
+        .with_state(state.clone());
+
+    (router, facts)
 }
 
-/// Build route definitions (shared between production and test routers).
+/// Build every route the server serves, and the access level of each.
 ///
 /// `auth_rate_limiter` is layered only onto the unauthenticated credential
 /// endpoints (`/users/register`, `/users/login`). The test router passes
 /// `None` so those routes carry no extra layer: the limiter middleware extracts
 /// `ConnectInfo`, which the test harness (plain `oneshot`, no
 /// `into_make_service_with_connect_info`) does not provide.
-fn build_routes(
+pub(crate) fn build_all_routes(
     state: &AppState,
     auth_rate_limiter: Option<&rate_limit::RateLimiter>,
-) -> (Router<AppState>, Router<AppState>) {
-    // Stricter per-route limiter for the credential endpoints. Applied via a
-    // per-route `.layer()` (same mechanism the OCI upload body-limit uses),
-    // keyed by the same client-IP resolution as the global limiter. `layer()`
-    // returns the same `MethodRouter<AppState>` type in both arms, so the
-    // attach-or-not choice stays type-consistent.
-    let apply_auth_rl = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+) -> Routers {
+    // Stricter per-route limiter for the credential endpoints, keyed by the
+    // same client-IP resolution as the global limiter. `layer()` returns the
+    // same `MethodRouter<AppState>` type in both arms, so the attach-or-not
+    // choice stays type-consistent.
+    let auth_rl = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
         match auth_rate_limiter {
             Some(limiter) => mr.layer(axum::middleware::from_fn_with_state(
                 limiter.clone(),
@@ -278,861 +352,1424 @@ fn build_routes(
             None => mr,
         }
     };
-    // ── Git Smart HTTP routes ──────────────────────────────────────────────
-    let git_routes = Router::new()
-        .route("/{owner}/{repo}/info/refs", get(git_http::handle_info_refs))
-        .route(
-            "/{owner}/{repo}/git-upload-pack",
-            post(git_http::handle_git_upload_pack),
-        )
-        .route(
-            "/{owner}/{repo}/git-receive-pack",
-            post(git_http::handle_git_receive_pack),
-        );
-
-    // Runner routes that require authentication (single middleware layer)
-    let runners_auth = Router::new()
-        .route("/runners/{id}/heartbeat", post(api::runners::heartbeat))
-        .route("/runners/{id}/deregister", post(api::runners::deregister))
-        .route("/runners/{id}/jobs/poll", get(api::runners::poll_job))
-        .route(
-            "/runners/{id}/jobs/{job_id}/start",
-            post(api::runners::start_job),
-        )
-        .route(
-            "/runners/{id}/jobs/{job_id}/log",
-            post(api::runners::upload_log),
-        )
-        .route(
-            "/runners/{id}/jobs/{job_id}/workspace",
-            get(api::runners::download_workspace),
-        )
-        .route(
-            "/runners/{id}/jobs/{job_id}/cache",
-            get(api::runners::download_cache)
-                .put(api::runners::upload_cache)
-                .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024)),
-        )
-        .route(
-            "/runners/{id}/jobs/{job_id}/finish",
-            post(api::runners::finish_job),
-        )
-        .route(
-            "/runners/{id}/jobs/{job_id}/artifacts",
-            post(api::artifacts::upload_artifact),
-        )
-        .layer(axum::middleware::from_fn_with_state(
+    // The runner token check. Applied per route rather than to a sub-router so
+    // that every route still passes through the one table that declares it.
+    let runner_auth = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::runners::authenticate_runner,
         ))
-        .with_state(state.clone());
+    };
+    // Raised body limits for the routes that carry an upload. Only the
+    // body-carrying method of a resource takes one; a limit on its `GET`
+    // sibling never applied to anything.
+    let limit_101mb = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(RequestBodyLimitLayer::new(101 * 1024 * 1024))
+    };
+    let limit_1gb = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024))
+    };
+    let limit_10gb = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
+    };
 
-    // ── REST API routes ───────────────────────────────────────────────────
-    let api_v1 = Router::new()
-        // Users
-        .route("/users/register", apply_auth_rl(post(api::users::register)))
-        .route("/users/login", apply_auth_rl(post(api::users::login)))
-        .route("/users/logout", post(api::users::logout))
-        .route("/users/me", get(api::users::me))
-        .route("/users/forgot-password", post(api::users::forgot_password))
-        .route("/users/reset-password", post(api::users::reset_password))
+    // ── Git Smart HTTP routes ──────────────────────────────────────────────
+    let (git, git_facts) = RouteTable::new("/git")
+        .get(
+            GIT_HTTP,
+            "/{owner}/{repo}/info/refs",
+            git_http::handle_info_refs,
+        )
+        .post(
+            GIT_HTTP,
+            "/{owner}/{repo}/git-upload-pack",
+            git_http::handle_git_upload_pack,
+        )
+        .post(
+            GIT_HTTP,
+            "/{owner}/{repo}/git-receive-pack",
+            git_http::handle_git_receive_pack,
+        )
+        .finish();
+
+    // ── Root-level routes ──────────────────────────────────────────────────
+    // Git clients request `/{owner}/{repo}.git/info/refs` etc. — these must be
+    // at root level (no `/git` prefix) for compatibility.
+    let (root, root_facts) = RouteTable::new("")
+        .get(
+            GIT_HTTP,
+            "/{owner}/{repo}/info/refs",
+            git_http::handle_info_refs,
+        )
+        .post(
+            GIT_HTTP,
+            "/{owner}/{repo}/git-upload-pack",
+            git_http::handle_git_upload_pack,
+        )
+        .post(
+            GIT_HTTP,
+            "/{owner}/{repo}/git-receive-pack",
+            git_http::handle_git_receive_pack,
+        )
+        .get(Public, "/health", handlers::health)
+        .get(Public, "/metrics", metrics::metrics_handler)
+        .finish();
+
+    // ── REST API routes ────────────────────────────────────────────────────
+    let (api_v1, api_facts) = RouteTable::new("/api/v1")
+        // ── Users ──────────────────────────────────────────────────────────
+        .post_with(Public, "/users/register", api::users::register, &auth_rl)
+        .post_with(Public, "/users/login", api::users::login, &auth_rl)
+        .post(Public, "/users/logout", api::users::logout)
+        .get(User, "/users/me", api::users::me)
+        .post(
+            Public,
+            "/users/forgot-password",
+            api::users::forgot_password,
+        )
+        .post(Public, "/users/reset-password", api::users::reset_password)
         // PAT
-        .route(
-            "/users/tokens",
-            get(api::users::list_tokens).post(api::users::create_token),
-        )
-        .route("/users/tokens/{id}", delete(api::users::delete_token))
+        .get(User, "/users/tokens", api::users::list_tokens)
+        .post(User, "/users/tokens", api::users::create_token)
+        .delete(User, "/users/tokens/{id}", api::users::delete_token)
         // SSH keys
-        .route(
-            "/users/ssh-keys",
-            get(api::ssh_keys::list_ssh_keys).post(api::ssh_keys::create_ssh_key),
-        )
-        .route(
-            "/users/ssh-keys/{id}",
-            delete(api::ssh_keys::delete_ssh_key),
-        )
-        .route(
+        .get(User, "/users/ssh-keys", api::ssh_keys::list_ssh_keys)
+        .post(User, "/users/ssh-keys", api::ssh_keys::create_ssh_key)
+        .delete(User, "/users/ssh-keys/{id}", api::ssh_keys::delete_ssh_key)
+        // Deploy keys
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/keys",
-            get(api::deploy_keys::list_deploy_keys).post(api::deploy_keys::create_deploy_key),
+            api::deploy_keys::list_deploy_keys,
         )
-        .route(
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/keys",
+            api::deploy_keys::create_deploy_key,
+        )
+        .delete(
+            RepoAdmin,
             "/repos/{owner}/{name}/keys/{id}",
-            delete(api::deploy_keys::delete_deploy_key),
+            api::deploy_keys::delete_deploy_key,
         )
         // MFA
-        .route("/users/mfa/setup", post(api::mfa::setup_mfa))
-        .route("/users/mfa/enable", post(api::mfa::enable_mfa))
-        .route("/users/mfa/verify", post(api::mfa::verify_mfa))
-        .route("/users/mfa/backup", get(api::mfa::get_backup_codes))
-        .route("/users/mfa/disable", post(api::mfa::disable_mfa))
+        .post(User, "/users/mfa/setup", api::mfa::setup_mfa)
+        .post(User, "/users/mfa/enable", api::mfa::enable_mfa)
+        // The second factor of a login: the caller has a password but no
+        // session yet, so this one is reachable without a token by design.
+        .post(Public, "/users/mfa/verify", api::mfa::verify_mfa)
+        .get(User, "/users/mfa/backup", api::mfa::get_backup_codes)
+        .post(User, "/users/mfa/disable", api::mfa::disable_mfa)
         // Passkeys (WebAuthn)
-        .route("/users/passkeys", get(api::passkeys::list_passkeys))
-        .route(
-            "/users/passkeys/{id}",
-            delete(api::passkeys::delete_passkey),
-        )
-        .route(
+        .get(User, "/users/passkeys", api::passkeys::list_passkeys)
+        .delete(User, "/users/passkeys/{id}", api::passkeys::delete_passkey)
+        .post(
+            User,
             "/users/passkeys/register/start",
-            post(api::passkeys::register_start),
+            api::passkeys::register_start,
         )
-        .route(
+        .post(
+            User,
             "/users/passkeys/register/finish",
-            post(api::passkeys::register_finish),
+            api::passkeys::register_finish,
         )
-        .route(
+        .post(
+            Public,
             "/users/passkeys/login/start",
-            post(api::passkeys::login_start),
+            api::passkeys::login_start,
         )
-        .route(
+        .post(
+            Public,
             "/users/passkeys/login/finish",
-            post(api::passkeys::login_finish),
+            api::passkeys::login_finish,
         )
         // SSO
-        .route("/auth/sso/providers", get(api::sso::list_providers))
-        .route("/auth/sso/{slug}", get(api::sso::authorize))
-        .route("/auth/sso/{slug}/callback", get(api::sso::callback))
-        .route("/auth/sso/{slug}/refresh", post(api::sso::refresh_token))
-        .route(
+        .get(Public, "/auth/sso/providers", api::sso::list_providers)
+        .get(Public, "/auth/sso/{slug}", api::sso::authorize)
+        .get(Public, "/auth/sso/{slug}/callback", api::sso::callback)
+        .post(User, "/auth/sso/{slug}/refresh", api::sso::refresh_token)
+        .delete(
+            User,
             "/auth/sso/{slug}/unlink",
-            delete(api::sso::unlink_oauth_account),
+            api::sso::unlink_oauth_account,
         )
-        // Repos
-        .route("/repos", post(api::repos::create_repo))
-        // Template listing & explore (must be before /repos/{owner} to avoid route conflict)
-        .route(
+        // ── Repositories ───────────────────────────────────────────────────
+        .post(User, "/repos", api::repos::create_repo)
+        // Template listing & explore (must be before /repos/{owner} to avoid
+        // route conflict)
+        .get(
+            Public,
             "/repos/templates/gitignores",
-            get(api::repos::list_gitignore_templates),
+            api::repos::list_gitignore_templates,
         )
-        .route(
+        .get(
+            Public,
             "/repos/templates/licenses",
-            get(api::repos::list_license_templates),
+            api::repos::list_license_templates,
         )
-        .route(
+        .get(
+            Public,
             "/repos/templates/readmes",
-            get(api::repos::list_readme_templates),
+            api::repos::list_readme_templates,
         )
-        .route("/repos/templates/labels", get(api::repos::list_label_sets))
-        .route("/repos/explore", get(api::repos::explore))
-        .route("/repos/{owner}", get(api::repos::list_repos))
-        .route("/repos/{owner}/{name}", get(api::repos::get_repo))
+        .get(
+            Public,
+            "/repos/templates/labels",
+            api::repos::list_label_sets,
+        )
+        .get(Public, "/repos/explore", api::repos::explore)
+        .get(Public, "/repos/{owner}", api::repos::list_repos)
+        .get(RepoRead, "/repos/{owner}/{name}", api::repos::get_repo)
+        .delete(
+            RepoOwner,
+            "/repos/{owner}/{name}",
+            api::repos::delete_repo_handler,
+        )
         // Milestones (before issues to avoid routing conflicts)
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/milestones",
-            get(api::issues::list_milestones).post(api::issues::create_milestone),
+            api::issues::list_milestones,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/milestones",
+            api::issues::create_milestone,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/milestones/{id}",
-            get(api::issues::get_milestone)
-                .patch(api::issues::update_milestone)
-                .delete(api::issues::delete_milestone),
+            api::issues::get_milestone,
+        )
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/milestones/{id}",
+            api::issues::update_milestone,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/milestones/{id}",
+            api::issues::delete_milestone,
         )
         // Labels
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/labels",
-            get(api::labels::list_labels).post(api::labels::create_label),
+            api::labels::list_labels,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/labels",
+            api::labels::create_label,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/labels/{id}",
-            get(api::labels::get_label)
-                .patch(api::labels::update_label)
-                .delete(api::labels::delete_label),
+            api::labels::get_label,
+        )
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/labels/{id}",
+            api::labels::update_label,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/labels/{id}",
+            api::labels::delete_label,
         )
         // Issues
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issue_templates",
-            get(api::issues::list_issue_templates),
+            api::issues::list_issue_templates,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issue_config",
-            get(api::issues::get_issue_config),
+            api::issues::get_issue_config,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issue_config/validate",
-            get(api::issues::validate_issue_config),
+            api::issues::validate_issue_config,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pull_request_template",
-            get(api::issues::get_pull_request_template),
+            api::issues::get_pull_request_template,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues",
-            get(api::issues::list_issues).post(api::issues::create_issue),
+            api::issues::list_issues,
         )
-        .route(
+        .post(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues",
+            api::issues::create_issue,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}",
-            get(api::issues::get_issue).patch(api::issues::update_issue),
+            api::issues::get_issue,
         )
-        .route(
+        // The issue's own author may edit it with read access; `RepoWrite` is
+        // what a caller who is not the author needs, which is the level a
+        // stranger is measured against.
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/issues/{number}",
+            api::issues::update_issue,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}/labels",
-            get(api::issues::get_issue_labels),
+            api::issues::get_issue_labels,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}/comments",
-            get(api::issues::list_comments).post(api::issues::add_comment),
+            api::issues::list_comments,
         )
-        .route(
+        .post(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues/{number}/comments",
+            api::issues::add_comment,
+        )
+        // Attachments. Deleting one takes write access unless you uploaded it,
+        // so `RepoWrite` is the level a stranger is measured against.
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}/assets",
-            get(api::attachments::list_issue_attachments)
-                .post(api::attachments::create_issue_attachment)
-                .layer(RequestBodyLimitLayer::new(101 * 1024 * 1024)),
+            api::attachments::list_issue_attachments,
         )
-        .route(
+        .post_with(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues/{number}/assets",
+            api::attachments::create_issue_attachment,
+            &limit_101mb,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}",
-            get(api::attachments::get_issue_attachment)
-                .delete(api::attachments::delete_issue_attachment),
+            api::attachments::get_issue_attachment,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}",
+            api::attachments::delete_issue_attachment,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
-            get(api::attachments::list_issue_comment_attachments)
-                .post(api::attachments::create_issue_comment_attachment)
-                .layer(RequestBodyLimitLayer::new(101 * 1024 * 1024)),
+            api::attachments::list_issue_comment_attachments,
         )
-        .route(
+        .post_with(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
+            api::attachments::create_issue_comment_attachment,
+            &limit_101mb,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
-            get(api::attachments::get_issue_comment_attachment)
-                .delete(api::attachments::delete_issue_comment_attachment),
+            api::attachments::get_issue_comment_attachment,
         )
-        // Pull Requests
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
+            api::attachments::delete_issue_comment_attachment,
+        )
+        // ── Pull requests ──────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls",
-            get(api::pulls::list_prs).post(api::pulls::create_pr),
+            api::pulls::list_prs,
         )
-        .route(
+        .post(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls",
+            api::pulls::create_pr,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}",
-            get(api::pulls::get_pr).patch(api::pulls::update_pr),
+            api::pulls::get_pr,
         )
-        .route(
+        .patch(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}",
+            api::pulls::update_pr,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/assets",
-            get(api::attachments::list_pull_request_attachments)
-                .post(api::attachments::create_pull_request_attachment)
-                .layer(RequestBodyLimitLayer::new(101 * 1024 * 1024)),
+            api::attachments::list_pull_request_attachments,
         )
-        .route(
+        .post_with(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/assets",
+            api::attachments::create_pull_request_attachment,
+            &limit_101mb,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
-            get(api::attachments::get_pull_request_attachment)
-                .delete(api::attachments::delete_pull_request_attachment),
+            api::attachments::get_pull_request_attachment,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
+            api::attachments::delete_pull_request_attachment,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
-            get(api::attachments::list_review_comment_attachments)
-                .post(api::attachments::create_review_comment_attachment)
-                .layer(RequestBodyLimitLayer::new(101 * 1024 * 1024)),
+            api::attachments::list_review_comment_attachments,
         )
-        .route(
+        .post_with(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+            api::attachments::create_review_comment_attachment,
+            &limit_101mb,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
-            get(api::attachments::get_review_comment_attachment)
-                .delete(api::attachments::delete_review_comment_attachment),
+            api::attachments::get_review_comment_attachment,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
+            api::attachments::delete_review_comment_attachment,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/diff",
-            get(api::pulls::get_diff),
+            api::pulls::get_diff,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/merge",
-            post(api::pulls::merge_pr),
+            api::pulls::merge_pr,
         )
-        .route(
+        .put(
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/auto-merge",
-            put(api::pulls::enable_auto_merge).delete(api::pulls::disable_auto_merge),
+            api::pulls::enable_auto_merge,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/pulls/{number}/auto-merge",
+            api::pulls::disable_auto_merge,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/merge-queue",
-            get(api::pulls::list_merge_queue),
+            api::pulls::list_merge_queue,
         )
-        .route(
+        .put(
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/merge-queue",
-            put(api::pulls::enqueue_merge_queue).delete(api::pulls::cancel_merge_queue),
+            api::pulls::enqueue_merge_queue,
         )
-        // PR Reviews
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/pulls/{number}/merge-queue",
+            api::pulls::cancel_merge_queue,
+        )
+        // PR reviews
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/reviews",
-            get(api::reviews::list_reviews).post(api::reviews::submit_review),
+            api::reviews::list_reviews,
         )
-        .route(
+        .post(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/reviews",
+            api::reviews::submit_review,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/reviews/{id}",
-            get(api::reviews::get_review),
+            api::reviews::get_review,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/reviews/{id}/dismiss",
-            post(api::reviews::dismiss_review),
+            api::reviews::dismiss_review,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/comments",
-            get(api::reviews::list_review_comments).post(api::reviews::create_review_comment),
+            api::reviews::list_review_comments,
         )
-        .route(
+        .post(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/comments",
+            api::reviews::create_review_comment,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/timeline",
-            get(api::reviews::get_review_timeline),
+            api::reviews::get_review_timeline,
         )
-        .route(
+        .patch(
+            RepoAuthRead,
             "/repos/{owner}/{name}/pulls/{number}/comments/{id}/resolution",
-            patch(api::reviews::set_thread_resolution),
+            api::reviews::set_thread_resolution,
         )
-        .route(
+        .post(
+            RepoAuthRead,
             "/repos/{owner}/{name}/pulls/{number}/comments/{id}/suggestion/apply",
-            post(api::reviews::apply_review_suggestion),
+            api::reviews::apply_review_suggestion,
         )
-        .route(
+        .post(
+            RepoAuthRead,
             "/repos/{owner}/{name}/pulls/{number}/suggestions/apply",
-            post(api::reviews::apply_review_suggestions),
+            api::reviews::apply_review_suggestions,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/reviewers",
-            get(api::reviews::list_requested_reviewers).post(api::reviews::request_reviewer),
+            api::reviews::list_requested_reviewers,
         )
-        .route(
+        .post(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/reviewers",
+            api::reviews::request_reviewer,
+        )
+        .delete(
+            RepoAuthRead,
             "/repos/{owner}/{name}/pulls/{number}/reviewers/{username}",
-            delete(api::reviews::remove_requested_reviewer),
+            api::reviews::remove_requested_reviewer,
         )
-        // Wiki
-        .route(
+        // ── Wiki ───────────────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/wiki",
-            get(api::wiki::list_pages).post(api::wiki::create_page),
+            api::wiki::list_pages,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/wiki",
+            api::wiki::create_page,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/wiki/{title}",
-            get(api::wiki::get_page)
-                .patch(api::wiki::update_page)
-                .delete(api::wiki::delete_page),
+            api::wiki::get_page,
         )
-        .route(
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/wiki/{title}",
+            api::wiki::update_page,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/wiki/{title}",
+            api::wiki::delete_page,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/wiki/{title}/history",
-            get(api::wiki::list_revisions),
+            api::wiki::list_revisions,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/wiki/{title}/revisions/{rev_id}",
-            get(api::wiki::get_revision),
+            api::wiki::get_revision,
         )
-        // LFS (body size limit for object uploads: 10 GiB)
-        .route(
+        // ── Git LFS ────────────────────────────────────────────────────────
+        .post(
+            LFS_PROTOCOL,
             "/repos/{owner}/{name}/lfs/objects/batch",
-            post(api::lfs::batch),
+            api::lfs::batch,
         )
-        .route(
+        .get(
+            LFS_PROTOCOL,
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            get(api::lfs::download_object)
-                .put(api::lfs::upload_object)
-                .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024)),
+            api::lfs::download_object,
         )
-        // Webhooks
-        .route(
+        .put_with(
+            LFS_PROTOCOL,
+            "/repos/{owner}/{name}/lfs/objects/{oid}",
+            api::lfs::upload_object,
+            &limit_10gb,
+        )
+        // ── Webhooks ───────────────────────────────────────────────────────
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/hooks",
-            get(api::webhooks::list_webhooks).post(api::webhooks::create_webhook),
+            api::webhooks::list_webhooks,
         )
-        .route(
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/hooks",
+            api::webhooks::create_webhook,
+        )
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/hooks/{id}",
-            get(api::webhooks::get_webhook)
-                .patch(api::webhooks::update_webhook)
-                .delete(api::webhooks::delete_webhook),
+            api::webhooks::get_webhook,
         )
-        .route(
+        .patch(
+            RepoAdmin,
+            "/repos/{owner}/{name}/hooks/{id}",
+            api::webhooks::update_webhook,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/hooks/{id}",
+            api::webhooks::delete_webhook,
+        )
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/hooks/{id}/deliveries",
-            get(api::webhooks::list_deliveries),
+            api::webhooks::list_deliveries,
         )
-        .route(
+        .post(
+            RepoAdmin,
             "/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
-            post(api::webhooks::redeliver),
+            api::webhooks::redeliver,
         )
-        // CI/CD Pipelines
-        .route(
+        // ── CI/CD pipelines ────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pipelines",
-            get(api::ci::list_pipelines).post(api::ci::trigger_pipeline),
+            api::ci::list_pipelines,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/pipelines",
+            api::ci::trigger_pipeline,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pipelines/{id}",
-            get(api::ci::get_pipeline),
+            api::ci::get_pipeline,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/pipelines/{id}/retry",
-            post(api::ci::retry_pipeline),
+            api::ci::retry_pipeline,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/pipelines/{id}/cancel",
-            post(api::ci::cancel_pipeline),
+            api::ci::cancel_pipeline,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
-            get(api::ci::get_job),
+            api::ci::get_job,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play",
-            post(api::ci::play_job),
+            api::ci::play_job,
         )
-        .route(
+        .post(
+            RepoAuthRead,
             "/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve",
-            post(api::ci_environments::approve),
+            api::ci_environments::approve,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/actions/environments",
-            get(api::ci_environments::list).post(api::ci_environments::create),
+            api::ci_environments::list,
         )
-        .route(
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/environments",
+            api::ci_environments::create,
+        )
+        .put(
+            RepoAdmin,
             "/repos/{owner}/{name}/actions/environments/{id}",
-            axum::routing::put(api::ci_environments::update).delete(api::ci_environments::delete),
+            api::ci_environments::update,
         )
-        .route(
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/environments/{id}",
+            api::ci_environments::delete,
+        )
+        .get(
+            Public,
             "/ci/oidc/.well-known/openid-configuration",
-            get(api::ci_oidc::discovery),
+            api::ci_oidc::discovery,
         )
-        .route("/ci/oidc/jwks", get(api::ci_oidc::jwks))
-        .route("/ci/oidc/token", get(api::ci_oidc::token))
-        .route(
+        .get(Public, "/ci/oidc/jwks", api::ci_oidc::jwks)
+        .get(CI_JOB_TOKEN, "/ci/oidc/token", api::ci_oidc::token)
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/actions/retention",
-            get(api::ci_retention::get_policy).put(api::ci_retention::update_policy),
+            api::ci_retention::get_policy,
         )
-        .route(
+        .put(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/retention",
+            api::ci_retention::update_policy,
+        )
+        .delete(
+            RepoAdmin,
             "/repos/{owner}/{name}/actions/retention/expired",
-            axum::routing::delete(api::ci_retention::cleanup),
+            api::ci_retention::cleanup,
         )
-        .route(
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/actions/secrets",
-            get(api::ci_secrets::list),
+            api::ci_secrets::list,
         )
-        .route(
+        .put(
+            RepoAdmin,
             "/repos/{owner}/{name}/actions/secrets/{secret_name}",
-            axum::routing::put(api::ci_secrets::put).delete(api::ci_secrets::delete),
+            api::ci_secrets::put,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/secrets/{secret_name}",
+            api::ci_secrets::delete,
         )
         // Repository archive download
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/archive/{archive}",
-            get(api::archive::download_archive),
+            api::archive::download_archive,
         )
-        // Branch Protection
-        .route(
+        // ── Branch and tag protection ──────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/branches/protection",
-            get(api::branch_protection::list_protections)
-                .post(api::branch_protection::create_protection),
+            api::branch_protection::list_protections,
         )
-        .route(
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/branches/protection",
+            api::branch_protection::create_protection,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/branches/protection/{id}",
-            get(api::branch_protection::get_protection)
-                .patch(api::branch_protection::update_protection)
-                .delete(api::branch_protection::delete_protection),
+            api::branch_protection::get_protection,
         )
-        .route(
+        .patch(
+            RepoAdmin,
+            "/repos/{owner}/{name}/branches/protection/{id}",
+            api::branch_protection::update_protection,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/branches/protection/{id}",
+            api::branch_protection::delete_protection,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/tags/protection",
-            get(api::tag_protection::list).post(api::tag_protection::create),
+            api::tag_protection::list,
         )
-        .route(
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/tags/protection",
+            api::tag_protection::create,
+        )
+        .patch(
+            RepoAdmin,
             "/repos/{owner}/{name}/tags/protection/{id}",
-            patch(api::tag_protection::update).delete(api::tag_protection::delete),
+            api::tag_protection::update,
         )
-        // Collaborators
-        .route(
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/tags/protection/{id}",
+            api::tag_protection::delete,
+        )
+        // ── Collaborators ──────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/collaborators",
-            get(api::collaborators::list_collaborators).post(api::collaborators::add_collaborator),
+            api::collaborators::list_collaborators,
         )
-        .route(
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/collaborators",
+            api::collaborators::add_collaborator,
+        )
+        .patch(
+            RepoAdmin,
             "/repos/{owner}/{name}/collaborators/{id}",
-            patch(api::collaborators::update_permission)
-                .delete(api::collaborators::remove_collaborator),
+            api::collaborators::update_permission,
         )
-        // Repo Content Browsing
-        .route(
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/collaborators/{id}",
+            api::collaborators::remove_collaborator,
+        )
+        // ── Repository content ─────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/tree",
-            get(api::repo_content::list_tree),
+            api::repo_content::list_tree,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/blob/{*path}",
-            get(api::repo_content::get_blob),
+            api::repo_content::get_blob,
         )
-        .route("/repos/{owner}/{name}/log", get(api::repo_content::get_log))
-        .route(
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/log",
+            api::repo_content::get_log,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/branches",
-            get(api::repo_content::list_branches),
+            api::repo_content::list_branches,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/tags",
-            get(api::repo_content::list_tags),
+            api::repo_content::list_tags,
         )
-        // GPG Signatures
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/commits/{sha}/signature",
-            get(api::repo_content::get_commit_signature),
+            api::repo_content::get_commit_signature,
         )
-        // File creation/update/deletion
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/contents/{*path}",
-            post(api::repo_content::create_or_update_file).delete(api::repo_content::delete_file),
+            api::repo_content::create_or_update_file,
         )
-        // Mirror
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/contents/{*path}",
+            api::repo_content::delete_file,
+        )
+        // ── Mirroring ──────────────────────────────────────────────────────
+        .get(
+            RepoWrite,
             "/repos/{owner}/{name}/mirror",
-            get(api::mirrors::get_mirror)
-                .post(api::mirrors::create_mirror)
-                .patch(api::mirrors::update_mirror)
-                .delete(api::mirrors::delete_mirror),
+            api::mirrors::get_mirror,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/mirror",
+            api::mirrors::create_mirror,
+        )
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/mirror",
+            api::mirrors::update_mirror,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/mirror",
+            api::mirrors::delete_mirror,
+        )
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/mirror/sync",
-            post(api::mirrors::trigger_mirror_sync),
+            api::mirrors::trigger_mirror_sync,
         )
         // Imports (GitHub/GitLab migration)
-        .route(
-            "/imports",
-            post(api::imports::start_import).get(api::imports::list_imports),
-        )
-        .route(
-            "/imports/{id}",
-            get(api::imports::get_import_status).delete(api::imports::delete_import),
-        )
-        // Project Boards
-        .route(
+        .post(User, "/imports", api::imports::start_import)
+        .get(User, "/imports", api::imports::list_imports)
+        .get(User, "/imports/{id}", api::imports::get_import_status)
+        .delete(User, "/imports/{id}", api::imports::delete_import)
+        // ── Project boards ─────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/boards",
-            get(api::boards::list_boards).post(api::boards::create_board),
+            api::boards::list_boards,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/boards",
+            api::boards::create_board,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/boards/{id}",
-            get(api::boards::get_board)
-                .patch(api::boards::update_board)
-                .delete(api::boards::delete_board),
+            api::boards::get_board,
         )
-        .route(
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/boards/{id}",
+            api::boards::update_board,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/boards/{id}",
+            api::boards::delete_board,
+        )
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/boards/{id}/columns",
-            post(api::boards::create_column),
+            api::boards::create_column,
         )
-        .route(
+        .patch(
+            RepoWrite,
             "/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
-            patch(api::boards::update_column).delete(api::boards::delete_column),
+            api::boards::update_column,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
+            api::boards::delete_column,
+        )
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards",
-            post(api::boards::create_card),
+            api::boards::create_card,
         )
-        .route(
+        .patch(
+            RepoWrite,
             "/repos/{owner}/{name}/boards/{id}/cards/{card_id}",
-            patch(api::boards::update_card).delete(api::boards::delete_card),
+            api::boards::update_card,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/boards/{id}/cards/{card_id}",
+            api::boards::delete_card,
+        )
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/boards/{id}/cards/{card_id}/move",
-            post(api::boards::move_card),
+            api::boards::move_card,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/boards/{id}/cards/reorder",
-            post(api::boards::reorder_cards),
+            api::boards::reorder_cards,
         )
-        // Time Tracking
-        .route(
+        // ── Time tracking ──────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}/time",
-            get(api::time_tracking::list_time_entries).post(api::time_tracking::add_time),
+            api::time_tracking::list_time_entries,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/issues/{number}/time",
+            api::time_tracking::add_time,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/issues/{number}/time/total",
-            get(api::time_tracking::total_time),
+            api::time_tracking::total_time,
         )
-        .route(
+        .delete(
+            RepoWrite,
             "/repos/{owner}/{name}/issues/{number}/time/{id}",
-            delete(api::time_tracking::delete_time_entry),
+            api::time_tracking::delete_time_entry,
         )
-        // Commit Statuses
-        .route(
+        // ── Commit statuses ────────────────────────────────────────────────
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/statuses/{sha}",
-            post(api::repos::create_commit_status),
+            api::repos::create_commit_status,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/commits/{sha}/statuses",
-            get(api::repos::list_commit_statuses),
+            api::repos::list_commit_statuses,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/commits/{sha}/status",
-            get(api::repos::get_combined_status),
+            api::repos::get_combined_status,
         )
-        // Organizations
-        .route(
-            "/orgs",
-            get(api::orgs::list_orgs).post(api::orgs::create_org),
-        )
-        .route(
-            "/orgs/{name}",
-            get(api::orgs::get_org)
-                .patch(api::orgs::update_org)
-                .delete(api::orgs::delete_org),
-        )
-        .route(
-            "/orgs/{name}/members",
-            get(api::orgs::list_org_members).post(api::orgs::add_org_member),
-        )
-        .route(
+        // ── Organizations ──────────────────────────────────────────────────
+        .get(User, "/orgs", api::orgs::list_orgs)
+        .post(User, "/orgs", api::orgs::create_org)
+        .get(OrgRead, "/orgs/{name}", api::orgs::get_org)
+        .patch(OrgAdmin, "/orgs/{name}", api::orgs::update_org)
+        .delete(OrgAdmin, "/orgs/{name}", api::orgs::delete_org)
+        .get(OrgRead, "/orgs/{name}/members", api::orgs::list_org_members)
+        .post(OrgAdmin, "/orgs/{name}/members", api::orgs::add_org_member)
+        .delete(
+            OrgAdmin,
             "/orgs/{name}/members/{user_id}",
-            delete(api::orgs::remove_org_member),
+            api::orgs::remove_org_member,
         )
-        .route(
-            "/orgs/{name}/teams",
-            get(api::orgs::list_org_teams).post(api::orgs::create_team),
-        )
-        .route(
+        .get(OrgRead, "/orgs/{name}/teams", api::orgs::list_org_teams)
+        .post(OrgAdmin, "/orgs/{name}/teams", api::orgs::create_team)
+        .get(OrgRead, "/orgs/{name}/teams/{team_id}", api::orgs::get_team)
+        .delete(
+            OrgAdmin,
             "/orgs/{name}/teams/{team_id}",
-            get(api::orgs::get_team).delete(api::orgs::delete_team),
+            api::orgs::delete_team,
         )
-        .route(
+        .get(
+            OrgRead,
             "/orgs/{name}/teams/{team_id}/members",
-            get(api::orgs::list_team_members).post(api::orgs::add_team_member),
+            api::orgs::list_team_members,
         )
-        .route(
+        .post(
+            OrgAdmin,
+            "/orgs/{name}/teams/{team_id}/members",
+            api::orgs::add_team_member,
+        )
+        .delete(
+            OrgAdmin,
             "/orgs/{name}/teams/{team_id}/members/{user_id}",
-            delete(api::orgs::remove_team_member),
+            api::orgs::remove_team_member,
         )
-        // Notifications
-        .route(
+        // ── Notifications ──────────────────────────────────────────────────
+        .get(
+            User,
             "/notifications",
-            get(api::notifications::list_notifications),
+            api::notifications::list_notifications,
         )
-        .route(
+        .get(
+            User,
             "/notifications/unread-count",
-            get(api::notifications::unread_count),
+            api::notifications::unread_count,
         )
-        .route(
+        .post(
+            User,
             "/notifications/mark-all-read",
-            post(api::notifications::mark_all_read),
+            api::notifications::mark_all_read,
         )
-        .route(
+        .post(
+            User,
             "/notifications/{id}/read",
-            post(api::notifications::mark_read),
+            api::notifications::mark_read,
         )
-        .route(
+        .delete(
+            User,
             "/notifications/{id}",
-            delete(api::notifications::delete_notification),
+            api::notifications::delete_notification,
         )
-        // Star/Watch
-        .route("/repos/{owner}/{name}/star", put(api::repos::star_repo))
-        .route(
+        // ── Star / watch ───────────────────────────────────────────────────
+        .put(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/star",
+            api::repos::star_repo,
+        )
+        .get(
+            RepoAuthRead,
             "/repos/{owner}/{name}/starred",
-            get(api::repos::get_starred_status),
+            api::repos::get_starred_status,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/stargazers",
-            get(api::repos::get_stargazers),
+            api::repos::get_stargazers,
         )
-        .route(
+        .get(
+            RepoAuthRead,
             "/repos/{owner}/{name}/watch",
-            get(api::repos::get_watch_status)
-                .put(api::repos::watch_repo)
-                .delete(api::repos::unwatch_repo),
+            api::repos::get_watch_status,
         )
-        // Repo Delete (combined with GET)
-        .route(
-            "/repos/{owner}/{name}",
-            delete(api::repos::delete_repo_handler),
+        .put(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/watch",
+            api::repos::watch_repo,
         )
-        // Releases
-        .route(
+        .delete(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/watch",
+            api::repos::unwatch_repo,
+        )
+        // ── Releases ───────────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/releases",
-            get(api::releases::list_releases).post(api::releases::create_release),
+            api::releases::list_releases,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/releases",
+            api::releases::create_release,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/releases/{id}",
-            get(api::releases::get_release)
-                .patch(api::releases::update_release)
-                .delete(api::releases::delete_release),
+            api::releases::get_release,
         )
-        // Release Assets
-        .route(
+        .patch(
+            RepoWrite,
+            "/repos/{owner}/{name}/releases/{id}",
+            api::releases::update_release,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/releases/{id}",
+            api::releases::delete_release,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/releases/{release_id}/assets",
-            get(api::releases::list_assets).post(api::releases::upload_asset),
+            api::releases::list_assets,
         )
-        .route(
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/releases/{release_id}/assets",
+            api::releases::upload_asset,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/releases/assets/{asset_id}",
-            get(api::releases::get_asset).delete(api::releases::delete_asset),
+            api::releases::get_asset,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/releases/assets/{asset_id}",
+            api::releases::delete_asset,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/releases/assets/{asset_id}/download",
-            get(api::releases::download_asset),
+            api::releases::download_asset,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
-            post(api::releases::sign_asset_attestation).get(api::releases::get_asset_attestation),
+            api::releases::sign_asset_attestation,
         )
-        .route(
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+            api::releases::get_asset_attestation,
+        )
+        .post(
+            RepoRead,
             "/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify",
-            post(api::releases::verify_asset_attestation),
+            api::releases::verify_asset_attestation,
         )
-        // Fork
-        .route(
+        // ── Fork / transfer ────────────────────────────────────────────────
+        // Forking needs a session and read access to the source, not ownership:
+        // `rg_core::repo::service::fork_repo` gates on `can_read_repo`.
+        .post(
+            RepoAuthRead,
             "/repos/{owner}/{name}/fork",
-            post(api::repos::fork_repo_handler),
+            api::repos::fork_repo_handler,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/forks",
-            get(api::repos::list_forks_handler),
+            api::repos::list_forks_handler,
         )
-        // Transfer
-        .route(
+        .post(
+            RepoOwner,
             "/repos/{owner}/{name}/transfer",
-            post(api::repos::transfer_repo_handler),
+            api::repos::transfer_repo_handler,
         )
-        // Package Registry — protocol-specific routes first (before generic catch-all)
-        .route(
+        // ── Package registry ───────────────────────────────────────────────
+        // Protocol-specific routes first (before the generic catch-all).
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages",
-            get(api::packages::list_registries),
+            api::packages::list_registries,
         )
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/packages/{pkg_type}/publish",
-            post(api::packages::publish),
+            api::packages::publish,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/{pkg_type}/list",
-            get(api::packages::list_packages),
+            api::packages::list_packages,
         )
         // Cargo sparse index protocol
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/cargo/index/{pkg}",
-            get(api::packages::cargo_sparse_index),
+            api::packages::cargo_sparse_index,
         )
         // npm registry protocol
-        .route(
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/packages/npm/publish",
-            post(api::packages::publish_npm),
+            api::packages::publish_npm,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/npm/list",
-            get(api::packages::list_npm_packages),
+            api::packages::list_npm_packages,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/npm/{pkg_name}",
-            get(api::packages::npm_registry_metadata),
+            api::packages::npm_registry_metadata,
         )
         // PyPI Simple Repository API (PEP 503)
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}",
-            get(api::packages::pypi_simple_index),
+            api::packages::pypi_simple_index,
         )
         // Maven metadata endpoint
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/maven/{group_id}/{artifact_id}/maven-metadata.xml",
-            get(api::packages::maven_metadata),
+            api::packages::maven_metadata,
         )
         // NuGet protocol endpoints
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/nuget/index.json",
-            get(api::packages::nuget_service_index),
+            api::packages::nuget_service_index,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/nuget/registration/{id}/index.json",
-            get(api::packages::nuget_registration_index),
+            api::packages::nuget_registration_index,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/nuget/query",
-            get(api::packages::nuget_search),
+            api::packages::nuget_search,
         )
         // RubyGems protocol endpoints
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies",
-            get(api::packages::rubygems_dependencies),
+            api::packages::rubygems_dependencies,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/rubygems/api/v1/gems/{gem_name}",
-            get(api::packages::rubygems_gem_info),
+            api::packages::rubygems_gem_info,
         )
         // Helm repository index
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/helm/index.yaml",
-            get(api::packages::helm_index),
+            api::packages::helm_index,
         )
         // Composer packages.json
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/composer/packages.json",
-            get(api::packages::composer_packages_json),
+            api::packages::composer_packages_json,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}",
-            get(api::packages::get_package),
+            api::packages::get_package,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/versions",
-            get(api::packages::list_versions),
+            api::packages::list_versions,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}",
-            get(api::packages::get_version).delete(api::packages::delete_version),
+            api::packages::get_version,
         )
-        .route(
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}",
+            api::packages::delete_version,
+        )
+        .patch(
+            RepoWrite,
             "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank",
-            patch(api::packages::yank_version),
+            api::packages::yank_version,
         )
-        .route(
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}",
-            get(api::packages::download_file),
+            api::packages::download_file,
         )
-        // CI/CD Runners
-        .route("/runners/register", post(api::runners::register))
-        .merge(runners_auth)
-        .route(
+        // ── CI/CD runners ──────────────────────────────────────────────────
+        .post(RUNNER_TOKEN, "/runners/register", api::runners::register)
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/heartbeat",
+            api::runners::heartbeat,
+            &runner_auth,
+        )
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/deregister",
+            api::runners::deregister,
+            &runner_auth,
+        )
+        .get_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/poll",
+            api::runners::poll_job,
+            &runner_auth,
+        )
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/start",
+            api::runners::start_job,
+            &runner_auth,
+        )
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/log",
+            api::runners::upload_log,
+            &runner_auth,
+        )
+        .get_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/workspace",
+            api::runners::download_workspace,
+            &runner_auth,
+        )
+        .get_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/cache",
+            api::runners::download_cache,
+            &runner_auth,
+        )
+        .put_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/cache",
+            api::runners::upload_cache,
+            &|mr| runner_auth(limit_1gb(mr)),
+        )
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/finish",
+            api::runners::finish_job,
+            &runner_auth,
+        )
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/artifacts",
+            api::artifacts::upload_artifact,
+            &runner_auth,
+        )
+        // ── Artifacts ──────────────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pipelines/{id}/artifacts",
-            get(api::artifacts::list_pipeline_artifacts),
+            api::artifacts::list_pipeline_artifacts,
         )
-        .route("/artifacts/{id}", get(api::artifacts::get_artifact))
-        .route(
+        .get(RepoRead, "/artifacts/{id}", api::artifacts::get_artifact)
+        .get(
+            RepoRead,
             "/artifacts/{id}/download",
-            get(api::artifacts::download_artifact),
+            api::artifacts::download_artifact,
         )
-        .route("/artifacts/{id}", delete(api::artifacts::delete_artifact))
-        // Admin
-        .route("/admin/runners", get(api::runners::list_runners_admin))
-        .route(
+        .delete(
+            RepoWrite,
+            "/artifacts/{id}",
+            api::artifacts::delete_artifact,
+        )
+        // ── Instance administration ────────────────────────────────────────
+        .get(
+            InstanceAdmin,
+            "/admin/runners",
+            api::runners::list_runners_admin,
+        )
+        .delete(
+            InstanceAdmin,
             "/admin/runners/{id}",
-            delete(api::runners::delete_runner_admin),
+            api::runners::delete_runner_admin,
         )
-        .route("/admin/users", get(api::admin::list_users))
-        .route("/admin/users/{id}", get(api::admin::get_user))
-        .route("/admin/users/{id}", patch(api::admin::update_user))
-        .route("/admin/users/{id}", delete(api::admin::delete_user))
-        .route("/admin/users/{id}/unlock", post(api::admin::unlock_user))
-        .route("/admin/orgs", get(api::admin::list_orgs))
-        .route("/admin/orgs/{name}", get(api::admin::get_org))
-        .route("/admin/orgs/{name}", delete(api::admin::delete_org))
+        .get(InstanceAdmin, "/admin/users", api::admin::list_users)
+        .get(InstanceAdmin, "/admin/users/{id}", api::admin::get_user)
+        .patch(InstanceAdmin, "/admin/users/{id}", api::admin::update_user)
+        .delete(InstanceAdmin, "/admin/users/{id}", api::admin::delete_user)
+        .post(
+            InstanceAdmin,
+            "/admin/users/{id}/unlock",
+            api::admin::unlock_user,
+        )
+        .get(InstanceAdmin, "/admin/orgs", api::admin::list_orgs)
+        .get(InstanceAdmin, "/admin/orgs/{name}", api::admin::get_org)
+        .delete(InstanceAdmin, "/admin/orgs/{name}", api::admin::delete_org)
         // Admin SSO
-        .route(
+        .get(
+            InstanceAdmin,
             "/admin/sso/providers",
-            get(api::admin::list_sso_providers).post(api::admin::create_sso_provider),
+            api::admin::list_sso_providers,
         )
-        .route(
+        .post(
+            InstanceAdmin,
+            "/admin/sso/providers",
+            api::admin::create_sso_provider,
+        )
+        .get(
+            InstanceAdmin,
             "/admin/sso/providers/{id}",
-            get(api::admin::get_sso_provider)
-                .patch(api::admin::update_sso_provider)
-                .delete(api::admin::delete_sso_provider),
+            api::admin::get_sso_provider,
         )
-        .route(
+        .patch(
+            InstanceAdmin,
+            "/admin/sso/providers/{id}",
+            api::admin::update_sso_provider,
+        )
+        .delete(
+            InstanceAdmin,
+            "/admin/sso/providers/{id}",
+            api::admin::delete_sso_provider,
+        )
+        .post(
+            InstanceAdmin,
             "/admin/sso/providers/{id}/test",
-            post(api::admin::test_sso_provider_connection),
+            api::admin::test_sso_provider_connection,
         )
         // Audit logs (admin only)
-        .route("/admin/audit/logs", get(api::audit::list_audit_logs))
-        .route("/admin/audit/logs/{id}", get(api::audit::get_audit_log))
-        .route(
+        .get(
+            InstanceAdmin,
+            "/admin/audit/logs",
+            api::audit::list_audit_logs,
+        )
+        .get(
+            InstanceAdmin,
+            "/admin/audit/logs/{id}",
+            api::audit::get_audit_log,
+        )
+        .get(
+            InstanceAdmin,
             "/admin/login-attempts",
-            get(api::audit::list_login_attempts),
+            api::audit::list_login_attempts,
         )
         // Admin instance settings
-        .route(
+        .get(InstanceAdmin, "/admin/settings", api::admin::get_settings)
+        .patch(
+            InstanceAdmin,
             "/admin/settings",
-            get(api::admin::get_settings).patch(api::admin::update_settings),
+            api::admin::update_settings,
         )
-        // Global Search
-        .route("/search", get(api::search::search))
-        // External CI/CD Webhook
-        .route(
+        // ── Global search ──────────────────────────────────────────────────
+        .get(Public, "/search", api::search::search)
+        // ── External CI/CD webhook ─────────────────────────────────────────
+        .post(
+            RepoWrite,
             "/repos/{owner}/{name}/webhooks/external/ci",
-            post(api::webhooks_external::external_ci_webhook),
+            api::webhooks_external::external_ci_webhook,
         )
-        // ── AI Agent endpoints ─────────────────────────────
-        .route(
+        // ── AI agent endpoints ─────────────────────────────────────────────
+        .get(
+            RepoRead,
             "/ai/repos/{owner}/{name}/summary",
-            get(api::ai::ai_repo_summary),
+            api::ai::ai_repo_summary,
         )
-        .route(
+        .get(
+            RepoRead,
             "/ai/repos/{owner}/{name}/issues",
-            get(api::ai::ai_list_issues),
+            api::ai::ai_list_issues,
         )
-        .route("/ai/repos/{owner}/{name}/prs", get(api::ai::ai_list_prs))
-        .route("/ai/repos/{owner}/{name}/tree", get(api::ai::ai_repo_tree))
-        .route(
+        .get(
+            RepoRead,
+            "/ai/repos/{owner}/{name}/prs",
+            api::ai::ai_list_prs,
+        )
+        .get(
+            RepoRead,
+            "/ai/repos/{owner}/{name}/tree",
+            api::ai::ai_repo_tree,
+        )
+        .get(
+            RepoRead,
             "/ai/repos/{owner}/{name}/search/code",
-            get(api::ai::ai_search_code),
+            api::ai::ai_search_code,
         )
-        // .route("/ai/repos/{owner}/{name}/index", post(api::ai::ai_index_repository))  // Temporarily disabled: Axum Handler trait issue, using a CLI command instead
-        // WebSocket
-        .route("/ws/notifications", get(ws::ws_notifications_handler))
-        .route("/ws/job/{job_id}", get(ws::ws_job_log_handler));
+        // ── WebSocket ──────────────────────────────────────────────────────
+        .get(WS_TICKET, "/ws/notifications", ws::ws_notifications_handler)
+        .get(WS_TICKET, "/ws/job/{job_id}", ws::ws_job_log_handler)
+        .finish();
 
     // Accept Personal Access Tokens on the REST API by translating them to a
     // Bearer JWT before the (JWT-only) handlers run.
@@ -1141,32 +1778,44 @@ fn build_routes(
         pat_auth::pat_auth_middleware,
     ));
 
-    (api_v1, git_routes)
+    let (v2, v2_facts) = build_v2_routes(state);
+    let (docs, docs_facts) = build_docs_routes(state);
+
+    let facts = api_facts
+        .into_iter()
+        .chain(git_facts)
+        .chain(root_facts)
+        .chain(v2_facts)
+        .chain(docs_facts)
+        .collect();
+
+    Routers {
+        api_v1,
+        git,
+        root,
+        v2,
+        docs,
+        facts,
+    }
 }
 
 /// Create the Axum router for testing (no rate limiter, no static file serving).
 pub(crate) fn build_test_router(state: AppState) -> Router {
+    build_test_router_with_facts(state).0
+}
+
+/// The test router together with the access level of every route in it.
+///
+/// The sweep test drives the same router the other integration tests use, and
+/// reads the declarations out of the very build that produced it — there is no
+/// second enumeration to fall out of step.
+pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<RouteFact>) {
     // No auth limiter in tests: the limiter middleware extracts ConnectInfo,
     // which the test harness does not supply. Passing None skips that layer.
-    let (api_v1, git_routes) = build_routes(&state, None);
-    let v2_routes = build_v2_routes(&state);
-    let docs_routes = build_docs_routes(&state);
+    let routers = build_all_routes(&state, None);
+    let facts = routers.facts.clone();
 
-    Router::new()
-        .nest("/git", git_routes)
-        .route("/{owner}/{repo}/info/refs", get(git_http::handle_info_refs))
-        .route(
-            "/{owner}/{repo}/git-upload-pack",
-            post(git_http::handle_git_upload_pack),
-        )
-        .route(
-            "/{owner}/{repo}/git-receive-pack",
-            post(git_http::handle_git_receive_pack),
-        )
-        .nest("/api/v1", api_v1)
-        .nest("/v2", v2_routes)
-        .merge(docs_routes)
-        .route("/health", get(handlers::health))
+    let router = assemble(&routers)
         // ── Middleware layers (no rate limiter for tests) ──────────────────
         // Kept in step with `build_router`: the revocation gate is part of the
         // route table's contract, so the router under test has to carry it.
@@ -1192,5 +1841,7 @@ pub(crate) fn build_test_router(state: AppState) -> Router {
             },
         ))
         .layer(build_cors_layer())
-        .with_state(state)
+        .with_state(state);
+
+    (router, facts)
 }

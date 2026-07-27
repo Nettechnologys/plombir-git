@@ -138,6 +138,29 @@ pub async fn spawn_test_app() -> String {
     base_url
 }
 
+/// Spawn the test app and hand back `(base_url, route_facts)`.
+///
+/// The facts are the `(method, path, access)` rows recorded by the very build
+/// that produced this router — see `rg_http::route_table`. A test that walks
+/// them is therefore walking the real route set, not a hand-kept copy of it.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_routes() -> (String, Vec<rg_http::route_table::RouteFact>) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    let state = build_test_app_state(db, repo_root);
+    let (app, facts) = rg_http::create_router_for_test_with_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    (base_url, facts)
+}
+
 /// Spawn the test app and keep the db handle alive for tests that need
 /// to manipulate data directly (e.g. promoting admin users).
 #[allow(dead_code)]

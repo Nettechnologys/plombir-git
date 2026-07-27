@@ -23,6 +23,7 @@ pub mod oci;
 pub mod openapi;
 pub mod pagination;
 pub mod rate_limit;
+pub mod route_table;
 pub mod security;
 pub mod ws;
 
@@ -544,6 +545,16 @@ async fn load_tls_config(
 /// Create the Axum router for testing (no rate limiter, no static file serving).
 pub fn create_router_for_test(state: AppState) -> Router {
     routes::build_test_router(state)
+}
+
+/// The test router plus the declared access level of every route in it.
+///
+/// The route-access sweep needs both, and needs them to come from one build —
+/// a table assembled separately from the router is a table that can drift.
+pub fn create_router_for_test_with_routes(
+    state: AppState,
+) -> (Router, Vec<route_table::RouteFact>) {
+    routes::build_test_router_with_facts(state)
 }
 
 // ── Metrics gauge sink ────────────────────────────────────
