@@ -21,22 +21,52 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
 
-// ── Read gates ────────────────────────────────────────────────────────
+// ── Access gates ──────────────────────────────────────────────────────
 //
 // These routes carry the repository in the path but address the release (or
-// asset) by a *global* id, so the read check and the object it guards are two
-// different things. Checking only the repository proves the caller can open
-// some repo — it says nothing about where the id points, and a public repo of
-// their own is enough to reach a private repo's releases. Both helpers below
-// therefore re-anchor the object to the repository that was checked.
+// asset) by a *global* id, so the permission check and the object it guards are
+// two different things. Checking only the repository proves the caller can open
+// (or write to) some repo — it says nothing about where the id points, and a
+// public repo of their own is enough to reach a private repo's releases. Every
+// helper below therefore re-anchors the object to the repository that was
+// checked, and hands the resolved model back so handlers act on the id that was
+// verified rather than the one from the path.
 //
 // A mismatch answers 404, not 403: a 403 would still confirm that the id
 // exists, which is most of what an id-walking caller wants to learn.
+
+/// Anchor a release to an already-authorized repository.
+async fn release_in_repo(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    release_id: i64,
+) -> Result<rg_db::entities::release::Model, AppError> {
+    let release = rg_core::release::service::get_release(&state.db, release_id).await?;
+    if release.repo_id != repo.id {
+        return Err(AppError::not_found("release not found"));
+    }
+
+    Ok(release)
+}
+
+/// Anchor an asset to an already-authorized repository, through its release.
+async fn asset_in_repo(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    asset_id: i64,
+) -> Result<rg_db::entities::release_asset::Model, AppError> {
+    let asset = rg_core::release::service::get_asset(&state.db, asset_id).await?;
+    let release = rg_core::release::service::get_release(&state.db, asset.release_id).await?;
+    if release.repo_id != repo.id {
+        return Err(AppError::not_found("asset not found"));
+    }
+
+    Ok(asset)
+}
 
 /// Require read access to `owner/name` and return the release, which must live
 /// in that repository.
@@ -48,13 +78,7 @@ async fn resolve_release_in_repo(
     release_id: i64,
 ) -> Result<rg_db::entities::release::Model, AppError> {
     let repo = crate::api::repo_access::require_read(state, headers, owner, name).await?;
-
-    let release = rg_core::release::service::get_release(&state.db, release_id).await?;
-    if release.repo_id != repo.id {
-        return Err(AppError::not_found("release not found"));
-    }
-
-    Ok(release)
+    release_in_repo(state, &repo, release_id).await
 }
 
 /// Require read access to `owner/name` and return the asset, whose release must
@@ -67,14 +91,37 @@ async fn resolve_asset_in_repo(
     asset_id: i64,
 ) -> Result<rg_db::entities::release_asset::Model, AppError> {
     let repo = crate::api::repo_access::require_read(state, headers, owner, name).await?;
+    asset_in_repo(state, &repo, asset_id).await
+}
 
-    let asset = rg_core::release::service::get_asset(&state.db, asset_id).await?;
-    let release = rg_core::release::service::get_release(&state.db, asset.release_id).await?;
-    if release.repo_id != repo.id {
-        return Err(AppError::not_found("asset not found"));
-    }
+/// Require write access to `owner/name` and return the release living in it,
+/// together with the acting user id.
+async fn resolve_release_in_repo_write(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    release_id: i64,
+) -> Result<(rg_db::entities::release::Model, i64), AppError> {
+    let (repo, user_id) =
+        crate::api::repo_access::require_write(state, headers, owner, name).await?;
+    let release = release_in_repo(state, &repo, release_id).await?;
+    Ok((release, user_id))
+}
 
-    Ok(asset)
+/// Require write access to `owner/name` and return the asset living in it,
+/// together with the acting user id.
+async fn resolve_asset_in_repo_write(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    asset_id: i64,
+) -> Result<(rg_db::entities::release_asset::Model, i64), AppError> {
+    let (repo, user_id) =
+        crate::api::repo_access::require_write(state, headers, owner, name).await?;
+    let asset = asset_in_repo(state, &repo, asset_id).await?;
+    Ok((asset, user_id))
 }
 
 /// Request body for creating a release.
@@ -166,43 +213,14 @@ pub async fn create_release(
     Path((owner, name)): Path<(String, String)>,
     Json(body): Json<CreateReleaseRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response();
-        }
-    };
-
-    // Find repo
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return AppError::not_found("repository not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    };
-
-    // Check write permission
-    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return AppError::forbidden("permission denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
+    // The release is created *in* the resolved repository, so this route carries
+    // no foreign id — the shared gate is enough, and it keeps one copy of the
+    // resolve-then-check sequence instead of a second hand-rolled one.
+    let (repo, user_id) =
+        match crate::api::repo_access::require_write(&state, &headers, &owner, &name).await {
+            Ok(resolved) => resolved,
+            Err(e) => return e.into_response(),
+        };
 
     // H-02: Validate owner/name before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -284,35 +302,16 @@ pub async fn update_release(
     Path((owner, name, id)): Path<(String, String, i64)>,
     Json(body): Json<UpdateReleaseRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    // Write access to `owner/name` says nothing about where `id` points: the
+    // release has to live in the repository the permission was checked against.
+    let release = match resolve_release_in_repo_write(&state, &headers, &owner, &name, id).await {
+        Ok((release, _user_id)) => release,
+        Err(e) => return e.into_response(),
     };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response();
-        }
-    };
-
-    // Check write permission
-    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return AppError::forbidden("permission denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
 
     match rg_core::release::service::update_release(
         &state.db,
-        id,
+        release.id,
         body.title.as_deref(),
         body.body.as_deref(),
         body.is_draft,
@@ -346,33 +345,12 @@ pub async fn delete_release(
     headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    let release = match resolve_release_in_repo_write(&state, &headers, &owner, &name, id).await {
+        Ok((release, _user_id)) => release,
+        Err(e) => return e.into_response(),
     };
 
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response();
-        }
-    };
-
-    // Check write permission
-    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return AppError::forbidden("permission denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
-
-    match rg_core::release::service::delete_release(&state.db, id).await {
+    match rg_core::release::service::delete_release(&state.db, release.id).await {
         Ok(()) => (
             StatusCode::NO_CONTENT,
             Json(serde_json::json!({ "deleted": true })),
@@ -441,31 +419,14 @@ pub async fn upload_asset(
     Path((owner, name, release_id)): Path<(String, String, i64)>,
     body: Body,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response();
-        }
-    };
-
-    // Check write permission
-    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return AppError::forbidden("permission denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
+    // Gate before reading the body: the release must belong to the repository
+    // whose write permission was just checked, otherwise the asset lands in
+    // someone else's release.
+    let (release, user_id) =
+        match resolve_release_in_repo_write(&state, &headers, &owner, &name, release_id).await {
+            Ok(resolved) => resolved,
+            Err(e) => return e.into_response(),
+        };
 
     let filename = headers
         .get(header::CONTENT_DISPOSITION)
@@ -504,7 +465,7 @@ pub async fn upload_asset(
 
     match rg_core::release::service::upload_asset(
         &state.db,
-        release_id,
+        release.id,
         state.blob_storage.as_ref(),
         &state.repo_root,
         &owner,
@@ -719,27 +680,15 @@ pub async fn sign_asset_attestation(
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
+    let asset = match resolve_asset_in_repo_write(&state, &headers, &owner, &name, asset_id).await {
+        Ok((asset, _user_id)) => asset,
+        Err(e) => return e.into_response(),
     };
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("permission denied").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
 
     let builder_id = attestation_builder_id(&state);
     match rg_core::release::service::sign_asset_attestation(
         &state.db,
-        asset_id,
+        asset.id,
         &state.jwt_secret,
         &builder_id,
     )
@@ -782,11 +731,16 @@ pub async fn get_asset_attestation(
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
+    // Read access to the repository in the path is only half of it — the
+    // envelope belongs to a globally addressed asset, and it carries the
+    // filename and digest of a release that may live in a private repository
+    // the caller cannot open.
+    let asset = match resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+        Ok(asset) => asset,
+        Err(e) => return e.into_response(),
+    };
 
-    match rg_core::release::service::get_asset_attestation(&state.db, asset_id).await {
+    match rg_core::release::service::get_asset_attestation(&state.db, asset.id).await {
         Ok(Some(envelope)) => (StatusCode::OK, Json(serde_json::json!(envelope))).into_response(),
         Ok(None) => AppError::not_found("asset has no attestation").into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -820,13 +774,14 @@ pub async fn verify_asset_attestation(
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    if let Err(e) = crate::api::repo_access::require_read(&state, &headers, &owner, &name).await {
-        return e.into_response();
-    }
+    let asset = match resolve_asset_in_repo(&state, &headers, &owner, &name, asset_id).await {
+        Ok(asset) => asset,
+        Err(e) => return e.into_response(),
+    };
 
     match rg_core::release::service::verify_asset_attestation(
         &state.db,
-        asset_id,
+        asset.id,
         state.blob_storage.as_ref(),
         &state.repo_root,
         &owner,
@@ -864,35 +819,16 @@ pub async fn delete_asset(
     headers: HeaderMap,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
+    // `owner`/`name` below only build the storage path — on their own they never
+    // constrain which asset row is deleted, so the id has to be anchored first.
+    let asset = match resolve_asset_in_repo_write(&state, &headers, &owner, &name, asset_id).await {
+        Ok((asset, _user_id)) => asset,
+        Err(e) => return e.into_response(),
     };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response();
-        }
-    };
-
-    // Check write permission
-    match rg_core::repo::service::can_write(&state.db, &owner, &name, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return AppError::forbidden("permission denied").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
-    }
 
     match rg_core::release::service::delete_asset(
         &state.db,
-        asset_id,
+        asset.id,
         state.blob_storage.as_ref(),
         &state.repo_root,
         &owner,
