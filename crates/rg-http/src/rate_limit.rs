@@ -302,7 +302,9 @@ impl RateLimiter {
 async fn wait_optional_shutdown(shutdown_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
     match shutdown_rx {
         Some(rx) => {
-            let _ = rx.changed().await;
+            if rx.changed().await.is_err() {
+                // Sender dropped: treat it the same as an explicit shutdown.
+            }
         }
         None => std::future::pending::<()>().await,
     }

@@ -230,14 +230,16 @@ pub fn build_packages_json(
 
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(byte as char)
             }
             _ => {
-                use std::fmt::Write;
-                let _ = write!(encoded, "%{byte:02X}");
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
             }
         }
     }

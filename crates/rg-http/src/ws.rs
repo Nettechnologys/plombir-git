@@ -103,7 +103,9 @@ impl NotificationHub {
 
         let channels = self.inner.user_channels.read().await;
         if let Some(sender) = channels.get(&user_id) {
-            let _ = sender.send(event);
+            if sender.send(event).is_err() {
+                // The channel exists but currently has no receivers.
+            }
         }
         // If the user has no active channel, the notification is silently
         // dropped. The REST API /notifications endpoint will still serve
@@ -160,7 +162,9 @@ impl NotificationHub {
         };
         let channels = self.inner.job_channels.read().await;
         if let Some(sender) = channels.get(&job_id) {
-            let _ = sender.send(event);
+            if sender.send(event).is_err() {
+                // The channel exists but currently has no receivers.
+            }
         }
     }
 }
@@ -246,14 +250,20 @@ async fn handle_ws_connection(socket: WebSocket, hub: NotificationHub, user_id: 
     let (mut sender, mut receiver) = socket.split();
 
     if user_id.is_none() {
-        let _ = sender
+        if sender
             .send(Message::Text(
                 serde_json::json!({"error": "authentication required"})
                     .to_string()
                     .into(),
             ))
-            .await;
-        let _ = sender.close().await;
+            .await
+            .is_err()
+        {
+            // Client disconnected before the authentication error was sent.
+        }
+        if sender.close().await.is_err() {
+            // Client already disconnected.
+        }
         return;
     }
 

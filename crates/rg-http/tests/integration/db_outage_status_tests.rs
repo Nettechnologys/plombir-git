@@ -20,7 +20,7 @@ use crate::common::{build_test_app_state, setup_test_db};
 async fn db_outage_in_handler_returns_503_not_500() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).ok();
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db.clone(), repo_root);
 
     // Simulate a database outage: close the shared connection pool. Every
@@ -51,7 +51,7 @@ async fn db_outage_in_handler_returns_503_not_500() {
 async fn db_outage_in_packages_handler_returns_503_not_500() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).ok();
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db.clone(), repo_root);
 
     // Close the pool to simulate a connection-level outage.

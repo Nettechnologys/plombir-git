@@ -261,7 +261,7 @@ impl BlobStorage for FaultyBlobStorage {
 pub async fn spawn_test_app_with_faults() -> (String, rg_db::DatabaseConnection, BlobFaults) {
     let (db, dir) = super::setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).ok();
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let (blob_storage, faults) = FaultyBlobStorage::wrap(Arc::new(
         rg_core::blob_storage::LocalBlobStorage::new(&repo_root),
     ));

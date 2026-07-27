@@ -163,7 +163,7 @@ pub async fn wait_for_listener(addr: &str) {
 pub async fn spawn_test_app() -> String {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).ok();
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db, repo_root);
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -186,7 +186,7 @@ pub async fn spawn_test_app() -> String {
 pub async fn spawn_test_app_with_routes() -> (String, Vec<rg_http::route_table::RouteFact>) {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).ok();
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db, repo_root);
     let (app, facts) = rg_http::create_router_for_test_with_routes(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

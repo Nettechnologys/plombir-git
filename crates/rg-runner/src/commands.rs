@@ -319,14 +319,12 @@ pub async fn cmd_run(
                 }
                 let execution = async {
                     if let Some(img) = &job.image {
-                        run_job_docker(img, &script_str, &variables, &workspace, job.job_id)
-                            .await
+                        run_job_docker(img, &script_str, &variables, &workspace, job.job_id).await
                     } else {
                         run_job_local(&script_str, &variables, &workspace).await
                     }
                 };
-                let timeout_seconds =
-                    u64::try_from(job.timeout).unwrap_or(3600).clamp(1, 86_400);
+                let timeout_seconds = u64::try_from(job.timeout).unwrap_or(3600).clamp(1, 86_400);
                 let (exit_code, log) = match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_seconds),
                     execution,
@@ -336,14 +334,17 @@ pub async fn cmd_run(
                     Ok(result) => result,
                     Err(_) => {
                         if job.image.is_some() {
-                            let _ = tokio::process::Command::new("docker")
-                                .args([
-                                    "rm",
-                                    "-f",
-                                    &format!("forgekeep-runner-job-{}", job.job_id),
-                                ])
+                            if let Err(error) = tokio::process::Command::new("docker")
+                                .args(["rm", "-f", &format!("forgekeep-runner-job-{}", job.job_id)])
                                 .output()
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(
+                                    job_id = job.job_id,
+                                    %error,
+                                    "failed to remove timed-out docker job container"
+                                );
+                            }
                         }
                         (-1, format!("Job timed out after {timeout_seconds} seconds"))
                     }

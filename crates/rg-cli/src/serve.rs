@@ -330,7 +330,10 @@ pub(crate) async fn run_serve(
         "FORGEKEEP_EXTERNAL_WEBHOOK_SECRET",
         "IRONFORGE_EXTERNAL_WEBHOOK_SECRET",
     )
-    .or_else(|| cfg.as_ref().and_then(|c| c.webhooks.external_secret.clone()));
+    .or_else(|| {
+        cfg.as_ref()
+            .and_then(|c| c.webhooks.external_secret.clone())
+    });
     if resolved_external_webhook_secret.is_some() {
         tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
     }
@@ -375,21 +378,23 @@ pub(crate) async fn run_serve(
     // guard owns the non-blocking appender worker and the OTLP tracer provider;
     // it is flushed on shutdown at the end of this function.
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
-    let (log_writer, appender_guard): (BoxMakeWriter, Option<tracing_appender::non_blocking::WorkerGuard>) =
-        if let Some(ref log_path) = resolved_log_file {
-            let log_dir = std::path::Path::new(log_path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
-            let log_prefix = std::path::Path::new(log_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("forgekeep");
-            let log_suffix = std::path::Path::new(log_path)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("log");
+    let (log_writer, appender_guard): (
+        BoxMakeWriter,
+        Option<tracing_appender::non_blocking::WorkerGuard>,
+    ) = if let Some(ref log_path) = resolved_log_file {
+        let log_dir = std::path::Path::new(log_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let log_prefix = std::path::Path::new(log_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("forgekeep");
+        let log_suffix = std::path::Path::new(log_path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log");
 
-            let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
                 .filename_prefix(log_prefix)
                 .filename_suffix(log_suffix)
@@ -410,11 +415,11 @@ pub(crate) async fn run_serve(
                     anyhow::anyhow!(message)
                 })?;
 
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            (BoxMakeWriter::new(non_blocking), Some(guard))
-        } else {
-            (BoxMakeWriter::new(std::io::stdout), None)
-        };
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        (BoxMakeWriter::new(non_blocking), Some(guard))
+    } else {
+        (BoxMakeWriter::new(std::io::stdout), None)
+    };
 
     let otel_config = telemetry::resolve_otel_config(
         cfg.as_ref()
@@ -482,7 +487,9 @@ pub(crate) async fn run_serve(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
+        if shutdown_tx.send(true).is_err() {
+            // Every receiver has already shut down.
+        }
     });
 
     let audit_config = cfg.as_ref().map(|config| &config.audit);
@@ -531,29 +538,26 @@ pub(crate) async fn run_serve(
     };
 
     // ── HTTP server ───────────────────────────────────────────────
-    let smtp_config =
-        match (
-            resolved_smtp_host,
-            resolved_smtp_user,
-            resolved_smtp_pass,
-            resolved_smtp_from,
-        ) {
-            (Some(host), Some(user), Some(pass), Some(from)) => {
-                if resolved_smtp_port == 0 {
-                    anyhow::bail!(
-                        "config `smtp.port` must be 1-65535 (got 0) when SMTP is configured"
-                    );
-                }
-                Some(rg_core::email::SmtpConfig::new(
-                    &host,
-                    resolved_smtp_port,
-                    &user,
-                    &pass,
-                    &from,
-                ))
+    let smtp_config = match (
+        resolved_smtp_host,
+        resolved_smtp_user,
+        resolved_smtp_pass,
+        resolved_smtp_from,
+    ) {
+        (Some(host), Some(user), Some(pass), Some(from)) => {
+            if resolved_smtp_port == 0 {
+                anyhow::bail!("config `smtp.port` must be 1-65535 (got 0) when SMTP is configured");
             }
-            _ => None,
-        };
+            Some(rg_core::email::SmtpConfig::new(
+                &host,
+                resolved_smtp_port,
+                &user,
+                &pass,
+                &from,
+            ))
+        }
+        _ => None,
+    };
 
     let tls_config = match (resolved_tls_cert, resolved_tls_key) {
         (Some(cert), Some(key)) => {

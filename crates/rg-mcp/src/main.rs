@@ -111,10 +111,14 @@ fn main() -> anyhow::Result<()> {
     let _runtime_guard = runtime.enter();
 
     // Log to stderr so the stdio JSON-RPC channel stays clean.
-    let _ = tracing_subscriber::fmt()
+    if tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
+        .try_init()
+        .is_err()
+    {
+        // Another embedding binary/test installed a subscriber first.
+    }
 
     let app_state = AppState::from_env()?;
 

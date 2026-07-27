@@ -194,24 +194,32 @@ impl GitCommandGateway {
             let mut guard = child_clone.lock().unwrap();
             if let Some(c) = guard.take() {
                 let result = c.wait_with_output();
-                let _ = tx.send(result);
+                if tx.send(result).is_err() {
+                    // Receiver timed out and is already returning the timeout error.
+                }
             }
         });
 
         let output = match rx.recv_timeout(self.timeout) {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
-                handle.join().ok();
+                if handle.join().is_err() {
+                    tracing::warn!("git command wait thread panicked after returning an I/O error");
+                }
                 return Err(GitCliError::Io(e).into());
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Kill the child process
                 if let Ok(mut guard) = child_arc.lock() {
                     if let Some(mut c) = guard.take() {
-                        let _ = c.kill();
+                        if c.kill().is_err() {
+                            // Process has already exited between timeout and kill.
+                        }
                     }
                 }
-                handle.join().ok();
+                if handle.join().is_err() {
+                    tracing::warn!("git command wait thread panicked after timeout");
+                }
                 return Err(GitCliError::Timeout {
                     command: command_str,
                     timeout: self.timeout,

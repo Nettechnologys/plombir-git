@@ -680,7 +680,9 @@ fn stream_git_archive_with_idle(
         let stderr_task = tokio::spawn(async move {
             let mut buf = Vec::new();
             if let Some(mut se) = stderr {
-                let _ = se.read_to_end(&mut buf).await;
+                if let Err(error) = se.read_to_end(&mut buf).await {
+                    tracing::warn!(%error, "failed to drain git archive stderr");
+                }
             }
             buf
         });
@@ -735,7 +737,9 @@ fn stream_git_archive_with_idle(
         }
 
         // Reap git. On a trip we kill it; on clean EOF it has already exited.
-        let _ = child.start_kill();
+        if let Err(error) = child.start_kill() {
+            tracing::debug!(%error, "git archive process already exited before kill");
+        }
         if let Ok(status) = child.wait().await {
             if clean_eof && !status.success() {
                 let err = stderr_task.await.unwrap_or_default();

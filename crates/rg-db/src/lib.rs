@@ -497,6 +497,25 @@ pub async fn rebuild_fts_indexes(db: &DatabaseConnection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "SQLite test files may already be absent before or after the run; cleanup must not mask the assertion under test."
+    )]
+    fn discard_sqlite_test_file(path: impl AsRef<std::path::Path>) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn discard_sqlite_test_files(path: &std::path::Path) {
+        discard_sqlite_test_file(path);
+        for suffix in ["-wal", "-shm"] {
+            discard_sqlite_test_file(std::path::PathBuf::from(format!(
+                "{}{}",
+                path.display(),
+                suffix
+            )));
+        }
+    }
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
     /// The identity has to survive being asked twice and being asked through a
@@ -613,7 +632,7 @@ mod tests {
     async fn connect_applies_per_connection_pragmas() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("forgekeep_pragma_test_{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        discard_sqlite_test_file(&path);
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
         let db = connect(&url).await.expect("connect");
@@ -640,7 +659,7 @@ mod tests {
         let mode: String = row.try_get_by_index(0).expect("journal mode value");
         assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
 
-        let _ = std::fs::remove_file(&path);
+        discard_sqlite_test_file(&path);
     }
 
     /// Stands in for a load test: hammer the multi-connection pool with
@@ -654,9 +673,7 @@ mod tests {
             "forgekeep_concurrency_test_{}.db",
             std::process::id()
         ));
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
-        }
+        discard_sqlite_test_files(&path);
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
         let db = connect(&url).await.expect("connect");
@@ -703,8 +720,6 @@ mod tests {
         let count: i64 = row.try_get_by_index(0).expect("count value");
         assert_eq!(count, TASKS, "every concurrent write must be persisted");
 
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
-        }
+        discard_sqlite_test_files(&path);
     }
 }

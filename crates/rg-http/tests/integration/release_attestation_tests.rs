@@ -66,7 +66,7 @@ async fn sign_get_verify_round_trip() {
     assert_eq!(signed.status(), 201);
     let envelope: serde_json::Value = signed.json().await.unwrap();
     assert_eq!(envelope["payloadType"], "application/vnd.in-toto+json");
-    assert!(envelope["payload"].as_str().unwrap().len() > 0);
+    assert!(!envelope["payload"].as_str().unwrap().is_empty());
     assert_eq!(envelope["signatures"].as_array().unwrap().len(), 1);
 
     // Fetch stored envelope → identical.
@@ -132,7 +132,7 @@ async fn verify_without_attestation_is_404() {
 async fn disabled_endpoints_return_404() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    std::fs::create_dir_all(&repo_root).ok();
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let mut state = build_test_app_state(db, repo_root);
     state.attestation_enabled = false; // opt-in: off
     let app = rg_http::create_router_for_test(state);
@@ -171,5 +171,9 @@ async fn disabled_endpoints_return_404() {
         .send()
         .await
         .unwrap();
-    assert_eq!(verify.status(), 404, "verify must 404 when feature disabled");
+    assert_eq!(
+        verify.status(),
+        404,
+        "verify must 404 when feature disabled"
+    );
 }

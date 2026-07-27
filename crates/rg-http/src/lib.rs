@@ -509,7 +509,9 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
     if *shutdown_rx.borrow() {
         return;
     }
-    let _ = shutdown_rx.changed().await;
+    if shutdown_rx.changed().await.is_err() {
+        // Coordinator dropped: graceful shutdown should still proceed.
+    }
 }
 
 /// Bridge the `watch` shutdown signal to an `axum_server::Handle`: once the

@@ -18,7 +18,9 @@ static WEBHOOK_DELIVERY_OBSERVER: OnceLock<fn(bool)> = OnceLock::new();
 /// Install the webhook-delivery observer. Idempotent: the first installer wins,
 /// later calls are ignored (a process only boots one metrics registry).
 pub fn set_webhook_delivery_observer(observer: fn(bool)) {
-    let _ = WEBHOOK_DELIVERY_OBSERVER.set(observer);
+    if WEBHOOK_DELIVERY_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
 }
 
 /// Record a completed webhook delivery. No-op when no observer is installed.
@@ -36,7 +38,9 @@ static PR_MERGED_OBSERVER: OnceLock<fn()> = OnceLock::new();
 
 /// Install the pr-merged observer. Idempotent (first installer wins).
 pub fn set_pr_merged_observer(observer: fn()) {
-    let _ = PR_MERGED_OBSERVER.set(observer);
+    if PR_MERGED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
 }
 
 /// Record a merged pull request. No-op when no observer is installed.
@@ -53,7 +57,9 @@ static REPO_CREATED_OBSERVER: OnceLock<fn()> = OnceLock::new();
 
 /// Install the repo-created observer. Idempotent (first installer wins).
 pub fn set_repo_created_observer(observer: fn()) {
-    let _ = REPO_CREATED_OBSERVER.set(observer);
+    if REPO_CREATED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
 }
 
 /// Record a created repository. No-op when no observer is installed.
@@ -72,7 +78,9 @@ static USER_PROVISIONED_OBSERVER: OnceLock<fn(&str)> = OnceLock::new();
 
 /// Install the user-provisioned observer. Idempotent (first installer wins).
 pub fn set_user_provisioned_observer(observer: fn(&str)) {
-    let _ = USER_PROVISIONED_OBSERVER.set(observer);
+    if USER_PROVISIONED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
 }
 
 /// Record a user account auto-provisioned by an external identity source.

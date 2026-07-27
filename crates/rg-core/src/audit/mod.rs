@@ -26,9 +26,12 @@ pub use audit_impl::record;
 macro_rules! audit {
     ($db:expr, $user_id:expr, $username:expr, $action:expr,
      $rt:expr, $rid:expr, $rn:expr, $ip:expr, $ua:expr, $details:expr $(,)?) => {{
-        let _ = $crate::audit::record(
+        if let Err(error) = $crate::audit::record(
             $db, $user_id, $username, $action, $rt, $rid, $rn, $ip, $ua, $details,
         )
-        .await;
+        .await
+        {
+            tracing::warn!(%error, "audit record failed");
+        }
     }};
 }

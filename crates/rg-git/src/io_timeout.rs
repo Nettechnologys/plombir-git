@@ -193,8 +193,8 @@ pub fn is_idle_timeout(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A slow-drip read trips the idle timer close to the window, not the far
@@ -208,7 +208,9 @@ mod tests {
         tokio::spawn(async move {
             server.write_all(&[0x42]).await.unwrap();
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let _ = server.write_all(&[0x43]).await;
+            if server.write_all(&[0x43]).await.is_err() {
+                // The reader timed out and closed first, which is the test case.
+            }
         });
 
         let mut reader = IdleTimeout::from_secs(client, /* 1s window (paused clock) */ 1);
@@ -220,7 +222,11 @@ mod tests {
         // Second read stalls past the idle window → TimedOut, well before the
         // writer's 10s quiet period would end.
         let err = reader.read_exact(&mut byte).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "slow-drip must trip idle");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "slow-drip must trip idle"
+        );
     }
 
     /// Continuous-but-slow traffic (bytes arriving faster than the idle window)
@@ -253,7 +259,7 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(64);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            let _ = server.write_all(&[0x99]).await;
+            server.write_all(&[0x99]).await.unwrap();
         });
 
         let mut reader = IdleTimeout::from_secs(client, 0); // disabled
@@ -295,8 +301,15 @@ mod tests {
             1,
         );
         let err = writer.write_all(b"packdata").await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "stalled write must trip idle");
-        assert!(polls.load(Ordering::SeqCst) >= 1, "inner writer must have been polled");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "stalled write must trip idle"
+        );
+        assert!(
+            polls.load(Ordering::SeqCst) >= 1,
+            "inner writer must have been polled"
+        );
     }
 
     #[test]

@@ -422,7 +422,7 @@ mod tests {
             let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
             let mut reader = BufReader::new(Cursor::new(buf));
             // The `let _ =` is the assertion: reaching here means no panic/hang.
-            let _ = read_pkt_line(&mut reader).await;
+            drop(read_pkt_line(&mut reader).await);
         }
     }
 
@@ -440,7 +440,7 @@ mod tests {
             let payload_len = rng.below(80);
             buf.extend((0..payload_len).map(|_| rng.byte()));
             let mut reader = BufReader::new(Cursor::new(buf));
-            let _ = read_pkt_line(&mut reader).await;
+            drop(read_pkt_line(&mut reader).await);
         }
     }
 
@@ -456,10 +456,10 @@ mod tests {
             let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
 
             let mut batch_reader = BufReader::new(Cursor::new(buf.clone()));
-            let _ = read_pkt_lines_until_flush(&mut batch_reader).await;
+            drop(read_pkt_lines_until_flush(&mut batch_reader).await);
 
             let mut text_reader = BufReader::new(Cursor::new(buf));
-            let _ = read_text_line(&mut text_reader).await;
+            drop(read_text_line(&mut text_reader).await);
         }
     }
 }

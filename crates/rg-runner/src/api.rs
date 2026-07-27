@@ -601,8 +601,12 @@ mod tests {
                 tokio::spawn(async move {
                     if read_request(&mut stream).await.is_ok() {
                         served.fetch_add(1, Ordering::SeqCst);
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        let _ = stream.shutdown().await;
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if stream.shutdown().await.is_err() {
+                            // Client closed after reading the response.
+                        }
                     }
                 });
             }

@@ -749,49 +749,53 @@ impl Handler for SshHandler {
                 }
             };
 
-            let result: Result<(), anyhow::Error> =
-                match with_git_timeout(git_stream_timeout_secs, handler_fut).await {
-                    Ok(Ok(ref_updates)) => {
-                        // ── Post-push hooks: CI, webhooks, PR head-SHA ─────────
-                        //
-                        // The same hooks the Smart-HTTP transport runs, from the
-                        // same `rg-core` entry point. Detached so the client isn't
-                        // held while CI is triggered and the webhooks fan out —
-                        // but *tracked*: the client is about to get its exit
-                        // status, so a bare `tokio::spawn` would be severed by a
-                        // SIGTERM in the next few seconds with no pipeline, no
-                        // webhook and no trace that any of it was owed.
-                        // `delivery_tracker()` is drained by `rg_http::run` after
-                        // it stops accepting, the same contract the HTTP push path
-                        // relies on.
-                        if let (Some(ref_updates), Some(hooks), Some(db), Some((owner, repo_name))) =
-                            (ref_updates, post_push, hook_db, hook_target)
-                        {
-                            rg_core::task_tracker::delivery_tracker().spawn(async move {
-                                hooks
-                                    .run(
-                                        &db,
-                                        &hook_repo_path,
-                                        &owner,
-                                        &repo_name,
-                                        hook_pusher_id,
-                                        &ref_updates,
-                                    )
-                                    .await;
-                            });
-                        }
-                        Ok(())
+            let result: Result<(), anyhow::Error> = match with_git_timeout(
+                git_stream_timeout_secs,
+                handler_fut,
+            )
+            .await
+            {
+                Ok(Ok(ref_updates)) => {
+                    // ── Post-push hooks: CI, webhooks, PR head-SHA ─────────
+                    //
+                    // The same hooks the Smart-HTTP transport runs, from the
+                    // same `rg-core` entry point. Detached so the client isn't
+                    // held while CI is triggered and the webhooks fan out —
+                    // but *tracked*: the client is about to get its exit
+                    // status, so a bare `tokio::spawn` would be severed by a
+                    // SIGTERM in the next few seconds with no pipeline, no
+                    // webhook and no trace that any of it was owed.
+                    // `delivery_tracker()` is drained by `rg_http::run` after
+                    // it stops accepting, the same contract the HTTP push path
+                    // relies on.
+                    if let (Some(ref_updates), Some(hooks), Some(db), Some((owner, repo_name))) =
+                        (ref_updates, post_push, hook_db, hook_target)
+                    {
+                        rg_core::task_tracker::delivery_tracker().spawn(async move {
+                            hooks
+                                .run(
+                                    &db,
+                                    &hook_repo_path,
+                                    &owner,
+                                    &repo_name,
+                                    hook_pusher_id,
+                                    &ref_updates,
+                                )
+                                .await;
+                        });
                     }
-                    Ok(Err(e)) => Err(e),
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            %service_name,
-                            timeout_secs = git_stream_timeout_secs,
-                            "git SSH session exceeded wall-clock timeout — killed git, closing channel"
-                        );
-                        Err(anyhow::anyhow!("git operation timed out"))
-                    }
-                };
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        %service_name,
+                        timeout_secs = git_stream_timeout_secs,
+                        "git SSH session exceeded wall-clock timeout — killed git, closing channel"
+                    );
+                    Err(anyhow::anyhow!("git operation timed out"))
+                }
+            };
 
             let exit_code: u32 = if result.is_ok() { 0 } else { 1 };
 
@@ -806,7 +810,9 @@ impl Handler for SshHandler {
                     idle_timeout_secs = git_idle_timeout_secs,
                     "git SSH session idle (no read/write progress within idle window) — killed git, closing channel"
                 ),
-                Err(e) => tracing::error!(error = %format!("{e:#}"), %service_name, "Git SSH session failed"),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), %service_name, "Git SSH session failed")
+                }
             }
 
             // CRITICAL: SSH stream shutdown order (pitfall)
@@ -1092,7 +1098,10 @@ mod tests {
     fn proc_state(pid: u32) -> Option<char> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let after = stat.rsplit_once(')')?.1;
-        after.split_whitespace().next().and_then(|s| s.chars().next())
+        after
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.chars().next())
     }
 
     /// The core anti-zombie guarantee: the git subprocess lives *inside* the
@@ -1112,7 +1121,10 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id().expect("child pid");
-        assert!(proc_state(pid).is_some(), "child should be alive before timeout");
+        assert!(
+            proc_state(pid).is_some(),
+            "child should be alive before timeout"
+        );
 
         // The child is owned *inside* the future, mirroring the real handlers.
         let res = with_git_timeout(1, async move {
@@ -1120,7 +1132,7 @@ mod tests {
             let mut buf = Vec::new();
             // This never completes within the bound — the child sleeps 60s.
             if let Some(mut out) = child.stdout.take() {
-                let _ = out.read_to_end(&mut buf).await;
+                drop(out.read_to_end(&mut buf).await);
             }
             buf
         })
@@ -1139,6 +1151,9 @@ mod tests {
                 _ => tokio::time::sleep(Duration::from_millis(20)).await,
             }
         }
-        assert!(killed, "child must be killed/zombie after timeout drop, not still running");
+        assert!(
+            killed,
+            "child must be killed/zombie after timeout drop, not still running"
+        );
     }
 }

@@ -31,7 +31,8 @@ pub struct LdapUser {
 /// Escape a value embedded in an LDAP search filter (RFC 4515).
 fn escape_filter_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in value.as_bytes() {
         match byte {
             b'\0' => escaped.push_str("\\00"),
             b'(' => escaped.push_str("\\28"),
@@ -39,10 +40,11 @@ fn escape_filter_value(value: &str) -> String {
             b'*' => escaped.push_str("\\2a"),
             b'\\' => escaped.push_str("\\5c"),
             byte if !byte.is_ascii() => {
-                use std::fmt::Write;
-                let _ = write!(escaped, "\\{byte:02x}");
+                escaped.push('\\');
+                escaped.push(HEX[(byte >> 4) as usize] as char);
+                escaped.push(HEX[(byte & 0x0f) as usize] as char);
             }
-            byte => escaped.push(*byte as char),
+            byte => escaped.push(byte as char),
         }
     }
     escaped
@@ -129,7 +131,9 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
         });
 
     // Step 3: unbind service
-    ldap.unbind().await.ok();
+    if let Err(error) = ldap.unbind().await {
+        tracing::warn!(%error, "LDAP service unbind failed");
+    }
 
     // Step 4: rebind with user DN + password to verify
     let settings2 = connection_settings(config);
@@ -144,7 +148,9 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
         .await
         .map_err(|e| anyhow::anyhow!("LDAP user bind failed: {}", e))?;
 
-    ldap2.unbind().await.ok();
+    if let Err(error) = ldap2.unbind().await {
+        tracing::warn!(%error, "LDAP user unbind failed");
+    }
 
     // Check bind success via the result code
     if bind_result.rc != 0 {

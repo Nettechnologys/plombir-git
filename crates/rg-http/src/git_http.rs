@@ -10,11 +10,11 @@ use axum::response::{IntoResponse, Response};
 use sea_orm::DatabaseConnection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::pat_auth::extract_actor_id;
+use crate::{git_v2, AppState};
 use rg_core::branch_protection::push_rules::{
     branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
 };
-use crate::pat_auth::extract_actor_id;
-use crate::{git_v2, AppState};
 
 /// RAII timer that records a Git transport operation into the Prometheus
 /// metrics on drop — so every return path of the (branch-heavy) pack handlers
@@ -505,7 +505,11 @@ pub(crate) async fn handle_git_upload_pack(
     let body = match buffer_git_body(body, state.git_idle_timeout_secs).await {
         Ok(bytes) => bytes,
         Err((status, msg)) => {
-            return (status, [(header::CONTENT_TYPE, "text/plain")], Body::from(msg))
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(msg),
+            )
                 .into_response();
         }
     };
@@ -557,7 +561,9 @@ pub(crate) async fn handle_git_upload_pack(
         // Protocol V2: use V2 handler
         let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
         tokio::spawn(async move {
-            let _ = pipe_write.write_all(&body).await;
+            if pipe_write.write_all(&body).await.is_err() {
+                // Git stopped reading before the buffered request body was copied.
+            }
         });
 
         let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
@@ -565,7 +571,9 @@ pub(crate) async fn handle_git_upload_pack(
         let reader_task = tokio::spawn(async move {
             let mut buf_reader = buf_reader;
             let mut output = Vec::new();
-            let _ = buf_reader.read_to_end(&mut output).await;
+            if buf_reader.read_to_end(&mut output).await.is_err() {
+                output.clear();
+            }
             output
         });
 
@@ -576,7 +584,16 @@ pub(crate) async fn handle_git_upload_pack(
         .await
         {
             Ok(Ok(())) => {
-                let _ = buf_writer.flush().await;
+                if let Err(error) = buf_writer.flush().await {
+                    drop(buf_writer);
+                    reader_task.abort();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        Body::from(format!("failed to flush git upload-pack response: {error}")),
+                    )
+                        .into_response();
+                }
                 drop(buf_writer);
                 let output = reader_task.await.unwrap_or_default();
                 (
@@ -621,7 +638,9 @@ pub(crate) async fn handle_git_upload_pack(
         // Protocol V1: use V1 handler
         let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
         tokio::spawn(async move {
-            let _ = pipe_write.write_all(&body).await;
+            if pipe_write.write_all(&body).await.is_err() {
+                // Git stopped reading before the buffered request body was copied.
+            }
         });
 
         let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
@@ -629,7 +648,9 @@ pub(crate) async fn handle_git_upload_pack(
         let reader_task = tokio::spawn(async move {
             let mut buf_reader = buf_reader;
             let mut output = Vec::new();
-            let _ = buf_reader.read_to_end(&mut output).await;
+            if buf_reader.read_to_end(&mut output).await.is_err() {
+                output.clear();
+            }
             output
         });
 
@@ -644,7 +665,16 @@ pub(crate) async fn handle_git_upload_pack(
         .await
         {
             Ok(Ok(())) => {
-                let _ = buf_writer.flush().await;
+                if let Err(error) = buf_writer.flush().await {
+                    drop(buf_writer);
+                    reader_task.abort();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        Body::from(format!("failed to flush git upload-pack response: {error}")),
+                    )
+                        .into_response();
+                }
                 drop(buf_writer);
                 let output = reader_task.await.unwrap_or_default();
                 (
@@ -701,7 +731,11 @@ pub(crate) async fn handle_git_receive_pack(
     let body = match buffer_git_body(body, state.git_idle_timeout_secs).await {
         Ok(bytes) => bytes,
         Err((status, msg)) => {
-            return (status, [(header::CONTENT_TYPE, "text/plain")], Body::from(msg));
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(msg),
+            );
         }
     };
 
@@ -799,7 +833,9 @@ pub(crate) async fn handle_git_receive_pack(
 
     let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
     tokio::spawn(async move {
-        let _ = pipe_write.write_all(&body).await;
+        if pipe_write.write_all(&body).await.is_err() {
+            // Git stopped reading before the buffered request body was copied.
+        }
     });
 
     let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
@@ -807,7 +843,9 @@ pub(crate) async fn handle_git_receive_pack(
     let reader_task = tokio::spawn(async move {
         let mut buf_reader = buf_reader;
         let mut output = Vec::new();
-        let _ = buf_reader.read_to_end(&mut output).await;
+        if buf_reader.read_to_end(&mut output).await.is_err() {
+            output.clear();
+        }
         output
     });
 
@@ -827,7 +865,17 @@ pub(crate) async fn handle_git_receive_pack(
     .await
     {
         Ok(Ok(ref_updates)) => {
-            let _ = buf_writer.flush().await;
+            if let Err(error) = buf_writer.flush().await {
+                drop(buf_writer);
+                reader_task.abort();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from(format!(
+                        "failed to flush git receive-pack response: {error}"
+                    )),
+                );
+            }
             drop(buf_writer);
             let output = reader_task.await.unwrap_or_default();
 
@@ -929,7 +977,9 @@ mod tests {
             Some((Ok::<_, std::io::Error>(Bytes::from_static(b"pack")), i + 1))
         }));
 
-        let buffered = buffer_git_body(body, 1).await.expect("continuous traffic must not trip");
+        let buffered = buffer_git_body(body, 1)
+            .await
+            .expect("continuous traffic must not trip");
         assert_eq!(&buffered[..], b"packpackpackpackpack");
     }
 
@@ -946,7 +996,9 @@ mod tests {
             }
         }));
 
-        let buffered = buffer_git_body(body, 0).await.expect("disabled window must not trip");
+        let buffered = buffer_git_body(body, 0)
+            .await
+            .expect("disabled window must not trip");
         assert_eq!(&buffered[..], b"late");
     }
 
@@ -1026,7 +1078,10 @@ mod tests {
     fn proc_state(pid: u32) -> Option<char> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let after = stat.rsplit_once(')')?.1;
-        after.split_whitespace().next().and_then(|s| s.chars().next())
+        after
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.chars().next())
     }
 
     /// The core anti-zombie guarantee: the subprocess lives *inside* the future,
@@ -1047,7 +1102,7 @@ mod tests {
                 .spawn()
                 .expect("spawn sleep child");
             *captured.lock().unwrap() = child.id();
-            let _ = child.wait().await; // hang until the future is dropped
+            drop(child.wait().await); // hang until the future is dropped
         })
         .await;
         assert!(res.is_err(), "the hanging future should elapse");

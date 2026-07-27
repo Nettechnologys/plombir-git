@@ -92,14 +92,16 @@ fn is_https_request(headers: &HeaderMap) -> bool {
 
 fn encode_query_component(value: &str) -> String {
     let mut out = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(byte as char)
             }
             _ => {
-                use std::fmt::Write;
-                let _ = write!(out, "%{byte:02X}");
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
             }
         }
     }
@@ -152,8 +154,8 @@ fn sign_cookie_value(value: &str, secret: &str) -> String {
     type HmacSha256 = Hmac<Sha256>;
 
     // HMAC accepts a key of any length, so init cannot fail.
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(value.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -633,46 +635,67 @@ pub async fn refresh_token(
             AppError::bad_request("failed to refresh token")
         })?;
 
-    // Store updated tokens
-    let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
-        .unwrap_or_default();
-    let enc_refresh = token_response
-        .refresh_token
-        .as_ref()
-        .and_then(|rt| rg_core::auth::encryption::encrypt(rt, &enc_key).ok());
-
-    let expires_at = token_response
-        .expires_in
-        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
-
-    // Update the OAuth account with new tokens
-    if let Some(account) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
-        &state.db, &slug, "", // We'll find by user
+    store_refreshed_oauth_tokens(
+        &state.db,
+        &state.jwt_secret,
+        user_id,
+        &slug,
+        &token_response,
     )
-    .await
-    .ok()
-    .flatten()
-    {
-        rg_db::ops::oauth_account_ops::upsert(
-            &state.db,
-            account.user_id,
-            &slug,
-            &account.provider_user_id,
-            &account.provider_username,
-            &account.email,
-            Some(&enc_access),
-            enc_refresh.as_deref(),
-            expires_at,
-        )
-        .await
-        .ok();
-    }
+    .await?;
 
     Ok(Json(serde_json::json!({
         "access_token": token_response.access_token,
         "expires_in": token_response.expires_in,
         "refresh_token": token_response.refresh_token,
     })))
+}
+
+async fn store_refreshed_oauth_tokens(
+    db: &sea_orm::DatabaseConnection,
+    jwt_secret: &str,
+    user_id: i64,
+    provider_slug: &str,
+    token_response: &rg_core::auth::sso::OAuth2TokenResponse,
+) -> Result<(), AppError> {
+    let accounts = rg_db::ops::oauth_account_ops::find_by_user_id(db, user_id)
+        .await
+        .map_err(AppError::from)?;
+    let account = accounts
+        .into_iter()
+        .find(|account| account.provider == provider_slug)
+        .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
+
+    let enc_key = rg_core::auth::encryption::derive_key(jwt_secret);
+    let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
+        .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
+    let enc_refresh = token_response
+        .refresh_token
+        .as_ref()
+        .map(|refresh| {
+            rg_core::auth::encryption::encrypt(refresh, &enc_key)
+                .map_err(|_| AppError::internal("failed to encrypt the OAuth refresh token"))
+        })
+        .transpose()?;
+    let expires_at = token_response
+        .expires_in
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+
+    rg_db::ops::oauth_account_ops::upsert(
+        db,
+        account.user_id,
+        provider_slug,
+        &account.provider_user_id,
+        &account.provider_username,
+        &account.email,
+        Some(&enc_access),
+        enc_refresh.as_deref(),
+        expires_at,
+    )
+    .await
+    .map_err(|_| AppError::internal("failed to store the OAuth account tokens"))?;
+
+    Ok(())
 }
 
 // ── Unlink OAuth account ─────────────────────────────────────────
@@ -864,8 +887,8 @@ async fn generate_unique_username(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_auth_cookie, encode_query_component, set_state_cookie, verify_state_cookie,
-        SSO_STATE_COOKIE, SSO_VERIFIER_COOKIE,
+        build_auth_cookie, encode_query_component, set_state_cookie, store_refreshed_oauth_tokens,
+        verify_state_cookie, SSO_STATE_COOKIE, SSO_VERIFIER_COOKIE,
     };
     use axum::http::{header, HeaderMap};
     use axum::response::IntoResponse;
@@ -934,6 +957,68 @@ mod tests {
             encode_query_component("alice bob+root"),
             "alice%20bob%2Broot"
         );
+    }
+
+    #[tokio::test]
+    async fn refreshed_tokens_are_stored_on_the_linked_oauth_account() {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect test database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "sso_refresh_user",
+            "sso-refresh@example.com",
+            "",
+            "SSO Refresh",
+        )
+        .await
+        .expect("create user");
+
+        let jwt_secret = "test-jwt-secret";
+        let enc_key = rg_core::auth::encryption::derive_key(jwt_secret);
+        let old_access = rg_core::auth::encryption::encrypt("old-access", &enc_key).unwrap();
+        let old_refresh = rg_core::auth::encryption::encrypt("old-refresh", &enc_key).unwrap();
+        rg_db::ops::oauth_account_ops::upsert(
+            &db,
+            user.id,
+            "oidc",
+            "provider-user-1",
+            "alice",
+            "alice@example.com",
+            Some(&old_access),
+            Some(&old_refresh),
+            None,
+        )
+        .await
+        .expect("insert OAuth account");
+
+        let token_response = rg_core::auth::sso::OAuth2TokenResponse {
+            access_token: "new-access".to_string(),
+            refresh_token: Some("new-refresh".to_string()),
+            expires_in: Some(3600),
+        };
+
+        store_refreshed_oauth_tokens(&db, jwt_secret, user.id, "oidc", &token_response)
+            .await
+            .expect("store refreshed tokens");
+
+        let account =
+            rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc", "provider-user-1")
+                .await
+                .expect("query OAuth account")
+                .expect("OAuth account exists");
+        let updated_access =
+            rg_core::auth::encryption::decrypt(account.access_token.as_deref().unwrap(), &enc_key)
+                .unwrap();
+        let updated_refresh =
+            rg_core::auth::encryption::decrypt(account.refresh_token.as_deref().unwrap(), &enc_key)
+                .unwrap();
+
+        assert_eq!(updated_access, "new-access");
+        assert_eq!(updated_refresh, "new-refresh");
+        assert!(account.token_expires_at.is_some());
     }
 
     #[test]

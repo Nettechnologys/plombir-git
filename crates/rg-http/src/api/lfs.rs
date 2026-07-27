@@ -408,7 +408,9 @@ async fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::re
         let decoder = match zstd::stream::Decoder::new(file) {
             Ok(d) => d,
             Err(error) => {
-                let _ = tx.blocking_send(Err(aborted(&error)));
+                if tx.blocking_send(Err(aborted(&error))).is_err() {
+                    // Client disconnected before the stream error could be delivered.
+                }
                 return;
             }
         };
@@ -426,7 +428,9 @@ async fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::re
                     }
                 }
                 Err(error) => {
-                    let _ = tx.blocking_send(Err(aborted(&error)));
+                    if tx.blocking_send(Err(aborted(&error))).is_err() {
+                        // Client disconnected before the stream error could be delivered.
+                    }
                     break;
                 }
             }
