@@ -5,6 +5,8 @@ pub use rg_http;
 
 use rg_core::package_registry::oci::OciStorage;
 
+pub mod fault;
+
 struct NoopCiEngine;
 
 impl rg_core::ci::CiTrigger for NoopCiEngine {
@@ -67,9 +69,32 @@ pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
     (db, dir)
 }
 
+/// Test-only replacements for individual pieces of [`rg_http::AppState`].
+///
+/// A struct with a `Default` rather than extra parameters on
+/// [`build_test_app_state`]: that function is called from a dozen places, and a
+/// harness that has to grow a parameter for every new seam is a harness nobody
+/// adds a seam to.
+#[derive(Default)]
+pub struct StateOverrides {
+    /// Replaces the `LocalBlobStorage` this harness would otherwise build.
+    ///
+    /// The OCI storage is layered on the same backend, so overriding this one
+    /// value reaches both the attachment/LFS write paths and the registry's.
+    pub blob_storage: Option<Arc<dyn rg_core::blob_storage::BlobStorage>>,
+}
+
 pub fn build_test_app_state(
     db: rg_db::DatabaseConnection,
     repo_root: std::path::PathBuf,
+) -> rg_http::AppState {
+    build_test_app_state_with(db, repo_root, StateOverrides::default())
+}
+
+pub fn build_test_app_state_with(
+    db: rg_db::DatabaseConnection,
+    repo_root: std::path::PathBuf,
+    overrides: StateOverrides,
 ) -> rg_http::AppState {
     let db_for_queue = db.clone();
     // Keep the registry inside this test's own temp tree. A fixed
@@ -81,8 +106,9 @@ pub fn build_test_app_state(
         .parent()
         .unwrap_or(repo_root.as_path())
         .join("oci-storage");
-    let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> =
-        Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root));
+    let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = overrides
+        .blob_storage
+        .unwrap_or_else(|| Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root)));
     rg_http::AppState {
         blob_storage: blob_storage.clone(),
         repo_root: Arc::new(repo_root),
