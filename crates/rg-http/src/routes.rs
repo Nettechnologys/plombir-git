@@ -347,6 +347,66 @@ fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
     (router, facts)
 }
 
+/// The Maven repository layout, registered once per `groupId` depth.
+///
+/// Maven writes a `groupId` with one path segment per dot: `mvn` and Gradle ask
+/// for `com.example:matrix-maven` at
+/// `.../packages/maven/com/example/matrix-maven/…`, never at
+/// `.../maven/com.example/matrix-maven/…`. Two shapes carry the whole read side
+/// of the protocol:
+///
+/// - `<group…>/<artifact>/maven-metadata.xml` — the version list;
+/// - `<group…>/<artifact>/<version>/<file>` — the artifact itself.
+///
+/// Axum matches a fixed number of segments, and a catch-all (`{*path}`) is not
+/// an option here: it would sit above `POST .../packages/maven/publish` and the
+/// rest of the generic `{pkg_type}` package API, which would then answer `405`.
+/// So each shape is registered once per group depth instead, up to
+/// [`MAVEN_MAX_GROUP_SEGMENTS`] — two past the longest groups in the wild
+/// (`com.fasterxml.jackson.core` is four).
+///
+/// Depth 1 doubles as the flat spelling ForgeKeep's own API and UI use: a single
+/// segment that already carries the dots joins back to the same `groupId`, so
+/// `.../maven/com.example/matrix-maven/maven-metadata.xml` keeps working.
+///
+/// Two known edges, both harmless and both a consequence of matching on shape:
+/// a SNAPSHOT's `<group…>/<artifact>/<version>/maven-metadata.xml` matches the
+/// metadata shape (the static filename wins over `{m…}`) and answers an empty
+/// version list, and a stored file name containing a `/` is no longer reachable
+/// under `maven/` through the generic `{*file}` route. ForgeKeep publishes
+/// neither.
+fn maven_layout_routes(table: RouteTable) -> RouteTable {
+    const METADATA: [&str; MAVEN_MAX_GROUP_SEGMENTS] = [
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/maven-metadata.xml",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/maven-metadata.xml",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/maven-metadata.xml",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/maven-metadata.xml",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/maven-metadata.xml",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}/maven-metadata.xml",
+    ];
+    const FILES: [&str; MAVEN_MAX_GROUP_SEGMENTS] = [
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}/{m8}",
+        "/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}/{m8}/{m9}",
+    ];
+
+    let mut table = table;
+    for path in METADATA {
+        table = table.get(RepoRead, path, api::packages::maven_metadata);
+    }
+    for path in FILES {
+        table = table.get(RepoRead, path, api::packages::maven_download);
+    }
+    table
+}
+
+/// How many segments a `groupId` may span — the number of variants of each
+/// Maven shape [`maven_layout_routes`] registers.
+const MAVEN_MAX_GROUP_SEGMENTS: usize = 6;
+
 /// Build every route the server serves, and the access level of each.
 ///
 /// `auth_rate_limiter` is layered only onto the unauthenticated credential
@@ -1543,12 +1603,8 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}",
             api::packages::pypi_simple_index,
         )
-        // Maven metadata endpoint
-        .get(
-            RepoRead,
-            "/repos/{owner}/{name}/packages/maven/{group_id}/{artifact_id}/maven-metadata.xml",
-            api::packages::maven_metadata,
-        )
+        // Maven repository layout — see `maven_layout_routes`.
+        .with(maven_layout_routes)
         // NuGet protocol endpoints
         .get(
             RepoRead,

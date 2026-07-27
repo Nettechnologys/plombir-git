@@ -299,3 +299,193 @@ async fn nine_native_package_formats_publish_index_and_download() {
         .unwrap();
     assert_eq!(registries["registries"].as_array().unwrap().len(), 9);
 }
+
+/// Maven asks for an artifact at the path it builds from the coordinate, and a
+/// `groupId` becomes one directory per dot: `com.example.tools:matrix-deep` is
+/// fetched from `com/example/tools/matrix-deep/…`, never from
+/// `com.example.tools/matrix-deep/…`. This walks exactly the URLs `mvn` and
+/// Gradle send — the flat spelling the rest of the suite uses is our own, and a
+/// registry that only answers that one is unreachable from a build tool.
+#[tokio::test]
+async fn maven_repository_layout_serves_metadata_and_artifacts() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    // A three-segment groupId, so the test fails on any implementation that
+    // reads the group as a single path segment.
+    let pom = br#"<?xml version="1.0"?>
+<project><groupId>com.example.tools</groupId><artifactId>matrix-deep</artifactId><version>1.0.0</version></project>"#
+        .to_vec();
+    let jar = zip_archive(&[("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")]);
+
+    let publish = |filename: &'static str,
+                   body: Vec<u8>,
+                   coordinates: Option<(&'static str, &'static str)>| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        async move {
+            let mut url = package_url(&base, &["maven", "publish"]);
+            if let Some((name, version)) = coordinates {
+                url.query_pairs_mut()
+                    .append_pair("name", name)
+                    .append_pair("version", version);
+            }
+            client
+                .post(url)
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // The POM carries its own coordinate; the JAR is deployed under the same
+    // one as a second version, the way a build tool publishes a release.
+    let published = publish("matrix-deep-1.0.0.pom", pom.clone(), None).await;
+    assert_eq!(published.status(), StatusCode::CREATED);
+    let published = publish(
+        "matrix-deep-2.0.0.jar",
+        jar.clone(),
+        Some(("com.example.tools:matrix-deep", "2.0.0")),
+    )
+    .await;
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    // ── The two URLs a Maven client actually sends ──────────────────────────
+    let metadata = client
+        .get(package_url(
+            &base,
+            &[
+                "maven",
+                "com",
+                "example",
+                "tools",
+                "matrix-deep",
+                "maven-metadata.xml",
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), StatusCode::OK, "layout metadata");
+    let metadata = metadata.text().await.unwrap();
+    assert!(
+        metadata.contains("<groupId>com.example.tools</groupId>")
+            && metadata.contains("<artifactId>matrix-deep</artifactId>")
+            && metadata.contains("<version>1.0.0</version>")
+            && metadata.contains("<version>2.0.0</version>"),
+        "layout metadata lost the coordinate or the versions: {metadata}"
+    );
+
+    for (version, filename, expected) in [
+        ("1.0.0", "matrix-deep-1.0.0.pom", &pom),
+        ("2.0.0", "matrix-deep-2.0.0.jar", &jar),
+    ] {
+        let response = client
+            .get(package_url(
+                &base,
+                &[
+                    "maven",
+                    "com",
+                    "example",
+                    "tools",
+                    "matrix-deep",
+                    version,
+                    filename,
+                ],
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "layout download {filename}"
+        );
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            expected.as_slice()
+        );
+    }
+
+    // A coordinate nobody published is a miss, not a stray 200.
+    let missing = client
+        .get(package_url(
+            &base,
+            &[
+                "maven",
+                "com",
+                "example",
+                "tools",
+                "matrix-deep",
+                "9.9.9",
+                "matrix-deep-9.9.9.jar",
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    // ── The routes the layout ones sit on top of still answer ───────────────
+    // The flat spelling ForgeKeep's own API and UI use: one segment that
+    // already carries the dots resolves to the same package.
+    let flat = client
+        .get(package_url(
+            &base,
+            &[
+                "maven",
+                "com.example.tools",
+                "matrix-deep",
+                "maven-metadata.xml",
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flat.status(), StatusCode::OK, "flat metadata");
+    assert!(flat
+        .text()
+        .await
+        .unwrap()
+        .contains("<version>1.0.0</version>"));
+
+    // The generic package API lives one level up under `{pkg_type}`; a Maven
+    // route that swallowed it would leave these `404`/`405`.
+    let listed = client
+        .get(package_url(&base, &["maven", "list"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK, "generic list");
+    let listed = listed.json::<serde_json::Value>().await.unwrap();
+    assert!(listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|package| package["name"] == "com.example.tools:matrix-deep"));
+
+    let canonical = client
+        .get(package_url(
+            &base,
+            &[
+                "maven",
+                "com.example.tools:matrix-deep",
+                "1.0.0",
+                "matrix-deep-1.0.0.pom",
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(canonical.status(), StatusCode::OK, "generic download");
+    assert_eq!(canonical.bytes().await.unwrap().as_ref(), pom.as_slice());
+}

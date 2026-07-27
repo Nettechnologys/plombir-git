@@ -136,6 +136,15 @@ impl RouteTable {
         (self.router, self.facts)
     }
 
+    /// Hand the table to `f` and take it back — for a family of routes that is
+    /// generated from a list rather than spelled out one call at a time.
+    ///
+    /// It adds no way around the [`Access`] argument: `f` only has the same
+    /// `get`/`post`/… methods every other caller has.
+    pub(crate) fn with(self, f: impl FnOnce(Self) -> Self) -> Self {
+        f(self)
+    }
+
     fn add(
         mut self,
         access: Access,

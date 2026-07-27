@@ -14,6 +14,8 @@
 //! == Protocol-specific endpoints ==
 //! GET    /api/v1/repos/{owner}/{repo}/packages/cargo/index/{pkg}  — Cargo sparse index
 //! GET    /api/v1/repos/{owner}/{repo}/packages/npm/{pkg}          — npm registry metadata
+//! GET    /api/v1/repos/{owner}/{repo}/packages/maven/{group…}/{artifact}/maven-metadata.xml
+//! GET    /api/v1/repos/{owner}/{repo}/packages/maven/{group…}/{artifact}/{version}/{file}
 
 use crate::error::AppError;
 use axum::{
@@ -551,11 +553,32 @@ pub async fn download_file(
     )>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
+    serve_package_file(
+        &state, &owner, &name, &pkg_type, &pkg_name, &version, &filename,
+    )
+    .await
+}
+
+/// Read one stored file of one version and answer it as a download.
+///
+/// Shared by the generic route above and by the protocol routes that address
+/// the same file through their own layout — Maven's, for one, which spells the
+/// package name out as a directory tree.
+#[allow(clippy::too_many_arguments)]
+async fn serve_package_file(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+    pkg_type: &str,
+    pkg_name: &str,
+    version: &str,
+    filename: &str,
+) -> axum::response::Response {
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
 
     match rg_core::package_registry::service::download_file(
-        &state.db, &storage, &owner, &name, &pkg_type, &pkg_name, &version, &filename,
+        &state.db, &storage, owner, name, pkg_type, pkg_name, version, filename,
     )
     .await
     {
@@ -857,14 +880,75 @@ pub async fn pypi_simple_root_index(
 
 // ── Maven Protocol Endpoints ──────────────────────────────
 
-/// GET /api/v1/repos/{owner}/{name}/packages/maven/{group_id}/{artifact_id}/maven-metadata.xml
+/// The repository and the layout segments of one Maven request.
+///
+/// A Maven client writes a `groupId` with one path segment per dot, so
+/// `com.example:matrix-maven` is fetched from `com/example/matrix-maven/…` and
+/// the number of segments depends on the group. The routes therefore capture
+/// the layout as `{m1}`, `{m2}`, … (see `maven_layout_routes` in
+/// `crate::routes`) and the split back into coordinates happens here, from the
+/// end, where the shape is fixed.
+struct MavenRequest {
+    owner: String,
+    repo: String,
+    /// Everything below `.../packages/maven/`, in order.
+    segments: Vec<String>,
+}
+
+impl MavenRequest {
+    /// Read the captures by name: `{owner}` / `{name}` are the repository, and
+    /// every other capture on these routes is a layout segment.
+    fn from_params(params: &axum::extract::RawPathParams) -> Self {
+        let mut owner = String::new();
+        let mut repo = String::new();
+        let mut segments = Vec::new();
+
+        for (key, value) in params {
+            match key {
+                "owner" => owner = value.to_string(),
+                "name" => repo = value.to_string(),
+                _ => segments.push(value.to_string()),
+            }
+        }
+
+        Self {
+            owner,
+            repo,
+            segments,
+        }
+    }
+
+    /// `<group…>/<artifact>` → the `groupId:artifactId` the registry stores.
+    ///
+    /// The group is everything before the artifact, joined back with the dots
+    /// the client replaced by slashes — so the flat spelling ForgeKeep's own
+    /// API uses (`com.example/matrix-maven`) resolves to the same name.
+    fn coordinates(group_and_artifact: &[String]) -> Option<(String, String)> {
+        let (artifact_id, group) = group_and_artifact.split_last()?;
+        if group.is_empty() || artifact_id.is_empty() {
+            return None;
+        }
+        Some((group.join("."), artifact_id.clone()))
+    }
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/maven/{group…}/{artifact}/maven-metadata.xml
 ///
 /// Maven metadata XML endpoint — returns version list in Maven's standard format.
 pub async fn maven_metadata(
     State(state): State<AppState>,
-    Path((owner, name, group_id, artifact_id)): Path<(String, String, String, String)>,
+    params: axum::extract::RawPathParams,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
+    let request = MavenRequest::from_params(&params);
+    let Some((group_id, artifact_id)) = MavenRequest::coordinates(&request.segments) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "Maven metadata path carries no groupId/artifactId",
+        );
+    };
+    let (owner, name) = (request.owner, request.repo);
+
     // Maven package names are stored as "{groupId}:{artifactId}"
     let pkg_name = format!("{}:{}", group_id, artifact_id);
 
@@ -906,6 +990,47 @@ pub async fn maven_metadata(
         xml,
     )
         .into_response()
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/maven/{group…}/{artifact}/{version}/{file}
+///
+/// The artifact itself, at the path `mvn` and Gradle build from the coordinate:
+/// the group's dots are slashes, and the version is a directory. Everything
+/// before the last three segments is the group.
+pub async fn maven_download(
+    State(state): State<AppState>,
+    params: axum::extract::RawPathParams,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let request = MavenRequest::from_params(&params);
+
+    // `<group…>/<artifact>/<version>/<file>` — at least four segments, and the
+    // coordinate is read off the end so the group can be any length.
+    let Some((filename, head)) = request.segments.split_last() else {
+        return err(StatusCode::NOT_FOUND, "empty Maven path");
+    };
+    let Some((version, head)) = head.split_last() else {
+        return err(StatusCode::NOT_FOUND, "Maven path carries no version");
+    };
+    let Some((group_id, artifact_id)) = MavenRequest::coordinates(head) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "Maven path carries no groupId/artifactId",
+        );
+    };
+
+    let pkg_name = format!("{}:{}", group_id, artifact_id);
+
+    serve_package_file(
+        &state,
+        &request.owner,
+        &request.repo,
+        "maven",
+        &pkg_name,
+        version,
+        filename,
+    )
+    .await
 }
 
 // ── NuGet Protocol Endpoints ──────────────────────────────
