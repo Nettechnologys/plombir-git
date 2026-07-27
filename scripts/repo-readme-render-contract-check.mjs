@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { requireBlock } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const repoPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/+page.svelte');
 const repoPage = readFileSync(repoPagePath, 'utf8');
@@ -20,13 +22,18 @@ if (!/function\s+renderInlineMarkdown\s*\(\s*line:\s*string\s*\)/.test(repoPage)
   failures.push('Repository README renderer must centralize inline markdown rendering');
 }
 
-const renderBlock = repoPage.match(/function\s+renderInlineMarkdown\s*\(\s*line:\s*string\s*\)\s*:\s*string\s*\{[\s\S]*?\n\s*\}/)?.[0] || '';
+const renderBlock = requireBlock(
+  repoPage,
+  /function\s+renderInlineMarkdown\s*\(\s*line:\s*string\s*\)\s*:\s*string\s*\{[\s\S]*?\n\s*\}/,
+  'renderInlineMarkdown(line): string body could not be located for the escaping checks',
+  failures,
+);
 
-if (!/escapeHtml\(line\)/.test(renderBlock)) {
+if (renderBlock && !/escapeHtml\(line\)/.test(renderBlock)) {
   failures.push('renderInlineMarkdown must start from escaped README text');
 }
 
-if (!/safeMarkdownHref\(href\)/.test(renderBlock)) {
+if (renderBlock && !/safeMarkdownHref\(href\)/.test(renderBlock)) {
   failures.push('renderInlineMarkdown must sanitize markdown link hrefs');
 }
 

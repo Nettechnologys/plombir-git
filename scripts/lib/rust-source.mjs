@@ -1,6 +1,32 @@
-// Helpers for asserting against Rust sources from the contract checks.
+// Helpers for asserting against source files from the contract checks.
 
 import { readFileSync } from 'node:fs';
+
+/**
+ * Extract the block matched by `re`, or record a failure and return `null`.
+ *
+ * Replaces the idiom `source.match(re)?.[0] || ''`. That spelling hands an
+ * empty string to whatever inspects the block, and a *negative* assertion over
+ * an empty string always passes — so a drifted anchor reads as "the forbidden
+ * construct is absent" when what really happened is "I never found the code I
+ * was supposed to inspect". The gate goes green over an unread file, which is
+ * strictly worse than going red: nobody investigates a passing check.
+ *
+ * This is the per-block version of what `loadRouteTable` already refuses to do
+ * for the router — a check that cannot read its subject must say so, not pass.
+ *
+ * Callers guard with `if (block)`, so a missed anchor turns the check red.
+ *
+ * @param {number} group Capture group to return; 0 (default) is the whole match.
+ */
+export function requireBlock(source, re, message, failures, group = 0) {
+  const match = source.match(re);
+  if (!match || match[group] === undefined) {
+    failures.push(message);
+    return null;
+  }
+  return match[group];
+}
 
 /**
  * Strip Rust line/block comments from `source`, preserving string literals and newlines.

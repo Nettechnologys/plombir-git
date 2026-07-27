@@ -2,6 +2,8 @@
 
 import { readFileSync } from 'node:fs';
 
+import { requireBlock } from './lib/rust-source.mjs';
+
 const source = readFileSync('web/src/lib/api/packages.ts', 'utf8');
 const failures = [];
 
@@ -17,15 +19,30 @@ if (/Content-Disposition['"\]]\s*=\s*`attachment;\s*filename="\$\{filename\}"/.t
   failures.push('packages.publish must not interpolate raw filenames into a quoted Content-Disposition header');
 }
 
-const packagesBlock = source.match(/export const packages = \{([\s\S]*?)\n\};/)?.[1] || '';
-const createStart = packagesBlock.indexOf('create:');
-const createEnd = packagesBlock.indexOf('\n  delete:', createStart);
-const createSource = createStart >= 0 && createEnd > createStart ? packagesBlock.slice(createStart, createEnd) : '';
-if (!/packages\.publish\(/.test(createSource)) {
+// Both the regex and the indexOf slicing below used to fall back to an empty
+// string, which the negative assertion at the end reads as "clean".
+const packagesBlock = requireBlock(
+  source,
+  /export const packages = \{([\s\S]*?)\n\};/,
+  'API client must export a packages object literal',
+  failures,
+  1,
+);
+
+const createStart = packagesBlock === null ? -1 : packagesBlock.indexOf('create:');
+const createEnd = packagesBlock === null ? -1 : packagesBlock.indexOf('\n  delete:', createStart);
+
+if (packagesBlock !== null && (createStart < 0 || createEnd <= createStart)) {
+  failures.push('packages.create block could not be located between create: and delete: in the packages object');
+}
+
+const createSource = createStart >= 0 && createEnd > createStart ? packagesBlock.slice(createStart, createEnd) : null;
+
+if (createSource !== null && !/packages\.publish\(/.test(createSource)) {
   failures.push('packages.create must delegate to packages.publish so it sends the backend octet-stream payload');
 }
 
-if (/body:\s*JSON\.stringify\(data\)/.test(createSource)) {
+if (createSource !== null && /body:\s*JSON\.stringify\(data\)/.test(createSource)) {
   failures.push('packages.create must not JSON.stringify metadata to the binary package publish endpoint');
 }
 

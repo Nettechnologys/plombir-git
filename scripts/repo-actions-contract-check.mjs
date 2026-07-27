@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, requireBlock, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPaths = [
@@ -142,13 +142,20 @@ if (!/httpCloneUrl\s*=\s*\$derived\(withBackendBase\(`\/git\/\$\{encodeURICompon
   failures.push('RepoHeader HTTP clone URL must target backend /git/{owner}/{repo}, not the frontend origin');
 }
 
-const httpCloneLine = header.match(/httpCloneUrl\s*=\s*\$derived\([^\n]+\)/)?.[0] || '';
+// The two assertions below are negative, so they must never run against a
+// block that simply failed to match — an empty string satisfies both.
+const httpCloneLine = requireBlock(
+  header,
+  /httpCloneUrl\s*=\s*\$derived\([^\n]+\)/,
+  'RepoHeader httpCloneUrl $derived expression could not be located',
+  failures,
+);
 
-if (/location\.(protocol|host)/.test(httpCloneLine)) {
+if (httpCloneLine && /location\.(protocol|host)/.test(httpCloneLine)) {
   failures.push('RepoHeader HTTP clone URL must not use the frontend location origin');
 }
 
-if (/\.git/.test(httpCloneLine)) {
+if (httpCloneLine && /\.git/.test(httpCloneLine)) {
   failures.push('RepoHeader HTTP clone URL must not append .git to the backend /git/{owner}/{repo} path');
 }
 
@@ -160,9 +167,14 @@ if (!/sshCloneUrl\s*=\s*\$derived\(browser\s*\?\s*buildSshCloneUrl\(owner,\s*rep
   failures.push('RepoHeader SSH clone URL must use ssh://git@host:port/{owner}/{repo}');
 }
 
-const sshCloneLine = header.match(/sshCloneUrl\s*=\s*\$derived\([^\n]+\)/)?.[0] || '';
+const sshCloneLine = requireBlock(
+  header,
+  /sshCloneUrl\s*=\s*\$derived\([^\n]+\)/,
+  'RepoHeader sshCloneUrl $derived expression could not be located',
+  failures,
+);
 
-if (/git@[^`]*:\$\{owner\}\/\$\{repo\}\.git/.test(sshCloneLine)) {
+if (sshCloneLine && /git@[^`]*:\$\{owner\}\/\$\{repo\}\.git/.test(sshCloneLine)) {
   failures.push('RepoHeader SSH clone URL must not use scp-like default-port syntax with .git suffix');
 }
 
@@ -174,13 +186,18 @@ if (!/httpCloneUrl\s*=\s*\$derived\(withBackendBase\(`\/git\/\$\{encodeURICompon
   failures.push('Repository empty state HTTP clone URL must target backend /git/{owner}/{repo}, not the frontend origin');
 }
 
-const repoPageHttpCloneLine = repoPage.match(/httpCloneUrl\s*=\s*\$derived\([^\n]+\)/)?.[0] || '';
+const repoPageHttpCloneLine = requireBlock(
+  repoPage,
+  /httpCloneUrl\s*=\s*\$derived\([^\n]+\)/,
+  'Repository page httpCloneUrl $derived expression could not be located',
+  failures,
+);
 
-if (/location\.(protocol|host)/.test(repoPageHttpCloneLine)) {
+if (repoPageHttpCloneLine && /location\.(protocol|host)/.test(repoPageHttpCloneLine)) {
   failures.push('Repository empty state HTTP clone URL must not use the frontend location origin');
 }
 
-if (/\.git/.test(repoPageHttpCloneLine)) {
+if (repoPageHttpCloneLine && /\.git/.test(repoPageHttpCloneLine)) {
   failures.push('Repository empty state HTTP clone URL must not append .git to the backend /git/{owner}/{repo} path');
 }
 
@@ -192,9 +209,14 @@ if (!/sshCloneUrl\s*=\s*\$derived\(browser\s*\?\s*buildSshCloneUrl\(owner,\s*rep
   failures.push('Repository empty state SSH clone URL must use ssh://git@host:port/{owner}/{repo}');
 }
 
-const repoPageSshCloneLine = repoPage.match(/sshCloneUrl\s*=\s*\$derived\([^\n]+\)/)?.[0] || '';
+const repoPageSshCloneLine = requireBlock(
+  repoPage,
+  /sshCloneUrl\s*=\s*\$derived\([^\n]+\)/,
+  'Repository page sshCloneUrl $derived expression could not be located',
+  failures,
+);
 
-if (/git@[^`]*:\$\{owner\}\/\$\{repo\}\.git/.test(repoPageSshCloneLine)) {
+if (repoPageSshCloneLine && /git@[^`]*:\$\{owner\}\/\$\{repo\}\.git/.test(repoPageSshCloneLine)) {
   failures.push('Repository empty state SSH clone URL must not use scp-like default-port syntax with .git suffix');
 }
 
@@ -206,7 +228,14 @@ if (!/configuredSshPort\s*\|\|\s*'2222'/.test(base)) {
   failures.push('Shared SSH clone URL helper must default to ForgeKeep SSH port 2222');
 }
 
-if (!/ssh:\/\/git@/.test(base) || /\.git/.test(base.match(/buildSshCloneUrl[\s\S]*?\n\}/)?.[0] || '')) {
+const buildSshCloneUrlBody = requireBlock(
+  base,
+  /buildSshCloneUrl[\s\S]*?\n\}/,
+  'Shared API base must define buildSshCloneUrl',
+  failures,
+);
+
+if (!/ssh:\/\/git@/.test(base) || (buildSshCloneUrlBody && /\.git/.test(buildSshCloneUrlBody))) {
   failures.push('Shared SSH clone URL helper must emit ssh:// URLs without appending .git');
 }
 

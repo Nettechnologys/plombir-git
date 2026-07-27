@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, requireBlock, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -37,8 +37,17 @@ if (!/pub struct AccessTokenResponse/.test(backend)) {
   failures.push('Backend token listing must use a sanitized AccessTokenResponse DTO');
 }
 
-const listTokensBody = backend.match(/pub async fn list_tokens[\s\S]*?\n}\n\n\/\/\/ POST \/api\/v1\/users\/tokens/)?.[0] || '';
-if (/serde_json::json!\(tokens\)/.test(listTokensBody) || /token_hash/.test(listTokensBody)) {
+// Anchored on the handler alone. The previous anchor also required the doc
+// comment of the *next* handler to follow, so merely reordering the file
+// emptied the block this assertion inspects — and the assertion below is
+// negative, so an empty block would have waved `token_hash` through.
+const listTokensBody = requireBlock(
+  backend,
+  /pub async fn list_tokens[\s\S]*?\n\}/,
+  'Backend list_tokens handler body could not be located for the token_hash leak check',
+  failures,
+);
+if (listTokensBody && (/serde_json::json!\(tokens\)/.test(listTokensBody) || /token_hash/.test(listTokensBody))) {
   failures.push('Backend token listing must not serialize DB token_hash fields');
 }
 
