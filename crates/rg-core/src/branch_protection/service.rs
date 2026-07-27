@@ -108,37 +108,44 @@ pub async fn update_protection(
     require_signed_commits: Option<bool>,
     allowed_push_user_ids: Option<Vec<i64>>,
 ) -> Result<ProtectedBranch> {
-    let mut protection = protected_branch_ops::find_by_id(db, protection_id)
+    let protection = protected_branch_ops::find_by_id(db, protection_id)
         .await?
         .ok_or_else(|| crate::error::not_found("protection rule"))?;
 
+    // `From<Model> for ActiveModel` marks every field `Unchanged`, so mutating
+    // the model first and converting afterwards produced an update with no SET
+    // clause: the call echoed the old row back and wrote nothing, while the
+    // operator who just turned on `require_signed_commits` read that 200 as
+    // "the branch is protected now". Each field the request actually carries
+    // has to be `Set` on the ActiveModel itself; the ones it omits stay
+    // `Unchanged` and are left alone.
+    let mut active: protected_branch::ActiveModel = protection.into();
     if let Some(v) = require_pr {
-        protection.require_pr = v;
+        active.require_pr = Set(v);
     }
     if let Some(v) = require_status_check {
-        protection.require_status_check = v;
+        active.require_status_check = Set(v);
     }
     if let Some(v) = required_status_checks {
-        protection.required_status_checks = Some(serde_json::to_string(&v).unwrap_or_default());
+        active.required_status_checks = Set(Some(serde_json::to_string(&v).unwrap_or_default()));
     }
     if let Some(v) = require_approval {
-        protection.require_approval = v;
+        active.require_approval = Set(v);
     }
     if let Some(v) = required_approvals {
-        protection.required_approvals = Some(v);
+        active.required_approvals = Set(Some(v));
     }
     if let Some(v) = allow_force_push {
-        protection.allow_force_push = v;
+        active.allow_force_push = Set(v);
     }
     if let Some(v) = require_signed_commits {
-        protection.require_signed_commits = v;
+        active.require_signed_commits = Set(v);
     }
     if let Some(v) = allowed_push_user_ids {
-        protection.allowed_push_user_ids = Some(serde_json::to_string(&v).unwrap_or_default());
+        active.allowed_push_user_ids = Set(Some(serde_json::to_string(&v).unwrap_or_default()));
     }
-    protection.updated_at = Utc::now();
+    active.updated_at = Set(Utc::now());
 
-    let active: protected_branch::ActiveModel = protection.into();
     protected_branch_ops::update(db, active).await
 }
 
