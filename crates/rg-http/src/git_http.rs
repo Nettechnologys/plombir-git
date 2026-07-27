@@ -870,6 +870,7 @@ pub(crate) async fn handle_git_receive_pack(
                         repo_root: &repo_root,
                         owner: &owner_clone,
                         repo_name: &repo_clone,
+                        pusher_id: actor_id,
                         docker_enabled,
                         external_runners,
                         allow_host_runner,

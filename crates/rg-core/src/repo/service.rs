@@ -1069,7 +1069,11 @@ pub async fn get_combined_status(
 // ── Watch Notifications ────────────────────────────────────────────────
 
 /// Notify watchers of a push event to a repository.
-/// This should be called from the push handler after a successful push.
+///
+/// Called from [`crate::push_hooks::post_push_hooks`], so every transport that
+/// runs the post-push hooks fans out to watchers. `pusher_name` is empty when
+/// the transport authenticated nobody (open-access server): the body then omits
+/// the actor instead of rendering a leading blank, and no recipient is excluded.
 pub async fn notify_watchers_push(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -1077,13 +1081,18 @@ pub async fn notify_watchers_push(
     pusher_name: &str,
     ref_name: &str,
 ) -> Result<()> {
+    let body = if pusher_name.is_empty() {
+        format!("New push to {}", ref_name)
+    } else {
+        format!("{} pushed to {}", pusher_name, ref_name)
+    };
     crate::notification::notify_watchers(
         db,
         repo_id,
         pusher_name,
         &format!("New push to {}", repo_name),
         "push",
-        Some(format!("{} pushed to {}", pusher_name, ref_name)),
+        Some(body),
     )
     .await
 }

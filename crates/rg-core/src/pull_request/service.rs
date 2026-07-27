@@ -132,6 +132,17 @@ pub async fn create_pr(
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger PR opened webhook");
     }
 
+    announce_pr_to_watchers(
+        db,
+        repo_id,
+        &target_repo.name,
+        Some(author_id),
+        pr.number,
+        &pr.title,
+        "opened",
+    )
+    .await;
+
     Ok(pr)
 }
 
@@ -209,25 +220,76 @@ pub(super) async fn repository_namespace(
         .context("repository owner not found")
 }
 
-/// Notify watchers of a PR event.
-pub async fn notify_watchers_pr(
+/// Notify watchers of a PR event (`opened` / `closed` / `reopened` / `merged`).
+///
+/// `actor_name` is the account that caused the transition, and is `None` when
+/// there isn't one: an auto-merge or a merge-queue merge is performed by the
+/// server, not by a user. The body then states the action without an actor
+/// instead of rendering a leading blank, and no recipient is excluded from the
+/// fan-out.
+async fn notify_watchers_pr(
     db: &DatabaseConnection,
     repo_id: i64,
     repo_name: &str,
-    author_name: &str,
+    actor_name: Option<&str>,
     pr_number: i64,
     pr_title: &str,
     action: &str,
 ) -> Result<()> {
+    let body = match actor_name {
+        Some(actor) => format!("{} {}: {}", actor, action, pr_title),
+        None => format!("PR #{} {}: {}", pr_number, action, pr_title),
+    };
     crate::notification::notify_watchers(
         db,
         repo_id,
-        author_name,
+        actor_name.unwrap_or_default(),
         &format!("PR #{} {} in {}", pr_number, action, repo_name),
         "pull_request",
-        Some(format!("{} {}: {}", author_name, action, pr_title)),
+        Some(body),
     )
     .await
+}
+
+/// Resolve a username for the watch fan-out, or `None` when the account is
+/// gone / unreadable. A failed lookup must not fail the PR operation that is
+/// merely being announced, so it degrades to an actor-less notification.
+async fn watch_actor_name(db: &DatabaseConnection, actor_id: i64) -> Option<String> {
+    user_ops::find_by_id(db, actor_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|user| user.username)
+}
+
+/// Fan a PR transition out to the repository's watchers, logging rather than
+/// propagating a failure: the transition itself has already been committed.
+async fn announce_pr_to_watchers(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    repo_name: &str,
+    actor_id: Option<i64>,
+    pr_number: i64,
+    pr_title: &str,
+    action: &str,
+) {
+    let actor_name = match actor_id {
+        Some(actor_id) => watch_actor_name(db, actor_id).await,
+        None => None,
+    };
+    if let Err(e) = notify_watchers_pr(
+        db,
+        repo_id,
+        repo_name,
+        actor_name.as_deref(),
+        pr_number,
+        pr_title,
+        action,
+    )
+    .await
+    {
+        tracing::warn!(error = %format!("{e:#}"), action, "failed to notify watchers about PR");
+    }
 }
 
 /// List PRs for a repo, optionally filtered by state.
@@ -396,6 +458,29 @@ pub async fn update_pr(
             serde_json::json!({"from": previous_state, "to": updated.state}),
         )
         .await?;
+        // Announced from here, after the transition is persisted — not from the
+        // `state` match above, which runs before the UPDATE and would tell
+        // watchers about a close that a later failure rolled back.
+        let action = match updated.state.as_str() {
+            "open" => Some("reopened"),
+            "closed" => Some("closed"),
+            // A merge announces itself from `update_pr_merged`, which knows the
+            // strategy and the merge commit; a bare state write to "merged"
+            // through this path is not the merge event.
+            _ => None,
+        };
+        if let Some(action) = action {
+            announce_pr_to_watchers(
+                db,
+                updated.repo_id,
+                repo_name,
+                Some(actor_id),
+                updated.number,
+                &updated.title,
+                action,
+            )
+            .await;
+        }
     }
     Ok(updated)
 }
@@ -1208,7 +1293,7 @@ async fn merge_claimed_pr(
                 .await??
             };
 
-            return update_pr_merged(db, pr, merge_commit_sha, strategy).await;
+            return update_pr_merged(db, repo_name, pr, merge_commit_sha, strategy).await;
         }
     }
 
@@ -1226,7 +1311,7 @@ async fn merge_claimed_pr(
         .await??
     };
 
-    update_pr_merged(db, pr, merge_commit_sha, strategy).await
+    update_pr_merged(db, repo_name, pr, merge_commit_sha, strategy).await
 }
 
 /// Merge from an arbitrary ref (used for fork PRs).
@@ -1256,6 +1341,7 @@ fn merge_from_ref(
 /// Update PR state after successful merge.
 async fn update_pr_merged(
     db: &DatabaseConnection,
+    repo_name: &str,
     mut pr: PullRequest,
     merge_commit_sha: String,
     strategy: MergeStrategy,
@@ -1310,6 +1396,20 @@ async fn update_pr_merged(
     {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger PR merged webhook");
     }
+
+    // No actor: this path serves the REST merge, auto-merge and the merge queue
+    // alike, and the last two have no user behind them. `merge_pr` does not
+    // carry the caller's id, so naming one here would mean guessing.
+    announce_pr_to_watchers(
+        db,
+        merged_pr.repo_id,
+        repo_name,
+        None,
+        merged_pr.number,
+        &merged_pr.title,
+        "merged",
+    )
+    .await;
 
     Ok(MergeResult {
         merge_commit_sha,

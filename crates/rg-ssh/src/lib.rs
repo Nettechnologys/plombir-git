@@ -671,6 +671,11 @@ impl Handler for SshHandler {
         let hook_target = receive_pack_context
             .as_ref()
             .map(|context| (context.owner.clone(), context.repo_name.clone()));
+        // The pushing account, for the watch fan-out inside the hooks. `None` on
+        // an open-access server that authenticated nobody.
+        let hook_pusher_id = receive_pack_context
+            .as_ref()
+            .and_then(|context| context.actor_id);
 
         tokio::spawn(async move {
             tracing::info!(%service_name, path = %repo_full_path.display(), "Starting git SSH session");
@@ -764,7 +769,14 @@ impl Handler for SshHandler {
                         {
                             rg_core::task_tracker::delivery_tracker().spawn(async move {
                                 hooks
-                                    .run(&db, &hook_repo_path, &owner, &repo_name, &ref_updates)
+                                    .run(
+                                        &db,
+                                        &hook_repo_path,
+                                        &owner,
+                                        &repo_name,
+                                        hook_pusher_id,
+                                        &ref_updates,
+                                    )
                                     .await;
                             });
                         }

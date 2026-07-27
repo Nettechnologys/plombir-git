@@ -42,6 +42,13 @@ pub struct PostPushParams<'a> {
     pub repo_root: &'a Path,
     pub owner: &'a str,
     pub repo_name: &'a str,
+    /// The account that pushed, when the transport authenticated one.
+    ///
+    /// Only the watch fan-out needs it: it names the pusher in the notification
+    /// and is how the pusher is kept off their own recipient list. `None` (an
+    /// unauthenticated push on an open-access server) simply means nobody is
+    /// excluded.
+    pub pusher_id: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,
     pub allow_host_runner: bool,
@@ -98,6 +105,7 @@ impl PostPushContext {
         repo_path: &Path,
         owner: &str,
         repo_name: &str,
+        pusher_id: Option<i64>,
         ref_updates: &[RefUpdate],
     ) {
         post_push_hooks(
@@ -107,6 +115,7 @@ impl PostPushContext {
                 repo_root: &self.repo_root,
                 owner,
                 repo_name,
+                pusher_id,
                 docker_enabled: self.docker_enabled,
                 external_runners: self.external_runners,
                 allow_host_runner: self.allow_host_runner,
@@ -137,6 +146,17 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         }
     };
 
+    // Resolved once, not per ref: the watch fan-out below needs the pusher's
+    // username, and a tag push can carry dozens of updates.
+    let pusher_name = match params.pusher_id {
+        Some(pusher_id) => rg_db::ops::user_ops::find_by_id(params.db, pusher_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|user| user.username),
+        None => None,
+    };
+
     for update in ref_updates {
         if update.status != "ok" {
             continue;
@@ -158,6 +178,25 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
 
         // 2-3. Push + branch/tag webhooks and the real-time notification
         trigger_push_webhooks(params, repo_id, repo_owner_id, update).await;
+
+        // 4. Watch fan-out.
+        //
+        // The real-time notification above goes to `repo_owner_id` alone, so
+        // until card_dc66742badc5 a "Watch" subscription produced nothing for a
+        // push: `notify_watchers_push` existed with no caller anywhere in the
+        // tree. This is that caller. Read access is re-checked per recipient
+        // inside `notification::notify_watchers`, so no gate is needed here.
+        if let Err(error) = crate::repo::service::notify_watchers_push(
+            params.db,
+            repo_id,
+            params.repo_name,
+            pusher_name.as_deref().unwrap_or_default(),
+            &update.refname,
+        )
+        .await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "failed to notify watchers about push");
+        }
     }
 }
 

@@ -87,6 +87,17 @@ pub async fn delete_notification_for_user(
 
 // ── Watch notification helpers ─────────────────────────────────────────
 
+/// The one `repo_watch.watch_state` value that means "send me things".
+///
+/// The subscribe endpoint accepts three states (`watching`, `not_watching`,
+/// `ignoring` — see `web/src/lib/api/repos.ts`) and `DELETE .../watch` is
+/// implemented as `set_watch(.., "not_watching")` rather than a row delete, so
+/// the row survives an unwatch. `repo_watch_ops::list_watchers` returns *every*
+/// row for the repo, which makes it a list of subscriptions, not of subscribers
+/// — hence the allowlist here rather than a `!= "not_watching"` test: an
+/// unrecognised state must not be read as consent.
+const WATCH_STATE_SUBSCRIBED: &str = "watching";
+
 /// Notify all watchers of a repository about an event.
 ///
 /// Every watcher is re-checked against [`crate::repo::service::can_read_repo`]
@@ -97,6 +108,9 @@ pub async fn delete_notification_for_user(
 /// the subscribe endpoint would keep serving all three cases, so the check
 /// lives here, at the single point every watch notification passes through.
 /// A failed check drops the recipient rather than delivering to them.
+///
+/// The subscription state is filtered at the same point and for the same
+/// reason: see [`WATCH_STATE_SUBSCRIBED`].
 pub async fn notify_watchers(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -127,6 +141,10 @@ pub async fn notify_watchers(
             .flatten()
     };
     for watcher in watchers {
+        // An unwatched / ignored subscription is a row, not a recipient.
+        if watcher.watch_state != WATCH_STATE_SUBSCRIBED {
+            continue;
+        }
         // Don't notify the author themselves
         if let Some(ref author) = author_opt {
             if author.id == watcher.user_id {
