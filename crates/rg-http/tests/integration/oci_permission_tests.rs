@@ -117,6 +117,93 @@ async fn oci_token_endpoint_grants_only_authorized_scopes() {
     assert!(other_push.scope.is_none());
 }
 
+/// The spec's version check is `GET /v2/`, trailing slash included.
+///
+/// Endpoint end-1 of the OCI distribution spec, and the very first request any
+/// docker/podman/containerd client sends: it is how a client discovers that the
+/// host speaks the registry protocol and where to get a token. Under `nest` an
+/// inner `"/"` route answers the prefix *without* the slash, so the spelling the
+/// clients actually send fell through to the SPA fallback and the whole registry
+/// looked absent. Both spellings have to answer.
+#[tokio::test]
+async fn the_registry_answers_the_spec_version_check_path() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+
+    for path in ["/v2/", "/v2"] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "GET {path} must be the registry's version check, not a fallback"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("Docker-Distribution-API-Version")
+                .and_then(|v| v.to_str().ok()),
+            Some("registry/2.0"),
+            "GET {path} must identify itself as a registry"
+        );
+        assert!(
+            resp.headers().contains_key(reqwest::header::WWW_AUTHENTICATE),
+            "GET {path} must carry the auth challenge that starts the token flow"
+        );
+    }
+}
+
+/// The realm in the challenge has to be a path this registry actually serves.
+///
+/// A client does not guess the token endpoint: it reads `realm=` out of the
+/// `WWW-Authenticate` header of the 401 and requests its token there. Pointing
+/// it at a path we do not route means `docker login` and every pull of a private
+/// image fail at the first hop, with the registry answering the question
+/// correctly and the client never seeing it.
+#[tokio::test]
+async fn the_advertised_token_realm_is_a_path_the_registry_serves() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _owner_id) =
+        register_full(&base, "oci_realm_owner", "oci_realm_owner@example.com").await;
+    create_repo(&base, &owner_token, "realm-image", false).await;
+
+    let challenge = client
+        .get(format!("{base}/v2/"))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .expect("the version check must issue a challenge")
+        .to_string();
+
+    let realm = challenge
+        .split_once("realm=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(realm, _)| realm.to_string())
+        .expect("the challenge must name a realm");
+
+    let resp = client
+        .get(&realm)
+        .query(&[
+            ("service", "forgekeep-registry"),
+            ("scope", "repository:oci_realm_owner/realm-image:pull"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the advertised realm {realm} is not a route this registry serves"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["token"].as_str().is_some_and(|t| !t.is_empty()),
+        "the realm must issue a token: {body}"
+    );
+}
+
 /// `201 Created` on a blob push has to mean the blob is retrievable.
 ///
 /// The registry writes the bytes to blob storage and the locating row to the

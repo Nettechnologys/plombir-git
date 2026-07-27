@@ -215,11 +215,15 @@ fn build_router(
 ///
 /// Production and test routers differ in their middleware stack, never in their
 /// route set — so the mounting lives in one place and both call it.
+///
+/// The OCI router is merged, not nested, and carries its `/v2` in full in every
+/// path: a nested router cannot serve its own prefix *with* a trailing slash,
+/// and `GET /v2/` is the spec's version check — see [`build_v2_routes`].
 fn assemble(routers: &Routers) -> Router<AppState> {
     Router::new()
         .nest("/git", routers.git.clone())
         .nest("/api/v1", routers.api_v1.clone())
-        .nest("/v2", routers.v2.clone())
+        .merge(routers.v2.clone())
         .merge(routers.root.clone())
         .merge(routers.docs.clone())
 }
@@ -228,71 +232,86 @@ fn assemble(routers: &Routers) -> Router<AppState> {
 ///
 /// The registry authenticates with its own bearer tokens and answers in its own
 /// error envelope, so every route here is signed off as [`OCI_TOKEN`].
+///
+/// Every path is written out in full, `/v2` included, and the table is merged
+/// rather than nested. Two of the spec's endpoints end in a slash — `GET /v2/`
+/// (end-1, the version check) and `POST /v2/<name>/blobs/uploads/` (end-4a, the
+/// start of every push) — and that is the spelling docker, podman and
+/// containerd send. Under `nest`, axum 0.8 answers the prefix *without* the
+/// trailing slash: an inner `"/"` route serves `/v2` and 404s `/v2/`. There is
+/// no path-normalizing layer in front of the router to absorb the difference,
+/// and in production the 404 is worse than it sounds — the request falls
+/// through to the SPA fallback, so a registry client is handed HTML.
+///
+/// Nesting would also make the recorded [`RouteFact`] a lie: the fact would
+/// read `/v2/` while the router served `/v2`, and the table is what the access
+/// sweep and the contract checks read.
 fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
     // 10 GiB body limit for blob upload requests.
     let upload_limit = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
         mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
     };
 
-    let (router, facts) = RouteTable::new("/v2")
+    let (router, facts) = RouteTable::new("")
         // API version check
         // The spec's version check: answers `401` with a
         // `WWW-Authenticate` challenge to an anonymous client, which is how a
-        // registry client discovers where to get its token.
-        .get(OCI_TOKEN, "/", oci::api_version_check)
+        // registry client discovers where to get its token. Clients send the
+        // trailing-slash form; the bare one is served too so a hand-typed URL
+        // or a proxy that strips the slash still reaches the registry.
+        .get(OCI_TOKEN, "/v2/", oci::api_version_check)
+        .get(OCI_TOKEN, "/v2", oci::api_version_check)
         // Token authentication
-        .get(Public, "/auth/token", oci::get_token)
+        // Advertised as the `realm` of the challenge above — the two have to
+        // stay the same path.
+        .get(Public, "/v2/auth/token", oci::get_token)
         // Tags
-        .get(OCI_TOKEN, "/{owner}/{repo}/tags/list", oci::list_tags)
+        .get(OCI_TOKEN, "/v2/{owner}/{repo}/tags/list", oci::list_tags)
         // Manifests
         .get(
             OCI_TOKEN,
-            "/{owner}/{repo}/manifests/{reference}",
+            "/v2/{owner}/{repo}/manifests/{reference}",
             oci::get_manifest,
         )
         .head(
             OCI_TOKEN,
-            "/{owner}/{repo}/manifests/{reference}",
+            "/v2/{owner}/{repo}/manifests/{reference}",
             oci::head_manifest,
         )
         .put(
             OCI_TOKEN,
-            "/{owner}/{repo}/manifests/{reference}",
+            "/v2/{owner}/{repo}/manifests/{reference}",
             oci::put_manifest,
         )
         // Blobs
-        .get(OCI_TOKEN, "/{owner}/{repo}/blobs/{digest}", oci::get_blob)
-        .head(OCI_TOKEN, "/{owner}/{repo}/blobs/{digest}", oci::head_blob)
+        .get(OCI_TOKEN, "/v2/{owner}/{repo}/blobs/{digest}", oci::get_blob)
+        .head(
+            OCI_TOKEN,
+            "/v2/{owner}/{repo}/blobs/{digest}",
+            oci::head_blob,
+        )
         // Uploads (with body size limit)
-        //
-        // The OCI distribution spec starts every blob push at
-        // `POST /v2/<name>/blobs/uploads/` — **with** the trailing slash
-        // (endpoint end-4a), and that is what docker/podman/containerd actually
-        // send. Under `nest`, axum 0.8 matches the inner `"/"` route at the
-        // prefix *without* a trailing slash and 404s the spec form, so both
-        // spellings are registered explicitly. There is no path-normalizing
-        // layer in front of the router to paper over the difference.
         .post_with(
             OCI_TOKEN,
-            "/{owner}/{repo}/blobs/uploads",
+            "/v2/{owner}/{repo}/blobs/uploads/",
             oci::start_upload,
             &upload_limit,
         )
         .post_with(
             OCI_TOKEN,
-            "/{owner}/{repo}/blobs/uploads/",
+            "/v2/{owner}/{repo}/blobs/uploads",
             oci::start_upload,
             &upload_limit,
         )
         .patch_with(
             OCI_TOKEN,
-            "/{owner}/{repo}/blobs/uploads/{uuid}",
+            "/v2/{owner}/{repo}/blobs/uploads/{uuid}",
             oci::chunk_upload,
             &upload_limit,
         )
         .put_with(
             OCI_TOKEN,
-            "/{owner}/{repo}/blobs/uploads/{uuid}",
+            "/v2/{owner}/{repo}/blobs/uploads/{uuid}",
             oci::complete_upload,
             &upload_limit,
         )

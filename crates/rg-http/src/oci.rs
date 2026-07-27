@@ -261,7 +261,10 @@ pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap
     // Return 401 to trigger Docker auth flow
     let _ = extract_user(&headers, &state.jwt_secret);
 
-    let realm = format!("{}/v2/token", get_base_url(&headers));
+    // The realm is not decoration: a client does not guess where to get its
+    // token, it reads this path out of the challenge and goes there. It has to
+    // be the path `build_v2_routes` registers for `oci::get_token`.
+    let realm = format!("{}/v2/auth/token", get_base_url(&headers));
     let service = "forgekeep-registry";
 
     (
