@@ -900,19 +900,33 @@ pub async fn upload_cache(
     // in-memory bytes costs nothing extra.
     let sha256 = cache_content_hash(body.as_ref());
     let temporary = path.with_extension("tar.tmp");
+    // From here until `upsert_cache_entry` succeeds there is a file on disk that
+    // no DB row points at. Retention walks rows, so every early exit below has to
+    // take its file with it — otherwise the failure leaks a cache-sized archive
+    // that nothing will ever come back for.
     if let Err(error) = tokio::fs::write(&temporary, body).await {
+        discard_unreferenced_cache_file("CI cache staging file", &temporary, repo_id, job_id, key)
+            .await;
         return cache_path_error("CI cache staging file", &temporary, &error).into_response();
     }
     if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+        discard_unreferenced_cache_file("CI cache staging file", &temporary, repo_id, job_id, key)
+            .await;
         return cache_path_error("CI cache archive", &path, &error).into_response();
     }
     let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
         Ok(policy) => policy,
-        Err(error) => return AppError::from(error).into_response(),
+        Err(error) => {
+            discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
+            return AppError::from(error).into_response();
+        }
     };
     let size = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta.len() as i64,
-        Err(error) => return cache_path_error("CI cache archive", &path, &error).into_response(),
+        Err(error) => {
+            discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
+            return cache_path_error("CI cache archive", &path, &error).into_response();
+        }
     };
     if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
         &state.db,
@@ -925,23 +939,38 @@ pub async fn upload_cache(
     )
     .await
     {
-        // Compensation on the error path: the runner must still see the DB
-        // failure, so a failed rollback can only be reported. The archive is
-        // already at its final path — if it survives, nothing references it and
-        // retention (which walks DB rows) will never come back for it.
-        if let Err(cleanup_error) = tokio::fs::remove_file(&path).await {
-            tracing::warn!(
-                repo_id,
-                job_id,
-                cache_key = %key,
-                path = %path.display(),
-                error = %cleanup_error,
-                "orphaned CI cache archive: the cache entry was not recorded and the rollback delete failed too — the file stays on disk with no row pointing at it"
-            );
-        }
+        discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
         return AppError::from(error).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Roll back a cache file that is on disk with no DB row pointing at it.
+///
+/// The caller still has to report the original failure to the runner, so a
+/// failed rollback can only be logged: if the file survives, nothing references
+/// it and retention (which walks DB rows) will never come back for it. An
+/// already-absent file is the normal outcome of a write that failed before
+/// creating anything, and is not worth a warning.
+async fn discard_unreferenced_cache_file(
+    what: &str,
+    path: &std::path::Path,
+    repo_id: i64,
+    job_id: i64,
+    key: &str,
+) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cleanup_error) => tracing::warn!(
+            repo_id,
+            job_id,
+            cache_key = %key,
+            path = %path.display(),
+            error = %cleanup_error,
+            "orphaned {what}: the cache entry was not recorded and the rollback delete failed too — the file stays on disk with no row pointing at it"
+        ),
+    }
 }
 
 async fn assigned_job_repo(
