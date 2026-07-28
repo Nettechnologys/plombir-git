@@ -82,6 +82,8 @@ pub struct StateOverrides {
     /// The OCI storage is layered on the same backend, so overriding this one
     /// value reaches both the attachment/LFS write paths and the registry's.
     pub blob_storage: Option<Arc<dyn rg_core::blob_storage::BlobStorage>>,
+    /// Replaces the default per-test delivery tracker.
+    pub delivery_tracker: Option<rg_core::task_tracker::TaskTracker>,
 }
 
 pub fn build_test_app_state(
@@ -124,6 +126,7 @@ pub fn build_test_app_state_with(
         smtp_config: None,
         oci_storage: Arc::new(OciStorage::from_backend(blob_storage, oci_storage_path)),
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
+        delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
         external_url: None,
         job_timeout_secs: 3600,
         git_stream_timeout_secs: 300,

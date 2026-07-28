@@ -128,13 +128,11 @@ fn seed_branches(bare_path: &Path, extra_branch: Option<&str>) -> tempfile::Temp
 /// Drain the detached hook tasks exactly as `rg_http::run` does on shutdown —
 /// this is what makes the assertions deterministic instead of a sleep-and-hope,
 /// and in the cascade test it is also the "it terminates" assertion.
-async fn drain_delivery_tracker() {
-    let tracker = rg_core::task_tracker::delivery_tracker();
+async fn drain_delivery_tracker(tracker: &rg_core::task_tracker::TaskTracker) {
     tracker.close();
     tokio::time::timeout(Duration::from_secs(120), tracker.wait())
         .await
         .expect("post-push hooks drained within timeout — a cascade that never ends hangs here");
-    // The tracker is process-wide; other tests in this binary spawn into it.
     tracker.reopen();
 }
 
@@ -150,6 +148,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
     let ci_engine = Arc::new(RecordingCiEngine::default());
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -198,7 +197,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
 
     // Opening a PR is a CI event of its own since card_074d93bfe327. Drain and
     // clear it, so what the merge assertion sees is the merge's own automation.
-    drain_delivery_tracker().await;
+    drain_delivery_tracker(&delivery_tracker).await;
     ci_engine.triggered.lock().unwrap().clear();
 
     let merged = client
@@ -222,7 +221,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
         "the merge must actually be the new tip of the base branch"
     );
 
-    drain_delivery_tracker().await;
+    drain_delivery_tracker(&delivery_tracker).await;
 
     let triggered = ci_engine.triggered.lock().unwrap().clone();
     assert_eq!(
@@ -272,6 +271,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
     let ci_engine = Arc::new(RecordingCiEngine::default());
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -381,7 +381,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
         .unwrap();
     assert_eq!(finished.status(), 200, "{}", finished.text().await.unwrap());
 
-    drain_delivery_tracker().await;
+    drain_delivery_tracker(&delivery_tracker).await;
 
     let merged_pr = rg_db::ops::pull_request_ops::find_by_id(&db, waiting.id)
         .await
@@ -442,6 +442,7 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
     let ci_engine = Arc::new(RecordingCiEngine::default());
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -474,7 +475,7 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
 
     // Opening the PR triggers its own `pull_request` pipeline
     // (card_074d93bfe327); the cascade under test starts at the merge below.
-    drain_delivery_tracker().await;
+    drain_delivery_tracker(&delivery_tracker).await;
     ci_engine.triggered.lock().unwrap().clear();
 
     // The second PR is seeded directly: opening it through the API and enabling
@@ -531,7 +532,7 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
     let first_merge_sha = merged["merge_commit_sha"].as_str().unwrap().to_string();
 
     // If the cascade did not terminate, this never returns.
-    drain_delivery_tracker().await;
+    drain_delivery_tracker(&delivery_tracker).await;
 
     let auto_merged = rg_db::ops::pull_request_ops::find_by_id(&db, waiting.id)
         .await

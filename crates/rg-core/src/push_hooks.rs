@@ -62,6 +62,7 @@ pub struct PostPushParams<'a> {
     pub smtp_config: &'a Option<SmtpConfig>,
     pub ci_engine: &'a dyn CiTrigger,
     pub external_url: Option<&'a str>,
+    pub delivery_tracker: &'a crate::task_tracker::TaskTracker,
 }
 
 impl PostPushParams<'_> {
@@ -107,14 +108,16 @@ pub struct PostPushContext {
     pub ci_engine: Arc<dyn CiTrigger + Send + Sync>,
     pub external_url: Option<String>,
     pub notifier: Option<Arc<dyn PushNotifier>>,
+    /// Tracker used for detached post-push work spawned from this context.
+    pub delivery_tracker: crate::task_tracker::TaskTracker,
 }
 
 impl PostPushContext {
     /// Run every post-push hook for one accepted push.
     ///
-    /// Call it from a **tracked** detached task
-    /// (`rg_core::task_tracker::delivery_tracker().spawn(...)`), never from a
-    /// bare `tokio::spawn`: the client already has its success response, so a
+    /// Call it from a **tracked** detached task through this context's
+    /// `delivery_tracker`, never from a bare `tokio::spawn`: the client already
+    /// has its success response, so a
     /// SIGTERM in the next few seconds would sever the work at its first await
     /// with no trace that it was owed.
     pub async fn run(
@@ -142,6 +145,7 @@ impl PostPushContext {
                 smtp_config: &self.smtp_config,
                 ci_engine: &*self.ci_engine,
                 external_url: self.external_url.as_deref(),
+                delivery_tracker: &self.delivery_tracker,
             },
             ref_updates,
         )
@@ -203,7 +207,7 @@ impl PostPushContext {
     ) {
         let context = self.clone();
         let db = db.clone();
-        crate::task_tracker::delivery_tracker().spawn(async move {
+        self.delivery_tracker.spawn(async move {
             crate::pull_request::trigger_pull_request_ci_best_effort(
                 &db,
                 &context.repo_root,
@@ -232,7 +236,7 @@ impl PostPushContext {
         }
         let context = self.clone();
         let db = db.clone();
-        crate::task_tracker::delivery_tracker().spawn(async move {
+        self.delivery_tracker.spawn(async move {
             for merged_ref in merged {
                 let repo_path = context
                     .repo_root
@@ -740,8 +744,14 @@ async fn trigger_push_webhooks(
         },
     });
 
-    if let Err(e) =
-        crate::webhook::service::trigger_event(params.db, repo_id, "push", &payload).await
+    if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
+        params.db,
+        repo_id,
+        "push",
+        &payload,
+        params.delivery_tracker,
+    )
+    .await
     {
         tracing::warn!(error = %format!("{e:#}"), "Failed to trigger push webhook");
     }
@@ -751,9 +761,19 @@ async fn trigger_push_webhooks(
         if update.old_sha.is_empty() || update.old_sha == "0000000000000000000000000000000000000000"
         {
             // New branch created
-            if let Err(e) =
-                crate::webhook::service::trigger_branch_created(params.db, repo_id, branch_name)
-                    .await
+            let payload = serde_json::json!({
+                "event": "branch.created",
+                "ref": branch_name,
+                "ref_type": "branch",
+            });
+            if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
+                params.db,
+                repo_id,
+                "branch.created",
+                &payload,
+                params.delivery_tracker,
+            )
+            .await
             {
                 tracing::warn!(
                     "Failed to trigger branch.created webhook for {}: {e}",
@@ -764,9 +784,19 @@ async fn trigger_push_webhooks(
             || update.new_sha == "0000000000000000000000000000000000000000"
         {
             // Branch deleted
-            if let Err(e) =
-                crate::webhook::service::trigger_branch_deleted(params.db, repo_id, branch_name)
-                    .await
+            let payload = serde_json::json!({
+                "event": "branch.deleted",
+                "ref": branch_name,
+                "ref_type": "branch",
+            });
+            if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
+                params.db,
+                repo_id,
+                "branch.deleted",
+                &payload,
+                params.delivery_tracker,
+            )
+            .await
             {
                 tracing::warn!(
                     "Failed to trigger branch.deleted webhook for {}: {e}",
@@ -778,8 +808,19 @@ async fn trigger_push_webhooks(
         if update.old_sha.is_empty() || update.old_sha == "0000000000000000000000000000000000000000"
         {
             // New tag created
-            if let Err(e) =
-                crate::webhook::service::trigger_tag_created(params.db, repo_id, tag_name).await
+            let payload = serde_json::json!({
+                "event": "tag.created",
+                "ref": tag_name,
+                "ref_type": "tag",
+            });
+            if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
+                params.db,
+                repo_id,
+                "tag.created",
+                &payload,
+                params.delivery_tracker,
+            )
+            .await
             {
                 tracing::warn!(
                     "Failed to trigger tag.created webhook for {}: {e}",
@@ -790,8 +831,19 @@ async fn trigger_push_webhooks(
             || update.new_sha == "0000000000000000000000000000000000000000"
         {
             // Tag deleted
-            if let Err(e) =
-                crate::webhook::service::trigger_tag_deleted(params.db, repo_id, tag_name).await
+            let payload = serde_json::json!({
+                "event": "tag.deleted",
+                "ref": tag_name,
+                "ref_type": "tag",
+            });
+            if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
+                params.db,
+                repo_id,
+                "tag.deleted",
+                &payload,
+                params.delivery_tracker,
+            )
+            .await
             {
                 tracing::warn!(
                     "Failed to trigger tag.deleted webhook for {}: {e}",

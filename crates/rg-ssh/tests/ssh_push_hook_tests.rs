@@ -222,6 +222,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
     let notifier = Arc::new(RecordingNotifier {
         events: events.clone(),
     });
+    let delivery_tracker = rg_core::task_tracker::TaskTracker::new();
 
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let listen_addr = probe.local_addr().unwrap().to_string();
@@ -244,6 +245,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             ci_engine,
             external_url: None,
             notifier: Some(notifier),
+            delivery_tracker: delivery_tracker.clone(),
         })),
     };
     let server = tokio::spawn(async move {
@@ -289,7 +291,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
     // The hooks are detached; the tracker is what makes "detached" survivable,
     // and awaiting it here is also what makes the assertions deterministic
     // instead of a sleep-and-hope.
-    let tracker = rg_core::task_tracker::delivery_tracker();
+    let tracker = &delivery_tracker;
     tracker.close();
     // Hang-guard, not a deadline: untracked work makes `wait()` return
     // instantly (the assertions below are what fail then), while a tight bound
@@ -297,7 +299,6 @@ async fn ssh_push_runs_the_post_push_hooks() {
     tokio::time::timeout(Duration::from_secs(120), tracker.wait())
         .await
         .expect("delivery tracker drained within timeout");
-    tracker.reopen();
 
     let refreshed = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
         .await

@@ -91,8 +91,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
 
 /// Drain the detached hook tasks the way `rg_http::run` drains them on shutdown,
 /// so the assertions are deterministic instead of sleep-and-hope.
-async fn drain_delivery_tracker(what: &str) {
-    let tracker = rg_core::task_tracker::delivery_tracker();
+async fn drain_delivery_tracker(tracker: &rg_core::task_tracker::TaskTracker, what: &str) {
     tracker.close();
     tokio::time::timeout(Duration::from_secs(120), tracker.wait())
         .await
@@ -108,6 +107,7 @@ struct Fixture {
     user_id: i64,
     head_sha: String,
     ci_engine: Arc<RecordingCiEngine>,
+    delivery_tracker: rg_core::task_tracker::TaskTracker,
     db: rg_db::DatabaseConnection,
     server: tokio::task::JoinHandle<()>,
 }
@@ -120,6 +120,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
     let ci_engine = Arc::new(RecordingCiEngine::new(workflow_for_event));
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -166,7 +167,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
 
     // The seed write's own post-push hooks are detached; drain and clear them so
     // only the action under test is in the recorder.
-    drain_delivery_tracker("the seed write's hooks").await;
+    drain_delivery_tracker(&delivery_tracker, "the seed write's hooks").await;
     ci_engine.triggered.lock().unwrap().clear();
 
     Fixture {
@@ -175,6 +176,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
         user_id,
         head_sha,
         ci_engine,
+        delivery_tracker,
         db,
         server,
     }
@@ -206,7 +208,7 @@ async fn open_pr(fixture: &Fixture, owner: &str, repo_name: &str) -> serde_json:
 async fn opening_a_pull_request_triggers_the_pull_request_pipeline() {
     let fixture = fixture("prci", "pr-ci-repo", true).await;
     open_pr(&fixture, "prci", "pr-ci-repo").await;
-    drain_delivery_tracker("the PR's CI trigger").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
 
     let triggered = fixture.ci_engine.triggered.lock().unwrap().clone();
     assert_eq!(
@@ -234,7 +236,7 @@ async fn opening_a_pull_request_triggers_the_pull_request_pipeline() {
 async fn a_repository_without_a_pull_request_workflow_gets_no_pipeline() {
     let fixture = fixture("nopr", "no-pr-workflow", false).await;
     open_pr(&fixture, "nopr", "no-pr-workflow").await;
-    drain_delivery_tracker("the PR's CI trigger").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
 
     assert!(
         fixture.ci_engine.triggered.lock().unwrap().is_empty(),
@@ -255,7 +257,7 @@ async fn pushing_the_head_branch_re_runs_the_pull_request_pipeline() {
     let fixture = fixture("prsync", "pr-sync-repo", true).await;
     let pr = open_pr(&fixture, "prsync", "pr-sync-repo").await;
     let pr_number = pr["number"].as_i64().expect("PR carries a number");
-    drain_delivery_tracker("the PR's CI trigger").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
     fixture.ci_engine.triggered.lock().unwrap().clear();
 
     // Move the head branch the way a push does — through the web editor, which
@@ -279,7 +281,7 @@ async fn pushing_the_head_branch_re_runs_the_pull_request_pipeline() {
     let new_sha = written["commit_sha"].as_str().unwrap().to_string();
     assert_ne!(new_sha, fixture.head_sha, "the branch must have moved");
 
-    drain_delivery_tracker("the head-branch push hooks").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the head-branch push hooks").await;
 
     let triggered = fixture.ci_engine.triggered.lock().unwrap().clone();
     assert!(

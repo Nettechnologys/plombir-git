@@ -633,6 +633,7 @@ pub(crate) async fn run_serve(
         ci_engine,
         external_url: resolved_external_url,
         notifier: Some(std::sync::Arc::new(notification_hub)),
+        delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
     };
 
     let ssh_config = rg_ssh::SshServerConfig {

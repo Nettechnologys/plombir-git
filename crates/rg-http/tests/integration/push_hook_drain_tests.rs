@@ -57,6 +57,7 @@ async fn post_push_hooks_are_drained_by_the_delivery_tracker() {
     std::fs::create_dir_all(&repo_root).unwrap();
 
     let state = build_test_app_state(db.clone(), repo_root.clone());
+    let delivery_tracker = state.delivery_tracker.clone();
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -132,7 +133,7 @@ async fn post_push_hooks_are_drained_by_the_delivery_tracker() {
     git(&["push", &url, "main"], Some(worktree.path()));
 
     // ── The shutdown drain, as `rg_http::run` performs it. ──
-    let tracker = rg_core::task_tracker::delivery_tracker();
+    let tracker = &delivery_tracker;
     tracker.close();
     // Hang-guard, not a deadline: an untracked hook task makes `wait()` return
     // instantly (the assertion below is what fails), while a tight bound would
@@ -141,9 +142,6 @@ async fn post_push_hooks_are_drained_by_the_delivery_tracker() {
     tokio::time::timeout(Duration::from_secs(120), tracker.wait())
         .await
         .expect("delivery tracker drained within timeout");
-    // Restore global state: the tracker is process-wide and other tests in this
-    // binary spawn into it.
-    tracker.reopen();
 
     let refreshed = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
         .await

@@ -123,6 +123,23 @@ pub async fn trigger_event(
     event: &str,
     payload: &Value,
 ) -> Result<()> {
+    trigger_event_with_tracker(
+        db,
+        repo_id,
+        event,
+        payload,
+        crate::task_tracker::delivery_tracker(),
+    )
+    .await
+}
+
+pub(crate) async fn trigger_event_with_tracker(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    event: &str,
+    payload: &Value,
+    delivery_tracker: &crate::task_tracker::TaskTracker,
+) -> Result<()> {
     let hooks = webhook_ops::list_active_by_repo_and_event(db, repo_id, event).await?;
 
     for hook in hooks {
@@ -138,7 +155,7 @@ pub async fn trigger_event(
         let content_type = hook.content_type.clone();
         let secret = hook.secret.clone();
 
-        crate::task_tracker::delivery_tracker().spawn(async move {
+        delivery_tracker.spawn(async move {
             let delivery_id = uuid::Uuid::new_v4().to_string();
             let start = std::time::Instant::now();
 

@@ -1076,8 +1076,8 @@ mod tests {
 
         // Anchored on the helper and its first `spawn(`, not on the hook call
         // itself: the call moved into `PostPushContext::run` (card_73a1ec5b32f3)
-        // and rustfmt is free to reflow it, but "the helper's spawn is the
-        // tracker's" is the invariant, and it survives both.
+        // and rustfmt is free to reflow it, but "the helper's spawn is this
+        // app state's tracker" is the invariant, and it survives both.
         let source = include_str!("lib.rs");
         let lines: Vec<&str> = source.lines().collect();
         let helper = lines
@@ -1092,11 +1092,16 @@ mod tests {
             .position(|line| line.contains("spawn("))
             .expect("the post-push helper must detach the hook run");
         assert!(
-            lines[helper + spawn].contains("delivery_tracker()"),
-            "post-push hooks must be spawned via rg_core::task_tracker::delivery_tracker() \
-             so the shutdown drain awaits them; found `{}` at lib.rs:{}",
+            lines[helper + spawn].contains("self.delivery_tracker."),
+            "post-push hooks must be spawned via AppState::delivery_tracker \
+             so tests can inject a local tracker and production shutdown can await it; \
+             found `{}` at lib.rs:{}",
             lines[helper + spawn].trim(),
             helper + spawn + 1
+        );
+        assert!(
+            source.contains("delivery_tracker: rg_core::task_tracker::delivery_tracker().clone()"),
+            "rg_http::run must back AppState::delivery_tracker with the shared shutdown tracker"
         );
     }
 

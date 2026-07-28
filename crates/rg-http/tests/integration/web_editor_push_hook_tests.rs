@@ -68,6 +68,14 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
     }
 }
 
+async fn drain_delivery_tracker(tracker: &rg_core::task_tracker::TaskTracker, what: &str) {
+    tracker.close();
+    tokio::time::timeout(Duration::from_secs(120), tracker.wait())
+        .await
+        .unwrap_or_else(|_| panic!("{what} drained within timeout"));
+    tracker.reopen();
+}
+
 /// A file committed through the web editor must trigger CI on the new commit
 /// and refresh the head SHA of the open PR on that branch — the two effects the
 /// card names, both of which a `git push` of the same commit already produced.
@@ -80,6 +88,7 @@ async fn a_web_editor_commit_runs_the_post_push_hooks() {
     let ci_engine = Arc::new(RecordingCiEngine::default());
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -157,13 +166,7 @@ async fn a_web_editor_commit_runs_the_post_push_hooks() {
     // ── The drain, as `rg_http::run` performs it on shutdown. ──
     // The hooks are detached, so this is what makes the assertions below
     // deterministic instead of a sleep-and-hope.
-    let tracker = rg_core::task_tracker::delivery_tracker();
-    tracker.close();
-    tokio::time::timeout(Duration::from_secs(120), tracker.wait())
-        .await
-        .expect("delivery tracker drained within timeout");
-    // The tracker is process-wide; other tests in this binary spawn into it.
-    tracker.reopen();
+    drain_delivery_tracker(&delivery_tracker, "delivery tracker").await;
 
     let refreshed = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
         .await
@@ -213,6 +216,7 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
     let ci_engine = Arc::new(RecordingCiEngine::default());
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -296,12 +300,7 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
     // recorder after the clear — leaving two entries for the assertion below to
     // trip over. Observed as a flake in a 35-test filter; the clear silently
     // assumed the seed's hook had already run.
-    let tracker = rg_core::task_tracker::delivery_tracker();
-    tracker.close();
-    tokio::time::timeout(Duration::from_secs(120), tracker.wait())
-        .await
-        .expect("the seed write's hooks drained within timeout");
-    tracker.reopen();
+    drain_delivery_tracker(&delivery_tracker, "the seed write's hooks").await;
     ci_engine.triggered.lock().unwrap().clear();
 
     let resp = client
@@ -320,12 +319,7 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
         "the delete must have produced a new commit"
     );
 
-    let tracker = rg_core::task_tracker::delivery_tracker();
-    tracker.close();
-    tokio::time::timeout(Duration::from_secs(120), tracker.wait())
-        .await
-        .expect("delivery tracker drained within timeout");
-    tracker.reopen();
+    drain_delivery_tracker(&delivery_tracker, "delivery tracker").await;
 
     let refreshed = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
         .await

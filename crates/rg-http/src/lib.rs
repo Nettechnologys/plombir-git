@@ -71,6 +71,8 @@ pub struct AppState {
     pub blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage>,
     pub oci_storage: Arc<OciStorage>,
     pub log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue,
+    /// Tracker for detached delivery/post-push work owned by this app state.
+    pub delivery_tracker: rg_core::task_tracker::TaskTracker,
     /// External-facing base URL for SSO callbacks (None = detect from request).
     pub external_url: Option<String>,
     /// CI job timeout in seconds.
@@ -130,7 +132,7 @@ impl AppState {
         let db = self.db.clone();
         let context = self.post_push_context();
 
-        rg_core::task_tracker::delivery_tracker().spawn(async move {
+        self.delivery_tracker.spawn(async move {
             context
                 .run(&db, &repo_path, &owner, &repo_name, pusher_id, &ref_updates)
                 .await;
@@ -149,6 +151,7 @@ impl AppState {
             ci_engine: self.ci_engine.clone(),
             external_url: self.external_url.clone(),
             notifier: Some(Arc::new(self.notification_hub.clone())),
+            delivery_tracker: self.delivery_tracker.clone(),
         }
     }
 
@@ -376,6 +379,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         blob_storage,
         oci_storage,
         log_write_queue,
+        delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         external_url: config.external_url,
         job_timeout_secs: config.job_timeout_secs,
         git_stream_timeout_secs: config.git_stream_timeout_secs,

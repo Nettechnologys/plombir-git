@@ -411,6 +411,7 @@ fn post_push_context(
         ci_engine: std::sync::Arc::new(CiEngine),
         external_url: external_url.map(str::to_string),
         notifier: None,
+        delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
     }
 }
 

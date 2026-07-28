@@ -797,7 +797,8 @@ impl Handler for SshHandler {
                     if let (Some(ref_updates), Some(hooks), Some(db), Some((owner, repo_name))) =
                         (ref_updates, post_push, hook_db, hook_target)
                     {
-                        rg_core::task_tracker::delivery_tracker().spawn(async move {
+                        let delivery_tracker = hooks.delivery_tracker.clone();
+                        delivery_tracker.spawn(async move {
                             hooks
                                 .run(
                                     &db,

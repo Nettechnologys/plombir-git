@@ -82,10 +82,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
 
 /// Drain the detached hook tasks the way `rg_http::run` drains them on shutdown.
 /// This is what makes the assertions deterministic instead of sleep-and-hope.
-/// The tracker is process-wide, so it is reopened for the other tests in this
-/// binary.
-async fn drain_delivery_tracker(what: &str) {
-    let tracker = rg_core::task_tracker::delivery_tracker();
+async fn drain_delivery_tracker(tracker: &rg_core::task_tracker::TaskTracker, what: &str) {
     tracker.close();
     tokio::time::timeout(Duration::from_secs(120), tracker.wait())
         .await
@@ -106,6 +103,7 @@ async fn applying_a_suggestion_runs_the_post_push_hooks() {
     let ci_engine = Arc::new(RecordingCiEngine::default());
     let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = ci_engine.clone();
+    let delivery_tracker = state.delivery_tracker.clone();
 
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -214,7 +212,7 @@ async fn applying_a_suggestion_runs_the_post_push_hooks() {
     // Drain and clear before the action under test: the seed write's own hooks
     // are detached, so under a loaded parallel run they can still be queued here
     // and would otherwise land in the recorder as a second entry.
-    drain_delivery_tracker("the seed write's hooks").await;
+    drain_delivery_tracker(&delivery_tracker, "the seed write's hooks").await;
     ci_engine.triggered.lock().unwrap().clear();
     rg_db::ops::notification_ops::mark_all_read(&db, watcher_id)
         .await
@@ -241,7 +239,7 @@ async fn applying_a_suggestion_runs_the_post_push_hooks() {
         "applying a suggestion must have produced a new commit"
     );
 
-    drain_delivery_tracker("the suggestion's post-push hooks").await;
+    drain_delivery_tracker(&delivery_tracker, "the suggestion's post-push hooks").await;
 
     let refreshed = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
         .await

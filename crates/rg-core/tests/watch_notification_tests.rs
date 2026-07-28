@@ -109,6 +109,7 @@ async fn run_post_push_hooks(
     ref_updates: &[rg_git::protocol::receive_pack::RefUpdate],
 ) {
     let ci = NoCi;
+    let delivery_tracker = rg_core::task_tracker::TaskTracker::new();
     rg_core::push_hooks::post_push_hooks(
         &rg_core::push_hooks::PostPushParams {
             db,
@@ -125,6 +126,7 @@ async fn run_post_push_hooks(
             smtp_config: &None,
             ci_engine: &ci,
             external_url: None,
+            delivery_tracker: &delivery_tracker,
         },
         ref_updates,
     )

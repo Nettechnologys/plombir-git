@@ -307,6 +307,7 @@ pub async fn spawn_test_app_for_fault_sweep() -> FaultSweepApp {
         repo_root.clone(),
         super::StateOverrides {
             blob_storage: Some(blob_storage),
+            ..Default::default()
         },
     );
     let (app, facts) = rg_http::create_router_for_test_with_routes(state);
@@ -434,6 +435,7 @@ pub async fn spawn_test_app_with_faults() -> (String, rg_db::DatabaseConnection,
         repo_root,
         super::StateOverrides {
             blob_storage: Some(blob_storage),
+            ..Default::default()
         },
     );
     let app = rg_http::create_router_for_test(state);

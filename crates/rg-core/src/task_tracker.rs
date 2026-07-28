@@ -25,7 +25,7 @@
 
 use std::sync::OnceLock;
 
-use tokio_util::task::TaskTracker;
+pub use tokio_util::task::TaskTracker;
 
 static DELIVERY_TRACKER: OnceLock<TaskTracker> = OnceLock::new();
 
@@ -52,10 +52,11 @@ mod tests {
     /// between a drained webhook delivery and one severed mid-write on SIGTERM.
     #[tokio::test]
     async fn close_then_wait_drains_a_spawned_task() {
+        let tracker = TaskTracker::new();
         let done = Arc::new(AtomicBool::new(false));
         let done_in_task = done.clone();
 
-        delivery_tracker().spawn(async move {
+        tracker.spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             done_in_task.store(true, Ordering::SeqCst);
         });
@@ -63,7 +64,6 @@ mod tests {
         // Still in flight immediately after spawn (the task sleeps first).
         assert!(!done.load(Ordering::SeqCst));
 
-        let tracker = delivery_tracker();
         tracker.close();
         // Hang-guard, not a deadline — see the same reasoning in
         // `ci::log_write_queue` (card_2b890485c8d8). The tracked task sleeps
@@ -77,8 +77,5 @@ mod tests {
             done.load(Ordering::SeqCst),
             "detached task ran to completion before wait() returned"
         );
-
-        // Restore global state so closing here doesn't leak into other tests.
-        tracker.reopen();
     }
 }
