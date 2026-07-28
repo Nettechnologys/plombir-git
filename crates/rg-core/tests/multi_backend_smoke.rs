@@ -10,7 +10,7 @@ use sea_orm::{NotSet, Set};
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
         .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
-    let db = rg_db::connect_with_pool(&database_url, 15, 60, 2)
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
     rg_db::run_migrations(&db).await.expect("run migrations");

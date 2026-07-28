@@ -214,7 +214,9 @@ mod tests {
     async fn drains_buffered_writes_on_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let db = rg_db::connect_with_pool(&db_url, 5, 60, 2).await.unwrap();
+        let db = rg_db::connect_with_pool(&db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
 
         // Minimal pipeline → stage → job chain so there is a real row to append to.

@@ -385,7 +385,7 @@ disk gets tight, `cargo clean` is the whole fix — the next build is cold
 
 #### Test databases go through the production connect path
 
-`setup_test_db` (in `crates/rg-http/tests/common/mod.rs`) connects via
+`setup_test_db` (in `crates/rg-http/tests/integration/common/mod.rs`) connects via
 `rg_db::connect_with_pool`, **not** a bare `sea_orm::Database::connect`. That
 is deliberate on two counts:
 
@@ -400,8 +400,20 @@ is deliberate on two counts:
   connect + migrate a fresh database, against 455 ms through the production
   path.
 
+The one production value the tests do **not** inherit is the connect timeout.
+`connect_with_pool`'s third argument is sqlx's *acquire* timeout, and the pool
+opens `min_connections` eagerly, so it also bounds the first connect — creating
+the file, running the PRAGMAs, writing the WAL header. Production wants that
+budget short (a connect nobody answers within seconds is an outage worth
+reporting); a test process wants it long, because it competes for the same disk
+with every sibling test doing the same thing, and a blown budget surfaces as a
+`pool timed out while waiting for an open connection` panic in *setup* — a busy
+disk wearing the costume of a broken test. Test harnesses therefore pass
+`rg_db::TEST_CONNECT_TIMEOUT_SECS`.
+
 If you add a new test that needs its own database, connect through `rg_db`
-rather than reaching for `Database::connect` directly.
+rather than reaching for `Database::connect` directly, and use that constant
+rather than a literal.
 
 #### Process-wide state keyed by row ids needs the database in the key
 

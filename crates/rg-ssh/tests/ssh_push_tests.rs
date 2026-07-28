@@ -42,7 +42,7 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
     // configuration as the server, and ~6x less time in the migration run.
     let db = rg_db::connect_with_pool(
         &format!("sqlite://{}?mode=rwc", db_path.display()),
-        5,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
         60,
         2,
     )
@@ -181,7 +181,7 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
     let db_path = app_dir.path().join("test.db");
     let db = rg_db::connect_with_pool(
         &format!("sqlite://{}?mode=rwc", db_path.display()),
-        5,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
         60,
         2,
     )

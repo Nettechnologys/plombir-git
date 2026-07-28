@@ -58,7 +58,7 @@ async fn fresh_db(dir: &Path) -> sea_orm::DatabaseConnection {
     let db_path = dir.join("test.db");
     let db = rg_db::connect_with_pool(
         &format!("sqlite://{}?mode=rwc", db_path.display()),
-        5,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
         60,
         2,
     )

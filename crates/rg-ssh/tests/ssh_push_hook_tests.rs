@@ -119,7 +119,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
     let db_path = app_dir.path().join("test.db");
     let db = rg_db::connect_with_pool(
         &format!("sqlite://{}?mode=rwc", db_path.display()),
-        5,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
         60,
         2,
     )

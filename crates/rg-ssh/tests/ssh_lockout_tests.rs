@@ -97,7 +97,7 @@ async fn harness(username: &str) -> Harness {
     let db_path = dir.path().join("test.db");
     let db = rg_db::connect_with_pool(
         &format!("sqlite://{}?mode=rwc", db_path.display()),
-        5,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
         60,
         2,
     )

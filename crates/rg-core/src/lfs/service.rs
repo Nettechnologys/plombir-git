@@ -920,7 +920,9 @@ mod compress_existing_log_tests {
         oid: &str,
     ) -> sea_orm::DatabaseConnection {
         let db_url = format!("sqlite://{}?mode=rwc", dir.join("test.db").display());
-        let db = rg_db::connect_with_pool(&db_url, 5, 60, 2).await.unwrap();
+        let db = rg_db::connect_with_pool(&db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         rg_db::ops::lfs_object_ops::create(
             &db,

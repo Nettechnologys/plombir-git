@@ -260,7 +260,9 @@ mod tests {
     /// different configuration from production and an fsync on each of the
     /// ~75 migration commits.
     async fn connect_test_db(db_url: &str) -> sea_orm::DatabaseConnection {
-        rg_db::connect_with_pool(db_url, 5, 60, 2).await.unwrap()
+        rg_db::connect_with_pool(db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap()
     }
 
     /// Permission bits mean nothing to uid 0, so the read-only-directory tests

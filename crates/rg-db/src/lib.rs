@@ -251,6 +251,23 @@ fn connect_options_handle(db: &DatabaseConnection) -> Option<Arc<dyn Any + Send 
 
 /// Default DB connect (acquire) timeout (seconds).
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Connect (acquire) timeout for the throwaway databases the test suites build.
+///
+/// Deliberately far longer than [`DEFAULT_CONNECT_TIMEOUT_SECS`]. The timeout is
+/// sqlx's *acquire* timeout, and [`connect_with_pool`] opens `min_connections`
+/// eagerly, so it also bounds the very first connect: creating the file, running
+/// the PRAGMAs and writing the WAL header must all finish inside it. A test
+/// process is the one place where that budget competes with dozens of sibling
+/// test processes doing the same thing on the same disk — so the short
+/// production value turns machine load into a `pool timed out while waiting for
+/// an open connection` panic in *setup*, which reads like a broken test rather
+/// than a busy disk.
+///
+/// A server has the opposite need: a connect that is not answered within seconds
+/// is an outage worth reporting, not something to wait out. Hence two values.
+pub const TEST_CONNECT_TIMEOUT_SECS: u64 = 30;
+
 /// Default DB idle timeout (seconds).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 /// Default max pool connections.

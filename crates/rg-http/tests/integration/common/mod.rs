@@ -60,9 +60,11 @@ pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path().join("test.db");
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-    // Pool size and connect timeout kept as they were; only the PRAGMA
-    // configuration changes.
-    let db = rg_db::connect_with_pool(&db_url, 5, 60, 2)
+    // The connect timeout is the test-suite value, not production's: it also
+    // bounds the eager first connect, and under a parallel run this harness
+    // competes for the disk with every sibling test doing the same thing. See
+    // `rg_db::TEST_CONNECT_TIMEOUT_SECS`.
+    let db = rg_db::connect_with_pool(&db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("failed to connect");
     rg_db::run_migrations(&db).await.expect("migration failed");
