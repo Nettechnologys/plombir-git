@@ -177,6 +177,7 @@ fn parse_rfc822_meta(content: &str) -> Result<ExtractedMetadata, anyhow::Error> 
         keywords,
         license,
         semver: Some(version),
+        protocol_metadata: None,
     })
 }
 

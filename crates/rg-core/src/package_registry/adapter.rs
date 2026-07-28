@@ -24,6 +24,17 @@ pub struct ExtractedMetadata {
     pub license: Option<String>,
     /// semver-compatible version (if different from `version`).
     pub semver: Option<String>,
+    /// Everything the protocol needs that has no column of its own — stored
+    /// verbatim in `package_version.metadata` and read back by the protocol
+    /// handler for this package type.
+    ///
+    /// The fields above are the ones the *registry* understands (they end up on
+    /// the package row and in the generic API); a gemspec's dependency list, a
+    /// nuspec's tags or a chart's `appVersion` are meaningful only to the one
+    /// client that asks for them, so they travel as a JSON object whose keys are
+    /// whatever that client's endpoint parses. An adapter with nothing
+    /// protocol-specific to carry leaves this `None`.
+    pub protocol_metadata: Option<String>,
 }
 
 /// Trait implemented by every package-type adapter.

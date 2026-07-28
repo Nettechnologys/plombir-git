@@ -865,3 +865,230 @@ async fn rubygems_compact_index_serves_the_layout_gem_requests() {
         .iter()
         .any(|package| package["name"] == "matrix-gem"));
 }
+
+/// A gemspec's dependencies live nowhere but the gemspec, and both endpoints a
+/// client resolves through read them back out of the stored version metadata.
+/// Published without them, the registry answers `200` with an empty dependency
+/// list — which Bundler reads as "this gem needs nothing" and resolves cleanly,
+/// so the failure only shows up as a missing transitive gem at runtime.
+#[tokio::test]
+async fn rubygems_publishes_gemspec_dependencies_into_both_resolvers() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    // The shape `gem build` writes: tagged objects, `[operator, Gem::Version]`
+    // constraint pairs, and both dependency kinds in one list.
+    let gem_metadata = br#"--- !ruby/object:Gem::Specification
+name: matrix-deps-gem
+version: !ruby/object:Gem::Version
+  version: '1.0.0'
+summary: A gem with dependencies
+description: The long form of the summary
+homepage: https://example.com/matrix-deps-gem
+licenses:
+- MIT
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: rack
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: '2.0'
+    - - "<"
+      - !ruby/object:Gem::Version
+        version: '4.0'
+  type: :runtime
+- !ruby/object:Gem::Dependency
+  name: rspec
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: '3.0'
+  type: :development
+"#;
+    let gem_file = tar_archive(&[("metadata.gz", &gzip(gem_metadata))]);
+
+    let published = client
+        .post(package_url(&base, &["rubygems", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-deps-gem-1.0.0.gem\"",
+        )
+        .body(gem_file)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    // ── The dependencies API ────────────────────────────────────────────────
+    let mut deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies"]);
+    deps_url
+        .query_pairs_mut()
+        .append_pair("gems", "matrix-deps-gem");
+    let deps = client
+        .get(deps_url)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+
+    let entry = deps
+        .as_array()
+        .and_then(|entries| entries.first())
+        .unwrap_or_else(|| panic!("dependencies API returned nothing: {deps}"));
+    assert_eq!(entry["number"], "1.0.0");
+    assert_eq!(
+        entry["dependencies"],
+        serde_json::json!([["rack", ">= 2.0, < 4.0"]]),
+        "the runtime dependency is missing, or the development one leaked in"
+    );
+
+    // ── The compact index, which is what a modern client actually reads ─────
+    let info = client
+        .get(package_url(&base, &["rubygems", "info", "matrix-deps-gem"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = info
+        .lines()
+        .find(|line| line.starts_with("1.0.0"))
+        .unwrap_or_else(|| panic!("info file lost the version: {info}"));
+    let (versioned_deps, _) = line.split_once('|').expect("info line carries no pipe");
+    // Two constraints on one gem join with `&`; the comma is what separates
+    // dependencies in this format.
+    assert_eq!(
+        versioned_deps.trim(),
+        "1.0.0 rack:>= 2.0&< 4.0",
+        "compact index line: {line}"
+    );
+
+    // ── And the gem info endpoint, which reads the same stored blob ─────────
+    let gem_info = client
+        .get(package_url(
+            &base,
+            &["rubygems", "api", "v1", "gems", "matrix-deps-gem.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let version = &gem_info["versions"]["1.0.0"];
+    assert_eq!(version["summary"], "A gem with dependencies");
+    assert_eq!(version["description"], "The long form of the summary");
+    assert_eq!(
+        version["homepage_uri"],
+        "https://example.com/matrix-deps-gem"
+    );
+    assert_eq!(version["licenses"], serde_json::json!(["MIT"]));
+}
+
+/// NuGet's registration index and Helm's `index.yaml` describe one *version*
+/// each, and the fields they publish have no package column — they survive the
+/// publish only through the stored version metadata.
+#[tokio::test]
+async fn nuget_and_helm_indexes_carry_per_version_metadata() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let publish = |pkg_type: &'static str, filename: &'static str, body: Vec<u8>| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        async move {
+            let response = client
+                .post(package_url(&base, &[pkg_type, "publish"]))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED, "{pkg_type} publish");
+        }
+    };
+
+    let nuspec = br#"<?xml version="1.0"?>
+<package><metadata>
+  <id>Matrix.Meta</id>
+  <version>1.0.0</version>
+  <description>NuGet metadata package</description>
+  <projectUrl>https://example.com/matrix-meta</projectUrl>
+  <license type="expression">MIT</license>
+  <tags>matrix testing</tags>
+</metadata></package>"#;
+    publish(
+        "nuget",
+        "Matrix.Meta.1.0.0.nupkg",
+        zip_archive(&[("Matrix.Meta.nuspec", nuspec)]),
+    )
+    .await;
+
+    let chart_yaml = br#"apiVersion: v2
+name: matrix-chart
+version: 1.0.0
+appVersion: 1.19
+keywords:
+  - web
+  - proxy
+sources:
+  - https://example.com/matrix-chart-source
+"#;
+    publish(
+        "helm",
+        "matrix-chart-1.0.0.tgz",
+        tar_gz(&[("matrix-chart/Chart.yaml", chart_yaml)]),
+    )
+    .await;
+
+    let registration = client
+        .get(package_url(
+            &base,
+            &["nuget", "registration", "Matrix.Meta", "index.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let catalog = &registration["items"][0]["items"][0]["catalogEntry"];
+    assert_eq!(catalog["description"], "NuGet metadata package");
+    assert_eq!(catalog["projectUrl"], "https://example.com/matrix-meta");
+    assert_eq!(catalog["licenseUrl"], "MIT");
+    assert_eq!(catalog["tags"], serde_json::json!(["matrix", "testing"]));
+
+    let index = client
+        .get(package_url(&base, &["helm", "index.yaml"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let index: serde_json::Value = serde_yaml::from_str(&index).unwrap();
+    let chart = &index["entries"]["matrix-chart"][0];
+    assert_eq!(chart["apiVersion"], "v2");
+    assert_eq!(chart["appVersion"], "1.19");
+    assert_eq!(chart["keywords"], serde_json::json!(["web", "proxy"]));
+    assert_eq!(
+        chart["sources"],
+        serde_json::json!(["https://example.com/matrix-chart-source"])
+    );
+}

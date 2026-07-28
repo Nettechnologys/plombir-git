@@ -230,7 +230,137 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         keywords,
         license,
         semver: Some(version),
+        protocol_metadata: Some(gemspec_protocol_metadata(&doc)),
     })
+}
+
+/// The gemspec fields no package column holds, in the shape the RubyGems
+/// endpoints read them back.
+///
+/// Dependencies are the reason this exists: they live only here, and a gem
+/// served without them looks to Bundler like a gem that genuinely depends on
+/// nothing — a wrong answer that resolves cleanly instead of failing. The keys
+/// are the ones `parse_rubygems_deps` / `parse_rubygems_info` (rg-http) look
+/// for, and the object is always written, so an empty dependency list is a
+/// recorded fact rather than a missing one.
+fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> String {
+    let mut out = serde_json::Map::new();
+
+    for (key, yaml_key) in [("summary", "summary"), ("description", "description")] {
+        if let Some(value) = doc
+            .get(yaml_key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            out.insert(key.into(), value.into());
+        }
+    }
+
+    if let Some(homepage) = doc
+        .get("homepage")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        out.insert("homepage".into(), homepage.into());
+    }
+
+    let licenses: Vec<serde_json::Value> = doc
+        .get("licenses")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|l| l.as_str())
+                .map(Into::into)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !licenses.is_empty() {
+        out.insert("licenses".into(), licenses.into());
+    }
+
+    let dependencies: Vec<serde_json::Value> = gemspec_dependencies(doc)
+        .into_iter()
+        .map(|(name, requirements)| {
+            serde_json::json!({ "name": name, "requirements": requirements })
+        })
+        .collect();
+    out.insert("dependencies".into(), dependencies.into());
+
+    serde_json::Value::Object(out).to_string()
+}
+
+/// The runtime dependencies a gemspec declares, as `(name, requirement)`.
+///
+/// `dependencies:` lists both kinds under one key and only the runtime ones
+/// belong in an index: a development dependency published there would pull a
+/// gem's own test suite into every consumer's resolution.
+fn gemspec_dependencies(doc: &serde_yaml::Value) -> Vec<(String, String)> {
+    let Some(deps) = doc.get("dependencies").and_then(|v| v.as_sequence()) else {
+        return Vec::new();
+    };
+
+    deps.iter()
+        .filter(|dep| is_runtime_dependency(dep))
+        .filter_map(|dep| {
+            let name = dep.get("name").and_then(|v| v.as_str())?.to_string();
+            // `requirement` is the modern spelling; `version_requirements` is
+            // what gems packed before RubyGems 1.4 carry, and old gems stay
+            // installable forever.
+            let requirements = dep
+                .get("requirement")
+                .or_else(|| dep.get("version_requirements"))
+                .map(gem_requirement_string)
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| ">= 0".to_string());
+            Some((name, requirements))
+        })
+        .collect()
+}
+
+/// Whether a `Gem::Dependency` is a runtime one. A gemspec spells the kind as a
+/// Ruby symbol (`:runtime` / `:development`), and an absent `type` predates the
+/// distinction — those are runtime.
+fn is_runtime_dependency(dep: &serde_yaml::Value) -> bool {
+    match dep.get("type").and_then(|v| v.as_str()) {
+        Some(kind) => kind.trim_start_matches(':') == "runtime",
+        None => true,
+    }
+}
+
+/// Flatten a `Gem::Requirement` into the comma-separated string a gemspec would
+/// have been written with (`">= 2.0, < 4.0"`).
+fn gem_requirement_string(requirement: &serde_yaml::Value) -> String {
+    let Some(constraints) = requirement
+        .get("requirements")
+        .and_then(|v| v.as_sequence())
+    else {
+        // Some tooling writes the requirement as a bare string.
+        return requirement.as_str().unwrap_or_default().to_string();
+    };
+
+    constraints
+        .iter()
+        .filter_map(|constraint| {
+            let pair = constraint.as_sequence()?;
+            let operator = pair.first().and_then(|v| v.as_str())?;
+            let version = gem_version_string(pair.get(1)?)?;
+            Some(format!("{operator} {version}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A `Gem::Version` is a tagged object wrapping a `version` scalar, but a plain
+/// string turns up in hand-written and older metadata.
+fn gem_version_string(value: &serde_yaml::Value) -> Option<String> {
+    if let Some(version) = value.as_str() {
+        return Some(version.to_string());
+    }
+    let inner = value.get("version")?;
+    inner
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| inner.as_f64().map(|n| n.to_string()))
 }
 
 // ── RubyGems API helpers ──────────────────────────────────
@@ -574,6 +704,122 @@ description: ""
         let meta = adapter.extract_metadata("mygem-0.1.0.gem", &data).unwrap();
         // Empty description should fall back to summary
         assert_eq!(meta.description.unwrap(), "Short summary");
+    }
+
+    /// The gemspec a real `gem build` produces: every dependency is a tagged
+    /// `Gem::Dependency`, its constraints are `[operator, Gem::Version]` pairs,
+    /// and runtime and development ones sit in the same list.
+    #[test]
+    fn gemspec_metadata_carries_runtime_dependencies_only() {
+        let yaml = r#"--- !ruby/object:Gem::Specification
+name: matrix-deps-gem
+version: !ruby/object:Gem::Version
+  version: '1.0.0'
+summary: Depends on things
+description: The long form of the summary
+homepage: https://example.com/matrix-deps-gem
+licenses:
+- MIT
+- Apache-2.0
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: rack
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: '2.0'
+    - - "<"
+      - !ruby/object:Gem::Version
+        version: '4.0'
+  type: :runtime
+- !ruby/object:Gem::Dependency
+  name: rake
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: '0'
+  type: :runtime
+- !ruby/object:Gem::Dependency
+  name: rspec
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: '3.0'
+  type: :development
+"#;
+
+        let data = make_gem(yaml);
+        let meta = RubyGemsAdapter
+            .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+            .unwrap();
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap();
+
+        assert_eq!(stored["summary"], "Depends on things");
+        assert_eq!(stored["description"], "The long form of the summary");
+        assert_eq!(stored["homepage"], "https://example.com/matrix-deps-gem");
+        assert_eq!(stored["licenses"], serde_json::json!(["MIT", "Apache-2.0"]));
+
+        // Two constraints on one gem stay comma-separated here; the compact
+        // index is where they become `&`-joined.
+        assert_eq!(
+            stored["dependencies"],
+            serde_json::json!([
+                { "name": "rack", "requirements": ">= 2.0, < 4.0" },
+                { "name": "rake", "requirements": ">= 0" },
+            ]),
+            "development dependency leaked into the index, or a constraint was lost"
+        );
+    }
+
+    /// A gem with no dependencies still records the empty list: the endpoints
+    /// cannot tell "resolved to nothing" from "never written" otherwise.
+    #[test]
+    fn gemspec_metadata_records_an_empty_dependency_list() {
+        let data = make_gem("name: matrix-bare\nversion: '1.0.0'\n");
+        let meta = RubyGemsAdapter
+            .extract_metadata("matrix-bare-1.0.0.gem", &data)
+            .unwrap();
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap();
+        assert_eq!(stored["dependencies"], serde_json::json!([]));
+        assert!(stored.get("licenses").is_none());
+    }
+
+    /// Gems packed before RubyGems 1.4 spell the requirement
+    /// `version_requirements`, and they stay installable forever.
+    #[test]
+    fn gemspec_metadata_reads_the_legacy_requirement_key() {
+        let yaml = r#"--- !ruby/object:Gem::Specification
+name: matrix-legacy
+version: '1.0.0'
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: rack
+  version_requirements: !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: '1.0'
+"#;
+
+        let data = make_gem(yaml);
+        let meta = RubyGemsAdapter
+            .extract_metadata("matrix-legacy-1.0.0.gem", &data)
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.unwrap()).unwrap();
+
+        assert_eq!(
+            stored["dependencies"],
+            serde_json::json!([{ "name": "rack", "requirements": ">= 1.0" }]),
+            "a dependency with no `type` is a runtime one"
+        );
     }
 
     #[test]

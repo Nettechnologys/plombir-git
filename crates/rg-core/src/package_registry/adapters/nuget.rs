@@ -194,6 +194,17 @@ fn extract_from_nuspec(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
 
     let keywords = xml_tag_value(xml, "tags");
 
+    // The registration index reads these back out of the stored metadata rather
+    // than off the package row, because they describe one *version* — a later
+    // release may drop a tag or change its licence, and the row only ever holds
+    // whatever the first publish said.
+    let protocol_metadata = nuspec_protocol_metadata(
+        description.as_deref(),
+        homepage.as_deref(),
+        license.as_deref(),
+        keywords.as_deref(),
+    );
+
     Ok(ExtractedMetadata {
         name: id,
         version: version.clone(),
@@ -203,7 +214,34 @@ fn extract_from_nuspec(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         keywords,
         license,
         semver: Some(version),
+        protocol_metadata,
     })
+}
+
+/// The per-version nuspec fields, keyed the way `parse_nuget_metadata`
+/// (rg-http) reads them. `None` when the nuspec carried none of them, so an
+/// empty object is never stored in place of a real absence.
+fn nuspec_protocol_metadata(
+    description: Option<&str>,
+    project_url: Option<&str>,
+    license: Option<&str>,
+    tags: Option<&str>,
+) -> Option<String> {
+    let fields = [
+        ("description", description),
+        ("projectUrl", project_url),
+        ("license", license),
+        ("tags", tags),
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (key, value) in fields {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            out.insert(key.into(), value.into());
+        }
+    }
+
+    (!out.is_empty()).then(|| serde_json::Value::Object(out).to_string())
 }
 
 /// Try to extract repository URL from <repository type="git" url="..." /> element.
@@ -440,6 +478,46 @@ mod tests {
         assert_eq!(meta.description.unwrap(), "A test library for unit testing");
         assert_eq!(meta.homepage.unwrap(), "https://github.com/user/mylib");
         assert_eq!(meta.keywords.unwrap(), "testing utility");
+    }
+
+    /// The registration index builds its `catalogEntry` from the stored version
+    /// metadata, so anything the nuspec says about *this* version has to be
+    /// carried across the publish.
+    #[test]
+    fn nuspec_metadata_carries_the_registration_fields() {
+        let nuspec = r#"<?xml version="1.0" encoding="utf-8"?>
+<package>
+  <metadata>
+    <id>MyLib</id>
+    <version>1.2.3</version>
+    <description>A test library</description>
+    <projectUrl>https://github.com/user/mylib</projectUrl>
+    <license type="expression">MIT</license>
+    <tags>testing utility</tags>
+  </metadata>
+</package>"#;
+
+        let meta = NuGetAdapter
+            .extract_metadata("MyLib.1.2.3.nupkg", &make_nupkg(nuspec))
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap();
+
+        assert_eq!(stored["description"], "A test library");
+        assert_eq!(stored["projectUrl"], "https://github.com/user/mylib");
+        assert_eq!(stored["license"], "MIT");
+        assert_eq!(stored["tags"], "testing utility");
+    }
+
+    #[test]
+    fn nuspec_metadata_is_absent_when_the_nuspec_declares_none_of_it() {
+        let nuspec = r#"<?xml version="1.0"?>
+<package><metadata><id>Bare</id><version>1.0.0</version></metadata></package>"#;
+
+        let meta = NuGetAdapter
+            .extract_metadata("Bare.1.0.0.nupkg", &make_nupkg(nuspec))
+            .unwrap();
+        assert!(meta.protocol_metadata.is_none());
     }
 
     #[test]

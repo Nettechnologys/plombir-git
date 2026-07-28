@@ -5280,6 +5280,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "serde_yaml",
  "sha2 0.10.9",
  "socket2 0.5.10",
  "tar",

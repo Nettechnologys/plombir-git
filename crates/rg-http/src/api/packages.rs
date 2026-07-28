@@ -121,48 +121,61 @@ fn auth(headers: &axum::http::HeaderMap, secret: &str) -> Result<i64, AppError> 
         .ok_or_else(|| AppError::unauthorized("authentication required"))
 }
 
+/// What a publish request resolved to, once the adapter's reading of the file
+/// and the caller's query params have been merged.
+struct ResolvedPublishInfo {
+    name: String,
+    version: String,
+    description: Option<String>,
+    homepage: Option<String>,
+    repository_url: Option<String>,
+    semver: Option<String>,
+    /// The protocol-specific JSON the adapter read out of the file — gemspec
+    /// dependencies, nuspec tags, a chart's `apiVersion`. It is stored on the
+    /// version row and parsed back by the endpoint that speaks that protocol;
+    /// there is no query param for it, because it is not something a caller
+    /// could restate by hand.
+    protocol_metadata: Option<String>,
+}
+
 /// Resolve publish metadata: adapter-extracted fields take precedence, then
 /// query-param overrides.
-type PublishPackageTuple = (
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
 fn resolve_publish_info(
     query: &PublishPackageQuery,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
-) -> Result<PublishPackageTuple, String> {
+) -> Result<ResolvedPublishInfo, String> {
     // If adapter extracted metadata, use it as base; query params override.
     if let Some(meta) = adapter_meta {
         let name = query.name.clone().unwrap_or(meta.name);
         let version = query.version.clone().unwrap_or(meta.version);
-        let description = query.description.clone().or(meta.description);
-        let homepage = query.homepage.clone().or(meta.homepage);
-        let repository_url = query.repository_url.clone().or(meta.repository_url);
-        let semver = query.semver.clone().or(meta.semver);
         if name.is_empty() || version.is_empty() {
             return Err(
                 "package name and version are required (could not be auto-extracted)".into(),
             );
         }
-        return Ok((name, version, description, homepage, repository_url, semver));
+        return Ok(ResolvedPublishInfo {
+            name,
+            version,
+            description: query.description.clone().or(meta.description),
+            homepage: query.homepage.clone().or(meta.homepage),
+            repository_url: query.repository_url.clone().or(meta.repository_url),
+            semver: query.semver.clone().or(meta.semver),
+            protocol_metadata: meta.protocol_metadata,
+        });
     }
 
     // No adapter extraction — must be in query params.
     let name = query.name.clone().ok_or("package name is required")?;
     let version = query.version.clone().ok_or("package version is required")?;
-    Ok((
+    Ok(ResolvedPublishInfo {
         name,
         version,
-        query.description.clone(),
-        query.homepage.clone(),
-        query.repository_url.clone(),
-        query.semver.clone(),
-    ))
+        description: query.description.clone(),
+        homepage: query.homepage.clone(),
+        repository_url: query.repository_url.clone(),
+        semver: query.semver.clone(),
+        protocol_metadata: None,
+    })
 }
 
 // ── Generic REST route handlers ──────────────────────────
@@ -228,11 +241,10 @@ pub async fn publish(
         None
     };
 
-    let (pkg_name, pkg_version, description, homepage, repository_url, semver) =
-        match resolve_publish_info(&query, adapter_meta) {
-            Ok(v) => v,
-            Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
-        };
+    let resolved = match resolve_publish_info(&query, adapter_meta) {
+        Ok(v) => v,
+        Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
+    };
 
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
@@ -241,13 +253,13 @@ pub async fn publish(
         owner,
         repo: name,
         package_type: pkg_type,
-        name: pkg_name,
-        version: pkg_version,
-        semver,
-        metadata: None,
-        description,
-        homepage,
-        repository_url,
+        name: resolved.name,
+        version: resolved.version,
+        semver: resolved.semver,
+        metadata: resolved.protocol_metadata,
+        description: resolved.description,
+        homepage: resolved.homepage,
+        repository_url: resolved.repository_url,
         author_id: user_id,
         files: vec![(filename, body.to_vec())],
     };
@@ -1717,18 +1729,17 @@ pub async fn helm_index(
             );
 
             // Parse Helm-specific metadata from version JSON
-            let (app_version, api_version, keywords_list) =
-                parse_helm_metadata(v.metadata.as_deref());
+            let chart = parse_helm_metadata(v.metadata.as_deref());
 
             entries.push(rg_core::package_registry::HelmIndexEntry {
                 name: pkg.name.clone(),
                 version: v.version.clone(),
-                app_version,
+                app_version: chart.app_version,
                 description: pkg.description.clone(),
-                api_version,
+                api_version: chart.api_version,
                 home: pkg.homepage.clone(),
-                sources: Vec::new(),
-                keywords: keywords_list,
+                sources: chart.sources,
+                keywords: chart.keywords,
                 created: v.created_at.clone(),
                 digest: v.sha256.clone(),
                 urls: vec![download_url],
@@ -1840,37 +1851,49 @@ pub async fn composer_packages_json(
         .into_response()
 }
 
+/// The Chart.yaml fields `index.yaml` republishes, read back out of the stored
+/// version metadata.
+#[derive(Default)]
+struct HelmChartMetadata {
+    app_version: Option<String>,
+    api_version: Option<String>,
+    keywords: Vec<String>,
+    sources: Vec<String>,
+}
+
 /// Parse Helm-specific metadata from version metadata JSON.
-/// Returns (app_version, api_version, keywords).
-fn parse_helm_metadata(
-    metadata_json: Option<&str>,
-) -> (Option<String>, Option<String>, Vec<String>) {
-    let md = match metadata_json {
-        Some(s) => s,
-        None => return (None, None, Vec::new()),
+fn parse_helm_metadata(metadata_json: Option<&str>) -> HelmChartMetadata {
+    let Some(md) = metadata_json else {
+        return HelmChartMetadata::default();
     };
     let doc: serde_json::Value = match serde_json::from_str(md) {
         Ok(v) => v,
-        Err(_) => return (None, None, Vec::new()),
+        Err(_) => return HelmChartMetadata::default(),
     };
-    let app_version = doc
-        .get("appVersion")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let api_version = doc
-        .get("apiVersion")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let keywords = doc
-        .get("keywords")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|k| k.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    (app_version, api_version, keywords)
+
+    let string_list = |key: &str| {
+        doc.get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    HelmChartMetadata {
+        app_version: doc
+            .get("appVersion")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        api_version: doc
+            .get("apiVersion")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        keywords: string_list("keywords"),
+        sources: string_list("sources"),
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────

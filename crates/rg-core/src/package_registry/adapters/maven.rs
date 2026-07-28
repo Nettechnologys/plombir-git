@@ -178,6 +178,7 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
         keywords: None,
         license: None,
         semver: Some(version),
+        protocol_metadata: None,
     })
 }
 
@@ -233,6 +234,7 @@ fn extract_from_filename(filename: &str) -> Result<ExtractedMetadata, anyhow::Er
         keywords: None,
         license: None,
         semver: Some(version),
+        protocol_metadata: None,
     })
 }
 

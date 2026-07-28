@@ -31,6 +31,7 @@ impl PackageAdapter for GenericAdapter {
             keywords: None,
             license: None,
             semver: None,
+            protocol_metadata: None,
         })
     }
 

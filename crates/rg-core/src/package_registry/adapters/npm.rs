@@ -135,6 +135,7 @@ impl PackageAdapter for NpmAdapter {
             keywords,
             license,
             semver: Some(version),
+            protocol_metadata: None,
         })
     }
 

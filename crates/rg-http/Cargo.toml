@@ -53,6 +53,9 @@ tokio-tungstenite = "0.29"
 # Checks that the RubyGems `versions` index publishes the MD5 of the very
 # `info` body the server answers with — the pair is what a client caches on.
 md-5 = { workspace = true }
+# Helm's `index.yaml` is asserted on as a parsed document, not as text: a
+# `contains` check passes on a key that landed under the wrong chart.
+serde_yaml = { workspace = true }
 
 [lints]
 workspace = true

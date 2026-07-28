@@ -102,6 +102,7 @@ impl PackageAdapter for ComposerAdapter {
             keywords,
             license,
             semver: None,
+            protocol_metadata: None,
         })
     }
 

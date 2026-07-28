@@ -109,6 +109,7 @@ impl PackageAdapter for CargoAdapter {
             keywords,
             license,
             semver: Some(version),
+            protocol_metadata: None,
         })
     }
 

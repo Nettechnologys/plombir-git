@@ -169,7 +169,49 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         keywords,
         license: None, // Helm Chart.yaml doesn't standardize license
         semver: Some(version),
+        protocol_metadata: chart_protocol_metadata(&doc),
     })
+}
+
+/// The Chart.yaml fields `index.yaml` republishes but no package column holds,
+/// keyed the way `parse_helm_metadata` (rg-http) reads them back.
+///
+/// `apiVersion` is the load-bearing one: Helm decides how to read a chart from
+/// it, so an index entry missing it describes a chart the client cannot place.
+/// `None` when the chart declared none of these.
+fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Option<String> {
+    let mut out = serde_json::Map::new();
+
+    for key in ["appVersion", "apiVersion"] {
+        // `appVersion: 1.19` is a number to YAML and a string to Helm.
+        let value = doc.get(key).and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_f64().map(|n| n.to_string()))
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        });
+        if let Some(value) = value.filter(|s| !s.is_empty()) {
+            out.insert(key.into(), value.into());
+        }
+    }
+
+    for key in ["keywords", "sources"] {
+        let values: Vec<serde_json::Value> = doc
+            .get(key)
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(Into::into)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !values.is_empty() {
+            out.insert(key.into(), values.into());
+        }
+    }
+
+    (!out.is_empty()).then(|| serde_json::Value::Object(out).to_string())
 }
 
 // ── Helm repository index helpers ─────────────────────────
@@ -310,6 +352,49 @@ sources:
         );
         assert_eq!(meta.keywords.unwrap(), "nginx, ingress, web");
         assert!(meta.repository_url.is_some());
+    }
+
+    /// `index.yaml` republishes `apiVersion` / `appVersion` / `keywords` /
+    /// `sources`, and none of them has a package column — they only survive the
+    /// publish if the adapter carries them across.
+    #[test]
+    fn chart_metadata_carries_the_index_only_fields() {
+        let yaml = r#"apiVersion: v2
+name: nginx
+version: 1.2.3
+appVersion: 1.19
+keywords:
+  - web
+  - proxy
+sources:
+  - https://github.com/kubernetes/ingress-nginx
+"#;
+
+        let meta = HelmAdapter
+            .extract_metadata("nginx-1.2.3.tgz", &make_chart(yaml))
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap();
+
+        assert_eq!(stored["apiVersion"], "v2");
+        // `appVersion: 1.19` is a number to YAML and a string to Helm.
+        assert_eq!(stored["appVersion"], "1.19");
+        assert_eq!(stored["keywords"], serde_json::json!(["web", "proxy"]));
+        assert_eq!(
+            stored["sources"],
+            serde_json::json!(["https://github.com/kubernetes/ingress-nginx"])
+        );
+    }
+
+    #[test]
+    fn chart_metadata_is_absent_when_the_chart_declares_none_of_it() {
+        let meta = HelmAdapter
+            .extract_metadata(
+                "bare-1.0.0.tgz",
+                &make_chart("name: bare\nversion: 1.0.0\n"),
+            )
+            .unwrap();
+        assert!(meta.protocol_metadata.is_none());
     }
 
     #[test]
