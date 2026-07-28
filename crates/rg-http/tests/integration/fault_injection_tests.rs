@@ -435,3 +435,152 @@ async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
         "the repository must still work for its owner after the failed transfer"
     );
 }
+
+// ── LFS object upload ────────────────────────────────────────
+
+/// `PUT` an LFS object the way `git lfs push` does, returning `(status, oid)`.
+async fn upload_lfs_object(
+    base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    payload: &[u8],
+) -> (u16, String) {
+    let oid = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload));
+    let status = reqwest::Client::new()
+        .put(format!("{base}/api/v1/repos/{owner}/{repo}/lfs/objects/{oid}"))
+        .bearer_auth(token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    (status, oid)
+}
+
+/// Everything the upload staged in the repository's LFS root, sorted.
+///
+/// The staging files carry a UUID in their name, so the assertion cannot name
+/// them — it can only insist the directory is empty. That is the right shape
+/// anyway: a leak the test does not know how to name is still a leak.
+fn lfs_staging_leftovers(repo_root: &std::path::Path, owner: &str, repo: &str) -> Vec<String> {
+    let root = repo_root.join(format!("{owner}.lfs")).join(repo);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Where the compressed object lands once the blob store accepts it.
+fn lfs_blob_path(
+    repo_root: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    oid: &str,
+) -> std::path::PathBuf {
+    repo_root
+        .join("lfs")
+        .join(owner)
+        .join(repo)
+        .join(&oid[..2])
+        .join(format!("{oid}.zst"))
+}
+
+/// An upload that failed before storing anything must not keep the body.
+///
+/// The handler streams the request body to `.tmp_<oid>` — the full size of the
+/// object — before the service ever looks at the database. Every exit between
+/// that write and the blob store used to keep it: no row points at the file, so
+/// retention never comes back for it and the LFS root grows by one full upload
+/// per failed push, with nothing in the log tying the two together.
+#[tokio::test]
+async fn an_lfs_upload_whose_row_was_never_written_leaves_no_staging_file() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let (token, _user_id) = register_full(&app.base, "lfs_row", "lfs_row@example.com").await;
+    create_repo(&app.base, &token, "lost-lfs-row").await;
+
+    let fault = fail_db_writes(&app.db, "lfs_objects", DbWrite::Insert).await;
+    let (status, _oid) =
+        upload_lfs_object(&app.base, &token, "lfs_row", "lost-lfs-row", b"forgekeep-lfs-payload")
+            .await;
+    assert_eq!(
+        status, 500,
+        "a lost LFS row must fail the upload, not answer 200"
+    );
+    fault.clear().await;
+
+    assert_eq!(
+        lfs_staging_leftovers(&app.repo_root, "lfs_row", "lost-lfs-row"),
+        Vec::<String>::new(),
+        "the failed upload kept its staging files"
+    );
+}
+
+/// A blob store that refused the object must not keep either staging file.
+#[tokio::test]
+async fn an_lfs_object_the_blob_store_refused_leaves_no_staging_file() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let (token, _user_id) = register_full(&app.base, "lfs_put", "lfs_put@example.com").await;
+    create_repo(&app.base, &token, "refused-lfs").await;
+
+    app.blob_faults.fail_put_file();
+    let (status, _oid) =
+        upload_lfs_object(&app.base, &token, "lfs_put", "refused-lfs", b"forgekeep-lfs-refused")
+            .await;
+    assert_eq!(
+        status, 500,
+        "a blob store that refused the object is the server's failure"
+    );
+    app.blob_faults.heal();
+
+    assert_eq!(
+        lfs_staging_leftovers(&app.repo_root, "lfs_put", "refused-lfs"),
+        Vec::<String>::new(),
+        "the refused upload kept its staging files"
+    );
+}
+
+/// An object whose row was never marked uploaded must not keep the blob.
+///
+/// The bytes reach the blob store one step before the row that claims them. Left
+/// behind, they are invisible to retention (which walks rows) and useless to
+/// downloads (which refuse a row reading `uploaded = false`) — storage that
+/// nothing will ever free and nothing will ever serve.
+#[tokio::test]
+async fn an_lfs_object_that_was_never_marked_uploaded_leaves_no_blob() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let (token, _user_id) = register_full(&app.base, "lfs_mark", "lfs_mark@example.com").await;
+    create_repo(&app.base, &token, "unmarked-lfs").await;
+
+    let fault = fail_db_writes(&app.db, "lfs_objects", DbWrite::Update).await;
+    let (status, oid) = upload_lfs_object(
+        &app.base,
+        &token,
+        "lfs_mark",
+        "unmarked-lfs",
+        b"forgekeep-lfs-unmarked",
+    )
+    .await;
+    assert_eq!(
+        status, 500,
+        "an object that was never marked uploaded must fail the upload"
+    );
+    fault.clear().await;
+
+    let blob = lfs_blob_path(&app.repo_root, "lfs_mark", "unmarked-lfs", &oid);
+    assert!(
+        !blob.exists(),
+        "the stored blob outlived the row that would have claimed it: {}",
+        blob.display()
+    );
+    assert_eq!(
+        lfs_staging_leftovers(&app.repo_root, "lfs_mark", "unmarked-lfs"),
+        Vec::<String>::new(),
+        "the failed upload kept its staging files"
+    );
+}

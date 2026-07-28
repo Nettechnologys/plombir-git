@@ -485,36 +485,71 @@ pub async fn store_object(
         "LFS object compressed and stored"
     );
 
-    // Update DB with compression info and mark as uploaded
-    let obj = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("LFS object {} not found after create", oid))?;
+    mark_uploaded(db, storage, repo_id, oid, &key, compressed_size).await
+}
+
+/// Mark a stored LFS object uploaded, taking the blob with every failure.
+///
+/// Between the `put` and this update the blob is in storage while its row still
+/// reads `uploaded = false`: downloads refuse it and retention — which walks
+/// rows — never comes back for it. The row going missing orphans the blob just
+/// as thoroughly as the update failing, so the compensation belongs to *every*
+/// exit here, not only to the last one.
+async fn mark_uploaded(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    repo_id: i64,
+    oid: &str,
+    key: &BlobKey,
+    compressed_size: i64,
+) -> Result<()> {
+    let obj = match lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await {
+        Ok(Some(obj)) => obj,
+        Ok(None) => {
+            discard_stored_blob(storage, key, repo_id, oid).await;
+            anyhow::bail!("LFS object {} not found after create", oid);
+        }
+        Err(error) => {
+            discard_stored_blob(storage, key, repo_id, oid).await;
+            return Err(error).context("db: reload LFS object after store");
+        }
+    };
 
     let mut model: lfs_object::ActiveModel = obj.into();
     model.uploaded = sea_orm::Set(true);
     model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
     model.compressed_size = sea_orm::Set(Some(compressed_size));
     if let Err(error) = model.update(db).await {
-        // Compensation on the error path: the caller must still see the DB
-        // failure, so a failed rollback can only be reported, never returned.
-        if let Err(cleanup_error) = storage.delete(&key).await {
-            tracing::warn!(
-                oid = %oid,
-                repo_id,
-                blob_key = %key,
-                error = %cleanup_error,
-                "orphaned LFS blob: marking the object uploaded failed and the rollback delete failed too — the blob stays in storage while its row still reads uploaded=false"
-            );
-        }
+        discard_stored_blob(storage, key, repo_id, oid).await;
         return Err(error).context("db: update LFS object after store");
     }
 
     Ok(())
 }
 
+/// Roll back a blob whose row will never claim it as uploaded.
+///
+/// The caller must still report the failure that got us here, so a failed
+/// rollback can only be logged, never returned: if the delete does not land,
+/// the bytes stay in storage with nothing pointing at them.
+async fn discard_stored_blob(storage: &dyn BlobStorage, key: &BlobKey, repo_id: i64, oid: &str) {
+    if let Err(cleanup_error) = storage.delete(key).await {
+        tracing::warn!(
+            oid = %oid,
+            repo_id,
+            blob_key = %key,
+            error = %cleanup_error,
+            "orphaned LFS blob: marking the object uploaded failed and the rollback delete failed too — the blob stays in storage while its row still reads uploaded=false"
+        );
+    }
+}
+
 /// Store an LFS object from an uncompressed file on disk.
 /// Streams the file through zstd compression—never loads the entire
 /// object into memory.
+///
+/// Ownership of `uncompressed_path` transfers here: the caller stages the
+/// upload and this function retires it, whichever way it ends.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_object_from_file(
     db: &DatabaseConnection,
@@ -524,6 +559,42 @@ pub async fn store_object_from_file(
     repo: &str,
     oid: &str,
     uncompressed_path: &std::path::Path,
+    original_size: i64,
+) -> Result<()> {
+    // Two files are staged in the repository's LFS root for the duration of
+    // this call — the upload itself (full object size) and the compressed copy
+    // — and no DB row points at either, so nothing ever comes back for them.
+    // Hence one cleanup tail over the whole body instead of a discard on the
+    // one failure that happened to be noticed: a compression error in the
+    // middle used to leave both files behind for good.
+    let compressed_path = uncompressed_path.with_extension(format!("{}.zst", uuid::Uuid::new_v4()));
+    let stored = stream_compress_and_store(
+        db,
+        repo_id,
+        storage,
+        owner,
+        repo,
+        oid,
+        uncompressed_path,
+        &compressed_path,
+        original_size,
+    )
+    .await;
+    discard_file("uncompressed LFS upload", uncompressed_path);
+    discard_file("compressed LFS object", &compressed_path);
+    stored
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_compress_and_store(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    storage: &dyn BlobStorage,
+    owner: &str,
+    repo: &str,
+    oid: &str,
+    uncompressed_path: &std::path::Path,
+    compressed_path: &std::path::Path,
     original_size: i64,
 ) -> Result<()> {
     // Find or create the DB record first
@@ -546,10 +617,9 @@ pub async fn store_object_from_file(
     };
 
     // Stream-compress from file (uses chunked I/O, not full file read)
-    let compressed_path = uncompressed_path.with_extension(format!("{}.zst", uuid::Uuid::new_v4()));
     let src_file = std::fs::File::open(uncompressed_path)
         .with_context(|| format!("open uncompressed file {:?}", uncompressed_path))?;
-    let dst_file = std::fs::File::create(&compressed_path)
+    let dst_file = std::fs::File::create(compressed_path)
         .with_context(|| format!("create compressed file {:?}", compressed_path))?;
 
     let mut encoder = zstd::stream::Encoder::new(dst_file, ZSTD_LEVEL)
@@ -563,15 +633,7 @@ pub async fn store_object_from_file(
     let compressed_size = finished.metadata().map(|m| m.len() as i64).unwrap_or(0);
 
     let key = lfs_object_key(owner, repo, oid, true)?;
-    if let Err(error) = storage.put_file(&key, &compressed_path).await {
-        discard_file("compressed LFS object", &compressed_path);
-        discard_file("uncompressed LFS upload", uncompressed_path);
-        return Err(error.into());
-    }
-
-    // Both staging files have been superseded by the stored blob.
-    discard_file("uncompressed LFS upload", uncompressed_path);
-    discard_file("compressed LFS object", &compressed_path);
+    storage.put_file(&key, compressed_path).await?;
 
     tracing::info!(
         oid = %oid,
@@ -581,31 +643,7 @@ pub async fn store_object_from_file(
         "LFS object stream-compressed and stored"
     );
 
-    // Update DB with compression info and mark as uploaded
-    let obj = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("LFS object {} not found after create", oid))?;
-
-    let mut model: lfs_object::ActiveModel = obj.into();
-    model.uploaded = sea_orm::Set(true);
-    model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
-    model.compressed_size = sea_orm::Set(Some(compressed_size));
-    if let Err(error) = model.update(db).await {
-        // Compensation on the error path: the caller must still see the DB
-        // failure, so a failed rollback can only be reported, never returned.
-        if let Err(cleanup_error) = storage.delete(&key).await {
-            tracing::warn!(
-                oid = %oid,
-                repo_id,
-                blob_key = %key,
-                error = %cleanup_error,
-                "orphaned LFS blob: marking the object uploaded failed and the rollback delete failed too — the blob stays in storage while its row still reads uploaded=false"
-            );
-        }
-        return Err(error).context("db: update LFS object after store");
-    }
-
-    Ok(())
+    mark_uploaded(db, storage, repo_id, oid, &key, compressed_size).await
 }
 
 /// Read an LFS object from disk.

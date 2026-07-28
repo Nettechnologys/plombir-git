@@ -17,7 +17,7 @@ use crate::AppState;
 /// Where LFS objects live and what has to be true about that directory. Shared
 /// with the background compressor in `rg_core::lfs::service`, so a handler
 /// failure and a maintenance-pass failure name the same directory the same way.
-use rg_core::platform::fs::LFS_STORAGE_HINT;
+use rg_core::platform::fs::{discard_file_async, LFS_STORAGE_HINT};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct LfsActionQuery {
@@ -247,7 +247,14 @@ pub async fn upload_object(
                 Err(e) => AppError::from(e).into_response(),
             }
         }
-        Err(e) => AppError::from(e).into_response(),
+        // A body that stopped mid-stream leaves a partial `.tmp_<oid>` sized by
+        // however much arrived. `store_object_from_file` takes ownership of the
+        // staging file, but it never ran, so this is the only place left that
+        // can retire it — and nothing else ever will: no DB row points at it.
+        Err(e) => {
+            discard_file_async("LFS staging file", &temp_path).await;
+            AppError::from(e).into_response()
+        }
     }
 }
 
