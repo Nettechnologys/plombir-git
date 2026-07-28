@@ -96,6 +96,10 @@ sha2 = "0.10"
 # cache key of an `info` file, and a client compares it against its own
 # `Digest::MD5` of the cached copy. Any other digest would simply never match.
 md-5 = "0.10"
+# Same reason: `dist.shasum` is SHA-1 by definition in both the npm and the
+# Composer protocol, and a client hashes the file it downloaded with SHA-1 to
+# compare. Publishing a stronger digest under that name only fails the check.
+sha1 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 aes-gcm = "0.10"

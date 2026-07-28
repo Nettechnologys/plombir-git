@@ -98,6 +98,14 @@ pub struct FileDetail {
     pub filename: String,
     pub size: i64,
     pub sha256: Option<String>,
+    /// SHA-1 of the file, for the protocols whose checksum field is defined as
+    /// SHA-1 (`dist.shasum` in npm and Composer). `None` for files published
+    /// before the registry recorded it, and the field is then left out of the
+    /// metadata rather than filled with a different algorithm's digest.
+    pub sha1: Option<String>,
+    /// SHA-512 of the file, published as npm's `dist.integrity`. `None` for
+    /// files published before the registry recorded it.
+    pub sha512: Option<String>,
 }
 
 /// Publish a package version to the registry.
@@ -173,7 +181,7 @@ pub async fn publish(
 
         // Use first file's sha256 or combine
         if let Some(sf) = stored_files.first() {
-            combined_sha256 = Some(sf.sha256.clone());
+            combined_sha256 = Some(sf.digests.sha256.clone());
         }
 
         // 5. Create version record
@@ -223,7 +231,7 @@ pub async fn publish(
                 v.id,
                 &sf.filename,
                 sf.size,
-                Some(&sf.sha256),
+                file_digests(sf),
                 &sf.storage_path,
             )
             .await
@@ -287,6 +295,19 @@ pub async fn publish(
     })
 }
 
+/// The digests of a freshly stored file, in the shape the DB layer records.
+///
+/// Every one of them is written at publish: a metadata route can then answer
+/// with the digest its protocol names instead of passing off the one column
+/// that happened to exist.
+fn file_digests(stored: &StoredFile) -> rg_db::ops::package_file_ops::FileDigests<'_> {
+    rg_db::ops::package_file_ops::FileDigests {
+        sha256: Some(&stored.digests.sha256),
+        sha1: Some(&stored.digests.sha1),
+        sha512: Some(&stored.digests.sha512),
+    }
+}
+
 /// Add the files of a publish request to a version that already exists.
 ///
 /// A filename the version already holds is refused with a [`conflict`] rather
@@ -346,7 +367,7 @@ async fn add_files_to_version(
             version.id,
             &stored.filename,
             stored.size,
-            Some(&stored.sha256),
+            file_digests(&stored),
             &stored.storage_path,
         )
         .await
@@ -555,6 +576,8 @@ pub async fn get_version(
             filename: f.filename,
             size: f.size,
             sha256: f.sha256,
+            sha1: f.sha1,
+            sha512: f.sha512,
         })
         .collect();
 
@@ -703,6 +726,8 @@ async fn futures_for_versions(
                 filename: f.filename,
                 size: f.size,
                 sha256: f.sha256,
+                sha1: f.sha1,
+                sha512: f.sha512,
             })
             .collect();
 

@@ -4,7 +4,8 @@
 //! Directory layout: `{root}/{owner}/{repo}/packages/{type}/{name}/{version}/{filename}`
 
 use crate::blob_storage::{BlobKey, BlobStorage, LocalBlobStorage};
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -73,7 +74,14 @@ impl PackageStorage {
         .map_err(Into::into)
     }
 
-    /// Store a file returning its storage path and sha256.
+    /// Store a file returning its storage path and digests.
+    ///
+    /// Three digests, because three is what the protocols ask for and a
+    /// registry that keeps only one ends up publishing it under whatever name
+    /// each protocol happens to use: npm and Composer both spell `dist.shasum`,
+    /// and both define it as SHA-1, so a SHA-256 in that field is not a
+    /// stronger answer but a wrong one — the client hashes the file it just
+    /// downloaded with SHA-1 and refuses it. See [`FileDigests`].
     #[allow(clippy::too_many_arguments)]
     pub async fn store_file(
         &self,
@@ -88,12 +96,10 @@ impl PackageStorage {
         let key = self.file_key(owner, repo, package_type, name, version, filename)?;
         let metadata = self.backend.put(&key, data).await?;
 
-        let sha256 = hex::encode(Sha256::digest(data));
-
         Ok(StoredFile {
             filename: filename.to_string(),
             size: metadata.size as i64,
-            sha256,
+            digests: FileDigests::of(data),
             storage_path: key.to_string(),
         })
     }
@@ -186,8 +192,39 @@ impl std::fmt::Debug for PackageStorage {
 pub struct StoredFile {
     pub filename: String,
     pub size: i64,
-    pub sha256: String,
+    pub digests: FileDigests,
     pub storage_path: String,
+}
+
+/// Every digest of a stored file a package protocol may ask us to publish.
+///
+/// The algorithm is not ours to choose: `dist.shasum` is SHA-1 in npm and in
+/// Composer, npm's `dist.integrity` is conventionally SHA-512, and cargo's
+/// `cksum`, RubyGems' compact-index checksum, PyPI's `#sha256=` fragment and
+/// Helm's `digest` are SHA-256. All three are computed once, at publish, over
+/// the same bytes that were stored — recomputing one later means reading the
+/// blob back on a metadata request, which is the one thing these routes must
+/// not do.
+#[derive(Debug, Clone)]
+pub struct FileDigests {
+    /// Lowercase hex, 40 chars. Only ever published where the protocol spells
+    /// SHA-1 — never as a general-purpose identity.
+    pub sha1: String,
+    /// Lowercase hex, 64 chars.
+    pub sha256: String,
+    /// Lowercase hex, 128 chars.
+    pub sha512: String,
+}
+
+impl FileDigests {
+    /// Hash a blob with every algorithm the registries publish.
+    pub fn of(data: &[u8]) -> Self {
+        Self {
+            sha1: hex::encode(Sha1::digest(data)),
+            sha256: hex::encode(Sha256::digest(data)),
+            sha512: hex::encode(Sha512::digest(data)),
+        }
+    }
 }
 
 /// Error type for storage operations.

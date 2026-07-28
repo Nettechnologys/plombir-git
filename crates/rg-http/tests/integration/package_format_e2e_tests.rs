@@ -918,6 +918,126 @@ async fn npm_metadata_carries_the_manifest_dependencies() {
     );
 }
 
+/// The `dist` block is a promise about bytes, and both of its checksum fields
+/// name the algorithm they are in: `shasum` is SHA-1 (pacote feeds it to ssri
+/// as `sha1-<base64>`, Composer runs `hash_file('sha1')` on the archive) and
+/// `integrity` is an SRI string over the raw digest bytes. A SHA-256 published
+/// under either name is not a stronger answer but a failing one — `npm install`
+/// aborts with `EINTEGRITY` after resolving the whole tree, and `composer
+/// install` throws "The checksum verification of the file failed".
+///
+/// So the assertion is not "some digest is present" but "every digest the
+/// metadata publishes is that algorithm, over exactly the bytes the download
+/// route serves".
+#[tokio::test]
+async fn npm_and_composer_publish_each_checksum_under_its_own_algorithm() {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    // ── npm ────────────────────────────────────────────────────────────────
+    let tarball = tar_gz(&[(
+        "package/package.json",
+        br#"{ "name": "matrix-integrity-npm", "version": "1.0.0" }"#.as_slice(),
+    )]);
+    let published = client
+        .post(package_url(&base, &["npm", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-integrity-npm-1.0.0.tgz\"",
+        )
+        .body(tarball.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let document = client
+        .get(package_url(&base, &["npm", "matrix-integrity-npm"]))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let dist = &document["versions"]["1.0.0"]["dist"];
+
+    // The bytes the client actually gets, followed from the published URL.
+    let tarball_url = dist["tarball"].as_str().expect("no tarball url");
+    let downloaded = client.get(tarball_url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    let downloaded = downloaded.bytes().await.unwrap().to_vec();
+    assert_eq!(
+        downloaded, tarball,
+        "the tarball served is the one published"
+    );
+
+    assert_eq!(
+        dist["shasum"].as_str(),
+        Some(hex::encode(sha1::Sha1::digest(&downloaded)).as_str()),
+        "dist.shasum must be the SHA-1 of the tarball: {dist}"
+    );
+    assert_eq!(
+        dist["integrity"].as_str(),
+        Some(
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&downloaded))
+            )
+            .as_str()
+        ),
+        "dist.integrity must be an SRI SHA-512 of the tarball: {dist}"
+    );
+
+    // ── Composer ───────────────────────────────────────────────────────────
+    let archive = zip_archive(&[(
+        "composer.json",
+        br#"{ "name": "vendor/matrix-integrity", "version": "1.0.0" }"#.as_slice(),
+    )]);
+    let published = client
+        .post(package_url(&base, &["composer", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-integrity-1.0.0.zip\"",
+        )
+        .body(archive.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let packages = client
+        .get(package_url(&base, &["composer", "packages.json"]))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let dist = &packages["packages"]["vendor/matrix-integrity"]["1.0.0"]["dist"];
+
+    let archive_url = dist["url"].as_str().expect("no dist url");
+    let downloaded = client.get(archive_url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    let downloaded = downloaded.bytes().await.unwrap().to_vec();
+    assert_eq!(
+        downloaded, archive,
+        "the archive served is the one published"
+    );
+
+    assert_eq!(
+        dist["shasum"].as_str(),
+        Some(hex::encode(sha1::Sha1::digest(&downloaded)).as_str()),
+        "dist.shasum must be the SHA-1 of the zip Composer downloads: {dist}"
+    );
+}
+
 /// RubyGems resolves through the compact index: `versions` first — its presence
 /// is what keeps the client off the legacy Marshal index we do not serve — then
 /// `info/<gem>`, then a `.gem` at a path the client builds itself by appending

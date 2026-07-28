@@ -12,6 +12,12 @@ pub struct Model {
     pub filename: String,
     pub size: i64,
     pub sha256: Option<String>,
+    /// SHA-1 of the stored bytes — the digest npm and Composer both call
+    /// `dist.shasum`. `None` for files published before the column existed.
+    pub sha1: Option<String>,
+    /// SHA-512 of the stored bytes, published as npm's `dist.integrity`.
+    /// `None` for files published before the column existed.
+    pub sha512: Option<String>,
     pub storage_path: String,
     pub created_at: DateTimeUtc,
 }

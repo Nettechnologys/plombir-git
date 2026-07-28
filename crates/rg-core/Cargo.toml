@@ -27,6 +27,7 @@ sea-orm = { workspace = true }
 reqwest = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
 lettre = { workspace = true }

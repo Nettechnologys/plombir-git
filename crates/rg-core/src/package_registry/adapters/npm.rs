@@ -15,6 +15,7 @@
 //!       "version": "1.0.0",
 //!       "dependencies": { "left-pad": "^1.3.0" },
 //!       "dist": {
+//!         "integrity": "sha512-...",
 //!         "shasum": "...",
 //!         "tarball": "https://..."
 //!       }
@@ -22,6 +23,20 @@
 //!   }
 //! }
 //! ```
+//!
+//! ## What `dist` promises about the tarball
+//!
+//! Both checksum fields are the client's integrity check, and both name their
+//! algorithm: `shasum` is the tarball's **SHA-1** in hex — pacote turns it into
+//! `sha1-<base64>` when there is nothing better — and `integrity` is a
+//! Subresource Integrity string, `<algorithm>-<base64 of the raw digest>`,
+//! conventionally SHA-512. Putting some other digest in either one does not
+//! make the answer stronger, it makes it false: pacote verifies what it
+//! downloaded, gets a different digest and aborts with `EINTEGRITY` — after the
+//! resolver already built the whole tree, so the install fails at the last
+//! step. A digest the registry does not have is therefore left out entirely
+//! (npm skips a check it was not given) rather than filled in from whatever is
+//! at hand.
 //!
 //! This document — the "abbreviated" one, `application/vnd.npm.install-v1+json`
 //! — is the only thing npm's dependency resolver reads. It never opens a
@@ -306,6 +321,26 @@ fn has_install_script(doc: &serde_json::Value) -> bool {
     })
 }
 
+/// A hex digest as a Subresource Integrity string, `<algorithm>-<base64>`.
+///
+/// npm compares the digest of what it downloaded against this string, so the
+/// base64 is of the raw digest bytes — not of its hex spelling, which is the
+/// mistake that produces an integrity string of the right shape and the wrong
+/// value. A digest that is missing or not valid hex yields `None`: the field is
+/// then left out, and npm skips a check rather than failing one.
+fn sri(algorithm: &str, hex_digest: Option<&str>) -> Option<String> {
+    use base64::Engine as _;
+
+    let raw = hex::decode(hex_digest?.trim()).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{algorithm}-{}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    ))
+}
+
 /// Build the npm registry "abbreviated" metadata JSON response.
 ///
 /// This is the format npm expects when querying a registry.
@@ -360,13 +395,23 @@ pub fn build_npm_metadata(
 
         // Last, and after the overlay: where the tarball is and what it hashes
         // to is the registry's own answer about its own storage.
-        ver_obj.insert(
-            "dist".into(),
-            serde_json::json!({
-                "shasum": vi.sha256.clone().unwrap_or_default(),
-                "tarball": tarball_url,
-            }),
-        );
+        let mut dist = serde_json::Map::new();
+        // Preferred by pacote over `shasum`, and the only field here that can
+        // carry a modern digest — SHA-512 when the file has one, SHA-256 for a
+        // version stored before the registry recorded it. Both are valid SRI.
+        if let Some(integrity) =
+            sri("sha512", vi.sha512.as_deref()).or_else(|| sri("sha256", vi.sha256.as_deref()))
+        {
+            dist.insert("integrity".into(), integrity.into());
+        }
+        // SHA-1 or nothing: see the module docs. A file published before the
+        // registry recorded a SHA-1 simply has no `shasum`, and npm falls back
+        // to `integrity` — which is the field it prefers anyway.
+        if let Some(sha1) = vi.sha1.as_deref().filter(|value| !value.is_empty()) {
+            dist.insert("shasum".into(), sha1.into());
+        }
+        dist.insert("tarball".into(), tarball_url.into());
+        ver_obj.insert("dist".into(), serde_json::Value::Object(dist));
 
         versions_map.insert(vi.version.clone(), serde_json::Value::Object(ver_obj));
     }
@@ -384,7 +429,17 @@ pub fn build_npm_metadata(
 pub struct NpmVersionInfo {
     pub version: String,
     pub description: Option<String>,
+    /// Hex SHA-256 of the tarball. Only ever published as an SRI `integrity`
+    /// fallback — never as `shasum`, which the protocol defines as SHA-1.
     pub sha256: Option<String>,
+    /// Hex SHA-1 of the tarball, published verbatim as `dist.shasum`. `None`
+    /// for a version stored before the registry recorded it, and the field is
+    /// then omitted.
+    pub sha1: Option<String>,
+    /// Hex SHA-512 of the tarball, published as `dist.integrity`. `None` for a
+    /// version stored before the registry recorded it, and `integrity` then
+    /// falls back to SHA-256.
+    pub sha512: Option<String>,
     pub filename: Option<String>,
     pub yanked: bool,
     /// The abbreviated-document fields the adapter stored at publish, as a JSON
@@ -399,6 +454,11 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use sha1::Digest as _;
+
+    /// Bytes standing in for a published tarball. What they are does not
+    /// matter — that every digest in `dist` is a digest of *these* bytes does.
+    const TARBALL: &[u8] = b"matrix-npm-1.0.0.tgz contents";
 
     /// An npm package is a gzipped tar carrying `package/package.json`.
     fn make_tgz(manifest: &str) -> Vec<u8> {
@@ -433,7 +493,9 @@ mod tests {
             &[NpmVersionInfo {
                 version: "1.0.0".into(),
                 description: Some("matrix package".into()),
-                sha256: Some("deadbeef".into()),
+                sha256: Some(hex::encode(sha2::Sha256::digest(TARBALL))),
+                sha1: Some(hex::encode(sha1::Sha1::digest(TARBALL))),
+                sha512: Some(hex::encode(sha2::Sha512::digest(TARBALL))),
                 filename: Some("matrix-npm-1.0.0.tgz".into()),
                 yanked: false,
                 metadata: Some(stored),
@@ -461,14 +523,119 @@ mod tests {
             serde_json::json!({ "left-pad": "^1.3.0", "lodash": "4.17.21" }),
             "version object: {version}"
         );
-        assert_eq!(version["devDependencies"], serde_json::json!({ "jest": "^29.0.0" }));
+        assert_eq!(
+            version["devDependencies"],
+            serde_json::json!({ "jest": "^29.0.0" })
+        );
         // The rest of the object is untouched by the overlay.
         assert_eq!(version["version"], "1.0.0");
-        assert_eq!(version["dist"]["shasum"], "deadbeef");
+        assert_eq!(
+            version["dist"]["shasum"],
+            serde_json::json!(hex::encode(sha1::Sha1::digest(TARBALL)))
+        );
         assert_eq!(
             version["dist"]["tarball"],
             "https://forge.example/api/v1/repos/acme/tools/packages/npm/matrix-npm/1.0.0/matrix-npm-1.0.0.tgz"
         );
+    }
+
+    /// The two checksum fields name their algorithms, and pacote verifies the
+    /// tarball against both. `shasum` used to carry the SHA-256, which is a
+    /// SHA-1 field: the check failed on every download, and it failed at the
+    /// end of the install, after the resolver had already built the tree.
+    #[test]
+    fn the_dist_block_publishes_each_digest_under_its_own_algorithm() {
+        use base64::Engine as _;
+
+        let version = version_object(r#"{ "name": "matrix-npm", "version": "1.0.0" }"#);
+        let dist = &version["dist"];
+
+        assert_eq!(
+            dist["shasum"],
+            serde_json::json!(hex::encode(sha1::Sha1::digest(TARBALL))),
+            "shasum is the tarball's SHA-1, in hex: {dist}"
+        );
+        assert_eq!(
+            dist["integrity"],
+            serde_json::json!(format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(TARBALL))
+            )),
+            "integrity is an SRI string over the raw SHA-512 bytes: {dist}"
+        );
+    }
+
+    /// A version stored before the registry recorded a SHA-1 has no honest
+    /// `shasum` to publish, and the SHA-256 it does have is still a valid SRI
+    /// digest — so the answer is an `integrity` without a `shasum`, not a
+    /// `shasum` npm is guaranteed to reject.
+    #[test]
+    fn a_version_without_a_sha1_publishes_integrity_and_no_shasum() {
+        use base64::Engine as _;
+
+        let document = build_npm_metadata(
+            "matrix-npm",
+            &[NpmVersionInfo {
+                version: "1.0.0".into(),
+                description: None,
+                sha256: Some(hex::encode(sha2::Sha256::digest(TARBALL))),
+                sha1: None,
+                sha512: None,
+                filename: Some("matrix-npm-1.0.0.tgz".into()),
+                yanked: false,
+                metadata: None,
+            }],
+            "https://forge.example",
+            "acme",
+            "tools",
+        );
+        let dist = &document["versions"]["1.0.0"]["dist"];
+
+        assert!(
+            dist.get("shasum").is_none(),
+            "no SHA-1 on record means no shasum at all: {dist}"
+        );
+        assert_eq!(
+            dist["integrity"],
+            serde_json::json!(format!(
+                "sha256-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(TARBALL))
+            )),
+            "SHA-256 is a valid SRI algorithm and says so: {dist}"
+        );
+        // The tarball URL is the one thing that must never go missing.
+        assert_eq!(
+            dist["tarball"],
+            "https://forge.example/api/v1/repos/acme/tools/packages/npm/matrix-npm/1.0.0/matrix-npm-1.0.0.tgz"
+        );
+    }
+
+    /// A version with no digests at all is a version npm downloads without
+    /// verifying — which it does happily. An empty or malformed digest must not
+    /// turn into an integrity string of the right shape and the wrong value.
+    #[test]
+    fn a_version_without_digests_publishes_no_checksum_fields() {
+        let document = build_npm_metadata(
+            "matrix-npm",
+            &[NpmVersionInfo {
+                version: "1.0.0".into(),
+                description: None,
+                sha256: Some(String::new()),
+                sha1: Some(String::new()),
+                sha512: Some("not hex".into()),
+                filename: Some("matrix-npm-1.0.0.tgz".into()),
+                yanked: false,
+                metadata: None,
+            }],
+            "https://forge.example",
+            "acme",
+            "tools",
+        );
+        let dist = &document["versions"]["1.0.0"]["dist"];
+
+        assert!(dist.get("shasum").is_none(), "dist: {dist}");
+        assert!(dist.get("integrity").is_none(), "dist: {dist}");
+        assert!(dist.get("tarball").is_some(), "dist: {dist}");
     }
 
     /// Peer and optional dependencies decide whether an install warns, errors
@@ -485,7 +652,10 @@ mod tests {
 }"#,
         );
 
-        assert_eq!(version["peerDependencies"], serde_json::json!({ "react": ">=17" }));
+        assert_eq!(
+            version["peerDependencies"],
+            serde_json::json!({ "react": ">=17" })
+        );
         assert_eq!(
             version["peerDependenciesMeta"],
             serde_json::json!({ "react": { "optional": true } }),
@@ -561,7 +731,10 @@ mod tests {
 }"#,
         );
 
-        assert_eq!(stored["bundleDependencies"], serde_json::json!(["left-pad"]));
+        assert_eq!(
+            stored["bundleDependencies"],
+            serde_json::json!(["left-pad"])
+        );
         assert!(stored.get("bundledDependencies").is_none(), "{stored}");
     }
 
@@ -570,9 +743,7 @@ mod tests {
     /// to look up.
     #[test]
     fn a_manifest_without_dependencies_records_an_empty_table() {
-        let stored = stored_metadata(
-            r#"{ "name": "matrix-npm", "version": "1.0.0" }"#,
-        );
+        let stored = stored_metadata(r#"{ "name": "matrix-npm", "version": "1.0.0" }"#);
 
         assert_eq!(stored["dependencies"], serde_json::json!({}));
         assert!(stored.get("peerDependencies").is_none(), "{stored}");
@@ -594,13 +765,19 @@ mod tests {
     /// version object rather than one npm cannot read.
     #[test]
     fn a_version_without_stored_metadata_keeps_the_old_shape() {
-        for metadata in [None, Some("not json".to_string()), Some("[1,2]".to_string())] {
+        for metadata in [
+            None,
+            Some("not json".to_string()),
+            Some("[1,2]".to_string()),
+        ] {
             let document = build_npm_metadata(
                 "matrix-npm",
                 &[NpmVersionInfo {
                     version: "1.0.0".into(),
                     description: None,
                     sha256: None,
+                    sha1: None,
+                    sha512: None,
                     filename: None,
                     yanked: false,
                     metadata: metadata.clone(),
@@ -611,7 +788,11 @@ mod tests {
             );
             let version = &document["versions"]["1.0.0"];
 
-            assert_eq!(version["dependencies"], serde_json::json!({}), "{metadata:?}");
+            assert_eq!(
+                version["dependencies"],
+                serde_json::json!({}),
+                "{metadata:?}"
+            );
             assert_eq!(version["version"], "1.0.0", "{metadata:?}");
             assert_eq!(
                 version["dist"]["tarball"],
@@ -632,6 +813,8 @@ mod tests {
                 version: "1.0.0".into(),
                 description: None,
                 sha256: Some("deadbeef".into()),
+                sha1: None,
+                sha512: None,
                 filename: Some("matrix-npm-1.0.0.tgz".into()),
                 yanked: false,
                 metadata: Some(
@@ -667,6 +850,8 @@ mod tests {
                     version: "2.0.0".into(),
                     description: None,
                     sha256: None,
+                    sha1: None,
+                    sha512: None,
                     filename: None,
                     yanked: true,
                     metadata: None,
@@ -675,6 +860,8 @@ mod tests {
                     version: "1.0.0".into(),
                     description: None,
                     sha256: None,
+                    sha1: None,
+                    sha512: None,
                     filename: None,
                     yanked: false,
                     metadata: Some(r#"{"dependencies":{"left-pad":"^1.3.0"}}"#.into()),

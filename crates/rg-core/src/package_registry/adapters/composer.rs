@@ -195,15 +195,28 @@ pub fn build_packages_json(
         let mut entry = serde_json::Map::new();
         entry.insert("name".into(), package_name.to_string().into());
         entry.insert("version".into(), v.version.clone().into());
-        entry.insert(
-            "dist".into(),
-            serde_json::json!({
-                "type": "zip",
-                "url": download_url,
-                "reference": v.sha256.clone().unwrap_or_default(),
-                "shasum": v.sha256.clone().unwrap_or_default(),
-            }),
+
+        let mut dist = serde_json::Map::new();
+        dist.insert("type".into(), "zip".into());
+        dist.insert("url".into(), download_url.into());
+        // `reference` names nothing in particular — Composer treats it as an
+        // opaque identity for the archive and builds its cache path from it —
+        // so any stable per-file value will do.
+        dist.insert(
+            "reference".into(),
+            v.sha256.clone().unwrap_or_default().into(),
         );
+        // `shasum`, unlike `reference`, is a promise about an algorithm:
+        // Composer's `FileDownloader` compares it against `hash_file('sha1')`
+        // of what it downloaded and throws "The checksum verification of the
+        // file failed" on a mismatch. A SHA-256 there fails every install. When
+        // there is no SHA-1 on record the field is left out — Composer skips
+        // the check when the key is absent, and a skipped check beats a
+        // guaranteed-failing one.
+        if let Some(sha1) = v.sha1.as_deref().filter(|value| !value.is_empty()) {
+            dist.insert("shasum".into(), sha1.into());
+        }
+        entry.insert("dist".into(), Value::Object(dist));
 
         // Include download count as a custom metric
         entry.insert(
@@ -251,7 +264,12 @@ fn encode_path_segment(value: &str) -> String {
 pub struct ComposerVersionInfo {
     pub version: String,
     pub filename: String,
+    /// Hex SHA-256 of the archive. Published only as the opaque `dist.reference`
+    /// — never as `shasum`, which Composer verifies as SHA-1.
     pub sha256: Option<String>,
+    /// Hex SHA-1 of the archive, published as `dist.shasum`. `None` for a file
+    /// stored before the registry recorded it, and the field is then omitted.
+    pub sha1: Option<String>,
     pub description: Option<String>,
     pub license: Option<String>,
     pub package_type: Option<String>,
@@ -287,6 +305,7 @@ mod tests {
             version: "1.0.0".into(),
             filename: "vendor-pkg-1.0.0.zip".into(),
             sha256: Some("abc123".into()),
+            sha1: Some("def456".into()),
             description: Some("Test package".into()),
             license: Some("MIT".into()),
             package_type: Some("library".into()),
@@ -302,5 +321,63 @@ mod tests {
         assert!(json.contains("\"1.0.0\""));
         assert!(json.contains("\"zip\""));
         assert!(json.contains("\"abc123\""));
+    }
+
+    /// The `dist` block a version entry carries, as a Composer client reads it.
+    fn dist_of(version: ComposerVersionInfo) -> Value {
+        let json = build_packages_json(
+            "vendor/pkg",
+            &[version],
+            "https://forge.example",
+            "owner",
+            "repo",
+        );
+        let document: Value = serde_json::from_str(&json).unwrap();
+        document["packages"]["vendor/pkg"]["1.0.0"]["dist"].clone()
+    }
+
+    /// `dist.shasum` is verified as SHA-1 by `FileDownloader`. Publishing the
+    /// SHA-256 there made every `composer install` fail with "The checksum
+    /// verification of the file failed" — after the download had succeeded.
+    #[test]
+    fn shasum_is_the_archives_sha1() {
+        let dist = dist_of(ComposerVersionInfo {
+            version: "1.0.0".into(),
+            filename: "vendor-pkg-1.0.0.zip".into(),
+            sha256: Some("a".repeat(64)),
+            sha1: Some("b".repeat(40)),
+            description: None,
+            license: None,
+            package_type: None,
+        });
+
+        assert_eq!(dist["shasum"], "b".repeat(40), "dist: {dist}");
+        // `reference` names no algorithm — Composer treats it as an opaque id.
+        assert_eq!(dist["reference"], "a".repeat(64), "dist: {dist}");
+    }
+
+    /// Composer skips the checksum check when the key is absent, so a file with
+    /// no recorded SHA-1 is published without one rather than with a digest
+    /// that cannot match.
+    #[test]
+    fn a_file_without_a_sha1_publishes_no_shasum() {
+        let dist = dist_of(ComposerVersionInfo {
+            version: "1.0.0".into(),
+            filename: "vendor-pkg-1.0.0.zip".into(),
+            sha256: Some("a".repeat(64)),
+            sha1: None,
+            description: None,
+            license: None,
+            package_type: None,
+        });
+
+        assert!(dist.get("shasum").is_none(), "dist: {dist}");
+        assert!(
+            dist["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("vendor-pkg-1.0.0.zip"),
+            "dist: {dist}"
+        );
     }
 }

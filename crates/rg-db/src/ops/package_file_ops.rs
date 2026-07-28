@@ -1,13 +1,25 @@
 use crate::entities::{package_file, package_file::Entity as PackageFile};
 use sea_orm::*;
 
+/// The digests of a stored file, as the package protocols ask for them.
+///
+/// Each field is lowercase hex, or `None` when the caller does not have that
+/// digest — a metadata route then omits the field instead of publishing
+/// another algorithm's value under its name.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileDigests<'a> {
+    pub sha256: Option<&'a str>,
+    pub sha1: Option<&'a str>,
+    pub sha512: Option<&'a str>,
+}
+
 /// Create a new package file entry.
 pub async fn create(
     db: &DatabaseConnection,
     version_id: i64,
     filename: &str,
     size: i64,
-    sha256: Option<&str>,
+    digests: FileDigests<'_>,
     storage_path: &str,
 ) -> Result<package_file::Model, DbErr> {
     use package_file::ActiveModel;
@@ -18,7 +30,9 @@ pub async fn create(
         version_id: Set(version_id),
         filename: Set(filename.to_string()),
         size: Set(size),
-        sha256: Set(sha256.map(|s| s.to_string())),
+        sha256: Set(digests.sha256.map(|s| s.to_string())),
+        sha1: Set(digests.sha1.map(|s| s.to_string())),
+        sha512: Set(digests.sha512.map(|s| s.to_string())),
         storage_path: Set(storage_path.to_string()),
         created_at: Set(now),
     };

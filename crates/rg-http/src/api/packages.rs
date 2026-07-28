@@ -806,7 +806,15 @@ pub async fn npm_registry_metadata(
             rg_core::package_registry::NpmVersionInfo {
                 version: v.version.clone(),
                 description: None, // Version-level descriptions come from package detail
-                sha256: v.sha256.clone(),
+                // Digests of the tarball itself — the file the `dist` block
+                // makes its promises about. The version-level `sha256` is only
+                // the first file's and is used as a fallback for a version
+                // stored before the per-file digests existed.
+                sha256: tgz_file
+                    .and_then(|f| f.sha256.clone())
+                    .or_else(|| v.sha256.clone()),
+                sha1: tgz_file.and_then(|f| f.sha1.clone()),
+                sha512: tgz_file.and_then(|f| f.sha512.clone()),
                 filename: tgz_file.map(|f| f.filename.clone()),
                 yanked: v.is_yanked,
                 // Dependency tables live only in the `package.json` inside the
@@ -1816,15 +1824,19 @@ pub async fn composer_packages_json(
         > = versions
             .iter()
             .map(|v| {
-                let filename = v
-                    .files
-                    .first()
+                let archive = v.files.first();
+                let filename = archive
                     .map(|f| f.filename.clone())
                     .unwrap_or_else(|| format!("{}.zip", v.version));
                 rg_core::package_registry::adapters::composer::ComposerVersionInfo {
                     version: v.version.clone(),
                     filename,
-                    sha256: v.sha256.clone(),
+                    // Digests of the archive the `dist` block points at, not of
+                    // whatever the version recorded first.
+                    sha256: archive
+                        .and_then(|f| f.sha256.clone())
+                        .or_else(|| v.sha256.clone()),
+                    sha1: archive.and_then(|f| f.sha1.clone()),
                     description: pkg.description.clone(),
                     license: None, // Composer license is stored in metadata
                     package_type: None,
