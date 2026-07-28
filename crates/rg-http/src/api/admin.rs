@@ -880,7 +880,7 @@ pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> 
     if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
-    let settings = crate::instance::get_settings();
+    let settings = state.instance_settings.get(&state.db).await;
     (StatusCode::OK, Json(serde_json::json!(settings))).into_response()
 }
 
@@ -893,6 +893,7 @@ pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> 
     responses(
         (status = 200, description = "Settings updated", body = serde_json::Value),
         (status = 401, description = "Admin access required"),
+        (status = 500, description = "Settings could not be persisted"),
     ),
 )]
 pub async fn update_settings(
@@ -903,19 +904,31 @@ pub async fn update_settings(
     if require_instance_admin(&state, &headers).await.is_none() {
         return AppError::forbidden("admin required").into_response();
     }
-    crate::instance::update_settings(|s| {
-        if let Some(mm) = body.get("maintenance_mode").and_then(|v| v.as_bool()) {
-            s.maintenance_mode = mm;
+    let updated = state
+        .instance_settings
+        .update(&state.db, |s| {
+            if let Some(mm) = body.get("maintenance_mode").and_then(|v| v.as_bool()) {
+                s.maintenance_mode = mm;
+            }
+            if let Some(msg) = body.get("banner_message") {
+                s.banner_message = msg.as_str().filter(|m| !m.is_empty()).map(String::from);
+            }
+            if let Some(bt) = body.get("banner_type").and_then(|v| v.as_str()) {
+                s.banner_type = bt.to_string();
+            }
+        })
+        .await;
+
+    // A settings change that cannot be stored has not happened. Reporting it as
+    // applied is how maintenance mode used to survive exactly until the next
+    // restart, so the failure is surfaced instead.
+    match updated {
+        Ok(settings) => (StatusCode::OK, Json(serde_json::json!(settings))).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist instance settings");
+            AppError::internal("failed to persist instance settings").into_response()
         }
-        if let Some(msg) = body.get("banner_message") {
-            s.banner_message = msg.as_str().filter(|m| !m.is_empty()).map(String::from);
-        }
-        if let Some(bt) = body.get("banner_type").and_then(|v| v.as_str()) {
-            s.banner_type = bt.to_string();
-        }
-    });
-    let settings = crate::instance::get_settings();
-    (StatusCode::OK, Json(serde_json::json!(settings))).into_response()
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

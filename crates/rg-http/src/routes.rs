@@ -205,7 +205,8 @@ fn build_router(
             rate_limit::rate_limit_middleware,
         ))
         // Maintenance mode check (runs early, before most handlers)
-        .layer(axum::middleware::from_fn(
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             middleware::maintenance_middleware,
         ))
         .with_state(state)

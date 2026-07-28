@@ -73,6 +73,7 @@ probed_entities!(
     commit_status,
     deploy_key,
     import_task,
+    instance_settings,
     issue,
     issue_comment,
     issue_label,

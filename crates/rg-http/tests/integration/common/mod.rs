@@ -131,6 +131,9 @@ pub fn build_test_app_state_with(
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).
         attestation_enabled: true,
+        // Empty memo over this state's own database — see
+        // `rg_http::instance::InstanceSettingsCache`.
+        instance_settings: Default::default(),
     }
 }
 
@@ -246,6 +249,31 @@ pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
     });
     wait_for_listener(&addr.to_string()).await;
     (base_url, db)
+}
+
+/// Spawn a second server over a database that already exists — a process
+/// restart, minus the process.
+///
+/// The new server gets a brand-new `AppState`, so every in-memory cache it
+/// carries starts cold and anything it then reports has to have come off disk.
+/// That is what makes it the honest test for "this setting is durable" as
+/// opposed to "this setting is still in the same `RwLock` we wrote it to".
+#[allow(dead_code)]
+pub async fn spawn_test_app_over_db(db: rg_db::DatabaseConnection) -> String {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let state = build_test_app_state(db, repo_root);
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    base_url
 }
 
 /// Spawn the test app with an inbound-webhook HMAC secret configured.

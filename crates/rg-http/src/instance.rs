@@ -1,12 +1,23 @@
 //! Instance-wide settings (maintenance mode, banner).
 //!
-//! Uses a process-global `RwLock` so the admin API can toggle settings
-//! without requiring AppState mutations or server restarts.
+//! These describe **one running instance**, so they live where that instance's
+//! other state lives: durably in its database, cached in its [`AppState`]. They
+//! used to live in a process-global `RwLock` (card_08bab0b46e40), which cost
+//! both halves of that. In production nothing was ever written to disk, so an
+//! admin who enabled maintenance mode lost it on the next restart — precisely
+//! when a restart is most likely, since the mode gets enabled because something
+//! is wrong. In the test binary, where every test builds its own database but
+//! shares the one process, the global was a single slot that all of them wrote
+//! to and read from.
+//!
+//! [`AppState`]: crate::AppState
 
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct InstanceSettings {
     /// When true, only GET/HEAD/OPTIONS and admin routes are served.
     pub maintenance_mode: bool,
@@ -22,19 +33,97 @@ impl InstanceSettings {
     }
 }
 
-static SETTINGS: RwLock<InstanceSettings> = RwLock::new(InstanceSettings {
-    maintenance_mode: false,
-    banner_message: None,
-    banner_type: String::new(),
-});
-
-/// Read the current instance settings.
-pub fn get_settings() -> InstanceSettings {
-    SETTINGS.read().unwrap_or_else(|e| e.into_inner()).clone()
+impl From<rg_db::entities::instance_settings::Model> for InstanceSettings {
+    fn from(row: rg_db::entities::instance_settings::Model) -> Self {
+        Self {
+            maintenance_mode: row.maintenance_mode,
+            banner_message: row.banner_message,
+            banner_type: row.banner_type,
+        }
+    }
 }
 
-/// Update instance settings (e.g. from admin API).
-pub fn update_settings(f: impl FnOnce(&mut InstanceSettings)) {
-    let mut guard = SETTINGS.write().unwrap_or_else(|e| e.into_inner());
-    f(&mut guard);
+/// One instance's view of its settings: the durable row, plus a memo of it.
+///
+/// Cheap to clone (it is a handle, not a copy) and scoped to the `AppState` it
+/// is built into, so two servers in one process — which is what the integration
+/// test binary is — never see each other's settings.
+///
+/// The cache fills lazily on first read rather than being loaded at startup.
+/// That is deliberate: an eagerly-loaded cache needs every construction site to
+/// remember the load, and a site that forgets gets a silently stale instance.
+/// Here the only way to observe the settings is to go through a path that
+/// resolves them, so "forgot to load" is not a reachable state.
+#[derive(Clone, Default)]
+pub struct InstanceSettingsCache {
+    /// `None` = not yet read from the database.
+    cached: Arc<RwLock<Option<InstanceSettings>>>,
+}
+
+impl InstanceSettingsCache {
+    /// The current settings, reading the database once per process and then
+    /// serving from memory.
+    ///
+    /// A database failure yields the defaults **without** caching them, so the
+    /// next request retries rather than inheriting a wrong answer for the life
+    /// of the process.
+    pub async fn get(&self, db: &DatabaseConnection) -> InstanceSettings {
+        if let Some(settings) = self.cached.read().await.as_ref() {
+            return settings.clone();
+        }
+
+        let mut guard = self.cached.write().await;
+        // Another task may have filled the cache while this one waited.
+        if let Some(settings) = guard.as_ref() {
+            return settings.clone();
+        }
+
+        match rg_db::ops::instance_settings_ops::find(db).await {
+            Ok(row) => {
+                let settings = row.map(InstanceSettings::from).unwrap_or_default();
+                *guard = Some(settings.clone());
+                settings
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read instance settings; using defaults");
+                InstanceSettings::default()
+            }
+        }
+    }
+
+    /// Apply `f` to the current settings, persist the result, and refresh the
+    /// cache — in that order, holding the write lock throughout so two
+    /// concurrent updates cannot each build on the pre-update value.
+    ///
+    /// The cache is only advanced once the row is written: a failed write
+    /// leaves both the database and the memo on the old value, and the caller
+    /// learns the change did not take instead of watching it evaporate at the
+    /// next restart.
+    pub async fn update(
+        &self,
+        db: &DatabaseConnection,
+        f: impl FnOnce(&mut InstanceSettings),
+    ) -> Result<InstanceSettings, sea_orm::DbErr> {
+        let mut guard = self.cached.write().await;
+        let mut settings = match guard.as_ref() {
+            Some(settings) => settings.clone(),
+            None => rg_db::ops::instance_settings_ops::find(db)
+                .await?
+                .map(InstanceSettings::from)
+                .unwrap_or_default(),
+        };
+
+        f(&mut settings);
+
+        rg_db::ops::instance_settings_ops::save(
+            db,
+            settings.maintenance_mode,
+            settings.banner_message.as_deref(),
+            &settings.banner_type,
+        )
+        .await?;
+
+        *guard = Some(settings.clone());
+        Ok(settings)
+    }
 }

@@ -76,6 +76,7 @@ pub mod m20260724_000004_add_ci_cache_sha256;
 pub mod m20260726_000001_rename_mirror_table_plural;
 pub mod m20260727_000001_clear_plaintext_mirror_passwords;
 pub mod m20260727_000002_clear_import_task_auth_tokens;
+pub mod m20260728_000001_create_instance_settings;
 
 use sea_orm_migration::prelude::*;
 
@@ -165,6 +166,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260726_000001_rename_mirror_table_plural::Migration),
             Box::new(m20260727_000001_clear_plaintext_mirror_passwords::Migration),
             Box::new(m20260727_000002_clear_import_task_auth_tokens::Migration),
+            Box::new(m20260728_000001_create_instance_settings::Migration),
         ]
     }
 }

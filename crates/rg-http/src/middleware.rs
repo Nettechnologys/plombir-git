@@ -1,7 +1,7 @@
 //! Shared HTTP middleware for ForgeKeep.
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{MatchedPath, Request};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::Method;
 use axum::http::{header, HeaderName, HeaderValue};
 use axum::middleware::Next;
@@ -147,8 +147,12 @@ async fn inject_request_id(response: Response, request_id: &str) -> Response {
 /// Maintenance mode middleware — rejects mutating requests when the instance
 /// is in read-only maintenance mode.  Safe methods (GET, HEAD, OPTIONS) and
 /// the admin panel are always allowed.
-pub async fn maintenance_middleware(request: Request, next: Next) -> Response {
-    let settings = crate::instance::get_settings();
+pub async fn maintenance_middleware(
+    State(state): State<crate::AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let settings = state.instance_settings.get(&state.db).await;
     if settings.maintenance_mode {
         let method = request.method();
         let path = request.uri().path();

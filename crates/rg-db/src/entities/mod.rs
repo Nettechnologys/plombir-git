@@ -15,6 +15,7 @@ pub mod ci_secret;
 pub mod commit_status;
 pub mod deploy_key;
 pub mod import_task;
+pub mod instance_settings;
 pub mod issue;
 pub mod issue_comment;
 pub mod issue_label;

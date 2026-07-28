@@ -84,6 +84,10 @@ pub struct AppState {
     /// enabled. Default `false`: the sign/verify endpoints return 404 until an
     /// operator turns the feature on.
     pub attestation_enabled: bool,
+    /// This instance's admin-toggled switches (maintenance mode, banner),
+    /// backed by the `instance_settings` row in `db`. Lazily loaded, so
+    /// `Default::default()` is the correct value at every construction site.
+    pub instance_settings: instance::InstanceSettingsCache,
 }
 
 impl AppState {
@@ -366,6 +370,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         git_idle_timeout_secs: config.git_idle_timeout_secs,
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
+        instance_settings: instance::InstanceSettingsCache::default(),
     };
 
     let app = routes::create_router(state.clone(), rate_limiter.clone(), auth_rate_limiter);
