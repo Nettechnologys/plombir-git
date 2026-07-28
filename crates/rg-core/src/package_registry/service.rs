@@ -165,7 +165,7 @@ pub async fn publish(
         let mut combined_sha256: Option<String> = None;
 
         for (filename, data) in &info.files {
-            let sf = storage
+            let sf = match storage
                 .store_file(
                     &info.owner,
                     &info.repo,
@@ -175,7 +175,41 @@ pub async fn publish(
                     filename,
                     data,
                 )
-                .await?;
+                .await
+            {
+                Ok(sf) => sf,
+                Err(error) => {
+                    // A publish of several files (`mvn deploy` sends the POM
+                    // then the JAR, PyPI an sdist beside a wheel) that fails
+                    // half-way has already written the files before this one.
+                    // Nothing points at them: the version row is created below,
+                    // at step 5, so retention and every listing walk past them
+                    // and only `df` ever sees them again. The caller must still
+                    // see the storage failure, so a failed rollback can only be
+                    // reported here.
+                    if let Err(cleanup_error) = storage
+                        .delete_version(
+                            &info.owner,
+                            &info.repo,
+                            &info.package_type,
+                            &info.name,
+                            &info.version,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            package = %format!("{}/{}", info.owner, info.repo),
+                            package_type = %info.package_type,
+                            name = %info.name,
+                            version = %info.version,
+                            filename = %filename,
+                            error = %format!("{cleanup_error:#}"),
+                            "orphaned package files: storing a file failed part-way through a publish and the rollback delete failed too — the files uploaded before it stay in storage with no version row pointing at them"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             stored_files.push(sf);
         }
 

@@ -326,6 +326,103 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
     );
 }
 
+// ── Package registry ─────────────────────────────────────────
+
+/// Where a published package file lands once the blob store accepts it.
+fn package_file_path(
+    repo_root: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    package_type: &str,
+    name: &str,
+    version: &str,
+    filename: &str,
+) -> std::path::PathBuf {
+    repo_root
+        .join("packages")
+        .join(owner)
+        .join(repo)
+        .join(package_type)
+        .join(name)
+        .join(version)
+        .join(filename)
+}
+
+/// A publish that failed on its second file must not keep the first one.
+///
+/// This one calls the service instead of driving the route, and deliberately:
+/// the HTTP endpoint sends one file per request (`packages.rs`), so the loop
+/// that stores several of them is only reachable through
+/// `package_registry::service::publish` itself. The branch is still the one
+/// that runs in production — a second file goes through `add_files_to_version`,
+/// which rolls back, while the *first* request of a version takes this path —
+/// and leaving it uncompensated means any future caller that publishes a
+/// multi-file version leaks every file stored before the failure: the version
+/// row is written after the loop, so nothing points at them and retention,
+/// which walks rows, never comes back for them.
+#[tokio::test]
+async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let (token, user_id) = register_full(&app.base, "pkg_part", "pkg_part@example.com").await;
+    create_repo(&app.base, &token, "half-published").await;
+
+    let info = || rg_core::package_registry::PublishInfo {
+        owner: "pkg_part".to_string(),
+        repo: "half-published".to_string(),
+        package_type: "maven".to_string(),
+        name: "widget".to_string(),
+        version: "1.0.0".to_string(),
+        semver: None,
+        metadata: None,
+        description: None,
+        homepage: None,
+        repository_url: None,
+        author_id: user_id,
+        files: vec![
+            ("widget-1.0.0.pom".to_string(), b"<project/>".to_vec()),
+            ("widget-1.0.0.jar".to_string(), b"jar bytes".to_vec()),
+        ],
+    };
+
+    let root = std::sync::Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&app.repo_root));
+    let broken = rg_core::package_registry::PackageStorage::from_backend(
+        crate::common::fault::RejectOneKey::wrap(root.clone(), "widget-1.0.0.jar"),
+    );
+    let failed = rg_core::package_registry::service::publish(&app.db, &broken, info()).await;
+    assert!(
+        failed.is_err(),
+        "a file the blob store refused must fail the publish"
+    );
+
+    let pom = package_file_path(
+        &app.repo_root,
+        "pkg_part",
+        "half-published",
+        "maven",
+        "widget",
+        "1.0.0",
+        "widget-1.0.0.pom",
+    );
+    assert!(
+        !pom.exists(),
+        "the file stored before the failure outlived the publish that would have claimed it: {}",
+        pom.display()
+    );
+
+    // Control: the same publish, with the store healthy, does write that file —
+    // so the assertion above is about the rollback and not about a path that is
+    // never written in the first place.
+    let healthy = rg_core::package_registry::PackageStorage::from_backend(root);
+    rg_core::package_registry::service::publish(&app.db, &healthy, info())
+        .await
+        .expect("the publish must succeed once the blob store accepts every file");
+    assert!(
+        pom.exists(),
+        "a successful publish must leave its files in storage: {}",
+        pom.display()
+    );
+}
+
 // ── Attachments ──────────────────────────────────────────────
 
 /// Upload one attachment, returning `(status, body)`.

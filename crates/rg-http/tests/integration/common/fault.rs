@@ -272,6 +272,106 @@ impl BlobStorage for FaultyBlobStorage {
     }
 }
 
+/// A [`BlobStorage`] that refuses the writes of exactly one key.
+///
+/// [`BlobFaults`] switches the whole store at once, which is right for "the
+/// backend is gone" but useless for a request that writes more than one object:
+/// with `put` faulted, the *first* write already fails and the compensation
+/// that only exists for the objects written before the failure never runs. The
+/// key this rejects is named by a substring of it, so a test can break the
+/// second file of a publish and leave the first one stored.
+pub struct RejectOneKey {
+    inner: Arc<dyn BlobStorage>,
+    needle: String,
+}
+
+#[allow(dead_code)]
+impl RejectOneKey {
+    /// Wrap `inner`, refusing `put` / `put_file` for every key containing
+    /// `needle`.
+    pub fn wrap(inner: Arc<dyn BlobStorage>, needle: &str) -> Arc<dyn BlobStorage> {
+        Arc::new(Self {
+            inner,
+            needle: needle.to_string(),
+        })
+    }
+
+    fn rejects(&self, key: &BlobKey) -> bool {
+        key.as_str().contains(&self.needle)
+    }
+}
+
+impl BlobStorage for RejectOneKey {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a BlobKey,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<BlobMetadata>> {
+        Box::pin(async move {
+            if self.rejects(key) {
+                return Err(injected("blob storage put", key));
+            }
+            self.inner.put(key, data).await
+        })
+    }
+
+    fn put_file<'a>(
+        &'a self,
+        key: &'a BlobKey,
+        source: &'a std::path::Path,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<BlobMetadata>> {
+        Box::pin(async move {
+            if self.rejects(key) {
+                return Err(injected("blob storage put_file", key));
+            }
+            self.inner.put_file(key, source).await
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<Vec<u8>>> {
+        self.inner.get(key)
+    }
+
+    fn metadata<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<BlobMetadata>> {
+        self.inner.metadata(key)
+    }
+
+    fn exists<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<bool>> {
+        self.inner.exists(key)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<bool>> {
+        self.inner.delete(key)
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: Option<&'a BlobKey>,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<Vec<BlobMetadata>>> {
+        self.inner.list(prefix)
+    }
+
+    fn local_path(&self, key: &BlobKey) -> Option<std::path::PathBuf> {
+        self.inner.local_path(key)
+    }
+}
+
 // ── Harness ──────────────────────────────────────────────────
 
 /// A test server with every seam a whole-server fault sweep needs.
