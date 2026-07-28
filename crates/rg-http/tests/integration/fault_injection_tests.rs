@@ -136,6 +136,133 @@ async fn a_blob_row_that_was_not_written_fails_the_push() {
     assert_eq!(head.status(), 200, "the successful push must be readable");
 }
 
+/// Where a finalized OCI layer lands once the blob store accepts it.
+fn oci_blob_path(
+    repo_root: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    digest: &str,
+) -> std::path::PathBuf {
+    let hash = digest.strip_prefix("sha256:").expect("sha256 digest");
+    repo_root
+        .join("oci")
+        .join(owner)
+        .join(repo)
+        .join("blobs")
+        .join("sha256")
+        .join(&hash[..2])
+        .join(hash)
+}
+
+/// A push whose blob row was never written must not keep the bytes.
+///
+/// Every route to an OCI blob — reclamation included — goes through its
+/// `oci_blobs` row, so bytes left without one are unreachable. Every failed push
+/// then costs one layer of disk forever, with nothing in the tree tying the file
+/// back to the request that made it.
+#[tokio::test]
+async fn a_push_whose_blob_row_was_never_written_leaves_no_blob() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&app.base, "oci_orphan", "oci_orphan@example.com").await;
+    create_repo(&app.base, &token, "orphan-blob").await;
+
+    let payload = b"forgekeep-orphaned-layer";
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
+    );
+    let location = start_upload(&app.base, &token, "oci_orphan", "orphan-blob", payload).await;
+
+    let fault = fail_db_writes(&app.db, "oci_blob", DbWrite::Insert).await;
+    let finish = client
+        .put(format!("{app_base}{location}", app_base = app.base))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        finish.status(),
+        500,
+        "a lost blob row must fail the push, not answer 201"
+    );
+    fault.clear().await;
+
+    let blob = oci_blob_path(&app.repo_root, "oci_orphan", "orphan-blob", &digest);
+    assert!(
+        !blob.exists(),
+        "the published layer outlived the row that would have claimed it: {}",
+        blob.display()
+    );
+
+    // Control: the same sequence, with the row writable, does store the bytes —
+    // so the assertion above is about the rollback and not about a path that is
+    // simply never written.
+    push_blob(&app.base, &token, "oci_orphan", "orphan-blob", payload).await;
+    assert!(
+        blob.exists(),
+        "a successful push must leave the layer in storage: {}",
+        blob.display()
+    );
+}
+
+/// A re-push whose row insert fails must NOT take the stored layer with it.
+///
+/// Finalizing deduplicates: a key that already holds these bytes is reused
+/// untouched, and the push that first stored them has a row pointing at it.
+/// Compensating there would answer a failed push by deleting a live layer —
+/// the earlier image stops pulling. The rollback is only for the caller that
+/// actually published.
+#[tokio::test]
+async fn a_failed_repush_does_not_delete_the_layer_an_earlier_push_stored() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&app.base, "oci_dedup", "oci_dedup@example.com").await;
+    create_repo(&app.base, &token, "shared-layer").await;
+
+    let payload = b"forgekeep-shared-layer";
+    let digest = push_blob(&app.base, &token, "oci_dedup", "shared-layer", payload).await;
+    let blob = oci_blob_path(&app.repo_root, "oci_dedup", "shared-layer", &digest);
+    assert!(blob.exists(), "the first push must store the layer");
+
+    // A second push of the identical layer takes the dedup branch and then
+    // fails to record a row (here because the row already exists — the same
+    // shape a concurrent push produces).
+    let location = start_upload(&app.base, &token, "oci_dedup", "shared-layer", payload).await;
+    let finish = client
+        .put(format!("{app_base}{location}", app_base = app.base))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        finish.status().is_client_error() || finish.status().is_server_error(),
+        "this scenario is only meaningful while the duplicate row is refused (card_eff9561d6171)"
+    );
+
+    assert!(
+        blob.exists(),
+        "the failed re-push deleted the layer the first push stored: {}",
+        blob.display()
+    );
+    let head = client
+        .head(format!(
+            "{app_base}/v2/oci_dedup/shared-layer/blobs/{digest}",
+            app_base = app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.status(),
+        200,
+        "the image the first push produced must still pull"
+    );
+}
+
 /// A manifest whose blob ref counts were not incremented must fail the push.
 ///
 /// An under-counted blob is one the GC may delete while this manifest still

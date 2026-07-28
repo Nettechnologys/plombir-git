@@ -21,6 +21,24 @@ const UPLOAD_DIR_HINT: &str =
     "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` directory; \
      that directory must be writable by the user running forgekeep";
 
+/// A blob that has reached its content-addressed key, and how it got there.
+///
+/// `published` is the part the caller cannot work out for itself, and it decides
+/// whether a failure further along may roll the bytes back. Finalizing is
+/// deduplicating: a key that already holds these bytes is accepted as-is and
+/// nothing is written. Rolling *that* back would delete the object an earlier,
+/// successful push already recorded a row for — turning a leaked blob into an
+/// unpullable image. Only the caller that actually published may compensate.
+#[derive(Debug, Clone)]
+pub struct FinalizedBlob {
+    pub digest: String,
+    pub size: i64,
+    /// The backend key the bytes live under, as a string.
+    pub storage_path: String,
+    /// Whether this call wrote the bytes, as opposed to finding them already there.
+    pub published: bool,
+}
+
 /// One actionable error for a filesystem failure on an OCI upload path.
 fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
     crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
@@ -349,14 +367,19 @@ impl OciStorage {
         repo: &str,
         uuid: &str,
         expected_digest: &str,
-    ) -> anyhow::Result<(String, i64, String)> {
+    ) -> anyhow::Result<FinalizedBlob> {
         let upload_path = self.upload_file_path(owner, repo, uuid);
         let key = self.blob_key(owner, repo, expected_digest)?;
 
         if self.backend.exists(&key).await? {
             let size = self.backend.metadata(&key).await?.size as i64;
             discard_dir_async("OCI upload directory", &self.upload_dir(owner, repo, uuid)).await;
-            return Ok((expected_digest.to_string(), size, key.to_string()));
+            return Ok(FinalizedBlob {
+                digest: expected_digest.to_string(),
+                size,
+                storage_path: key.to_string(),
+                published: false,
+            });
         }
 
         let mut source = tokio::fs::File::open(&upload_path)
@@ -387,7 +410,12 @@ impl OciStorage {
 
         self.backend.put_file(&key, &upload_path).await?;
         discard_dir_async("OCI upload directory", &self.upload_dir(owner, repo, uuid)).await;
-        Ok((expected_digest.to_string(), size, key.to_string()))
+        Ok(FinalizedBlob {
+            digest: expected_digest.to_string(),
+            size,
+            storage_path: key.to_string(),
+            published: true,
+        })
     }
 
     pub async fn delete_upload(&self, owner: &str, repo: &str, uuid: &str) -> anyhow::Result<()> {
@@ -550,15 +578,64 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, size, key) = storage
+        let blob = storage
             .finalize_upload("alice", "demo", &upload, &digest)
             .await
             .unwrap();
-        assert_eq!(size, data.len() as i64);
-        assert!(key.starts_with("oci/alice/demo/blobs/sha256/"));
+        assert_eq!(blob.size, data.len() as i64);
+        assert!(blob
+            .storage_path
+            .starts_with("oci/alice/demo/blobs/sha256/"));
+        assert!(
+            blob.published,
+            "the first finalize is what wrote the bytes and must say so"
+        );
         assert_eq!(
             storage.read_blob("alice", "demo", &digest).await.unwrap(),
             data
+        );
+    }
+
+    /// Finalizing a layer whose key already holds the bytes must not claim to
+    /// have published them.
+    ///
+    /// The flag is what the HTTP layer rolls back on: told `true` here, a failed
+    /// `insert_blob` on a re-push would delete the object the *first* push
+    /// recorded a row for, and that image stops pulling. The dedup branch writes
+    /// nothing, so it has nothing to take back.
+    #[tokio::test]
+    async fn a_deduplicated_finalize_does_not_claim_to_have_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = OciStorage::new(directory.path());
+        let data = b"oci layer";
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(data)));
+
+        let mut finalized = Vec::new();
+        for _ in 0..2 {
+            let (upload, _) = storage.create_upload("alice", "demo").await.unwrap();
+            storage
+                .append_to_upload("alice", "demo", &upload, data)
+                .await
+                .unwrap();
+            finalized.push(
+                storage
+                    .finalize_upload("alice", "demo", &upload, &digest)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        assert!(finalized[0].published, "the first push wrote the bytes");
+        assert!(
+            !finalized[1].published,
+            "the second push found them already there and wrote nothing"
+        );
+        assert_eq!(finalized[0].storage_path, finalized[1].storage_path);
+        assert_eq!(finalized[0].size, finalized[1].size);
+        assert_eq!(
+            storage.read_blob("alice", "demo", &digest).await.unwrap(),
+            data,
+            "the deduplicated finalize must leave the stored bytes intact"
         );
     }
 }

@@ -19,8 +19,8 @@ use rg_core::auth::oci_token::{
     build_www_authenticate, generate_oci_token, validate_oci_token, ParsedScope,
 };
 use rg_core::package_registry::oci::{
-    error_codes, is_client_digest_fault, media_types, ErrorDetail, ErrorResponse, ParsedManifest,
-    Reference, TagListResponse, API_VERSION,
+    error_codes, is_client_digest_fault, media_types, ErrorDetail, ErrorResponse, FinalizedBlob,
+    ParsedManifest, Reference, TagListResponse, API_VERSION,
 };
 
 use crate::api::repo_access;
@@ -1215,7 +1215,13 @@ pub async fn complete_upload(
         .finalize_upload(&owner, &repo, &uuid, &expected_digest)
         .await
     {
-        Ok((digest, size, storage_path)) => {
+        Ok(blob) => {
+            let FinalizedBlob {
+                digest,
+                size,
+                storage_path,
+                published,
+            } = blob;
             // Record blob in DB.
             //
             // The bytes are already in blob storage; without this row nothing
@@ -1233,6 +1239,43 @@ pub async fn complete_upload(
             )
             .await
             {
+                // Compensation on the error path, and only where it is ours to
+                // make: `published` means this request is what put the bytes at
+                // that key, so nothing else can be pointing at them. Every way
+                // of reaching an OCI blob for deletion goes through its
+                // `oci_blobs` row, so bytes left without one are unreachable —
+                // a layer-sized object no reclamation, present or future, can
+                // come back for.
+                //
+                // The `false` arm is not an omission. Finalizing deduplicates: a
+                // key that already held these bytes is reused untouched, and an
+                // earlier push has a row for it. Deleting there would answer a
+                // failed push by making somebody else's image unpullable, which
+                // is strictly worse than the leak this compensates.
+                //
+                // The client must still get the DB failure either way, so a
+                // failed rollback can only be reported here.
+                if published {
+                    let cleanup = match rg_core::blob_storage::BlobKey::new(&storage_path) {
+                        Ok(key) => state
+                            .blob_storage
+                            .delete(&key)
+                            .await
+                            .err()
+                            .map(|error| error.to_string()),
+                        Err(error) => Some(error.to_string()),
+                    };
+                    if let Some(reason) = cleanup {
+                        tracing::warn!(
+                            %owner,
+                            %repo,
+                            %digest,
+                            storage_path = %storage_path,
+                            error = %reason,
+                            "orphaned OCI blob: the oci_blobs row was not created and the rollback delete failed too — the blob stays in storage with no row pointing at it, and OCI GC walks rows"
+                        );
+                    }
+                }
                 return oci_err(
                     oci_status_for(&e),
                     "UNKNOWN",
