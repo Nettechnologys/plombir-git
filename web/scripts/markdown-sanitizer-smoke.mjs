@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'vite';
 
+// `noDiscovery` turns off the dependency pre-bundling scan. We only ever
+// `ssrLoadModule` one leaf module, so the scan is pure overhead — and because it
+// runs in the background it loses a race with `server.close()` below and prints
+// ~100 lines of "Failed to scan for dependencies" / "server is being restarted
+// or closed" onto a run that still exits 0. A CI gate whose green output is full
+// of stack traces is a gate people stop reading.
 const server = await createServer({
   logLevel: 'error',
   server: { middlewareMode: true },
   appType: 'custom',
+  optimizeDeps: { noDiscovery: true },
 });
 
 try {
@@ -26,6 +33,8 @@ try {
   const html = sanitizeHtml('<a href="https://example.com" onclick="alert(1)">safe</a>');
   assert.equal(html.includes('onclick'), false);
   assert.equal(html.includes('href="https://example.com"'), true);
+
+  console.log('markdown sanitizer smoke: 4 checks passed');
 } finally {
   await server.close();
 }

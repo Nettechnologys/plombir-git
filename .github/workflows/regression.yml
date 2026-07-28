@@ -289,6 +289,24 @@ jobs:
       - name: Svelte check
         run: npm run check
 
+      # The markdown sanitizer is the boundary between user-supplied markdown
+      # (README, issue, comment, wiki) and the DOM, so a regression in it is
+      # stored XSS rather than a cosmetic bug. It asserts that `javascript:`
+      # links lose their href, `onerror` is stripped off `<img>`, `<svg>` and
+      # `<script>` are dropped and `<strong>` survives. It belongs in this job
+      # because it is offline — vite in middleware mode `ssrLoadModule`s
+      # src/lib/utils/markdown.ts, so it needs no backend and no browser, only
+      # the node_modules `npm ci` just installed.
+      #
+      # Know what this does NOT prove: `sanitizeHtml` picks its implementation
+      # from `typeof DOMParser`, and Node has none, so this exercises the regex
+      # fallback — not `sanitizeWithDomParser`, which is what actually runs in
+      # every browser. Covering the real path needs a DOM test environment;
+      # tracked as card_dd1b9ed2ad70, with a bypass already found in the branch
+      # this step does cover (card_2fc2a934926a).
+      - name: Markdown sanitizer smoke
+        run: npm run smoke:markdown-sanitizer
+
       - name: Build frontend
         run: npm run build
 
