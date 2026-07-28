@@ -16,6 +16,10 @@
 //! GET    /api/v1/repos/{owner}/{repo}/packages/npm/{pkg}          — npm registry metadata
 //! GET    /api/v1/repos/{owner}/{repo}/packages/maven/{group…}/{artifact}/maven-metadata.xml
 //! GET    /api/v1/repos/{owner}/{repo}/packages/maven/{group…}/{artifact}/{version}/{file}
+//! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/versions      — compact index
+//! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/info/{gem}    — compact index
+//! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/names         — compact index
+//! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/gems/{file}   — `.gem` download
 
 use crate::error::AppError;
 use axum::{
@@ -1360,26 +1364,22 @@ pub async fn rubygems_gem_info(
     };
 
     let base_url = build_base_url(&headers);
+    let root = rubygems_root(&base_url, &owner, &name);
 
     let entries: Vec<rg_core::package_registry::RubyGemsVersionEntry> = versions
         .iter()
         .map(|v| {
-            let filename = format!("{}-{}.gem", gem_name, v.version);
-            let download_url = format!(
-                "{}/api/v1/repos/{}/{}/packages/rubygems/{}/{}/{}",
-                base_url.trim_end_matches('/'),
-                owner,
-                name,
-                gem_name,
-                v.version,
-                filename,
-            );
-            let gem_uri = format!(
-                "{}/gems/{}-{}.gem",
-                base_url.trim_end_matches('/'),
-                gem_name,
-                v.version,
-            );
+            // The name the file was published under, not one rebuilt from the
+            // coordinates: a platform gem is stored as `{name}-{ver}-{platform}.gem`.
+            let filename = gem_file(v)
+                .map(|f| f.filename.clone())
+                .unwrap_or_else(|| format!("{}-{}.gem", gem_name, v.version));
+            let download_url = format!("{root}/{gem_name}/{}/{filename}", v.version);
+            // `gems/{file}` under the registry root, because that is the only
+            // path a client will ever ask for: `Gem::RemoteFetcher#download`
+            // glues it onto the source URL itself. Advertising anything else
+            // here is advertising a URL nothing serves.
+            let gem_uri = format!("{root}/gems/{filename}");
 
             let (summary, desc, hp, lic) = parse_rubygems_info(v.metadata.as_deref());
 
@@ -1412,6 +1412,255 @@ pub async fn rubygems_gem_info(
 pub struct RubyGemsDepsParams {
     #[serde(default)]
     pub gems: Option<String>,
+}
+
+// ── RubyGems compact index ────────────────────────────────
+
+/// The registry root a client is pointed at — `gem install --source <this>`,
+/// or a `Gemfile`'s `source`. Every compact-index path hangs off it, and so
+/// does the `gems/{file}` download the client builds on its own.
+fn rubygems_root(base_url: &str, owner: &str, repo: &str) -> String {
+    format!(
+        "{}/api/v1/repos/{}/{}/packages/rubygems",
+        base_url.trim_end_matches('/'),
+        owner,
+        repo,
+    )
+}
+
+/// The `.gem` of a version — the file a client downloads, as opposed to any
+/// checksum or signature published beside it.
+fn gem_file(
+    version: &rg_core::package_registry::VersionDetail,
+) -> Option<&rg_core::package_registry::FileDetail> {
+    version
+        .files
+        .iter()
+        .find(|f| f.filename.ends_with(".gem"))
+        .or_else(|| version.files.first())
+}
+
+/// Turn stored versions into compact-index lines.
+///
+/// Yanked versions are dropped rather than marked: the format has no spelling
+/// for a yanked version inside an `info` file, it simply stops listing it.
+fn compact_index_entries(
+    gem_name: &str,
+    versions: &[rg_core::package_registry::VersionDetail],
+) -> Vec<rg_core::package_registry::CompactIndexVersion> {
+    versions
+        .iter()
+        .filter(|v| !v.is_yanked)
+        .map(|v| {
+            let file = gem_file(v);
+            rg_core::package_registry::CompactIndexVersion {
+                number: v.version.clone(),
+                platform: file.and_then(|f| gem_platform(&f.filename, gem_name, &v.version)),
+                dependencies: parse_rubygems_deps(v.metadata.as_deref()),
+                checksum: file
+                    .and_then(|f| f.sha256.clone())
+                    .or_else(|| v.sha256.clone()),
+            }
+        })
+        .collect()
+}
+
+/// The platform a stored `.gem` carries, when it is not the default `ruby`.
+///
+/// ForgeKeep keeps no platform column — but the client encodes it in the file
+/// name it published (`nokogiri-1.16.0-x86_64-linux.gem`), and the compact
+/// index has to spell the same `VERSION-PLATFORM` chunk back or the download
+/// the client derives from it will not exist.
+fn gem_platform(filename: &str, gem_name: &str, version: &str) -> Option<String> {
+    let stem = filename.strip_suffix(".gem")?;
+    let rest = stem.strip_prefix(&format!("{gem_name}-{version}"))?;
+    let platform = rest.strip_prefix('-')?;
+
+    (!platform.is_empty() && platform != "ruby").then(|| platform.to_string())
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/rubygems/versions
+///
+/// The compact index's entry point, and the request that decides which protocol
+/// the client speaks for the rest of the session: `Gem::Source` asks for this
+/// file first, resolves through `info/{gem}` when it is served, and falls back
+/// to the legacy Marshal index (which ForgeKeep does not serve) when it is not.
+///
+/// A repository with no gems answers an empty index rather than a 404, for that
+/// reason: the 404 would not read as "nothing published yet", it would push the
+/// client onto a protocol that then fails on its own missing files.
+pub async fn rubygems_compact_versions(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let mut gems = Vec::new();
+    let mut created_at = String::new();
+
+    for pkg in rubygems_packages(&state, &owner, &name).await {
+        let versions = match rg_core::package_registry::service::list_versions(
+            &state.db, &owner, &name, "rubygems", &pkg.name,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entries = compact_index_entries(&pkg.name, &versions);
+        if entries.is_empty() {
+            continue;
+        }
+
+        if let Some(newest) = versions.iter().map(|v| &v.created_at).max() {
+            if *newest > created_at {
+                created_at.clone_from(newest);
+            }
+        }
+
+        // The checksum has to be of the body this server will actually serve at
+        // `info/{gem}`, so the info file is built here and hashed, not guessed.
+        let info = rg_core::package_registry::build_compact_index_info(&entries);
+        gems.push(rg_core::package_registry::CompactIndexGem {
+            name: pkg.name.clone(),
+            versions: entries.iter().map(|e| e.version_and_platform()).collect(),
+            info_checksum: rg_core::package_registry::compact_index_info_checksum(&info),
+        });
+    }
+
+    gems.sort_by(|a, b| a.name.cmp(&b.name));
+
+    text_index(rg_core::package_registry::build_compact_index_versions(
+        &created_at,
+        &gems,
+    ))
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/rubygems/info/{gem_name}
+///
+/// One gem's versions, dependencies and checksums — what the client resolves
+/// against once `versions` has told it this registry speaks the compact index.
+pub async fn rubygems_compact_info(
+    State(state): State<AppState>,
+    Path((owner, name, gem_name)): Path<(String, String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let versions = match rg_core::package_registry::service::list_versions(
+        &state.db, &owner, &name, "rubygems", &gem_name,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return err_text(StatusCode::NOT_FOUND, &format!("{e:#}")),
+    };
+
+    let entries = compact_index_entries(&gem_name, &versions);
+    if entries.is_empty() {
+        return err_text(
+            StatusCode::NOT_FOUND,
+            &format!("gem '{gem_name}' has no installable version"),
+        );
+    }
+
+    text_index(rg_core::package_registry::build_compact_index_info(
+        &entries,
+    ))
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/rubygems/names
+///
+/// Every gem name in the registry. No official RubyGems tool reads it, but it
+/// is part of the index a mirroring client expects to find beside the other
+/// two, and it costs one query.
+pub async fn rubygems_compact_names(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let mut names: Vec<String> = rubygems_packages(&state, &owner, &name)
+        .await
+        .into_iter()
+        .map(|pkg| pkg.name)
+        .collect();
+    names.sort();
+
+    text_index(rg_core::package_registry::build_compact_index_names(&names))
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/rubygems/gems/{filename}
+///
+/// The `.gem` download. The client does not read this path out of any index —
+/// `Gem::RemoteFetcher#download` appends `gems/{file}` to the source URL — so
+/// it is fixed, and the file is found by the name it was published under rather
+/// than by splitting `{name}-{version}` back out of it (both halves may contain
+/// dashes, and a platform gem carries a third).
+pub async fn rubygems_gem_download(
+    State(state): State<AppState>,
+    Path((owner, name, filename)): Path<(String, String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    for pkg in rubygems_packages(&state, &owner, &name).await {
+        // Every gem file starts with its gem's name, so most candidates are
+        // ruled out without a query.
+        if !filename.starts_with(&format!("{}-", pkg.name)) {
+            continue;
+        }
+
+        let versions = match rg_core::package_registry::service::list_versions(
+            &state.db, &owner, &name, "rubygems", &pkg.name,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(version) = versions
+            .iter()
+            .find(|v| v.files.iter().any(|f| f.filename == filename))
+        {
+            return serve_package_file(
+                &state,
+                &owner,
+                &name,
+                "rubygems",
+                &pkg.name,
+                &version.version,
+                &filename,
+            )
+            .await;
+        }
+    }
+
+    err_text(
+        StatusCode::NOT_FOUND,
+        &format!("gem '{filename}' not found"),
+    )
+}
+
+/// The gems published to a repository, or nothing at all.
+///
+/// A repository that never enabled the registry is not an error on these
+/// routes — an empty index is the honest answer, and the alternative pushes the
+/// client onto the legacy protocol.
+async fn rubygems_packages(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+) -> Vec<rg_core::package_registry::PackageSummary> {
+    rg_core::package_registry::service::list_packages(&state.db, owner, repo, "rubygems")
+        .await
+        .unwrap_or_default()
+}
+
+/// Answer one of the compact index files.
+fn text_index(body: String) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 // ── Helm Protocol Endpoints ───────────────────────────────

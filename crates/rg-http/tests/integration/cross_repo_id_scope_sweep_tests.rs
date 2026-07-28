@@ -125,6 +125,13 @@ const PER_REPO_PLACEHOLDERS: &[(&str, &str)] = &[
     ("pkg", "a package name, unique within its registry"),
     ("pkg_name", "a package name, unique within its registry"),
     ("gem_name", "a package name, unique within its registry"),
+    (
+        "filename",
+        "a published file name, resolved inside the repository's own registry",
+    ),
+    ("c1", "a Cargo index prefix segment, or the crate name"),
+    ("c2", "a Cargo index prefix segment, or the crate name"),
+    ("c3", "a Cargo index prefix segment, or the crate name"),
     ("group_id", "a Maven coordinate"),
     ("artifact_id", "a Maven coordinate"),
     ("version", "a package version string"),

@@ -17,6 +17,22 @@
 //! - Dependencies: `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/dependencies?gems={name}`
 //! - Gem info:     `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/gems/{name}.json`
 //! - Download:     (standard package download endpoint)
+//!
+//! ## Compact index
+//!
+//! Neither of those two is how a modern client resolves a gem.
+//! `Gem::Source#dependency_resolver_set` asks the source for `versions`, and
+//! what it does next depends only on whether that file is there: on a hit it
+//! resolves through the *compact index* (`info/<gem>`), on a miss it falls back
+//! to the legacy Marshal index (`specs.4.8.gz` + `quick/Marshal.4.8/…`), which
+//! ForgeKeep does not serve. So `versions` is the switch, and the three files
+//! built below — `versions`, `info/<gem>`, `names` — are the whole read side:
+//! <https://guides.rubygems.org/rubygems-org-compact-index-api/>
+//!
+//! The download URL is not part of that negotiation and is not configurable the
+//! way Cargo's `dl` is: `Gem::RemoteFetcher#download` glues `gems/<file>` onto
+//! the source URL, so `.../packages/rubygems/gems/{file}` is the one path a
+//! `gem_uri` may point at.
 
 use flate2::read::GzDecoder;
 use std::io::Read;
@@ -315,6 +331,139 @@ pub fn build_gem_info_json(name: &str, entries: &[RubyGemsVersionEntry]) -> serd
     })
 }
 
+// ── Compact index ─────────────────────────────────────────
+
+/// One version's line in a compact index `info` file.
+pub struct CompactIndexVersion {
+    pub number: String,
+    /// The platform, and only when it is not the default `ruby` — the format
+    /// spells `1.0.0-java` out but leaves a plain `ruby` gem as `1.0.0`.
+    pub platform: Option<String>,
+    pub dependencies: Vec<RubyGemsDep>,
+    /// SHA-256 of the `.gem` the client is about to download. A client that
+    /// gets one checks the file against it and refuses a mismatch, so it is
+    /// omitted rather than faked when the stored file has no digest.
+    pub checksum: Option<String>,
+}
+
+impl CompactIndexVersion {
+    /// The `VERSION[-PLATFORM]` chunk, spelled the same way in both files —
+    /// `versions` lists it per gem and `info` opens each line with it.
+    pub fn version_and_platform(&self) -> String {
+        match self.platform {
+            Some(ref platform) => format!("{}-{}", self.number, platform),
+            None => self.number.clone(),
+        }
+    }
+}
+
+/// One gem's line in the compact index `versions` file.
+pub struct CompactIndexGem {
+    pub name: String,
+    /// `VERSION[-PLATFORM]` chunks, in the order the `info` file lists them.
+    pub versions: Vec<String>,
+    /// MD5 of this gem's `info` file — see [`compact_index_info_checksum`].
+    pub info_checksum: String,
+}
+
+/// Build a gem's `info` file: one line per version.
+///
+/// ```text
+/// ---
+/// 1.0.0 rack:>= 2.0&< 4.0,rake:>= 0|checksum:6d2f…
+/// ```
+///
+/// The pipe is always there even with no dependencies, because it is what the
+/// client's parser splits on; the requirements after it carry the checksum.
+pub fn build_compact_index_info(versions: &[CompactIndexVersion]) -> String {
+    let mut out = String::from("---\n");
+
+    for version in versions {
+        out.push_str(&version.version_and_platform());
+        out.push(' ');
+
+        let deps: Vec<String> = version
+            .dependencies
+            .iter()
+            .map(|dep| format!("{}:{}", dep.name, join_constraints(&dep.requirements)))
+            .collect();
+        out.push_str(&deps.join(","));
+
+        out.push('|');
+        if let Some(ref checksum) = version.checksum {
+            out.push_str("checksum:");
+            out.push_str(checksum);
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Build the `versions` file — the index a client reads before anything else.
+///
+/// `created_at` sits above the `---` separator, which the format calls opaque
+/// metadata, so it is passed through as stored rather than reformatted.
+pub fn build_compact_index_versions(created_at: &str, gems: &[CompactIndexGem]) -> String {
+    let mut out = format!("created_at: {created_at}\n---\n");
+
+    for gem in gems {
+        out.push_str(&gem.name);
+        out.push(' ');
+        out.push_str(&gem.versions.join(","));
+        out.push(' ');
+        out.push_str(&gem.info_checksum);
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Build the `names` file: every gem name, one per line.
+pub fn build_compact_index_names(names: &[String]) -> String {
+    let mut out = String::from("---\n");
+    for name in names {
+        out.push_str(name);
+        out.push('\n');
+    }
+    out
+}
+
+/// The checksum the `versions` file publishes for a gem's `info` file.
+///
+/// MD5, and not a choice: the client caches `info/<gem>` on disk and re-fetches
+/// it only when this column differs from its own `Digest::MD5` of the cached
+/// copy. It must therefore be the MD5 of the info body byte for byte as it is
+/// served — anything else is a permanent cache miss.
+pub fn compact_index_info_checksum(info: &str) -> String {
+    use md5::{Digest, Md5};
+
+    let mut hasher = Md5::new();
+    hasher.update(info.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Rewrite a RubyGems requirement string into one compact-index constraint
+/// chunk.
+///
+/// A gemspec spells several constraints on one dependency comma-separated
+/// (`">= 2.0, < 4.0"`), but the comma is what separates *dependencies* in this
+/// format — the ampersand separates constraints on the same gem. An empty
+/// requirement becomes `>= 0`, which is what it means.
+fn join_constraints(requirements: &str) -> String {
+    let constraints: Vec<&str> = requirements
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    if constraints.is_empty() {
+        ">= 0".to_string()
+    } else {
+        constraints.join("&")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +623,82 @@ description: ""
         assert_eq!(v1["number"], "1.0.0");
         assert_eq!(v1["summary"], "A gem");
         assert_eq!(v1["sha"], "abc123");
+    }
+
+    #[test]
+    fn info_line_separates_dependencies_from_constraints() {
+        let info = build_compact_index_info(&[CompactIndexVersion {
+            number: "1.0.0".into(),
+            platform: None,
+            dependencies: vec![
+                RubyGemsDep {
+                    name: "rack".into(),
+                    // One dependency, two constraints: the comma a gemspec uses
+                    // here separates *dependencies* in this format.
+                    requirements: ">= 2.0, < 4.0".into(),
+                },
+                RubyGemsDep {
+                    name: "rake".into(),
+                    requirements: String::new(),
+                },
+            ],
+            checksum: Some("6d2f".into()),
+        }]);
+
+        assert_eq!(
+            info,
+            "---\n1.0.0 rack:>= 2.0&< 4.0,rake:>= 0|checksum:6d2f\n"
+        );
+    }
+
+    #[test]
+    fn info_line_keeps_the_pipe_without_dependencies_or_checksum() {
+        // The client's parser splits on the pipe before it looks at either
+        // side, so a line missing it is not an empty entry — it is unparseable.
+        let info = build_compact_index_info(&[CompactIndexVersion {
+            number: "1.0.0".into(),
+            platform: Some("java".into()),
+            dependencies: Vec::new(),
+            checksum: None,
+        }]);
+
+        assert_eq!(info, "---\n1.0.0-java |\n");
+    }
+
+    #[test]
+    fn versions_file_lists_each_gem_with_its_info_checksum() {
+        let info = build_compact_index_info(&[CompactIndexVersion {
+            number: "1.0.0".into(),
+            platform: None,
+            dependencies: Vec::new(),
+            checksum: Some("abc".into()),
+        }]);
+        let checksum = compact_index_info_checksum(&info);
+
+        let versions = build_compact_index_versions(
+            "2026-07-28T00:00:00Z",
+            &[CompactIndexGem {
+                name: "matrix-gem".into(),
+                versions: vec!["1.0.0".into(), "1.1.0-java".into()],
+                info_checksum: checksum.clone(),
+            }],
+        );
+
+        assert_eq!(
+            versions,
+            format!(
+                "created_at: 2026-07-28T00:00:00Z\n---\nmatrix-gem 1.0.0,1.1.0-java {checksum}\n"
+            )
+        );
+        // MD5 of the info body, not of anything else: the client compares this
+        // column against its own digest of the cached file.
+        use md5::{Digest, Md5};
+        assert_eq!(checksum, format!("{:x}", Md5::digest(info.as_bytes())));
+    }
+
+    #[test]
+    fn names_file_is_one_gem_per_line_under_the_separator() {
+        let names = build_compact_index_names(&["a-gem".to_string(), "b-gem".to_string()]);
+        assert_eq!(names, "---\na-gem\nb-gem\n");
     }
 }

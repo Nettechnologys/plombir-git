@@ -488,6 +488,49 @@ fn cargo_index_routes(table: RouteTable) -> RouteTable {
     table
 }
 
+/// The RubyGems compact index, and the one download path a client derives.
+///
+/// The registry root is `.../packages/rubygems/` — that URL is what goes into
+/// `gem install --source` or a `Gemfile`. What hangs off it is not a matter of
+/// taste: `Gem::Source` asks for `versions` before anything else and reads the
+/// answer as a protocol choice. Served, and it resolves through `info/{gem}`;
+/// missing, and it falls back to the legacy Marshal index (`specs.4.8.gz`,
+/// `quick/Marshal.4.8/…`), which ForgeKeep does not serve either — so the
+/// client's next stop is a 404 with no explanation.
+///
+/// `gems/{file}` is not advertised anywhere and does not need to be: the client
+/// appends it to the source URL on its own. That makes it the only path a
+/// `gem_uri` can point at, and the reason the old one — `{base}/gems/…`, at the
+/// instance root, where the SPA lives — handed `gem` an HTML page.
+///
+/// One edge, the same shape as the ones [`maven_layout_routes`] documents: a
+/// gem named `versions`, `names`, `info` or `gems` shadows part of ForgeKeep's
+/// own `{pkg_type}/{pkg_name}` API for that one name. RubyGems has no such gem,
+/// and the protocol spelling is the one a client cannot be asked to give up.
+fn rubygems_protocol_routes(table: RouteTable) -> RouteTable {
+    table
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/rubygems/versions",
+            api::packages::rubygems_compact_versions,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/rubygems/info/{gem_name}",
+            api::packages::rubygems_compact_info,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/rubygems/names",
+            api::packages::rubygems_compact_names,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/rubygems/gems/{filename}",
+            api::packages::rubygems_gem_download,
+        )
+}
+
 /// Build every route the server serves, and the access level of each.
 ///
 /// `auth_rate_limiter` is layered only onto the unauthenticated credential
@@ -1700,6 +1743,8 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/nuget/query",
             api::packages::nuget_search,
         )
+        // RubyGems compact index — see `rubygems_protocol_routes`.
+        .with(rubygems_protocol_routes)
         // RubyGems protocol endpoints
         .get(
             RepoRead,

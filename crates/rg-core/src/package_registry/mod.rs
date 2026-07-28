@@ -21,8 +21,9 @@ pub use adapters::pypi::{
     PyPIVersionEntry,
 };
 pub use adapters::rubygems::{
-    build_dependencies_json, build_gem_info_json, RubyGemsDep, RubyGemsDependencyEntry,
-    RubyGemsVersionEntry,
+    build_compact_index_info, build_compact_index_names, build_compact_index_versions,
+    build_dependencies_json, build_gem_info_json, compact_index_info_checksum, CompactIndexGem,
+    CompactIndexVersion, RubyGemsDep, RubyGemsDependencyEntry, RubyGemsVersionEntry,
 };
 pub use service::{
     package_types, FileDetail, PackageDetail, PackageSummary, PublishInfo, PublishResult,

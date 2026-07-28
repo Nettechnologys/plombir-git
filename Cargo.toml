@@ -92,6 +92,10 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 # Crypto
 hmac = "0.12"
 sha2 = "0.10"
+# Not a security primitive here: the RubyGems compact index specifies MD5 as the
+# cache key of an `info` file, and a client compares it against its own
+# `Digest::MD5` of the cached copy. Any other digest would simply never match.
+md-5 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 aes-gcm = "0.10"

@@ -718,3 +718,150 @@ version = "1.0.0"
         .iter()
         .any(|package| package["name"] == "matrix-cargo"));
 }
+
+/// RubyGems resolves through the compact index: `versions` first — its presence
+/// is what keeps the client off the legacy Marshal index we do not serve — then
+/// `info/<gem>`, then a `.gem` at a path the client builds itself by appending
+/// `gems/<file>` to the source URL. This walks those three, in that order, and
+/// then follows the published `gem_uri`; the `api/v1/gems/<gem>.json` spelling
+/// the rest of the suite uses is ForgeKeep's own and no client asks for it.
+#[tokio::test]
+async fn rubygems_compact_index_serves_the_layout_gem_requests() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let gem_metadata = b"name: matrix-gem\nversion: 1.0.0\nsummary: RubyGems matrix package\n";
+    let gem_file = tar_archive(&[("metadata.gz", &gzip(gem_metadata))]);
+
+    let published = client
+        .post(package_url(&base, &["rubygems", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-gem-1.0.0.gem\"",
+        )
+        .body(gem_file.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    // ── `versions`, the request that picks the protocol ─────────────────────
+    let versions = client
+        .get(package_url(&base, &["rubygems", "versions"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(versions.status(), StatusCode::OK, "compact index versions");
+    let versions = versions.text().await.unwrap();
+    let entry = versions
+        .lines()
+        .find(|line| line.starts_with("matrix-gem "))
+        .unwrap_or_else(|| panic!("versions index lost the gem: {versions}"));
+    let mut columns = entry.split(' ');
+    assert_eq!(columns.next(), Some("matrix-gem"));
+    assert_eq!(columns.next(), Some("1.0.0"));
+    let info_checksum = columns.next().expect("versions line carries no checksum");
+
+    // ── `info/<gem>`, what the resolver actually reads ──────────────────────
+    let info = client
+        .get(package_url(&base, &["rubygems", "info", "matrix-gem"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.status(), StatusCode::OK, "compact index info");
+    let info = info.text().await.unwrap();
+    let line = info
+        .lines()
+        .find(|line| line.starts_with("1.0.0"))
+        .unwrap_or_else(|| panic!("info file lost the version: {info}"));
+    // The pipe is what the client's parser splits on before it reads either
+    // side, and the checksum after it is what it verifies the download against.
+    let (_, requirements) = line.split_once('|').expect("info line carries no pipe");
+    let checksum = requirements
+        .strip_prefix("checksum:")
+        .unwrap_or_else(|| panic!("info line carries no checksum: {line}"));
+    assert_eq!(checksum.len(), 64, "checksum is not a SHA-256: {checksum}");
+
+    // The column in `versions` is the client's cache key for this exact body —
+    // if it is the digest of anything else, every resolve refetches forever.
+    use md5::{Digest, Md5};
+    assert_eq!(
+        info_checksum,
+        format!("{:x}", Md5::digest(info.as_bytes())),
+        "versions index publishes a checksum of a different info body"
+    );
+
+    // ── The download, at the path the client builds on its own ──────────────
+    let derived = package_url(&base, &["rubygems", "gems", "matrix-gem-1.0.0.gem"]);
+    let downloaded = client.get(derived.clone()).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK, "derived {derived}");
+    assert_eq!(
+        downloaded.bytes().await.unwrap().as_ref(),
+        gem_file.as_slice()
+    );
+
+    // ── And the URL we publish has to be that same one ──────────────────────
+    let gem_info = client
+        .get(package_url(
+            &base,
+            &["rubygems", "api", "v1", "gems", "matrix-gem.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let gem_uri = gem_info["versions"]["1.0.0"]["gem_uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no gem_uri: {gem_info}"));
+    let advertised = client.get(gem_uri).send().await.unwrap();
+    assert_eq!(advertised.status(), StatusCode::OK, "gem_uri {gem_uri}");
+    assert_eq!(
+        advertised.bytes().await.unwrap().as_ref(),
+        gem_file.as_slice()
+    );
+
+    // ── Misses are misses, not the SPA ──────────────────────────────────────
+    for segments in [
+        vec!["rubygems", "info", "no-such-gem"],
+        vec!["rubygems", "gems", "no-such-gem-1.0.0.gem"],
+    ] {
+        let response = client
+            .get(package_url(&base, &segments))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{segments:?}");
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("<html"),
+            "{segments:?} reached the SPA fallback: {body}"
+        );
+    }
+
+    // ── The routes these sit on top of still answer ─────────────────────────
+    let names = client
+        .get(package_url(&base, &["rubygems", "names"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(names.status(), StatusCode::OK, "names");
+    assert!(names.text().await.unwrap().contains("matrix-gem"));
+
+    let listed = client
+        .get(package_url(&base, &["rubygems", "list"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK, "generic list");
+    let listed = listed.json::<serde_json::Value>().await.unwrap();
+    assert!(listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|package| package["name"] == "matrix-gem"));
+}

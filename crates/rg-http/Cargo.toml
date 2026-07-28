@@ -50,6 +50,9 @@ zip = { workspace = true }
 socket2 = "0.5"
 jsonwebtoken = { workspace = true }
 tokio-tungstenite = "0.29"
+# Checks that the RubyGems `versions` index publishes the MD5 of the very
+# `info` body the server answers with — the pair is what a client caches on.
+md-5 = { workspace = true }
 
 [lints]
 workspace = true
