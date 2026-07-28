@@ -226,6 +226,10 @@ fn apply_middleware(
     // with `into_make_service_with_connect_info` supplies; the test harness
     // serves without it, so both layers stay off there. This is the one
     // deliberate difference between the two stacks — see `build_test_router`.
+    // Because it is the one difference, it is also the one layer the ordinary
+    // suite cannot notice going missing; `rate_limit_mounted_tests` builds the
+    // production router with a tiny budget and serves it the production way, so
+    // deleting either limiter turns a test red (card_971ab86e0eaf).
     let router = match rate_limiter {
         Some(limiter) => router
             .layer(axum::middleware::from_extractor::<
@@ -490,7 +494,9 @@ fn cargo_index_routes(table: RouteTable) -> RouteTable {
 /// endpoints (`/users/register`, `/users/login`). The test router passes
 /// `None` so those routes carry no extra layer: the limiter middleware extracts
 /// `ConnectInfo`, which the test harness (plain `oneshot`, no
-/// `into_make_service_with_connect_info`) does not provide.
+/// `into_make_service_with_connect_info`) does not provide. That the two routes
+/// really do carry it in production is covered by `rate_limit_mounted_tests`,
+/// which builds this router with `Some(..)` and a budget of two.
 pub(crate) fn build_all_routes(
     state: &AppState,
     auth_rate_limiter: Option<&rate_limit::RateLimiter>,

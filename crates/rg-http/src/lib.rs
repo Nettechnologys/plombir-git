@@ -594,11 +594,30 @@ pub fn create_router_for_test(state: AppState) -> Router {
 /// `into_make_service_with_connect_info`, because the production stack still
 /// carries the rate-limit layer's `ConnectInfo` extractor.
 pub fn create_router_for_test_with_static_files(state: AppState) -> Router {
-    routes::create_router(
+    // Both limiters disabled (`max_requests = 0`), so the layers are mounted —
+    // the `ConnectInfo` extractor with them — but never reject anything.
+    create_router_for_test_with_rate_limits(
         state,
         rate_limit::RateLimiter::new(0, 60),
         rate_limit::RateLimiter::new(0, 60),
     )
+}
+
+/// Create the production router in tests with both rate limiters supplied.
+///
+/// The two limiters are the only thing production's stack carries that the test
+/// router does not (see `routes::apply_middleware`), which makes them the only
+/// thing no ordinary integration test can notice going missing. A test that
+/// wants to prove they are mounted builds the router here with a budget small
+/// enough to spend, and serves it with
+/// `into_make_service_with_connect_info::<SocketAddr>()` — the limiter
+/// middleware extracts `ConnectInfo`, which the plain harness does not supply.
+pub fn create_router_for_test_with_rate_limits(
+    state: AppState,
+    rate_limiter: rate_limit::RateLimiter,
+    auth_rate_limiter: rate_limit::RateLimiter,
+) -> Router {
+    routes::create_router(state, rate_limiter, auth_rate_limiter)
 }
 
 /// The test router plus the declared access level of every route in it.
