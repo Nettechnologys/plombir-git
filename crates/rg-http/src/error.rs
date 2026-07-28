@@ -502,7 +502,10 @@ mod tests {
             message.contains("/srv/forgekeep/repos/acme/widgets.git"),
             "{message}"
         );
-        assert!(message.contains("repository directory is missing"), "{message}");
+        assert!(
+            message.contains("repository directory is missing"),
+            "{message}"
+        );
         assert!(message.contains("[server].repo_root"), "{message}");
     }
 

@@ -425,7 +425,9 @@ pub async fn trigger_pipeline(
         .unwrap_or_else(|| "refs/heads/main".to_string());
     let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
         Ok(Some(sha)) => sha,
-        Ok(None) => return AppError::bad_request("cannot resolve commit SHA for ref").into_response(),
+        Ok(None) => {
+            return AppError::bad_request("cannot resolve commit SHA for ref").into_response()
+        }
         Err(e) => return AppError::from(e).into_response(),
     };
 
@@ -706,7 +708,9 @@ fn resolve_commit_sha(
                 "cannot open repository while resolving a commit SHA: {:#}",
                 error
             );
-            return Err(crate::error::repository_storage_open_error(repo_path, error));
+            return Err(crate::error::repository_storage_open_error(
+                repo_path, error,
+            ));
         }
     };
 
