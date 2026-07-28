@@ -41,6 +41,7 @@ mod cross_repo_release_tests;
 mod db_outage_status_tests;
 mod deactivated_account_tests;
 mod deploy_key_tests;
+mod failure_semantics_sweep_tests;
 mod fault_injection_tests;
 mod fork_tests;
 mod git_auth_tests;

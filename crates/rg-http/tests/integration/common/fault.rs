@@ -129,6 +129,14 @@ impl BlobFaults {
         self.delete.store(true, Ordering::SeqCst);
     }
 
+    /// Take the whole blob store away at once — what the sweep needs, where a
+    /// per-endpoint test wants exactly one method to fail.
+    pub fn fail_everything(&self) {
+        for flag in [&self.put, &self.put_file, &self.get, &self.delete] {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Lift every fault, so the test can read back what the failed request left
     /// behind.
     pub fn heal(&self) {
@@ -246,12 +254,168 @@ impl BlobStorage for FaultyBlobStorage {
         self.inner.list(prefix)
     }
 
+    /// Answers "no local file" while reads are faulted.
+    ///
+    /// This is not decoration. `local_path` is the read *shortcut* — the
+    /// attachment, LFS, package and OCI download paths all take it when the
+    /// backend is local and only call [`BlobStorage::get`] when it comes back
+    /// `None` — so a decorator that faults `get` but forwards `local_path`
+    /// leaves every download running against the real disk. The whole-store
+    /// sweep measured exactly that: one route out of ninety-nine noticed the
+    /// store was gone. Withdrawing the shortcut sends those callers down their
+    /// own `get` branch, which is faulted.
     fn local_path(&self, key: &BlobKey) -> Option<std::path::PathBuf> {
+        if self.faults.get.load(Ordering::SeqCst) {
+            return None;
+        }
         self.inner.local_path(key)
     }
 }
 
 // ── Harness ──────────────────────────────────────────────────
+
+/// A test server with every seam a whole-server fault sweep needs.
+///
+/// The per-endpoint tests above take one seam at a time. A sweep that walks the
+/// route table needs all of them at once, plus the table itself — and it needs
+/// the `repo_root` too, because the third piece of infrastructure a handler can
+/// lose is neither the database nor the blob store but the git tree on disk.
+pub struct FaultSweepApp {
+    pub base: String,
+    pub db: rg_db::DatabaseConnection,
+    /// The switches of the [`FaultyBlobStorage`] this server was built with.
+    pub blob_faults: BlobFaults,
+    /// Where bare repositories live: `repo_root/{owner}/{name}.git`.
+    pub repo_root: std::path::PathBuf,
+    /// The `(method, path, access)` rows recorded by the build that produced
+    /// this very router.
+    pub facts: Vec<rg_http::route_table::RouteFact>,
+}
+
+/// Spawn a server whose database, blob store and git tree can each be taken
+/// away independently.
+#[allow(dead_code)]
+pub async fn spawn_test_app_for_fault_sweep() -> FaultSweepApp {
+    let (db, dir) = super::setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let (blob_storage, blob_faults) = FaultyBlobStorage::wrap(Arc::new(
+        rg_core::blob_storage::LocalBlobStorage::new(&repo_root),
+    ));
+    let state = super::build_test_app_state_with(
+        db.clone(),
+        repo_root.clone(),
+        super::StateOverrides {
+            blob_storage: Some(blob_storage),
+        },
+    );
+    let (app, facts) = rg_http::create_router_for_test_with_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    super::wait_for_listener(&addr.to_string()).await;
+    FaultSweepApp {
+        base,
+        db,
+        blob_faults,
+        repo_root,
+        facts,
+    }
+}
+
+/// The tables a request needs to be authenticated at all.
+///
+/// `session_standing_middleware` reads `users` on every authenticated request,
+/// so an outage that takes it away answers `503` from the middleware and no
+/// handler is ever reached. Keeping it alive is what makes the rest of the
+/// server the thing under test.
+pub const AUTH_TABLES: &[&str] = &["users"];
+
+/// The tables an *authorization gate* needs on top of [`AUTH_TABLES`].
+///
+/// Keeping these alive is the difference between measuring the gate and
+/// measuring the handler. Under a total outage a repository-scoped route never
+/// reaches its handler — `RepoRead` and friends resolve the repository first
+/// and fail there — so every handler behind a gate is shielded from the fault
+/// and a handler that collapses a database error into `400` sails through.
+/// With repository resolution and the permission tables intact, the gate admits
+/// the caller and the handler's own queries are the ones that fail.
+pub const GATE_TABLES: &[&str] = &[
+    "users",
+    "repositories",
+    "repo_collaborators",
+    "organizations",
+    "organization_members",
+    "teams",
+    "team_members",
+];
+
+/// Take the database away from a running server, without closing its pool.
+///
+/// Closing the pool is the blunter outage and `db_outage_status_tests` uses it;
+/// it is useless to a sweep, because it fails the session lookup and every
+/// request dies in the middleware. Dropping tables selectively lets a caller
+/// choose *which layer* the fault lands on — see [`AUTH_TABLES`] and
+/// [`GATE_TABLES`].
+///
+/// Returns how many tables were dropped, so a caller can refuse to trust a sweep
+/// that broke nothing.
+#[allow(dead_code)]
+pub async fn drop_every_table_except(db: &rg_db::DatabaseConnection, keep: &[&str]) -> usize {
+    use sea_orm::{DatabaseBackend, Statement};
+
+    async fn names(db: &rg_db::DatabaseConnection, kind: &str, keep: &[&str]) -> Vec<String> {
+        db.query_all(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "SELECT name FROM sqlite_master WHERE type = '{kind}' \
+                 AND name NOT LIKE 'sqlite_%'"
+            ),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("failed to list {kind}s: {error}"))
+        .iter()
+        .map(|row| row.try_get::<String>("", "name").expect("object name"))
+        .filter(|name| !keep.contains(&name.as_str()))
+        .collect()
+    }
+
+    // Triggers and views are dropped wholesale: one attached to a kept table
+    // but referencing a dropped one is exactly the "no such table" landmine
+    // below, and nothing in the sweep depends on them.
+    let tables = names(db, "table", keep).await;
+
+    // One batch on one connection, and both halves of that matter.
+    //
+    // `PRAGMA foreign_keys` is per-connection while a `DatabaseConnection` is a
+    // *pool*, so setting it in its own call disables enforcement on whichever
+    // connection happened to serve that call and no other. With enforcement
+    // still on elsewhere, dropping a child table runs an implicit delete whose
+    // foreign-key action names a parent that is already gone, and the drop dies
+    // with "no such table: main.repositories" — the sweep would then fail while
+    // *arming* the fault rather than while measuring anything.
+    //
+    // Triggers and views go first for the same family of reason: SQLite
+    // re-parses a table's triggers as it drops the table.
+    let mut batch = String::from("PRAGMA foreign_keys = OFF;\n");
+    for kind in ["trigger", "view"] {
+        for name in names(db, kind, &[]).await {
+            batch.push_str(&format!("DROP {kind} IF EXISTS \"{name}\";\n"));
+        }
+    }
+    for name in &tables {
+        batch.push_str(&format!("DROP TABLE IF EXISTS \"{name}\";\n"));
+    }
+
+    db.execute_unprepared(&batch)
+        .await
+        .unwrap_or_else(|error| panic!("failed to take the database away: {error}"));
+    tables.len()
+}
 
 /// Spawn the test app with both seams armed and idle.
 ///
