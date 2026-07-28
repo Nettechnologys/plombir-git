@@ -735,9 +735,17 @@ pub async fn cargo_sparse_index(
         Err(e) => return err_text(StatusCode::NOT_FOUND, &format!("{e:#}")),
     };
 
-    let entries: Vec<(&str, Option<&str>, bool)> = versions
+    let entries: Vec<rg_core::package_registry::CargoIndexVersion<'_>> = versions
         .iter()
-        .map(|v| (v.version.as_str(), v.sha256.as_deref(), v.is_yanked))
+        .map(|v| rg_core::package_registry::CargoIndexVersion {
+            version: v.version.as_str(),
+            sha256: v.sha256.as_deref(),
+            yanked: v.is_yanked,
+            // Dependencies and features live only in the manifest inside the
+            // `.crate`; the adapter lifted them here at publish, and this is
+            // where cargo's resolver reads them back.
+            metadata: v.metadata.as_deref(),
+        })
         .collect();
 
     let body = rg_core::package_registry::build_sparse_index(pkg_name, &entries);

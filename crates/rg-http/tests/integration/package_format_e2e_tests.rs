@@ -719,6 +719,115 @@ version = "1.0.0"
         .any(|package| package["name"] == "matrix-cargo"));
 }
 
+/// Cargo resolves against the index, never against the `.crate` file, so the
+/// dependencies and features of a published crate have to survive the trip out
+/// of its manifest and into the index line. Served without them, the entry does
+/// not say "unknown" — it says the crate needs nothing, which resolves cleanly
+/// and only fails much later at `unresolved import`.
+#[tokio::test]
+async fn cargo_index_carries_the_manifest_dependencies_and_features() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let cargo_toml = br#"[package]
+name = "matrix-deps-crate"
+version = "1.0.0"
+links = "openssl"
+rust-version = "1.70"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], default-features = false }
+rand = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix = "0.27"
+
+[features]
+default = ["std"]
+std = []
+fast = ["dep:rand"]
+"#;
+    let crate_file = tar_gz(&[("matrix-deps-crate-1.0.0/Cargo.toml", cargo_toml)]);
+
+    let published = client
+        .post(package_url(&base, &["cargo", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-deps-crate-1.0.0.crate\"",
+        )
+        .body(crate_file)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let index = client
+        .get(package_url(
+            &base,
+            &["cargo", "index", "ma", "tr", "matrix-deps-crate"],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+    let body = index.text().await.unwrap();
+    let line = body
+        .lines()
+        .find(|line| line.contains("\"vers\":\"1.0.0\""))
+        .unwrap_or_else(|| panic!("index lost the version: {body}"));
+    let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+
+    let deps = entry["deps"].as_array().unwrap();
+    let dep = |name: &str| {
+        deps.iter()
+            .find(|d| d["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from the index entry: {entry}"))
+    };
+
+    // The whole RFC 2789 dependency shape, not just the name.
+    assert_eq!(
+        *dep("serde"),
+        serde_json::json!({
+            "name": "serde",
+            "req": "1.0",
+            "features": ["derive"],
+            "optional": false,
+            "default_features": false,
+            "target": null,
+            "kind": "normal",
+            "registry": null,
+            "package": null,
+        }),
+        "index entry: {entry}"
+    );
+    assert_eq!(dep("rand")["optional"], true);
+    assert_eq!(dep("tempfile")["kind"], "dev");
+    assert_eq!(dep("nix")["target"], "cfg(unix)");
+
+    // `--features` is checked against this map; without it every feature the
+    // crate really has comes back as "unknown feature".
+    assert_eq!(
+        entry["features"],
+        serde_json::json!({ "default": ["std"], "std": [] }),
+        "index entry: {entry}"
+    );
+    // `dep:` syntax is legible only under schema 2, so it travels separately.
+    assert_eq!(
+        entry["features2"],
+        serde_json::json!({ "fast": ["dep:rand"] })
+    );
+    assert_eq!(entry["v"], 2);
+
+    assert_eq!(entry["links"], "openssl");
+    assert_eq!(entry["rust_version"], "1.70");
+}
+
 /// RubyGems resolves through the compact index: `versions` first — its presence
 /// is what keeps the client off the legacy Marshal index we do not serve — then
 /// `info/<gem>`, then a `.gem` at a path the client builds itself by appending

@@ -55,7 +55,8 @@ impl PackageAdapter for CargoAdapter {
             anyhow::anyhow!("invalid .crate file: no Cargo.toml found in archive")
         })?;
 
-        // Parse minimal TOML — we only need [package] fields.
+        // `[package]` fills the package row; the dependency and feature tables
+        // go into the sparse index, so the whole document is parsed.
         let doc: toml::Value =
             toml::from_str(&toml_str).map_err(|e| anyhow::anyhow!("invalid Cargo.toml: {e}"))?;
 
@@ -100,6 +101,8 @@ impl PackageAdapter for CargoAdapter {
             })
         });
 
+        let protocol_metadata = Some(cargo_protocol_metadata(&doc, pkg));
+
         Ok(ExtractedMetadata {
             name,
             version: version.clone(),
@@ -109,7 +112,7 @@ impl PackageAdapter for CargoAdapter {
             keywords,
             license,
             semver: Some(version),
-            protocol_metadata: None,
+            protocol_metadata,
         })
     }
 
@@ -156,38 +159,276 @@ impl PackageAdapter for CargoAdapter {
     }
 }
 
+/// One published version, in the terms the sparse index describes it.
+#[derive(Debug, Clone, Copy)]
+pub struct CargoIndexVersion<'a> {
+    /// The version string, as published.
+    pub version: &'a str,
+    /// Checksum of the `.crate` file — cargo verifies the download against it.
+    pub sha256: Option<&'a str>,
+    /// Whether the version was yanked.
+    pub yanked: bool,
+    /// The index fields the adapter stored at publish, as a JSON object; see
+    /// [`cargo_protocol_metadata`]. `None` for a version published before the
+    /// adapter recorded them, and the entry then falls back to the dependency-
+    /// free shape it always had.
+    pub metadata: Option<&'a str>,
+}
+
+/// The keys a stored blob is allowed to contribute to an index entry.
+///
+/// The metadata column is written by [`CargoAdapter::extract_metadata`], but it
+/// is still a free-form JSON column: whitelisting keeps anything else that ends
+/// up there — a future field, a hand-edited row — out of the protocol response,
+/// where cargo would reject the line as malformed rather than ignore it.
+const INDEX_FIELDS: [&str; 6] = [
+    "deps",
+    "features",
+    "features2",
+    "v",
+    "links",
+    "rust_version",
+];
+
 /// Build a sparse-index line for a version entry.
 ///
 /// Cargo expects one JSON object per line, like:
 /// ```json
-/// {"name":"mycrate","vers":"0.1.0","deps":[],"cksum":"...","features":{},"yanked":false,"links":null}
+/// {"name":"mycrate","vers":"0.1.0","deps":[{"name":"serde","req":"^1.0","features":[],
+///  "optional":false,"default_features":true,"target":null,"kind":"normal",
+///  "registry":null,"package":null}],"cksum":"...","features":{},"yanked":false,"links":null}
 /// ```
-pub fn build_sparse_index_entry(
-    name: &str,
-    version: &str,
-    sha256: Option<&str>,
-    yanked: bool,
-) -> serde_json::Value {
-    serde_json::json!({
+///
+/// `deps` and `features` are the resolver's whole input: cargo resolves against
+/// the index, never against the `.crate` file, so an entry that reports neither
+/// is not a partial answer but a wrong one — it asserts the crate depends on
+/// nothing, and resolution succeeds on that lie before the build fails at
+/// `unresolved import`.
+pub fn build_sparse_index_entry(name: &str, version: &CargoIndexVersion<'_>) -> serde_json::Value {
+    let mut entry = serde_json::json!({
         "name": name,
-        "vers": version,
+        "vers": version.version,
         "deps": [],
-        "cksum": sha256.unwrap_or(""),
+        "cksum": version.sha256.unwrap_or(""),
         "features": {},
-        "yanked": yanked,
+        "yanked": version.yanked,
         "links": serde_json::Value::Null,
-    })
+    });
+
+    let stored = version
+        .metadata
+        .and_then(|blob| serde_json::from_str::<serde_json::Value>(blob).ok());
+    if let Some(serde_json::Value::Object(stored)) = stored {
+        for field in INDEX_FIELDS {
+            if let Some(value) = stored.get(field) {
+                entry[field] = value.clone();
+            }
+        }
+    }
+
+    entry
 }
 
 /// Build the full sparse-index response: one JSON line per version.
-pub fn build_sparse_index(name: &str, versions: &[(&str, Option<&str>, bool)]) -> String {
+pub fn build_sparse_index(name: &str, versions: &[CargoIndexVersion<'_>]) -> String {
     let mut lines = String::new();
-    for (ver, sha256, yanked) in versions {
-        let entry = build_sparse_index_entry(name, ver, *sha256, *yanked);
+    for version in versions {
+        let entry = build_sparse_index_entry(name, version);
         lines.push_str(&serde_json::to_string(&entry).unwrap_or_default());
         lines.push('\n');
     }
     lines
+}
+
+/// The `Cargo.toml` sections that have no package column of their own, in the
+/// shape RFC 2789 spells them, ready to be pasted into an index entry.
+///
+/// This is written at publish rather than derived on read because the `.crate`
+/// file is the only place the manifest exists, and the index route never opens
+/// it. The object is always produced, so an empty `deps` is a recorded fact
+/// about the crate instead of a missing one.
+fn cargo_protocol_metadata(doc: &toml::Value, pkg: &toml::Value) -> String {
+    let mut out = serde_json::Map::new();
+
+    out.insert("deps".into(), index_dependencies(doc).into());
+
+    let (features, features2) = index_features(doc);
+    out.insert("features".into(), features.into());
+    if !features2.is_empty() {
+        out.insert("features2".into(), features2.into());
+        // Schema 2 is what tells a client `features2` may be present. Cargo
+        // before 1.60 reads only `features`, so keeping the new syntax out of
+        // it is what lets an old client read the rest of the entry at all.
+        out.insert("v".into(), 2.into());
+    }
+
+    // `links` claims a native library, and cargo refuses a graph where two
+    // crates claim the same one — a check it can only make from the index.
+    if let Some(links) = pkg.get("links").and_then(|v| v.as_str()) {
+        out.insert("links".into(), links.into());
+    }
+    // MSRV-aware resolution picks versions by this field; without it cargo
+    // picks the newest and fails on a toolchain the crate never supported.
+    if let Some(rust_version) = pkg.get("rust-version").and_then(|v| v.as_str()) {
+        out.insert("rust_version".into(), rust_version.into());
+    }
+
+    serde_json::Value::Object(out).to_string()
+}
+
+/// The manifest's dependency tables and the `kind` each maps to in the index.
+const DEP_SECTIONS: [(&str, &str); 3] = [
+    ("dependencies", "normal"),
+    ("dev-dependencies", "dev"),
+    ("build-dependencies", "build"),
+];
+
+/// Every dependency a manifest declares, including the per-target ones.
+///
+/// Dev-dependencies are kept — unlike a gemspec's, they are what `cargo test`
+/// of a *published* crate resolves against, and the index is where cargo reads
+/// them from; the `kind` field is how a client tells them apart.
+fn index_dependencies(doc: &toml::Value) -> Vec<serde_json::Value> {
+    let mut deps = Vec::new();
+
+    for (section, kind) in DEP_SECTIONS {
+        collect_dependency_section(doc.get(section), kind, None, &mut deps);
+    }
+
+    // `[target.'cfg(unix)'.dependencies]` — the same three tables again, once
+    // per target expression. The expression is not ours to interpret: it goes
+    // into the entry verbatim and the client decides whether it applies.
+    if let Some(targets) = doc.get("target").and_then(|v| v.as_table()) {
+        for (target, sections) in targets {
+            for (section, kind) in DEP_SECTIONS {
+                collect_dependency_section(sections.get(section), kind, Some(target), &mut deps);
+            }
+        }
+    }
+
+    deps
+}
+
+fn collect_dependency_section(
+    section: Option<&toml::Value>,
+    kind: &str,
+    target: Option<&str>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    let Some(table) = section.and_then(|v| v.as_table()) else {
+        return;
+    };
+    for (alias, spec) in table {
+        out.push(index_dependency(alias, spec, kind, target));
+    }
+}
+
+/// One dependency, in the form RFC 2789 gives it.
+///
+/// `name` is the name the manifest imports the crate under; a renamed
+/// dependency (`foo = { package = "bar" }`) keeps the alias here and names the
+/// real crate in `package`, which is the split cargo's resolver expects — swap
+/// them and it fetches a crate that does not exist.
+fn index_dependency(
+    alias: &str,
+    spec: &toml::Value,
+    kind: &str,
+    target: Option<&str>,
+) -> serde_json::Value {
+    // The short form is nothing but the requirement: `serde = "1.0"`.
+    let short_form = spec.as_str().map(String::from);
+
+    let req = short_form.clone().unwrap_or_else(|| {
+        spec.get("version")
+            .and_then(|v| v.as_str())
+            // A dependency that reached the index without a requirement (a
+            // bare `path` / `git` entry that survived packaging) matches
+            // anything, rather than vanishing from the entry.
+            .unwrap_or("*")
+            .to_string()
+    });
+
+    let features: Vec<serde_json::Value> = spec
+        .get("features")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.as_str())
+                .map(Into::into)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let optional = spec
+        .get("optional")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Absent means enabled — the opposite default from the JSON field's `false`.
+    let default_features = spec
+        .get("default-features")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let package = spec
+        .get("package")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    // A dependency from another registry names it by index URL; one from this
+    // registry leaves the field null.
+    let registry = spec
+        .get("registry-index")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    serde_json::json!({
+        "name": alias,
+        "req": req,
+        "features": features,
+        "optional": optional,
+        "default_features": default_features,
+        "target": target,
+        "kind": kind,
+        "registry": registry,
+        "package": package,
+    })
+}
+
+/// The `[features]` table, split the way the index requires.
+///
+/// A feature whose value mentions `dep:foo` or `foo?/bar` uses syntax cargo
+/// only learned in 1.60. Listing it under `features` makes an older client fail
+/// on the whole entry; `features2` is the key such a client does not read, so
+/// the split is what keeps both able to resolve the crate.
+fn index_features(
+    doc: &toml::Value,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+) {
+    let mut features = serde_json::Map::new();
+    let mut features2 = serde_json::Map::new();
+
+    let Some(table) = doc.get("features").and_then(|v| v.as_table()) else {
+        return (features, features2);
+    };
+
+    for (name, values) in table {
+        let values: Vec<&str> = values
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let needs_schema_2 = values
+            .iter()
+            .any(|v| v.starts_with("dep:") || v.contains("?/"));
+
+        let values: Vec<serde_json::Value> = values.into_iter().map(Into::into).collect();
+        if needs_schema_2 {
+            features2.insert(name.clone(), values.into());
+        } else {
+            features.insert(name.clone(), values.into());
+        }
+    }
+
+    (features, features2)
 }
 
 /// The directory segments Cargo puts a crate under in the index.
@@ -246,6 +487,317 @@ pub fn build_cargo_index_config(base_url: &str, owner: &str, repo: &str) -> serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    /// A `.crate` file is a gzipped tar carrying `{name}-{version}/Cargo.toml`.
+    fn make_crate(manifest: &str) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        let bytes = manifest.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "matrix-crate-1.0.0/Cargo.toml", bytes)
+            .unwrap();
+        let tar = tar.into_inner().unwrap();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// The stored index fields of a manifest, as the adapter records them.
+    fn stored_metadata(manifest: &str) -> serde_json::Value {
+        let meta = CargoAdapter
+            .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(manifest))
+            .unwrap();
+        serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap()
+    }
+
+    /// The entry a client would read for that manifest.
+    fn index_entry(manifest: &str) -> serde_json::Value {
+        let stored = stored_metadata(manifest).to_string();
+        build_sparse_index_entry(
+            "matrix-crate",
+            &CargoIndexVersion {
+                version: "1.0.0",
+                sha256: Some("deadbeef"),
+                yanked: false,
+                metadata: Some(&stored),
+            },
+        )
+    }
+
+    #[test]
+    fn index_entry_carries_the_manifest_dependencies() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dependencies]
+serde = "1.0"
+rand = { version = "0.8", features = ["small_rng"], optional = true, default-features = false }
+"#,
+        );
+
+        assert_eq!(
+            entry["deps"],
+            serde_json::json!([
+                {
+                    "name": "rand",
+                    "req": "0.8",
+                    "features": ["small_rng"],
+                    "optional": true,
+                    "default_features": false,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null,
+                    "package": null,
+                },
+                {
+                    "name": "serde",
+                    "req": "1.0",
+                    "features": [],
+                    "optional": false,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null,
+                    "package": null,
+                },
+            ]),
+            "RFC 2789 dependency shape: {entry}"
+        );
+        // The rest of the entry is untouched by the overlay.
+        assert_eq!(entry["cksum"], "deadbeef");
+        assert_eq!(entry["vers"], "1.0.0");
+        assert_eq!(entry["yanked"], false);
+    }
+
+    #[test]
+    fn dev_and_build_and_target_dependencies_keep_their_kind() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cc = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = "0.27"
+"#,
+        );
+
+        let deps = entry["deps"].as_array().unwrap();
+        let find = |name: &str| {
+            deps.iter()
+                .find(|d| d["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from {entry}"))
+        };
+        assert_eq!(find("tempfile")["kind"], "dev");
+        assert_eq!(find("cc")["kind"], "build");
+        assert_eq!(find("nix")["kind"], "normal");
+        assert_eq!(
+            find("nix")["target"],
+            "cfg(unix)",
+            "the target expression travels verbatim"
+        );
+    }
+
+    /// A renamed dependency keeps the alias as `name`; the crate actually
+    /// fetched is the one in `package`. Swapped, cargo asks for a crate that
+    /// does not exist.
+    #[test]
+    fn a_renamed_dependency_names_both_the_alias_and_the_crate() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dependencies]
+json = { version = "1.0", package = "serde_json", registry-index = "https://other.example/index" }
+"#,
+        );
+
+        let dep = &entry["deps"][0];
+        assert_eq!(dep["name"], "json");
+        assert_eq!(dep["package"], "serde_json");
+        assert_eq!(dep["registry"], "https://other.example/index");
+    }
+
+    /// A dependency that reached the index without a version requirement still
+    /// belongs in the entry — dropping it would understate the crate's needs.
+    #[test]
+    fn a_dependency_without_a_requirement_matches_anything() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dependencies]
+local = { path = "../local" }
+"#,
+        );
+
+        assert_eq!(entry["deps"][0]["name"], "local");
+        assert_eq!(entry["deps"][0]["req"], "*");
+    }
+
+    #[test]
+    fn features_reach_the_entry_and_new_syntax_goes_to_features2() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dependencies]
+rand = { version = "0.8", optional = true }
+
+[features]
+default = ["std"]
+std = []
+fast = ["dep:rand"]
+maybe = ["rand?/small_rng"]
+"#,
+        );
+
+        assert_eq!(
+            entry["features"],
+            serde_json::json!({ "default": ["std"], "std": [] }),
+            "plain features stay where cargo before 1.60 reads them: {entry}"
+        );
+        assert_eq!(
+            entry["features2"],
+            serde_json::json!({ "fast": ["dep:rand"], "maybe": ["rand?/small_rng"] }),
+        );
+        assert_eq!(entry["v"], 2, "features2 is only legible under schema 2");
+    }
+
+    /// No `dep:` syntax anywhere means no `features2` and no `v` — an entry an
+    /// old client reads exactly as a new one does.
+    #[test]
+    fn a_plain_manifest_stays_on_schema_1() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[features]
+std = []
+"#,
+        );
+
+        assert!(entry.get("features2").is_none(), "{entry}");
+        assert!(entry.get("v").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn links_and_rust_version_come_from_the_package_section() {
+        let entry = index_entry(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+links = "openssl"
+rust-version = "1.70"
+"#,
+        );
+
+        assert_eq!(entry["links"], "openssl");
+        assert_eq!(entry["rust_version"], "1.70");
+    }
+
+    /// A manifest with no dependency table records an empty list, so "no
+    /// dependencies" is something the registry knows rather than something it
+    /// failed to look up.
+    #[test]
+    fn a_manifest_without_dependencies_records_an_empty_list() {
+        let stored = stored_metadata(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+"#,
+        );
+
+        assert_eq!(stored["deps"], serde_json::json!([]));
+        assert_eq!(stored["features"], serde_json::json!({}));
+        assert!(stored.get("links").is_none());
+    }
+
+    /// Versions published before the adapter stored index fields — and rows
+    /// whose metadata is not the JSON object this expects — still serve a
+    /// well-formed entry rather than a line cargo cannot parse.
+    #[test]
+    fn an_entry_without_stored_metadata_keeps_the_old_shape() {
+        for metadata in [None, Some("not json"), Some("[1,2]")] {
+            let entry = build_sparse_index_entry(
+                "matrix-crate",
+                &CargoIndexVersion {
+                    version: "1.0.0",
+                    sha256: None,
+                    yanked: true,
+                    metadata,
+                },
+            );
+
+            assert_eq!(entry["deps"], serde_json::json!([]), "{metadata:?}");
+            assert_eq!(entry["features"], serde_json::json!({}), "{metadata:?}");
+            assert_eq!(entry["cksum"], "", "{metadata:?}");
+            assert_eq!(entry["yanked"], true, "{metadata:?}");
+            assert!(entry["links"].is_null(), "{metadata:?}");
+        }
+    }
+
+    /// The metadata column is free-form JSON; only the index's own keys may
+    /// reach a protocol response.
+    #[test]
+    fn a_stray_key_in_the_stored_blob_stays_out_of_the_entry() {
+        let entry = build_sparse_index_entry(
+            "matrix-crate",
+            &CargoIndexVersion {
+                version: "1.0.0",
+                sha256: None,
+                yanked: false,
+                metadata: Some(r#"{"deps":[],"summary":"leaked"}"#),
+            },
+        );
+
+        assert!(entry.get("summary").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn sparse_index_writes_one_line_per_version() {
+        let body = build_sparse_index(
+            "matrix-crate",
+            &[
+                CargoIndexVersion {
+                    version: "1.0.0",
+                    sha256: Some("aa"),
+                    yanked: false,
+                    metadata: Some(r#"{"deps":[{"name":"serde","req":"1.0"}]}"#),
+                },
+                CargoIndexVersion {
+                    version: "1.1.0",
+                    sha256: Some("bb"),
+                    yanked: true,
+                    metadata: None,
+                },
+            ],
+        );
+
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "{body}");
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["deps"][0]["name"], "serde");
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["deps"], serde_json::json!([]));
+        assert_eq!(second["yanked"], true);
+    }
 
     #[test]
     fn index_prefix_follows_the_name_length() {
