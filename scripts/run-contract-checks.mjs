@@ -31,10 +31,6 @@ const root = resolve(scriptsDir, '..');
 //   - nothing gets added here without a card id explaining the red.
 const QUARANTINE = new Map([
   [
-    'release-assets-contract-check.mjs',
-    'card_0c926648b67d — the check greps authorization symbols that were renamed',
-  ],
-  [
     'webhooks-contract-check.mjs',
     'card_71260b04bb85 — the check greps a helper that was removed and an old binding name',
   ],
