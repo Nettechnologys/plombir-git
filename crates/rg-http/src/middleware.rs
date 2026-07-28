@@ -3,7 +3,7 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::Method;
-use axum::http::{header, HeaderName, HeaderValue};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use std::time::Instant;
@@ -147,6 +147,12 @@ async fn inject_request_id(response: Response, request_id: &str) -> Response {
 /// Maintenance mode middleware — rejects mutating requests when the instance
 /// is in read-only maintenance mode.  Safe methods (GET, HEAD, OPTIONS) and
 /// the admin panel are always allowed.
+///
+/// A rejection is a `503 Service Unavailable`, not a 200 carrying an error body:
+/// the request did not happen, and a client — a browser, `git`, a CI runner —
+/// decides whether to retry from the status line, not by parsing the body. The
+/// `Retry-After` hint is deliberately conservative; the instance cannot know how
+/// long the maintenance will last, only that retrying immediately is pointless.
 pub async fn maintenance_middleware(
     State(state): State<crate::AppState>,
     request: Request,
@@ -163,11 +169,22 @@ pub async fn maintenance_middleware(
         let is_admin = path.starts_with("/api/v1/admin/");
 
         if !is_safe_method && !is_admin {
-            return Json(serde_json::json!({
-                "error": "Instance is in maintenance mode. Read-only access only.",
-                "code": "MAINTENANCE_MODE"
-            }))
-            .into_response();
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(crate::error::ErrorResponse {
+                    error: crate::error::ErrorBody {
+                        code: "MAINTENANCE_MODE",
+                        message: "Instance is in maintenance mode. Read-only access only."
+                            .to_string(),
+                        request_id: None,
+                    },
+                }),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
+            return response;
         }
     }
     next.run(request).await

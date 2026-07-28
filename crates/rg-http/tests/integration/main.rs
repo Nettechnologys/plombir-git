@@ -53,6 +53,7 @@ mod job_websocket_tests;
 mod label_lookup_failure_status_tests;
 mod lfs_signed_url_tests;
 mod login_enumeration_tests;
+mod maintenance_mode_tests;
 mod merge_queue_ci_tests;
 mod mfa_disable_lockout_tests;
 mod mirror_tests;

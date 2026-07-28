@@ -179,12 +179,15 @@ async fn admin_settings_survive_a_restart() {
     );
     assert_eq!(row.banner_type, "warning");
 
-    // A second server over the same database: fresh state, cold caches.
+    // A second server over the same database: fresh state, cold caches. The
+    // admin registered above is reused rather than a new one registered here —
+    // both instances share the database and the test JWT secret, and the
+    // restarted one comes up in maintenance mode, which (correctly) refuses the
+    // POST that registration is.
     let restarted = spawn_test_app_over_db(db.clone()).await;
-    let token_after = admin_token(&restarted, &db, "settings_restart_admin_2").await;
     let get_resp = client
         .get(format!("{}/api/v1/admin/settings", restarted))
-        .bearer_auth(&token_after)
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();

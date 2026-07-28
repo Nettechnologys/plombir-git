@@ -1944,6 +1944,20 @@ pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<Rout
             },
         ))
         .layer(build_cors_layer())
+        // Outermost, exactly as in `build_router`: maintenance mode decides
+        // whether a request is served at all, so it answers before anything
+        // else — including the request-id layer, which is why the rejection body
+        // carries no `request_id` in either router.
+        //
+        // Mounting it here is only safe now that the settings live in this
+        // `AppState` instead of a process-global: while they were global, a test
+        // that switched the mode on switched it on for every other test in the
+        // binary (card_08bab0b46e40), and the absence of this layer was the only
+        // thing hiding it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::maintenance_middleware,
+        ))
         .with_state(state);
 
     (router, facts)
