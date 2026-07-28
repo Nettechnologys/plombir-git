@@ -580,6 +580,7 @@ pub(crate) async fn run_serve(
     let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> =
         std::sync::Arc::new(rg_ci::CiEngine);
     let notification_hub = rg_http::ws::NotificationHub::new();
+    let instance_settings = rg_core::instance::InstanceSettingsCache::default();
 
     let http_config = rg_http::HttpServerConfig {
         listen_addr: resolved_http_addr,
@@ -609,6 +610,7 @@ pub(crate) async fn run_serve(
         shutdown_grace_secs: resolved_shutdown_grace,
         attestation_enabled: resolved_attestation_enabled,
         notification_hub: Some(notification_hub.clone()),
+        instance_settings: instance_settings.clone(),
     };
 
     // ── SSH server ────────────────────────────────────────────────
@@ -641,6 +643,7 @@ pub(crate) async fn run_serve(
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,
         post_push: Some(std::sync::Arc::new(post_push_context)),
+        instance_settings,
     };
 
     let http_handle = tokio::spawn(async move {

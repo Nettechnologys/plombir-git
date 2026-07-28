@@ -284,6 +284,10 @@ pub struct HttpServerConfig {
     /// through it, and a hub of their own would fan out to nobody. `None`
     /// creates a private hub (the standalone-HTTP default).
     pub notification_hub: Option<ws::NotificationHub>,
+    /// Shared instance settings cache. Pass the same handle to the SSH server
+    /// when both transports run in one process, so admin updates take effect on
+    /// every write path immediately.
+    pub instance_settings: rg_core::instance::InstanceSettingsCache,
 }
 
 /// Start the HTTP server and run forever.
@@ -370,7 +374,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         git_idle_timeout_secs: config.git_idle_timeout_secs,
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
-        instance_settings: instance::InstanceSettingsCache::default(),
+        instance_settings: config.instance_settings,
     };
 
     let app = routes::create_router(state.clone(), rate_limiter.clone(), auth_rate_limiter);

@@ -231,6 +231,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
         listen_addr: listen_addr.clone(),
         repo_root: repo_root.clone(),
         db: Some(db.clone()),
+        instance_settings: Default::default(),
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: Some(Arc::new(rg_core::push_hooks::PostPushContext {

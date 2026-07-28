@@ -99,6 +99,7 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
         listen_addr: listen_addr.clone(),
         repo_root: repo_root.clone(),
         db: Some(db.clone()),
+        instance_settings: Default::default(),
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
@@ -170,6 +171,171 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
         .unwrap();
     assert!(used_key.last_used_at.is_some());
     assert_eq!(repo.owner_id, user.id);
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
+    let app_dir = tempfile::tempdir().unwrap();
+    let db_path = app_dir.path().join("test.db");
+    let db = rg_db::connect_with_pool(
+        &format!("sqlite://{}?mode=rwc", db_path.display()),
+        5,
+        60,
+        2,
+    )
+    .await
+    .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+
+    let user = rg_db::ops::user_ops::create_user(
+        &db,
+        "ssh-maint-owner",
+        "ssh-maint-owner@example.com",
+        "",
+        "SSH Maintenance Owner",
+    )
+    .await
+    .unwrap();
+    let repo_root = app_dir.path().join("repos");
+    rg_core::repo::service::create_repo(
+        &db,
+        user.id,
+        "ssh-maint-repo",
+        None,
+        true,
+        &repo_root,
+        None,
+    )
+    .await
+    .unwrap();
+    let bare_path = repo_root.join("ssh-maint-owner/ssh-maint-repo.git");
+
+    let client_key = app_dir.path().join("client_ed25519");
+    let keygen = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&client_key)
+        .status()
+        .expect("ssh-keygen must be installed for SSH integration tests");
+    assert!(keygen.success());
+    let public_key = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+    let public_key = public_key.trim();
+    let fingerprint = rg_core::auth::ssh_key::fingerprint_from_openssh(public_key).unwrap();
+    rg_db::ops::ssh_key_ops::create(
+        &db,
+        rg_db::entities::ssh_key::ActiveModel {
+            id: sea_orm::NotSet,
+            user_id: Set(user.id),
+            title: Set("maintenance integration test".to_string()),
+            public_key: Set(public_key.to_string()),
+            fingerprint: Set(fingerprint),
+            created_at: Set(chrono::Utc::now()),
+            last_used_at: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+
+    rg_db::ops::instance_settings_ops::save(&db, true, None, "warning")
+        .await
+        .unwrap();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_addr = probe.local_addr().unwrap().to_string();
+    drop(probe);
+    let server_config = rg_ssh::SshServerConfig {
+        host_key_path: app_dir.path().join("host_ed25519"),
+        listen_addr: listen_addr.clone(),
+        repo_root: repo_root.clone(),
+        db: Some(db.clone()),
+        instance_settings: Default::default(),
+        git_stream_timeout_secs: 300,
+        git_idle_timeout_secs: 30,
+        post_push: None,
+    };
+    let server = tokio::spawn(async move {
+        rg_ssh::start_ssh_server(server_config).await.unwrap();
+    });
+    wait_for_listener(&listen_addr).await;
+
+    let remote = format!(
+        "ssh://git@{}/ssh-maint-owner/ssh-maint-repo.git",
+        listen_addr
+    );
+    let ssh_command = format!(
+        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes",
+        client_key.display()
+    );
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+    let clone_parent = tempfile::tempdir().unwrap();
+    let clone_path = clone_parent.path().join("clone");
+    let clone_arg = clone_path.to_string_lossy();
+    let cloned = gateway
+        .run_with_env(
+            &["clone", &remote, &clone_arg],
+            None,
+            &[("GIT_SSH_COMMAND", ssh_command.as_str())],
+        )
+        .unwrap();
+    assert!(
+        cloned.success(),
+        "SSH clone must remain available in maintenance mode: {}",
+        cloned.stderr_str()
+    );
+    let fetched = gateway
+        .run_with_env(
+            &["fetch", "origin"],
+            Some(&clone_path),
+            &[("GIT_SSH_COMMAND", ssh_command.as_str())],
+        )
+        .unwrap();
+    assert!(
+        fetched.success(),
+        "SSH fetch must remain available in maintenance mode: {}",
+        fetched.stderr_str()
+    );
+
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree_arg = worktree.path().to_string_lossy();
+    git(&["init", "--initial-branch=main", &worktree_arg], None);
+    git(
+        &["config", "user.name", "SSH Maintenance"],
+        Some(worktree.path()),
+    );
+    git(
+        &["config", "user.email", "ssh-maintenance@example.com"],
+        Some(worktree.path()),
+    );
+    std::fs::write(worktree.path().join("README.md"), "should not land\n").unwrap();
+    git(&["add", "."], Some(worktree.path()));
+    git(
+        &["commit", "-m", "push blocked by maintenance"],
+        Some(worktree.path()),
+    );
+    git(&["remote", "add", "origin", &remote], Some(worktree.path()));
+
+    let pushed = gateway
+        .run_with_env(
+            &["push", "origin", "main"],
+            Some(worktree.path()),
+            &[("GIT_SSH_COMMAND", ssh_command.as_str())],
+        )
+        .unwrap();
+    assert!(
+        !pushed.success(),
+        "SSH push succeeded while maintenance mode was enabled"
+    );
+    let stderr = pushed.stderr_str();
+    assert!(
+        stderr.contains("maintenance") || stderr.contains("read-only"),
+        "SSH push rejection should explain maintenance mode; stderr was: {stderr}"
+    );
+    assert!(
+        !bare_path.join("refs/heads/main").exists(),
+        "maintenance-mode SSH push created refs/heads/main"
+    );
 
     server.abort();
 }

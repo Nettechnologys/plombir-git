@@ -83,6 +83,10 @@ pub struct SshServerConfig {
     pub repo_root: PathBuf,
     /// Database connection (None = open access, Phase 1 compat).
     pub db: Option<DatabaseConnection>,
+    /// Shared instance settings cache. In the normal HTTP+SSH process this is
+    /// the same handle the HTTP admin API updates, so maintenance mode reaches
+    /// SSH pushes without a restart.
+    pub instance_settings: rg_core::instance::InstanceSettingsCache,
     /// Wall-clock timeout (seconds) for the streaming git transport
     /// (upload-pack / receive-pack / v2). Bounds a hung or pathologically slow
     /// `git` subprocess so a stalled-but-connected SSH client can't hold a
@@ -111,6 +115,7 @@ pub struct SshServerConfig {
 struct SharedState {
     repo_root: Arc<PathBuf>,
     db: Option<Arc<DatabaseConnection>>,
+    instance_settings: rg_core::instance::InstanceSettingsCache,
     /// Wall-clock bound (seconds) applied around each git streaming handler.
     /// 0 = disabled. See [`SshServerConfig::git_stream_timeout_secs`].
     git_stream_timeout_secs: u64,
@@ -234,6 +239,7 @@ impl SshServer {
         let shared = Arc::new(SharedState {
             repo_root: Arc::new(ssh_config.repo_root),
             db: ssh_config.db.map(Arc::new),
+            instance_settings: ssh_config.instance_settings,
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
             git_idle_timeout_secs: ssh_config.git_idle_timeout_secs,
             post_push: ssh_config.post_push,
@@ -598,6 +604,26 @@ impl Handler for SshHandler {
                     "repository access denied: {}",
                     repo_path
                 )));
+            }
+        }
+
+        if service == "git-receive-pack" {
+            if let Some(db) = &self.shared.db {
+                let settings = self.shared.instance_settings.get(db).await;
+                if settings.maintenance_mode {
+                    let msg =
+                        "Instance is in maintenance mode. SSH push is disabled; read-only access only.";
+                    tracing::warn!(
+                        identity = ?self.authenticated_identity,
+                        %repo_path,
+                        "SSH git receive-pack rejected by maintenance mode"
+                    );
+                    session.channel_success(channel_id)?;
+                    session.extended_data(channel_id, 1, format!("{msg}\n"))?;
+                    session.exit_status_request(channel_id, 1)?;
+                    session.close(channel_id)?;
+                    return Ok(());
+                }
             }
         }
 

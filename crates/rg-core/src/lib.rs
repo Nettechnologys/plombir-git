@@ -46,6 +46,7 @@ pub mod release;
 pub mod audit;
 pub mod blob_storage;
 pub mod email;
+pub mod instance;
 pub mod lfs;
 pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;
