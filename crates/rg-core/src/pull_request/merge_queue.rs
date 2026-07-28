@@ -295,6 +295,8 @@ async fn process_repository_inner(
         }
 
         let strategy = MergeStrategy::parse(&entry.strategy)?;
+        // The queue worker is a background loop, not a request path: the merge
+        // announcement goes to the process-global delivery tracker.
         match service::merge_pr(
             db,
             repo_root,
@@ -302,6 +304,7 @@ async fn process_repository_inner(
             &repository.name,
             pr.number,
             strategy,
+            None,
         )
         .await
         {

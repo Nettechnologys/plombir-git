@@ -176,6 +176,10 @@ pub async fn get_issue(
 }
 
 /// Update an issue's title, body, state, labels, assignee, or milestone.
+///
+/// `delivery_tracker` is where the milestone-completion watch fan-out is
+/// detached to; `None` = the process-global delivery tracker. See
+/// [`crate::notification::spawn_notify_watchers`].
 #[allow(clippy::too_many_arguments)]
 pub async fn update_issue(
     db: &DatabaseConnection,
@@ -188,6 +192,7 @@ pub async fn update_issue(
     labels: Option<Vec<String>>,
     assignee_id: Option<Option<i64>>,
     milestone_id: Option<Option<i64>>,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<Issue> {
     let existing = get_issue(db, owner, repo_name, number).await?;
     let issue_id = existing.id;
@@ -271,7 +276,9 @@ pub async fn update_issue(
                     rg_db::ops::milestone_ops::count_open_by_milestone(db, issue_repo_id, mid).await
                 {
                     if remaining == 0 {
-                        if let Err(e) = notify_milestone_closed(db, issue_repo_id, mid).await {
+                        if let Err(e) =
+                            notify_milestone_closed(db, issue_repo_id, mid, delivery_tracker).await
+                        {
                             tracing::warn!(milestone_id = %mid, error = %format!("{e:#}"), "failed to notify milestone closed");
                         }
                     }
@@ -385,6 +392,7 @@ async fn notify_milestone_closed(
     db: &DatabaseConnection,
     repo_id: i64,
     milestone_id: i64,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<()> {
     // Trigger milestone.closed webhook
     let payload = serde_json::json!({
@@ -402,18 +410,20 @@ async fn notify_milestone_closed(
             .one(db)
             .await
         {
-            if let Err(e) = crate::notification::notify_watchers(
+            // Detached: closing the last issue of a milestone answers an HTTP
+            // request, and the fan-out below is a read check plus an insert for
+            // every subscriber of the repository.
+            crate::notification::spawn_notify_watchers(
                 db,
-                repo_id,
-                "",
-                &format!("Milestone {} in {}", "closed", repo.name),
-                "milestone",
-                Some(format!("Milestone '{}' {}", milestone.title, "closed")),
-            )
-            .await
-            {
-                tracing::warn!(error = %format!("{e:#}"), "failed to notify watchers about milestone");
-            }
+                delivery_tracker.unwrap_or_else(|| crate::task_tracker::delivery_tracker()),
+                crate::notification::WatchEvent {
+                    repo_id,
+                    author_name: String::new(),
+                    title: format!("Milestone {} in {}", "closed", repo.name),
+                    notification_type: "milestone".to_string(),
+                    body: Some(format!("Milestone '{}' {}", milestone.title, "closed")),
+                },
+            );
         }
     }
 

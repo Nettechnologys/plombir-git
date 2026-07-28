@@ -196,6 +196,7 @@ pub async fn create_pr(
                 req.base,
                 head_repo_id,
                 req.draft,
+                Some(&state.delivery_tracker),
             )
             .await
             {
@@ -314,7 +315,16 @@ pub async fn update_pr(
     }
 
     match rg_core::pull_request::update_pr(
-        &state.db, &owner, &repo, number, req.title, req.body, req.state, req.draft, actor_id,
+        &state.db,
+        &owner,
+        &repo,
+        number,
+        req.title,
+        req.body,
+        req.state,
+        req.draft,
+        actor_id,
+        Some(&state.delivery_tracker),
     )
     .await
     {
@@ -426,6 +436,7 @@ pub async fn merge_pr(
         &repo,
         number,
         strategy,
+        Some(&state.delivery_tracker),
     )
     .await
     {

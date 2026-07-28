@@ -482,6 +482,7 @@ pub async fn update_issue(
         req.labels,
         req.assignee_id,
         req.milestone_id,
+        Some(&state.delivery_tracker),
     )
     .await
     {

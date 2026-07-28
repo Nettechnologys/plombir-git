@@ -18,6 +18,9 @@ use rg_db::ops::{pull_request_ops, repo_ops, user_ops};
 ///
 /// If `head_repo_id` is provided, this is a fork PR (cross-repository).
 /// The `head_branch` should contain just the branch name (not `owner:branch` format).
+///
+/// `delivery_tracker` carries the watch fan-out off this call's critical path —
+/// see [`announce_pr_to_watchers`] for what `None` means.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_pr(
     db: &DatabaseConnection,
@@ -30,6 +33,7 @@ pub async fn create_pr(
     base_branch: String,
     head_repo_id: Option<i64>,
     is_draft: bool,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<PullRequest> {
     // The two things the caller can get wrong here carry `InvalidRequest`;
     // everything after them is a query or a git read of ours, and a failure
@@ -136,14 +140,14 @@ pub async fn create_pr(
 
     announce_pr_to_watchers(
         db,
+        delivery_tracker,
         repo_id,
         &target_repo.name,
         Some(author_id),
         pr.number,
         &pr.title,
         "opened",
-    )
-    .await;
+    );
 
     Ok(pr)
 }
@@ -244,11 +248,13 @@ async fn notify_watchers_pr(
     };
     crate::notification::notify_watchers(
         db,
-        repo_id,
-        actor_name.unwrap_or_default(),
-        &format!("PR #{} {} in {}", pr_number, action, repo_name),
-        "pull_request",
-        Some(body),
+        &crate::notification::WatchEvent {
+            repo_id,
+            author_name: actor_name.unwrap_or_default().to_string(),
+            title: format!("PR #{} {} in {}", pr_number, action, repo_name),
+            notification_type: "pull_request".to_string(),
+            body: Some(body),
+        },
     )
     .await
 }
@@ -266,8 +272,23 @@ async fn watch_actor_name(db: &DatabaseConnection, actor_id: i64) -> Option<Stri
 
 /// Fan a PR transition out to the repository's watchers, logging rather than
 /// propagating a failure: the transition itself has already been committed.
-async fn announce_pr_to_watchers(
+///
+/// Detached, never awaited. The walk costs a read check and an insert per
+/// subscriber, and all three transitions that reach here — open, close/reopen,
+/// merge — are answered to a waiting HTTP client, so awaiting it priced opening
+/// a pull request on a popular repository at `O(watchers)` round-trips of
+/// latency (card_3b4275a366ab). The actor lookup goes inside the task for the
+/// same reason.
+///
+/// `tracker` is the caller's, when it has one: an HTTP handler passes its
+/// `AppState`'s, so a test can drain exactly the work its own request produced.
+/// `None` falls back to the process-global delivery tracker — the same one
+/// `rg_http::run` closes on shutdown — for callers that are already off a
+/// request path (the merge queue, auto-merge).
+#[allow(clippy::too_many_arguments)]
+fn announce_pr_to_watchers(
     db: &DatabaseConnection,
+    tracker: Option<&crate::task_tracker::TaskTracker>,
     repo_id: i64,
     repo_name: &str,
     actor_id: Option<i64>,
@@ -275,23 +296,30 @@ async fn announce_pr_to_watchers(
     pr_title: &str,
     action: &str,
 ) {
-    let actor_name = match actor_id {
-        Some(actor_id) => watch_actor_name(db, actor_id).await,
-        None => None,
-    };
-    if let Err(e) = notify_watchers_pr(
-        db,
-        repo_id,
-        repo_name,
-        actor_name.as_deref(),
-        pr_number,
-        pr_title,
-        action,
-    )
-    .await
-    {
-        tracing::warn!(error = %format!("{e:#}"), action, "failed to notify watchers about PR");
-    }
+    let tracker = tracker.unwrap_or_else(|| crate::task_tracker::delivery_tracker());
+    let db = db.clone();
+    let repo_name = repo_name.to_string();
+    let pr_title = pr_title.to_string();
+    let action = action.to_string();
+    tracker.spawn(async move {
+        let actor_name = match actor_id {
+            Some(actor_id) => watch_actor_name(&db, actor_id).await,
+            None => None,
+        };
+        if let Err(e) = notify_watchers_pr(
+            &db,
+            repo_id,
+            &repo_name,
+            actor_name.as_deref(),
+            pr_number,
+            &pr_title,
+            &action,
+        )
+        .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), action, "failed to notify watchers about PR");
+        }
+    });
 }
 
 /// List PRs for a repo, optionally filtered by state.
@@ -338,6 +366,9 @@ pub async fn get_pr(
 }
 
 /// Update PR metadata (title, body, state).
+///
+/// `delivery_tracker` carries the watch fan-out off this call's critical path —
+/// see [`announce_pr_to_watchers`] for what `None` means.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_pr(
     db: &DatabaseConnection,
@@ -349,6 +380,7 @@ pub async fn update_pr(
     state: Option<String>,
     is_draft: Option<bool>,
     actor_id: i64,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<PullRequest> {
     let mut pr = get_pr(db, owner, repo_name, number).await?;
     let previous_state = pr.state.clone();
@@ -474,14 +506,14 @@ pub async fn update_pr(
         if let Some(action) = action {
             announce_pr_to_watchers(
                 db,
+                delivery_tracker,
                 updated.repo_id,
                 repo_name,
                 Some(actor_id),
                 updated.number,
                 &updated.title,
                 action,
-            )
-            .await;
+            );
         }
     }
     Ok(updated)
@@ -1118,7 +1150,10 @@ pub async fn try_auto_merge(
             merge: None,
         });
     }
-    let merge = match merge_pr(db, repo_root, owner, repo_name, number, strategy).await {
+    // No tracker to hand down: auto-merge runs from the post-push hooks and the
+    // CI-completion paths, which are already detached, so the merge announcement
+    // takes the process-global delivery tracker.
+    let merge = match merge_pr(db, repo_root, owner, repo_name, number, strategy, None).await {
         Ok(merge) => merge,
         Err(error) => {
             if let Err(restore_error) = pull_request_ops::restore_auto_merge(db, pr.id).await {
@@ -1247,6 +1282,7 @@ pub async fn merge_pr(
     repo_name: &str,
     number: i64,
     strategy: MergeStrategy,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
     let mut pr = get_pr(db, owner, repo_name, number).await?;
 
@@ -1284,7 +1320,16 @@ pub async fn merge_pr(
         ));
     }
 
-    let result = merge_claimed_pr(db, repo_root, owner, repo_name, pr.clone(), strategy).await;
+    let result = merge_claimed_pr(
+        db,
+        repo_root,
+        owner,
+        repo_name,
+        pr.clone(),
+        strategy,
+        delivery_tracker,
+    )
+    .await;
     if result.is_err() {
         if let Err(error) = pull_request_ops::restore_merge_claim(db, pr.id).await {
             tracing::error!(pr_id = pr.id, error = %format!("{error:#}"), "failed to restore PR merge state");
@@ -1297,6 +1342,7 @@ pub async fn merge_pr(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn merge_claimed_pr(
     db: &DatabaseConnection,
     repo_root: &std::path::Path,
@@ -1304,6 +1350,7 @@ async fn merge_claimed_pr(
     repo_name: &str,
     pr: PullRequest,
     strategy: MergeStrategy,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
     if !repo_path.exists() {
@@ -1385,6 +1432,7 @@ async fn merge_claimed_pr(
                 merge_commit_sha,
                 strategy,
                 base_sha_before,
+                delivery_tracker,
             )
             .await;
         }
@@ -1412,6 +1460,7 @@ async fn merge_claimed_pr(
         merge_commit_sha,
         strategy,
         base_sha_before,
+        delivery_tracker,
     )
     .await
 }
@@ -1444,6 +1493,7 @@ fn merge_from_ref(
 ///
 /// `base_sha_before` is the base branch tip read before the merge — see
 /// [`MergeResult::base_ref_update`], which is built from it.
+#[allow(clippy::too_many_arguments)]
 async fn update_pr_merged(
     db: &DatabaseConnection,
     owner: &str,
@@ -1452,6 +1502,7 @@ async fn update_pr_merged(
     merge_commit_sha: String,
     strategy: MergeStrategy,
     base_sha_before: Option<String>,
+    delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
     pr.state = "merged".to_string();
     pr.merge_strategy = Some(format!("{:?}", strategy).to_lowercase());
@@ -1509,14 +1560,14 @@ async fn update_pr_merged(
     // carry the caller's id, so naming one here would mean guessing.
     announce_pr_to_watchers(
         db,
+        delivery_tracker,
         merged_pr.repo_id,
         repo_name,
         None,
         merged_pr.number,
         &merged_pr.title,
         "merged",
-    )
-    .await;
+    );
 
     Ok(MergeResult {
         base_ref_update: base_sha_before

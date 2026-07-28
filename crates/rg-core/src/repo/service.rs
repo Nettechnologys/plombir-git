@@ -1232,27 +1232,34 @@ pub async fn get_combined_status(
 /// runs the post-push hooks fans out to watchers. `pusher_name` is empty when
 /// the transport authenticated nobody (open-access server): the body then omits
 /// the actor instead of rendering a leading blank, and no recipient is excluded.
-pub async fn notify_watchers_push(
+///
+/// Detached onto `tracker` rather than awaited: the hook run is itself a tracked
+/// background task, and one repository's subscriber walk has no business
+/// delaying the CI trigger of the next ref in the same push.
+pub fn notify_watchers_push(
     db: &DatabaseConnection,
+    tracker: &crate::task_tracker::TaskTracker,
     repo_id: i64,
     repo_name: &str,
     pusher_name: &str,
     ref_name: &str,
-) -> Result<()> {
+) {
     let body = if pusher_name.is_empty() {
         format!("New push to {}", ref_name)
     } else {
         format!("{} pushed to {}", pusher_name, ref_name)
     };
-    crate::notification::notify_watchers(
+    crate::notification::spawn_notify_watchers(
         db,
-        repo_id,
-        pusher_name,
-        &format!("New push to {}", repo_name),
-        "push",
-        Some(body),
-    )
-    .await
+        tracker,
+        crate::notification::WatchEvent {
+            repo_id,
+            author_name: pusher_name.to_string(),
+            title: format!("New push to {}", repo_name),
+            notification_type: "push".to_string(),
+            body: Some(body),
+        },
+    );
 }
 
 /// Create or update a file in a repository.

@@ -66,39 +66,41 @@ pub async fn get_watch_state(
     Ok(result.map(|r| r.watch_state))
 }
 
-/// List the watch *rows* of a repo with pagination — subscriptions, not
-/// subscribers.
+/// One page of a repository's watch rows in `state`, keyed on `id`.
 ///
-/// Deliberately unfiltered: `DELETE .../watch` is implemented as a write of
-/// `not_watching` rather than a row delete, so an unwatched and an ignoring
-/// user both keep a row here. This used to be called `list_watchers`, which
-/// read as "the people subscribed to this repo" and is exactly what it is not —
-/// its one caller had to re-filter by `watch_state` to avoid notifying people
-/// who had unsubscribed. Any consumer wanting subscribers (a watcher count, a
-/// watchers endpoint) must filter by
-/// `rg_core::repo::service::WatchState::Watching`.
-pub async fn list_watch_rows(
+/// Both halves of that sentence are deliberate, and both exist because the one
+/// consumer is the notification fan-out:
+///
+/// - **Filtered in SQL.** `DELETE .../watch` is implemented as a write of
+///   `not_watching` rather than a row delete, so an unwatched and an ignoring
+///   user both keep a row. Paging over *every* row and discarding them in the
+///   caller makes the page size a function of how many people once unwatched —
+///   a repository whose subscribers have all left is a page of tombstones with
+///   the actual recipients behind them.
+/// - **Keyset, not offset.** `updated_at` moves whenever somebody toggles a
+///   subscription, so an offset walk ordered by it silently skips or repeats
+///   recipients mid-fan-out. `id` never moves.
+///
+/// `state` is the caller's policy rather than this layer's: the allowlist lives
+/// in `rg_core::repo::service::WatchState`, and the delivery point applies it
+/// (see `rg_core::notification`).
+///
+/// Pass `after_id = 0` for the first page, then the `id` of the last row
+/// returned. A short page is the last one.
+pub async fn list_in_state_after(
     db: &DatabaseConnection,
     repo_id: i64,
-    offset: u64,
+    state: &str,
+    after_id: i64,
     limit: u64,
-) -> Result<(Vec<Model>, i64)> {
-    let base = RepoWatchEntity::find()
+) -> Result<Vec<Model>> {
+    RepoWatchEntity::find()
         .filter(repo_watch::Column::RepoId.eq(repo_id))
-        .order_by_desc(repo_watch::Column::UpdatedAt);
-
-    let total = base
-        .clone()
-        .count(db)
-        .await
-        .context("db: count watch rows")? as i64;
-
-    let rows = base
-        .offset(offset)
+        .filter(repo_watch::Column::WatchState.eq(state))
+        .filter(repo_watch::Column::Id.gt(after_id))
+        .order_by_asc(repo_watch::Column::Id)
         .limit(limit)
         .all(db)
         .await
-        .context("db: list watch rows")?;
-
-    Ok((rows, total))
+        .context("db: list watch rows in state")
 }

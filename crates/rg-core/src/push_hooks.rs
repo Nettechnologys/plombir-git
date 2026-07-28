@@ -547,17 +547,18 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         // push: `notify_watchers_push` existed with no caller anywhere in the
         // tree. This is that caller. Read access is re-checked per recipient
         // inside `notification::notify_watchers`, so no gate is needed here.
-        if let Err(error) = crate::repo::service::notify_watchers_push(
+        //
+        // Onto this run's tracker rather than awaited: the walk is one query
+        // pair per subscriber, and a repository with thousands of them would
+        // otherwise hold up every later ref in this same push.
+        crate::repo::service::notify_watchers_push(
             params.db,
+            params.delivery_tracker,
             target.repo_id,
             &target.name,
             pusher_name.as_deref().unwrap_or_default(),
             &update.refname,
-        )
-        .await
-        {
-            tracing::warn!(error = %format!("{error:#}"), "failed to notify watchers about push");
-        }
+        );
     }
 }
 

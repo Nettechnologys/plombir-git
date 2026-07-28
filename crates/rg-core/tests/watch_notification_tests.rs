@@ -14,7 +14,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use sea_orm::{ActiveValue::NotSet, Set};
+use sea_orm::{ActiveValue::NotSet, EntityTrait, Set};
 
 /// A `CiTrigger` that reports no CI config, so the hook run under test is just
 /// the DB-visible half: PR head-SHA refresh, webhooks (none registered) and the
@@ -131,6 +131,25 @@ async fn run_post_push_hooks(
         ref_updates,
     )
     .await;
+    drain(&delivery_tracker).await;
+}
+
+/// Await the detached work a call produced, on the caller's own tracker.
+///
+/// The watch fan-out is spawned rather than awaited, so "the notification is
+/// not there yet" is a normal state right after the producer returns; draining
+/// is what makes the assertions below deterministic. The tracker is local to
+/// the fixture on purpose — closing the process-global one would reach into
+/// whatever else the test binary is running in parallel (card_0ce231198269).
+///
+/// The timeout is a hang-guard, not a deadline: a tracker that never drains
+/// fails at any finite bound, while a tight one turns machine load into a red
+/// suite.
+async fn drain(tracker: &rg_core::task_tracker::TaskTracker) {
+    tracker.close();
+    tokio::time::timeout(std::time::Duration::from_secs(120), tracker.wait())
+        .await
+        .expect("delivery tracker drained within timeout");
 }
 
 #[tokio::test]
@@ -309,6 +328,7 @@ async fn pull_request_transitions_notify_watchers_but_not_the_actor() {
     watch(&db, owner.id, repo.id, "watching").await;
     watch(&db, watcher.id, repo.id, "watching").await;
 
+    let tracker = rg_core::task_tracker::TaskTracker::new();
     let pr = rg_core::pull_request::create_pr(
         &db,
         &repo_root,
@@ -320,20 +340,26 @@ async fn pull_request_transitions_notify_watchers_but_not_the_actor() {
         "main".to_string(),
         None,
         false,
+        Some(&tracker),
     )
     .await
     .expect("create PR");
 
+    // Checked synchronously, with no `.await` between: this test runs on the
+    // current-thread runtime, so a task that has been *queued* rather than run
+    // cannot have started yet. That is the whole point of the change — the
+    // fan-out is one read check and one insert per subscriber, and the client
+    // opening the PR must not be paying for that walk.
     assert_eq!(
-        notified_events(&db, watcher.id).await,
-        vec!["pull_request".to_string()],
-        "opening a PR must reach the repository's watchers"
-    );
-    assert!(
-        notified_events(&db, owner.id).await.is_empty(),
-        "the PR author must not be notified about their own PR"
+        tracker.len(),
+        1,
+        "create_pr must hand the watch fan-out to the tracker, not walk the \
+         subscribers before it returns"
     );
 
+    // Both transitions are announced on the tracker this test owns, so one
+    // drain at the end covers them; the assertions in between would otherwise
+    // be racing a task that is deliberately not awaited.
     rg_core::pull_request::update_pr(
         &db,
         "prowner",
@@ -344,17 +370,134 @@ async fn pull_request_transitions_notify_watchers_but_not_the_actor() {
         Some("closed".to_string()),
         None,
         owner.id,
+        Some(&tracker),
     )
     .await
     .expect("close PR");
 
+    drain(&tracker).await;
+
     assert_eq!(
         notified_events(&db, watcher.id).await,
         vec!["pull_request".to_string(), "pull_request".to_string()],
-        "closing a PR must reach the watchers too"
+        "opening and closing a PR must both reach the repository's watchers"
     );
     assert!(
         notified_events(&db, owner.id).await.is_empty(),
-        "the account that closed the PR must not be notified about it"
+        "the account behind a PR transition must not be notified about it"
+    );
+}
+
+/// The fan-out used to be one `limit = 1000` query with no loop behind it, so
+/// subscriber #1001 was a row in `repo_watches`, counted as a watcher, and
+/// silently unreachable — no log line said anybody had been dropped. The
+/// population here is deliberately above that old ceiling.
+#[tokio::test]
+async fn every_subscriber_is_notified_past_the_old_page_limit() {
+    const SUBSCRIBERS: usize = 1200;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(dir.path()).await;
+    let repo_root = dir.path().join("repos");
+
+    let owner = user(&db, "capowner").await;
+    let repo = rg_core::repo::service::create_repo(
+        &db, owner.id, "caprepo", None, false, &repo_root, None,
+    )
+    .await
+    .expect("create repo");
+
+    // Inserted in chunked bulk statements: one round-trip per row would make
+    // the fixture, not the fan-out, the slow part of this test, and one
+    // statement for all of them would run into SQLite's bound-parameter limit.
+    let now = chrono::Utc::now();
+    for chunk in (0..SUBSCRIBERS).collect::<Vec<_>>().chunks(40) {
+        let users: Vec<rg_db::entities::user::ActiveModel> = chunk
+            .iter()
+            .map(|i| rg_db::entities::user::ActiveModel {
+                id: NotSet,
+                username: Set(format!("crowd{i}")),
+                email: Set(format!("crowd{i}@example.invalid")),
+                password_hash: Set(String::new()),
+                display_name: Set(None),
+                avatar_url: Set(None),
+                bio: Set(None),
+                is_admin: Set(false),
+                is_active: Set(true),
+                auth_provider: Set("local".to_string()),
+                ldap_dn: Set(None),
+                ldap_uid: Set(None),
+                ldap_provider_id: Set(None),
+                totp_secret: Set(None),
+                mfa_enabled: Set(false),
+                mfa_type: Set(None),
+                backup_codes: Set(None),
+                last_login_at: Set(None),
+                login_attempts: Set(0),
+                locked_until: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+            })
+            .collect();
+        rg_db::entities::user::Entity::insert_many(users)
+            .exec(&db)
+            .await
+            .expect("bulk insert users");
+    }
+
+    let subscriber_ids: Vec<i64> = rg_db::ops::user_ops::list_users(&db, 0, 10_000)
+        .await
+        .expect("list users")
+        .0
+        .into_iter()
+        .filter(|user| user.username.starts_with("crowd"))
+        .map(|user| user.id)
+        .collect();
+    assert_eq!(
+        subscriber_ids.len(),
+        SUBSCRIBERS,
+        "fixture must have created every subscriber"
+    );
+
+    for chunk in subscriber_ids.chunks(100) {
+        let watches: Vec<rg_db::entities::repo_watch::ActiveModel> = chunk
+            .iter()
+            .map(|user_id| rg_db::entities::repo_watch::ActiveModel {
+                id: NotSet,
+                user_id: Set(*user_id),
+                repo_id: Set(repo.id),
+                watch_state: Set("watching".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            })
+            .collect();
+        rg_db::entities::repo_watch::Entity::insert_many(watches)
+            .exec(&db)
+            .await
+            .expect("bulk insert watches");
+    }
+
+    run_post_push_hooks(
+        &db,
+        &repo_root,
+        "capowner",
+        "caprepo",
+        Some(owner.id),
+        &[accepted_push("refs/heads/main", &"d".repeat(40))],
+    )
+    .await;
+
+    let mut unreached = Vec::new();
+    for user_id in &subscriber_ids {
+        if notified_events(&db, *user_id).await.is_empty() {
+            unreached.push(*user_id);
+        }
+    }
+    assert!(
+        unreached.is_empty(),
+        "{} of {SUBSCRIBERS} subscribers were never notified — the fan-out is \
+         capped again, and nothing in the logs would say so",
+        unreached.len()
     );
 }

@@ -93,10 +93,60 @@ pub async fn delete_notification_for_user(
 ///
 /// The subscribe endpoint accepts three states and `DELETE .../watch` is
 /// implemented as `set_watch(.., "not_watching")` rather than a row delete, so
-/// the row survives an unwatch. `repo_watch_ops::list_watch_rows` returns
-/// *every* row for the repo — subscriptions, not subscribers — hence the
-/// allowlist here rather than a `!= "not_watching"` test.
+/// the row survives an unwatch. The `repo_watches` table therefore holds
+/// subscriptions, not subscribers, and the fan-out selects on this state rather
+/// than on `!= "not_watching"`.
 const WATCH_STATE_SUBSCRIBED: WatchState = WatchState::Watching;
+
+/// How many subscriptions one fan-out query pulls at a time.
+///
+/// A page size, not a ceiling: [`notify_watchers`] keeps paging until the table
+/// is exhausted. It used to be a bare `limit = 1000` with no loop, which capped
+/// delivery silently — watcher #1001 was subscribed by every observable measure
+/// and simply never heard anything.
+const WATCH_FANOUT_PAGE: u64 = 500;
+
+/// One repository event, in the owned form a detached fan-out task takes.
+pub struct WatchEvent {
+    pub repo_id: i64,
+    /// Username of the account that caused the event, empty when there isn't
+    /// one (an unauthenticated push, an auto-merge). Used to keep them off
+    /// their own recipient list, so an empty name excludes nobody.
+    pub author_name: String,
+    pub title: String,
+    /// `notification.event_type` — `push`, `pull_request`, `milestone`.
+    pub notification_type: String,
+    pub body: Option<String>,
+}
+
+/// Fan `event` out to the repository's watchers on `tracker`, returning as soon
+/// as the task is queued.
+///
+/// This is what a request path calls. The fan-out is `O(subscribers)` database
+/// round-trips — a read check and an insert each — so awaiting it inline made
+/// opening a pull request on a popular repository cost the client the whole
+/// walk. Tracked rather than a bare `tokio::spawn` so a SIGTERM in the next few
+/// seconds drains the deliveries instead of severing them (card_3b4275a366ab).
+///
+/// A caller already off the request path (the post-push hooks, which are
+/// themselves detached) can just await [`notify_watchers`] instead.
+pub fn spawn_notify_watchers(
+    db: &DatabaseConnection,
+    tracker: &crate::task_tracker::TaskTracker,
+    event: WatchEvent,
+) {
+    let db = db.clone();
+    tracker.spawn(async move {
+        if let Err(e) = notify_watchers(&db, &event).await {
+            tracing::warn!(
+                repo_id = event.repo_id,
+                notification_type = %event.notification_type,
+                error = %format!("{e:#}"),
+                "watch fan-out failed"
+            );
+        }
+    });
+}
 
 /// Notify all watchers of a repository about an event.
 ///
@@ -109,20 +159,16 @@ const WATCH_STATE_SUBSCRIBED: WatchState = WatchState::Watching;
 /// lives here, at the single point every watch notification passes through.
 /// A failed check drops the recipient rather than delivering to them.
 ///
-/// The subscription state is filtered at the same point and for the same
-/// reason: see [`WATCH_STATE_SUBSCRIBED`].
-pub async fn notify_watchers(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    author_name: &str,
-    title: &str,
-    notification_type: &str,
-    body: Option<String>,
-) -> Result<()> {
-    let watchers = rg_db::ops::repo_watch_ops::list_watch_rows(db, repo_id, 0, 1000)
-        .await?
-        .0;
-    if watchers.is_empty() {
+/// The subscription state is filtered for the same reason, one layer down in
+/// the query this pages through: see [`WATCH_STATE_SUBSCRIBED`].
+///
+/// Every subscriber is reached, however many there are. A per-recipient failure
+/// is logged and the walk continues; only a failed *query* aborts it, and the
+/// count reached by then is logged rather than lost.
+pub async fn notify_watchers(db: &DatabaseConnection, event: &WatchEvent) -> Result<()> {
+    let repo_id = event.repo_id;
+    let mut page = watch_page(db, repo_id, 0).await?;
+    if page.is_empty() {
         return Ok(());
     }
     // A repo that is gone (or soft-deleted) has nobody left to notify. Loading
@@ -132,59 +178,113 @@ pub async fn notify_watchers(
         return Ok(());
     };
     // Resolve author once outside the loop to avoid N+1 queries
-    let author_opt = if author_name.is_empty() {
+    let author_opt = if event.author_name.is_empty() {
         None
     } else {
-        rg_db::ops::user_ops::find_by_username(db, author_name)
+        rg_db::ops::user_ops::find_by_username(db, &event.author_name)
             .await
             .ok()
             .flatten()
     };
-    for watcher in watchers {
-        // An unwatched / ignored subscription is a row, not a recipient.
-        if watcher.watch_state != WATCH_STATE_SUBSCRIBED.as_str() {
-            continue;
-        }
-        // Don't notify the author themselves
-        if let Some(ref author) = author_opt {
-            if author.id == watcher.user_id {
-                continue;
+
+    let notification_type = event.notification_type.as_str();
+    let mut considered = 0usize;
+    let mut delivered = 0usize;
+    loop {
+        let page_len = page.len() as u64;
+        let last_id = page.last().map_or(0, |watcher| watcher.id);
+
+        for watcher in page {
+            considered += 1;
+            // Don't notify the author themselves
+            if let Some(ref author) = author_opt {
+                if author.id == watcher.user_id {
+                    continue;
+                }
             }
-        }
-        match crate::repo::service::can_read_repo(db, &repo, Some(watcher.user_id)).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(
-                    "Skipping watcher {} for {notification_type}: no read access to repo {repo_id}",
+            match crate::repo::service::can_read_repo(db, &repo, Some(watcher.user_id)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        "Skipping watcher {} for {notification_type}: no read access to repo {repo_id}",
+                        watcher.user_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Fail closed: an unreadable permission answer must not become
+                    // a delivered notification.
+                    tracing::warn!(
+                        "Skipping watcher {} for {notification_type}: read check failed: {e}",
+                        watcher.user_id
+                    );
+                    continue;
+                }
+            }
+            match notification_ops::create_notification(
+                db,
+                watcher.user_id,
+                notification_type,
+                &event.title,
+                event.body.as_deref(),
+                Some(repo_id),
+            )
+            .await
+            {
+                Ok(_) => delivered += 1,
+                Err(e) => tracing::warn!(
+                    "Failed to notify watcher {} about {notification_type}: {e}",
                     watcher.user_id
-                );
-                continue;
+                ),
             }
+        }
+
+        // A short page is the last one — no extra query to discover the end.
+        if page_len < WATCH_FANOUT_PAGE {
+            break;
+        }
+        page = match watch_page(db, repo_id, last_id).await {
+            Ok(page) => page,
             Err(e) => {
-                // Fail closed: an unreadable permission answer must not become
-                // a delivered notification.
+                // Say how far the walk got: the subscribers past this point are
+                // the ones who will wonder why they heard nothing.
                 tracing::warn!(
-                    "Skipping watcher {} for {notification_type}: read check failed: {e}",
-                    watcher.user_id
+                    repo_id,
+                    notification_type,
+                    considered,
+                    delivered,
+                    "watch fan-out aborted mid-walk"
                 );
-                continue;
+                return Err(e);
             }
-        }
-        if let Err(e) = notification_ops::create_notification(
-            db,
-            watcher.user_id,
-            notification_type,
-            title,
-            body.as_deref(),
-            Some(repo_id),
-        )
-        .await
-        {
-            tracing::warn!(
-                "Failed to notify watcher {} about {notification_type}: {e}",
-                watcher.user_id
-            );
+        };
+        if page.is_empty() {
+            break;
         }
     }
+
+    tracing::debug!(
+        repo_id,
+        notification_type,
+        considered,
+        delivered,
+        "watch fan-out complete"
+    );
     Ok(())
+}
+
+/// One page of subscribed watch rows after `after_id` (0 for the first page).
+async fn watch_page(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    after_id: i64,
+) -> Result<Vec<rg_db::entities::repo_watch::Model>> {
+    rg_db::ops::repo_watch_ops::list_in_state_after(
+        db,
+        repo_id,
+        WATCH_STATE_SUBSCRIBED.as_str(),
+        after_id,
+        WATCH_FANOUT_PAGE,
+    )
+    .await
 }

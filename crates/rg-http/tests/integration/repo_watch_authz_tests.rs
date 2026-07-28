@@ -304,11 +304,13 @@ async fn watch_rows_that_outlive_read_access_stop_receiving_notifications() {
 
     rg_core::notification::notify_watchers(
         &db,
-        repo_id,
-        owner,
-        "New push to watchrevokerepo",
-        "push",
-        Some(format!("{owner} pushed to secret-branch")),
+        &rg_core::notification::WatchEvent {
+            repo_id,
+            author_name: owner.to_string(),
+            title: "New push to watchrevokerepo".to_string(),
+            notification_type: "push".to_string(),
+            body: Some(format!("{owner} pushed to secret-branch")),
+        },
     )
     .await
     .expect("notify watchers");
