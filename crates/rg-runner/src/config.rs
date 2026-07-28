@@ -310,25 +310,7 @@ pub(crate) fn config_not_persisted_warning(path: &str, error: &anyhow::Error) ->
 }
 
 pub(crate) fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
-    auth_token.or_else(|| env_var_compat("FORGEKEEP_AUTH_TOKEN", "IRONFORGE_AUTH_TOKEN"))
-}
-
-/// Read `new` from the environment, falling back to the deprecated `old` name
-/// (IronForge → ForgeKeep rebrand) with a one-time deprecation warning.
-fn env_var_compat(new: &str, old: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(new) {
-        return Some(value);
-    }
-    match std::env::var(old) {
-        Ok(value) => {
-            tracing::warn!(
-                "environment variable `{old}` is deprecated and will be removed in a future \
-                 release; use `{new}` instead"
-            );
-            Some(value)
-        }
-        Err(_) => None,
-    }
+    auth_token.or_else(|| std::env::var("FORGEKEEP_AUTH_TOKEN").ok())
 }
 
 #[cfg(test)]

@@ -209,9 +209,7 @@ pub(crate) async fn run_serve(
     };
 
     // Resolve JWT secret: env var > CLI args > config file > error
-    let resolved_jwt_secret = if let Some(env_secret) =
-        rg_core::env_compat::env_var_compat("FORGEKEEP_JWT_SECRET", "IRONFORGE_JWT_SECRET")
-    {
+    let resolved_jwt_secret = if let Ok(env_secret) = std::env::var("FORGEKEEP_JWT_SECRET") {
         validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
         tracing::info!("Using JWT secret from environment variable FORGEKEEP_JWT_SECRET");
         env_secret
@@ -326,14 +324,12 @@ pub(crate) async fn run_serve(
 
     // Inbound-webhook HMAC secret: env var wins, fallback to config file.
     // Unset ⇒ signature verification stays off (endpoints are auth-gated).
-    let resolved_external_webhook_secret = rg_core::env_compat::env_var_compat(
-        "FORGEKEEP_EXTERNAL_WEBHOOK_SECRET",
-        "IRONFORGE_EXTERNAL_WEBHOOK_SECRET",
-    )
-    .or_else(|| {
-        cfg.as_ref()
-            .and_then(|c| c.webhooks.external_secret.clone())
-    });
+    let resolved_external_webhook_secret = std::env::var("FORGEKEEP_EXTERNAL_WEBHOOK_SECRET")
+        .ok()
+        .or_else(|| {
+            cfg.as_ref()
+                .and_then(|c| c.webhooks.external_secret.clone())
+        });
     if resolved_external_webhook_secret.is_some() {
         tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
     }

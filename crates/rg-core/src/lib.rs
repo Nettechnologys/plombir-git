@@ -46,7 +46,6 @@ pub mod release;
 pub mod audit;
 pub mod blob_storage;
 pub mod email;
-pub mod env_compat; // IRONFORGE_* → FORGEKEEP_* env var fallback (fork rebrand)
 pub mod lfs;
 pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;

@@ -57,7 +57,7 @@ fn build_cors_layer() -> CorsLayer {
 
     let headers_list = [header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT];
 
-    match rg_core::env_compat::env_var_compat("FORGEKEEP_CORS_ORIGINS", "IRONFORGE_CORS_ORIGINS") {
+    match std::env::var("FORGEKEEP_CORS_ORIGINS").ok() {
         Some(origins_str) if !origins_str.is_empty() => {
             let origins: Vec<HeaderValue> = origins_str
                 .split(',')

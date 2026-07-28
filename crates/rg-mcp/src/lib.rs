@@ -18,24 +18,6 @@ pub mod tools;
 // Re-export for convenience
 pub use error::{Error, Result};
 
-/// Read `new` from the environment, falling back to the deprecated `old` name
-/// (IronForge → ForgeKeep rebrand) with a one-time deprecation warning.
-fn env_var_compat(new: &str, old: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(new) {
-        return Some(value);
-    }
-    match std::env::var(old) {
-        Ok(value) => {
-            tracing::warn!(
-                "environment variable `{old}` is deprecated and will be removed in a future \
-                 release; use `{new}` instead"
-            );
-            Some(value)
-        }
-        Err(_) => None,
-    }
-}
-
 /// Request timeout for MCP → ForgeKeep API calls (whole request, incl. body),
 /// so a slow/hanging server can't pin a tool call forever.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -78,9 +60,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_env() -> Result<Self> {
-        let api_base = env_var_compat("FORGEKEEP_URL", "IRONFORGE_URL")
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        let pat = env_var_compat("FORGEKEEP_PAT", "IRONFORGE_PAT").unwrap_or_default();
+        let api_base =
+            std::env::var("FORGEKEEP_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let pat = std::env::var("FORGEKEEP_PAT").unwrap_or_default();
 
         if pat.is_empty() {
             tracing::warn!("FORGEKEEP_PAT not set – API calls may fail");

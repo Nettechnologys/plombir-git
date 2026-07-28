@@ -58,9 +58,6 @@ deploy/docker-compose.override.yml
 # it points at (repos, DB, logs, generated SSH host key).
 deploy/forgekeep.toml
 deploy/data/
-# Legacy IronForge config names (pre-rebrand) — still ignored so old local files never get committed
-/ironforge.toml
-/ironforge-simple.toml
 
 # Python bytecode from the scripts/ helpers
 __pycache__/

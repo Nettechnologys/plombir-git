@@ -604,9 +604,8 @@ fn read_ci_config(
         return Ok(config);
     }
 
-    // Fall back to the native CI config: the current ForgeKeep filename, then the
-    // deprecated IronForge name for backwards compatibility (removed in a future release).
-    let ci_filename = [".forgekeep-ci.yml", ".ironforge-ci.yml"]
+    // Fall back to the native CI config.
+    let ci_filename = [".forgekeep-ci.yml"]
         .into_iter()
         .find(|name| {
             repo.rev_parse_single(format!("{}:{}", commit_sha, name).as_str())
@@ -626,7 +625,7 @@ fn read_ci_config(
                 )
             } else {
                 anyhow::anyhow!(
-                    "no CI config found (.gitea/workflows/*.yml, .forgekeep-ci.yml, or .ironforge-ci.yml) at commit {}",
+                    "no CI config found (.gitea/workflows/*.yml or .forgekeep-ci.yml) at commit {}",
                     commit_sha
                 )
             }

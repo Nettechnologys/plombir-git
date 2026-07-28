@@ -268,9 +268,6 @@ Jobs with an `image` can be executed in Docker (`--docker`). Job logs stream to
 the UI over a WebSocket (`/ws/job/:job_id`); artifacts are stored and served
 through the REST API.
 
-> Note: the legacy `.ironforge-ci.yml` filename is still accepted for backward
-> compatibility, but `.forgekeep-ci.yml` is the canonical name.
-
 ### 6.4 Wiki engine
 
 A repository's wiki is a Markdown-backed page store with version history
@@ -315,9 +312,7 @@ Correspondingly, **no flag that has a config-file equivalent may carry a clap
 `default_value`** — a clap default is indistinguishable from a value the operator
 typed, so it makes the config key unreachable; the built-in defaults live in
 `config::DEFAULT_*` and are named in each flag's `--help`.
-Environment variables use the `FORGEKEEP_*` prefix; the deprecated
-`IRONFORGE_*` names are still read as a fallback (with a one-time warning) to
-ease migration from the upstream project.
+Environment variables use the `FORGEKEEP_*` prefix.
 
 **Path-typed keys are checked at startup, not on first use.** `server.repo_root`,
 `tls.cert` / `tls.key`, `logging.file` and `audit.archive_dir` are created
