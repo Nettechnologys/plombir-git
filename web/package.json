@@ -10,7 +10,8 @@
 		"smoke:integration": "node ../scripts/frontend-backend-smoke.mjs",
 		"smoke:admin-browser": "node ../scripts/browser-admin-smoke.mjs",
 		"smoke:admin": "npm run smoke:integration && npm run smoke:admin-browser",
-		"smoke:markdown-sanitizer": "node scripts/markdown-sanitizer-smoke.mjs",
+		"test": "vitest run",
+		"test:watch": "vitest",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
@@ -20,10 +21,12 @@
 		"@sveltejs/adapter-static": "^3.0.10",
 		"@sveltejs/kit": "^2.57.0",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"jsdom": "^29.1.1",
 		"svelte": "^5.55.2",
 		"svelte-check": "^4.4.6",
 		"typescript": "^6.0.2",
-		"vite": "^8.0.7"
+		"vite": "^8.0.7",
+		"vitest": "^4.1.10"
 	},
 	"dependencies": {
 		"highlight.js": "^11.11.1",
