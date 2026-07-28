@@ -129,6 +129,9 @@ const PER_REPO_PLACEHOLDERS: &[(&str, &str)] = &[
         "filename",
         "a published file name, resolved inside the repository's own registry",
     ),
+    // Cargo spells a crate name out as its own directory prefix, so the last
+    // segment is the name and the ones before it are that name again: a
+    // package name, unique within its registry, either way.
     ("c1", "a Cargo index prefix segment, or the crate name"),
     ("c2", "a Cargo index prefix segment, or the crate name"),
     ("c3", "a Cargo index prefix segment, or the crate name"),
