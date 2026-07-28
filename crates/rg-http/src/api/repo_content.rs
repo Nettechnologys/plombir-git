@@ -8,8 +8,7 @@ use axum::Json;
 use chrono;
 use serde::{Deserialize, Serialize};
 
-use crate::api::auth::extract_bearer_claims;
-use crate::api::repo_access::{CiRead, RepoContents};
+use crate::api::repo_access::{self, CiRead, RepoContents};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -974,34 +973,11 @@ async fn resolve_and_check_write_access(
     ),
     AppError,
 > {
-    let claims = extract_bearer_claims(headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-
-    let user_id = claims
-        .sub
-        .parse::<i64>()
-        .map_err(|_| AppError::unauthorized("invalid token subject".to_string()))?;
-
-    if user_id <= 0 {
-        return Err(AppError::unauthorized("invalid token"));
-    }
-
-    let repo_model = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-
-    // The read gateway above (`resolve_and_check_access`) already keeps "denied"
-    // and "the check failed" apart; this one used to collapse both into 403.
-    match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return Err(AppError::forbidden("write access denied")),
-        Err(e) => return Err(AppError::from(e)),
-    }
+    let (repo_model, user_id) = repo_access::require_write(state, headers, owner, repo).await?;
 
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::unauthorized("invalid token"))?;
 
     Ok((repo_model, user))

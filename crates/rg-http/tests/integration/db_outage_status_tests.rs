@@ -71,6 +71,44 @@ async fn db_outage_in_packages_handler_returns_503_not_500() {
     );
 }
 
+/// The contents write gate used to resolve the repository locally with
+/// `.map_err(AppError::internal)`, so a closed pool on the first repo lookup
+/// became 500 instead of the shared repo-access gateway's 503.
+#[tokio::test]
+async fn db_outage_in_contents_write_gate_returns_503_not_500() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let state = build_test_app_state(db.clone(), repo_root);
+    let headers = bearer(42, "contents-outage");
+
+    db.close().await.expect("close pool");
+
+    let response = rg_http::api::repo_content::create_or_update_file(
+        State(state),
+        Path((
+            "owner".to_string(),
+            "repo".to_string(),
+            "README.md".to_string(),
+        )),
+        headers,
+        axum::Json(rg_http::api::repo_content::CreateOrUpdateFileRequest {
+            branch: None,
+            content: "# outage\n".to_string(),
+            message: "write during outage".to_string(),
+            sha: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "database outage while resolving a contents write must map to 503, not 500"
+    );
+}
+
 /// Peripheral of the same class (card_2e22af5e82a2): the OCI Distribution
 /// registry handlers convert DB errors through a local `oci_err()` helper that
 /// hardcoded `INTERNAL_SERVER_ERROR`, bypassing the 503 classification. Unlike

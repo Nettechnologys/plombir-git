@@ -51,6 +51,27 @@ async fn status(url: &str, auth: Option<(&str, bool)>) -> reqwest::StatusCode {
     req.send().await.unwrap().status()
 }
 
+async fn write_file_status(
+    base: &str,
+    owner: &str,
+    repo: &str,
+    token: &str,
+) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/contents/README.md"
+        ))
+        .header("cookie", format!("forgekeep_token={token}"))
+        .json(&serde_json::json!({
+            "content": "# cookie write\n",
+            "message": "write through cookie session",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
 #[tokio::test]
 async fn private_repo_reads_reject_anonymous_and_outsiders_everywhere() {
     let base = spawn_test_app().await;
@@ -102,4 +123,20 @@ async fn cookie_session_reads_its_own_private_repo() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn cookie_session_writes_its_own_private_repo_contents() {
+    let base = spawn_test_app().await;
+    let owner = "cookiewriteowner";
+    let repo = "cookiewriterepo";
+
+    let owner_token = register_user(&base, owner, &format!("{owner}@example.com"), PW).await;
+    create_private_repo(&base, &owner_token, repo).await;
+
+    let status = write_file_status(&base, owner, repo, &owner_token).await;
+    assert_eq!(
+        status, 200,
+        "cookie session of the owner must be accepted by the contents write gate"
+    );
 }
