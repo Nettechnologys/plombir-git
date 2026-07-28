@@ -238,7 +238,10 @@ mod tests {
         assert!(!parsed.is_manifest_list());
         assert_eq!(parsed.manifest.layers.len(), 1);
         assert_eq!(
-            parsed.manifest.annotations.get("org.opencontainers.image.source"),
+            parsed
+                .manifest
+                .annotations
+                .get("org.opencontainers.image.source"),
             Some(&"https://example.invalid/repo".to_string())
         );
     }
@@ -278,7 +281,8 @@ mod tests {
         // already validated the Content-Type header.
         let body = br#"{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":3,"digest":"sha256:aa"},"layers":[]}"#;
 
-        let parsed = ParsedManifest::parse(body).expect("a missing mediaType is not a client error");
+        let parsed =
+            ParsedManifest::parse(body).expect("a missing mediaType is not a client error");
         assert_eq!(parsed.manifest.media_type, None);
     }
 
@@ -286,7 +290,8 @@ mod tests {
     fn an_unsupported_media_type_is_rejected() {
         let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.example.nonsense+json","layers":[]}"#;
 
-        let err = ParsedManifest::parse(body).expect_err("unknown manifest media types are refused");
+        let err =
+            ParsedManifest::parse(body).expect_err("unknown manifest media types are refused");
         assert!(
             err.to_string().contains("unsupported manifest media type"),
             "unexpected error: {err}"
