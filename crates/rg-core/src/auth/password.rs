@@ -12,7 +12,7 @@ use argon2::{
 };
 use rand_core::OsRng;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 use thiserror::Error;
 
 /// The *stored* hash could not be used to decide anything.
@@ -80,7 +80,25 @@ const DUMMY_PASSWORD_HASH: &str =
     "$argon2id$v=19$m=19456,t=2,p=1$j10MFJnxYC8YdoKn2f0/pw$hiB3C8eJEitR5h7E+0P51MvixnERtz8bhn3hwLOHcq0";
 
 #[cfg(test)]
-static DUMMY_VERIFICATION_BURNS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Dummy verifications burned *on this thread*, for the tests that assert
+    /// the work was spent.
+    ///
+    /// Per-thread rather than one process-global counter. The crate's tests
+    /// compile into a single binary that runs them in parallel threads, and
+    /// three of them burn dummy verifications — so a shared counter answers one
+    /// test's "how many did *I* spend?" with another test's work, and one
+    /// test's reset zeroes a count another is mid-way through asserting.
+    /// Measured before this change: 1 red run in 30 of
+    /// `cargo test -p rg-core --lib -- burns wrong_password_against`.
+    ///
+    /// The trade is deliberate: a test that pushes the burn onto another thread
+    /// (a `multi_thread` runtime, a `spawn_blocking`) reads 0 and fails on
+    /// every run rather than one run in thirty. A test that is always wrong is
+    /// cheap to fix; a test that is occasionally wrong is what this phase is
+    /// about.
+    static DUMMY_VERIFICATION_BURNS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Verify `password` against `stored_hash`, spending the same Argon2 work when
 /// there is no hash to verify against.
@@ -120,20 +138,21 @@ pub fn burn_dummy_verification(password: &str) {
     // `black_box` keeps the optimizer from noticing the result is thrown away.
     let verified = verify_password(password, DUMMY_PASSWORD_HASH).is_ok();
     #[cfg(test)]
-    {
-        let _ = DUMMY_VERIFICATION_BURNS.fetch_add(1, Ordering::SeqCst);
-    }
+    DUMMY_VERIFICATION_BURNS.with(|burns| burns.set(burns.get() + 1));
     std::hint::black_box(verified);
 }
 
+/// Zero this thread's burn count. Call it at the start of the assertion, not
+/// once for the whole suite: the count belongs to the thread, not the process.
 #[cfg(test)]
 pub(crate) fn reset_dummy_verification_burns() {
-    DUMMY_VERIFICATION_BURNS.store(0, Ordering::SeqCst);
+    DUMMY_VERIFICATION_BURNS.with(|burns| burns.set(0));
 }
 
+/// Dummy verifications burned on the calling thread since the last reset.
 #[cfg(test)]
 pub(crate) fn dummy_verification_burns() -> usize {
-    DUMMY_VERIFICATION_BURNS.load(Ordering::SeqCst)
+    DUMMY_VERIFICATION_BURNS.with(|burns| burns.get())
 }
 
 // ── Password Strength Validation (Phase 22-D) ──────────────────────────────
