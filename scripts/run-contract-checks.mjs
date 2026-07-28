@@ -29,12 +29,7 @@ const root = resolve(scriptsDir, '..');
 //   - a quarantined check that starts PASSING fails the job (remove it here);
 //   - an entry naming a file that no longer exists fails the job;
 //   - nothing gets added here without a card id explaining the red.
-const QUARANTINE = new Map([
-  [
-    'webhooks-contract-check.mjs',
-    'card_71260b04bb85 — the check greps a helper that was removed and an old binding name',
-  ],
-]);
+const QUARANTINE = new Map([]);
 
 const checks = readdirSync(scriptsDir)
   .filter((name) => name.endsWith('-contract-check.mjs'))

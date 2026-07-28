@@ -82,6 +82,41 @@ export function stripRustComments(source) {
   return out;
 }
 
+/**
+ * The parameter list and body of a top-level `pub async fn <name>`, or `null`
+ * when the function is not where the caller expects it.
+ *
+ * Handler-level assertions express what a file-wide grep cannot. Counting five
+ * occurrences of a call across a module stays green when one handler drops the
+ * call and another gains a second one — and it says nothing about *which*
+ * handler is missing it. Reading each handler on its own makes "this one door
+ * stopped checking" red, and names the door.
+ *
+ * Relies on rustfmt putting a multi-line signature's closing paren and the
+ * function's own closing brace at column 0; the tree is fmt-clean and CI keeps
+ * it that way. Callers guard on `null`, so a form this cannot read turns the
+ * check red rather than passing over an unread function.
+ */
+export function rustFnBlock(source, name) {
+  const start = source.search(new RegExp(`^pub(?:\\(crate\\))? async fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
+  if (start < 0) return null;
+
+  const rest = source.slice(start);
+  const close = rest.search(/\n\}/);
+  if (close < 0) return null;
+  const block = rest.slice(0, close + 2);
+
+  const signature =
+    /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(([\s\S]*?)\n\)/.exec(block) ||
+    /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(([^)]*)\)/.exec(block);
+  if (!signature) return null;
+
+  const brace = block.indexOf('{', signature[0].length);
+  if (brace < 0) return null;
+
+  return { params: signature[1], body: block.slice(brace) };
+}
+
 // ── Route table ────────────────────────────────────────────────────────────
 //
 // `crates/rg-http/src/routes.rs` no longer registers routes with axum's

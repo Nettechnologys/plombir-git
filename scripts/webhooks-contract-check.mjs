@@ -3,13 +3,16 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { loadRouteTable, routeFailures, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/webhooks.rs');
 const clientPath = path.join(root, 'web/src/lib/api/webhooks.ts');
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/webhooks/+page.svelte');
 
-const backend = readFileSync(backendPath, 'utf8');
+// Comments are stripped so a commented-out handler reads as a deleted one.
+const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
 const client = readFileSync(clientPath, 'utf8');
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');
@@ -30,17 +33,153 @@ for (const [method, route] of [
   }
 }
 
-if (!/Path\(\(owner,\s*repo,\s*id,\s*delivery_id\)\):\s*Path<\(String,\s*String,\s*i64,\s*i64\)>/.test(backend)) {
-  failures.push('Webhook redelivery handler must destructure owner, repo, hook id, and delivery id path params.');
+// ── The admin gate and the repo-scoping of `{id}` ─────────────────────────
+//
+// A webhook row carries the delivery target and the HMAC key ForgeKeep signs
+// deliveries with, and `{id}` is a global `webhooks` primary key. So every
+// id-taking door owes two refusals: a non-admin, and a hook that belongs to
+// some other repository.
+//
+// This used to be asserted by grepping the module for
+// `resolve_webhook_in_repo(&state.db, &owner, &repo, id)` and counting to five,
+// plus a literal `Path((owner, repo, id, delivery_id))`. Two renames later
+// neither string existed — scoping had moved to a two-argument helper behind
+// the `RepoAdmin` extractor, i.e. it had become *stricter* — and the check
+// reported "no scoping" about scoping that was there (card_71260b04bb85).
+//
+// Rewritten to read each handler on its own instead of the file as a whole: a
+// file-wide count of five stays green when one door drops the call and another
+// gains a second one. Three assertions, none satisfiable by the other two:
+//
+//   1. The router *declares* `RepoAdmin` for all seven routes. That declaration
+//      is what `route_access_sweep_tests::
+//      every_route_answers_its_declared_access_level` drives its personas
+//      against, so a declaration that does not match behaviour is red there.
+//   2. Each handler *takes* one of the gates — a route can keep its declared
+//      level while the handler quietly stops asking, and (1) would not notice.
+//   3. Each id-taking handler re-anchors the hook to the repository the gate
+//      authorized, not to the one the path asked for.
+//
+// The gate names and the scoping helper are read out of the modules that define
+// them rather than spelled out here. A hard-coded list of symbol names is
+// exactly what rotted the first time.
+
+const repoAccess = readFileSync(path.join(root, 'crates/rg-http/src/api/repo_access.rs'), 'utf8');
+
+// Extractors are the braced/generic `pub struct`s; the unit structs next to
+// them (`RepoContents`, `Packages`) are scope markers, not gates.
+const gates = [
+  ...[...repoAccess.matchAll(/^pub struct (\w+)(?:<[^>]*>)?\s*\{/gm)].map((m) => m[1]),
+  ...[...repoAccess.matchAll(/^pub(?:\(crate\))? async fn (require_\w+)/gm)].map((m) => m[1]),
+];
+
+// The module-private `async fn`s of webhooks.rs — that is what a handler calls
+// to re-anchor a hook to a repository.
+const scopingHelpers = [...backend.matchAll(/^async fn (\w+)/gm)].map((m) => m[1]);
+
+if (gates.length === 0 || scopingHelpers.length === 0) {
+  failures.push(
+    'This check can no longer read the gates in api/repo_access.rs or the private helpers in ' +
+      'api/webhooks.rs that it derives its assertions from, so its verdicts below mean nothing. ' +
+      'Fix the parsing, not the handlers.',
+  );
 }
 
-const scopedHelperCalls = backend.match(/resolve_webhook_in_repo\(&state\.db,\s*&owner,\s*&repo,\s*id\)\.await/g) || [];
-if (scopedHelperCalls.length < 5) {
-  failures.push('Webhook get/update/delete/deliveries/redeliver handlers must resolve hook ids within the routed repository.');
+failures.push(
+  ...routeFailures(
+    loadRouteTable(path.join(root, 'crates/rg-http/src/routes.rs')),
+    [
+      ['GET', '/repos/{owner}/{name}/hooks', 'list_webhooks'],
+      ['POST', '/repos/{owner}/{name}/hooks', 'create_webhook'],
+      ['GET', '/repos/{owner}/{name}/hooks/{id}', 'get_webhook'],
+      ['PATCH', '/repos/{owner}/{name}/hooks/{id}', 'update_webhook'],
+      ['DELETE', '/repos/{owner}/{name}/hooks/{id}', 'delete_webhook'],
+      ['GET', '/repos/{owner}/{name}/hooks/{id}/deliveries', 'list_deliveries'],
+      ['POST', '/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver', 'redeliver'],
+    ].map(([method, routePath, handler]) => ({
+      method,
+      path: routePath,
+      handler: `api::webhooks::${handler}`,
+      access: 'RepoAdmin',
+    })),
+  ),
+);
+
+/** `Path((a, b, c)): Path<(String, String, i64)>` → its bindings and its types. */
+function pathTuple(params) {
+  const match = /Path\(\(([^)]*)\)\)\s*:\s*Path<\(([^)]*)\)>/.exec(params);
+  if (!match) {
+    return null;
+  }
+  const split = (list) => list.split(',').map((part) => part.trim()).filter(Boolean);
+  return { bindings: split(match[1]), types: split(match[2]) };
 }
 
-if (!/delivery\.webhook_id\s*==\s*hook\.id/.test(backend)) {
-  failures.push('Webhook redelivery must verify the delivery belongs to the routed hook before redelivering.');
+// `hookIdAt` / `deliveryIdAt` are indexes into the Path tuple, so the bindings
+// are read from the signature instead of being assumed to be called `id`.
+for (const [handler, types, hookIdAt, deliveryIdAt] of [
+  ['get_webhook', ['String', 'String', 'i64'], 2, null],
+  ['update_webhook', ['String', 'String', 'i64'], 2, null],
+  ['delete_webhook', ['String', 'String', 'i64'], 2, null],
+  ['list_deliveries', ['String', 'String', 'i64'], 2, null],
+  ['redeliver', ['String', 'String', 'i64', 'i64'], 2, 3],
+]) {
+  const fn = rustFnBlock(backend, handler);
+  if (fn === null) {
+    failures.push(`api/webhooks.rs no longer defines a \`pub async fn ${handler}\` this check can read`);
+    continue;
+  }
+  if (gates.length === 0 || scopingHelpers.length === 0) {
+    continue;
+  }
+
+  if (!gates.some((gate) => new RegExp(`\\b${gate}\\b`).test(fn.params))) {
+    failures.push(
+      `Webhook handler ${handler} must enforce repository admin access: it takes none of the ` +
+        `api::repo_access gates (${gates.join(', ')})`,
+    );
+  }
+
+  const tuple = pathTuple(fn.params);
+  if (tuple === null || tuple.types.join(', ') !== types.join(', ')) {
+    failures.push(
+      `Webhook handler ${handler} must destructure Path<(${types.join(', ')})>` +
+        (tuple === null ? ' (no Path extractor found)' : ` (found: (${tuple.types.join(', ')}))`),
+    );
+    continue;
+  }
+
+  // The repository is taken from the gate, never from the path: `{owner}/{name}`
+  // is what the caller asked for, the gate's repo is what they were authorized
+  // for. Falls back to any `<x>.id` when the gate binding cannot be read, so an
+  // unfamiliar spelling weakens the message rather than the assertion.
+  const gateBinding = /(\w+)\s*\{\s*(?:\w+\s*:\s*)?(\w+)[^}]*\}\s*:\s*\1\b/.exec(fn.params);
+  const repoId = gateBinding ? `${gateBinding[2]}\\.id` : '\\w+\\.id';
+  const hookId = tuple.bindings[hookIdAt];
+
+  const scoped = scopingHelpers.some((helper) =>
+    new RegExp(`\\b${helper}\\(\\s*&state\\.db\\s*,\\s*${repoId}\\s*,\\s*${hookId}\\s*\\)`).test(fn.body),
+  );
+  if (!scoped) {
+    failures.push(
+      `Webhook handler ${handler} must re-anchor hook id \`${hookId}\` to the repository the gate ` +
+        `authorized — none of ${scopingHelpers.map((helper) => `${helper}(&state.db, <repo>.id, ${hookId})`).join(', ')} ` +
+        'is called. `{id}` is a global webhooks primary key, so admin of one repository must not reach ' +
+        "another one's rows",
+    );
+  }
+
+  if (deliveryIdAt === null) {
+    continue;
+  }
+
+  const deliveryId = tuple.bindings[deliveryIdAt];
+  if (!new RegExp(`\\b${deliveryId}\\b`).test(fn.body)) {
+    failures.push(`Webhook handler ${handler} destructures delivery id \`${deliveryId}\` but never uses it.`);
+  }
+  if (!/\.webhook_id\s*==\s*\w+\.id/.test(fn.body)) {
+    failures.push('Webhook redelivery must verify the delivery belongs to the routed hook before redelivering.');
+  }
 }
 
 for (const [name, method, pathPattern] of [

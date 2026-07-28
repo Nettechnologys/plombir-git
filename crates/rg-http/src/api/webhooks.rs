@@ -3,8 +3,8 @@
 //! Every endpoint here is repository *administration*: a webhook carries the
 //! delivery target and the HMAC key ForgeKeep signs deliveries with, exactly
 //! like a deploy key or a CI secret. So all seven verbs — reads included — sit
-//! behind [`repo_access::require_admin`], the same door
-//! `api::deploy_keys` and `api::ci_secrets` use. They previously stopped at
+//! behind the [`RepoAdmin`] extractor, the same door `api::deploy_keys` and
+//! `api::ci_secrets` use. They previously stopped at
 //! `extract_user_id`, which is authentication, not authorization: any account
 //! with a valid token could read — and rewrite — the webhooks of any
 //! repository, private ones included, and the reply handed over the raw
