@@ -687,111 +687,117 @@ fn auto_init_repo(
     std::fs::create_dir_all(&tmp)
         .map_err(|error| temp_tree_error("auto-init working tree", &tmp, &error))?;
 
-    // Init a non-bare repo in the temp dir
-    let gateway =
-        rg_git::cli_gateway::GitCommandGateway::new().with_context(|| "git CLI not available")?;
-    let output = gateway
-        .run(&["init", "-b", default_branch], Some(&tmp))
-        .with_context(|| format!("git init failed in {:?}", tmp))?;
-    output
-        .ensure_success()
-        .with_context(|| format!("git init failed in {:?}", tmp))?;
+    // One cleanup point behind the body, the shape `update_files_in_commit`
+    // already uses. `tmp` is a whole working tree, and a `?` or `bail!` that
+    // slipped past a per-branch `discard_dir` left it in `TMPDIR` for good —
+    // under a UUID name nothing in the logs can tie back to a repository.
+    let result = (|| -> Result<()> {
+        // Init a non-bare repo in the temp dir
+        let gateway = rg_git::cli_gateway::GitCommandGateway::new()
+            .with_context(|| "git CLI not available")?;
+        let output = gateway
+            .run(&["init", "-b", default_branch], Some(&tmp))
+            .with_context(|| format!("git init failed in {:?}", tmp))?;
+        output
+            .ensure_success()
+            .with_context(|| format!("git init failed in {:?}", tmp))?;
 
-    // Write README.md if specified
-    let mut files_written = false;
+        // Write README.md if specified
+        let mut files_written = false;
 
-    // Write .gitignore if specified
-    if let Some(key) = gitignores_key {
-        if !key.is_empty() {
-            if let Some(tmpl) = templates::gitignore_content(key) {
-                std::fs::write(tmp.join(".gitignore"), tmpl.content)
-                    .context("failed to write .gitignore")?;
+        // Write .gitignore if specified
+        if let Some(key) = gitignores_key {
+            if !key.is_empty() {
+                if let Some(tmpl) = templates::gitignore_content(key) {
+                    std::fs::write(tmp.join(".gitignore"), tmpl.content)
+                        .context("failed to write .gitignore")?;
+                    files_written = true;
+                }
+            }
+        }
+
+        // Write LICENSE if specified (with year/author substitution)
+        if let Some(key) = license_key {
+            if !key.is_empty() {
+                if let Some(tmpl) = templates::license_content(key) {
+                    let year = Utc::now().format("%Y").to_string();
+                    let content = tmpl
+                        .content
+                        .replace("{YEAR}", &year)
+                        .replace("{AUTHOR}", owner_name);
+                    std::fs::write(tmp.join("LICENSE"), content)
+                        .context("failed to write LICENSE")?;
+                    files_written = true;
+                }
+            }
+        }
+
+        // Write README.md if specified (default to "default" if auto_init but no template specified)
+        let readme_key = readme_key.unwrap_or("default");
+        if !readme_key.is_empty() {
+            if let Some(content) = templates::readme_content(readme_key, repo_name, description) {
+                std::fs::write(tmp.join("README.md"), content)
+                    .context("failed to write README.md")?;
                 files_written = true;
             }
         }
-    }
 
-    // Write LICENSE if specified (with year/author substitution)
-    if let Some(key) = license_key {
-        if !key.is_empty() {
-            if let Some(tmpl) = templates::license_content(key) {
-                let year = Utc::now().format("%Y").to_string();
-                let content = tmpl
-                    .content
-                    .replace("{YEAR}", &year)
-                    .replace("{AUTHOR}", owner_name);
-                std::fs::write(tmp.join("LICENSE"), content).context("failed to write LICENSE")?;
-                files_written = true;
-            }
+        // If no files were written, skip the commit — the tail still cleans up.
+        if !files_written {
+            tracing::info!(%repo_name, "auto_init: no template files to commit, skipping");
+            return Ok(());
         }
-    }
 
-    // Write README.md if specified (default to "default" if auto_init but no template specified)
-    let readme_key = readme_key.unwrap_or("default");
-    if !readme_key.is_empty() {
-        if let Some(content) = templates::readme_content(readme_key, repo_name, description) {
-            std::fs::write(tmp.join("README.md"), content).context("failed to write README.md")?;
-            files_written = true;
+        // git add all files
+        let output = gateway
+            .run(&["add", "-A"], Some(&tmp))
+            .context("git add failed")?;
+        output.ensure_success().context("git add failed")?;
+
+        // git commit (identity env via gateway)
+        let identity = git_identity_env(git_author_name, git_author_email);
+        let output = gateway
+            .run_with_env(&["commit", "-m", "Initial commit"], Some(&tmp), &identity)
+            .context("git commit failed")?;
+        if !output.success() {
+            bail!("git commit failed: {}", output.stderr_str());
         }
-    }
 
-    // If no files were written, skip commit and just clean up
-    if !files_written {
-        discard_dir("auto-init working tree", &tmp);
-        tracing::info!(%repo_name, "auto_init: no template files to commit, skipping");
-        return Ok(());
-    }
+        // git push to the bare repo
+        let push_url =
+            path_to_git_url(&bare_path).context("failed to convert bare repo path to git URL")?;
+        let refspec = format!("{}:{}", default_branch, default_branch);
 
-    // git add all files
-    let output = gateway
-        .run(&["add", "-A"], Some(&tmp))
-        .context("git add failed")?;
-    output.ensure_success().context("git add failed")?;
+        let output = gateway
+            .run(&["push", "--quiet", &push_url, &refspec], Some(&tmp))
+            .context("git push failed")?;
+        if !output.success() {
+            bail!("git push to bare repo failed: {}", output.stderr_str());
+        }
 
-    // git commit (identity env via gateway)
-    let identity = git_identity_env(git_author_name, git_author_email);
-    let output = gateway
-        .run_with_env(&["commit", "-m", "Initial commit"], Some(&tmp), &identity)
-        .context("git commit failed")?;
-    if !output.success() {
-        bail!("git commit failed: {}", output.stderr_str());
-    }
+        // Set HEAD in the bare repo to point to the default branch.
+        // Use --git-dir (cannot combine with the gateway's `-C`, so repo_path=None).
+        let head_ref = format!("refs/heads/{}", default_branch);
+        let head_output = gateway
+            .run(
+                &["--git-dir", &push_url, "symbolic-ref", "HEAD", &head_ref],
+                None,
+            )
+            .context("git symbolic-ref HEAD failed")?;
+        if !head_output.success() {
+            tracing::warn!(stderr = %head_output.stderr_str(), "failed to set HEAD in bare repo");
+        }
 
-    // git push to the bare repo
-    let push_url =
-        path_to_git_url(&bare_path).context("failed to convert bare repo path to git URL")?;
-    let refspec = format!("{}:{}", default_branch, default_branch);
+        tracing::info!(
+            repo = %repo_name,
+            branch = %default_branch,
+            "auto-initialized repository with template files"
+        );
 
-    let output = gateway
-        .run(&["push", "--quiet", &push_url, &refspec], Some(&tmp))
-        .context("git push failed")?;
-    if !output.success() {
-        bail!("git push to bare repo failed: {}", output.stderr_str());
-    }
-
-    // Set HEAD in the bare repo to point to the default branch.
-    // Use --git-dir (cannot combine with the gateway's `-C`, so repo_path=None).
-    let head_ref = format!("refs/heads/{}", default_branch);
-    let head_output = gateway
-        .run(
-            &["--git-dir", &push_url, "symbolic-ref", "HEAD", &head_ref],
-            None,
-        )
-        .context("git symbolic-ref HEAD failed")?;
-    if !head_output.success() {
-        tracing::warn!(stderr = %head_output.stderr_str(), "failed to set HEAD in bare repo");
-    }
-
-    // Clean up temp directory
+        Ok(())
+    })();
     discard_dir("auto-init working tree", &tmp);
-
-    tracing::info!(
-        repo = %repo_name,
-        branch = %default_branch,
-        "auto-initialized repository with template files"
-    );
-
-    Ok(())
+    result
 }
 
 /// Build git identity env vars for commit commands run via `GitCommandGateway`.
@@ -1333,86 +1339,87 @@ pub async fn create_or_update_file(
     std::fs::create_dir_all(&tmp)
         .map_err(|error| temp_tree_error("file-edit working tree", &tmp, &error))?;
 
-    // Clone the repo
-    let clone_url =
-        path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
-    let tmp_str = tmp.to_string_lossy();
-    let gateway = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
+    // One cleanup point behind the body — see `auto_init_repo`. The per-branch
+    // `discard_dir` calls this used to carry covered the `bail!`s and none of
+    // the eleven `?`s between them, so a git CLI that was merely missing leaked
+    // a full clone of the repository.
+    let result = (|| -> Result<()> {
+        // Clone the repo
+        let clone_url =
+            path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
+        let tmp_str = tmp.to_string_lossy();
+        let gateway = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
 
-    // Try cloning with the target branch; fall back to --no-checkout for new repos
-    // where the branch does not exist yet, then create the branch via checkout -b.
-    let clone_out = gateway
-        .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
-        .context("git clone failed")?;
-    if !clone_out.success() {
-        let nc_out = gateway
-            .run(&["clone", "--no-checkout", &clone_url, &tmp_str], None)
-            .context("git clone (no-checkout) failed")?;
-        if !nc_out.success() {
-            discard_dir("file-edit working tree", &tmp);
-            bail!("git clone failed: {}", nc_out.stderr_str());
+        // Try cloning with the target branch; fall back to --no-checkout for new repos
+        // where the branch does not exist yet, then create the branch via checkout -b.
+        let clone_out = gateway
+            .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
+            .context("git clone failed")?;
+        if !clone_out.success() {
+            let nc_out = gateway
+                .run(&["clone", "--no-checkout", &clone_url, &tmp_str], None)
+                .context("git clone (no-checkout) failed")?;
+            if !nc_out.success() {
+                bail!("git clone failed: {}", nc_out.stderr_str());
+            }
+            let co_out = gateway
+                .run(&["checkout", "-b", branch], Some(&tmp))
+                .context("git checkout failed")?;
+            if !co_out.success() {
+                bail!("git checkout failed: {}", co_out.stderr_str());
+            }
         }
-        let co_out = gateway
-            .run(&["checkout", "-b", branch], Some(&tmp))
-            .context("git checkout failed")?;
-        if !co_out.success() {
-            discard_dir("file-edit working tree", &tmp);
-            bail!("git checkout failed: {}", co_out.stderr_str());
+
+        // Write the file
+        let full_path = tmp.join(file_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| temp_tree_error("file-edit working tree", parent, &error))?;
         }
-    }
+        std::fs::write(&full_path, content)
+            .map_err(|error| temp_tree_error("edited file", &full_path, &error))?;
 
-    // Write the file
-    let full_path = tmp.join(file_path);
-    if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| temp_tree_error("file-edit working tree", parent, &error))?;
-    }
-    std::fs::write(&full_path, content)
-        .map_err(|error| temp_tree_error("edited file", &full_path, &error))?;
+        // Git add
+        let output = gateway
+            .run(&["add", file_path], Some(&tmp))
+            .context("git add failed")?;
+        if !output.success() {
+            bail!("git add failed: {}", output.stderr_str());
+        }
 
-    // Git add
-    let output = gateway
-        .run(&["add", file_path], Some(&tmp))
-        .context("git add failed")?;
-    if !output.success() {
-        discard_dir("file-edit working tree", &tmp);
-        bail!("git add failed: {}", output.stderr_str());
-    }
+        // Git commit
+        let identity = git_identity_env(author_name, author_email);
+        let output = gateway
+            .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
+            .context("git commit failed")?;
+        if !output.success() {
+            bail!("git commit failed: {}", output.stderr_str());
+        }
 
-    // Git commit
-    let identity = git_identity_env(author_name, author_email);
-    let output = gateway
-        .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
-        .context("git commit failed")?;
-    if !output.success() {
-        discard_dir("file-edit working tree", &tmp);
-        bail!("git commit failed: {}", output.stderr_str());
-    }
+        // Git push
+        let push_url =
+            path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
 
-    // Git push
-    let push_url = path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
+        let output = gateway
+            .run(&["push", &push_url, branch], Some(&tmp))
+            .context("git push failed")?;
+        if !output.success() {
+            bail!("git push failed: {}", output.stderr_str());
+        }
 
-    let output = gateway
-        .run(&["push", &push_url, branch], Some(&tmp))
-        .context("git push failed")?;
-    if !output.success() {
-        discard_dir("file-edit working tree", &tmp);
-        bail!("git push failed: {}", output.stderr_str());
-    }
+        tracing::info!(
+            repo = %repo_name,
+            file = %file_path,
+            branch = %branch,
+            "file created/updated successfully"
+        );
 
-    // Clean up
+        Ok(())
+    })();
     discard_dir("file-edit working tree", &tmp);
-
-    tracing::info!(
-        repo = %repo_name,
-        file = %file_path,
-        branch = %branch,
-        "file created/updated successfully"
-    );
-
-    Ok(())
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -1592,63 +1599,62 @@ pub async fn delete_file(
     std::fs::create_dir_all(&tmp)
         .map_err(|error| temp_tree_error("file-delete working tree", &tmp, &error))?;
 
-    // Clone the repo
-    let clone_url =
-        path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
-    let tmp_str = tmp.to_string_lossy();
-    let gateway = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
+    // One cleanup point behind the body — see `auto_init_repo`.
+    let result = (|| -> Result<()> {
+        // Clone the repo
+        let clone_url =
+            path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
+        let tmp_str = tmp.to_string_lossy();
+        let gateway = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
 
-    let output = gateway
-        .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
-        .context("git clone failed")?;
-    if !output.success() {
-        discard_dir("file-delete working tree", &tmp);
-        bail!("git clone failed: {}", output.stderr_str());
-    }
+        let output = gateway
+            .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
+            .context("git clone failed")?;
+        if !output.success() {
+            bail!("git clone failed: {}", output.stderr_str());
+        }
 
-    // Delete the file
-    let output = gateway
-        .run(&["rm", file_path], Some(&tmp))
-        .context("git rm failed")?;
-    if !output.success() {
-        discard_dir("file-delete working tree", &tmp);
-        bail!("git rm failed: {}", output.stderr_str());
-    }
+        // Delete the file
+        let output = gateway
+            .run(&["rm", file_path], Some(&tmp))
+            .context("git rm failed")?;
+        if !output.success() {
+            bail!("git rm failed: {}", output.stderr_str());
+        }
 
-    // Git commit
-    let identity = git_identity_env(author_name, author_email);
-    let output = gateway
-        .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
-        .context("git commit failed")?;
-    if !output.success() {
-        discard_dir("file-delete working tree", &tmp);
-        bail!("git commit failed: {}", output.stderr_str());
-    }
+        // Git commit
+        let identity = git_identity_env(author_name, author_email);
+        let output = gateway
+            .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
+            .context("git commit failed")?;
+        if !output.success() {
+            bail!("git commit failed: {}", output.stderr_str());
+        }
 
-    // Git push
-    let push_url = path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
+        // Git push
+        let push_url =
+            path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
 
-    let output = gateway
-        .run(&["push", &push_url, branch], Some(&tmp))
-        .context("git push failed")?;
-    if !output.success() {
-        discard_dir("file-delete working tree", &tmp);
-        bail!("git push failed: {}", output.stderr_str());
-    }
+        let output = gateway
+            .run(&["push", &push_url, branch], Some(&tmp))
+            .context("git push failed")?;
+        if !output.success() {
+            bail!("git push failed: {}", output.stderr_str());
+        }
 
-    // Clean up
+        tracing::info!(
+            repo = %repo_name,
+            file = %file_path,
+            branch = %branch,
+            "file deleted successfully"
+        );
+
+        Ok(())
+    })();
     discard_dir("file-delete working tree", &tmp);
-
-    tracing::info!(
-        repo = %repo_name,
-        file = %file_path,
-        branch = %branch,
-        "file deleted successfully"
-    );
-
-    Ok(())
+    result
 }
 
 /// Reject a repository-relative file path before it is joined onto a working
@@ -1738,6 +1744,59 @@ mod path_diagnostic_tests {
 
         assert!(rendered.contains("this process runs as uid="), "{rendered}");
         assert!(rendered.contains("TMPDIR"), "{rendered}");
+    }
+
+    /// A working tree that outlives its request is a whole clone of the
+    /// repository, left in `TMPDIR` under a UUID no log can tie back to
+    /// anything — so no error path may return without it being gone.
+    ///
+    /// `auto_init_repo` pushes into the bare path it is handed; pointing it at
+    /// an ordinary directory fails that push after the tree has been built,
+    /// which is the branch that used to `bail!` straight past the cleanup. A
+    /// machine with no `git` at all fails earlier inside the same body, and the
+    /// assertion holds either way — which is the point of one cleanup tail
+    /// rather than a `discard_dir` per branch.
+    #[test]
+    fn a_failed_auto_init_leaves_no_working_tree_behind() {
+        let sandbox = tempfile::tempdir().expect("create sandbox");
+        let tmpdir = sandbox.path().join("tmp");
+        std::fs::create_dir_all(&tmpdir).expect("create private TMPDIR");
+        // Process-wide, but nothing else in this test binary reads `temp_dir()`
+        // for more than an is-absolute assertion, and this path is absolute.
+        std::env::set_var("TMPDIR", &tmpdir);
+
+        let not_a_repo = sandbox.path().join("bare");
+        std::fs::create_dir_all(&not_a_repo).expect("create the push target");
+
+        let error = auto_init_repo(
+            &not_a_repo,
+            "notes",
+            "",
+            "main",
+            None,
+            None,
+            Some("default"),
+            "alice",
+            "Alice",
+            "alice@example.com",
+        )
+        .expect_err("pushing into a directory that is not a repository must fail");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&tmpdir)
+            .expect("read the private TMPDIR")
+            .map(|entry| {
+                entry
+                    .expect("TMPDIR entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the failed auto-init left a working tree behind: {leftovers:?} \
+             (it failed with: {error:#})"
+        );
     }
 }
 
