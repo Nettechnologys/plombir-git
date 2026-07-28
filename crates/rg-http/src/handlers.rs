@@ -14,6 +14,10 @@ use crate::{openapi, security, AppState};
 /// `/app/web/build` and sets `WORKDIR /app`.
 pub(crate) const WEB_BUILD_DIR: &str = "web/build";
 
+/// Build directory captured when the production router mounts the SPA fallback.
+#[derive(Clone)]
+pub(crate) struct SpaBuildDir(pub PathBuf);
+
 /// Remediation hint attached to every failure to serve the SPA shell. The bundle
 /// is resolved from the process CWD, so "file missing" and "wrong CWD" look
 /// identical from the outside — name both.
@@ -26,8 +30,11 @@ const WEB_BUILD_HINT: &str = "the frontend bundle is expected in `web/build/` re
 /// request extensions. This handler reads it and injects `nonce="<value>"`
 /// into every `<script>` tag so the browser allows inline scripts under
 /// the strict `script-src 'self' 'nonce-<value>'` CSP.
-pub(crate) async fn spa_index_handler(Extension(nonce): Extension<security::CspNonce>) -> Response {
-    let index_path = spa_index_path();
+pub(crate) async fn spa_index_handler(
+    Extension(nonce): Extension<security::CspNonce>,
+    Extension(spa_build_dir): Extension<SpaBuildDir>,
+) -> Response {
+    let index_path = spa_index_path(&spa_build_dir.0);
     match tokio::fs::read(&index_path).await {
         Ok(html_bytes) => {
             let html = String::from_utf8_lossy(&html_bytes).into_owned();
@@ -43,8 +50,8 @@ pub(crate) async fn spa_index_handler(Extension(nonce): Extension<security::CspN
     }
 }
 
-fn spa_index_path() -> PathBuf {
-    Path::new(WEB_BUILD_DIR).join("index.html")
+fn spa_index_path(web_build_dir: &Path) -> PathBuf {
+    web_build_dir.join("index.html")
 }
 
 /// Resolve a CWD-relative path against the process working directory, so the log
@@ -365,7 +372,7 @@ mod tests {
 
     #[test]
     fn a_missing_bundle_and_an_unreadable_one_get_different_statuses() {
-        let path = spa_index_path();
+        let path = spa_index_path(Path::new(WEB_BUILD_DIR));
 
         let missing =
             spa_index_error_response(&path, &Error::new(ErrorKind::NotFound, "No such file"));
@@ -386,7 +393,7 @@ mod tests {
 
     #[test]
     fn the_logged_index_path_is_absolute() {
-        let absolute = absolutize(&spa_index_path());
+        let absolute = absolutize(&spa_index_path(Path::new(WEB_BUILD_DIR)));
         assert!(
             absolute.is_absolute(),
             "the log must name the file the server actually opened, got {}",
@@ -397,7 +404,7 @@ mod tests {
 
     #[test]
     fn the_log_carries_the_absolute_path_the_errno_and_the_remediation() {
-        let path = spa_index_path();
+        let path = spa_index_path(Path::new(WEB_BUILD_DIR));
         let cwd = std::env::current_dir().expect("cwd");
 
         let missing = spa_index_diagnostic(
@@ -433,7 +440,7 @@ mod tests {
 
     #[test]
     fn the_router_and_the_handler_agree_on_the_bundle_directory() {
-        assert!(spa_index_path().starts_with(WEB_BUILD_DIR));
+        assert!(spa_index_path(Path::new(WEB_BUILD_DIR)).starts_with(WEB_BUILD_DIR));
     }
 
     #[tokio::test]

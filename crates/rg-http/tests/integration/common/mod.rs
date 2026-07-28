@@ -112,6 +112,7 @@ pub fn build_test_app_state_with(
     rg_http::AppState {
         blob_storage: blob_storage.clone(),
         repo_root: Arc::new(repo_root),
+        spa_build_dir: Arc::new(std::path::PathBuf::from(rg_http::DEFAULT_SPA_BUILD_DIR)),
         db,
         jwt_secret: Arc::new("test-secret-key".to_string()),
         external_webhook_secret: None,

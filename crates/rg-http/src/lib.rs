@@ -42,10 +42,17 @@ use axum::Router;
 use rg_core::package_registry::oci::OciStorage;
 use sea_orm::DatabaseConnection;
 
+/// Default directory holding the built SPA bundle, relative to the server CWD.
+pub const DEFAULT_SPA_BUILD_DIR: &str = handlers::WEB_BUILD_DIR;
+
 /// Shared application state injected into every Axum handler via `State<AppState>`.
 #[derive(Clone)]
 pub struct AppState {
     pub repo_root: Arc<PathBuf>,
+    /// Directory holding the built SPA bundle. Production uses
+    /// [`DEFAULT_SPA_BUILD_DIR`]; tests can inject a temp fixture without
+    /// mutating process-global cwd or env.
+    pub spa_build_dir: Arc<PathBuf>,
     pub db: DatabaseConnection,
     pub jwt_secret: Arc<String>,
     /// Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
@@ -356,6 +363,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
 
     let state = AppState {
         repo_root: Arc::new(config.repo_root),
+        spa_build_dir: Arc::new(PathBuf::from(DEFAULT_SPA_BUILD_DIR)),
         db: config.db,
         jwt_secret: Arc::new(config.jwt_secret),
         external_webhook_secret: config.external_webhook_secret.map(Arc::new),
@@ -572,6 +580,21 @@ async fn load_tls_config(
 /// Create the Axum router for testing (no rate limiter, no static file serving).
 pub fn create_router_for_test(state: AppState) -> Router {
     routes::build_test_router(state)
+}
+
+/// Create the production router in tests, including static SPA fallback.
+///
+/// Most integration tests intentionally use [`create_router_for_test`], whose
+/// router omits static file serving. Tests that need to prove the production
+/// fallback is mounted should use this helper and serve it with
+/// `into_make_service_with_connect_info`, because the production stack still
+/// carries the rate-limit layer's `ConnectInfo` extractor.
+pub fn create_router_for_test_with_static_files(state: AppState) -> Router {
+    routes::create_router(
+        state,
+        rate_limit::RateLimiter::new(0, 60),
+        rate_limit::RateLimiter::new(0, 60),
+    )
 }
 
 /// The test router plus the declared access level of every route in it.

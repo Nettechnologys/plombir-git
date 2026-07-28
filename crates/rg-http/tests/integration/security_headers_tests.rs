@@ -15,7 +15,9 @@
 //! missing from the test router without going missing from production too, and
 //! that is the guarantee that was wanted.
 
-use crate::common::spawn_test_app;
+use std::sync::Arc;
+
+use crate::common::{build_test_app_state, setup_test_db, spawn_test_app, wait_for_listener};
 
 /// Every header `security_headers_middleware` promises, checked on a live
 /// response from the real router.
@@ -87,4 +89,80 @@ async fn a_rejected_request_is_answered_with_the_security_headers_too() {
         "an unauthenticated request to a user route should be rejected"
     );
     assert_security_headers(resp.headers(), "unauthenticated GET /api/v1/users/me");
+}
+
+fn extract_between<'a>(haystack: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = haystack
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("missing marker {start_marker:?} in {haystack}"))
+        + start_marker.len();
+    let rest = &haystack[start..];
+    let end = rest.find(end_marker).unwrap_or_else(|| {
+        panic!("missing marker {end_marker:?} after {start_marker:?} in {haystack}")
+    });
+    &rest[..end]
+}
+
+/// The SPA fallback is production-only, so this test drives the production
+/// router with a temp SvelteKit bundle fixture instead of the normal test
+/// router. It catches both halves of the contract: fallback mounted, and the
+/// exact CSP nonce injected into `index.html`.
+#[tokio::test]
+async fn spa_fallback_uses_the_same_nonce_in_html_and_csp() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+
+    let spa_build_dir = dir.path().join("spa-build");
+    std::fs::create_dir_all(&spa_build_dir).expect("create SPA build dir");
+    std::fs::write(
+        spa_build_dir.join("index.html"),
+        r#"<!doctype html><script>window.__fk=1</script><script type="module">boot()</script>"#,
+    )
+    .expect("write SPA fixture");
+
+    let mut state = build_test_app_state(db, repo_root);
+    state.spa_build_dir = Arc::new(spa_build_dir);
+    let app = rg_http::create_router_for_test_with_static_files(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+
+    let response = reqwest::get(format!("http://{addr}/dashboard"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "production SPA fallback must answer client-side routes"
+    );
+    let csp = response
+        .headers()
+        .get("content-security-policy")
+        .expect("fallback response carries CSP")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = response.text().await.unwrap();
+
+    let csp_nonce = extract_between(&csp, "'nonce-", "'");
+    let html_nonce = extract_between(&body, "nonce=\"", "\"");
+    assert_eq!(
+        html_nonce, csp_nonce,
+        "the browser only runs the SPA bootstrap when body and header nonces match"
+    );
+    assert_eq!(
+        body.matches(&format!("nonce=\"{html_nonce}\"")).count(),
+        2,
+        "every bootstrap script tag in index.html must receive the CSP nonce"
+    );
 }

@@ -155,6 +155,10 @@ fn build_router(
     auth_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
     let routers = build_all_routes(&state, Some(&auth_rate_limiter));
+    let spa_build_dir = state.spa_build_dir.as_ref().clone();
+    let spa_fallback = axum::routing::get(handlers::spa_index_handler).layer(axum::Extension(
+        handlers::SpaBuildDir(spa_build_dir.clone()),
+    ));
 
     let router = assemble(&routers)
         // Serve SvelteKit static assets if the build directory exists
@@ -162,8 +166,7 @@ fn build_router(
             // SPA fallback: serve static assets, and for any unmatched path
             // (client-side routes like /login, /dashboard) return index.html
             // with a per-request CSP nonce injected into all <script> tags (H-2).
-            ServeDir::new(handlers::WEB_BUILD_DIR)
-                .fallback(axum::routing::get(handlers::spa_index_handler)),
+            ServeDir::new(spa_build_dir).fallback(spa_fallback),
         );
 
     apply_middleware(router, &state, Some(&rate_limiter)).with_state(state)
