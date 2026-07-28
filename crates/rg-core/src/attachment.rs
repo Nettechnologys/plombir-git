@@ -442,7 +442,171 @@ fn normalize_content_type(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_content_type, validate_filename};
+    use super::{
+        create_attachment, delete_attachment, normalize_content_type, validate_filename,
+        AttachmentTarget,
+    };
+    use crate::blob_storage::{BlobKey, BlobMetadata, BlobStorage, BlobStorageError};
+    use futures::future::BoxFuture;
+    use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryBlobStorage {
+        objects: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
+        fail_put: AtomicBool,
+    }
+
+    impl MemoryBlobStorage {
+        fn fail_put(&self) {
+            self.fail_put.store(true, Ordering::SeqCst);
+        }
+
+        fn injected_error(&self, what: &str, key: &BlobKey) -> BlobStorageError {
+            BlobStorageError::io(
+                what,
+                std::path::PathBuf::from(format!("<injected>/{key}")),
+                std::io::Error::other("injected blob storage failure"),
+            )
+        }
+
+        fn metadata_for(&self, key: BlobKey, len: usize) -> BlobMetadata {
+            BlobMetadata {
+                key,
+                size: len as u64,
+                modified: Some(SystemTime::UNIX_EPOCH),
+            }
+        }
+    }
+
+    impl BlobStorage for MemoryBlobStorage {
+        fn backend_name(&self) -> &'static str {
+            "memory-test"
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            Box::pin(async move {
+                if self.fail_put.load(Ordering::SeqCst) {
+                    return Err(self.injected_error("attachment restore put", key));
+                }
+                self.objects
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), data.to_vec());
+                Ok(self.metadata_for(key.clone(), data.len()))
+            })
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a std::path::Path,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            Box::pin(async move {
+                let data = tokio::fs::read(source)
+                    .await
+                    .map_err(|_error| self.injected_error("attachment restore file read", key))?;
+                self.put(key, &data).await
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<u8>>> {
+            Box::pin(async move {
+                self.objects
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| BlobStorageError::NotFound(key.clone()))
+            })
+        }
+
+        fn metadata<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            Box::pin(async move {
+                let len = self
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .map(Vec::len)
+                    .ok_or_else(|| BlobStorageError::NotFound(key.clone()))?;
+                Ok(self.metadata_for(key.clone(), len))
+            })
+        }
+
+        fn exists<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            Box::pin(async move { Ok(self.objects.lock().unwrap().contains_key(key)) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            Box::pin(async move { Ok(self.objects.lock().unwrap().remove(key).is_some()) })
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<BlobMetadata>>> {
+            Box::pin(async move {
+                let objects = self.objects.lock().unwrap();
+                Ok(objects
+                    .iter()
+                    .filter(|(key, _)| {
+                        prefix
+                            .map(|prefix| key.as_str().starts_with(prefix.as_str()))
+                            .unwrap_or(true)
+                    })
+                    .map(|(key, data)| self.metadata_for(key.clone(), data.len()))
+                    .collect())
+            })
+        }
+    }
 
     #[test]
     fn validates_gitea_default_extensions() {
@@ -457,6 +621,151 @@ mod tests {
         assert_eq!(
             normalize_content_type("text/plain\r\nx: y"),
             "application/octet-stream"
+        );
+    }
+
+    async fn setup_db() -> sea_orm::DatabaseConnection {
+        let mut opt = ConnectOptions::new("sqlite::memory:");
+        opt.max_connections(1);
+        let db = Database::connect(opt).await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        db
+    }
+
+    async fn seed_issue_attachment(
+        db: &sea_orm::DatabaseConnection,
+        storage: &MemoryBlobStorage,
+    ) -> rg_db::entities::attachment::Model {
+        let now = chrono::Utc::now();
+        let user = rg_db::ops::user_ops::create(
+            db,
+            rg_db::entities::user::ActiveModel {
+                username: Set("attachment_loss".to_string()),
+                email: Set("attachment_loss@example.test".to_string()),
+                password_hash: Set(String::new()),
+                is_admin: Set(false),
+                is_active: Set(true),
+                auth_provider: Set("local".to_string()),
+                mfa_enabled: Set(false),
+                login_attempts: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo = rg_db::ops::repo_ops::create(
+            db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(user.id),
+                name: Set("attachment-loss".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let issue = rg_db::ops::issue_ops::create(
+            db,
+            rg_db::entities::issue::ActiveModel {
+                repo_id: Set(repo.id),
+                number: Set(1),
+                title: Set("attachment loss".to_string()),
+                body: Set(None),
+                state: Set("open".to_string()),
+                author_id: Set(user.id),
+                assignee_id: Set(None),
+                milestone_id: Set(None),
+                labels: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                closed_at: Set(None),
+                deleted_at: Set(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        create_attachment(
+            db,
+            storage,
+            repo.id,
+            user.id,
+            AttachmentTarget::Issue(issue.id),
+            "evidence.txt",
+            "text/plain",
+            b"attachment body",
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_delete_restore_logs_the_blob_that_was_not_restored() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let db = setup_db().await;
+        let storage = MemoryBlobStorage::default();
+        let attachment = seed_issue_attachment(&db, &storage).await;
+        let key = BlobKey::new(attachment.blob_key.clone()).unwrap();
+
+        db.execute_unprepared(
+            "CREATE TRIGGER fk_fault_attachments_delete BEFORE DELETE ON attachments \
+             BEGIN SELECT RAISE(ABORT, 'injected failure: DELETE on attachments'); END;",
+        )
+        .await
+        .unwrap();
+        storage.fail_put();
+
+        let error = delete_attachment(
+            &db,
+            &storage,
+            attachment.repo_id,
+            AttachmentTarget::Issue(attachment.issue_id.unwrap()),
+            attachment.id,
+        )
+        .await
+        .expect_err("metadata delete failure must still reach the caller");
+
+        assert!(
+            format!("{error:#}").contains("failed to delete attachment metadata"),
+            "{error:#}"
+        );
+        assert!(
+            rg_db::ops::attachment_ops::find_by_id(&db, attachment.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the metadata row survives the injected delete failure"
+        );
+        assert!(
+            !storage.exists(&key).await.unwrap(),
+            "the blob was deleted and the injected restore failure kept it missing"
+        );
+
+        let rendered = logs.rendered();
+        assert!(rendered.contains("attachment lost"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("attachment_id={}", attachment.id)),
+            "{rendered}"
+        );
+        assert!(rendered.contains(key.as_str()), "{rendered}");
+        assert!(
+            rendered.contains("row now points at a missing blob"),
+            "{rendered}"
         );
     }
 }
