@@ -35,6 +35,55 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # The workspace is configured to make clippy fail, not merely warn: the
+  # `[workspace.lints.clippy]` block in Cargo.toml raises await_holding_lock /
+  # await_holding_refcell_ref / let_underscore_must_use to `deny`, and every
+  # crate opts in via `[lints] workspace = true`. Until this job existed nothing
+  # ever ran `cargo clippy`, so those denies were a declaration rather than a
+  # gate — a non-async lock guard held across an `.await` (CWE-833: blocked
+  # tokio worker, deadlock/DoS) could land on main and no check would notice.
+  #
+  # Its own job for the same reason as Rustfmt: a lint result must report
+  # independently of whether the test job is red, and a clippy failure ahead of
+  # the tests inside one job would mean no test feedback at all on that run.
+  #
+  # Deliberately no `-D warnings`, even though the workspace happens to be at
+  # zero warnings today (measured after `cargo clean -p` on all nine crates, so
+  # it is a real full run and not a warm cache reporting two of them). The
+  # deny-lints above already fail this job on what it exists to catch; `-D
+  # warnings` would additionally hand the toolchain a veto, and the toolchain
+  # here floats on `@stable` — the next clippy release that adds a default lint
+  # would turn main red on an unrelated PR. A gate that reddens for reasons the
+  # PR author did not cause is a gate people learn to ignore.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
+
+      # dtolnay/rust-toolchain installs the minimal profile, which ships neither
+      # clippy nor rustfmt — the component has to be requested by name.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # --all-targets so tests, examples and benches are linted too: the deny
+      # lints are about code that runs, and test code holding a guard across an
+      # await hangs the suite exactly the same way.
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets
+
   rust:
     name: Rust tests and migration smoke
     runs-on: ubuntu-latest
