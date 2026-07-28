@@ -224,23 +224,50 @@ async fn check_git_access(
             [(header::CONTENT_TYPE, "text/plain")],
             "access denied".to_string(),
         )),
-        // A DB outage during the access check is a retryable 503, not a 404:
-        // masking an unreachable database as "repository not found" would tell
-        // git the repo is gone (and clients not to retry). Genuine not-found —
-        // and any statement-level DB error — stays 404. See `git_db_status`.
-        Err(e) if git_db_status(&e) == StatusCode::SERVICE_UNAVAILABLE => {
-            tracing::error!(error = %format!("{e:#}"), "database unavailable during git access check, returning 503");
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "database temporarily unavailable".to_string(),
-            ))
-        }
-        Err(e) => Err((
+        // The repository genuinely is not there — the only failure of this
+        // lookup that belongs to the caller. `can_read` / `can_write` mark it
+        // with `rg_core::error::NotFound`, which survives any `.context(…)` on
+        // the way up, so this arm cannot be reached by a lookup that merely
+        // *failed*.
+        Err(e) if e.downcast_ref::<rg_core::error::NotFound>().is_some() => Err((
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/plain")],
-            format!("repository not found: {}", e),
+            "repository not found".to_string(),
         )),
+        // Everything else is ours: the question could not be asked, so the
+        // answer is not "no such repository". Saying 404 here tells git the
+        // repo is gone — a clone stops, and CI / mirrors / cron pushes do not
+        // retry a 404 — and it used to ship the `db: …` context of the failed
+        // operation in a body nothing sanitizes (H-05). Status from
+        // `git_db_status`, detail to the log only.
+        Err(e) => Err((
+            git_db_status(&e),
+            [(header::CONTENT_TYPE, "text/plain")],
+            git_failure_body("git access check", &e),
+        )),
+    }
+}
+
+/// The one sentence a git client is allowed to hear about a failure of ours,
+/// with the whole `anyhow` chain going to the log instead.
+///
+/// The git transport has no JSON envelope for `AppError` to sanitize — every
+/// return path writes its own body — so `{:#}` on an error puts the storage
+/// path, the gix internals and the `db: <operation>` context straight in front
+/// of whoever ran `git clone` (H-05). `operation` names the step for the log;
+/// the client gets a fixed string chosen by the status.
+fn git_failure_body(operation: &'static str, e: &anyhow::Error) -> String {
+    let status = git_db_status(e);
+    tracing::error!(
+        error = %format!("{e:#}"),
+        %operation,
+        %status,
+        "git transport request failed"
+    );
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        "database temporarily unavailable".to_string()
+    } else {
+        "internal server error".to_string()
     }
 }
 
@@ -360,7 +387,7 @@ pub(crate) async fn handle_info_refs(
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         [(header::CONTENT_TYPE, "text/plain")],
-                        format!("error: {:#}", e),
+                        git_failure_body("v2 capability advertisement", &e),
                     ),
                 };
             }
@@ -377,7 +404,9 @@ pub(crate) async fn handle_info_refs(
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(header::CONTENT_TYPE, "text/plain")],
-                    format!("error: {:#}", e),
+                    // `build_info_refs` opens the bare repository, and its
+                    // context carries the server-side path.
+                    git_failure_body("ref advertisement", &e),
                 ),
             }
         }
@@ -615,7 +644,7 @@ pub(crate) async fn handle_git_upload_pack(
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from(format!("error: {:#}", e)),
+                    Body::from(git_failure_body("upload-pack (v2)", &e)),
                 )
                     .into_response()
             }
@@ -696,7 +725,7 @@ pub(crate) async fn handle_git_upload_pack(
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from(format!("error: {:#}", e)),
+                    Body::from(git_failure_body("upload-pack", &e)),
                 )
                     .into_response()
             }
@@ -798,7 +827,7 @@ pub(crate) async fn handle_git_receive_pack(
                     header::CONTENT_TYPE,
                     "application/x-git-receive-pack-result",
                 )],
-                Body::from(format!("failed to load repository: {:#}", e)),
+                Body::from(git_failure_body("load repository", &e)),
             );
         }
     };
@@ -812,7 +841,7 @@ pub(crate) async fn handle_git_receive_pack(
                         header::CONTENT_TYPE,
                         "application/x-git-receive-pack-result",
                     )],
-                    Body::from(format!("failed to load branch protections: {:#}", e)),
+                    Body::from(git_failure_body("load branch protections", &e)),
                 );
             }
         };
@@ -826,7 +855,7 @@ pub(crate) async fn handle_git_receive_pack(
                         header::CONTENT_TYPE,
                         "application/x-git-receive-pack-result",
                     )],
-                    Body::from(format!("failed to load tag protections: {:#}", e)),
+                    Body::from(git_failure_body("load tag protections", &e)),
                 );
             }
         };
@@ -908,7 +937,7 @@ pub(crate) async fn handle_git_receive_pack(
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "text/plain")],
-            Body::from(format!("error: {:#}", e)),
+            Body::from(git_failure_body("receive-pack", &e)),
         ),
         Err(_elapsed) => {
             drop(buf_writer);

@@ -160,25 +160,13 @@ const NOT_DRIVEN: &[(&str, &str)] = &[
 /// the card asked for: it shrinks as the handlers are fixed, and it is the
 /// evidence that the gate sees them rather than being vacuously green.
 const KNOWN_GAPS: &[(&str, &str)] = &[
-    // card_de1377f8da43 — the smart protocol answers "no such repository" to a
-    // database outage, and ships `db: find repo by owner and name` in a body
-    // nothing sanitizes. A git client does not retry a 404.
-    (
-        "database POST /git/{owner}/{repo}/git-upload-pack",
-        "card_de1377f8da43: DB outage -> 404 + `db:` context in the body",
-    ),
-    (
-        "database POST /git/{owner}/{repo}/git-receive-pack",
-        "card_de1377f8da43: DB outage -> 404 + `db:` context in the body",
-    ),
-    (
-        "database POST /{owner}/{repo}/git-upload-pack",
-        "card_de1377f8da43: same handler on the root mount",
-    ),
-    (
-        "database POST /{owner}/{repo}/git-receive-pack",
-        "card_de1377f8da43: same handler on the root mount",
-    ),
+    // card_de1377f8da43 is fixed: the smart protocol used to answer "no such
+    // repository" to a database outage and ship `db: find repo by owner and
+    // name` in a body nothing sanitizes. `check_git_access` now answers 404
+    // only to a typed `rg_core::error::NotFound`; see
+    // `git_http_failure_status_tests` for the body half, which this sweep
+    // does not look at.
+    //
     // card_b013d630a280 — a bare repository that is in the database but gone
     // from disk reads as a deleted repository. Ten of the ten routes that see
     // this fault get it wrong, because they all share one open-the-repository

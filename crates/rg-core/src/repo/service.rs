@@ -295,6 +295,11 @@ pub async fn can_read_repo(
 
 /// Check whether `actor_id` (None = anonymous) can read `owner/repo`.
 /// Takes into account: public repos, private repos (owner + collaborators + org members).
+///
+/// "No such repository" is returned as a typed [`crate::error::NotFound`], not
+/// as an anonymous `anyhow!`: the caller has to tell it apart from "the lookup
+/// itself failed", and with both flattened into a bare `anyhow::Error` the git
+/// transport answered `404 repository not found` to a database outage.
 pub async fn can_read(
     db: &DatabaseConnection,
     owner: &str,
@@ -303,7 +308,7 @@ pub async fn can_read(
 ) -> Result<bool> {
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository '{}/{}' not found", owner, repo_name))?;
+        .ok_or_else(|| crate::error::not_found("repository"))?;
     can_read_repo(db, &repo, actor_id).await
 }
 
@@ -390,6 +395,9 @@ pub async fn can_admin_repo(
 /// Check whether `actor_id` can write to `owner/repo`.
 /// Owner always has write. Collaborators with "write" or "admin" can write.
 /// Org admins/members with write team permission can write.
+///
+/// Typed [`crate::error::NotFound`] for the absent repository, for the same
+/// reason as [`can_read`].
 pub async fn can_write(
     db: &DatabaseConnection,
     owner: &str,
@@ -398,7 +406,7 @@ pub async fn can_write(
 ) -> Result<bool> {
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository '{}/{}' not found", owner, repo_name))?;
+        .ok_or_else(|| crate::error::not_found("repository"))?;
     can_write_repo(db, &repo, actor_id).await
 }
 
