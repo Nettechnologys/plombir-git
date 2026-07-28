@@ -564,6 +564,20 @@ pub async fn upload_log(
 }
 
 /// Download a tar snapshot of the exact commit assigned to an external job.
+#[utoipa::path(
+    get,
+    path = "/runners/{id}/jobs/{job_id}/workspace",
+    tag = "Runners",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID, which must be assigned to this runner"),
+    ),
+    responses(
+        (status = 200, description = "Tar archive of the commit assigned to the job", content_type = "application/x-tar"),
+        (status = 403, description = "Job not assigned to this runner", body = serde_json::Value),
+        (status = 404, description = "Job, stage, pipeline or repository not found", body = serde_json::Value),
+    ),
+)]
 pub async fn download_workspace(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
@@ -756,6 +770,23 @@ fn stream_git_archive_with_idle(
     axum::body::Body::new(http_body_util::StreamBody::new(frame_stream))
 }
 
+/// Download the CI cache archive stored under the `x-cache-key` of an assigned job.
+#[utoipa::path(
+    get,
+    path = "/runners/{id}/jobs/{job_id}/cache",
+    tag = "Runners",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID, which must be assigned to this runner"),
+        ("x-cache-key" = String, Header, description = "Cache key, 1-512 bytes"),
+    ),
+    responses(
+        (status = 200, description = "Cache archive", content_type = "application/x-tar"),
+        (status = 400, description = "Missing or malformed x-cache-key header", body = serde_json::Value),
+        (status = 403, description = "Job not assigned to this runner", body = serde_json::Value),
+        (status = 404, description = "Job has no cache configuration, or no cache entry for this key", body = serde_json::Value),
+    ),
+)]
 pub async fn download_cache(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
@@ -869,6 +900,28 @@ pub async fn download_cache(
     }
 }
 
+/// Store a CI cache archive under the `x-cache-key` of an assigned job.
+#[utoipa::path(
+    put,
+    path = "/runners/{id}/jobs/{job_id}/cache",
+    tag = "Runners",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID, which must be assigned to this runner"),
+        ("x-cache-key" = String, Header, description = "Cache key, 1-512 bytes"),
+    ),
+    request_body(
+        content = String,
+        description = "Cache archive, 1 byte to 1 GiB",
+        content_type = "application/x-tar",
+    ),
+    responses(
+        (status = 204, description = "Cache entry stored"),
+        (status = 400, description = "Job has no cache configuration, bad x-cache-key, or archive outside 1 byte..1 GiB", body = serde_json::Value),
+        (status = 403, description = "Job not assigned to this runner", body = serde_json::Value),
+        (status = 404, description = "Job, stage or pipeline not found", body = serde_json::Value),
+    ),
+)]
 pub async fn upload_cache(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,

@@ -288,6 +288,26 @@ pub async fn publish(
 /// npm metadata uses `/packages/npm/{pkg_name}`, which otherwise captures the reserved
 /// `publish` segment before Axum can select the generic `/{pkg_type}/publish` route.
 /// Keep an exact npm publish route and delegate to the common implementation.
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/packages/npm/publish",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+    ),
+    request_body(
+        content = String,
+        description = "npm tarball payload",
+    ),
+    responses(
+        (status = 201, description = "Created", body = serde_json::Value),
+        (status = 200, description = "Updated existing package", body = serde_json::Value),
+        (status = 400, description = "Bad request", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
 pub async fn publish_npm(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
@@ -307,6 +327,22 @@ pub async fn publish_npm(
     .await
 }
 
+/// The generic package listing, pinned to `npm` — `/packages/npm/{pkg_name}` is
+/// the npm metadata route, so the listing needs a spelling of its own.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/packages/npm/list",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 404, description = "Repository not found", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
 pub async fn list_npm_packages(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
@@ -530,6 +566,25 @@ pub async fn delete_version(
 }
 
 /// PATCH /api/v1/repos/:owner/:name/packages/:type/:pkg/:ver/yank
+#[utoipa::path(
+    patch,
+    path = "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("pkg_type" = String, Path, description = "package type"),
+        ("pkg_name" = String, Path, description = "package name"),
+        ("version" = String, Path, description = "package version"),
+    ),
+    request_body = YankRequest,
+    responses(
+        (status = 200, description = "New yank state", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Package version not found", body = serde_json::Value),
+    ),
+)]
 pub async fn yank_version(
     State(state): State<AppState>,
     Path((owner, name, pkg_type, pkg_name, version)): Path<(
@@ -557,6 +612,23 @@ pub async fn yank_version(
 }
 
 /// GET /api/v1/repos/:owner/:name/packages/:type/:pkg/:ver/*file
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("pkg_type" = String, Path, description = "package type"),
+        ("pkg_name" = String, Path, description = "package name"),
+        ("version" = String, Path, description = "package version"),
+    ),
+    responses(
+        (status = 200, description = "Stored package file", content_type = "application/octet-stream"),
+        (status = 404, description = "Package, version or file not found", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
 pub async fn download_file(
     State(state): State<AppState>,
     Path((owner, name, pkg_type, pkg_name, version, filename)): Path<(

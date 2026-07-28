@@ -79,6 +79,11 @@ pub struct PaginatedRepoResponse {
         crate::api::repos::create_commit_status,
         crate::api::repos::list_commit_statuses,
         crate::api::repos::get_combined_status,
+        crate::api::repos::explore,
+        crate::api::repos::list_gitignore_templates,
+        crate::api::repos::list_license_templates,
+        crate::api::repos::list_readme_templates,
+        crate::api::repos::list_label_sets,
         // Archive
         crate::api::archive::download_archive,
         // External CI
@@ -251,6 +256,8 @@ pub struct PaginatedRepoResponse {
         crate::api::repo_content::list_branches,
         crate::api::repo_content::list_tags,
         crate::api::repo_content::get_commit_signature,
+        crate::api::repo_content::create_or_update_file,
+        crate::api::repo_content::delete_file,
         // Package registry
         crate::api::packages::publish,
         crate::api::packages::list_registries,
@@ -259,6 +266,10 @@ pub struct PaginatedRepoResponse {
         crate::api::packages::list_versions,
         crate::api::packages::get_version,
         crate::api::packages::delete_version,
+        crate::api::packages::yank_version,
+        crate::api::packages::download_file,
+        crate::api::packages::publish_npm,
+        crate::api::packages::list_npm_packages,
         // Imports
         crate::api::imports::start_import,
         crate::api::imports::list_imports,
@@ -274,6 +285,10 @@ pub struct PaginatedRepoResponse {
         crate::api::runners::list_runners_admin,
         crate::api::runners::get_runner_admin,
         crate::api::runners::delete_runner_admin,
+        crate::api::runners::deregister,
+        crate::api::runners::download_workspace,
+        crate::api::runners::download_cache,
+        crate::api::runners::upload_cache,
         // Artifacts
         crate::api::artifacts::upload_artifact,
         crate::api::artifacts::list_pipeline_artifacts,
@@ -420,6 +435,7 @@ pub struct PaginatedRepoResponse {
             crate::api::boards::ReorderCardsRequest,
             crate::api::time_tracking::AddTimeRequest,
             crate::api::imports::StartImportRequest,
+            crate::api::packages::YankRequest,
         )
     ),
     tags(

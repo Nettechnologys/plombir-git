@@ -257,6 +257,68 @@ export function loadRouteTable(routerPath) {
   return routes;
 }
 
+/**
+ * Every handler path mounted by a `RouteTable` build, regardless of how the URL
+ * was spelled.
+ *
+ * `parseRouteTable` only yields a row when the path argument is a string
+ * *literal*, because the (method, path) assertions it feeds have nothing to say
+ * about a row whose URL it cannot read. That filter is a blind spot for a
+ * coverage question: `maven_layout_routes` / `cargo_index_routes` register their
+ * rows in a `for path in CONST_ARRAY` loop, so the path argument is an
+ * identifier and the whole Maven and Cargo-sparse surface is invisible to the
+ * literal-only parse. A coverage gate built on that parse would report those
+ * handlers as "not mounted" — i.e. silently exempt them.
+ *
+ * So this reads the third argument instead, which is a handler path in every
+ * spelling, and reports the path literal only when there happens to be one.
+ *
+ * Returns `{ handler, method, path|null, line }` rows; one per registration, so
+ * a handler mounted under several URLs appears several times.
+ */
+export function parseMountedHandlers(source) {
+  const src = stripRustComments(source);
+  const rows = [];
+  const re = new RegExp(`\\.(${ROUTE_METHODS.join('|')})(?:_with)?\\s*\\(`, 'g');
+  let match;
+  while ((match = re.exec(src)) !== null) {
+    const open = re.lastIndex - 1;
+    const args = splitCallArgs(src, open);
+    if (!args || args.length < 3) continue;
+    // `(access, path, handler)` — the handler is a Rust path expression. This is
+    // what separates a route registration from `map.get(k)` now that the path
+    // argument is no longer required to be a literal.
+    const handler = args[2].replace(/\s+/g, '');
+    if (!/^(?:crate::)?[a-z_][\w:]*::[a-z_]\w*$/.test(handler)) continue;
+    const pathLiteral = args[1].match(/^"((?:[^"\\]|\\.)*)"$/);
+    rows.push({
+      handler: handler.replace(/^crate::/, ''),
+      method: match[1].toUpperCase(),
+      path: pathLiteral ? pathLiteral[1] : null,
+      line: src.slice(0, match.index).split('\n').length,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Read `routerPath` and parse every mounted handler.
+ *
+ * Same fail-loud floor as `loadRouteTable`: a parser that understands nothing
+ * would turn the coverage gate into a no-op that reports full coverage.
+ */
+export function loadMountedHandlers(routerPath) {
+  const rows = parseMountedHandlers(readFileSync(routerPath, 'utf8'));
+  if (rows.length < MIN_PARSED_ROUTES) {
+    throw new Error(
+      `Handler parser understood only ${rows.length} route registrations in ${routerPath} ` +
+        `(expected at least ${MIN_PARSED_ROUTES}). The router registration form probably changed — ` +
+        'fix parseMountedHandlers() in scripts/lib/rust-source.mjs rather than the checks that use it.',
+    );
+  }
+  return rows;
+}
+
 /** The row for `method path`, or `undefined`. */
 export function findRoute(routes, method, routePath) {
   return routes.find((route) => route.method === method.toUpperCase() && route.path === routePath);
