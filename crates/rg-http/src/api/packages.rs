@@ -809,6 +809,10 @@ pub async fn npm_registry_metadata(
                 sha256: v.sha256.clone(),
                 filename: tgz_file.map(|f| f.filename.clone()),
                 yanked: v.is_yanked,
+                // Dependency tables live only in the `package.json` inside the
+                // `.tgz`; the adapter lifted them here at publish, and this is
+                // where npm's resolver reads them back.
+                metadata: v.metadata.clone(),
             }
         })
         .collect();

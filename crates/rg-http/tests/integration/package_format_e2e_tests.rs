@@ -828,6 +828,96 @@ fast = ["dep:rand"]
     assert_eq!(entry["rust_version"], "1.70");
 }
 
+/// npm's resolver reads the abbreviated document and nothing else — it never
+/// opens a tarball to find out what a package needs. A version object without
+/// `dependencies` therefore does not say "unknown", it says the package depends
+/// on nothing: `npm install` succeeds and leaves a package in `node_modules`
+/// that cannot run.
+#[tokio::test]
+async fn npm_metadata_carries_the_manifest_dependencies() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let package_json = br#"{
+  "name": "matrix-deps-npm",
+  "version": "1.0.0",
+  "description": "npm matrix package with dependencies",
+  "dependencies": { "left-pad": "^1.3.0" },
+  "devDependencies": { "jest": "^29.0.0" },
+  "peerDependencies": { "react": ">=17" },
+  "peerDependenciesMeta": { "react": { "optional": true } },
+  "optionalDependencies": { "fsevents": "^2.3.0" },
+  "bin": { "matrix": "./cli.js" },
+  "engines": { "node": ">=18" },
+  "scripts": { "postinstall": "node build.js" }
+}"#;
+    let tarball = tar_gz(&[("package/package.json", package_json)]);
+
+    let published = client
+        .post(package_url(&base, &["npm", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-deps-npm-1.0.0.tgz\"",
+        )
+        .body(tarball)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let metadata = client
+        .get(package_url(&base, &["npm", "matrix-deps-npm"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let document: serde_json::Value = metadata.json().await.unwrap();
+    let version = &document["versions"]["1.0.0"];
+
+    assert_eq!(
+        version["dependencies"],
+        serde_json::json!({ "left-pad": "^1.3.0" }),
+        "version object: {version}"
+    );
+    assert_eq!(
+        version["devDependencies"],
+        serde_json::json!({ "jest": "^29.0.0" })
+    );
+    // Peers decide whether an install warns or errors; the meta table is what
+    // marks one as optional rather than missing.
+    assert_eq!(
+        version["peerDependencies"],
+        serde_json::json!({ "react": ">=17" })
+    );
+    assert_eq!(
+        version["peerDependenciesMeta"],
+        serde_json::json!({ "react": { "optional": true } })
+    );
+    assert_eq!(
+        version["optionalDependencies"],
+        serde_json::json!({ "fsevents": "^2.3.0" })
+    );
+    // `bin` is what puts a command on PATH, `engines` what lets a client refuse
+    // a runtime it cannot satisfy, `hasInstallScript` what tells npm the
+    // package has a build step at all.
+    assert_eq!(version["bin"], serde_json::json!({ "matrix": "./cli.js" }));
+    assert_eq!(version["engines"], serde_json::json!({ "node": ">=18" }));
+    assert_eq!(version["hasInstallScript"], true);
+
+    // The registry's own answer about its own storage is unchanged by any of it.
+    assert_eq!(document["dist-tags"]["latest"], "1.0.0");
+    assert!(
+        version["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .ends_with("/packages/npm/matrix-deps-npm/1.0.0/matrix-deps-npm-1.0.0.tgz"),
+        "version object: {version}"
+    );
+}
+
 /// RubyGems resolves through the compact index: `versions` first — its presence
 /// is what keeps the client off the legacy Marshal index we do not serve — then
 /// `info/<gem>`, then a `.gem` at a path the client builds itself by appending
