@@ -60,6 +60,7 @@ mod mirror_tests;
 mod notification_tests;
 mod oauth_pkce_tests;
 mod oci_permission_tests;
+mod oci_push_pull_tests;
 mod openapi_docs_auth_tests;
 mod org_team_authz_tests;
 mod org_tests;

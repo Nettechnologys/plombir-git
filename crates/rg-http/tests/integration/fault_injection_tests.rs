@@ -63,23 +63,19 @@ async fn start_upload(base: &str, token: &str, owner: &str, repo: &str, payload:
 
 /// An image manifest whose only referenced blob is `digest`.
 ///
-/// The field names are the ones this registry's parser reads, which are *not*
-/// the camelCase names a real client sends: `ParsedManifest::parse` answers
-/// `400 missing field media_type` to every real `docker push` (card_83a755704a2c).
-/// This fixture follows the parser so the test can reach the code it is
-/// actually about; whoever fixes the parser will see it fail here and swap it
-/// for a real manifest.
+/// Docker V2 Schema 2, in the camelCase wire format a real `docker push` sends
+/// — no `layers` / `manifests` padding, exactly what the client puts on the
+/// wire (card_83a755704a2c).
 fn manifest_json(digest: &str, size: usize) -> String {
     serde_json::json!({
-        "schema_version": 2,
-        "media_type": "application/vnd.docker.distribution.manifest.v2+json",
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
         "config": {
-            "media_type": "application/vnd.docker.container.image.v1+json",
+            "mediaType": "application/vnd.docker.container.image.v1+json",
             "size": size,
             "digest": digest,
         },
         "layers": [],
-        "manifests": [],
     })
     .to_string()
 }
