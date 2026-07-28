@@ -155,21 +155,13 @@ fn build_router(
     auth_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
     let routers = build_all_routes(&state, Some(&auth_rate_limiter));
-    let spa_build_dir = state.spa_build_dir.as_ref().clone();
-    let spa_fallback = axum::routing::get(handlers::spa_index_handler).layer(axum::Extension(
-        handlers::SpaBuildDir(spa_build_dir.clone()),
-    ));
 
-    let router = assemble(&routers)
-        // Serve SvelteKit static assets if the build directory exists
-        .fallback_service(
-            // SPA fallback: serve static assets, and for any unmatched path
-            // (client-side routes like /login, /dashboard) return index.html
-            // with a per-request CSP nonce injected into all <script> tags (H-2).
-            ServeDir::new(spa_build_dir).fallback(spa_fallback),
-        );
-
-    apply_middleware(router, &state, Some(&rate_limiter)).with_state(state)
+    apply_middleware(
+        with_spa_fallback(assemble(&routers), &state),
+        &state,
+        Some(&rate_limiter),
+    )
+    .with_state(state)
 }
 
 /// The server's middleware stack — the one and only copy of it.
@@ -249,6 +241,31 @@ fn apply_middleware(
         state.clone(),
         middleware::maintenance_middleware,
     ))
+}
+
+/// What answers a path no route claims: the static assets, then the SPA shell.
+///
+/// Shared by both routers for the same reason [`apply_middleware`] is. While
+/// this belonged to production alone, the test router had no fallback at all
+/// and inherited the docs sub-router's — so the two answered unmatched paths
+/// differently, and the one production behaviour worth reproducing in a test
+/// was the one no test could see: an unmatched path does not 404 here, it
+/// returns the SPA's `index.html`, which is how a lost package-registry route
+/// hands `pip` a page of HTML instead of an error (card_dd8497e4fd58).
+///
+/// With no bundle on disk — the ordinary test harness — `spa_index_handler`
+/// answers 404 for a missing `index.html` and 500 for an unreadable one, so a
+/// test that wants the production answer injects a fixture through
+/// `AppState::spa_build_dir`.
+fn with_spa_fallback(router: Router<AppState>, state: &AppState) -> Router<AppState> {
+    let spa_build_dir = state.spa_build_dir.as_ref().clone();
+    // Serves `index.html` with a per-request CSP nonce injected into every
+    // `<script>` tag (H-2).
+    let spa_fallback = axum::routing::get(handlers::spa_index_handler).layer(axum::Extension(
+        handlers::SpaBuildDir(spa_build_dir.clone()),
+    ));
+
+    router.fallback_service(ServeDir::new(spa_build_dir).fallback(spa_fallback))
 }
 
 /// Nest every sub-router at the prefix its [`RouteFact`]s were recorded with.
@@ -365,20 +382,20 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
 }
 
 /// Build API docs routes with authentication required.
+///
+/// The gate is attached per route rather than to the sub-router. `Router::layer`
+/// wraps a router's *fallback* along with its routes, and this sub-router is
+/// merged into the tree — so the layered fallback became the answer for every
+/// path no route claims, and an unmatched URL replied `401 api docs requires
+/// authentication` instead of a 404 (card_dd8497e4fd58). In production the SPA
+/// fallback hid it; in the test router, which had no fallback of its own, a
+/// missing route looked like an authorization problem to anyone debugging one.
 fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
-    let (router, facts) = RouteTable::new("")
-        .get(
-            DOCS_AUTH,
-            "/api-docs/openapi.json",
-            handlers::openapi_handler,
-        )
-        .get(DOCS_AUTH, "/api-docs", handlers::swagger_ui_root_handler)
-        .get(DOCS_AUTH, "/api-docs/", handlers::swagger_ui_root_handler)
-        .get(DOCS_AUTH, "/api-docs/{*tail}", handlers::swagger_ui_handler)
-        .finish();
-
-    let router = router
-        .layer(axum::middleware::from_fn_with_state(
+    // Outermost first: `pat_auth_middleware` translates a PAT into the bearer
+    // token `docs_auth_middleware` then checks, so it has to run before it —
+    // i.e. be applied last.
+    let docs_auth = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(axum::middleware::from_fn_with_state(
             state.clone(),
             pat_auth::docs_auth_middleware,
         ))
@@ -386,9 +403,36 @@ fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
             state.clone(),
             pat_auth::pat_auth_middleware,
         ))
-        .with_state(state.clone());
+    };
 
-    (router, facts)
+    let (router, facts) = RouteTable::new("")
+        .get_with(
+            DOCS_AUTH,
+            "/api-docs/openapi.json",
+            handlers::openapi_handler,
+            &docs_auth,
+        )
+        .get_with(
+            DOCS_AUTH,
+            "/api-docs",
+            handlers::swagger_ui_root_handler,
+            &docs_auth,
+        )
+        .get_with(
+            DOCS_AUTH,
+            "/api-docs/",
+            handlers::swagger_ui_root_handler,
+            &docs_auth,
+        )
+        .get_with(
+            DOCS_AUTH,
+            "/api-docs/{*tail}",
+            handlers::swagger_ui_handler,
+            &docs_auth,
+        )
+        .finish();
+
+    (router.with_state(state.clone()), facts)
 }
 
 /// The Maven repository layout, registered once per `groupId` depth.
@@ -2042,7 +2086,8 @@ pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<Rout
     // settings live in this `AppState` instead of a process-global: while they
     // were global, a test that switched the mode on switched it on for every
     // other test in the binary (card_08bab0b46e40).
-    let router = apply_middleware(assemble(&routers), &state, None).with_state(state);
+    let router = apply_middleware(with_spa_fallback(assemble(&routers), &state), &state, None)
+        .with_state(state);
 
     (router, facts)
 }

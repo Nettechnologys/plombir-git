@@ -103,10 +103,11 @@ fn extract_between<'a>(haystack: &'a str, start_marker: &str, end_marker: &str) 
     &rest[..end]
 }
 
-/// The SPA fallback is production-only, so this test drives the production
-/// router with a temp SvelteKit bundle fixture instead of the normal test
-/// router. It catches both halves of the contract: fallback mounted, and the
-/// exact CSP nonce injected into `index.html`.
+/// Both routers carry the SPA fallback now (card_dd8497e4fd58), but this test
+/// stays on the production one: the nonce it checks is written by a layer in
+/// the production stack, so driving that stack is what makes the assertion
+/// about production. It catches both halves of the contract: fallback mounted,
+/// and the exact CSP nonce injected into `index.html`.
 #[tokio::test]
 async fn spa_fallback_uses_the_same_nonce_in_html_and_csp() {
     let (db, dir) = setup_test_db().await;

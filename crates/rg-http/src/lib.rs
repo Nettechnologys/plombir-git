@@ -581,18 +581,18 @@ async fn load_tls_config(
     Ok(Arc::new(server_config))
 }
 
-/// Create the Axum router for testing (no rate limiter, no static file serving).
+/// Create the Axum router for testing: the production route set, stack and
+/// fallback, minus the two rate limiters.
 pub fn create_router_for_test(state: AppState) -> Router {
     routes::build_test_router(state)
 }
 
-/// Create the production router in tests, including static SPA fallback.
+/// Create the production router in tests, rate limiters and all.
 ///
-/// Most integration tests intentionally use [`create_router_for_test`], whose
-/// router omits static file serving. Tests that need to prove the production
-/// fallback is mounted should use this helper and serve it with
-/// `into_make_service_with_connect_info`, because the production stack still
-/// carries the rate-limit layer's `ConnectInfo` extractor.
+/// Most integration tests use [`create_router_for_test`], which differs from
+/// this one only by those limiters. Serve this one with
+/// `into_make_service_with_connect_info`: the limiter layer extracts
+/// `ConnectInfo`, which a plain `axum::serve` does not supply.
 pub fn create_router_for_test_with_static_files(state: AppState) -> Router {
     // Both limiters disabled (`max_requests = 0`), so the layers are mounted —
     // the `ConnectInfo` extractor with them — but never reject anything.

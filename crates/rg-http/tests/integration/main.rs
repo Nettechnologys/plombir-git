@@ -102,6 +102,7 @@ mod tail_lookup_failure_status_tests;
 mod team_delete_failure_status_tests;
 mod time_tracking_authz_tests;
 mod time_tracking_tests;
+mod unmatched_route_tests;
 mod upload_failure_status_tests;
 mod web_editor_push_hook_tests;
 mod webhook_authz_tests;
