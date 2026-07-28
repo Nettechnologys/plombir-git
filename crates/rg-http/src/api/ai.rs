@@ -356,8 +356,8 @@ pub async fn ai_index_repository(
     // Resolve repository
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found on disk").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     // Placeholder - will call indexer later

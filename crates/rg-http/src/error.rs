@@ -6,6 +6,46 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use std::fmt;
+use std::io;
+use std::path::Path;
+
+/// The repository row resolved in the database, but the bare git directory under
+/// `repo_root` is not usable. That is an operator/storage fault, never a 404.
+pub(crate) fn repository_storage_missing(repo_path: &Path) -> anyhow::Error {
+    let error = io::Error::new(io::ErrorKind::NotFound, "repository directory is missing");
+    repository_storage_probe_error(repo_path, error)
+}
+
+pub(crate) fn repository_storage_probe_error(repo_path: &Path, error: io::Error) -> anyhow::Error {
+    rg_core::platform::fs::path_error(
+        "repository directory",
+        repo_path,
+        &error,
+        rg_core::platform::fs::REPO_ROOT_HINT,
+    )
+}
+
+/// Same storage-fault shape for paths that exist but `gix`/`git` cannot open as
+/// a repository. The client-facing 5xx body stays sanitized; the path and
+/// `repo_root` hint live in the operator log.
+pub(crate) fn repository_storage_open_error(
+    repo_path: &Path,
+    error: impl fmt::Display,
+) -> anyhow::Error {
+    repository_storage_probe_error(
+        repo_path,
+        io::Error::other(format!("failed to open repository: {error}")),
+    )
+}
+
+pub(crate) fn ensure_repository_storage(repo_path: &Path) -> anyhow::Result<()> {
+    match repo_path.try_exists() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(repository_storage_missing(repo_path)),
+        Err(error) => Err(repository_storage_probe_error(repo_path, error)),
+    }
+}
 
 /// Structured error response body.
 #[derive(Debug, Serialize)]
@@ -450,6 +490,20 @@ mod tests {
             "{logged}"
         );
         assert!(logged.contains("120s"), "{logged}");
+    }
+
+    #[test]
+    fn missing_repository_storage_names_the_path_and_repo_root_remedy() {
+        let repo_path = std::path::Path::new("/srv/forgekeep/repos/acme/widgets.git");
+        let error = repository_storage_missing(repo_path);
+        let message = error.to_string();
+
+        assert!(
+            message.contains("/srv/forgekeep/repos/acme/widgets.git"),
+            "{message}"
+        );
+        assert!(message.contains("repository directory is missing"), "{message}");
+        assert!(message.contains("[server].repo_root"), "{message}");
     }
 
     /// The 504 body must still be generic — widening the stored message to the

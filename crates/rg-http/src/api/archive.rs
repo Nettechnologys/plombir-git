@@ -79,8 +79,8 @@ pub async fn download_archive(
     };
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
-    if !repo_path.exists() {
-        return AppError::not_found("repository data not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     let format_flag = match ext {

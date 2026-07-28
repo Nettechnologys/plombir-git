@@ -171,8 +171,8 @@ pub async fn list_tree(
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
@@ -270,8 +270,8 @@ pub async fn get_blob(
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
@@ -320,8 +320,8 @@ pub async fn get_log(
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     let git_ref = params.r#ref.clone().unwrap_or_else(|| "HEAD".to_string());
@@ -368,8 +368,8 @@ pub async fn list_branches(
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     match list_branch_names(&repo_path) {
@@ -412,8 +412,8 @@ pub async fn list_tags(
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     match list_tag_names(&repo_path) {
@@ -433,7 +433,7 @@ fn list_tree_entries(
     sub_path: &str,
 ) -> anyhow::Result<Vec<TreeEntry>> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     // Exactly two outcomes below belong to the client: the ref does not
     // resolve, and the sub-path is not in that ref's tree. They carry
@@ -563,7 +563,7 @@ fn get_blob_content(
     path: &str,
 ) -> anyhow::Result<BlobContent> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let target = format!("{}:{}", git_ref, path);
 
@@ -669,7 +669,7 @@ fn get_blob_content(
 
 fn get_blob_size(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<i64> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let oid = gix::ObjectId::from_hex(sha.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid SHA: {}", e))?;
@@ -692,7 +692,7 @@ fn get_commit_log(
     limit: i64,
 ) -> anyhow::Result<Vec<CommitEntry>> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let mut entries = Vec::new();
 
@@ -768,7 +768,7 @@ fn get_commit_log(
 
 fn list_branch_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let references = repo.references()?;
     let branches: Vec<String> = references
@@ -791,7 +791,7 @@ fn list_branch_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>>
 
 fn list_tag_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let references = repo.references()?;
     let tags: Vec<String> = references
@@ -844,8 +844,8 @@ pub async fn get_commit_signature(
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    if !repo_path.exists() {
-        return AppError::not_found("repository not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     // Validate SHA format
@@ -863,7 +863,7 @@ pub async fn get_commit_signature(
 /// Verify a commit's GPG signature using `git log --show-signature`.
 fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<GpgSignature> {
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     // The same two-client-outcomes split as `get_blob_content`: the SHA does
     // not resolve, or it resolves to something that is not a commit. A repo

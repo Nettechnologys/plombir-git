@@ -19,9 +19,10 @@ use std::path::Path;
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_repo_root};
 
-/// Make the bare repository unopenable while leaving its directory in place —
-/// the handlers guard on `repo_path.exists()`, so a removed directory would
-/// exercise the already-correct "repository not found" arm instead.
+/// Make the bare repository unopenable while leaving its directory in place.
+/// The missing-directory case is covered by the differential failure sweep;
+/// this fixture keeps exercising the sibling "directory exists but is not a
+/// usable git repository" path.
 fn break_repository(bare: &Path) {
     std::fs::remove_dir_all(bare.join("objects")).expect("bare repo must have an objects dir");
     assert!(

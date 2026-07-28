@@ -2,7 +2,7 @@
 //! `git-receive-pack`) plus post-push hooks (CI, webhooks, notifications) and
 //! branch/tag protection enforcement.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -351,14 +351,6 @@ pub(crate) async fn handle_info_refs(
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
-    if !repo_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/plain")],
-            "repository not found".to_string(),
-        );
-    }
-
     // Extract actor from auth header
     let actor_id = extract_actor_id(&state.db, &headers, &state.jwt_secret).await;
     let require_write = service == "git-receive-pack";
@@ -366,6 +358,14 @@ pub(crate) async fn handle_info_refs(
     // Check access
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, require_write).await {
         return resp;
+    }
+
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain")],
+            git_failure_body("open repository", &e),
+        );
     }
 
     // Check if client wants Protocol V2
@@ -427,7 +427,7 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     buf.push_str("0000");
 
     let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     // Get all references (like git for-each-ref)
     let references = repo.references()?;
@@ -565,19 +565,19 @@ pub(crate) async fn handle_git_upload_pack(
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
-    if !repo_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
-            Body::from("repository not found"),
-        )
-            .into_response();
-    }
-
     // Check read access
     let actor_id = extract_actor_id(&state.db, &headers, &state.jwt_secret).await;
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, false).await {
         return (resp.0, resp.1, Body::from(resp.2)).into_response();
+    }
+
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+            Body::from(git_failure_body("open repository", &e)),
+        )
+            .into_response();
     }
 
     // Record fetch/clone/pull duration + count across every return path below.
@@ -788,21 +788,21 @@ pub(crate) async fn handle_git_receive_pack(
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
-    if !repo_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            [(
-                header::CONTENT_TYPE,
-                "application/x-git-receive-pack-result",
-            )],
-            Body::from("repository not found"),
-        );
-    }
-
     // Check write access
     let actor_id = extract_actor_id(&state.db, &headers, &state.jwt_secret).await;
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, true).await {
         return (resp.0, resp.1, Body::from(resp.2));
+    }
+
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-result",
+            )],
+            Body::from(git_failure_body("open repository", &e)),
+        );
     }
 
     // Record push duration + count across every return path below.

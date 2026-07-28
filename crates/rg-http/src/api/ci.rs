@@ -346,8 +346,8 @@ pub async fn play_job(
     let repo_path = state
         .repo_root
         .join(format!("{}/{}.git", owner_display, name));
-    if !repo_path.exists() {
-        return AppError::not_found("repo path not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
     if let Err(error) = state
         .ci_engine
@@ -415,8 +415,8 @@ pub async fn trigger_pipeline(
             .repo_root
             .join(format!("{}/{}.git", owner_display, name))
     };
-    if !repo_path.exists() {
-        return AppError::not_found("repo path not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     // Resolve HEAD commit SHA
@@ -424,8 +424,9 @@ pub async fn trigger_pipeline(
         .ref_name
         .unwrap_or_else(|| "refs/heads/main".to_string());
     let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
-        Some(sha) => sha,
-        None => return AppError::bad_request("cannot resolve commit SHA for ref").into_response(),
+        Ok(Some(sha)) => sha,
+        Ok(None) => return AppError::bad_request("cannot resolve commit SHA for ref").into_response(),
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     // Check if CI config exists. The wording lives in `rg_core::ci` next to the
@@ -516,8 +517,8 @@ pub async fn retry_pipeline(
             .repo_root
             .join(format!("{}/{}.git", owner_display, name))
     };
-    if !repo_path.exists() {
-        return AppError::not_found("repo path not found").into_response();
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
     }
 
     match state
@@ -689,7 +690,10 @@ async fn job_belongs_to_pipeline(state: &AppState, pipeline_id: i64, stage_id: i
     }
 }
 
-fn resolve_commit_sha(repo_path: &std::path::Path, ref_name: &str) -> Option<String> {
+fn resolve_commit_sha(
+    repo_path: &std::path::Path,
+    ref_name: &str,
+) -> anyhow::Result<Option<String>> {
     // Same class as the CI gate in `rg_core::ci::has_ci_config`: `.ok()?` turned
     // "the server cannot open this repository" into "your ref is wrong" (the
     // caller answers 400 `cannot resolve commit SHA for ref`), with nothing in
@@ -702,7 +706,7 @@ fn resolve_commit_sha(repo_path: &std::path::Path, ref_name: &str) -> Option<Str
                 "cannot open repository while resolving a commit SHA: {:#}",
                 error
             );
-            return None;
+            return Err(crate::error::repository_storage_open_error(repo_path, error));
         }
     };
 
@@ -714,11 +718,11 @@ fn resolve_commit_sha(repo_path: &std::path::Path, ref_name: &str) -> Option<Str
     };
 
     match repo.rev_parse_single(ref_name_normalized.as_str()) {
-        Ok(id) => Some(id.to_string()),
+        Ok(id) => Ok(Some(id.to_string())),
         Err(_) => {
             // Try without refs/heads/ prefix
             let short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
-            repo.rev_parse_single(short).ok().map(|id| id.to_string())
+            Ok(repo.rev_parse_single(short).ok().map(|id| id.to_string()))
         }
     }
 }

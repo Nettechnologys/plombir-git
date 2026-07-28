@@ -19,9 +19,10 @@ use std::path::Path;
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_repo_root};
 
-/// Make the bare repository unopenable while leaving its directory in place —
-/// the handler guards on `repo_path.exists()`, so a removed directory would
-/// exercise the already-correct "repository data not found" arm instead.
+/// Make the bare repository unopenable while leaving its directory in place.
+/// The missing-directory case is covered by the differential failure sweep;
+/// this fixture keeps exercising the sibling "directory exists but is not a
+/// usable git repository" path.
 ///
 /// Without `objects/` git no longer recognises the directory as a repository at
 /// all (`fatal: not a git repository`), which is exactly the shape a Docker

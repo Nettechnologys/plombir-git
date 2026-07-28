@@ -166,51 +166,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     // only to a typed `rg_core::error::NotFound`; see
     // `git_http_failure_status_tests` for the body half, which this sweep
     // does not look at.
-    //
-    // card_b013d630a280 — a bare repository that is in the database but gone
-    // from disk reads as a deleted repository. Ten of the ten routes that see
-    // this fault get it wrong, because they all share one open-the-repository
-    // layer that cannot tell "absent" from "unopenable".
-    (
-        "git tree GET /api/v1/repos/{owner}/{name}/archive/{archive}",
-        "card_b013d630a280: missing bare repo -> 404 (`stream_git_archive_with_idle`)",
-    ),
-    (
-        "git tree GET /api/v1/repos/{owner}/{name}/log",
-        "card_b013d630a280: missing bare repo -> 404 (`get_log`)",
-    ),
-    (
-        "git tree GET /api/v1/repos/{owner}/{name}/blob/{*path}",
-        "card_b013d630a280: missing bare repo -> 404",
-    ),
-    (
-        "git tree GET /api/v1/repos/{owner}/{name}/tree",
-        "card_b013d630a280: missing bare repo -> 404",
-    ),
-    (
-        "git tree GET /api/v1/repos/{owner}/{name}/branches",
-        "card_b013d630a280: missing bare repo -> 404",
-    ),
-    (
-        "git tree GET /api/v1/repos/{owner}/{name}/tags",
-        "card_b013d630a280: missing bare repo -> 404",
-    ),
-    (
-        "git tree POST /git/{owner}/{repo}/git-upload-pack",
-        "card_b013d630a280: missing bare repo -> 404",
-    ),
-    (
-        "git tree POST /git/{owner}/{repo}/git-receive-pack",
-        "card_b013d630a280: missing bare repo -> 404",
-    ),
-    (
-        "git tree POST /{owner}/{repo}/git-upload-pack",
-        "card_b013d630a280: same handler on the root mount",
-    ),
-    (
-        "git tree POST /{owner}/{repo}/git-receive-pack",
-        "card_b013d630a280: same handler on the root mount",
-    ),
 ];
 
 fn listed(list: &[(&str, &str)], key: &str) -> bool {
