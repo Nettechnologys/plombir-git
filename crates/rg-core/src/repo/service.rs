@@ -1827,10 +1827,8 @@ mod path_diagnostic_tests {
     #[test]
     fn a_failed_auto_init_leaves_no_working_tree_behind() {
         let sandbox = tempfile::tempdir().expect("create sandbox");
-        let private_tmp = std::env::temp_dir().join(format!(
-            "forgekeep-cleanup-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let private_tmp =
+            std::env::temp_dir().join(format!("forgekeep-cleanup-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");
         let previous_tmpdir = std::env::var_os("TMPDIR");
         std::env::set_var("TMPDIR", &private_tmp);
@@ -1873,7 +1871,8 @@ mod path_diagnostic_tests {
         // while it was `TMPDIR`, this fails and leaves its files alone.
         drop(std::fs::remove_dir(&private_tmp));
 
-        let error = outcome.expect_err("pushing into a directory that is not a repository must fail");
+        let error =
+            outcome.expect_err("pushing into a directory that is not a repository must fail");
         assert!(
             leftovers.is_empty(),
             "the failed auto-init left a working tree behind: {leftovers:?} \
@@ -1932,7 +1931,10 @@ mod path_diagnostic_tests {
             rendered.contains(&not_a_directory.display().to_string()),
             "{rendered}"
         );
-        assert!(rendered.contains("creating notes will keep failing"), "{rendered}");
+        assert!(
+            rendered.contains("creating notes will keep failing"),
+            "{rendered}"
+        );
         assert!(not_a_directory.exists(), "nothing was removed, as expected");
     }
 

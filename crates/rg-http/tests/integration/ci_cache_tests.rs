@@ -185,7 +185,8 @@ async fn cache_upload_fixture(
     repo_name: &str,
     cache_key: &str,
 ) -> (i64, i64, i64, String) {
-    let (owner_token, _owner_id) = register_full(base, login, &format!("{login}@example.com")).await;
+    let (owner_token, _owner_id) =
+        register_full(base, login, &format!("{login}@example.com")).await;
     let repo_id = create_private_repo(base, &owner_token, repo_name).await;
     let runner = rg_db::ops::runner_ops::register_runner(db, "cache-runner", "", None, None, None)
         .await

@@ -396,7 +396,10 @@ async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
 
     let fault = fail_db_writes(&app.db, "repositories", DbWrite::Update).await;
     let failed = client
-        .post(format!("{}/api/v1/repos/xfer_from/movable/transfer", app.base))
+        .post(format!(
+            "{}/api/v1/repos/xfer_from/movable/transfer",
+            app.base
+        ))
         .bearer_auth(&owner_token)
         .json(&serde_json::json!({ "new_owner": "xfer_to" }))
         .send()
@@ -448,7 +451,9 @@ async fn upload_lfs_object(
 ) -> (u16, String) {
     let oid = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload));
     let status = reqwest::Client::new()
-        .put(format!("{base}/api/v1/repos/{owner}/{repo}/lfs/objects/{oid}"))
+        .put(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/lfs/objects/{oid}"
+        ))
         .bearer_auth(token)
         .body(payload.to_vec())
         .send()
@@ -505,9 +510,14 @@ async fn an_lfs_upload_whose_row_was_never_written_leaves_no_staging_file() {
     create_repo(&app.base, &token, "lost-lfs-row").await;
 
     let fault = fail_db_writes(&app.db, "lfs_objects", DbWrite::Insert).await;
-    let (status, _oid) =
-        upload_lfs_object(&app.base, &token, "lfs_row", "lost-lfs-row", b"forgekeep-lfs-payload")
-            .await;
+    let (status, _oid) = upload_lfs_object(
+        &app.base,
+        &token,
+        "lfs_row",
+        "lost-lfs-row",
+        b"forgekeep-lfs-payload",
+    )
+    .await;
     assert_eq!(
         status, 500,
         "a lost LFS row must fail the upload, not answer 200"
@@ -529,9 +539,14 @@ async fn an_lfs_object_the_blob_store_refused_leaves_no_staging_file() {
     create_repo(&app.base, &token, "refused-lfs").await;
 
     app.blob_faults.fail_put_file();
-    let (status, _oid) =
-        upload_lfs_object(&app.base, &token, "lfs_put", "refused-lfs", b"forgekeep-lfs-refused")
-            .await;
+    let (status, _oid) = upload_lfs_object(
+        &app.base,
+        &token,
+        "lfs_put",
+        "refused-lfs",
+        b"forgekeep-lfs-refused",
+    )
+    .await;
     assert_eq!(
         status, 500,
         "a blob store that refused the object is the server's failure"
