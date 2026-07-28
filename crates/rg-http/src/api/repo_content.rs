@@ -2,13 +2,13 @@
 
 use anyhow::Context;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono;
 use serde::{Deserialize, Serialize};
 
-use crate::api::repo_access::{self, CiRead, RepoContents};
+use crate::api::repo_access::{CiRead, RepoContents, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -958,29 +958,21 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
     })
 }
 
-// ── Write access helper ─────────────────────────────────────────────
-/// Resolve a repo by owner/name and enforce write access.
-/// Returns the repo model. User must have write permission (owner, collaborator with write/admin, or org member with write).
-async fn resolve_and_check_write_access(
+// ── Commit author ───────────────────────────────────────────────────
+/// The account behind an already-authorized write, for the commit it will
+/// author.
+///
+/// Write access itself is the `RepoWrite` extractor's business — these handlers
+/// used to call `repo_access::require_write` here instead, which is the gate as
+/// a convention again: nothing but the author's memory made the call happen.
+async fn commit_author(
     state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    repo: &str,
-) -> Result<
-    (
-        rg_db::entities::repository::Model,
-        rg_db::entities::user::Model,
-    ),
-    AppError,
-> {
-    let (repo_model, user_id) = repo_access::require_write(state, headers, owner, repo).await?;
-
-    let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+    actor_id: i64,
+) -> Result<rg_db::entities::user::Model, AppError> {
+    rg_db::ops::user_ops::find_by_id(&state.db, actor_id)
         .await
         .map_err(AppError::from)?
-        .ok_or_else(|| AppError::unauthorized("invalid token"))?;
-
-    Ok((repo_model, user))
+        .ok_or_else(|| AppError::unauthorized("invalid token"))
 }
 
 // ── File creation/update/delete handlers ──────────────────────────
@@ -1008,7 +1000,10 @@ async fn resolve_and_check_write_access(
 pub async fn create_or_update_file(
     State(state): State<AppState>,
     Path((owner, repo, path)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
     Json(req): Json<CreateOrUpdateFileRequest>,
 ) -> impl IntoResponse {
     // Validate owner/repo
@@ -1019,12 +1014,10 @@ pub async fn create_or_update_file(
         return AppError::bad_request(e.to_string()).into_response();
     }
 
-    // Check write access
-    let (repo_model, user) =
-        match resolve_and_check_write_access(&state, &headers, &owner, &repo).await {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
+    let user = match commit_author(&state, actor_id).await {
+        Ok(user) => user,
+        Err(e) => return e.into_response(),
+    };
 
     let branch = req.branch.unwrap_or(repo_model.default_branch.clone());
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
@@ -1103,7 +1096,10 @@ pub async fn create_or_update_file(
 pub async fn delete_file(
     State(state): State<AppState>,
     Path((owner, repo, path)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
     Query(params): Query<DeleteFileQuery>,
 ) -> impl IntoResponse {
     // Validate owner/repo
@@ -1114,12 +1110,10 @@ pub async fn delete_file(
         return AppError::bad_request(e.to_string()).into_response();
     }
 
-    // Check write access
-    let (repo_model, user) =
-        match resolve_and_check_write_access(&state, &headers, &owner, &repo).await {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
+    let user = match commit_author(&state, actor_id).await {
+        Ok(user) => user,
+        Err(e) => return e.into_response(),
+    };
 
     let branch = params.branch.unwrap_or(repo_model.default_branch.clone());
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));

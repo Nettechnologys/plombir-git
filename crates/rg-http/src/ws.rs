@@ -418,10 +418,14 @@ pub async fn ws_job_log_handler(
         Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
         Err(error) => return crate::error::AppError::from(error).into_response(),
     };
-    match rg_core::repo::service::can_read_repo(&state.db, &repository, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return crate::error::AppError::forbidden("access denied").into_response(),
-        Err(error) => return crate::error::AppError::from(error).into_response(),
+    // The handshake resolved *who* is calling out of the subprotocol / query
+    // token, because a browser cannot set `Authorization` on a WebSocket. What
+    // that user may read is the shared repository gate's decision, exactly as
+    // it would be on the REST route serving the same logs.
+    if let Err(error) =
+        crate::api::repo_access::check_read_for(&state, &repository, Some(user_id)).await
+    {
+        return error.into_response();
     }
 
     let upgrade = if let Some(proto) = proto_echo {

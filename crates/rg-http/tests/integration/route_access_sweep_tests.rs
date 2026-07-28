@@ -198,8 +198,6 @@ const EXTRACTOR_BEFORE_GATE: &[&str] = &[
     "POST /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
     "POST /api/v1/repos/{owner}/{name}/pulls/{number}/assets",
     "POST /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
-    "POST /api/v1/repos/{owner}/{name}/contents/{*path}",
-    "DELETE /api/v1/repos/{owner}/{name}/contents/{*path}",
     "POST /api/v1/repos/{owner}/{name}/mirror",
     "POST /api/v1/repos/{owner}/{name}/statuses/{sha}",
     "POST /api/v1/repos/{owner}/{name}/transfer",

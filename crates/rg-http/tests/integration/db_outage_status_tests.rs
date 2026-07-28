@@ -74,6 +74,10 @@ async fn db_outage_in_packages_handler_returns_503_not_500() {
 /// The contents write gate used to resolve the repository locally with
 /// `.map_err(AppError::internal)`, so a closed pool on the first repo lookup
 /// became 500 instead of the shared repo-access gateway's 503.
+///
+/// Driven through the router because that gate is now the `RepoWrite` extractor
+/// — the handler cannot be called without it, which is what stops the next
+/// contents endpoint from quietly shipping without a gate at all.
 #[tokio::test]
 async fn db_outage_in_contents_write_gate_returns_503_not_500() {
     let (db, dir) = setup_test_db().await;
@@ -84,23 +88,17 @@ async fn db_outage_in_contents_write_gate_returns_503_not_500() {
 
     db.close().await.expect("close pool");
 
-    let response = rg_http::api::repo_content::create_or_update_file(
-        State(state),
-        Path((
-            "owner".to_string(),
-            "repo".to_string(),
-            "README.md".to_string(),
-        )),
+    let response = through_router(
+        state,
+        "POST",
+        "/api/v1/repos/owner/repo/contents/README.md",
         headers,
-        axum::Json(rg_http::api::repo_content::CreateOrUpdateFileRequest {
-            branch: None,
-            content: "# outage\n".to_string(),
-            message: "write during outage".to_string(),
-            sha: None,
-        }),
+        Some(serde_json::json!({
+            "content": "# outage\n",
+            "message": "write during outage",
+        })),
     )
-    .await
-    .into_response();
+    .await;
 
     assert_eq!(
         response.status(),
@@ -258,13 +256,29 @@ async fn get_through_router(
     path: &str,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    through_router(state, "GET", path, headers, None).await
+}
+
+/// [`get_through_router`] for any method, with an optional JSON body.
+async fn through_router(
+    state: rg_http::AppState,
+    method: &str,
+    path: &str,
+    headers: axum::http::HeaderMap,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
     use tower::ServiceExt as _;
 
-    let mut request = axum::http::Request::builder()
-        .method("GET")
-        .uri(path)
-        .body(axum::body::Body::empty())
-        .expect("build request");
+    let builder = axum::http::Request::builder().method(method).uri(path);
+    let mut request = match &body {
+        Some(json) => builder
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(json.to_string()))
+            .expect("build request"),
+        None => builder
+            .body(axum::body::Body::empty())
+            .expect("build request"),
+    };
     request.headers_mut().extend(headers);
 
     rg_http::create_router_for_test(state)

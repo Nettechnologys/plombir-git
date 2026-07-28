@@ -11,6 +11,14 @@
 //!   A handler that forgets its gate no longer compiles into a working route —
 //!   it simply has no repository to work with.
 //!
+//! The non-REST transports — git LFS, the OCI registry, the job-log WebSocket —
+//! cannot use either layer: each carries its credentials in a shape of its own
+//! (an LFS action signature, an OCI-scoped bearer token, a `?token=` query
+//! parameter), so they resolve *who is calling* themselves. What they must not
+//! also decide is *who is allowed*: [`check_read_for`] / [`check_write_for`]
+//! take the actor the transport already resolved and answer that question here,
+//! so there is still exactly one implementation of the rule.
+//!
 //! ```ignore
 //! pub async fn delete_page(
 //!     State(state): State<AppState>,
@@ -79,15 +87,71 @@ async fn check_read_inner(
 ) -> Result<(), AppError> {
     let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret);
 
+    match check_read_for(state, repo, actor_id).await {
+        Ok(()) => Ok(()),
+        // A *denial* may still be overturned by a CI job token scoped to this
+        // repository. A check that could not run may not: that is our failure,
+        // and swallowing it here would answer 403 to a caller whose token was
+        // never the problem.
+        Err(denied)
+            if is_access_denial(&denied)
+                && actor_id.is_none()
+                && ci_job_grants(state, headers, repo, ci_scope) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Decide read access for an already-resolved repository and an actor the
+/// caller has already identified.
+///
+/// The header-reading [`check_read`] is this function plus "who is calling".
+/// Transports that answer that question differently (LFS, OCI, the job-log
+/// WebSocket) come in here, so the *rule* stays single even where the
+/// credential does not.
+pub(crate) async fn check_read_for(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<(), AppError> {
     match rg_core::repo::service::can_read_repo(&state.db, repo, actor_id).await {
         Ok(true) => Ok(()),
-        Ok(false) if actor_id.is_none() && ci_job_grants(state, headers, repo, ci_scope) => Ok(()),
         Ok(false) if repo.is_private && actor_id.is_none() => {
             Err(AppError::unauthorized("authentication required"))
         }
         Ok(false) => Err(AppError::forbidden("access denied")),
         Err(e) => Err(AppError::from(e)),
     }
+}
+
+/// [`check_read_for`] for write access: an anonymous caller is `401` whatever
+/// the repository's visibility, because no repository is anonymously writable.
+pub(crate) async fn check_write_for(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<(), AppError> {
+    let Some(actor_id) = actor_id else {
+        return Err(AppError::unauthorized("authentication required"));
+    };
+
+    match rg_core::repo::service::can_write_repo(&state.db, repo, Some(actor_id)).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden("write access denied")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+/// Whether the gate said "no", as opposed to the gate failing to run.
+///
+/// The distinction is the whole point of [`check_read_for`] returning an error
+/// rather than a `bool`: a caller that folds a decision back into a boolean
+/// (the OCI registry mints a scope from one) must fold the *denial* only and
+/// let a failed check stay a failure — see `oci::granted`.
+pub(crate) fn is_access_denial(error: &AppError) -> bool {
+    matches!(error, AppError::Unauthorized(_) | AppError::Forbidden(_))
 }
 
 /// Whether the request carries a CI job token scoped to this repository.
@@ -141,11 +205,8 @@ pub(crate) async fn require_authenticated_read(
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
     let repo = resolve_repo(state, owner, name).await?;
 
-    match rg_core::repo::service::can_read_repo(&state.db, &repo, Some(actor_id)).await {
-        Ok(true) => Ok((repo, actor_id)),
-        Ok(false) => Err(AppError::forbidden("access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
+    check_read_for(state, &repo, Some(actor_id)).await?;
+    Ok((repo, actor_id))
 }
 
 /// Require an authenticated user with repository write access.
@@ -159,11 +220,8 @@ pub(crate) async fn require_write(
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
     let repo = resolve_repo(state, owner, name).await?;
 
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(actor_id)).await {
-        Ok(true) => Ok((repo, actor_id)),
-        Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(e) => Err(AppError::from(e)),
-    }
+    check_write_for(state, &repo, Some(actor_id)).await?;
+    Ok((repo, actor_id))
 }
 
 /// Require an authenticated repository administrator.

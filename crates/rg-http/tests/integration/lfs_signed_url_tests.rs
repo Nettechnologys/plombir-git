@@ -172,6 +172,97 @@ async fn lfs_upload_batch_always_requires_write_access() {
     assert_eq!(anonymous.status(), 401);
 }
 
+/// LFS downloads answer with the repository's own read gate.
+///
+/// The three outcomes used to be produced by two different mechanisms: the
+/// anonymous `401` came out of the LFS credential helper (which simply demanded
+/// a bearer token) and only the outsider's `403` came from a permission check —
+/// and on a public repository the check was skipped entirely. They agreed by
+/// coincidence, not by construction, so nothing kept them agreeing.
+#[tokio::test]
+async fn lfs_download_batch_answers_with_the_repository_read_gate() {
+    let (base, _) = spawn_test_app_with_db().await;
+    let (owner_token, _) =
+        register_full(&base, "lfs_read_owner", "lfs_read_owner@example.com").await;
+    let (outsider_token, _) =
+        register_full(&base, "lfs_read_outsider", "lfs_read_outsider@example.com").await;
+    create_repo(&base, &owner_token, "private-read-lfs", true).await;
+    create_repo(&base, &owner_token, "public-read-lfs", false).await;
+    let content = b"public LFS content";
+    let oid = hex::encode(Sha256::digest(content));
+
+    // Anonymous on a private repository: a token would help → 401.
+    let anonymous = batch(
+        &base,
+        "lfs_read_owner",
+        "private-read-lfs",
+        None,
+        "download",
+        &oid,
+        1,
+    )
+    .await;
+    assert_eq!(anonymous.status(), 401);
+
+    // Authenticated outsider on the same repository: a token does not help → 403.
+    let outsider = batch(
+        &base,
+        "lfs_read_owner",
+        "private-read-lfs",
+        Some(&outsider_token),
+        "download",
+        &oid,
+        1,
+    )
+    .await;
+    assert_eq!(outsider.status(), 403);
+
+    // A public repository stays anonymously readable — with a real object
+    // behind the request, so the 200 proves the gate let it through rather than
+    // some earlier failure short-circuiting the response.
+    let upload = batch(
+        &base,
+        "lfs_read_owner",
+        "public-read-lfs",
+        Some(&owner_token),
+        "upload",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(upload.status(), 200);
+    let upload = upload.json::<serde_json::Value>().await.unwrap();
+    let upload_href = upload["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap();
+    let stored = reqwest::Client::new()
+        .put(upload_href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), 200);
+
+    let public = batch(
+        &base,
+        "lfs_read_owner",
+        "public-read-lfs",
+        None,
+        "download",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(public.status(), 200);
+    let public = public.json::<serde_json::Value>().await.unwrap();
+    assert!(
+        public["objects"][0]["actions"]["download"]["href"]
+            .as_str()
+            .is_some(),
+        "anonymous download batch on a public repo must hand out a download action: {public}"
+    );
+}
+
 #[test]
 fn lfs_action_signature_rejects_tampering_and_expiry() {
     use rg_core::lfs::service::{

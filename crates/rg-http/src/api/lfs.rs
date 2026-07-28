@@ -10,7 +10,7 @@ use axum::Json;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
-use crate::api::auth::extract_bearer_claims;
+use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -71,13 +71,15 @@ fn verify_signed_action(
     }
 }
 
-fn authenticated_user_id(headers: &HeaderMap, state: &AppState) -> Result<i64, AppError> {
-    let claims = extract_bearer_claims(headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    claims
-        .sub
-        .parse::<i64>()
-        .map_err(|_| AppError::unauthorized("invalid token subject"))
+/// The user behind this request's credentials, if any.
+///
+/// LFS answers "who is calling"; whether that caller may read or write the
+/// repository is [`repo_access::check_read_for`] / [`check_write_for`]'s
+/// decision, never this file's. An unauthenticated caller is `None` rather than
+/// an early `401`: on a public repository a download needs no credentials at
+/// all, and only the gate knows that.
+fn actor_id(headers: &HeaderMap, state: &AppState) -> Option<i64> {
+    crate::api::auth::extract_user_id(headers, &state.jwt_secret)
 }
 
 /// LFS batch API: POST /repos/:owner/:name/lfs/objects/batch
@@ -111,27 +113,19 @@ pub async fn batch(
         };
 
     // Upload actions always require repository write access, including for
-    // public repositories. Downloads only require auth for private repos.
-    if req.operation == "upload" {
-        let user_id = match authenticated_user_id(&headers, &state) {
-            Ok(user_id) => user_id,
-            Err(error) => return error.into_response(),
-        };
-        match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => return AppError::forbidden("write access denied").into_response(),
-            Err(error) => return AppError::from(error).into_response(),
-        }
-    } else if req.operation == "download" && repo_model.is_private {
-        let user_id = match authenticated_user_id(&headers, &state) {
-            Ok(user_id) => user_id,
-            Err(error) => return error.into_response(),
-        };
-        match rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => return AppError::forbidden("access denied").into_response(),
-            Err(error) => return AppError::from(error).into_response(),
-        }
+    // public repositories; a download requires whatever reading the repository
+    // requires. Both answers come from the shared gate: an anonymous caller on
+    // a private repository used to be turned away by the *credential* helper
+    // rather than by the gate, which happened to produce the same 401 without
+    // anything guaranteeing it would.
+    let actor_id = actor_id(&headers, &state);
+    let decision = if req.operation == "upload" {
+        repo_access::check_write_for(&state, &repo_model, actor_id).await
+    } else {
+        repo_access::check_read_for(&state, &repo_model, actor_id).await
+    };
+    if let Err(error) = decision {
+        return error.into_response();
     }
 
     let repo_id = repo_model.id;
@@ -215,14 +209,9 @@ pub async fn upload_object(
         Err(error) => return error.into_response(),
     };
     if !signed {
-        let user_id = match authenticated_user_id(&headers, &state) {
-            Ok(user_id) => user_id,
-            Err(error) => return error.into_response(),
-        };
-        match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => return AppError::forbidden("write access denied").into_response(),
-            Err(error) => return AppError::from(error).into_response(),
+        let actor_id = actor_id(&headers, &state);
+        if let Err(error) = repo_access::check_write_for(&state, &repo_model, actor_id).await {
+            return error.into_response();
         }
     }
 
@@ -336,7 +325,7 @@ pub async fn download_object(
 }
 
 /// Enforce download authorization: a valid signed action URL bypasses auth,
-/// otherwise a private repo requires an authenticated user with read access.
+/// otherwise the repository's own read gate decides.
 async fn authorize_lfs_download(
     state: &AppState,
     repo_model: &rg_db::entities::repository::Model,
@@ -354,15 +343,10 @@ async fn authorize_lfs_download(
         Ok(signed) => signed,
         Err(error) => return Err(error.into_response()),
     };
-    if !signed && repo_model.is_private {
-        let user_id = match authenticated_user_id(headers, state) {
-            Ok(user_id) => user_id,
-            Err(error) => return Err(error.into_response()),
-        };
-        match rg_core::repo::service::can_read_repo(&state.db, repo_model, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => return Err(AppError::forbidden("access denied").into_response()),
-            Err(error) => return Err(AppError::from(error).into_response()),
+    if !signed {
+        let actor_id = actor_id(headers, state);
+        if let Err(error) = repo_access::check_read_for(state, repo_model, actor_id).await {
+            return Err(error.into_response());
         }
     }
     Ok(())

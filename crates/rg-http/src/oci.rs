@@ -23,6 +23,8 @@ use rg_core::package_registry::oci::{
     Reference, TagListResponse, API_VERSION,
 };
 
+use crate::api::repo_access;
+use crate::error::AppError;
 use crate::AppState;
 
 // Docker distribution custom headers
@@ -126,81 +128,77 @@ fn oci_unauthorized(message: &str) -> Response {
     oci_err(StatusCode::UNAUTHORIZED, error_codes::UNAUTHORIZED, message)
 }
 
-/// H-3: Extract Bearer JWT token, returning user_id.
-/// Intentionally separate from `auth::extract_user_id` because OCI endpoints
-/// also accept OCI-scoped bearer tokens (not just user JWTs).
-/// For standard user auth, use `auth::AuthUser` extractor or `auth::extract_user_id`.
-fn extract_user(headers: &HeaderMap, jwt_secret: &str) -> Option<i64> {
-    let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = auth.strip_prefix("Bearer ")?;
+/// The `Authorization: Bearer` token this request carries, whichever kind.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
 
-    // Try normal JWT first (sub is user_id)
-    if let Some(claims) = jwt::validate_token(token, jwt_secret) {
-        return claims.sub.parse().ok();
+/// The ForgeKeep user behind a normal user JWT in `Authorization: Bearer`.
+///
+/// Deliberately *not* `api::auth::extract_user_id`: that one also accepts the
+/// browser session cookie, and the registry is not a browser surface. An OCI
+/// scoped token yields nothing here — it names a scope, not a user, and used to
+/// be reported as the sentinel user `0`, a user id that exists in no database
+/// and only ever reached a permission check by accident.
+fn bearer_user_id(headers: &HeaderMap, jwt_secret: &str) -> Option<i64> {
+    let claims = jwt::validate_token(bearer_token(headers)?, jwt_secret)?;
+    claims.sub.parse::<i64>().ok().filter(|uid| *uid > 0)
+}
+
+/// Fold the shared repository gate's verdict into the boolean this protocol
+/// needs, without losing the difference the gate draws: a denial is "not
+/// allowed", a check that could not *run* stays an error. Collapsing the second
+/// into the first is what makes a database outage look like a credentials
+/// problem — the registry then answers 401, and docker comes straight back for
+/// another token instead of backing off.
+fn granted(decision: Result<(), AppError>) -> Result<bool, AppError> {
+    match decision {
+        Ok(()) => Ok(true),
+        Err(error) if repo_access::is_access_denial(&error) => Ok(false),
+        Err(error) => Err(error),
     }
-
-    // Try OCI Bearer token (sub is username)
-    if let Some(_claims) = validate_oci_token(token, jwt_secret) {
-        // OCI token doesn't directly carry user_id
-        // Return 0 as sentinel (caller should use check_repo_access for authZ)
-        return Some(0);
-    }
-
-    None
 }
 
 /// Check if the request has access to perform an OCI repo action.
 ///
-/// Normal ForgeKeep JWTs are checked against repo `can_read_repo`/`can_write_repo`.
-/// OCI scoped tokens are trusted only for the exact signed scope they carry;
-/// token issuance is constrained by the same repo permission checks below.
-/// Anonymous pull is allowed only when the backing ForgeKeep repo is public.
+/// The registry decides *who* is calling — a ForgeKeep user JWT, an OCI scoped
+/// bearer token, or nobody — and the shared repository gate in
+/// `api::repo_access` decides what that caller may do. OCI scoped tokens are
+/// the one credential the gate cannot read: they carry no user, only the scope
+/// they were signed with, and `get_token` already ran the same gate to mint it.
 async fn check_access(
     state: &AppState,
     headers: &HeaderMap,
     owner: &str,
     repo: &str,
     required_action: &str,
-) -> anyhow::Result<(bool, Option<i64>)> {
-    let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo).await? {
-            Some(repo) => repo,
-            None => return Ok((false, None)),
-        };
+) -> Result<(bool, Option<i64>), AppError> {
+    let repo_model = match rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo)
+        .await
+        .map_err(AppError::from)?
+    {
+        Some(repo) => repo,
+        None => return Ok((false, None)),
+    };
 
-    // Try normal JWT first (sub is user_id)
-    if let Some(claims) = jwt::validate_token(
-        headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or(""),
-        &state.jwt_secret,
-    ) {
-        if let Ok(uid) = claims.sub.parse::<i64>() {
-            if uid > 0 {
-                let allowed = match required_action {
-                    "pull" => {
-                        rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(uid))
-                            .await?
-                    }
-                    "push" => {
-                        rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(uid))
-                            .await?
-                    }
-                    _ => false,
-                };
-                return Ok((allowed, allowed.then_some(uid)));
-            }
-        }
+    // A normal ForgeKeep JWT is a user, so the answer is the same one the REST
+    // API would give that user for this repository.
+    if let Some(uid) = bearer_user_id(headers, &state.jwt_secret) {
+        let allowed = match required_action {
+            "pull" => granted(repo_access::check_read_for(state, &repo_model, Some(uid)).await)?,
+            "push" => granted(repo_access::check_write_for(state, &repo_model, Some(uid)).await)?,
+            _ => false,
+        };
+        return Ok((allowed, allowed.then_some(uid)));
     }
 
     // Try OCI Bearer token (scope-based).
-    if let Some(claims) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .and_then(|token| validate_oci_token(token, &state.jwt_secret))
+    if let Some(claims) =
+        bearer_token(headers).and_then(|token| validate_oci_token(token, &state.jwt_secret))
     {
         if let Some(scope_str) = claims.scope {
             for single_scope in scope_str.split_whitespace() {
@@ -215,7 +213,7 @@ async fn check_access(
 
     // For pull, allow anonymous only when the backing ForgeKeep repo is public.
     if required_action == "pull" {
-        let allowed = rg_core::repo::service::can_read_repo(&state.db, &repo_model, None).await?;
+        let allowed = granted(repo_access::check_read_for(state, &repo_model, None).await)?;
         return Ok((allowed, None));
     }
 
@@ -232,7 +230,9 @@ async fn require_access(
     match check_access(state, headers, owner, repo, required_action).await {
         Ok((true, user_id)) => Ok(user_id),
         Ok((false, _)) => Err(oci_unauthorized("authentication required")),
-        Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"))),
+        // The gate's own status (503 on a database outage, 500 otherwise)
+        // inside the OCI envelope docker expects.
+        Err(e) => Err(oci_err(e.status(), "UNKNOWN", &e.to_string())),
     }
 }
 
@@ -257,9 +257,11 @@ fn www_authenticate(realm: &str, service: &str, scope: &str) -> String {
 /// `GET /v2/` — API version check.
 /// Docker clients call this first to verify the registry is available.
 /// Returns 401 with WWW-Authenticate if authentication is required.
-pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    // Return 401 to trigger Docker auth flow
-    let _ = extract_user(&headers, &state.jwt_secret);
+pub async fn api_version_check(State(_state): State<AppState>, headers: HeaderMap) -> Response {
+    // Unconditionally 401 + challenge: this endpoint exists so a client learns
+    // *where* to get its token, and it answers the same to everyone. Nothing is
+    // authenticated here, which is why no credential is read — the token this
+    // used to validate and then discard proved nothing about the response.
 
     // The realm is not decoration: a client does not guess where to get its
     // token, it reads this path out of the challenge and goes there. It has to
@@ -386,31 +388,36 @@ async fn authenticate_basic(
 /// then bounces off every pull with a 401, so docker re-runs the auth flow in a
 /// loop instead of seeing the outage and backing off.
 async fn grant_repository_scope(
-    db: &DatabaseConnection,
+    state: &AppState,
     parsed: &ParsedScope,
     authenticated_user_id: Option<i64>,
-) -> anyhow::Result<Option<String>> {
+) -> Result<Option<String>, AppError> {
     let Some((scope_owner, scope_repo)) = parse_namespace(&parsed.name) else {
         return Ok(None);
     };
     let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(db, scope_owner, scope_repo).await? {
+        match rg_core::repo::service::find_repo_by_owner_name(&state.db, scope_owner, scope_repo)
+            .await
+            .map_err(AppError::from)?
+        {
             Some(repo) => repo,
             None => return Ok(None),
         };
 
+    // Minting a scope *is* an access decision — it hands out a capability the
+    // pull/push handlers then trust without re-deriving it — so it is taken by
+    // the same gate, against the same user, as a request on the REST API.
     let mut allowed_actions = Vec::new();
     if parsed.has_action("pull")
-        && rg_core::repo::service::can_read_repo(db, &repo_model, authenticated_user_id).await?
+        && granted(repo_access::check_read_for(state, &repo_model, authenticated_user_id).await)?
     {
         allowed_actions.push("pull");
     }
-    if parsed.has_action("push") {
-        if let Some(user_id) = authenticated_user_id {
-            if rg_core::repo::service::can_write_repo(db, &repo_model, Some(user_id)).await? {
-                allowed_actions.push("push");
-            }
-        }
+    if parsed.has_action("push")
+        && authenticated_user_id.is_some()
+        && granted(repo_access::check_write_for(state, &repo_model, authenticated_user_id).await)?
+    {
+        allowed_actions.push("push");
     }
 
     Ok(if allowed_actions.is_empty() {
@@ -427,10 +434,10 @@ async fn grant_repository_scope(
 /// Evaluate every requested scope against the caller's permissions and return
 /// the subset of scope strings that are actually granted.
 async fn resolve_granted_scopes(
-    db: &DatabaseConnection,
+    state: &AppState,
     scope: &str,
     authenticated_user_id: Option<i64>,
-) -> anyhow::Result<Vec<String>> {
+) -> Result<Vec<String>, AppError> {
     let mut granted_scopes = Vec::new();
     for scope_part in scope.split_whitespace() {
         let Some(parsed) = ParsedScope::parse(scope_part) else {
@@ -438,10 +445,10 @@ async fn resolve_granted_scopes(
         };
 
         if parsed.scope_type == "repository" {
-            if let Some(granted) =
-                grant_repository_scope(db, &parsed, authenticated_user_id).await?
+            if let Some(scope) =
+                grant_repository_scope(state, &parsed, authenticated_user_id).await?
             {
-                granted_scopes.push(granted);
+                granted_scopes.push(scope);
             }
         } else if parsed.scope_type == "registry"
             && parsed.name == "catalog"
@@ -485,10 +492,9 @@ pub async fn get_token(
     // silently narrowed scope, and the client would spend the next pull being
     // told 401 — the one answer that makes it come straight back here. Report
     // the outage instead so docker/podman can back off and retry.
-    let granted_scope = match resolve_granted_scopes(&state.db, &scope, authenticated_user_id).await
-    {
+    let granted_scope = match resolve_granted_scopes(&state, &scope, authenticated_user_id).await {
         Ok(scopes) => scopes.join(" "),
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+        Err(e) => return oci_err(e.status(), "UNKNOWN", &e.to_string()),
     };
 
     // Generate token (TTL: 300s for normal, 60s for anonymous)

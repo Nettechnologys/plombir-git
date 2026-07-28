@@ -20,12 +20,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The gate functions that must not be called outside `api::repo_access`.
+///
+/// `check_read_for` / `check_write_for` are in here for a different reason than
+/// the rest: they take the actor as an *argument*, so a REST handler calling one
+/// would be free to pass whichever user id it happened to have in scope. They
+/// exist for the transports that genuinely resolve their own caller — see
+/// `TRANSPORTS` below — and a handler that can take an extractor must.
 const GATES: &[&str] = &[
     "require_read",
     "require_read_with_ci",
     "require_authenticated_read",
     "require_write",
     "require_admin",
+    "check_read_for",
+    "check_write_for",
 ];
 
 /// Files that legitimately hold their own gate, with the reason.
@@ -56,6 +64,20 @@ const SIGNED_OFF: &[(&str, &str)] = &[
          `Authorization`, so a headers-based gate does not reach it",
     ),
 ];
+
+/// The non-REST transports, and what each of them is allowed to decide.
+///
+/// Being signed off above means "you resolve your own caller", not "you write
+/// your own permission rule". Each of these used to do both: LFS turned an
+/// anonymous caller away through its credential helper rather than through a
+/// gate, the registry ran `can_read_repo` with a sentinel user id that exists in
+/// no database, and the job-log socket had its own copy of the read check. The
+/// permission predicates below are therefore off-limits here — the decision has
+/// to come from `api::repo_access`, whatever the credential looked like.
+const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "ws.rs"];
+
+/// The raw permission predicates. Calling one is deciding access.
+const PREDICATES: &[&str] = &["can_read_repo", "can_write_repo", "can_admin_repo"];
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -132,6 +154,37 @@ fn repository_gates_are_only_reachable_through_the_extractors() {
          `crate::api::repo_access`, so the compiler carries the gate instead of the author \
          remembering it. If this really is a different protocol with its own credentials, add \
          the file to SIGNED_OFF in this test with the reason.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// A transport may resolve its own caller; it may not decide what that caller
+/// is allowed to do.
+#[test]
+fn the_other_protocols_take_the_decision_from_the_shared_gate() {
+    let mut offenders = Vec::new();
+    for transport in TRANSPORTS {
+        let path = src_root().join(transport);
+        assert!(
+            path.exists(),
+            "TRANSPORTS names {transport} but that file is gone — drop the entry"
+        );
+        let text = fs::read_to_string(&path).expect("read source file");
+        for (n, line) in text.lines().enumerate() {
+            for predicate in PREDICATES {
+                if calls_gate(line, predicate) {
+                    offenders.push(format!("  {transport}:{} — {}", n + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a transport decided repository access itself instead of asking the shared gate.\n\
+         Resolve the actor however this protocol carries it, then call \
+         `repo_access::check_read_for` / `check_write_for` with it, so \"who is allowed\" has one \
+         implementation and \"who is calling\" stays the transport's own business.\n{}",
         offenders.join("\n")
     );
 }
