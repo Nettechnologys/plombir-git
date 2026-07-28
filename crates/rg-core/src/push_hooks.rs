@@ -986,11 +986,12 @@ mod tests {
             .iter()
             .position(|line| line.contains("spawn("))
             .expect("spawn_for_merged_refs must detach the hook run");
+        let spawn_line = lines[helper + spawn].trim();
         assert!(
-            lines[helper + spawn].contains("delivery_tracker()"),
-            "the merge hook run must be spawned via task_tracker::delivery_tracker() \
-             so the shutdown drain awaits it; found `{}`",
-            lines[helper + spawn].trim()
+            spawn_line.contains(".delivery_tracker.spawn(")
+                || spawn_line.contains("delivery_tracker().spawn("),
+            "the merge hook run must be spawned through a delivery tracker \
+             so the shutdown drain awaits it; found `{spawn_line}`"
         );
     }
 

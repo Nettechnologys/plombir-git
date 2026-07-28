@@ -11,6 +11,8 @@ use argon2::{
     Argon2,
 };
 use rand_core::OsRng;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
 /// The *stored* hash could not be used to decide anything.
@@ -77,6 +79,9 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
 const DUMMY_PASSWORD_HASH: &str =
     "$argon2id$v=19$m=19456,t=2,p=1$j10MFJnxYC8YdoKn2f0/pw$hiB3C8eJEitR5h7E+0P51MvixnERtz8bhn3hwLOHcq0";
 
+#[cfg(test)]
+static DUMMY_VERIFICATION_BURNS: AtomicUsize = AtomicUsize::new(0);
+
 /// Verify `password` against `stored_hash`, spending the same Argon2 work when
 /// there is no hash to verify against.
 ///
@@ -113,7 +118,22 @@ pub fn verify_password_or_dummy(password: &str, stored_hash: Option<&str>) -> Re
 /// return and nothing that can fail: the work *is* the point.
 pub fn burn_dummy_verification(password: &str) {
     // `black_box` keeps the optimizer from noticing the result is thrown away.
-    std::hint::black_box(verify_password(password, DUMMY_PASSWORD_HASH).is_ok());
+    let verified = verify_password(password, DUMMY_PASSWORD_HASH).is_ok();
+    #[cfg(test)]
+    {
+        let _ = DUMMY_VERIFICATION_BURNS.fetch_add(1, Ordering::SeqCst);
+    }
+    std::hint::black_box(verified);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_dummy_verification_burns() {
+    DUMMY_VERIFICATION_BURNS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn dummy_verification_burns() -> usize {
+    DUMMY_VERIFICATION_BURNS.load(Ordering::SeqCst)
 }
 
 // ── Password Strength Validation (Phase 22-D) ──────────────────────────────
@@ -378,32 +398,22 @@ mod tests {
     }
 
     #[test]
-    fn dummy_verification_costs_what_a_real_one_costs() {
-        use std::time::Instant;
-
+    fn verify_password_or_dummy_burns_once_for_unknown_accounts() {
         let real = hash_password("correct horse battery staple").unwrap();
-        // Minimum of a few runs: the true cost is the floor, everything above it
-        // is scheduler noise from the parallel test runner.
-        let floor = |stored: Option<&str>| {
-            (0..3)
-                .map(|_| {
-                    let started = Instant::now();
-                    assert!(!verify_password_or_dummy("wrong password", stored).unwrap());
-                    started.elapsed()
-                })
-                .min()
-                .unwrap()
-        };
 
-        let known = floor(Some(real.as_str())).as_secs_f64();
-        let unknown = floor(None).as_secs_f64();
+        reset_dummy_verification_burns();
+        assert!(!verify_password_or_dummy("wrong password", Some(real.as_str())).unwrap());
+        assert_eq!(
+            dummy_verification_burns(),
+            0,
+            "known accounts must spend their real hash instead of the dummy one"
+        );
 
-        // Wide band on purpose — this asserts "one full Argon2 either way",
-        // not a benchmark. The bug it guards against was a ~0x short-circuit.
-        assert!(
-            unknown > known * 0.5 && unknown < known * 2.0,
-            "unknown-account verification took {unknown:.4}s vs {known:.4}s for a known one — \
-             the branches no longer cost the same"
+        assert!(!verify_password_or_dummy("wrong password", None).unwrap());
+        assert_eq!(
+            dummy_verification_burns(),
+            1,
+            "unknown accounts must spend exactly one dummy verification"
         );
     }
 

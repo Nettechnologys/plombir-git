@@ -957,6 +957,35 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn unknown_login_burns_dummy_verification_when_no_ldap_bind_runs() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+
+        password::reset_dummy_verification_burns();
+        let error = match login_with_configured_auth(
+            &db,
+            "missing-user",
+            "definitely-not-the-password",
+            "jwt-secret",
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown user must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("invalid credentials"),
+            "unexpected login error: {error:#}"
+        );
+        assert_eq!(
+            password::dummy_verification_burns(),
+            1,
+            "an unknown login that never reaches LDAP bind must burn exactly one dummy verification"
+        );
+    }
+
     /// The H-5 property: response time must not tell the caller whether the
     /// address belongs to an account. Every branch is padded to one deadline
     /// measured from entry, and the SMTP send is detached — so the branch that

@@ -991,11 +991,12 @@ mod tests {
             .iter()
             .rposition(|line| line.contains("spawn("))
             .expect("the post-push call must sit inside a spawn");
+        let spawn_line = lines[spawn].trim();
         assert!(
-            lines[spawn].contains("delivery_tracker()"),
-            "post-push hooks must be spawned via rg_core::task_tracker::delivery_tracker() \
-             so the shutdown drain awaits them; found `{}` at lib.rs:{}",
-            lines[spawn].trim(),
+            spawn_line.contains("delivery_tracker.spawn(")
+                || spawn_line.contains("delivery_tracker().spawn("),
+            "post-push hooks must be spawned through a delivery tracker \
+             so the shutdown drain awaits them; found `{spawn_line}` at lib.rs:{}",
             spawn + 1
         );
     }
