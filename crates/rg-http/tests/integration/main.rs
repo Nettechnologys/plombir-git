@@ -88,6 +88,7 @@ mod review_lookup_failure_status_tests;
 mod route_access_sweep_tests;
 mod runner_auth_tests;
 mod runner_workspace_tests;
+mod security_headers_tests;
 mod service_failure_status_sweep_tests;
 mod service_failure_status_tests;
 mod session_gate_cost_tests;

@@ -156,7 +156,7 @@ fn build_router(
 ) -> Router {
     let routers = build_all_routes(&state, Some(&auth_rate_limiter));
 
-    assemble(&routers)
+    let router = assemble(&routers)
         // Serve SvelteKit static assets if the build directory exists
         .fallback_service(
             // SPA fallback: serve static assets, and for any unmatched path
@@ -164,8 +164,29 @@ fn build_router(
             // with a per-request CSP nonce injected into all <script> tags (H-2).
             ServeDir::new(handlers::WEB_BUILD_DIR)
                 .fallback(axum::routing::get(handlers::spa_index_handler)),
-        )
-        // ── Middleware layers (order: bottom-up, last .layer() runs first) ──
+        );
+
+    apply_middleware(router, &state, Some(&rate_limiter)).with_state(state)
+}
+
+/// The server's middleware stack — the one and only copy of it.
+///
+/// Production and test routers used to carry two hand-written stacks kept in
+/// step by a comment, and twice they were not: the maintenance gate was missing
+/// from the test router (card_42d82e91dbe3), and so were the security headers
+/// and the metrics layer (card_17ea3d843ca7). Both times every test stayed
+/// green, because the thing that was missing was the thing that would have
+/// noticed. The stack lives here now, so the two routers cannot drift: the only
+/// difference either side is allowed is the `rate_limiter`, and that difference
+/// is this argument.
+///
+/// Layer order is bottom-up — the last `.layer()` runs first.
+fn apply_middleware(
+    router: Router<AppState>,
+    state: &AppState,
+    rate_limiter: Option<&rate_limit::RateLimiter>,
+) -> Router<AppState> {
+    let router = router
         // Innermost, so a rejected session is still counted, traced and given
         // the security headers — and so rate limiting and maintenance mode both
         // get to answer before it spends a database read.
@@ -196,20 +217,31 @@ fn build_router(
                 )
             },
         ))
-        .layer(build_cors_layer())
-        .layer(axum::middleware::from_extractor::<
-            axum::extract::ConnectInfo<std::net::SocketAddr>,
-        >())
-        .layer(axum::middleware::from_fn_with_state(
-            rate_limiter.clone(),
-            rate_limit::rate_limit_middleware,
-        ))
-        // Maintenance mode check (runs early, before most handlers)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::maintenance_middleware,
-        ))
-        .with_state(state)
+        .layer(build_cors_layer());
+
+    // The per-IP limiter reads `ConnectInfo`, which only a real `axum::serve`
+    // with `into_make_service_with_connect_info` supplies; the test harness
+    // serves without it, so both layers stay off there. This is the one
+    // deliberate difference between the two stacks — see `build_test_router`.
+    let router = match rate_limiter {
+        Some(limiter) => router
+            .layer(axum::middleware::from_extractor::<
+                axum::extract::ConnectInfo<std::net::SocketAddr>,
+            >())
+            .layer(axum::middleware::from_fn_with_state(
+                limiter.clone(),
+                rate_limit::rate_limit_middleware,
+            )),
+        None => router,
+    };
+
+    // Outermost: maintenance mode decides whether a request is served at all,
+    // so it answers before anything else — including the request-id layer,
+    // which is why the rejection body carries no `request_id`.
+    router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        middleware::maintenance_middleware,
+    ))
 }
 
 /// Nest every sub-router at the prefix its [`RouteFact`]s were recorded with.
@@ -1918,47 +1950,12 @@ pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<Rout
     let routers = build_all_routes(&state, None);
     let facts = routers.facts.clone();
 
-    let router = assemble(&routers)
-        // ── Middleware layers (no rate limiter for tests) ──────────────────
-        // Kept in step with `build_router`: the revocation gate is part of the
-        // route table's contract, so the router under test has to carry it.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            api::auth::session_standing_middleware,
-        ))
-        .layer(axum::middleware::from_fn(middleware::request_id_middleware))
-        .layer(TraceLayer::new_for_http().make_span_with(
-            |request: &axum::http::Request<axum::body::Body>| {
-                let request_id = request
-                    .headers()
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("-");
-                tracing::info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri(),
-                    status = tracing::field::Empty,
-                    request_id = %request_id,
-                )
-            },
-        ))
-        .layer(build_cors_layer())
-        // Outermost, exactly as in `build_router`: maintenance mode decides
-        // whether a request is served at all, so it answers before anything
-        // else — including the request-id layer, which is why the rejection body
-        // carries no `request_id` in either router.
-        //
-        // Mounting it here is only safe now that the settings live in this
-        // `AppState` instead of a process-global: while they were global, a test
-        // that switched the mode on switched it on for every other test in the
-        // binary (card_08bab0b46e40), and the absence of this layer was the only
-        // thing hiding it.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::maintenance_middleware,
-        ))
-        .with_state(state);
+    // Same stack as production, minus the rate limiter — see `apply_middleware`.
+    // The maintenance gate is part of it, which is only safe now that the
+    // settings live in this `AppState` instead of a process-global: while they
+    // were global, a test that switched the mode on switched it on for every
+    // other test in the binary (card_08bab0b46e40).
+    let router = apply_middleware(assemble(&routers), &state, None).with_state(state);
 
     (router, facts)
 }
