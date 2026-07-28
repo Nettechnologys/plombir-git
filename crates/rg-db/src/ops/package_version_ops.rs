@@ -81,6 +81,30 @@ pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Resul
     Ok(())
 }
 
+/// Grow a version's recorded size by what a later publish added to it.
+///
+/// A version is not always uploaded in one request — `mvn deploy` sends the
+/// POM, the JAR and the sources separately, and PyPI puts an sdist and a wheel
+/// under one version — so `size`, the total of what the version holds, is set
+/// at creation and has to keep up with every file added afterwards.
+///
+/// Written as one statement rather than read-modify-write: two uploads landing
+/// on the same version concurrently would otherwise each add their bytes to the
+/// same stale total, and one of the two would be lost.
+pub async fn add_size(db: &DatabaseConnection, id: i64, delta: i64) -> Result<(), DbErr> {
+    let backend = db.get_database_backend();
+    db.execute(Statement::from_sql_and_values(
+        backend,
+        crate::prepare_sql(
+            backend,
+            "UPDATE package_versions SET size = size + ? WHERE id = ?",
+        ),
+        [Value::from(delta), Value::from(id)],
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Set the yanked status for a version.
 pub async fn set_yanked(db: &DatabaseConnection, id: i64, yanked: bool) -> Result<(), DbErr> {
     use package_version::ActiveModel;

@@ -490,6 +490,108 @@ async fn maven_repository_layout_serves_metadata_and_artifacts() {
     assert_eq!(canonical.bytes().await.unwrap().as_ref(), pom.as_slice());
 }
 
+/// A version is not uploaded in one request. `mvn deploy` sends the POM, then
+/// the JAR, then the sources, each as its own `PUT`; PyPI puts an sdist beside
+/// a wheel. Every request after the first used to be answered `200 OK` with its
+/// payload dropped on the floor — the file reached neither storage nor the
+/// database, and the client was told nothing.
+#[tokio::test]
+async fn a_second_file_published_into_one_version_is_kept_and_a_repeat_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let pom = br#"<?xml version="1.0"?>
+<project><groupId>com.example</groupId><artifactId>matrix-multi</artifactId><version>1.0.0</version></project>"#
+        .to_vec();
+    let jar = zip_archive(&[("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")]);
+    let sources = zip_archive(&[("Main.java", b"class Main {}\n")]);
+
+    let publish = |filename: &'static str, body: Vec<u8>| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        async move {
+            let mut url = package_url(&base, &["maven", "publish"]);
+            url.query_pairs_mut()
+                .append_pair("name", "com.example:matrix-multi")
+                .append_pair("version", "1.0.0");
+            client
+                .post(url)
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // The first request creates the version; the next two add to it.
+    let created = publish("matrix-multi-1.0.0.pom", pom.clone()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    for (filename, body) in [
+        ("matrix-multi-1.0.0.jar", &jar),
+        ("matrix-multi-1.0.0-sources.jar", &sources),
+    ] {
+        let added = publish(filename, body.clone()).await;
+        assert_eq!(added.status(), StatusCode::OK, "adding {filename}");
+        let added = added.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(added["existing"], true, "adding {filename}");
+    }
+
+    // All three are in the version, and all three come back byte for byte.
+    let version = client
+        .get(package_url(
+            &base,
+            &["maven", "com.example:matrix-multi", "1.0.0"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let files = version["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3, "version files: {version}");
+
+    for (filename, expected) in [
+        ("matrix-multi-1.0.0.pom", &pom),
+        ("matrix-multi-1.0.0.jar", &jar),
+        ("matrix-multi-1.0.0-sources.jar", &sources),
+    ] {
+        let downloaded = client
+            .get(package_url(
+                &base,
+                &["maven", "com", "example", "matrix-multi", "1.0.0", filename],
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK, "download {filename}");
+        assert_eq!(
+            downloaded.bytes().await.unwrap().as_ref(),
+            expected.as_slice(),
+            "download {filename}"
+        );
+    }
+
+    // The size the registry reports is the total of what the version holds, not
+    // of the request that happened to create it.
+    let total = (pom.len() + jar.len() + sources.len()) as u64;
+    assert_eq!(version["size"].as_u64(), Some(total), "version size");
+
+    // Re-sending a filename the version already carries is a conflict, not a
+    // silent overwrite of an artifact others have already resolved.
+    let repeat = publish("matrix-multi-1.0.0.jar", jar.clone()).await;
+    assert_eq!(repeat.status(), StatusCode::CONFLICT);
+}
+
 /// Cargo reads a sparse registry the way RFC 2789 spells it: `config.json`
 /// first, and then a crate at the path its name expands to — `matrix-cargo`
 /// lives at `ma/tr/matrix-cargo`, never at the bare name. This walks those

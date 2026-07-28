@@ -140,12 +140,15 @@ pub async fn publish(
     let existing_version = existing.is_some();
 
     let version = if let Some(v) = existing {
-        // Version already exists — allow re-upload? For safety, return existing.
-        tracing::warn!(
-            "version {} of package {} already exists, returning existing",
-            info.version,
-            info.name
-        );
+        // The version is already there, so this request is adding a file to it —
+        // and the files it carries are the whole point of the request. They used
+        // to be dropped on the floor here, under a `200 OK` that said nothing:
+        // a version is routinely uploaded in several requests (`mvn deploy`
+        // sends the POM, then the JAR, then the sources; PyPI puts an sdist
+        // beside a wheel; NuGet pushes a symbols package next to the main one),
+        // and every request after the first left no trace in storage or the
+        // database.
+        add_files_to_version(db, storage, &info, &v).await?;
         v
     } else {
         // 4. Store files
@@ -282,6 +285,139 @@ pub async fn publish(
         version_id: version.id,
         existing: existing_version,
     })
+}
+
+/// Add the files of a publish request to a version that already exists.
+///
+/// A filename the version already holds is refused with a [`conflict`] rather
+/// than overwritten: a published artifact is what everyone who resolved that
+/// name already got, and swapping its bytes underneath them is the one thing a
+/// registry must not do. The check is on the filename alone, so re-sending a
+/// byte-identical file is refused too — the request is still asking to replace
+/// something, and answering "already published" is honest where a silent 200
+/// was not.
+///
+/// Rollback is per-file and never touches what the version already held:
+/// `delete_version` is the tool the create path uses, and here it would wipe
+/// the artifacts of every earlier request.
+async fn add_files_to_version(
+    db: &DatabaseConnection,
+    storage: &PackageStorage,
+    info: &PublishInfo,
+    version: &rg_db::entities::package_version::Model,
+) -> Result<()> {
+    let published = rg_db::ops::package_file_ops::list_by_version(db, version.id).await?;
+    for (filename, _) in &info.files {
+        if published.iter().any(|f| &f.filename == filename) {
+            return Err(crate::error::conflict(format!(
+                "file '{}' is already published in version {} of package '{}'",
+                filename, info.version, info.name
+            )));
+        }
+    }
+
+    // Everything this request adds, so a failure part-way through can be undone
+    // without disturbing the files that were already there.
+    let mut added: Vec<StoredFile> = Vec::new();
+    let mut added_rows: Vec<i64> = Vec::new();
+
+    for (filename, data) in &info.files {
+        let stored = match storage
+            .store_file(
+                &info.owner,
+                &info.repo,
+                &info.package_type,
+                &info.name,
+                &info.version,
+                filename,
+                data,
+            )
+            .await
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                undo_added_files(db, storage, &added, &added_rows, info).await;
+                return Err(error);
+            }
+        };
+
+        match rg_db::ops::package_file_ops::create(
+            db,
+            version.id,
+            &stored.filename,
+            stored.size,
+            Some(&stored.sha256),
+            &stored.storage_path,
+        )
+        .await
+        {
+            Ok(row) => added_rows.push(row.id),
+            Err(error) => {
+                added.push(stored);
+                undo_added_files(db, storage, &added, &added_rows, info).await;
+                return Err(error.into());
+            }
+        }
+
+        added.push(stored);
+    }
+
+    // The version's recorded size is the total of what it holds, so it has to
+    // grow with the files just added — otherwise every listing under-reports the
+    // version from its second upload onwards.
+    let added_size: i64 = added.iter().map(|f| f.size).sum();
+    if let Err(error) = rg_db::ops::package_version_ops::add_size(db, version.id, added_size).await
+    {
+        // The files themselves are published and downloadable; only the total is
+        // now short. Failing the request would be worse than saying so.
+        tracing::warn!(
+            version_id = version.id,
+            name = %info.name,
+            version = %info.version,
+            added_size,
+            error = %format!("{error:#}"),
+            "package version size not updated — the version's reported size now under-counts the files just added to it"
+        );
+    }
+
+    Ok(())
+}
+
+/// Undo the files one publish request added to an existing version.
+///
+/// Both halves can fail on their own and each leaves a different residue: an
+/// undeleted row points at a file that is gone, an undeleted file is storage
+/// nobody will ever ask for again. The caller only ever sees the original
+/// error, so each failure has to name what it left behind.
+async fn undo_added_files(
+    db: &DatabaseConnection,
+    storage: &PackageStorage,
+    added: &[StoredFile],
+    added_rows: &[i64],
+    info: &PublishInfo,
+) {
+    for id in added_rows {
+        if let Err(cleanup_error) = rg_db::ops::package_file_ops::delete_by_id(db, *id).await {
+            tracing::warn!(
+                file_id = *id,
+                name = %info.name,
+                version = %info.version,
+                error = %format!("{cleanup_error:#}"),
+                "orphaned package_file row: adding a file to an existing version failed and deleting the record of an already-added file failed too — it points at a file the rollback is removing"
+            );
+        }
+    }
+    for file in added {
+        if let Err(cleanup_error) = storage.delete_file(&file.storage_path).await {
+            tracing::warn!(
+                name = %info.name,
+                version = %info.version,
+                filename = %file.filename,
+                error = %format!("{cleanup_error:#}"),
+                "orphaned package file: adding a file to an existing version failed and the rollback delete failed too — the file stays in storage with no record pointing at it"
+            );
+        }
+    }
 }
 
 /// List all packages for a repository and package type.
