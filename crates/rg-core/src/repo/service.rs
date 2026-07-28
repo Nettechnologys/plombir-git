@@ -536,23 +536,7 @@ pub async fn create_repo_with_opts(
         );
 
         if let Err(e) = &init_result {
-            // If auto_init fails, roll the bare repo back so we don't leave an
-            // inconsistent state. The rollback failing is worse than the usual
-            // orphaned-temp-file case and gets its own line: the directory is
-            // where `create_repo` looks before it does anything, so what the
-            // owner sees on their next attempt is "repository already exists"
-            // for a repository that was never created.
-            if let Err(cleanup_error) = std::fs::remove_dir_all(&git_path) {
-                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        path = %git_path.display(),
-                        error = %cleanup_error,
-                        "failed to roll back the bare repository of a failed create; re-creating \
-                         {name} will keep failing with \"repository already exists\" until the \
-                         directory is removed"
-                    );
-                }
-            }
+            discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
             bail!("auto-initialization failed: {}", e);
         }
 
@@ -575,7 +559,16 @@ pub async fn create_repo_with_opts(
         ..Default::default()
     };
 
-    let repo = repo_ops::create(db, model).await?;
+    // Same rollback as the auto-init branch above, for the same reason: the
+    // bare repository is on disk and this row is what was supposed to point at
+    // it. Leaving it makes the name permanently un-creatable.
+    let repo = match repo_ops::create(db, model).await {
+        Ok(repo) => repo,
+        Err(error) => {
+            discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+            return Err(error);
+        }
+    };
 
     // Keep the metadata FTS table in sync. Triggers also maintain it; use an
     // upsert so the explicit write is safe on SQLite, PostgreSQL and MySQL.
@@ -614,6 +607,36 @@ pub async fn create_repo_with_opts(
     crate::metrics_hook::record_repo_created();
 
     Ok(repo)
+}
+
+/// Roll back a repository directory that a failed step left with no row
+/// pointing at it.
+///
+/// Deliberately not [`discard_dir`]: its message is about a temporary working
+/// tree and the remedy it names is `TMPDIR`, while these paths are the
+/// canonical location every create checks before it does anything. A leftover
+/// here is not disk noise — it is a repository name that can no longer be
+/// created. The caller still has to report the failure that triggered the
+/// rollback, so a failed rollback can only be logged, and `consequence` is what
+/// makes that line worth reading.
+fn discard_unreferenced_repo_dir(path: &std::path::Path, consequence: &str) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to roll back a repository directory that no row points at: {consequence}"
+        ),
+    }
+}
+
+/// What an operator sees next when the rollback above fails.
+fn recreate_blocked_by(name: &str) -> String {
+    format!(
+        "creating {name} will keep failing with \"repository already exists\" until the directory \
+         is removed by hand"
+    )
 }
 
 /// Convert a local path to a git-compatible URL format.
@@ -1058,8 +1081,30 @@ pub async fn fork_repo(
         ..Default::default()
     };
 
-    let forked = repo_ops::create(db, model).await?;
-    repo_ops::update_forks_count(db, source_repo.id).await?;
+    // The clone is already at the forker's canonical path and this row is what
+    // was supposed to point at it. Without the rollback the retry passes the
+    // database check (still no row) and dies in `git clone` on "destination
+    // path already exists" — for good, since nothing ever removes that
+    // directory.
+    let forked = match repo_ops::create(db, model).await {
+        Ok(forked) => forked,
+        Err(error) => {
+            discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
+            return Err(error);
+        }
+    };
+
+    // A counter, not the fork: the row and the clone are both in place by now,
+    // so failing the request here would report a fork that actually happened as
+    // a server error — and the retry would be refused as a duplicate.
+    if let Err(error) = repo_ops::update_forks_count(db, source_repo.id).await {
+        tracing::warn!(
+            source_repo_id = source_repo.id,
+            fork_repo_id = forked.id,
+            error = %format!("{error:#}"),
+            "fork count not updated — the source repository now under-reports its forks"
+        );
+    }
 
     Ok(forked)
 }
@@ -1123,7 +1168,24 @@ pub async fn transfer_repo(
         )
     })?;
 
-    repo_ops::update_owner(db, repo.id, new_owner_id, new_org_id).await?;
+    if let Err(error) = repo_ops::update_owner(db, repo.id, new_owner_id, new_org_id).await {
+        // The directory has already moved, so a row left pointing at the old
+        // owner breaks the repository for *both* sides: the old owner has a row
+        // whose tree is gone, the new owner a tree no row names. Move it back,
+        // and if even that fails say so — nothing else will ever repair it.
+        if let Err(cleanup_error) = std::fs::rename(&new_path, &old_path) {
+            tracing::warn!(
+                repo_id = repo.id,
+                moved_to = %new_path.display(),
+                belongs_at = %old_path.display(),
+                error = %cleanup_error,
+                "failed to move a repository back after its ownership update failed — it is now \
+                 unreachable for both the old and the new owner until the directory is moved back \
+                 by hand"
+            );
+        }
+        return Err(error);
+    }
     // Ownership (and thus who can read/write) changed — drop cached decisions.
     invalidate_perm_cache_repo(db, repo.id);
 
@@ -1756,19 +1818,27 @@ mod path_diagnostic_tests {
     /// machine with no `git` at all fails earlier inside the same body, and the
     /// assertion holds either way — which is the point of one cleanup tail
     /// rather than a `discard_dir` per branch.
+    ///
+    /// `TMPDIR` is process-wide and `tempfile::tempdir()` reads it, so a test
+    /// that pointed it into its own `TempDir` would delete the directory other
+    /// tests in this binary were handed. Hence a plain directory that is never
+    /// removed recursively, and an assertion scoped to this function's own
+    /// `forgekeep-init-` prefix rather than to "the directory is empty".
     #[test]
     fn a_failed_auto_init_leaves_no_working_tree_behind() {
         let sandbox = tempfile::tempdir().expect("create sandbox");
-        let tmpdir = sandbox.path().join("tmp");
-        std::fs::create_dir_all(&tmpdir).expect("create private TMPDIR");
-        // Process-wide, but nothing else in this test binary reads `temp_dir()`
-        // for more than an is-absolute assertion, and this path is absolute.
-        std::env::set_var("TMPDIR", &tmpdir);
+        let private_tmp = std::env::temp_dir().join(format!(
+            "forgekeep-cleanup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");
+        let previous_tmpdir = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", &private_tmp);
 
         let not_a_repo = sandbox.path().join("bare");
         std::fs::create_dir_all(&not_a_repo).expect("create the push target");
 
-        let error = auto_init_repo(
+        let outcome = auto_init_repo(
             &not_a_repo,
             "notes",
             "",
@@ -1779,10 +1849,9 @@ mod path_diagnostic_tests {
             "alice",
             "Alice",
             "alice@example.com",
-        )
-        .expect_err("pushing into a directory that is not a repository must fail");
+        );
 
-        let leftovers: Vec<String> = std::fs::read_dir(&tmpdir)
+        let leftovers: Vec<String> = std::fs::read_dir(&private_tmp)
             .expect("read the private TMPDIR")
             .map(|entry| {
                 entry
@@ -1791,11 +1860,91 @@ mod path_diagnostic_tests {
                     .to_string_lossy()
                     .into_owned()
             })
+            .filter(|name| name.starts_with("forgekeep-init-"))
             .collect();
+
+        // Put the environment back before asserting, so a failure here cannot
+        // leave every later test staging into this directory.
+        match previous_tmpdir {
+            Some(value) => std::env::set_var("TMPDIR", value),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        // Non-recursive on purpose: if another test staged into this directory
+        // while it was `TMPDIR`, this fails and leaves its files alone.
+        drop(std::fs::remove_dir(&private_tmp));
+
+        let error = outcome.expect_err("pushing into a directory that is not a repository must fail");
         assert!(
             leftovers.is_empty(),
             "the failed auto-init left a working tree behind: {leftovers:?} \
              (it failed with: {error:#})"
+        );
+    }
+
+    /// The rollback of a repository directory is best-effort, and the operator
+    /// only ever sees the failure that triggered it — so when the rollback
+    /// fails too, the log line is the sole record of a name that can no longer
+    /// be created, and it has to carry the path and that consequence.
+    #[test]
+    fn a_failed_repo_dir_rollback_names_the_path_and_what_it_blocks() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+            type Writer = CapturedLogs;
+
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sandbox = tempfile::tempdir().expect("create sandbox");
+        // A regular file is a directory removal that fails for a reason other
+        // than "already gone" — no permission games, no root-vs-user surprise.
+        let not_a_directory = sandbox.path().join("notes.git");
+        std::fs::write(&not_a_directory, b"not a directory").expect("write the stand-in");
+
+        discard_unreferenced_repo_dir(&not_a_directory, &recreate_blocked_by("notes"));
+
+        let rendered = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(
+            rendered.contains(&not_a_directory.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("creating notes will keep failing"), "{rendered}");
+        assert!(not_a_directory.exists(), "nothing was removed, as expected");
+    }
+
+    /// The common case is not a failure: a rollback of a directory that is
+    /// already gone is the normal outcome of a step that failed before creating
+    /// anything, and must stay silent rather than cry wolf.
+    #[test]
+    fn rolling_back_an_absent_repo_dir_says_nothing() {
+        let sandbox = tempfile::tempdir().expect("create sandbox");
+        discard_unreferenced_repo_dir(
+            &sandbox.path().join("never-existed.git"),
+            &recreate_blocked_by("never-existed"),
         );
     }
 }

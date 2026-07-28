@@ -316,3 +316,122 @@ async fn a_failed_rollback_does_not_mask_the_failure_that_triggered_it() {
         "no attachment row can exist after the insert that failed"
     );
 }
+
+// ── Repository directory rollback ────────────────────────────
+
+/// A fork whose row was lost must not leave the clone behind.
+///
+/// The bare clone lands at the forker's *canonical* path one step before the
+/// row that names it. Left there, it is invisible to the duplicate check (which
+/// reads rows) and fatal to `git clone` (which sees the directory), so the
+/// retry dies on "destination path already exists" for as long as the
+/// deployment lives. The retry is the assertion: a fork that can be repeated is
+/// a fork that left nothing behind.
+#[tokio::test]
+async fn a_fork_whose_row_was_lost_can_be_retried() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (source_token, _source_id) =
+        register_full(&app.base, "fork_source", "fork_source@example.com").await;
+    create_repo(&app.base, &source_token, "forkable").await;
+    let (forker_token, _forker_id) =
+        register_full(&app.base, "fork_taker", "fork_taker@example.com").await;
+
+    let fault = fail_db_writes(&app.db, "repositories", DbWrite::Insert).await;
+    let failed = client
+        .post(format!(
+            "{}/api/v1/repos/fork_source/forkable/fork",
+            app.base
+        ))
+        .bearer_auth(&forker_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a lost fork row must fail the fork, not answer 201"
+    );
+
+    let clone_path = app.repo_root.join("fork_taker").join("forkable.git");
+    assert!(
+        !clone_path.exists(),
+        "the failed fork left its clone at {}",
+        clone_path.display()
+    );
+
+    fault.clear().await;
+    let retried = client
+        .post(format!(
+            "{}/api/v1/repos/fork_source/forkable/fork",
+            app.base
+        ))
+        .bearer_auth(&forker_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.status(),
+        201,
+        "the fork must be repeatable once the database is healthy again"
+    );
+    assert!(clone_path.exists(), "the successful fork wrote no clone");
+}
+
+/// A transfer whose row was lost must leave the tree where the row still says
+/// it is.
+///
+/// The directory moves before the ownership update. If the update fails and the
+/// move stands, the old owner holds a row whose tree is gone and the new owner
+/// a tree no row names — a repository that is broken for both and that nothing
+/// repairs on its own.
+#[tokio::test]
+async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _owner_id) =
+        register_full(&app.base, "xfer_from", "xfer_from@example.com").await;
+    create_repo(&app.base, &owner_token, "movable").await;
+    register_full(&app.base, "xfer_to", "xfer_to@example.com").await;
+
+    let fault = fail_db_writes(&app.db, "repositories", DbWrite::Update).await;
+    let failed = client
+        .post(format!("{}/api/v1/repos/xfer_from/movable/transfer", app.base))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "new_owner": "xfer_to" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a lost ownership update must fail the transfer, not answer 200"
+    );
+    fault.clear().await;
+
+    let stayed = app.repo_root.join("xfer_from").join("movable.git");
+    let moved = app.repo_root.join("xfer_to").join("movable.git");
+    assert!(
+        stayed.exists(),
+        "the tree must be back where its row says it is: {}",
+        stayed.display()
+    );
+    assert!(
+        !moved.exists(),
+        "the tree stayed at the destination no row names: {}",
+        moved.display()
+    );
+
+    // The row still points at a repository the server can serve.
+    let readable = client
+        .get(format!("{}/api/v1/repos/xfer_from/movable", app.base))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        readable.status(),
+        200,
+        "the repository must still work for its owner after the failed transfer"
+    );
+}
