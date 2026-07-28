@@ -489,3 +489,130 @@ async fn maven_repository_layout_serves_metadata_and_artifacts() {
     assert_eq!(canonical.status(), StatusCode::OK, "generic download");
     assert_eq!(canonical.bytes().await.unwrap().as_ref(), pom.as_slice());
 }
+
+/// Cargo reads a sparse registry the way RFC 2789 spells it: `config.json`
+/// first, and then a crate at the path its name expands to — `matrix-cargo`
+/// lives at `ma/tr/matrix-cargo`, never at the bare name. This walks those
+/// URLs; the flat spelling the rest of the suite uses is ForgeKeep's own, and a
+/// registry that answers only that one is unreachable from `cargo`.
+#[tokio::test]
+async fn cargo_sparse_index_serves_the_layout_cargo_requests() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let cargo_toml = br#"[package]
+name = "matrix-cargo"
+version = "1.0.0"
+"#;
+    let crate_file = tar_gz(&[("matrix-cargo-1.0.0/Cargo.toml", cargo_toml)]);
+
+    let published = client
+        .post(package_url(&base, &["cargo", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-cargo-1.0.0.crate\"",
+        )
+        .body(crate_file.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    // ── `config.json`, the request cargo makes before any crate ─────────────
+    let config = client
+        .get(package_url(&base, &["cargo", "index", "config.json"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(config.status(), StatusCode::OK, "sparse index config.json");
+    let config = config.json::<serde_json::Value>().await.unwrap();
+    let dl = config["dl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("config.json carries no `dl`: {config}"));
+
+    // Cargo substitutes the markers itself; the URL that comes out has to be a
+    // route this server serves, or every `cargo build` ends in a 404.
+    let download_url = dl
+        .replace("{crate}", "matrix-cargo")
+        .replace("{version}", "1.0.0");
+    let downloaded = client.get(&download_url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK, "dl url {download_url}");
+    assert_eq!(
+        downloaded.bytes().await.unwrap().as_ref(),
+        crate_file.as_slice()
+    );
+
+    // ── The crate entry, at the prefix the name expands to ──────────────────
+    let index = client
+        .get(package_url(
+            &base,
+            &["cargo", "index", "ma", "tr", "matrix-cargo"],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK, "prefixed index");
+    let index = index.text().await.unwrap();
+    assert!(
+        index.contains("\"name\":\"matrix-cargo\"") && index.contains("\"vers\":\"1.0.0\""),
+        "prefixed index lost the crate or the version: {index}"
+    );
+
+    // A prefix that does not spell the name out is a miss. Without the check
+    // the index would answer any crate under any path and stop being an index.
+    let wrong = client
+        .get(package_url(
+            &base,
+            &["cargo", "index", "zz", "zz", "matrix-cargo"],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::NOT_FOUND, "unrelated prefix");
+
+    // The other shapes of the layout are routed too — an unpublished crate is a
+    // 404 from the handler, whereas an unregistered shape falls through to the
+    // SPA fallback and answers `200` with HTML.
+    for segments in [
+        vec!["cargo", "index", "1", "a"],
+        vec!["cargo", "index", "2", "ab"],
+        vec!["cargo", "index", "3", "a", "abc"],
+    ] {
+        let response = client
+            .get(package_url(&base, &segments))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{segments:?}");
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("<html"),
+            "{segments:?} reached the SPA fallback: {body}"
+        );
+    }
+
+    // ── The routes the layout ones sit on top of still answer ───────────────
+    let flat = client
+        .get(package_url(&base, &["cargo", "index", "matrix-cargo"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flat.status(), StatusCode::OK, "flat index");
+    assert!(flat.text().await.unwrap().contains("\"vers\":\"1.0.0\""));
+
+    let listed = client
+        .get(package_url(&base, &["cargo", "list"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK, "generic list");
+    let listed = listed.json::<serde_json::Value>().await.unwrap();
+    assert!(listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|package| package["name"] == "matrix-cargo"));
+}

@@ -447,6 +447,43 @@ fn maven_layout_routes(table: RouteTable) -> RouteTable {
 /// Maven shape [`maven_layout_routes`] registers.
 const MAVEN_MAX_GROUP_SEGMENTS: usize = 6;
 
+/// The Cargo sparse index (RFC 2789), registered once per prefix depth.
+///
+/// The index root is `.../packages/cargo/index/` — that whole URL, with a
+/// `sparse+` scheme, is what a user writes into `.cargo/config.toml`. Two
+/// shapes hang off it, and Cargo fetches the first one before any crate:
+///
+/// - `config.json` — where to download a `.crate` from. A sparse index without
+///   it is not a registry, and the request used to fall through to the SPA
+///   fallback, handing Cargo HTML.
+/// - `{prefix…}/{crate}` — the version list. Cargo never asks for the bare
+///   name: it spells the name out as a directory prefix (`1/a`, `2/ab`,
+///   `3/a/abc`, `se/rd/serde`), so a crate path is two or three segments and
+///   the single `{pkg}` this used to be matched none of them.
+///
+/// As in [`maven_layout_routes`], a catch-all is not an option — it would sit
+/// above the generic `{pkg_type}` package API — so each depth is registered
+/// instead. Depth 1 is ForgeKeep's own flat spelling (`index/{crate}`), which
+/// its API and UI use; the layout never produces a single segment, so the two
+/// cannot collide, and `config.json` is static and so wins over `{c1}`.
+fn cargo_index_routes(table: RouteTable) -> RouteTable {
+    const INDEX: [&str; 3] = [
+        "/repos/{owner}/{name}/packages/cargo/index/{c1}",
+        "/repos/{owner}/{name}/packages/cargo/index/{c1}/{c2}",
+        "/repos/{owner}/{name}/packages/cargo/index/{c1}/{c2}/{c3}",
+    ];
+
+    let mut table = table.get(
+        RepoRead,
+        "/repos/{owner}/{name}/packages/cargo/index/config.json",
+        api::packages::cargo_index_config,
+    );
+    for path in INDEX {
+        table = table.get(RepoRead, path, api::packages::cargo_sparse_index);
+    }
+    table
+}
+
 /// Build every route the server serves, and the access level of each.
 ///
 /// `auth_rate_limiter` is layered only onto the unauthenticated credential
@@ -1592,12 +1629,8 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/{pkg_type}/list",
             api::packages::list_packages,
         )
-        // Cargo sparse index protocol
-        .get(
-            RepoRead,
-            "/repos/{owner}/{name}/packages/cargo/index/{pkg}",
-            api::packages::cargo_sparse_index,
-        )
+        // Cargo sparse index protocol — see `cargo_index_routes`.
+        .with(cargo_index_routes)
         // npm registry protocol
         .post(
             RepoWrite,

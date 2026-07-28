@@ -613,17 +613,105 @@ async fn serve_package_file(
 
 // ── Protocol-specific endpoints ──────────────────────────
 
-/// GET /api/v1/repos/:owner/:name/packages/cargo/index/:pkg
+/// Split the captures of a layout route into the repository and the path
+/// below it.
+///
+/// `{owner}` and `{name}` name the repository; every other capture on these
+/// routes is one segment of the client's own layout, in path order. Maven and
+/// Cargo both register one route per depth (`maven_layout_routes`,
+/// `cargo_index_routes`), so the number of captures varies from request to
+/// request and they cannot be read positionally.
+fn layout_segments(params: &axum::extract::RawPathParams) -> (String, String, Vec<String>) {
+    let mut owner = String::new();
+    let mut repo = String::new();
+    let mut segments = Vec::new();
+
+    for (key, value) in params {
+        match key {
+            "owner" => owner = value.to_string(),
+            "name" => repo = value.to_string(),
+            _ => segments.push(value.to_string()),
+        }
+    }
+
+    (owner, repo, segments)
+}
+
+/// Does `prefix` spell out `name` the way Cargo lays the index out?
+///
+/// Compared case-insensitively: Cargo lowercases the path, but a hand-written
+/// request (or ForgeKeep's own UI) may carry the manifest's spelling, and a
+/// case mismatch is not a different crate.
+fn matches_index_prefix(prefix: &[String], name: &str) -> bool {
+    let expected = rg_core::package_registry::cargo_index_prefix(name);
+    prefix.len() == expected.len()
+        && prefix
+            .iter()
+            .zip(&expected)
+            .all(|(got, want)| got.eq_ignore_ascii_case(want))
+}
+
+/// GET /api/v1/repos/:owner/:name/packages/cargo/index/config.json
+///
+/// The first request Cargo makes against a sparse registry, and the one that
+/// decides whether it will talk to it at all: without a `config.json` carrying
+/// a `dl` URL the index is not a registry. Registered at the index root, so the
+/// URL a user configures is
+/// `sparse+{base}/api/v1/repos/{owner}/{name}/packages/cargo/index/`.
+pub async fn cargo_index_config(
+    headers: axum::http::HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let base_url = build_base_url(&headers);
+    let json = rg_core::package_registry::build_cargo_index_config(&base_url, &owner, &name);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/repos/:owner/:name/packages/cargo/index/{prefix…}/{crate}
 ///
 /// Cargo sparse index protocol (RFC 2789 / Cargo ≥ 1.68).
 /// Returns line-delimited JSON, one line per version.
+///
+/// Cargo never asks for a crate by its bare name: the name is spelled out as
+/// the index prefix — `1/a`, `2/ab`, `3/a/abc`, `se/rd/serde` — so the routes
+/// capture two or three segments (see `cargo_index_routes` in `crate::routes`)
+/// and the crate name is read off the end here. The prefix is checked against
+/// the name rather than ignored: an unverified prefix would serve any crate
+/// under any path, and the index would stop being addressable.
+///
+/// A single segment is ForgeKeep's own flat spelling, `index/{crate}`, which
+/// its API and UI use. The layout never produces one segment, so the two cannot
+/// be confused.
 pub async fn cargo_sparse_index(
     State(state): State<AppState>,
-    Path((owner, name, pkg_name)): Path<(String, String, String)>,
+    params: axum::extract::RawPathParams,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
+    let (owner, name, segments) = layout_segments(&params);
+
+    let Some((pkg_name, prefix)) = segments.split_last() else {
+        return err_text(StatusCode::NOT_FOUND, "empty Cargo index path");
+    };
+    if !prefix.is_empty() && !matches_index_prefix(prefix, pkg_name) {
+        return err_text(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "'{}' is not the index prefix of crate '{}'",
+                prefix.join("/"),
+                pkg_name
+            ),
+        );
+    }
+
     let versions = match rg_core::package_registry::service::list_versions(
-        &state.db, &owner, &name, "cargo", &pkg_name,
+        &state.db, &owner, &name, "cargo", pkg_name,
     )
     .await
     {
@@ -636,7 +724,7 @@ pub async fn cargo_sparse_index(
         .map(|v| (v.version.as_str(), v.sha256.as_deref(), v.is_yanked))
         .collect();
 
-    let body = rg_core::package_registry::build_sparse_index(&pkg_name, &entries);
+    let body = rg_core::package_registry::build_sparse_index(pkg_name, &entries);
 
     (
         StatusCode::OK,
@@ -896,20 +984,10 @@ struct MavenRequest {
 }
 
 impl MavenRequest {
-    /// Read the captures by name: `{owner}` / `{name}` are the repository, and
-    /// every other capture on these routes is a layout segment.
+    /// Read the captures by name — see [`layout_segments`], which Cargo's index
+    /// routes share.
     fn from_params(params: &axum::extract::RawPathParams) -> Self {
-        let mut owner = String::new();
-        let mut repo = String::new();
-        let mut segments = Vec::new();
-
-        for (key, value) in params {
-            match key {
-                "owner" => owner = value.to_string(),
-                "name" => repo = value.to_string(),
-                _ => segments.push(value.to_string()),
-            }
-        }
+        let (owner, repo, segments) = layout_segments(params);
 
         Self {
             owner,

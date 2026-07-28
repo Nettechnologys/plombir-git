@@ -6,7 +6,9 @@ pub mod service;
 pub mod storage;
 
 pub use adapter::{get_adapter, ExtractedMetadata, PackageAdapter};
-pub use adapters::cargo::{build_sparse_index, build_sparse_index_entry};
+pub use adapters::cargo::{
+    build_cargo_index_config, build_sparse_index, build_sparse_index_entry, cargo_index_prefix,
+};
 pub use adapters::helm::{build_helm_index, HelmIndexEntry};
 pub use adapters::maven::{build_maven_metadata_xml, MavenVersionEntry};
 pub use adapters::npm::{build_npm_metadata, NpmVersionInfo};

@@ -4,10 +4,16 @@
 //!
 //! ## Sparse index protocol
 //!
-//! Cargo ≥ 1.68 uses the "sparse index" protocol: a GET to
-//! `{registry}/index/{name}` returns line-delimited JSON with one entry
-//! per version.  ForgeKeep serves this at:
-//!   `GET /api/v1/repos/{owner}/{repo}/packages/cargo/index/{pkg_name}`
+//! Cargo ≥ 1.68 uses the "sparse index" protocol (RFC 2789). The registry root
+//! is the index URL a user writes into `.cargo/config.toml`; ForgeKeep's is
+//!   `sparse+{base}/api/v1/repos/{owner}/{repo}/packages/cargo/index/`
+//! and two shapes hang off it:
+//!
+//! - `{index}/config.json` — [`build_cargo_index_config`]. Cargo fetches this
+//!   before any crate, so a registry without it is unusable.
+//! - `{index}/{prefix…}/{crate}` — [`build_sparse_index`], line-delimited JSON,
+//!   one entry per version. Cargo never asks for the bare name: it spells it
+//!   out as a directory prefix, see [`cargo_index_prefix`].
 
 use flate2::read::GzDecoder;
 use std::io::Read;
@@ -181,4 +187,86 @@ pub fn build_sparse_index(name: &str, versions: &[(&str, Option<&str>, bool)]) -
         lines.push('\n');
     }
     lines
+}
+
+/// The directory segments Cargo puts a crate under in the index.
+///
+/// A client never requests a crate by its bare name — the name is spelled out
+/// as a prefix, so that no directory of the index ever holds more entries than
+/// a filesystem is comfortable with:
+///
+/// | name length | path            | example        |
+/// |-------------|-----------------|----------------|
+/// | 1           | `1/{name}`      | `1/a`          |
+/// | 2           | `2/{name}`      | `2/ab`         |
+/// | 3           | `3/{c1}/{name}` | `3/a/abc`      |
+/// | 4 and up    | `{c1c2}/{c3c4}/{name}` | `se/rd/serde` |
+///
+/// Returned as the segments *before* the name, lowercased the way Cargo spells
+/// them; an empty name has no prefix. Non-ASCII names are not a real case
+/// (Cargo rejects them at publish), but the split is by `char` so one cannot
+/// panic here on a byte boundary.
+pub fn cargo_index_prefix(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.to_lowercase().chars().collect();
+    match chars.len() {
+        0 => Vec::new(),
+        1 => vec!["1".to_string()],
+        2 => vec!["2".to_string()],
+        3 => vec!["3".to_string(), chars[0].to_string()],
+        _ => vec![chars[..2].iter().collect(), chars[2..4].iter().collect()],
+    }
+}
+
+/// Build the sparse index's `config.json` (RFC 2789).
+///
+/// Cargo fetches this first, before any crate, and refuses the registry without
+/// it. Only `dl` is required — where to download a `.crate` from. The markers
+/// `{crate}` and `{version}` are substituted by Cargo, which lets the URL point
+/// straight at ForgeKeep's existing package-download route instead of needing a
+/// redirect endpoint of its own; the filename is the one `cargo package`
+/// produces, `{crate}-{version}.crate`.
+///
+/// `api` is deliberately absent. It is the base for `cargo publish` / `yank` /
+/// `owner`, and ForgeKeep serves none of those (publishing goes through
+/// `POST .../packages/cargo/publish`). Advertising an `api` we do not implement
+/// would turn `cargo publish` into an unexplained failure; without the key
+/// Cargo says outright that the registry does not support the command.
+pub fn build_cargo_index_config(base_url: &str, owner: &str, repo: &str) -> serde_json::Value {
+    serde_json::json!({
+        "dl": format!(
+            "{}/api/v1/repos/{}/{}/packages/cargo/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
+            base_url.trim_end_matches('/'),
+            owner,
+            repo,
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_prefix_follows_the_name_length() {
+        assert_eq!(cargo_index_prefix("a"), ["1"]);
+        assert_eq!(cargo_index_prefix("ab"), ["2"]);
+        assert_eq!(cargo_index_prefix("abc"), ["3", "a"]);
+        assert_eq!(cargo_index_prefix("serde"), ["se", "rd"]);
+        assert_eq!(cargo_index_prefix("matrix-cargo"), ["ma", "tr"]);
+        // Cargo lowercases the path even though the manifest name may not be.
+        assert_eq!(cargo_index_prefix("SerDe"), ["se", "rd"]);
+        assert!(cargo_index_prefix("").is_empty());
+    }
+
+    #[test]
+    fn index_config_carries_a_substitutable_download_url() {
+        let config = build_cargo_index_config("https://forge.example/", "acme", "tools");
+        let dl = config["dl"].as_str().unwrap();
+        assert_eq!(
+            dl,
+            "https://forge.example/api/v1/repos/acme/tools/packages/cargo/{crate}/{version}/{crate}-{version}.crate"
+        );
+        // No `api`: `cargo publish` must fail loudly, not against a dead URL.
+        assert!(config.get("api").is_none());
+    }
 }
