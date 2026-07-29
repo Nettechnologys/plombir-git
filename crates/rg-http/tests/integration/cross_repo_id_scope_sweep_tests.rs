@@ -83,7 +83,31 @@ const HOST: &str = "scopehost";
 /// The victim's private repository — the one every probe's ids come from.
 const VAULT: &str = "scopevault";
 
+/// The prefix most repository routes happen to share. Not the selector — see
+/// [`repo_tail`] — only what the sweep reports its reach against.
 const REPO_PREFIX: &str = "/api/v1/repos/{owner}/{name}";
+
+/// Everything a path says *after* it has named the repository, or `None` if it
+/// never names one.
+///
+/// The selector used to be `strip_prefix(REPO_PREFIX)`, which made the sweep's
+/// reach a property of one string rather than of the route. The
+/// `/api/v1/ai/repos/{owner}/{name}/…` group declares `RepoRead` and names its
+/// repository exactly the same way, and every loop dropped it with a silent
+/// `continue` — against a doc-comment that promises an unrecognised route fails
+/// the run rather than being passed over. Today those five routes carry no
+/// global id, so nothing leaks; the guarantee was resting on nobody ever adding
+/// `/ai/repos/{owner}/{name}/issues/{id}`, and on that day the sweep would have
+/// stayed green. Selecting on the placeholders themselves means a route under a
+/// new prefix is swept from the day it is added.
+fn repo_tail(path: &str) -> Option<&str> {
+    let owner = path.find("{owner}")?;
+    let (marker, at) = ["{name}", "{repo}"]
+        .iter()
+        .filter_map(|marker| path[owner..].find(marker).map(|at| (*marker, owner + at)))
+        .min_by_key(|(_, at)| *at)?;
+    Some(&path[at + marker.len()..])
+}
 
 /// Placeholders that carry an instance-wide primary key, and are therefore the
 /// subject of this sweep.
@@ -959,10 +983,7 @@ async fn drive(
         other => panic!("route table produced an unroutable method {other}"),
     };
     request = request.bearer_auth(token);
-    let tail = fact
-        .path
-        .strip_prefix(REPO_PREFIX)
-        .expect("repository-scoped path");
+    let tail = repo_tail(&fact.path).expect("repository-scoped path");
     request = match body_for(fact.method, tail, ids) {
         Body::None => request,
         Body::Json(body) => request.json(&body),
@@ -1036,10 +1057,14 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
     // per-repository, and a new one has to be classified before it can be
     // ignored.
     let mut unknown: BTreeSet<String> = BTreeSet::new();
+    let mut beyond_prefix: BTreeSet<String> = BTreeSet::new();
     for fact in &facts {
-        let Some(tail) = fact.path.strip_prefix(REPO_PREFIX) else {
+        let Some(tail) = repo_tail(&fact.path) else {
             continue;
         };
+        if !fact.path.starts_with(REPO_PREFIX) {
+            beyond_prefix.insert(fact.label());
+        }
         for name in placeholders(tail) {
             let maven_segment = name.strip_prefix('m').is_some_and(|index| {
                 index
@@ -1066,12 +1091,23 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
         unknown.into_iter().collect::<Vec<_>>().join("\n"),
     );
 
+    // The selector is a property of the route, not a prefix string. If this
+    // ever holds nothing, someone has narrowed `repo_tail` back to a constant
+    // and the routes outside `/api/v1/repos/…` — the `/ai/repos/…` group among
+    // them — have gone quiet again.
+    assert!(
+        !beyond_prefix.is_empty(),
+        "every route this sweep recognises sits under {REPO_PREFIX}, which is what the selector \
+         used to hard-code. Either the route table lost its other repository-scoped groups, or \
+         `repo_tail` was narrowed back to a prefix match",
+    );
+
     // The routes in scope: repository-scoped, and carrying a global id.
     let mut probes: Vec<(&RouteFact, HashMap<&'static str, i64>)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut unclassified: Vec<String> = Vec::new();
     for fact in &facts {
-        let Some(tail) = fact.path.strip_prefix(REPO_PREFIX) else {
+        let Some(tail) = repo_tail(&fact.path) else {
             continue;
         };
         if !placeholders(tail).any(|name| GLOBAL_ID_PLACEHOLDERS.contains(&name)) {
