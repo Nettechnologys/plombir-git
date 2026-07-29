@@ -357,33 +357,19 @@ pub async fn list_comments(
     issue_comment_ops::list_by_issue(db, issue.id).await
 }
 
-/// Update a comment.
-pub async fn update_comment(
-    db: &DatabaseConnection,
-    comment_id: i64,
-    body: String,
-) -> Result<Comment> {
-    if body.trim().is_empty() {
-        return Err(crate::error::invalid_request(
-            "comment body cannot be empty",
-        ));
-    }
-
-    let comment = issue_comment_ops::find_by_id(db, comment_id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("comment"))?;
-
-    let mut active: issue_comment::ActiveModel = comment.into();
-    active.body = Set(body);
-    active.updated_at = Set(Utc::now());
-
-    issue_comment_ops::update(db, active).await
-}
-
-/// Delete a comment.
-pub async fn delete_comment(db: &DatabaseConnection, comment_id: i64) -> Result<()> {
-    issue_comment_ops::delete_by_id(db, comment_id).await
-}
+// `update_comment(db, comment_id, body)` and `delete_comment(db, comment_id)`
+// used to live here. Both were dead — no route, no caller anywhere in the
+// workspace — and both were shaped so that a scope could not be passed even if
+// a caller wanted to: the comment id is global, and neither signature had room
+// for the issue or the repository it belongs to.
+//
+// That is the same primitive `time_tracking::service::delete_time_entry(db, id)`
+// was before it became `delete_time_entry(db, issue_id, id)`, and the reason it
+// mattered there was not the primitive itself but the handler written to its
+// shape. Editing a comment is a feature this forge will grow eventually; when
+// it does, the signature has to carry `issue_id` and the body has to verify
+// `comment.issue_id` before touching the row — see `delete_time_entry` for the
+// shape, and `api::attachments` for the call-site anchoring that goes with it.
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
