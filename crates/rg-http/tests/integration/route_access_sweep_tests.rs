@@ -31,13 +31,16 @@
 //! Both blind spots are here rather than in a card, because a reader deciding
 //! whether a green run means anything needs them in front of them:
 //!
-//! - **`Access::Public` is owed `Expect::Allowed`**, and everything short of a
-//!   denial satisfies that — so a public row cannot fail the persona passes
-//!   whatever it answers. Most of those rows are static content, but a few are
-//!   *self-filtering* data gates whose entire security property is that the
-//!   answer depends on who asks. [`no_public_route_names_the_private_repo`]
-//!   gives that class the one mechanism a generic sweep can: it is not a proof,
-//!   but it is not vacuous either.
+//! - **Both public levels are owed `Expect::Allowed`**, and everything short of
+//!   a denial satisfies that — so a public row cannot fail the persona passes
+//!   whatever it answers. For static content that is correct; for the handful
+//!   of rows that are *self-filtering* data gates it would be vacuous, and
+//!   those declare [`Access::PublicFiltered`] instead. The persona passes still
+//!   cannot fail them, but [`the_self_filtering_routes_show_public_and_hide_private`]
+//!   holds each one to a promise a generic pass cannot state: answer an
+//!   anonymous caller with real data, and never with data that caller may not
+//!   see. [`no_public_route_names_the_private_repo`] stays as the broad net
+//!   under *every* public row, including the ones nobody thought were gates.
 //! - **A gate that resolves the right repository and then acts on a global
 //!   `id`** passes here, because the gate did answer. That is a second
 //!   mechanism, not a hole in this one, and it has its own pass:
@@ -266,7 +269,10 @@ fn expectation(access: Access, persona: Persona, scope: Scope) -> Expect {
     use Persona::{Anonymous, Outsider, Owner};
 
     match access {
-        Access::Public => Expect::Allowed,
+        // Neither public level can be failed here — see the module note and
+        // `the_self_filtering_routes_show_public_and_hide_private`, which is
+        // where `PublicFiltered` is actually held to something.
+        Access::Public | Access::PublicFiltered => Expect::Allowed,
         Access::User => match persona {
             Anonymous => Expect::Denied,
             Outsider | Owner => Expect::Allowed,
@@ -379,6 +385,17 @@ impl Fixture {
                     == StatusCode::OK
             }
         }
+    }
+
+    /// `GET <path>` with the given session, or with none at all.
+    async fn get_as(&self, token: Option<&str>, path: &str) -> (StatusCode, String) {
+        let mut req = self.client.get(format!("{}{path}", self.base));
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.expect("filtered-route probe");
+        let status = resp.status();
+        (status, resp.text().await.unwrap_or_default())
     }
 
     async fn repo_readable_by_owner(&self, repo: &str) -> StatusCode {
@@ -903,28 +920,29 @@ async fn the_route_table_covers_the_whole_server() {
     }
 }
 
-/// No route declared [`Access::Public`] names a private repository to an
-/// anonymous caller.
+/// No route a caller can reach *without a ForgeKeep session* names a private
+/// repository to an anonymous caller.
 ///
-/// This is the narrow half of the sweep's `Public` blind spot. `expectation`
-/// owes a public route `Expect::Allowed` and every non-denial satisfies that,
-/// so the persona passes cannot fail a public row however it answers — and yet
-/// a handful of those rows are not static content but *self-filtering* data
-/// gates, where filtering the answer by what the caller may see is the entire
-/// security property. `/repos/explore`, `/repos/{owner}` and `/search` are that
-/// shape, and all three are where `card_76e22c3a8364` found a private
-/// repository on show to anonymous callers.
+/// The broad net under both public levels — and over the `Foreign` rows too,
+/// which is the same population by a different route: git-over-HTTP, the OCI
+/// registry and the LFS batch endpoint carry their own credentials, so a caller
+/// with none at all reaches them exactly as it reaches a public one. They have
+/// their own gates and their own tests; this is only the net that would notice
+/// if one of them started naming a repository it should not.
 ///
-/// So: seed one private repository, drive every public `GET`/`HEAD` with no
-/// credentials, and fail if its name comes back. What this catches is a leak
-/// through a route nobody wrote a bespoke test for — including one added
-/// tomorrow, since it walks the table rather than a list.
+/// It exists because `expectation` owes a public route `Expect::Allowed` and
+/// every non-denial satisfies that, so the persona passes cannot fail a public
+/// row however it answers. This one can: seed a private repository, drive every
+/// such `GET`/`HEAD` with no credentials, fail if its name comes back. What it
+/// catches is a leak through a route nobody wrote a bespoke test for —
+/// including one added tomorrow, since it walks the table rather than a list.
 ///
 /// It is deliberately weaker than a bespoke test and should not be mistaken for
 /// one. A route that answers `400` for want of a query parameter is not proven
-/// to filter anything; it is only proven not to have leaked *here*. The
-/// per-route tests (`private_repo_visibility_tests`) remain the real coverage —
-/// this is the net under them.
+/// to filter anything; it is only proven not to have leaked *here*. That is
+/// exactly the excuse [`the_self_filtering_routes_show_public_and_hide_private`]
+/// takes away from the rows where filtering is the point — this stays the net
+/// under the rest, where nobody expected a gate at all.
 #[tokio::test]
 async fn no_public_route_names_the_private_repo() {
     let (base, facts) = spawn_test_app_with_routes().await;
@@ -955,7 +973,10 @@ async fn no_public_route_names_the_private_repo() {
 
     let mut probed = 0usize;
     let mut leaks: Vec<String> = Vec::new();
-    for fact in facts.iter().filter(|f| f.access == Access::Public) {
+    let no_session_needed =
+        |fact: &&RouteFact| fact.access.is_public() || matches!(fact.access, Access::Foreign(_));
+
+    for fact in facts.iter().filter(no_session_needed) {
         // Only the safe verbs: a public `POST` here is login / register /
         // password reset, and driving those adds accounts and mail instead of
         // reading anything back.
@@ -983,14 +1004,213 @@ async fn no_public_route_names_the_private_repo() {
 
     assert!(
         probed > 5,
-        "only {probed} public route(s) were probed — the filter is wrong, not the server"
+        "only {probed} session-less route(s) were probed — the filter is wrong, not the server"
     );
     assert!(
         leaks.is_empty(),
-        "{} route(s) declared `Access::Public` handed a private repository to an \
-         anonymous caller. A public route either serves content that does not depend on \
-         who asks, or filters by what the caller may see — these did neither.\n{}",
+        "{} route(s) reachable without a session handed a private repository to an \
+         anonymous caller. Such a route either serves content that does not depend on who \
+         asks, or filters by what the caller may see — these did neither.\n{}",
         leaks.len(),
         leaks.join("\n"),
+    );
+}
+
+// ── The self-filtering rows, held to both halves of their promise ──────────
+
+/// One [`Access::PublicFiltered`] row and the two probes that pin it.
+///
+/// Two probes rather than one, because a route that answers nothing at all
+/// satisfies "did not leak" perfectly. `shows_public` proves the route is
+/// alive and serving; `hides_private` proves the filter is what keeps the
+/// private repository out of that same answer.
+struct FilteredProbe {
+    /// `RouteFact::label()` of the row this describes.
+    route: &'static str,
+    /// Query string (with its `?`, or empty) whose anonymous answer must name
+    /// the *public* repository.
+    shows_public: String,
+    /// Query string whose anonymous answer must not name the *private* one.
+    hides_private: String,
+    /// Whether the owner is supposed to see the private repository through
+    /// this very route. When true, the `hides_private` probe is re-run with
+    /// the owner's session and must name it — which is what proves the query
+    /// can reach the repository at all, so that "anonymous saw nothing" is the
+    /// filter working rather than the probe missing.
+    ///
+    /// `/repos/explore` is the instance shop window: nobody sees a private
+    /// repository there, its owner included, so there is no such control to
+    /// run and `shows_public` carries the anti-vacuity weight alone.
+    owner_sees_private: bool,
+}
+
+fn filtered_probes() -> Vec<FilteredProbe> {
+    vec![
+        FilteredProbe {
+            route: "GET /api/v1/repos/explore",
+            shows_public: String::new(),
+            hides_private: String::new(),
+            owner_sees_private: false,
+        },
+        FilteredProbe {
+            route: "GET /api/v1/repos/{owner}",
+            shows_public: String::new(),
+            hides_private: String::new(),
+            owner_sees_private: true,
+        },
+        FilteredProbe {
+            // The route the old net could not check at all: with no `q` it
+            // answers `400`, and a `400` proves nothing about filtering.
+            route: "GET /api/v1/search",
+            shows_public: format!("?type=repos&q={PUBLIC_REPO}"),
+            hides_private: format!("?type=repos&q={PRIVATE_REPO}"),
+            owner_sees_private: true,
+        },
+    ]
+}
+
+/// Every self-filtering public route answers an anonymous caller with real
+/// data, and never with data that caller may not see.
+///
+/// This is the half of the `Public` blind spot a generic pass cannot reach.
+/// The persona matrix owes these rows `Expect::Allowed`, which any non-denial
+/// satisfies, so they cannot fail it however they answer — and they are exactly
+/// the rows where the answer *must* depend on who asks: `/repos/explore`,
+/// `/repos/{owner}` and `/search` are the shape `card_76e22c3a8364` found a
+/// private repository on show through.
+///
+/// Held to both halves on purpose. "Did not name the private repository" is
+/// satisfied by a route that answers `400`, `404` or an empty page — which is
+/// how the previous net let `/search` through without ever driving it. So each
+/// row also has to *show* the public repository, and where the owner is
+/// supposed to see the private one, the same query run with the owner's session
+/// has to return it. A filter dropped from any of the three then fails this
+/// test by name.
+///
+/// What it still does not check, plainly: a leak that is not the repository's
+/// *name* — an id, a count, a `total` that includes rows the caller cannot see.
+/// Those need the per-route tests.
+#[tokio::test]
+async fn the_self_filtering_routes_show_public_and_hide_private() {
+    let (base, facts) = spawn_test_app_with_routes().await;
+    let client = Client::builder().build().expect("http client");
+
+    let owner_token = register_user(&base, OWNER, &format!("{OWNER}@example.com"), PW).await;
+    let fx = Fixture {
+        base,
+        client,
+        owner_token,
+        outsider_token: String::new(),
+    };
+    create_repo(&fx, PUBLIC_REPO, false).await;
+    create_repo(&fx, PRIVATE_REPO, true).await;
+    let seed = RepoSeed {
+        name: PRIVATE_REPO.to_string(),
+        comment_id: "1".to_string(),
+    };
+
+    let probes = filtered_probes();
+
+    // Checked both ways, like every other list in this file: a new
+    // `PublicFiltered` route with no probe would otherwise be declared and
+    // never driven, and a probe left behind after a route is renamed would
+    // quietly stop testing anything.
+    let declared: BTreeSet<String> = facts
+        .iter()
+        .filter(|f| f.access == Access::PublicFiltered)
+        .map(|f| f.label())
+        .collect();
+    let probed: BTreeSet<String> = probes.iter().map(|p| p.route.to_string()).collect();
+    assert_eq!(
+        declared,
+        probed,
+        "every `Access::PublicFiltered` route needs a probe in `filtered_probes` and every \
+         probe needs a route.\n  declared, not probed: {:?}\n  probed, not declared: {:?}",
+        declared.difference(&probed).collect::<Vec<_>>(),
+        probed.difference(&declared).collect::<Vec<_>>(),
+    );
+    assert!(
+        !probes.is_empty(),
+        "no route declares `Access::PublicFiltered` — either the level went unused or the \
+         three self-filtering routes were quietly relabelled `Public`, which puts them back \
+         in the blind spot this test exists for"
+    );
+
+    let path_of = |label: &str| -> String {
+        let fact = facts
+            .iter()
+            .find(|f| f.label() == label)
+            .expect("probe names a route in the table");
+        fill(&fact.path, &seed)
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    for probe in &probes {
+        let path = path_of(probe.route);
+
+        // Half one: the route serves. Without this a handler that answered
+        // `{"results":[]}` to everything would pass the leak half perfectly.
+        let (status, body) = fx
+            .get_as(None, &format!("{path}{}", probe.shows_public))
+            .await;
+        if status != StatusCode::OK || !body.contains(PUBLIC_REPO) {
+            failures.push(format!(
+                "  {} — anonymous {}{} answered {status} without naming the public \
+                 repository, so this route proves nothing about filtering:\n      {}",
+                probe.route,
+                path,
+                probe.shows_public,
+                body.chars().take(240).collect::<String>(),
+            ));
+        }
+
+        // Half two: and it filters.
+        let (status, body) = fx
+            .get_as(None, &format!("{path}{}", probe.hides_private))
+            .await;
+        if status != StatusCode::OK {
+            failures.push(format!(
+                "  {} — anonymous {}{} answered {status}; a route that declines to answer \
+                 has not been shown to filter anything",
+                probe.route, path, probe.hides_private,
+            ));
+        } else if body.contains(PRIVATE_REPO) {
+            failures.push(format!(
+                "  {} — anonymous {}{} names the private repository:\n      {}",
+                probe.route,
+                path,
+                probe.hides_private,
+                body.chars().take(240).collect::<String>(),
+            ));
+        }
+
+        // The control on half two: the query does reach the repository, and it
+        // was the filter that held it back.
+        if probe.owner_sees_private {
+            let (status, body) = fx
+                .get_as(
+                    Some(&fx.owner_token),
+                    &format!("{path}{}", probe.hides_private),
+                )
+                .await;
+            if status != StatusCode::OK || !body.contains(PRIVATE_REPO) {
+                failures.push(format!(
+                    "  {} — the owner's own {}{} answered {status} without naming their \
+                     private repository, so the anonymous probe next to it is vacuous: it \
+                     found nothing because the query finds nothing.\n      {}",
+                    probe.route,
+                    path,
+                    probe.hides_private,
+                    body.chars().take(240).collect::<String>(),
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} self-filtering public route(s) broke their promise:\n{}",
+        failures.len(),
+        failures.join("\n"),
     );
 }

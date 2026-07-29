@@ -16,8 +16,8 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use crate::route_table::Access::{
-    self, Foreign, InstanceAdmin, OrgAdmin, OrgRead, Public, RepoAdmin, RepoAuthRead, RepoOwner,
-    RepoRead, RepoWrite, User,
+    self, Foreign, InstanceAdmin, OrgAdmin, OrgRead, Public, PublicFiltered, RepoAdmin,
+    RepoAuthRead, RepoOwner, RepoRead, RepoWrite, User,
 };
 use crate::route_table::{RouteFact, RouteTable};
 use crate::{
@@ -766,8 +766,8 @@ pub(crate) fn build_all_routes(
             "/repos/templates/labels",
             api::repos::list_label_sets,
         )
-        .get(Public, "/repos/explore", api::repos::explore)
-        .get(Public, "/repos/{owner}", api::repos::list_repos)
+        .get(PublicFiltered, "/repos/explore", api::repos::explore)
+        .get(PublicFiltered, "/repos/{owner}", api::repos::list_repos)
         .get(RepoRead, "/repos/{owner}/{name}", api::repos::get_repo)
         .delete(
             RepoOwner,
@@ -1999,7 +1999,7 @@ pub(crate) fn build_all_routes(
             api::admin::update_settings,
         )
         // ── Global search ──────────────────────────────────────────────────
-        .get(Public, "/search", api::search::search)
+        .get(PublicFiltered, "/search", api::search::search)
         // ── External CI/CD webhook ─────────────────────────────────────────
         .post(
             RepoWrite,

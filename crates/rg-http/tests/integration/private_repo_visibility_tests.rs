@@ -124,6 +124,60 @@ async fn private_repo_is_hidden_from_anonymous_and_outsiders() {
     }
 }
 
+/// `GET /api/v1/repos/explore` — the instance shop window.
+///
+/// It had no test of its own at all until now, only the route-table net in
+/// `route_access_sweep_tests`, and it is the one listing whose whole filter is a
+/// single `is_private = false` in `repo_ops::list_public_paginated`. Nobody sees
+/// a private repository here — not an outsider, and not its owner either, which
+/// is what separates this route from `/repos/{owner}` next door.
+///
+/// `total` is asserted along with the rows for the reason the sibling test
+/// gives: a page count that includes rows the caller cannot see moves the leak
+/// from the body to the pagination and nothing else would notice.
+#[tokio::test]
+async fn explore_lists_public_repos_and_never_private_ones() {
+    let base = spawn_test_app().await;
+    let (owner_token, _) = register_full(&base, "expl-owner", "expl-owner@example.com").await;
+    let (outsider_token, _) =
+        register_full(&base, "expl-outsider", "expl-outsider@example.com").await;
+
+    create_repo_with_visibility(&base, &owner_token, "expl-secret", true).await;
+    create_repo_with_visibility(&base, &owner_token, "expl-open", false).await;
+
+    for (label, token) in [
+        ("anonymous", None),
+        ("an outsider", Some(outsider_token.as_str())),
+        // The owner too: explore is not "your repositories".
+        ("the owner", Some(owner_token.as_str())),
+    ] {
+        let (status, body) = get(&base, "/api/v1/repos/explore", token).await;
+        assert_eq!(status, 200, "{label}: explore should answer");
+
+        let names: Vec<&str> = body["data"]
+            .as_array()
+            .expect("explore data")
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"expl-open"),
+            "{label} did not see the public repo on explore, so this assertion proves \
+             nothing about the private one: {names:?}"
+        );
+        assert!(
+            !names.contains(&"expl-secret"),
+            "{label} saw a private repo on explore: {names:?}"
+        );
+        assert_eq!(
+            body["pagination"]["total"].as_u64(),
+            Some(names.len() as u64),
+            "{label}: explore's pagination total disagrees with the rows it returned, so \
+             the private repo is counted even where it is not listed"
+        );
+    }
+}
+
 #[tokio::test]
 async fn owner_and_collaborator_still_see_their_private_repo() {
     let base = spawn_test_app().await;

@@ -30,9 +30,24 @@ use crate::AppState;
 /// the level declared here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
-    /// Open to everyone, deliberately. The answer must not depend on who asks
-    /// — or must already filter itself by what the caller may see.
+    /// Open to everyone, deliberately, *and the answer does not depend on who
+    /// asks*: static content, a template list, a discovery document, a login
+    /// form's counterpart. If the reply would differ per caller, the route is
+    /// [`Access::PublicFiltered`] instead.
     Public,
+    /// Open to everyone, but the answer **does** depend on who asks: the route
+    /// serves a slice of instance-wide data and filters it down to what the
+    /// caller may see. `/repos/explore`, `/repos/{owner}` and `/search` are
+    /// this shape, and the filtering *is* their entire security property.
+    ///
+    /// The distinction exists because the persona passes cannot tell the two
+    /// apart. A public row is owed `Expect::Allowed`, which every non-denial
+    /// satisfies, so no public route can fail them however it answers — fine
+    /// for static content, worthless for a data gate. Declaring the shape here
+    /// hands `no_public_route_names_the_private_repo` a list it can hold to a
+    /// stronger promise: answer an anonymous caller with real data, and never
+    /// with data that caller may not see.
+    PublicFiltered,
     /// Any authenticated user. Not scoped to a repository.
     User,
     /// Repository read. A public repository stays anonymously readable, a
@@ -68,6 +83,12 @@ pub enum Access {
 }
 
 impl Access {
+    /// Whether the route is reachable with no credentials at all — either
+    /// shape of "public".
+    pub fn is_public(self) -> bool {
+        matches!(self, Self::Public | Self::PublicFiltered)
+    }
+
     /// Whether the level is about *this* repository, i.e. whether the sweep's
     /// private-repository fixture is the right thing to point it at.
     pub fn is_repo_scoped(self) -> bool {
