@@ -16,13 +16,23 @@
 //! anyone decides which HTTP verb to hang it on. The failure being guarded here
 //! is a line that was not written, and no request can exercise that.
 //!
-//! Deliberately narrow. The other files that carry an `*_in_repo` helper
-//! (`boards.rs`, `webhooks.rs`, `time_tracking.rs`, `issues.rs`) mix three
-//! different anchoring shapes — a `*_for_repo` service call that scopes itself,
-//! a nested id checked against its parent rather than against the repository,
-//! and an id that arrives in the request body — and a rule stretched over all
-//! of them would be a rule with four exceptions. `ANCHORED` grows one audited
-//! entry at a time.
+//! `ANCHORED` grows one audited entry at a time, and it now covers all five
+//! files in `api/` that hand a global id to a handler. Two of them only became
+//! coverable once their anchoring was given a *name*: `issues.rs` compared
+//! `m.repo_id == repo.id` inline in three milestone routes and `webhooks.rs`
+//! compared `delivery.webhook_id == hook.id` inline in `redeliver`. A guard
+//! that reads source can see a call; it cannot see a comparison. Reducing those
+//! to `milestone_in_repo` / `delivery_in_webhook` was the cheaper half of the
+//! job — the alternative was a second kind of rule per inline shape.
+//!
+//! What the table deliberately does **not** cover is an id that arrives in the
+//! request *body* rather than the path: `create_issue` / `update_issue` take
+//! `milestone_id` and `assignee_id` that way, and `boards.rs` takes `issue_id`.
+//! Those are anchored (`milestone_in_repo`, `require_assignee_in_repo`,
+//! `issue_in_repo`) but no path parameter announces them, so the rule form here
+//! cannot demand the call. They are listed in [`BODY_BORNE_IDS`], which asserts
+//! the anchors still exist, and are the reason a body-id rule is a separate
+//! piece of work rather than a fourth column.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,16 +41,81 @@ use std::path::{Path, PathBuf};
 ///
 /// Read as: inside this file, a handler that destructures a path parameter
 /// named `param` must call `anchor` before it does anything with it.
-const ANCHORED: &[(&str, &[(&str, &str)])] = &[(
-    "api/releases.rs",
-    &[
-        // `get_release` / `update_release` / `delete_release` spell the release
-        // id `id`; the asset routes carry the release as `release_id`.
-        ("id", "release_in_repo"),
-        ("release_id", "release_in_repo"),
-        ("asset_id", "asset_in_repo"),
-    ],
-)];
+const ANCHORED: &[(&str, &[(&str, &str)])] = &[
+    (
+        "api/releases.rs",
+        &[
+            // `get_release` / `update_release` / `delete_release` spell the release
+            // id `id`; the asset routes carry the release as `release_id`.
+            ("id", "release_in_repo"),
+            ("release_id", "release_in_repo"),
+            ("asset_id", "asset_in_repo"),
+        ],
+    ),
+    (
+        "api/boards.rs",
+        &[
+            // The board itself is the only id anchored to the *repository*; the
+            // two below it are anchored to their parent, which `board_in_repo`
+            // has already placed. `get_board` and friends spell it `id`, the
+            // nested routes spell it `board_id`.
+            ("id", "board_in_repo"),
+            ("board_id", "board_in_repo"),
+            // A column belongs to a board, a card belongs to a column — so the
+            // anchor is the parent, not the repository. `card_in_board` walks
+            // the card's column through `column_in_board` to get there.
+            ("col_id", "column_in_board"),
+            ("card_id", "card_in_board"),
+        ],
+    ),
+    (
+        "api/webhooks.rs",
+        &[
+            ("id", "webhook_in_repo"),
+            // Chained anchor: `webhook_in_repo` ties the hook to the repository,
+            // then the delivery is tied to that hook.
+            ("delivery_id", "delivery_in_webhook"),
+        ],
+    ),
+    (
+        "api/time_tracking.rs",
+        &[
+            // `number` is an issue number, which is only unique *within* a
+            // repository — so it is not a global id, but resolving it against
+            // anything other than the gated repository is the same defect. The
+            // rule exists to keep the resolution pinned to `repo.id`: two of
+            // these handlers used to re-resolve `owner`/`name` themselves.
+            ("number", "issue_in_repo"),
+            // The time-entry id *is* global. Nothing anchors it directly; it is
+            // only ever passed to the service beside an issue resolved above,
+            // and the service refuses a mismatch. The rule keeps that pairing.
+            ("id", "issue_in_repo"),
+        ],
+    ),
+    (
+        "api/issues.rs",
+        &[
+            // Only the three `/milestones/{id}` routes destructure `id` here.
+            // `number` is deliberately absent: an issue number is scoped to its
+            // repository by definition, and the routes carrying one hand
+            // `owner`/`name` to a service that resolves them itself.
+            ("id", "milestone_in_repo"),
+        ],
+    ),
+];
+
+/// Global ids that arrive in a request *body*, and the anchor each one gets.
+///
+/// [`ANCHORED`] keys off path parameters, so it is blind to these by
+/// construction — nothing in the handler's signature announces them. They are
+/// recorded here so the anchors cannot be deleted unnoticed, and so the gap is
+/// written down rather than merely known: a handler that reads a new id out of
+/// its body is *not* covered by this file.
+const BODY_BORNE_IDS: &[(&str, &str, &str)] = &[
+    ("api/issues.rs", "milestone_id", "milestone_in_repo"),
+    ("api/issues.rs", "assignee_id", "require_assignee_in_repo"),
+    ("api/boards.rs", "issue_id", "issue_in_repo"),
+];
 
 /// The `rg_core::release::service` functions that take a release or asset id
 /// with no repository beside it, and the one file allowed to call them.
@@ -82,8 +157,18 @@ struct Handler {
     body: String,
 }
 
+/// One `pub async fn`, ending at the `}` that closes it.
+///
+/// The body used to run on until the *next* `pub async fn`, which swept up
+/// whatever sat between the two — a private helper, the next handler's
+/// `#[utoipa::path]` block, its signature. That made a handler answerable for
+/// calls it does not make, and let one that takes no `Path` of its own inherit
+/// the next handler's parameters and be judged against rules that were never
+/// about it. rustfmt puts the closing brace of a top-level item in column 0 and
+/// nothing inside a function body there, so that brace is the exact end.
 fn handlers(text: &str) -> Vec<Handler> {
     let mut out: Vec<Handler> = Vec::new();
+    let mut open: Option<usize> = None;
     for (n, line) in text.lines().enumerate() {
         if let Some(rest) = line.strip_prefix("pub async fn ") {
             let name = rest
@@ -96,10 +181,14 @@ fn handlers(text: &str) -> Vec<Handler> {
                 line: n + 1,
                 body: String::new(),
             });
+            open = Some(out.len() - 1);
         }
-        if let Some(current) = out.last_mut() {
-            current.body.push_str(line);
-            current.body.push('\n');
+        if let Some(index) = open {
+            out[index].body.push_str(line);
+            out[index].body.push('\n');
+            if line == "}" {
+                open = None;
+            }
         }
     }
     out
@@ -276,6 +365,31 @@ fn every_anchoring_rule_still_matches_a_handler() {
                  matches nothing and would stay green through any rename"
             );
         }
+    }
+}
+
+/// The body-borne ids are outside what [`ANCHORED`] can demand, so the least
+/// this file can do is refuse to let their anchors disappear quietly. Checking
+/// that the anchor is *defined* and that the field is still read is not the
+/// same as checking it is *called* — that is exactly the gap being recorded.
+#[test]
+fn every_body_borne_id_still_has_its_anchor() {
+    for (rel, field, anchor) in BODY_BORNE_IDS {
+        let path = src_root().join(rel);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("BODY_BORNE_IDS names {rel} but it cannot be read: {e}"));
+
+        assert!(
+            text.contains(&format!("async fn {anchor}(")),
+            "{rel} is recorded as anchoring the body field `{field}` with {anchor}(), but does \
+             not define it — either the anchor was renamed and the note is stale, or the check \
+             is gone"
+        );
+        assert!(
+            text.contains(*field),
+            "{rel} no longer mentions `{field}` — drop the BODY_BORNE_IDS entry, or the note \
+             claims a gap that closed"
+        );
     }
 }
 

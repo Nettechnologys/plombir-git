@@ -301,25 +301,29 @@ pub async fn get_issue(
     }
 }
 
-/// Resolve a `milestone_id` taken from a *request body* against the repository
-/// the route was authorized for.
+/// Resolve a milestone id against the repository the route was authorized for.
 ///
-/// `get_milestone` / `update_milestone` already do this for the id in the
-/// **path**; the id in the body is just as global and was written straight into
-/// the issue. Attaching an issue to a foreign milestone is a write into someone
-/// else's repository: `count_open_by_milestone` then never reaches zero there,
-/// so the victim's `notify_milestone_closed` never fires — and the ids are
-/// guessable, private repositories included.
+/// The id is a global `milestones` primary key wherever it arrives — in the
+/// path (`/milestones/{id}`) and in the request body of `create_issue` /
+/// `update_issue` alike — while the gate above it only ever proves something
+/// about `{owner}/{name}`. Attaching an issue to a foreign milestone is a write
+/// into someone else's repository: `count_open_by_milestone` then never reaches
+/// zero there, so the victim's `notify_milestone_closed` never fires — and the
+/// ids are guessable, private repositories included.
 ///
-/// A mismatch answers 404 rather than 403 for the same reason as the milestone
-/// routes: a 403 would confirm that the id exists.
-async fn require_milestone_in_repo(
+/// A mismatch answers 404 rather than 403: a 403 would still confirm that the
+/// id exists, which is most of what an id-walking caller wants to learn.
+///
+/// The three `/milestones/{id}` routes each used to spell this comparison
+/// inline. One named helper is the form `global_id_anchor_guard` can read, so a
+/// fourth route that forgets it now fails the build rather than review.
+async fn milestone_in_repo(
     state: &AppState,
     repo_id: i64,
     milestone_id: i64,
-) -> Result<(), AppError> {
+) -> Result<rg_db::entities::milestone::Model, AppError> {
     match rg_db::ops::milestone_ops::find_by_id(&state.db, milestone_id).await {
-        Ok(Some(m)) if m.repo_id == repo_id => Ok(()),
+        Ok(Some(m)) if m.repo_id == repo_id => Ok(m),
         Ok(_) => Err(AppError::not_found("milestone not found".to_string())),
         Err(e) => Err(AppError::from(e)),
     }
@@ -402,7 +406,7 @@ pub async fn create_issue(
     }
 
     if let Some(milestone_id) = req.milestone_id {
-        if let Err(e) = require_milestone_in_repo(&state, repo_model.id, milestone_id).await {
+        if let Err(e) = milestone_in_repo(&state, repo_model.id, milestone_id).await {
             return e.into_response();
         }
     }
@@ -483,7 +487,7 @@ pub async fn update_issue(
     }
 
     if let Some(Some(milestone_id)) = req.milestone_id {
-        if let Err(e) = require_milestone_in_repo(&state, repo_model.id, milestone_id).await {
+        if let Err(e) = milestone_in_repo(&state, repo_model.id, milestone_id).await {
             return e.into_response();
         }
     }
@@ -769,16 +773,12 @@ pub async fn get_milestone(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
-        // The access check above is about `owner/name`, so the milestone it
-        // guards has to be the one that lives there. Without this, the route
-        // reads any milestone id through whatever repo the caller can open —
-        // and a 403 here instead of a 404 would still confirm the id exists.
-        Ok(Some(m)) if m.repo_id == repo.id => {
-            (StatusCode::OK, Json(serde_json::json!(m))).into_response()
-        }
-        Ok(_) => AppError::not_found("milestone not found".to_string()).into_response(),
-        Err(e) => AppError::from(e).into_response(),
+    // The access check above is about `owner/name`, so the milestone it guards
+    // has to be the one that lives there. Without this, the route reads any
+    // milestone id through whatever repo the caller can open.
+    match milestone_in_repo(&state, repo.id, id).await {
+        Ok(m) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -816,10 +816,9 @@ pub async fn update_milestone(
     // `repo_id` comparison, write access to a single repository was enough to
     // edit the milestones of every other one, and a 403 on the mismatch would
     // still confirm that the id exists.
-    let existing = match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
-        Ok(Some(m)) if m.repo_id == repo.id => m,
-        Ok(_) => return AppError::not_found("milestone not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let existing = match milestone_in_repo(&state, repo.id, id).await {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
     };
     // Convert to ActiveModel; use Set() for changed fields (Unchanged means "skip in UPDATE")
     let mut active: rg_db::entities::milestone::ActiveModel = existing.into();
@@ -872,10 +871,8 @@ pub async fn delete_milestone(
     // to be read and matched against the repository whose write access was
     // checked first — otherwise write access to one repository deleted the
     // milestones of any other, silently and without even a lookup.
-    match rg_db::ops::milestone_ops::find_by_id(&state.db, id).await {
-        Ok(Some(m)) if m.repo_id == repo.id => {}
-        Ok(_) => return AppError::not_found("milestone not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    if let Err(e) = milestone_in_repo(&state, repo.id, id).await {
+        return e.into_response();
     }
     match rg_db::ops::milestone_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

@@ -286,10 +286,8 @@ pub async fn redeliver(
         Err(e) => return e.into_response(),
     };
 
-    match rg_core::webhook::service::get_delivery(&state.db, delivery_id).await {
-        Ok(Some(delivery)) if delivery.webhook_id == hook.id => {}
-        Ok(Some(_)) | Ok(None) => return AppError::not_found("delivery not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    if let Err(e) = delivery_in_webhook(&state.db, hook.id, delivery_id).await {
+        return e.into_response();
     }
 
     match rg_core::webhook::service::redeliver(&state.db, delivery_id).await {
@@ -319,6 +317,32 @@ async fn webhook_in_repo(
     match rg_core::webhook::service::get_webhook(db, webhook_id).await {
         Ok(Some(hook)) if hook.repo_id == repo_id => Ok(hook),
         Ok(Some(_)) | Ok(None) => Err(AppError::not_found("webhook not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
+/// Fetch a delivery and re-anchor it to the webhook the caller was authorized
+/// for.
+///
+/// `{delivery_id}` is a global `webhook_deliveries` primary key, so being an
+/// admin of one repository must not replay another one's deliveries. The anchor
+/// is the webhook rather than the repository because that is the row the id
+/// hangs off — [`webhook_in_repo`] has already tied that webhook to the
+/// repository, so the two checks chain into the same guarantee.
+///
+/// A mismatch answers 404 for the same reason [`webhook_in_repo`] does.
+///
+/// Spelled as a named helper rather than inline in `redeliver`: an inline
+/// `delivery.webhook_id == hook.id` is invisible to `global_id_anchor_guard`,
+/// so the next delivery route could drop it and still ship green.
+async fn delivery_in_webhook(
+    db: &DatabaseConnection,
+    webhook_id: i64,
+    delivery_id: i64,
+) -> Result<rg_db::entities::webhook_delivery::Model, AppError> {
+    match rg_core::webhook::service::get_delivery(db, delivery_id).await {
+        Ok(Some(delivery)) if delivery.webhook_id == webhook_id => Ok(delivery),
+        Ok(Some(_)) | Ok(None) => Err(AppError::not_found("delivery not found")),
         Err(e) => Err(AppError::from(e)),
     }
 }

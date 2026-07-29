@@ -115,8 +115,8 @@ pub async fn add_time(
 )]
 pub async fn list_time_entries(
     State(state): State<AppState>,
-    RepoRead { .. }: RepoRead,
-    Path((owner, name, number)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
+    Path((_, _, number)): Path<(String, String, i64)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     // Time entries carry a free-form description written by collaborators, so
@@ -127,9 +127,13 @@ pub async fn list_time_entries(
     let offset = pagination.offset();
     let limit = pagination.limit();
 
-    let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
+    // Against `repo.id` from the gate, not a second lookup by `owner`/`name`:
+    // the handler used to throw the gate's repository away and re-resolve the
+    // route strings itself, so the check and the object it guards were two
+    // independent resolutions that only happened to agree.
+    let issue = match issue_in_repo(&state, repo.id, number).await {
         Ok(i) => i,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::time_tracking::service::list_time_entries(&state.db, issue.id, offset, limit)
@@ -163,15 +167,17 @@ pub async fn list_time_entries(
 )]
 pub async fn total_time(
     State(state): State<AppState>,
-    Path((owner, name, number)): Path<(String, String, i64)>,
-    RepoRead { .. }: RepoRead,
+    Path((_, _, number)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     // The aggregate leaks the same thing the listing does — that work happened
     // on this issue, and how much of it — so it gets the same gate.
 
-    let issue = match rg_core::issue::service::get_issue(&state.db, &owner, &name, number).await {
+    // Same anchoring as `list_time_entries`: resolve against the repository the
+    // gate proved, rather than resolving `owner`/`name` a second time.
+    let issue = match issue_in_repo(&state, repo.id, number).await {
         Ok(i) => i,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::time_tracking::service::total_time_minutes(&state.db, issue.id).await {
