@@ -1360,3 +1360,99 @@ async fn the_self_filtering_routes_show_public_and_hide_private() {
         failures.join("\n"),
     );
 }
+
+/// The PAT scope a route demands must follow from the level it declares.
+///
+/// `pat_auth::required_pat_scope` decides which family a personal access token
+/// may enter by reading the *path string* — `/admin…` is `"admin"`, `/users…`
+/// is `"user"`, everything else is `"repo"`. It has to work that way: the
+/// middleware is an outer layer and runs before axum matches anything, so
+/// there is no `MatchedPath` to look the route up by. But the level every one
+/// of those routes requires is already declared, in the table this file
+/// walks — and until now nothing compared the two statements.
+///
+/// They have drifted once already, and the drift was patched by hand:
+/// `|| path == "/runners/register"` exists because that route needs an
+/// instance admin while its path does not begin with `/admin`. The patch is
+/// fine; the *generator* is what this test pins. The next administrative route
+/// registered outside `/admin` would silently fall through to `"repo"`, which
+/// is the scope `create_token` hands out by default.
+///
+/// Only the instance-admin family is asserted, and that is a deliberate scope
+/// rather than a gap. It is the family where a disagreement is a hole instead
+/// of an inconvenience, and it is the only one that actually lines up with a
+/// level: `POST /repos` and `POST /orgs` declare `User` and ask for `"repo"`,
+/// which is right — they create repositories. A blanket level-to-scope rule
+/// would be a rule with a list of exceptions, which is what this file already
+/// has enough of.
+///
+/// Both directions, because they catch different mistakes:
+///
+/// - a route declared `InstanceAdmin` that does not demand `"admin"` is the
+///   hole itself;
+/// - a route demanding `"admin"` that is *not* declared `InstanceAdmin` is a
+///   hand-written exception that has outlived its route — which is exactly how
+///   the first one comes back.
+///
+/// The second direction buys something it was not aimed at.
+/// `middleware::maintenance_middleware` exempts `/api/v1/admin/` from read-only
+/// maintenance mode by the same kind of prefix test, and *that* one fails open:
+/// a non-administrative route registered under `/api/v1/admin/` would keep
+/// accepting mutations while the instance is meant to be frozen. Since
+/// `required_pat_scope` answers `"admin"` for exactly that prefix, such a route
+/// shows up here as an over-scoped row — so the exemption's precondition is
+/// pinned too, by a test that is nominally about something else.
+#[tokio::test]
+async fn every_instance_admin_route_demands_the_admin_pat_scope() {
+    let (_base, facts) = spawn_test_app_with_routes().await;
+    assert!(
+        !facts.is_empty(),
+        "the route table came back empty — this test is not checking anything"
+    );
+
+    let mut under_scoped: Vec<String> = Vec::new();
+    let mut over_scoped: Vec<String> = Vec::new();
+    let mut admin_rows = 0usize;
+
+    for fact in &facts {
+        let scope = rg_http::pat_auth::required_pat_scope(&fact.path);
+        let declared_admin = fact.access == Access::InstanceAdmin;
+        let demands_admin = scope == Some("admin");
+        if declared_admin {
+            admin_rows += 1;
+        }
+        match (declared_admin, demands_admin) {
+            (true, false) => under_scoped.push(format!(
+                "  {} — declared InstanceAdmin, but a PAT scoped {:?} reaches it",
+                fact.label(),
+                scope.unwrap_or("(none)")
+            )),
+            (false, true) => over_scoped.push(format!(
+                "  {} — demands the \"admin\" scope, but declares {:?}",
+                fact.label(),
+                fact.access
+            )),
+            _ => {}
+        }
+    }
+
+    // Without this the whole pass would be vacuously green the day the table
+    // stops declaring any administrative route at all.
+    assert!(
+        admin_rows >= 10,
+        "only {admin_rows} route(s) declare InstanceAdmin — the table, not the rule, is what \
+         changed, and this pass would now prove nothing"
+    );
+
+    assert!(
+        under_scoped.is_empty() && over_scoped.is_empty(),
+        "`pat_auth::required_pat_scope` and the levels declared in `rg_http::route_table` \
+         disagree about {} route(s).\nThe scope decision is made from the path string, so an \
+         administrative route registered outside `/admin` falls through to \"repo\" — the \
+         scope `create_token` issues by default. Either teach `required_pat_scope` about the \
+         route, or fix the level it declares.\n{}{}",
+        under_scoped.len() + over_scoped.len(),
+        under_scoped.join("\n"),
+        over_scoped.join("\n"),
+    );
+}

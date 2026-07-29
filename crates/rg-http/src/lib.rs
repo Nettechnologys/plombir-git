@@ -30,7 +30,11 @@ pub mod ws;
 mod git_http;
 mod handlers;
 mod http_stream;
-mod pat_auth;
+// Public for the same reason `route_table` is: `required_pat_scope` states
+// which token family a route belongs to, and the only way to check that
+// statement against the levels the route table declares is for a test to be
+// able to call it. Everything else in the module stays `pub(crate)`.
+pub mod pat_auth;
 mod routes;
 
 use std::net::IpAddr;

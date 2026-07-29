@@ -76,13 +76,31 @@ async fn resolve_pat(
 ///
 /// A scope only controls which API family the token may enter. Normal user,
 /// repository and administrator authorization is still enforced by handlers.
-fn required_pat_scope(path: &str) -> Option<&'static str> {
+///
+/// The decision is made from the path *string*, because this middleware is an
+/// outer layer: it runs before axum has matched anything, so a `MatchedPath`
+/// does not exist yet and the route table cannot be consulted here. That is a
+/// constraint, not a licence — the level each route requires is declared in
+/// `route_table::Access`, and this function has to agree with it. It drifted
+/// once already, which is why `/runners/register` is named literally below.
+///
+/// `pub` so that agreement can be *checked* rather than reviewed:
+/// `route_access_sweep_tests::every_instance_admin_route_demands_the_admin_pat_scope`
+/// walks the whole table and holds the two statements against each other in
+/// both directions.
+pub fn required_pat_scope(path: &str) -> Option<&'static str> {
     if path.starts_with("/api-docs") {
         return None;
     }
     // Axum may expose either the original URI or the path with the nested
     // `/api/v1` prefix stripped, depending on which router layer is running.
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    // `/runners/register` is the one administrative route that does not live
+    // under `/admin`: it is what hands a runner its token, so the credential
+    // that may call it is an instance-admin session and its declared level is
+    // `Access::InstanceAdmin`. Named here rather than inferred, and checked
+    // from both sides by the sweep test — if the route stops being
+    // instance-admin, this line has to go with it.
     if path.starts_with("/admin") || path == "/runners/register" {
         return Some("admin");
     }
