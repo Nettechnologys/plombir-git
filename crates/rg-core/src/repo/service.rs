@@ -1124,6 +1124,12 @@ pub async fn list_forks(
 }
 
 /// Transfer a repository to a new owner.
+///
+/// The check here is on the *source*: only its owner may give it away. Whether
+/// the caller may put a repository into `new_owner/` at all is the destination
+/// namespace's question, and it is answered by the route's `NamespaceCreate`
+/// gate in `rg-http` — the same rule `create_repo` applies to its `org` field,
+/// stated once there rather than a second time here.
 pub async fn transfer_repo(
     db: &DatabaseConnection,
     user_id: i64,

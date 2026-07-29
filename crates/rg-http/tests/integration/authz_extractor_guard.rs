@@ -33,12 +33,21 @@ use std::path::{Path, PathBuf};
 /// would be free to pass whichever user id it happened to have in scope. They
 /// exist for the transports that genuinely resolve their own caller — see
 /// `TRANSPORTS` below — and a handler that can take an extractor must.
+///
+/// `require_namespace_write` / `require_namespace_create` guard the routes whose
+/// target is named by the request *body* (`POST /imports`, the destination of a
+/// transfer). Their extractors — `NamespaceWrite` / `NamespaceCreate` — read the
+/// payload themselves, so a handler that took the body as a plain `Json<_>` and
+/// called the gate afterwards would be back to remembering the check by hand.
 const GATES: &[&str] = &[
     "require_read",
     "require_read_with_ci",
     "require_authenticated_read",
     "require_write",
     "require_admin",
+    "require_owner",
+    "require_namespace_write",
+    "require_namespace_create",
     "check_read_for",
     "check_write_for",
 ];

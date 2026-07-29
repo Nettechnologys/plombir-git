@@ -15,7 +15,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::api::auth::AuthUser;
-use crate::api::repo_access::{NamespaceWrite, TargetNamespace};
+use crate::api::repo_access::{NamespaceWrite, TargetNamespace, TargetOwner};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -84,11 +84,13 @@ impl StartImportRequest {
     }
 }
 
-impl TargetNamespace for StartImportRequest {
+impl TargetOwner for StartImportRequest {
     fn target_owner(&self) -> &str {
         &self.target_owner
     }
+}
 
+impl TargetNamespace for StartImportRequest {
     fn target_name(&self) -> String {
         self.resolved_target_name()
     }

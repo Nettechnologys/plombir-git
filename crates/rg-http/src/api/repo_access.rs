@@ -382,14 +382,24 @@ pub(crate) async fn require_owner(
 // it is the right to create under that owner, the same rule `create_repo`
 // applies to its `org` field).
 
+/// A request body that names the account or organization it is aimed at.
+///
+/// Split out of [`TargetNamespace`] because the two body-named routes need
+/// different halves of the target. An import names a whole `owner/name` in its
+/// payload; a transfer names only the *namespace* — the repository's name comes
+/// from the route and does not change — and asking it for a name it does not
+/// carry would only invite the handler to invent one.
+pub trait TargetOwner {
+    /// The account or organization the write is aimed at.
+    fn target_owner(&self) -> &str;
+}
+
 /// A request body that names the `owner/name` it wants to write into.
 ///
 /// Implemented next to the request type it belongs to, so the derivation of the
 /// target name (an import may leave it out and have it read off the source URL)
 /// stays with the handler that owns the payload.
-pub trait TargetNamespace {
-    /// The account or organization the write is aimed at.
-    fn target_owner(&self) -> &str;
+pub trait TargetNamespace: TargetOwner {
     /// The repository name inside that namespace, already defaulted.
     fn target_name(&self) -> String;
 }
@@ -676,6 +686,52 @@ where
             .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
 
         require_namespace_write(state, actor_id, body.target_owner(), &body.target_name()).await?;
+
+        Ok(Self { actor_id, body })
+    }
+}
+
+/// An authenticated caller who may place a *new* repository into the namespace
+/// their *body* names.
+///
+/// Mirrors [`require_namespace_create`], and is [`NamespaceWrite`]'s sibling for
+/// the routes whose target cannot already exist. `POST /repos/{owner}/{name}/
+/// transfer` is the one that made it necessary: `RepoOwner` gates the *source*
+/// — the route names it — while the destination arrives as `new_owner` in the
+/// payload, where no path extractor reaches it. Nothing asked whether the
+/// caller had any business in that namespace, so a repository could be pushed
+/// under a stranger's account, complete with its contents, and look like
+/// theirs.
+///
+/// The rule is the create rule rather than the write rule on purpose: a
+/// transfer *adds* a repository to the destination (the service refuses a name
+/// already taken there), and "may add a repository under this owner" is exactly
+/// what `create_repo` asks about its own `org` field.
+///
+/// Being a body extractor, it must be the *last* argument of the handler.
+pub struct NamespaceCreate<B> {
+    pub actor_id: i64,
+    pub body: B,
+}
+
+impl<B> FromRequest<AppState> for NamespaceCreate<B>
+where
+    B: TargetOwner + serde::de::DeserializeOwned + Send + 'static,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        // Same order as `NamespaceWrite`: authenticate, then parse, then gate —
+        // so an anonymous caller is `401` without the server parsing a payload
+        // it was never going to act on.
+        let actor_id = super::auth::extract_user_id(req.headers(), &state.jwt_secret)
+            .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+
+        let axum::Json(body) = axum::Json::<B>::from_request(req, state)
+            .await
+            .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+
+        require_namespace_create(state, actor_id, body.target_owner()).await?;
 
         Ok(Self { actor_id, body })
     }

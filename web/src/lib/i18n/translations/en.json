@@ -880,9 +880,9 @@
     "custom_color": "Custom color",
     "transfer": {
       "title": "Transfer ownership",
-      "desc": "Transfer this repository to another user or organization.",
+      "desc": "Move this repository to your own account or to an organization you belong to.",
       "new_owner": "New owner",
-      "new_owner_placeholder": "username or org name",
+      "new_owner_placeholder": "your username or an org you belong to",
       "confirm": "Transfer repository",
       "confirming": "Transferring...",
       "success": "Repository transferred successfully.",

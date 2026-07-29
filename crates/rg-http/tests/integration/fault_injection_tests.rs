@@ -609,14 +609,37 @@ async fn a_fork_whose_row_was_lost_can_be_retried() {
 /// move stands, the old owner holds a row whose tree is gone and the new owner
 /// a tree no row names — a repository that is broken for both and that nothing
 /// repairs on its own.
+///
+/// The destination is an organization the owner belongs to rather than another
+/// account, because since card_934b6037bcda a transfer only reaches the service
+/// when the caller may put a repository in the destination namespace at all —
+/// handing one to a stranger is `403` at the route. The rollback under test is
+/// the same either way.
 #[tokio::test]
 async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
     let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
     let client = reqwest::Client::new();
-    let (owner_token, _owner_id) =
+    let (org_owner_token, _) = register_full(&app.base, "xfer_org", "xfer_org@example.com").await;
+    let (owner_token, owner_id) =
         register_full(&app.base, "xfer_from", "xfer_from@example.com").await;
     create_repo(&app.base, &owner_token, "movable").await;
-    register_full(&app.base, "xfer_to", "xfer_to@example.com").await;
+
+    let created = client
+        .post(format!("{}/api/v1/orgs", app.base))
+        .bearer_auth(&org_owner_token)
+        .json(&serde_json::json!({ "name": "xfercorp", "visibility": "public" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "baseline: the destination org exists");
+    let joined = client
+        .post(format!("{}/api/v1/orgs/xfercorp/members", app.base))
+        .bearer_auth(&org_owner_token)
+        .json(&serde_json::json!({ "user_id": owner_id, "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), 201, "baseline: the owner may transfer in");
 
     let fault = fail_db_writes(&app.db, "repositories", DbWrite::Update).await;
     let failed = client
@@ -625,7 +648,7 @@ async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
             app.base
         ))
         .bearer_auth(&owner_token)
-        .json(&serde_json::json!({ "new_owner": "xfer_to" }))
+        .json(&serde_json::json!({ "new_owner": "xfercorp" }))
         .send()
         .await
         .unwrap();
@@ -637,7 +660,7 @@ async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
     fault.clear().await;
 
     let stayed = app.repo_root.join("xfer_from").join("movable.git");
-    let moved = app.repo_root.join("xfer_to").join("movable.git");
+    let moved = app.repo_root.join("xfercorp").join("movable.git");
     assert!(
         stayed.exists(),
         "the tree must be back where its row says it is: {}",

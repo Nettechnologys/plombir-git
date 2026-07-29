@@ -20,7 +20,9 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::repo_access::{RepoAuthRead, RepoOwner, RepoRead, RepoWrite};
+use crate::api::repo_access::{
+    NamespaceCreate, RepoAuthRead, RepoOwner, RepoRead, RepoWrite, TargetOwner,
+};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::{
@@ -762,6 +764,15 @@ pub struct TransferRequest {
     pub new_owner: String,
 }
 
+/// The destination namespace is named by the body, so the gate over it is a
+/// body extractor — see [`NamespaceCreate`]. The repository's *name* is not in
+/// the payload: a transfer keeps it and takes it from the route.
+impl TargetOwner for TransferRequest {
+    fn target_owner(&self) -> &str {
+        &self.new_owner
+    }
+}
+
 /// POST /api/v1/repos/:owner/:name/transfer
 #[utoipa::path(
     post,
@@ -771,34 +782,39 @@ pub struct TransferRequest {
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
     ),
-    request_body(content = serde_json::Value),
+    request_body = TransferRequest,
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden (source not owned, or destination namespace is someone else's)", body = serde_json::Value),
     ),
 )]
 pub async fn transfer_repo_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
-    // `transfer_repo` checks ownership too, and keeps doing so — the service is
-    // reachable from elsewhere. What the extractor adds is that the *route*
-    // states the level it needs, instead of the route table asserting `RepoOwner`
-    // while the only enforcement lives three calls down.
+    // Two namespaces, two gates. `RepoOwner` gates the *source*: `transfer_repo`
+    // checks ownership too, and keeps doing so — the service is reachable from
+    // elsewhere — but the extractor makes the route state the level it needs
+    // instead of the route table asserting `RepoOwner` while the only
+    // enforcement lives three calls down.
     RepoOwner { .. }: RepoOwner,
-    Json(body): Json<TransferRequest>,
+    // `NamespaceCreate` gates the *destination*, which is the half nobody was
+    // asking about: `new_owner` arrives in the payload, so no path extractor
+    // reaches it, and a transfer into a stranger's account went through with a
+    // `200`. Being a body extractor it has to come last.
+    NamespaceCreate {
+        actor_id: user_id,
+        body,
+    }: NamespaceCreate<TransferRequest>,
 ) -> impl IntoResponse {
+    // `claims.sub` is only the audit trail's subject string; both access
+    // decisions above it are the extractors'.
     let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
         Some(c) => c,
         None => {
             return AppError::unauthorized("authentication required".to_string()).into_response();
-        }
-    };
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
         }
     };
 
