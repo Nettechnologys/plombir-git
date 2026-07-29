@@ -1180,6 +1180,197 @@ async fn npm_and_composer_publish_each_checksum_under_its_own_algorithm() {
     );
 }
 
+/// card_343d636b1157: an index that puts a checksum next to a download link is
+/// answering "the digest of *what*", and `package_versions.sha256` is the
+/// digest of the first file of the first publish request — a different file as
+/// soon as the version carries two, which is the normal case (`twine upload
+/// dist/*` sends a wheel and an sdist). The assert is deliberately not "a
+/// digest is present": every one is checked against the bytes the published URL
+/// actually serves.
+#[tokio::test]
+async fn every_index_publishes_the_digest_of_the_file_its_link_points_at() {
+    use sha2::Digest as _;
+
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let publish = |pkg_type: &'static str, filename: String, body: Vec<u8>, expect: StatusCode| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        async move {
+            let response = client
+                .post(package_url(&base, &[pkg_type, "publish"]))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expect,
+                "{pkg_type} publish of {filename}"
+            );
+        }
+    };
+
+    let sha256_of = |bytes: &[u8]| hex::encode(sha2::Sha256::digest(bytes));
+
+    // ── PyPI: a wheel and an sdist in one version ──────────────────────────
+    let wheel = zip_archive(&[(
+        "matrix_hash-1.0.0.dist-info/METADATA",
+        b"Metadata-Version: 2.1\nName: matrix-hash\nVersion: 1.0.0\nSummary: hashes\n".as_slice(),
+    )]);
+    let sdist = tar_gz(&[(
+        "matrix_hash-1.0.0/PKG-INFO",
+        b"Metadata-Version: 2.1\nName: matrix-hash\nVersion: 1.0.0\nSummary: hashes\n".as_slice(),
+    )]);
+    publish(
+        "pypi",
+        "matrix_hash-1.0.0-py3-none-any.whl".into(),
+        wheel.clone(),
+        StatusCode::CREATED,
+    )
+    .await;
+    // The second file lands in the version that already exists.
+    publish(
+        "pypi",
+        "matrix_hash-1.0.0.tar.gz".into(),
+        sdist.clone(),
+        StatusCode::OK,
+    )
+    .await;
+
+    let simple = client
+        .get(package_url(&base, &["pypi", "simple", "matrix-hash", ""]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(simple.status(), StatusCode::OK);
+    let simple = simple.text().await.unwrap();
+
+    // Both artifacts are on the page: a release is not one file, and pip picks
+    // between them by name.
+    for (filename, body) in [
+        ("matrix_hash-1.0.0-py3-none-any.whl", &wheel),
+        ("matrix_hash-1.0.0.tar.gz", &sdist),
+    ] {
+        let href = simple
+            .lines()
+            .find(|line| line.contains(filename))
+            .unwrap_or_else(|| panic!("{filename} is missing from the Simple page:\n{simple}"));
+        let url = href
+            .split("href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a link with an href");
+        let (url, fragment) = url.split_once("#sha256=").unwrap_or_else(|| {
+            panic!("{filename} carries no #sha256= fragment: {href}");
+        });
+
+        let downloaded = client.get(url).send().await.unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK, "download {filename}");
+        let downloaded = downloaded.bytes().await.unwrap().to_vec();
+        assert_eq!(&downloaded, body, "the file served is the one published");
+        assert_eq!(
+            fragment,
+            sha256_of(&downloaded),
+            "the Simple page's #sha256 for {filename} is not that file's digest"
+        );
+    }
+
+    // ── RubyGems: the JSON info endpoint ───────────────────────────────────
+    let gem = tar_archive(&[(
+        "metadata.gz",
+        &gzip(b"name: matrix-hash-gem\nversion: 1.0.0\nsummary: hashes\n"),
+    )]);
+    publish(
+        "rubygems",
+        "matrix-hash-gem-1.0.0.gem".into(),
+        gem.clone(),
+        StatusCode::CREATED,
+    )
+    .await;
+    // The gem and chart adapters accept only their own archive, so those
+    // versions hold one file each and the version digest happens to coincide
+    // with it. These two halves are therefore a regression guard rather than a
+    // reproduction: they pin "the digest belongs to the file the link points
+    // at" against the downloaded bytes, so the day a second file can land in
+    // one of these versions — a platform gem, a `.prov` beside a chart — the
+    // answer does not quietly become the wrong file's.
+    let info = client
+        .get(package_url(
+            &base,
+            &["rubygems", "api", "v1", "gems", "matrix-hash-gem.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let entry = &info["versions"]["1.0.0"];
+    let gem_url = entry["gem_uri"].as_str().expect("no gem_uri");
+    let downloaded = client.get(gem_url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK, "download {gem_url}");
+    let downloaded = downloaded.bytes().await.unwrap().to_vec();
+    assert_eq!(downloaded, gem, "the gem served is the one published");
+    assert_eq!(
+        entry["sha"].as_str(),
+        Some(sha256_of(&downloaded).as_str()),
+        "gem info sha must be the digest of the .gem it links to: {entry}"
+    );
+
+    // ── Helm: index.yaml ───────────────────────────────────────────────────
+    let chart = tar_gz(&[(
+        "matrix-hash-chart/Chart.yaml",
+        b"apiVersion: v2\nname: matrix-hash-chart\nversion: 1.0.0\n".as_slice(),
+    )]);
+    publish(
+        "helm",
+        "matrix-hash-chart-1.0.0.tgz".into(),
+        chart.clone(),
+        StatusCode::CREATED,
+    )
+    .await;
+    let index = client
+        .get(package_url(&base, &["helm", "index.yaml"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let digest = index
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("digest: "))
+        .unwrap_or_else(|| panic!("no digest in the Helm index:\n{index}"));
+    let url = index
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("- ")
+                .filter(|u| u.contains("http"))
+        })
+        .unwrap_or_else(|| panic!("no chart url in the Helm index:\n{index}"));
+
+    let downloaded = client.get(url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK, "download {url}");
+    let downloaded = downloaded.bytes().await.unwrap().to_vec();
+    assert_eq!(downloaded, chart, "the chart served is the one published");
+    assert_eq!(
+        digest,
+        sha256_of(&downloaded),
+        "the Helm index digest must be the SHA-256 of the .tgz it links to"
+    );
+}
+
 /// RubyGems resolves through the compact index: `versions` first — its presence
 /// is what keeps the client off the legacy Marshal index we do not serve — then
 /// `info/<gem>`, then a `.gem` at a path the client builds itself by appending

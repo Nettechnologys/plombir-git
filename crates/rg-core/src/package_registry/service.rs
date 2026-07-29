@@ -92,6 +92,34 @@ pub struct VersionDetail {
     pub created_at: String,
 }
 
+impl VersionDetail {
+    /// The SHA-256 of one of this version's files, as far as the registry can
+    /// honestly state it.
+    ///
+    /// Every index that puts a checksum next to a download link has to answer
+    /// "the digest of *what*", and the two candidates are not interchangeable.
+    /// `FileDetail::sha256` is the file's own. `VersionDetail::sha256` is the
+    /// digest of the **first file of the first publish request** (see
+    /// `combined_sha256` below), which is all that was recorded before the
+    /// per-file digests existed — and a version is routinely built up over
+    /// several requests (`twine upload dist/*` sends a wheel and an sdist,
+    /// `mvn deploy` a POM then a JAR).
+    ///
+    /// So the version-level digest is only used as a fallback when this version
+    /// holds exactly one file, where it provably *is* that file's digest. With
+    /// more than one, the answer is `None` and the caller leaves the field out:
+    /// a client that gets no checksum skips the check, while one that gets the
+    /// wrong checksum fails the install outright with `THESE PACKAGES DO NOT
+    /// MATCH THE HASHES`.
+    pub fn sha256_of(&self, file: &FileDetail) -> Option<String> {
+        file.sha256.clone().or_else(|| {
+            (self.files.len() == 1)
+                .then(|| self.sha256.clone())
+                .flatten()
+        })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileDetail {
     pub id: i64,

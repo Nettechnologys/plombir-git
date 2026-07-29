@@ -882,9 +882,7 @@ pub async fn npm_registry_metadata(
                 // makes its promises about. The version-level `sha256` is only
                 // the first file's and is used as a fallback for a version
                 // stored before the per-file digests existed.
-                sha256: tgz_file
-                    .and_then(|f| f.sha256.clone())
-                    .or_else(|| v.sha256.clone()),
+                sha256: tgz_file.and_then(|f| v.sha256_of(f)),
                 sha1: tgz_file.and_then(|f| f.sha1.clone()),
                 sha512: tgz_file.and_then(|f| f.sha512.clone()),
                 filename: tgz_file.map(|f| f.filename.clone()),
@@ -919,6 +917,19 @@ fn pypi_simple_base(base_url: &str, owner: &str, repo: &str) -> String {
         owner,
         repo,
     )
+}
+
+/// Is this file one of the distributions a PyPI client installs from?
+///
+/// The Simple page lists installable artifacts; a checksum or signature stored
+/// beside them is not one, and offering it as a download makes pip choose a
+/// file it cannot install.
+fn is_pypi_distribution(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.ends_with(".whl")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".zip")
 }
 
 /// Resolve the project a client asked for to the name it was published under.
@@ -981,41 +992,55 @@ pub async fn pypi_simple_index(
 
     let base_url = build_base_url(&headers);
 
+    // The download route matches on the *stored* package name, so the link has
+    // to carry that one and not the normalized spelling the client asked with.
+    let link_to = |version: &str, filename: &str| {
+        format!(
+            "{}/api/v1/repos/{}/{}/packages/pypi/{}/{}/{}",
+            base_url.trim_end_matches('/'),
+            owner,
+            name,
+            project,
+            version,
+            filename,
+        )
+    };
+
+    // One link per distribution *file*, not per version. A release routinely
+    // carries a wheel and an sdist — `twine upload dist/*` publishes both — and
+    // a page with one link per version hid every artifact but the first from
+    // pip entirely. The digest beside each link is that file's own, because
+    // that is what the client hashes after downloading it.
     let entries: Vec<rg_core::package_registry::PyPIVersionEntry> = versions
         .iter()
-        .map(|v| {
-            // Find the primary package file
-            let primary_file = v.files.iter().find(|f| {
-                let fl = f.filename.to_lowercase();
-                fl.ends_with(".whl")
-                    || fl.ends_with(".tar.gz")
-                    || fl.ends_with(".tgz")
-                    || fl.ends_with(".zip")
-            });
+        .flat_map(|v| {
+            let files: Vec<rg_core::package_registry::PyPIVersionEntry> = v
+                .files
+                .iter()
+                .filter(|f| is_pypi_distribution(&f.filename))
+                .map(|f| rg_core::package_registry::PyPIVersionEntry {
+                    version: v.version.clone(),
+                    filename: f.filename.clone(),
+                    sha256: v.sha256_of(f),
+                    download_url: link_to(&v.version, &f.filename),
+                })
+                .collect();
 
-            let filename = primary_file
-                .map(|f| f.filename.clone())
-                .unwrap_or_else(|| format!("{}-{}.tar.gz", project, v.version));
+            if !files.is_empty() {
+                return files;
+            }
 
-            // The download route matches on the *stored* package name, so the
-            // link has to carry that one and not the normalized spelling the
-            // client asked with.
-            let download_url = format!(
-                "{}/api/v1/repos/{}/{}/packages/pypi/{}/{}/{}",
-                base_url.trim_end_matches('/'),
-                owner,
-                name,
-                project,
-                v.version,
-                filename,
-            );
-
-            rg_core::package_registry::PyPIVersionEntry {
+            // A version with no recognisable distribution file still has to
+            // appear: the name is the conventional sdist one, which is what the
+            // download route falls back to as well.
+            let filename = format!("{}-{}.tar.gz", project, v.version);
+            let download_url = link_to(&v.version, &filename);
+            vec![rg_core::package_registry::PyPIVersionEntry {
                 version: v.version.clone(),
                 filename,
                 sha256: v.sha256.clone(),
                 download_url,
-            }
+            }]
         })
         .collect();
 
@@ -1478,7 +1503,8 @@ pub async fn rubygems_gem_info(
         .map(|v| {
             // The name the file was published under, not one rebuilt from the
             // coordinates: a platform gem is stored as `{name}-{ver}-{platform}.gem`.
-            let filename = gem_file(v)
+            let file = gem_file(v);
+            let filename = file
                 .map(|f| f.filename.clone())
                 .unwrap_or_else(|| format!("{}-{}.gem", gem_name, v.version));
             let download_url = format!("{root}/{gem_name}/{}/{filename}", v.version);
@@ -1497,7 +1523,10 @@ pub async fn rubygems_gem_info(
                 description: desc,
                 homepage: hp,
                 license: lic,
-                sha256: v.sha256.clone(),
+                // The digest of the `.gem` the two URLs above point at — not
+                // the version's, which is a different file as soon as the
+                // version carries more than one.
+                sha256: file.and_then(|f| v.sha256_of(f)),
                 download_url,
                 gem_uri,
                 created_at: v.created_at.clone(),
@@ -1564,9 +1593,7 @@ fn compact_index_entries(
                 number: v.version.clone(),
                 platform: file.and_then(|f| gem_platform(&f.filename, gem_name, &v.version)),
                 dependencies: parse_rubygems_deps(v.metadata.as_deref()),
-                checksum: file
-                    .and_then(|f| f.sha256.clone())
-                    .or_else(|| v.sha256.clone()),
+                checksum: file.and_then(|f| v.sha256_of(f)),
             }
         })
         .collect()
@@ -1772,6 +1799,18 @@ fn text_index(body: String) -> axum::response::Response {
 
 // ── Helm Protocol Endpoints ───────────────────────────────
 
+/// The chart archive of a version — the file `urls` points at and `digest`
+/// makes its promise about, as opposed to anything stored beside it.
+fn chart_file(
+    version: &rg_core::package_registry::VersionDetail,
+) -> Option<&rg_core::package_registry::FileDetail> {
+    version
+        .files
+        .iter()
+        .find(|f| f.filename.ends_with(".tgz"))
+        .or_else(|| version.files.first())
+}
+
 /// GET /api/v1/repos/{owner}/{name}/packages/helm/index.yaml
 ///
 /// Helm repository index — returns the index.yaml that `helm repo add` expects.
@@ -1811,9 +1850,8 @@ pub async fn helm_index(
             }
 
             // Build download URL
-            let filename = v
-                .files
-                .first()
+            let chart = chart_file(v);
+            let filename = chart
                 .map(|f| f.filename.clone())
                 .unwrap_or_else(|| format!("{}-{}.tgz", pkg.name, v.version));
 
@@ -1828,19 +1866,21 @@ pub async fn helm_index(
             );
 
             // Parse Helm-specific metadata from version JSON
-            let chart = parse_helm_metadata(v.metadata.as_deref());
+            let meta = parse_helm_metadata(v.metadata.as_deref());
 
             entries.push(rg_core::package_registry::HelmIndexEntry {
                 name: pkg.name.clone(),
                 version: v.version.clone(),
-                app_version: chart.app_version,
+                app_version: meta.app_version,
                 description: pkg.description.clone(),
-                api_version: chart.api_version,
+                api_version: meta.api_version,
                 home: pkg.homepage.clone(),
-                sources: chart.sources,
-                keywords: chart.keywords,
+                sources: meta.sources,
+                keywords: meta.keywords,
                 created: v.created_at.clone(),
-                digest: v.sha256.clone(),
+                // `digest` is defined as the SHA-256 of the archive `urls`
+                // points at, and `helm` verifies exactly that.
+                digest: chart.and_then(|f| v.sha256_of(f)),
                 urls: vec![download_url],
             });
         }
@@ -1912,9 +1952,7 @@ pub async fn composer_packages_json(
                     filename,
                     // Digests of the archive the `dist` block points at, not of
                     // whatever the version recorded first.
-                    sha256: archive
-                        .and_then(|f| f.sha256.clone())
-                        .or_else(|| v.sha256.clone()),
+                    sha256: archive.and_then(|f| v.sha256_of(f)),
                     sha1: archive.and_then(|f| f.sha1.clone()),
                     description: pkg.description.clone(),
                     license: None, // Composer license is stored in metadata
