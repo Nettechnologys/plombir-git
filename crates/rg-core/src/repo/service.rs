@@ -1444,8 +1444,14 @@ pub async fn create_or_update_file(
             .map_err(|error| temp_tree_error("edited file", &full_path, &error))?;
 
         // Git add
+        // `--` before the client path: `file_path` is the caller's own string
+        // and `validate_repo_file_path` lets a leading `-` through, so without
+        // the separator git parses `-rf`/`--renormalize`/… as an option instead
+        // of a pathspec — the same argument-injection class as the sibling on
+        // the next commit (`add`/`push` both take the separator) and the one
+        // closed in `download_archive`.
         let output = gateway
-            .run(&["add", file_path], Some(&tmp))
+            .run(&["add", "--", file_path], Some(&tmp))
             .context("git add failed")?;
         if !output.success() {
             bail!("git add failed: {}", output.stderr_str());
@@ -1464,8 +1470,13 @@ pub async fn create_or_update_file(
         let push_url =
             path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
 
+        // `--` before the client-chosen `branch`: a refspec beginning with `-`
+        // is otherwise parsed as an option (`--receive-pack=<cmd>` reaches a
+        // shell), so keep the separator even though a dash-leading branch is
+        // rejected earlier by `checkout -b` — the guarantee comes from the
+        // separator, not from that upstream check.
         let output = gateway
-            .run(&["push", &push_url, branch], Some(&tmp))
+            .run(&["push", &push_url, "--", branch], Some(&tmp))
             .context("git push failed")?;
         if !output.success() {
             bail!("git push failed: {}", output.stderr_str());
@@ -1678,9 +1689,12 @@ pub async fn delete_file(
             bail!("git clone failed: {}", output.stderr_str());
         }
 
-        // Delete the file
+        // Delete the file. `--` before the client path for the same reason as
+        // the `add` in `create_or_update_file`: `validate_repo_file_path` lets
+        // a leading `-` through, and without the separator git reads
+        // `--cached`/`-r`/… as an option instead of a pathspec.
         let output = gateway
-            .run(&["rm", file_path], Some(&tmp))
+            .run(&["rm", "--", file_path], Some(&tmp))
             .context("git rm failed")?;
         if !output.success() {
             bail!("git rm failed: {}", output.stderr_str());
@@ -1695,12 +1709,13 @@ pub async fn delete_file(
             bail!("git commit failed: {}", output.stderr_str());
         }
 
-        // Git push
+        // Git push. `--` before `branch`: same argument-injection guard as the
+        // push in `create_or_update_file`.
         let push_url =
             path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
 
         let output = gateway
-            .run(&["push", &push_url, branch], Some(&tmp))
+            .run(&["push", &push_url, "--", branch], Some(&tmp))
             .context("git push failed")?;
         if !output.success() {
             bail!("git push failed: {}", output.stderr_str());
