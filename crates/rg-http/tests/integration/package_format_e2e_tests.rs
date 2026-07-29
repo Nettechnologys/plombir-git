@@ -300,6 +300,148 @@ async fn nine_native_package_formats_publish_index_and_download() {
     assert_eq!(registries["registries"].as_array().unwrap().len(), 9);
 }
 
+#[tokio::test]
+async fn yanked_only_packages_do_not_advertise_a_fake_latest_version() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let npm_json = br#"{
+  "name": "matrix-npm",
+  "version": "1.0.0",
+  "description": "npm matrix package"
+}"#;
+    let nuspec = br#"<?xml version="1.0"?>
+<package><metadata><id>Matrix.NuGet</id><version>1.0.0</version><description>NuGet matrix package</description></metadata></package>"#;
+    let chart_yaml =
+        b"apiVersion: v2\nname: matrix-helm\nversion: 1.0.0\ndescription: Helm matrix package\n";
+
+    for (package_type, filename, body) in [
+        (
+            "npm",
+            "matrix-npm-1.0.0.tgz",
+            tar_gz(&[("package/package.json", npm_json)]),
+        ),
+        (
+            "nuget",
+            "Matrix.NuGet.1.0.0.nupkg",
+            zip_archive(&[("Matrix.NuGet.nuspec", nuspec)]),
+        ),
+        (
+            "helm",
+            "matrix-helm-1.0.0.tgz",
+            tar_gz(&[("matrix-helm/Chart.yaml", chart_yaml)]),
+        ),
+    ] {
+        let published = client
+            .post(package_url(&base, &[package_type, "publish"]))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            published.status(),
+            StatusCode::CREATED,
+            "{package_type} publish"
+        );
+    }
+
+    for (package_type, package_name) in [
+        ("npm", "matrix-npm"),
+        ("nuget", "Matrix.NuGet"),
+        ("helm", "matrix-helm"),
+    ] {
+        let yanked = client
+            .patch(package_url(
+                &base,
+                &[package_type, package_name, "1.0.0", "yank"],
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "yank": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(yanked.status(), StatusCode::OK, "{package_type} yank");
+    }
+
+    let npm = client
+        .get(package_url(&base, &["npm", "matrix-npm"]))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert!(
+        npm.get("dist-tags").is_none(),
+        "all-yanked npm metadata must not publish dist-tags: {npm}"
+    );
+    assert!(npm["versions"].get("1.0.0").is_some(), "{npm}");
+    assert!(
+        !npm.to_string().contains("0.0.0"),
+        "npm metadata must not invent a version: {npm}"
+    );
+
+    let listed = client
+        .get(package_url(&base, &["nuget", "list"]))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let package = listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "Matrix.NuGet")
+        .unwrap_or_else(|| panic!("NuGet package missing from list: {listed}"));
+    assert!(
+        package["latest_version"].is_null(),
+        "a package with no live versions has no latest_version: {listed}"
+    );
+
+    let mut query = package_url(&base, &["nuget", "query"]);
+    query.query_pairs_mut().append_pair("q", "Matrix.NuGet");
+    let search = client
+        .get(query)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(search["totalHits"], 0, "{search}");
+    assert_eq!(search["data"].as_array().unwrap().len(), 0, "{search}");
+    assert!(
+        !search.to_string().contains("0.0.0"),
+        "NuGet search must not invent a version: {search}"
+    );
+
+    let helm_index = client
+        .get(package_url(&base, &["helm", "index.yaml"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !helm_index.contains("matrix-helm"),
+        "all-yanked Helm chart must not be advertised in index.yaml: {helm_index}"
+    );
+    assert!(
+        !helm_index.contains("1.0.0"),
+        "all-yanked Helm chart version must not be advertised in index.yaml: {helm_index}"
+    );
+}
+
 /// Maven asks for an artifact at the path it builds from the coordinate, and a
 /// `groupId` becomes one directory per dot: `com.example.tools:matrix-deep` is
 /// fetched from `com/example/tools/matrix-deep/…`, never from

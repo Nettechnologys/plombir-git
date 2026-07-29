@@ -498,7 +498,10 @@ pub async fn list_packages(
 
     for pkg in packages {
         let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
-        let latest = versions.first().map(|v| v.version.clone());
+        let latest = versions
+            .iter()
+            .find(|v| !v.is_yanked)
+            .map(|v| v.version.clone());
         let count = versions.len() as i64;
 
         summaries.push(PackageSummary {

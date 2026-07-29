@@ -416,13 +416,13 @@ pub fn build_npm_metadata(
         versions_map.insert(vi.version.clone(), serde_json::Value::Object(ver_obj));
     }
 
-    let latest = latest_version.unwrap_or_else(|| "0.0.0".into());
-
-    serde_json::json!({
-        "name": name,
-        "dist-tags": { "latest": latest },
-        "versions": versions_map,
-    })
+    let mut document = serde_json::Map::new();
+    document.insert("name".into(), name.into());
+    if let Some(latest) = latest_version {
+        document.insert("dist-tags".into(), serde_json::json!({ "latest": latest }));
+    }
+    document.insert("versions".into(), serde_json::Value::Object(versions_map));
+    serde_json::Value::Object(document)
 }
 
 /// Info needed for each version in the npm metadata response.
@@ -880,6 +880,42 @@ mod tests {
         assert_eq!(
             document["versions"]["2.0.0"]["dependencies"],
             serde_json::json!({}),
+        );
+    }
+
+    /// If every version is yanked, there is no `latest` tag to publish. A fake
+    /// `0.0.0` points npm at a version the registry does not have, making the
+    /// server's state look like a client-side resolution mistake.
+    #[test]
+    fn all_yanked_versions_publish_no_latest_tag() {
+        let document = build_npm_metadata(
+            "matrix-npm",
+            &[NpmVersionInfo {
+                version: "1.0.0".into(),
+                description: None,
+                sha256: None,
+                sha1: None,
+                sha512: None,
+                filename: None,
+                yanked: true,
+                metadata: None,
+            }],
+            "https://forge.example",
+            "acme",
+            "tools",
+        );
+
+        assert!(
+            document.get("dist-tags").is_none(),
+            "an all-yanked package must not invent dist-tags: {document}"
+        );
+        assert!(
+            document["versions"].get("1.0.0").is_some(),
+            "the historical version still exists in metadata: {document}"
+        );
+        assert!(
+            !document.to_string().contains("0.0.0"),
+            "metadata must not point at a fabricated version: {document}"
         );
     }
 }

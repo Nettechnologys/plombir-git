@@ -1348,6 +1348,9 @@ pub async fn nuget_search(
         let name_lower = pkg.name.to_lowercase();
         // Simple substring match
         if query.is_empty() || name_lower.contains(&query_lower) {
+            let Some(version) = pkg.latest_version.clone() else {
+                continue;
+            };
             let registration_url = format!(
                 "{}/api/v1/repos/{}/{}/packages/nuget/registration/{}/index.json",
                 base_url.trim_end_matches('/'),
@@ -1358,7 +1361,7 @@ pub async fn nuget_search(
 
             results.push(rg_core::package_registry::NuGetSearchResult {
                 name: pkg.name.clone(),
-                version: pkg.latest_version.clone().unwrap_or_else(|| "0.0.0".into()),
+                version,
                 description: pkg.description.clone(),
                 tags: pkg.keywords.clone(),
                 registration_url,
@@ -1803,6 +1806,10 @@ pub async fn helm_index(
         };
 
         for v in &versions {
+            if v.is_yanked {
+                continue;
+            }
+
             // Build download URL
             let filename = v
                 .files
