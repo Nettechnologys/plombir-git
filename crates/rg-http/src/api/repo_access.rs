@@ -11,6 +11,11 @@
 //!   A handler that forgets its gate no longer compiles into a working route —
 //!   it simply has no repository to work with.
 //!
+//! A route whose path names no repository at all — `/artifacts/{id}` and its
+//! kind — reaches one through [`AnchoredRead`] / [`AnchoredWrite`]: the domain
+//! module says how its id walks to a repository ([`RepoAnchor`]), and the
+//! decision still happens here. That is the third shape, not a third rule.
+//!
 //! The non-REST transports — git LFS, the OCI registry, the job-log WebSocket —
 //! cannot use either layer: each carries its credentials in a shape of its own
 //! (an LFS action signature, an OCI-scoped bearer token, a `?token=` query
@@ -27,6 +32,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::marker::PhantomData;
 
 use axum::extract::{FromRequest, FromRequestParts, Path, Request};
@@ -797,5 +803,124 @@ impl FromRequestParts<AppState> for RepoAdmin {
         let (owner, name) = route_repo(parts, state).await?;
         let (repo, actor_id) = require_admin(state, &parts.headers, &owner, &name).await?;
         Ok(Self { repo, actor_id })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anchored extractors: the repository is named by a *row*, not by the route
+// ---------------------------------------------------------------------------
+//
+// Every extractor above rests on [`route_repo`], which needs `{owner}/{name}`
+// in the path. A few routes do not have it: `/artifacts/{id}` addresses a row
+// by its instance-wide primary key, and the repository that admits the caller
+// is four tables away — artifact → job → stage → pipeline → repository. Those
+// routes had no extractor to take, so each wrote a prologue of its own:
+// resolve the row, walk to the repository, read the session out of the headers,
+// decide. The walk really is theirs. The decision never was, and writing it by
+// hand is how `require_artifact_write` came to re-derive "who is calling" from
+// `extract_user_id` while the route table said `RepoWrite`.
+//
+// So the two halves are split. A [`RepoAnchor`] says how *this* id reaches its
+// repository and lives next to the domain that knows how — `api::artifacts` for
+// an artifact — while [`AnchoredRead`] / [`AnchoredWrite`] hand what it resolved
+// to the same `check_*` the path-based extractors end in. The route gets its
+// access level back into the handler's signature; the rule stays singular.
+
+/// A route that names its repository indirectly — through the instance-wide id
+/// of a row that lives inside it.
+///
+/// An implementation resolves, and decides nothing: it turns the id into the
+/// row and the repository that owns it, and the extractor over it turns away a
+/// caller with no right to that repository. A row that is missing (or expired,
+/// or otherwise not to be served) is the implementation's to report, and it
+/// reports `404` — the id is instance-wide, so "no such row" and "not in a
+/// repository you may see" have to be the same answer.
+pub trait RepoAnchor: Send + Sync + 'static {
+    /// The row the id addresses. Handed to the handler beside the repository,
+    /// so a gate that had to fetch it is not paid for twice.
+    type Row: Send + 'static;
+
+    /// The path parameter carrying the id.
+    const PARAM: &'static str;
+
+    /// Resolve the row and the repository that owns it.
+    fn resolve(
+        state: &AppState,
+        id: i64,
+    ) -> impl Future<Output = Result<(Self::Row, rg_db::entities::repository::Model), AppError>> + Send;
+}
+
+/// Pull the instance-wide id an anchored route carries.
+///
+/// Read through `Path<HashMap<_, _>>` for the same reason [`route_repo`] is:
+/// the gate has to work whatever *else* the route captures, and a positional
+/// tuple would demand the exact arity of each individual route.
+async fn route_id(parts: &mut Parts, state: &AppState, param: &str) -> Result<i64, AppError> {
+    let Path(params) = Path::<HashMap<String, String>>::from_request_parts(parts, state)
+        .await
+        .map_err(|_| AppError::internal("route carries no path parameters to authorize against"))?;
+
+    let Some(raw) = params.get(param) else {
+        return Err(AppError::internal(format!(
+            "route is not anchored: no {{{param}}} capture to resolve a repository from"
+        )));
+    };
+    raw.parse::<i64>()
+        .map_err(|_| AppError::bad_request(format!("{param} must be a number")))
+}
+
+/// Read access to the repository an anchored row belongs to, anonymous callers
+/// included — the row of a public repository stays readable without a token,
+/// the row of a private one does not.
+///
+/// Mirrors [`RepoRead`] for the routes whose path names no repository.
+pub struct AnchoredRead<A: RepoAnchor> {
+    pub row: A::Row,
+    pub repo: rg_db::entities::repository::Model,
+}
+
+impl<A: RepoAnchor> FromRequestParts<AppState> for AnchoredRead<A> {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let id = route_id(parts, state, A::PARAM).await?;
+        let (row, repo) = A::resolve(state, id).await?;
+        check_read(state, &parts.headers, &repo).await?;
+        Ok(Self { row, repo })
+    }
+}
+
+/// An authenticated caller with write access to the repository an anchored row
+/// belongs to.
+///
+/// Mirrors [`RepoWrite`], and keeps [`RepoAuthRead`]'s order: a missing token is
+/// a `401` *before* anything is looked up, so the gate does not double as an
+/// existence oracle for the rows of private repositories.
+pub struct AnchoredWrite<A: RepoAnchor> {
+    pub row: A::Row,
+    pub repo: rg_db::entities::repository::Model,
+    pub actor_id: i64,
+}
+
+impl<A: RepoAnchor> FromRequestParts<AppState> for AnchoredWrite<A> {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let actor_id = super::auth::extract_user_id(&parts.headers, &state.jwt_secret)
+            .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+        let id = route_id(parts, state, A::PARAM).await?;
+        let (row, repo) = A::resolve(state, id).await?;
+        check_write_for(state, &repo, Some(actor_id)).await?;
+        Ok(Self {
+            row,
+            repo,
+            actor_id,
+        })
     }
 }

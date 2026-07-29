@@ -180,3 +180,160 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
         .unwrap()
         .is_none());
 }
+
+/// The four artifact routes take their access level as a *type* now —
+/// `ArtifactRead` / `ArtifactWrite` resolve the repository from the artifact
+/// and gate it before the handler is entered (card_1ec383429aea). This drives
+/// the live routes, because the gate being in the signature is exactly what no
+/// call to a helper can prove any more.
+///
+/// The baseline is in the same test and comes first: the owner reads, lists and
+/// finally deletes the very artifact the outsider is refused, so a wall of
+/// denials cannot be a dead fixture reported as a passing security test.
+#[tokio::test]
+async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _owner_id) = register_full(
+        &base,
+        "artifact_gate_owner",
+        "artifact_gate_owner@example.com",
+    )
+    .await;
+    let (outsider_token, _outsider_id) = register_full(
+        &base,
+        "artifact_gate_outsider",
+        "artifact_gate_outsider@example.com",
+    )
+    .await;
+
+    let repo_id = create_private_repo(&base, &owner_token, "gated-artifacts").await;
+    // A second repository of the *same* owner: reading it is the owner's right,
+    // so a pipeline of this one listed through the other one's URL is refused
+    // by the anchoring, not by the gate.
+    let other_repo_id = create_private_repo(&base, &owner_token, "gated-artifacts-two").await;
+    let runner =
+        rg_db::ops::runner_ops::register_runner(&db, "artifact-gate-runner", "", None, None, None)
+            .await
+            .unwrap();
+    let (pipeline_id, job_id) = create_assigned_job(&db, repo_id, runner.id).await;
+    let (other_pipeline_id, _other_job_id) =
+        create_assigned_job(&db, other_repo_id, runner.id).await;
+
+    let upload = client
+        .post(format!(
+            "{}/api/v1/runners/{}/jobs/{}/artifacts",
+            base, runner.id, job_id
+        ))
+        .bearer_auth(&runner.token)
+        .header("x-artifact-name", "report.txt")
+        .body("artifact bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 201);
+    let artifact_id = upload.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let metadata = format!("{base}/api/v1/artifacts/{artifact_id}");
+    let download = format!("{base}/api/v1/artifacts/{artifact_id}/download");
+    let listing = format!(
+        "{base}/api/v1/repos/artifact_gate_owner/gated-artifacts/pipelines/{pipeline_id}/artifacts"
+    );
+
+    // ── Baseline: the artifact is really there and really readable ──────────
+    assert_eq!(
+        client
+            .get(&metadata)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the owner cannot read his own artifact — every refusal below would be meaningless"
+    );
+    assert_eq!(
+        client
+            .get(&download)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .get(&listing)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // ── The outsider holds a perfectly valid session, and no rights here ────
+    for url in [&metadata, &download, &listing] {
+        assert_eq!(
+            client
+                .get(url)
+                .bearer_auth(&outsider_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403,
+            "{url} was served to an outsider"
+        );
+    }
+    assert_eq!(
+        client
+            .delete(&metadata)
+            .bearer_auth(&outsider_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "an outsider deleted an artifact out of a private repository"
+    );
+
+    // ── Anonymous: 401, and on the delete route before anything is resolved ─
+    assert_eq!(client.get(&metadata).send().await.unwrap().status(), 401);
+    assert_eq!(client.get(&download).send().await.unwrap().status(), 401);
+    assert_eq!(client.delete(&metadata).send().await.unwrap().status(), 401);
+
+    // ── The pipeline id is instance-wide; the URL's repository is not ───────
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/api/v1/repos/artifact_gate_owner/gated-artifacts/pipelines/{other_pipeline_id}/artifacts"
+            ))
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "a pipeline of another repository was listed through this repository's URL"
+    );
+
+    // ── Baseline for the write gate: the owner still owns the delete ────────
+    assert_eq!(
+        client
+            .delete(&metadata)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(rg_db::ops::artifact_ops::get_by_id(&db, artifact_id)
+        .await
+        .unwrap()
+        .is_none());
+}

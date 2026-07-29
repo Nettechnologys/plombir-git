@@ -105,8 +105,18 @@ type AnchoredFile = (&'static str, &'static [AnchorRule]);
 /// Read as: inside this file, a handler that destructures a path parameter
 /// named `param` must call one of `anchors` before it does anything with it.
 /// More than one anchor is listed when routes of the same family legitimately
-/// enter through different gates — `require_artifact_read` for the ones that
-/// only read, `require_artifact_write` for the one that deletes.
+/// re-tie the id through different helpers — a review id is placed by
+/// `review_in_pr` on most routes and by `require_suggestion_source` on the one
+/// that applies a suggestion.
+///
+/// A handler that takes the id through an *extractor* leaves this table
+/// altogether: `api/artifacts.rs` used to anchor `artifact_id` with a
+/// `require_artifact_read` / `require_artifact_write` prologue of its own, and
+/// now takes `ArtifactRead` / `ArtifactWrite`, which resolve the repository
+/// from the artifact and gate it before the handler is entered
+/// (card_1ec383429aea). There is no path parameter left for the census to see,
+/// and no way to forget the anchor — which is why the count below went down by
+/// three.
 const ANCHORED: &[AnchoredFile] = &[
     (
         "api/releases.rs",
@@ -206,11 +216,10 @@ const ANCHORED: &[AnchoredFile] = &[
     (
         "api/artifacts.rs",
         &[
-            (
-                "artifact_id",
-                &["require_artifact_read", "require_artifact_write"],
-            ),
-            ("pipeline_id", &["require_pipeline_read"]),
+            // The pipeline id is instance-wide while `RepoRead` only proves
+            // something about `{owner}/{name}`, so the listing route re-ties it
+            // to the repository the gate admitted.
+            ("pipeline_id", &["pipeline_in_repo"]),
             // The upload route is a runner route: the job must belong to the
             // runner whose token the middleware already checked.
             ("job_id", &["assigned_job"]),
@@ -331,7 +340,7 @@ const RELEASE_API: &str = "api/releases.rs";
 /// The number is written down so that adding a route which takes one is a
 /// deliberate act: the census fails until the new pair is classified *and* this
 /// count is updated. It is the denominator the plan for this guard was missing.
-const CENSUS_TOTAL: usize = 127;
+const CENSUS_TOTAL: usize = 124;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

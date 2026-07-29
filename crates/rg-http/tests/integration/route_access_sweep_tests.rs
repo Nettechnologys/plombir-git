@@ -115,12 +115,11 @@ const NO_FIXTURE: &[(&str, &str)] = &[
     ),
     (
         "DELETE /api/v1/artifacts/{id}",
-        "same as GET /api/v1/artifacts/{id}",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts",
-        "`require_pipeline_read` resolves the pipeline before the repository, and this \
-         fixture runs no pipeline — 404 for every persona",
+        "the same missing artifact as GET /api/v1/artifacts/{id} for the two personas that \
+         carry a session — 404 for the outsider and the owner alike. The anonymous caller is \
+         `401`, and from the gate rather than from the row: `ArtifactWrite` authenticates \
+         before it resolves anything, so a missing artifact and one in a private repository \
+         look the same from outside (card_1ec383429aea)",
     ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",

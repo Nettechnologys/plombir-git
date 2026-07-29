@@ -12,11 +12,73 @@ use std::path::{Path as FsPath, PathBuf};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::api::auth::extract_user_id;
-use crate::api::repo_access;
+use crate::api::repo_access::{AnchoredRead, AnchoredWrite, RepoAnchor, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::ToSchema;
+
+// ── Access ─────────────────────────────────────────────
+
+/// The artifact routes' anchor: `/artifacts/{id}` names its repository only
+/// through the artifact itself.
+///
+/// The walk — artifact → job → stage → pipeline → repository — is CI knowledge
+/// and lives here; the decision taken on the repository it arrives at is
+/// [`AnchoredRead`] / [`AnchoredWrite`]'s, and therefore `api::repo_access`'s.
+/// Before this existed the two were written together in this file, and the
+/// write half re-derived the caller from `extract_user_id` while the route
+/// table declared `RepoWrite` (card_1ec383429aea).
+pub struct Artifact;
+
+impl RepoAnchor for Artifact {
+    type Row = rg_db::entities::artifact::Model;
+
+    const PARAM: &'static str = "id";
+
+    async fn resolve(
+        state: &AppState,
+        artifact_id: i64,
+    ) -> Result<(Self::Row, rg_db::entities::repository::Model), AppError> {
+        let artifact = rg_db::ops::artifact_ops::get_by_id(&state.db, artifact_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found("artifact not found"))?;
+        // Retention has a date on the row and a sweep that gets to it later;
+        // between the two the artifact is already past its policy, so it is
+        // answered as gone rather than served for however long the sweep lags.
+        if artifact
+            .expires_at
+            .is_some_and(|expires| expires <= chrono::Utc::now())
+        {
+            return Err(AppError::not_found("artifact expired"));
+        }
+        let job = rg_db::ops::pipeline_ops::get_job(&state.db, artifact.job_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found("job not found"))?;
+        let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found("stage not found"))?;
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found("pipeline not found"))?;
+        let repo = rg_db::entities::repository::Entity::find_by_id(pipeline.repo_id)
+            .one(&state.db)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found("repository not found"))?;
+        Ok((artifact, repo))
+    }
+}
+
+/// Read access to the repository the artifact belongs to — the metadata and
+/// download routes.
+pub type ArtifactRead = AnchoredRead<Artifact>;
+
+/// Write access to it — the delete route.
+pub type ArtifactWrite = AnchoredWrite<Artifact>;
 
 // ── Response types ─────────────────────────────────────
 
@@ -153,14 +215,15 @@ pub async fn upload_artifact(
 )]
 pub async fn list_pipeline_artifacts(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, pipeline_id)): Path<(String, String, i64)>,
+    RepoRead { repo }: RepoRead,
+    Path((_owner, _name, pipeline_id)): Path<(String, String, i64)>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_pipeline_read(&state, &headers, &owner, &name, pipeline_id).await {
-        return e.into_response();
-    }
+    let pipeline = match pipeline_in_repo(&state, &repo, pipeline_id).await {
+        Ok(pipeline) => pipeline,
+        Err(e) => return e.into_response(),
+    };
 
-    match rg_db::ops::artifact_ops::list_by_pipeline(&state.db, pipeline_id).await {
+    match rg_db::ops::artifact_ops::list_by_pipeline(&state.db, pipeline.id).await {
         Ok(artifacts) => {
             let resp: Vec<ArtifactResponse> = artifacts
                 .into_iter()
@@ -196,15 +259,11 @@ pub async fn list_pipeline_artifacts(
     ),
 )]
 pub async fn get_artifact(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(artifact_id): Path<i64>,
+    ArtifactRead {
+        row: artifact,
+        repo: _,
+    }: ArtifactRead,
 ) -> impl IntoResponse {
-    let artifact = match require_artifact_read(&state, &headers, artifact_id).await {
-        Ok(artifact) => artifact,
-        Err(e) => return e.into_response(),
-    };
-
     (
         StatusCode::OK,
         Json(ArtifactResponse {
@@ -219,31 +278,6 @@ pub async fn get_artifact(
         }),
     )
         .into_response()
-}
-
-async fn require_artifact_write(
-    state: &AppState,
-    headers: &HeaderMap,
-    artifact_id: i64,
-) -> Result<rg_db::entities::artifact::Model, AppError> {
-    let artifact = require_artifact_read(state, headers, artifact_id).await?;
-    let job = rg_db::ops::pipeline_ops::get_job(&state.db, artifact.job_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("job not found"))?;
-    let repo_id = repo_id_for_job(state, &job).await?;
-    let repo = rg_db::entities::repository::Entity::find_by_id(repo_id)
-        .one(&state.db)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-    let actor_id = extract_user_id(headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    match crate::api::repo_access::may_write(state, &repo, Some(actor_id)).await {
-        Ok(true) => Ok(artifact),
-        Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(error) => Err(error),
-    }
 }
 
 /// GET /api/v1/artifacts/:id/download
@@ -263,14 +297,11 @@ async fn require_artifact_write(
 )]
 pub async fn download_artifact(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(artifact_id): Path<i64>,
+    ArtifactRead {
+        row: artifact,
+        repo: _,
+    }: ArtifactRead,
 ) -> impl IntoResponse {
-    let artifact = match require_artifact_read(&state, &headers, artifact_id).await {
-        Ok(artifact) => artifact,
-        Err(e) => return e.into_response(),
-    };
-
     let bytes = match read_artifact_bytes(&state, &artifact.file_path).await {
         Ok(bytes) => bytes,
         Err(error) => return error.into_response(),
@@ -344,18 +375,16 @@ pub async fn download_artifact(
 )]
 pub async fn delete_artifact(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(artifact_id): Path<i64>,
+    ArtifactWrite {
+        row: artifact,
+        repo: _,
+        actor_id: _,
+    }: ArtifactWrite,
 ) -> impl IntoResponse {
-    let artifact = match require_artifact_write(&state, &headers, artifact_id).await {
-        Ok(artifact) => artifact,
-        Err(e) => return e.into_response(),
-    };
-
     if let Err(error) = delete_artifact_blob(&state, &artifact.file_path).await {
         return AppError::from(error).into_response();
     }
-    match rg_db::ops::artifact_ops::delete_by_id(&state.db, artifact_id).await {
+    match rg_db::ops::artifact_ops::delete_by_id(&state.db, artifact.id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("artifact not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -635,14 +664,19 @@ fn is_path_under(path: &FsPath, root: &FsPath) -> bool {
     }
 }
 
-async fn require_pipeline_read(
+/// Re-tie a pipeline id to the repository the gate admitted.
+///
+/// `{id}` on the listing route is an instance-wide pipeline key while
+/// `RepoRead` only ever proved something about `{owner}/{name}` — so without
+/// this the artifacts of *any* pipeline could be listed through the URL of a
+/// repository the caller happens to be able to read. A mismatch answers `404`
+/// rather than `403`: a caller with no right to the pipeline has no right to
+/// learn that it exists either.
+async fn pipeline_in_repo(
     state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
+    repo: &rg_db::entities::repository::Model,
     pipeline_id: i64,
 ) -> Result<rg_db::entities::pipeline::Model, AppError> {
-    let repo = repo_access::resolve_repo(state, owner, name).await?;
     let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id)
         .await
         .map_err(AppError::internal)?
@@ -650,44 +684,7 @@ async fn require_pipeline_read(
     if pipeline.repo_id != repo.id {
         return Err(AppError::not_found("pipeline not found"));
     }
-    repo_access::check_read(state, headers, &repo).await?;
     Ok(pipeline)
-}
-
-async fn require_artifact_read(
-    state: &AppState,
-    headers: &HeaderMap,
-    artifact_id: i64,
-) -> Result<rg_db::entities::artifact::Model, AppError> {
-    let artifact = rg_db::ops::artifact_ops::get_by_id(&state.db, artifact_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("artifact not found"))?;
-    if artifact
-        .expires_at
-        .is_some_and(|expires| expires <= chrono::Utc::now())
-    {
-        return Err(AppError::not_found("artifact expired"));
-    }
-    let job = rg_db::ops::pipeline_ops::get_job(&state.db, artifact.job_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("job not found"))?;
-    let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("stage not found"))?;
-    let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("pipeline not found"))?;
-    let repo = rg_db::entities::repository::Entity::find_by_id(pipeline.repo_id)
-        .one(&state.db)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-    repo_access::check_read(state, headers, &repo).await?;
-    Ok(artifact)
 }
 
 async fn repo_id_for_job(

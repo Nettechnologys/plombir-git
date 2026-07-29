@@ -2,7 +2,8 @@
 //!
 //! Every repository-scoped REST handler declares its access level in its
 //! signature (`RepoRead` / `RepoAuthRead` / `RepoWrite` / `RepoAdmin` /
-//! `CiRead<_>`). The `require_*` functions those extractors are built on live
+//! `CiRead<_>`, and `AnchoredRead<_>` / `AnchoredWrite<_>` where the path names
+//! no repository). The `require_*` functions those extractors are built on live
 //! in `api::repo_access` and are meant to be called from nowhere else — the
 //! moment a handler calls one directly, the gate is a convention again and the
 //! next handler can simply forget it.
@@ -40,6 +41,15 @@ use std::path::{Path, PathBuf};
 /// `NamespaceCreate` — read the payload themselves, so a handler that took the
 /// body as a plain `Json<_>` and called the gate afterwards would be back to
 /// remembering the check by hand.
+///
+/// `check_read` / `check_read_with_ci` are the header-reading half of the same
+/// pair, and they were the loophole this list left open: they take a repository
+/// the caller resolved itself, so `resolve_repo` followed by `check_read` is a
+/// complete gate written by hand — no `require_*` in it for the grep to find,
+/// and no `can_*_repo` for the predicate guard below. `api::artifacts` was
+/// living in exactly that blind spot with a prologue of its own for four routes
+/// (card_1ec383429aea); when the path names no repository, the shape to take is
+/// `AnchoredRead` / `AnchoredWrite`, which resolves and then asks the gate here.
 const GATES: &[&str] = &[
     "require_read",
     "require_read_with_ci",
@@ -49,6 +59,8 @@ const GATES: &[&str] = &[
     "require_owner",
     "require_namespace_write",
     "require_namespace_create",
+    "check_read",
+    "check_read_with_ci",
     "check_read_for",
     "check_write_for",
 ];
@@ -407,6 +419,12 @@ fn the_extractors_are_actually_used() {
                 "RepoAdmin",
                 "RepoOwner",
                 "CiRead",
+                // The anchored pair, taken by the routes whose path names no
+                // repository — they are extractors like the rest, and a
+                // migration that dropped them back into handler bodies has to
+                // show up in this count too.
+                "ArtifactRead",
+                "ArtifactWrite",
             ] {
                 if code.contains(&format!("{ty} {{")) || code.contains(&format!(": {ty},")) {
                     uses += 1;
