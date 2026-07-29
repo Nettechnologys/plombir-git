@@ -335,6 +335,96 @@ async fn failed_write_permission_check_is_not_reported_as_forbidden() {
     );
 }
 
+/// Same class, third predicate (card_1e1ed1ee06f1): `POST /repos` decided
+/// organization membership itself, and its `_ =>` arm swallowed the `Err` — so a
+/// membership lookup that could not run answered `403 you are not a member of
+/// this organization`, telling the caller their account is the problem.
+///
+/// Only `organization_members` is dropped, so every other query on the path
+/// still succeeds: with the pool closed the *user* lookup ahead of it would fail
+/// first and the route would answer a server error whether or not this was
+/// fixed.
+#[tokio::test]
+async fn failed_org_membership_check_is_not_reported_as_forbidden() {
+    use sea_orm::ActiveModelTrait;
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::ConnectionTrait;
+
+    const OUTSIDER_ID: i64 = 900_201;
+    const ORG_OWNER_ID: i64 = 900_202;
+    const ORG_ID: i64 = 900_203;
+
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+
+    let now = chrono::Utc::now();
+    for (id, username) in [
+        (OUTSIDER_ID, "org-outage-user"),
+        (ORG_OWNER_ID, "org-outage-owner"),
+    ] {
+        rg_db::entities::user::ActiveModel {
+            id: Set(id),
+            username: Set(username.to_string()),
+            email: Set(format!("{username}@example.test")),
+            password_hash: Set(String::new()),
+            is_admin: Set(false),
+            is_active: Set(true),
+            auth_provider: Set("local".to_string()),
+            mfa_enabled: Set(false),
+            login_attempts: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert user");
+    }
+    rg_db::entities::organization::ActiveModel {
+        id: Set(ORG_ID),
+        name: Set("outagecorp".to_string()),
+        owner_id: Set(ORG_OWNER_ID),
+        visibility: Set("public".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("insert organization");
+
+    let state = build_test_app_state(db.clone(), repo_root);
+
+    // The one query the membership rule makes, and nothing else.
+    db.execute_unprepared("DROP TABLE organization_members")
+        .await
+        .expect("drop organization_members");
+
+    let response = through_router(
+        state,
+        "POST",
+        "/api/v1/repos",
+        bearer(OUTSIDER_ID, "org-outage-user"),
+        Some(serde_json::json!({
+            "name": "during-outage",
+            "org": "outagecorp",
+        })),
+    )
+    .await;
+
+    assert_ne!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a membership check that could not run must not be answered as 'you are not a member'"
+    );
+    assert!(
+        response.status().is_server_error(),
+        "the failed membership check must surface as a server-side failure, got {}",
+        response.status()
+    );
+}
+
 /// Read side: same contract, and here the pre-fix answer for an anonymous
 /// caller was a `401` — an instruction to authenticate that no token satisfies.
 #[tokio::test]

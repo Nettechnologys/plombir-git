@@ -394,6 +394,28 @@ pub trait TargetOwner {
     fn target_owner(&self) -> &str;
 }
 
+/// A request body whose target namespace may be *absent*, meaning the caller's
+/// own account.
+///
+/// `POST /repos` is why this half-open shape exists: its `org` field is
+/// optional, and an omitted one is not a missing target — it *is* the target,
+/// spelled "under me". A body forced to produce a `&str` would have the handler
+/// look up the caller's own username to satisfy the trait, which is a second
+/// name resolution in the one place this module exists to keep singular.
+pub trait TargetOwnerOrSelf {
+    /// The account or organization the write is aimed at, or `None` for the
+    /// caller's own account.
+    fn target_owner_or_self(&self) -> Option<&str>;
+}
+
+/// A body that always names its target speaks both dialects, so the create gate
+/// has a single bound and the two shapes cannot grow two rules.
+impl<T: TargetOwner> TargetOwnerOrSelf for T {
+    fn target_owner_or_self(&self) -> Option<&str> {
+        Some(self.target_owner())
+    }
+}
+
 /// A request body that names the `owner/name` it wants to write into.
 ///
 /// Implemented next to the request type it belongs to, so the derivation of the
@@ -423,7 +445,7 @@ pub(crate) async fn require_namespace_write(
 
     match existing {
         Some(repo) => check_write_for(state, &repo, Some(actor_id)).await,
-        None => require_namespace_create(state, actor_id, owner)
+        None => require_namespace_create(state, actor_id, Some(owner))
             .await
             .map(|_| ()),
     }
@@ -432,9 +454,15 @@ pub(crate) async fn require_namespace_write(
 /// Require the right to create a *new* repository under `owner/`.
 ///
 /// Two namespaces qualify: the caller's own account, and an organization the
-/// caller belongs to — the rule `create_repo` already applies to its `org`
-/// field. Returns the organization id when the namespace is one, so a caller
-/// that has to record it does not resolve the name a second time.
+/// caller belongs to — the rule `create_repo` applies to its `org` field.
+/// Returns the organization id when the namespace is one, so a caller that has
+/// to record it does not resolve the name a second time.
+///
+/// `None` *is* the caller's own account: a body that leaves its namespace out
+/// (`POST /repos` without an `org`) names the one namespace authentication has
+/// already settled, so there is no name to resolve and nothing left to decide.
+/// It is spelled as an absent owner rather than as the caller's username so the
+/// handler never has to produce that username to ask the question.
 ///
 /// The owner name is resolved exactly the way the write path resolves it
 /// (username first, then organization), so the gate cannot end up looser than
@@ -444,8 +472,12 @@ pub(crate) async fn require_namespace_write(
 pub(crate) async fn require_namespace_create(
     state: &AppState,
     actor_id: i64,
-    owner: &str,
+    owner: Option<&str>,
 ) -> Result<Option<i64>, AppError> {
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+
     if let Some(user) = rg_db::ops::user_ops::find_by_username(&state.db, owner)
         .await
         .map_err(AppError::from)?
@@ -706,17 +738,23 @@ where
 /// The rule is the create rule rather than the write rule on purpose: a
 /// transfer *adds* a repository to the destination (the service refuses a name
 /// already taken there), and "may add a repository under this owner" is exactly
-/// what `create_repo` asks about its own `org` field.
+/// what `create_repo` asks about its own `org` field — which is why
+/// `POST /repos` takes this extractor too rather than keeping the second copy
+/// of the membership rule it used to carry in its body (card_1e1ed1ee06f1).
 ///
 /// Being a body extractor, it must be the *last* argument of the handler.
 pub struct NamespaceCreate<B> {
     pub actor_id: i64,
+    /// The destination organization's id, when the namespace is one — already
+    /// resolved by the gate, so a handler that has to store it does not look
+    /// the name up a second time and cannot resolve it differently.
+    pub org_id: Option<i64>,
     pub body: B,
 }
 
 impl<B> FromRequest<AppState> for NamespaceCreate<B>
 where
-    B: TargetOwner + serde::de::DeserializeOwned + Send + 'static,
+    B: TargetOwnerOrSelf + serde::de::DeserializeOwned + Send + 'static,
 {
     type Rejection = AppError;
 
@@ -731,9 +769,13 @@ where
             .await
             .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
 
-        require_namespace_create(state, actor_id, body.target_owner()).await?;
+        let org_id = require_namespace_create(state, actor_id, body.target_owner_or_self()).await?;
 
-        Ok(Self { actor_id, body })
+        Ok(Self {
+            actor_id,
+            org_id,
+            body,
+        })
     }
 }
 

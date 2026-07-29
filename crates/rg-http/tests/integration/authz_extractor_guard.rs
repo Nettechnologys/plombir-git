@@ -35,10 +35,11 @@ use std::path::{Path, PathBuf};
 /// `TRANSPORTS` below — and a handler that can take an extractor must.
 ///
 /// `require_namespace_write` / `require_namespace_create` guard the routes whose
-/// target is named by the request *body* (`POST /imports`, the destination of a
-/// transfer). Their extractors — `NamespaceWrite` / `NamespaceCreate` — read the
-/// payload themselves, so a handler that took the body as a plain `Json<_>` and
-/// called the gate afterwards would be back to remembering the check by hand.
+/// target is named by the request *body* (`POST /imports`, `POST /repos`, the
+/// destination of a transfer). Their extractors — `NamespaceWrite` /
+/// `NamespaceCreate` — read the payload themselves, so a handler that took the
+/// body as a plain `Json<_>` and called the gate afterwards would be back to
+/// remembering the check by hand.
 const GATES: &[&str] = &[
     "require_read",
     "require_read_with_ci",
@@ -107,6 +108,33 @@ const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "ws.rs"];
 /// on top of a gate it has already passed.
 const PREDICATES: &[&str] = &["can_read_repo", "can_write_repo", "can_admin_repo"];
 
+/// The organization-membership predicate — the third dialect, and the one both
+/// guards above were blind to.
+///
+/// `create_repo` decided "may I put a repository in this organization" in its own
+/// body: `get_org_by_name` followed by `is_org_member`, with an `Ok(true) =>` arm
+/// and a `_ =>` that swallowed the `Err` — so a database outage answered `403 you
+/// are not a member of this organization`, and an organization that did not exist
+/// answered `404`, telling an outsider the account is real. The rule already had
+/// an implementation in `require_namespace_create`, which is what the extractors
+/// use; the copy was invisible here because it named neither a `require_*` gate
+/// nor a `can_*_repo` predicate (card_1e1ed1ee06f1).
+///
+/// Only `get_org_by_name`'s companion is barred, not `get_org_by_name` itself:
+/// resolving a name is not deciding anything, and half the tree legitimately
+/// does it. Deciding *membership* is the part that has to come from a gate.
+const ORG_MEMBERSHIP: &[&str] = &["is_org_member"];
+
+/// The two files that own an organization rule, and may therefore ask about
+/// membership directly.
+///
+/// `api::repo_access` decides which namespace a repository may be created in;
+/// `api::orgs` decides who may read and administer the organization itself
+/// (`require_org_visible` / `require_org_admin`, both of which already classify
+/// a failed lookup as ours rather than as a refusal). Every other file has to
+/// take the answer from one of them.
+const ORG_GATE_OWNERS: &[&str] = &["api/repo_access.rs", "api/orgs.rs"];
+
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -127,6 +155,43 @@ fn relative(path: &Path) -> String {
         .expect("file under src/")
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Every call to one of `predicates` outside the files that own the rule.
+///
+/// Shared by the predicate guards below so "which files may decide this" is the
+/// only thing that differs between them, and adding a predicate cannot
+/// accidentally come with a laxer scan.
+fn predicate_offenders(predicates: &[&str], owners: &[&str]) -> Vec<String> {
+    let mut files = Vec::new();
+    rust_files(&src_root(), &mut files);
+    assert!(
+        files.len() > 20,
+        "src tree looks empty — guard is not running"
+    );
+    for owner in owners {
+        assert!(
+            src_root().join(owner).exists(),
+            "{owner} owns a rule in this guard but that file is gone — fix the list"
+        );
+    }
+
+    let mut offenders = Vec::new();
+    for file in &files {
+        let rel = relative(file);
+        if owners.contains(&rel.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(file).expect("read source file");
+        for (n, line) in text.lines().enumerate() {
+            for predicate in predicates {
+                if calls_gate(line, predicate) {
+                    offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
+                }
+            }
+        }
+    }
+    offenders
 }
 
 /// A call to `name(` that is not a definition, a doc reference or a comment.
@@ -197,28 +262,7 @@ fn repository_gates_are_only_reachable_through_the_extractors() {
 /// rule has one implementation no matter which shape asks for it.
 #[test]
 fn the_permission_predicates_are_only_reachable_through_the_gate_module() {
-    let mut files = Vec::new();
-    rust_files(&src_root(), &mut files);
-    assert!(
-        files.len() > 20,
-        "src tree looks empty — guard is not running"
-    );
-
-    let mut offenders = Vec::new();
-    for file in &files {
-        let rel = relative(file);
-        if rel == "api/repo_access.rs" {
-            continue;
-        }
-        let text = fs::read_to_string(file).expect("read source file");
-        for (n, line) in text.lines().enumerate() {
-            for predicate in PREDICATES {
-                if calls_gate(line, predicate) {
-                    offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
-                }
-            }
-        }
-    }
+    let offenders = predicate_offenders(PREDICATES, &["api/repo_access.rs"]);
 
     assert!(
         offenders.is_empty(),
@@ -229,6 +273,31 @@ fn the_permission_predicates_are_only_reachable_through_the_gate_module() {
          top of a gate you already passed; call `check_read_for` / `check_write_for` when the \
          protocol resolves its own caller. Writing the rule again with `can_*_repo` is how the \
          copies this phase exists to remove got made.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The third dialect: the rule written out of `is_org_member` instead of out of
+/// a gate.
+///
+/// Neither guard above could see `create_repo`'s copy — it called no `require_*`
+/// and no `can_*_repo`, so "may I create a repository in this organization"
+/// existed twice, and the copy answered a failed lookup with `403` and an
+/// unknown organization with `404`. A membership question therefore has to come
+/// from one of the two files that own an organization rule.
+#[test]
+fn the_org_membership_predicate_is_only_reachable_through_a_gate_module() {
+    let offenders = predicate_offenders(ORG_MEMBERSHIP, ORG_GATE_OWNERS);
+
+    assert!(
+        offenders.is_empty(),
+        "organization membership was decided outside a gate module.\n\
+         For \"may this caller put a repository here\", take `NamespaceCreate` / `NamespaceWrite` \
+         from `crate::api::repo_access` — it answers the namespace question and hands back the \
+         organization id it resolved. For \"may this caller see or administer the organization\", \
+         use the `OrgRead` / `OrgAdmin` extractors in `api::orgs`. Asking `is_org_member` here \
+         writes the rule a second time, and the second copy is where the swallowed `Err` and the \
+         `404` existence oracle came from.\n{}",
         offenders.join("\n")
     );
 }

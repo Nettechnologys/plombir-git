@@ -21,12 +21,12 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::api::repo_access::{
-    NamespaceCreate, RepoAuthRead, RepoOwner, RepoRead, RepoWrite, TargetOwner,
+    NamespaceCreate, RepoAuthRead, RepoOwner, RepoRead, RepoWrite, TargetOwner, TargetOwnerOrSelf,
 };
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::{
-    api::auth::{extract_bearer_claims, extract_user_id, AuthUser},
+    api::auth::{extract_bearer_claims, extract_user_id},
     openapi::PaginatedRepoResponse,
     AppState,
 };
@@ -96,6 +96,16 @@ pub struct CreateRepoRequest {
     pub issue_labels: Option<String>,
 }
 
+/// The namespace is the optional `org` field, and its absence means "under my
+/// own account" — the half-open shape [`TargetOwnerOrSelf`] exists for. Whether
+/// the caller may create there is [`NamespaceCreate`]'s answer, not this
+/// handler's.
+impl TargetOwnerOrSelf for CreateRepoRequest {
+    fn target_owner_or_self(&self) -> Option<&str> {
+        self.org.as_deref()
+    }
+}
+
 /// Repository response (matches DB model fields exposed to API).
 #[derive(serde::Serialize, ToSchema)]
 pub struct RepoResponse {
@@ -134,36 +144,22 @@ pub struct RepoResponse {
 )]
 pub async fn create_repo(
     State(state): State<AppState>,
-    AuthUser(owner_id): AuthUser,
     headers: HeaderMap,
-    Json(body): Json<CreateRepoRequest>,
+    // The namespace this repository lands in is named by the *body* — the
+    // optional `org` field — so the gate over it is the body extractor, and the
+    // organization id it resolved comes back with it. The handler used to ask
+    // the question itself, with a copy of the membership rule that had drifted
+    // twice over: its `_` arm answered `403 you are not a member of this
+    // organization` to a failed *lookup*, and an unknown organization got a
+    // `404` that told an outsider the account exists (card_1e1ed1ee06f1).
+    //
+    // Being a body extractor it has to come last.
+    NamespaceCreate {
+        actor_id: owner_id,
+        org_id,
+        body,
+    }: NamespaceCreate<CreateRepoRequest>,
 ) -> impl IntoResponse {
-    // Resolve org_id if org is specified
-    let org_id = match &body.org {
-        Some(org_name) => {
-            match rg_db::ops::org_ops::get_org_by_name(&state.db, org_name).await {
-                Ok(Some(org)) => {
-                    // Verify the user is a member of this org
-                    match rg_db::ops::org_ops::is_org_member(&state.db, org.id, owner_id).await {
-                        Ok(true) => Some(org.id),
-                        _ => {
-                            return AppError::forbidden(
-                                "you are not a member of this organization".to_string(),
-                            )
-                            .into_response()
-                        }
-                    }
-                }
-                Ok(None) => {
-                    return AppError::not_found("organization not found".to_string())
-                        .into_response()
-                }
-                Err(e) => return AppError::from(e).into_response(),
-            }
-        }
-        None => None,
-    };
-
     // Get owner identity for template substitution and initial commit author.
     let owner_user = match rg_db::ops::user_ops::find_by_id(&state.db, owner_id).await {
         Ok(Some(user)) => user,
@@ -807,6 +803,9 @@ pub async fn transfer_repo_handler(
     NamespaceCreate {
         actor_id: user_id,
         body,
+        // The resolved destination organization id is not needed here: the
+        // service resolves the destination itself when it rewrites the row.
+        ..
     }: NamespaceCreate<TransferRequest>,
 ) -> impl IntoResponse {
     // `claims.sub` is only the audit trail's subject string; both access
