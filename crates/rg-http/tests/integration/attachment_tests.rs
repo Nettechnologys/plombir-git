@@ -206,6 +206,136 @@ async fn issue_attachment_roundtrip_enforces_type_permission_and_ownership() {
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
+/// The upload gate is `RepoAuthRead`, and both halves of that choice are load
+/// bearing.
+///
+/// *Auth* is why an anonymous caller is turned away before the multipart parser
+/// runs: the handlers used to take `RepoRead`, which admits anonymous callers on
+/// a public repository, and look the session up further down — so the answer
+/// came from `Multipart` as a `415` instead of from the gate as a `401`. The
+/// route was closed, but by the parser, not by the gate (`card_d3695d1dbe1b`).
+///
+/// *Read* — rather than `RepoWrite` — is why a reader may still attach a file to
+/// something they authored themselves. That allowance lives past the gate, in
+/// the handler's `author_id` check, and it is the whole reason the level here is
+/// not `RepoWrite`; without a test it would be the first thing a tightening
+/// silently removed.
+#[tokio::test]
+async fn an_author_without_write_access_may_attach_to_their_own_issue_and_comment() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("attgateowner{}", &suffix[..8]);
+    let reader = format!("attgatereader{}", &suffix[..8]);
+    let repo = format!("attgate{}", &suffix[..8]);
+    let owner_token = register_user(&base, &owner, &format!("{owner}@example.com"), PASSWORD).await;
+    let reader_token =
+        register_user(&base, &reader, &format!("{reader}@example.com"), PASSWORD).await;
+    create_repo(&base, &owner_token, &repo).await;
+
+    let file = || {
+        Form::new().part(
+            "attachment",
+            Part::bytes(b"reader evidence".to_vec())
+                .file_name("evidence.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        )
+    };
+
+    // The reader has no write access; filing an issue on read access is
+    // deliberate, and so is attaching to the issue they just filed.
+    let (_, own_issue) = create_issue(&base, &reader_token, &owner, &repo, "reader's issue").await;
+    let own = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{own_issue}/assets"
+        ))
+        .bearer_auth(&reader_token)
+        .multipart(file())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own.status(),
+        reqwest::StatusCode::CREATED,
+        "an issue's own author may attach to it without write access"
+    );
+
+    // Somebody else's issue is where the allowance stops.
+    let (_, owners_issue) = create_issue(&base, &owner_token, &owner, &repo, "owner's issue").await;
+    let foreign = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{owners_issue}/assets"
+        ))
+        .bearer_auth(&reader_token)
+        .multipart(file())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a reader may not attach to an issue somebody else authored"
+    );
+
+    // The same allowance, one level down: a comment the reader wrote on the
+    // owner's issue is still the reader's own.
+    let comment: Value = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{owners_issue}/comments"
+        ))
+        .bearer_auth(&reader_token)
+        .json(&serde_json::json!({"body": "mine to attach to"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let comment_id = comment["id"].as_i64().unwrap();
+    let own_comment = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/comments/{comment_id}/assets"
+        ))
+        .bearer_auth(&reader_token)
+        .multipart(file())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own_comment.status(),
+        reqwest::StatusCode::CREATED,
+        "a comment's own author may attach to it without write access"
+    );
+
+    // And the anonymous caller is answered by the gate, not by the parser: a
+    // `415` here would mean the multipart reader got there first.
+    for (what, url) in [
+        (
+            "issue",
+            format!("{base}/api/v1/repos/{owner}/{repo}/issues/{own_issue}/assets"),
+        ),
+        (
+            "issue comment",
+            format!("{base}/api/v1/repos/{owner}/{repo}/issues/comments/{comment_id}/assets"),
+        ),
+    ] {
+        let anonymous = client.post(&url).multipart(file()).send().await.unwrap();
+        assert_eq!(
+            anonymous.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "anonymous upload to a public repository's {what} must be answered by the gate"
+        );
+        // Not even a body: the gate runs before anything reads one.
+        let bodyless = client.post(&url).send().await.unwrap();
+        assert_eq!(
+            bodyless.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "anonymous upload to a {what} with no body at all must still be a 401"
+        );
+    }
+}
+
 #[tokio::test]
 async fn private_pr_and_review_comment_attachments_enforce_access_and_target_scope() {
     let (base, db) = spawn_test_app_with_db().await;

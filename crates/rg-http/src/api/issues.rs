@@ -1,7 +1,7 @@
 //! REST API handlers for Issues and Issue Comments.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -382,17 +382,12 @@ async fn require_assignee_in_repo(
 pub async fn create_issue(
     State(state): State<AppState>,
     Path((_, _)): Path<(String, String)>,
-    headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Json(req): Json<CreateIssueRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
     // Filing an issue on read access is deliberate; deciding its labels and
     // milestone is not. `update_issue` already keeps those two behind
     // `can_write` — create let a reader of a public repository set them on the
@@ -581,17 +576,11 @@ pub async fn list_comments(
 pub async fn add_comment(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
-    RepoRead { .. }: RepoRead,
+    RepoAuthRead {
+        actor_id: user_id, ..
+    }: RepoAuthRead,
     Json(req): Json<CreateCommentRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
     match rg_core::issue::add_comment(&state.db, &owner, &repo, number, user_id, req.body).await {
         Ok(comment) => {
             let comment = comment_with_author(&state.db, comment).await;

@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::api::auth::extract_user_id;
-use crate::api::repo_access::{self, RepoRead};
+use crate::api::repo_access::{self, RepoAuthRead, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::attachment::AttachmentTarget;
@@ -60,16 +60,18 @@ pub async fn list_issue_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/issues/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_issue_attachment(
     State(state): State<AppState>,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
-    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::Issue,
@@ -138,16 +140,18 @@ pub async fn list_pull_request_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/pulls/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_pull_request_attachment(
     State(state): State<AppState>,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
-    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::PullRequest,
@@ -216,16 +220,18 @@ pub async fn list_issue_comment_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/issues/comments/{comment_id}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_issue_comment_attachment(
     State(state): State<AppState>,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
-    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::IssueComment,
@@ -294,16 +300,18 @@ pub async fn list_review_comment_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_review_comment_attachment(
     State(state): State<AppState>,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
-    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
     create(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::ReviewComment,
@@ -398,10 +406,15 @@ fn upload_path_error(what: &str, path: &std::path::Path, error: &std::io::Error)
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `user_id` arrives from the handler's [`RepoAuthRead`] argument, so the
+/// session is required *before* axum hands this function a `Multipart` to read.
+/// Deciding it here would have put the parser in front of the gate: an
+/// anonymous caller on a public repository got a `415` from the body reader
+/// instead of the `401` the route table declares.
 async fn create(
     state: &AppState,
     repo_model: rg_db::entities::repository::Model,
-    headers: &HeaderMap,
+    user_id: i64,
     owner: &str,
     repo_name: &str,
     kind: TargetKind,
@@ -409,10 +422,6 @@ async fn create(
     query: UploadQuery,
     mut multipart: Multipart,
 ) -> Response {
-    let user_id = match extract_user_id(headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
     let (repo, target) = match resolve(state, repo_model, kind, target_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),

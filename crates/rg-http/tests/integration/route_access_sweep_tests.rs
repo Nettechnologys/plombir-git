@@ -74,6 +74,27 @@ const ORG: &str = "sweeporg";
 // reason in the route table itself, and the sweep skips it on that basis.
 
 /// Routes the fixture cannot reach the gate of, each with the reason.
+///
+/// An entry here is skipped by every persona pass, which makes it the widest
+/// exemption the sweep grants — and it used to be the only one of the three
+/// lists nothing re-read. `FALLS_OVER` and `EXTRACTOR_BEFORE_GATE` are both
+/// checked in reverse (a route that stops misbehaving has to leave the list);
+/// this one was only checked for naming a live route, so the *reason* — a
+/// checkable claim, "every persona is answered before any gate runs" — was
+/// never compared to what the route actually answers.
+///
+/// [`the_out_of_reach_routes_are_still_out_of_reach`] closes that: it drives
+/// every entry with all three personas, in both repository scopes, and fails if
+/// any of them gets *in*. That is the rot this list can hide — a route stops
+/// being out of reach, keeps its exemption, and nobody is checking who it lets
+/// through.
+///
+/// Writing it also corrected two reasons that were simply untrue: the two
+/// `DELETE .../assets/{attachment_id}` rows were signed off as "answered 404 for
+/// every persona" while on the private repository they answer `401` to an
+/// anonymous caller and `403` to the outsider. They stay on the list — the
+/// public-repository half really is out of reach — but on a reason that
+/// describes them (card_3cc941a766a0).
 const NO_FIXTURE: &[(&str, &str)] = &[
     (
         "GET /api/v1/artifacts/{id}",
@@ -95,8 +116,11 @@ const NO_FIXTURE: &[(&str, &str)] = &[
     ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
-        "the gate resolves the pull request first, and seeding one needs commits on two \
-         branches — out of reach of this fixture, so every persona is answered 404",
+        "the handler resolves the pull request before it decides access, and seeding one \
+         needs commits on two branches — out of reach of this fixture. Measured, because \
+         the reason this row used to give was wrong: on the *private* repository the gate \
+         does answer (401 anonymous, 403 outsider), but on the public one every persona is \
+         answered 404 for want of a pull request, so the row cannot be judged as a whole",
     ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
@@ -177,6 +201,12 @@ const RUN_LAST: &[(&str, &str)] = &[
 /// there. That is precisely why they are named here rather than passed over
 /// quietly — the list is a work queue, and it shrinks as handlers take their
 /// access level as an argument instead of fetching it mid-body.
+///
+/// **Empty, and the queue is finished.** Every route that was ever named here
+/// now takes its access level as a handler argument. The list stays so that a
+/// regression can be quarantined with a reason instead of the pass being
+/// switched off — and because the pass checks it in both directions, an entry
+/// added without cause fails the run as loudly as a missing one.
 const EXTRACTOR_BEFORE_GATE: &[&str] = &[
     // The twelve non-repository entries are gone: `card_533a5ddff9d3` moved
     // personal tokens, SSH keys, MFA enable/disable, repository and
@@ -189,12 +219,15 @@ const EXTRACTOR_BEFORE_GATE: &[&str] = &[
     // left this list when `card_f037c6e2e1f5` moved milestones, labels, mirrors,
     // commit statuses and repository transfer onto `RepoWrite` / `RepoOwner`:
     // the gate is now an argument, so it runs before the body is read.
-    "POST /api/v1/repos/{owner}/{name}/issues",
-    "POST /api/v1/repos/{owner}/{name}/issues/{number}/comments",
-    "POST /api/v1/repos/{owner}/{name}/issues/{number}/assets",
-    "POST /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
-    "POST /api/v1/repos/{owner}/{name}/pulls/{number}/assets",
-    "POST /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+    //
+    // The last six left with `card_d3695d1dbe1b`: issue creation, issue
+    // comments and the four attachment uploads declared `RepoAuthRead` in the
+    // route table while their handlers took `RepoRead` and looked the session up
+    // mid-body. On a *public* repository `RepoRead` admitted the anonymous
+    // caller, so the answer came from `Json` / `Multipart` — a 422 or a 415
+    // where a 401 was owed. Taking `RepoAuthRead` in the signature makes the
+    // declared level the one that actually runs, and it runs first.
+    //
     // `GET /api/v1/ai/repos/{owner}/{name}/search/code` left this list with
     // `card_cd6f512e2e52`. It was never a *body* entry: its gate was a
     // `RepoRead` argument all along, declared after `Query<SearchCodeQuery>`,
@@ -1456,5 +1489,96 @@ async fn every_instance_admin_route_demands_the_admin_pat_scope() {
         under_scoped.len() + over_scoped.len(),
         under_scoped.join("\n"),
         over_scoped.join("\n"),
+    );
+}
+
+/// No `NO_FIXTURE` route lets anybody in.
+///
+/// An entry on that list is skipped by every persona pass, which makes it the
+/// widest exemption the sweep grants — and it was the only one of the three
+/// lists nothing re-read: `FALLS_OVER` and `EXTRACTOR_BEFORE_GATE` both fail on
+/// a stale entry, this one only checked that the name still matched a live
+/// route (card_3cc941a766a0).
+///
+/// What can rot here is the precondition: the fixture grows, the route starts
+/// resolving something real, and a row that nobody judges starts answering
+/// `2xx`. So every entry is driven — three personas, both repository scopes —
+/// and a success is the failure: the route has become checkable and owes the
+/// sweep an answer instead of an excuse.
+///
+/// It deliberately does *not* demand a particular non-answer. The rows measure
+/// differently by scope — the `pulls/.../assets` pair answers `401`/`403` on the
+/// private repository and `404` on the public one — and pinning a single status
+/// would only encode the fixture's shape of the day.
+#[tokio::test]
+async fn the_out_of_reach_routes_are_still_out_of_reach() {
+    let (base, facts) = spawn_test_app_with_routes().await;
+    let client = Client::builder().build().expect("http client");
+
+    let owner_token = register_user(&base, OWNER, &format!("{OWNER}@example.com"), PW).await;
+    let outsider_token =
+        register_user(&base, OUTSIDER, &format!("{OUTSIDER}@example.com"), PW).await;
+    let fx = Fixture {
+        base,
+        client,
+        owner_token,
+        outsider_token,
+    };
+    create_repo(&fx, PRIVATE_REPO, true).await;
+    create_repo(&fx, PUBLIC_REPO, false).await;
+    // The repositories have to be real, or "out of reach" would be true for the
+    // wrong reason and this test would pass on a dead fixture.
+    for repo in [PRIVATE_REPO, PUBLIC_REPO] {
+        assert_eq!(
+            fx.repo_readable_by_owner(repo).await,
+            StatusCode::OK,
+            "fixture is dead: the owner cannot read '{repo}', so every route below would look \
+             out of reach whatever it does"
+        );
+    }
+    let seeds = [PRIVATE_REPO, PUBLIC_REPO].map(|repo| RepoSeed {
+        name: repo.to_string(),
+        // No comment is seeded: these rows resolve an artifact, a pipeline or a
+        // pull request first, and none of them gets as far as a comment.
+        comment_id: "1".to_string(),
+    });
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut probed = 0usize;
+    for (label, reason) in NO_FIXTURE {
+        let fact = facts
+            .iter()
+            .find(|fact| fact.label() == *label)
+            .unwrap_or_else(|| panic!("NO_FIXTURE names '{label}', which is not a route"));
+
+        for seed in &seeds {
+            for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
+                let (status, body) = probe(&fx, fact, persona, seed).await;
+                probed += 1;
+                if !status.is_success() {
+                    continue;
+                }
+                offenders.push(format!(
+                    "  {} {} {label} answered {status} (excused as: {reason})\n    {body}",
+                    persona.label(),
+                    seed.name,
+                ));
+            }
+            // Only the repository-scoped rows have anything to say about a
+            // second repository; the rest resolve an instance-wide id.
+            if !is_repo_path(&fact.path) {
+                break;
+            }
+        }
+    }
+
+    assert!(probed > 0, "NO_FIXTURE is empty — the guard is not guarding");
+    assert!(
+        offenders.is_empty(),
+        "{} NO_FIXTURE row(s) are no longer out of reach.\nThey are skipped by every persona \
+         pass, so a route that has started letting somebody in is a route nobody is checking. \
+         Drop it from NO_FIXTURE and let the sweep judge it.\n{}",
+        offenders.len(),
+        offenders.join("\n")
     );
 }
