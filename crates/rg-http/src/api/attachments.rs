@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::api::auth::extract_user_id;
-use crate::api::repo_access::RepoRead;
+use crate::api::repo_access::{self, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::attachment::AttachmentTarget;
@@ -420,11 +420,10 @@ async fn create(
     // A check that could not run is not a check that said "no": while the
     // database was down `unwrap_or(false)` answered 403 to the repository's own
     // writers, so the failure read as the caller's fault.
-    let can_write =
-        match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-            Ok(allowed) => allowed,
-            Err(error) => return AppError::from(error).into_response(),
-        };
+    let can_write = match repo_access::may_write(state, &repo, Some(user_id)).await {
+        Ok(allowed) => allowed,
+        Err(error) => return error.into_response(),
+    };
     if user_id != target.author_id && !can_write {
         return AppError::forbidden("write access denied").into_response();
     }
@@ -644,11 +643,10 @@ async fn delete(
     // A check that could not run is not a check that said "no": while the
     // database was down `unwrap_or(false)` answered 403 to the repository's own
     // writers, so the failure read as the caller's fault.
-    let can_write =
-        match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-            Ok(allowed) => allowed,
-            Err(error) => return AppError::from(error).into_response(),
-        };
+    let can_write = match repo_access::may_write(state, &repo, Some(user_id)).await {
+        Ok(allowed) => allowed,
+        Err(error) => return error.into_response(),
+    };
     if user_id != target.author_id && !can_write {
         return AppError::forbidden("write access denied").into_response();
     }

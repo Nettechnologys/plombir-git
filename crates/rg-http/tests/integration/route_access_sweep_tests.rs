@@ -189,18 +189,16 @@ const EXTRACTOR_BEFORE_GATE: &[&str] = &[
     "POST /api/v1/orgs/{name}/teams/{team_id}/members",
     "POST /api/v1/admin/sso/providers",
     "PATCH /api/v1/admin/sso/providers/{id}",
-    // Repository-scoped, gate written by hand inside the handler.
-    "POST /api/v1/repos/{owner}/{name}/milestones",
-    "POST /api/v1/repos/{owner}/{name}/labels",
+    // Repository-scoped, gate written by hand inside the handler. Five entries
+    // left this list when `card_f037c6e2e1f5` moved milestones, labels, mirrors,
+    // commit statuses and repository transfer onto `RepoWrite` / `RepoOwner`:
+    // the gate is now an argument, so it runs before the body is read.
     "POST /api/v1/repos/{owner}/{name}/issues",
     "POST /api/v1/repos/{owner}/{name}/issues/{number}/comments",
     "POST /api/v1/repos/{owner}/{name}/issues/{number}/assets",
     "POST /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
     "POST /api/v1/repos/{owner}/{name}/pulls/{number}/assets",
     "POST /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
-    "POST /api/v1/repos/{owner}/{name}/mirror",
-    "POST /api/v1/repos/{owner}/{name}/statuses/{sha}",
-    "POST /api/v1/repos/{owner}/{name}/transfer",
     "GET /api/v1/ai/repos/{owner}/{name}/search/code",
 ];
 

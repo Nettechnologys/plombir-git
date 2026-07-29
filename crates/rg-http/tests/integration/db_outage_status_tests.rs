@@ -308,20 +308,20 @@ async fn failed_write_permission_check_is_not_reported_as_forbidden() {
     let state = build_test_app_state(db.clone(), repo_root);
     break_permission_lookup(&db).await;
 
-    let response = rg_http::api::labels::create_label(
-        State(state),
+    // Through the router, for the reason `get_through_router` gives: the write
+    // check now runs in the `RepoWrite` extractor, so the handler cannot be
+    // called without it — and the classification under test is the extractor's.
+    let response = through_router(
+        state,
+        "POST",
+        &format!("/api/v1/repos/{owner}/{repo}/labels"),
         bearer(outsider_id, outsider),
-        Path((owner.to_string(), repo.to_string())),
-        axum::Json(
-            serde_json::from_value(serde_json::json!({
-                "name": "bug",
-                "color": "#ff0000",
-            }))
-            .expect("label body"),
-        ),
+        Some(serde_json::json!({
+            "name": "bug",
+            "color": "#ff0000",
+        })),
     )
-    .await
-    .into_response();
+    .await;
 
     assert_ne!(
         response.status(),

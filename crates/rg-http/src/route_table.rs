@@ -45,9 +45,10 @@ pub enum Access {
     RepoWrite,
     /// Repository administration. Mirrors `api::repo_access::RepoAdmin`.
     RepoAdmin,
-    /// Repository ownership — deleting, forking out of, or transferring the
-    /// repository. There is no extractor for this level yet; the handlers
-    /// compare `repo.owner_id` themselves.
+    /// Repository ownership — disposing of the repository itself, by deleting
+    /// or transferring it. Stronger than [`Access::RepoAdmin`]: an
+    /// organization admin administers a repository without owning it. Mirrors
+    /// `api::repo_access::RepoOwner`.
     RepoOwner,
     /// Read access to the organization in the path, following the same shape as
     /// [`Access::RepoRead`]: a public organization is anonymously readable, a

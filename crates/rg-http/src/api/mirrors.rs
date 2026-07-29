@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -16,7 +16,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
 use crate::api::repo_access::RepoWrite;
 use crate::error::AppError;
 use crate::AppState;
@@ -121,33 +120,10 @@ pub struct UpdateMirrorRequest {
 )]
 pub async fn create_mirror(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<CreateMirrorRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    // Check write permission
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
-
     match rg_core::mirror::service::create_mirror(
         &state.db,
         repo.id,
@@ -215,32 +191,10 @@ pub async fn get_mirror(
 )]
 pub async fn update_mirror(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<UpdateMirrorRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
-
     match rg_core::mirror::service::update_mirror(
         &state.db,
         repo.id,
@@ -274,31 +228,9 @@ pub async fn update_mirror(
 )]
 pub async fn delete_mirror(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
-
     match rg_core::mirror::service::delete_mirror(&state.db, repo.id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -323,31 +255,9 @@ pub async fn delete_mirror(
 )]
 pub async fn trigger_mirror_sync(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("no write permission").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
-
     match rg_core::mirror::service::trigger_sync(
         &state.db,
         repo.id,

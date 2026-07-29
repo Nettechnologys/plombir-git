@@ -8,43 +8,16 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
-use crate::api::repo_access::RepoRead;
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
-
-/// Enforce repository write access for a label mutation.
-///
-/// `can_write(owner, name)` folds "no such repository" into its `Err` arm, so
-/// the repository is resolved first and the check runs against the model. That
-/// keeps the three outcomes apart: an absent repository is a 404, a denied
-/// check is a 403, and a check that could not run at all reports the outage —
-/// where `unwrap_or(false)` used to answer 403 and send the client off to
-/// re-issue a token that was never the problem.
-async fn require_repo_write(
-    state: &AppState,
-    owner: &str,
-    name: &str,
-    user_id: i64,
-) -> Result<(), AppError> {
-    let repo = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found("repository not found"))?;
-
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(AppError::forbidden("forbidden")),
-        Err(e) => Err(AppError::from(e)),
-    }
-}
 
 /// Request body for creating a label.
 #[derive(Deserialize, ToSchema)]
@@ -146,30 +119,10 @@ pub async fn get_label(
 )]
 pub async fn create_label(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    RepoWrite { .. }: RepoWrite,
     Json(body): Json<CreateLabelRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    // Check write permission
-    if let Err(error) = require_repo_write(&state, &owner, &name, user_id).await {
-        return error.into_response();
-    }
-
     match rg_core::label::service::create_label(
         &state.db,
         &owner,
@@ -206,30 +159,10 @@ pub async fn create_label(
 )]
 pub async fn update_label(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
+    RepoWrite { .. }: RepoWrite,
     Json(body): Json<UpdateLabelRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    // Check write permission
-    if let Err(error) = require_repo_write(&state, &owner, &name, user_id).await {
-        return error.into_response();
-    }
-
     // The label is looked up *within* `owner/name`, the same repository the
     // write check above was about — a bare id let write access to one repository
     // rename a label in any other. `AppError::from` (not a blanket
@@ -269,29 +202,9 @@ pub async fn update_label(
 )]
 pub async fn delete_label(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((owner, name, id)): Path<(String, String, i64)>,
+    RepoWrite { .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    // Check write permission
-    if let Err(error) = require_repo_write(&state, &owner, &name, user_id).await {
-        return error.into_response();
-    }
-
     // Repository-scoped for the same reason as `update_label` above.
     match rg_core::label::service::delete_label(&state.db, &owner, &name, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

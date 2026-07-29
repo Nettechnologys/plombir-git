@@ -144,6 +144,23 @@ pub(crate) async fn check_write_for(
     }
 }
 
+/// [`check_read_for`] for administrative access.
+pub(crate) async fn check_admin_for(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<(), AppError> {
+    let Some(actor_id) = actor_id else {
+        return Err(AppError::unauthorized("authentication required"));
+    };
+
+    match rg_core::repo::service::can_admin_repo(&state.db, repo, Some(actor_id)).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden("repository admin access required")),
+        Err(error) => Err(AppError::from(error)),
+    }
+}
+
 /// Whether the gate said "no", as opposed to the gate failing to run.
 ///
 /// The distinction is the whole point of [`check_read_for`] returning an error
@@ -152,6 +169,66 @@ pub(crate) async fn check_write_for(
 /// let a failed check stay a failure — see `oci::granted`.
 pub(crate) fn is_access_denial(error: &AppError) -> bool {
     matches!(error, AppError::Unauthorized(_) | AppError::Forbidden(_))
+}
+
+/// Fold a gate decision into a boolean — the denial only.
+///
+/// A check that could not *run* stays an error, because the alternative is the
+/// bug this module keeps finding: `unwrap_or(false)` turns a database outage
+/// into "access denied" and sends the caller off to re-issue a token that was
+/// never the problem.
+fn decided(outcome: Result<(), AppError>) -> Result<bool, AppError> {
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(error) if is_access_denial(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Predicate form: access as a *question*, not as a gate
+// ---------------------------------------------------------------------------
+//
+// The extractors answer "may this request proceed at all". A handler sometimes
+// needs the weaker question — "is this caller also a writer?" — on top of a
+// gate it has already passed: an issue may be filed by any reader but only a
+// writer may set its labels; a comment may be edited by its author *or* by a
+// writer. Those handlers used to reach past this module into
+// `rg_core::repo::service::can_*_repo` and phrase the rule themselves, which is
+// the same gate in a second dialect: the source guard in
+// `tests/integration/authz_extractor_guard.rs` cannot see a decision written
+// from scratch, and the two dialects drift.
+//
+// So the question is answered here too. `may_*` is the same rule as
+// `check_*_for` — literally, it is that function with the denial folded into
+// `false` — and a handler asking it is still asking the layer.
+
+/// May this actor read the repository? See the module note above on when the
+/// predicate form is the right one.
+pub(crate) async fn may_read(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<bool, AppError> {
+    decided(check_read_for(state, repo, actor_id).await)
+}
+
+/// May this actor write to the repository?
+pub(crate) async fn may_write(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<bool, AppError> {
+    decided(check_write_for(state, repo, actor_id).await)
+}
+
+/// May this actor administer the repository?
+pub(crate) async fn may_admin(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<bool, AppError> {
+    decided(check_admin_for(state, repo, actor_id).await)
 }
 
 /// Whether the request carries a CI job token scoped to this repository.
@@ -234,11 +311,37 @@ pub(crate) async fn require_admin(
     let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret)
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
     let repo = resolve_repo(state, owner, name).await?;
-    match rg_core::repo::service::can_admin_repo(&state.db, &repo, Some(actor_id)).await {
-        Ok(true) => Ok((repo, actor_id)),
-        Ok(false) => Err(AppError::forbidden("repository admin access required")),
-        Err(error) => Err(AppError::from(error)),
+    check_admin_for(state, &repo, Some(actor_id)).await?;
+    Ok((repo, actor_id))
+}
+
+/// Require the repository's owner — not merely someone with write or admin
+/// rights on it.
+///
+/// Deleting a repository, and transferring it to someone else, are the two
+/// operations where "may change what is inside" is not enough: they dispose of
+/// the thing itself. `Access::RepoOwner` has named that level in the route
+/// table all along while the handlers compared `repo.owner_id` in their own
+/// bodies — a rule stated in prose next to the route and re-derived in code
+/// inside it, which is exactly the split this module exists to close.
+///
+/// Ownership is compared against `repo.owner_id` directly rather than through
+/// `can_admin_repo`: an organization admin administers the repository, and a
+/// collaborator may write to it, but neither of them owns it.
+pub(crate) async fn require_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
+    let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret)
+        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+    let repo = resolve_repo(state, owner, name).await?;
+
+    if repo.owner_id != actor_id {
+        return Err(AppError::forbidden("repository owner access required"));
     }
+    Ok((repo, actor_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +491,28 @@ impl FromRequestParts<AppState> for RepoWrite {
     ) -> Result<Self, Self::Rejection> {
         let (owner, name) = route_repo(parts, state).await?;
         let (repo, actor_id) = require_write(state, &parts.headers, &owner, &name).await?;
+        Ok(Self { repo, actor_id })
+    }
+}
+
+/// The repository's owner.
+///
+/// Mirrors [`require_owner`]. Stronger than [`RepoAdmin`]: an organization
+/// admin administers the repository without owning it.
+pub struct RepoOwner {
+    pub repo: rg_db::entities::repository::Model,
+    pub actor_id: i64,
+}
+
+impl FromRequestParts<AppState> for RepoOwner {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (owner, name) = route_repo(parts, state).await?;
+        let (repo, actor_id) = require_owner(state, &parts.headers, &owner, &name).await?;
         Ok(Self { repo, actor_id })
     }
 }

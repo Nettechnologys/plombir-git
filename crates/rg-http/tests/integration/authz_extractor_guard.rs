@@ -77,6 +77,18 @@ const SIGNED_OFF: &[(&str, &str)] = &[
 const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "ws.rs"];
 
 /// The raw permission predicates. Calling one is deciding access.
+///
+/// These are enforced across the whole tree, not just the transports below.
+/// `require_*` was only ever half the gate: a handler that never called one and
+/// wrote `can_write_repo(...)` with its own `Ok(false) => forbidden(...)` arm
+/// was invisible to this guard — the same rule in a second dialect, free to
+/// drift from the first. 32 call sites were living in that blind spot.
+///
+/// The decision now comes from `api::repo_access` in one of three shapes: the
+/// extractor in a handler's signature, `check_*_for` for a transport that
+/// resolves its own caller, or `may_read` / `may_write` / `may_admin` for a
+/// handler that needs access as a *question* — "is this caller also a writer?",
+/// on top of a gate it has already passed.
 const PREDICATES: &[&str] = &["can_read_repo", "can_write_repo", "can_admin_repo"];
 
 fn src_root() -> PathBuf {
@@ -150,10 +162,57 @@ fn repository_gates_are_only_reachable_through_the_extractors() {
     assert!(
         offenders.is_empty(),
         "repository access gate called directly instead of taken as a handler argument.\n\
-         Use RepoRead / RepoAuthRead / RepoWrite / RepoAdmin / CiRead<_> from \
+         Use RepoRead / RepoAuthRead / RepoWrite / RepoAdmin / RepoOwner / CiRead<_> from \
          `crate::api::repo_access`, so the compiler carries the gate instead of the author \
          remembering it. If this really is a different protocol with its own credentials, add \
          the file to SIGNED_OFF in this test with the reason.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The other dialect: a handler that never called `require_*` and wrote the
+/// decision itself, straight off `rg_core::repo::service::can_*_repo`.
+///
+/// The guard above cannot see that — there is no gate call in it to find. So
+/// the predicates are barred everywhere outside the gate module: a handler
+/// takes an extractor, a transport calls `check_*_for`, and a handler that
+/// needs the weaker *question* ("is this caller also a writer?") calls
+/// `may_read` / `may_write` / `may_admin`. All three live in one file, so the
+/// rule has one implementation no matter which shape asks for it.
+#[test]
+fn the_permission_predicates_are_only_reachable_through_the_gate_module() {
+    let mut files = Vec::new();
+    rust_files(&src_root(), &mut files);
+    assert!(
+        files.len() > 20,
+        "src tree looks empty — guard is not running"
+    );
+
+    let mut offenders = Vec::new();
+    for file in &files {
+        let rel = relative(file);
+        if rel == "api/repo_access.rs" {
+            continue;
+        }
+        let text = fs::read_to_string(file).expect("read source file");
+        for (n, line) in text.lines().enumerate() {
+            for predicate in PREDICATES {
+                if calls_gate(line, predicate) {
+                    offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a repository permission was decided outside `api::repo_access`.\n\
+         Take an extractor (RepoRead / RepoAuthRead / RepoWrite / RepoAdmin / RepoOwner / \
+         CiRead<_>) when the answer gates the whole handler; call \
+         `repo_access::may_read` / `may_write` / `may_admin` when you need it as a question on \
+         top of a gate you already passed; call `check_read_for` / `check_write_for` when the \
+         protocol resolves its own caller. Writing the rule again with `can_*_repo` is how the \
+         copies this phase exists to remove got made.\n{}",
         offenders.join("\n")
     );
 }
@@ -212,6 +271,7 @@ fn the_extractors_are_actually_used() {
                 "RepoAuthRead",
                 "RepoWrite",
                 "RepoAdmin",
+                "RepoOwner",
                 "CiRead",
             ] {
                 if code.contains(&format!("{ty} {{")) || code.contains(&format!(": {ty},")) {

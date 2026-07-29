@@ -7,7 +7,7 @@ use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
-use crate::api::repo_access::{RepoAuthRead, RepoRead, RepoWrite};
+use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -295,15 +295,9 @@ pub async fn update_pr(
     // `unwrap_or(false)` here told a repository writer "you may not update this
     // PR" whenever the permission query failed — a 403 that no retry or new
     // token can clear, for a failure that was ours.
-    let can_write = match rg_core::repo::service::can_write_repo(
-        &state.db,
-        &repo_model,
-        Some(actor_id),
-    )
-    .await
-    {
+    let can_write = match repo_access::may_write(&state, &repo_model, Some(actor_id)).await {
         Ok(allowed) => allowed,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return e.into_response(),
     };
     if existing.author_id != actor_id && !can_write {
         return AppError::forbidden("only the PR author or a repository writer may update this PR")

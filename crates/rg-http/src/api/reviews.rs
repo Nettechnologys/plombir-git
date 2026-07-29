@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
 
-use crate::api::repo_access::{RepoAuthRead, RepoRead, RepoWrite};
+use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
 use rg_db::entities::{
@@ -114,15 +114,9 @@ async fn require_pr_manager(
     // A permission check that failed is not a permission check that said "no":
     // `unwrap_or(false)` handed a repository writer a 403 whenever the query
     // behind it broke, hiding our outage behind the caller's credentials.
-    let can_write = match rg_core::repo::service::can_write_repo(
-        &state.db,
-        &repo_model,
-        Some(actor_id),
-    )
-    .await
-    {
+    let can_write = match repo_access::may_write(state, &repo_model, Some(actor_id)).await {
         Ok(allowed) => allowed,
-        Err(error) => return Err(AppError::from(error)),
+        Err(error) => return Err(error),
     };
     if pr.author_id != actor_id && !can_write {
         return Err(AppError::forbidden(
@@ -163,12 +157,10 @@ async fn require_suggestion_source(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("source repository not found"))?;
-    let can_write =
-        match rg_core::repo::service::can_write_repo(&state.db, &source_repo, Some(actor_id)).await
-        {
-            Ok(allowed) => allowed,
-            Err(error) => return Err(AppError::from(error)),
-        };
+    let can_write = match repo_access::may_write(state, &source_repo, Some(actor_id)).await {
+        Ok(allowed) => allowed,
+        Err(error) => return Err(error),
+    };
     if !can_write {
         return Err(AppError::forbidden(
             "write access to the PR source repository is required",
@@ -1176,16 +1168,11 @@ pub async fn request_reviewer(
     // This one leaned even further the wrong way: a failed check became a 400,
     // telling the requester their *reviewer* lacks access to the repository —
     // a statement about someone else that we never actually established.
-    let reviewer_can_read = match rg_core::repo::service::can_read_repo(
-        &state.db,
-        &repo_model,
-        Some(reviewer.id),
-    )
-    .await
-    {
-        Ok(allowed) => allowed,
-        Err(error) => return AppError::from(error).into_response(),
-    };
+    let reviewer_can_read =
+        match repo_access::may_read(&state, &repo_model, Some(reviewer.id)).await {
+            Ok(allowed) => allowed,
+            Err(error) => return error.into_response(),
+        };
     if !reviewer_can_read {
         return AppError::bad_request("reviewer does not have access to this repository")
             .into_response();
@@ -1328,15 +1315,9 @@ pub async fn set_thread_resolution(
         Ok(root) => root,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let can_write = match rg_core::repo::service::can_write_repo(
-        &state.db,
-        &repo_model,
-        Some(actor_id),
-    )
-    .await
-    {
+    let can_write = match repo_access::may_write(&state, &repo_model, Some(actor_id)).await {
         Ok(allowed) => allowed,
-        Err(error) => return AppError::from(error).into_response(),
+        Err(error) => return error.into_response(),
     };
     if root.author_id != actor_id && pr.author_id != actor_id && !can_write {
         return AppError::forbidden(

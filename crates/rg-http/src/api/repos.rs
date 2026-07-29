@@ -20,7 +20,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::repo_access::{RepoAuthRead, RepoRead};
+use crate::api::repo_access::{RepoAuthRead, RepoOwner, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::{
@@ -608,33 +608,19 @@ pub async fn delete_repo_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    RepoOwner {
+        repo,
+        actor_id: user_id,
+    }: RepoOwner,
 ) -> impl IntoResponse {
+    // `claims.sub` is only the audit trail's subject string; the ownership
+    // decision above it is the extractor's.
     let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
         Some(c) => c,
         None => {
             return AppError::unauthorized("authentication required".to_string()).into_response()
         }
     };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    // Only owner can delete
-    if repo.owner_id != user_id {
-        return AppError::forbidden("only repository owner can delete".to_string()).into_response();
-    }
 
     match rg_core::repo::service::delete_repo(&state.db, repo.id).await {
         Ok(()) => {
@@ -806,6 +792,11 @@ pub async fn transfer_repo_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    // `transfer_repo` checks ownership too, and keeps doing so — the service is
+    // reachable from elsewhere. What the extractor adds is that the *route*
+    // states the level it needs, instead of the route table asserting `RepoOwner`
+    // while the only enforcement lives three calls down.
+    RepoOwner { .. }: RepoOwner,
     Json(body): Json<TransferRequest>,
 ) -> impl IntoResponse {
     let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
@@ -892,41 +883,13 @@ pub struct CreateCommitStatusRequest {
 )]
 pub async fn create_commit_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((owner, name, sha)): Path<(String, String, String)>,
+    Path((_, _, sha)): Path<(String, String, String)>,
+    RepoWrite {
+        repo,
+        actor_id: user_id,
+    }: RepoWrite,
     Json(body): Json<CreateCommitStatusRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    // The repo model is already resolved above, so check against it: one query
-    // fewer, and a check that could not run reports the outage instead of
-    // answering 403 to a caller who does have write access.
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
-
     match rg_core::repo::service::create_commit_status(
         &state.db,
         repo.id,

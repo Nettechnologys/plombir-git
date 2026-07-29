@@ -7,8 +7,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::api::auth::extract_bearer_claims;
-use crate::api::repo_access::RepoRead;
+use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -350,10 +349,14 @@ async fn require_assignee_in_repo(
         Ok(None) => return Err(AppError::not_found("user not found".to_string())),
         Err(e) => return Err(AppError::from(e)),
     }
-    match rg_core::repo::service::can_read_repo(&state.db, repo, Some(assignee_id)).await {
+    // The gate's predicate form, not `check_read_for`: this is not the caller
+    // being let through, it is a *third party* being resolved, so the answer
+    // has to be foldable into "no such assignee here" rather than becoming this
+    // request's 401/403.
+    match repo_access::may_read(state, repo, Some(assignee_id)).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(AppError::not_found("user not found".to_string())),
-        Err(e) => Err(AppError::from(e)),
+        Err(e) => Err(e),
     }
 }
 
@@ -391,10 +394,10 @@ pub async fn create_issue(
     // `can_write` — create let a reader of a public repository set them on the
     // way in, which is the same edit through a different door.
     if req.labels.is_some() || req.milestone_id.is_some() {
-        match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
+        match repo_access::may_write(&state, &repo_model, Some(user_id)).await {
             Ok(true) => {}
             Ok(false) => return AppError::forbidden("write access required").into_response(),
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return e.into_response(),
         }
     }
 
@@ -442,51 +445,38 @@ pub async fn create_issue(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
+/// The route table declares this `RepoWrite` — that is what a stranger needs —
+/// while the handler takes [`RepoAuthRead`]: an issue's own author may edit the
+/// title and body of their issue without write access to the repository. The
+/// declaration states the level owed to an arbitrary caller; the widening for
+/// one specific person is decided below, against the same gate.
 pub async fn update_issue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    headers: HeaderMap,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Json(req): Json<UpdateIssueRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
     let existing = match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => issue,
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    let repo_model = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo)
-        .await
-    {
-        Ok(Some(repo)) => repo,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
+    // Read access is already proven by the extractor. What is left is the
+    // widening: write access, or authorship of this very issue and nothing
+    // that only a writer may set.
+    //
     // A permission check that could not run is not a permission check that
     // said "no": `unwrap_or(false)` answered 403 while the database was down,
     // sending the client off to re-issue a token that was never the problem.
-    let can_write =
-        match rg_core::repo::service::can_write_repo(&state.db, &repo_model, Some(user_id)).await {
-            Ok(allowed) => allowed,
-            Err(e) => return AppError::from(e).into_response(),
-        };
-    let can_read =
-        match rg_core::repo::service::can_read_repo(&state.db, &repo_model, Some(user_id)).await {
-            Ok(allowed) => allowed,
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    let can_write = match repo_access::may_write(&state, &repo_model, Some(user_id)).await {
+        Ok(allowed) => allowed,
+        Err(e) => return e.into_response(),
+    };
     let touches_management_fields =
         req.labels.is_some() || req.assignee_id.is_some() || req.milestone_id.is_some();
-
-    if !can_read {
-        return AppError::forbidden("access denied").into_response();
-    }
 
     if !can_write && (existing.author_id != user_id || touches_management_fields) {
         return AppError::forbidden("write access required").into_response();
@@ -731,36 +721,10 @@ pub struct CreateMilestoneRequest {
 )]
 pub async fn create_milestone(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path((owner, name)): Path<(String, String)>,
+    Path((_, _)): Path<(String, String)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<CreateMilestoneRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    // The repo model is already in hand, so check against it directly: one
-    // query fewer, and a failed check reports the outage instead of "forbidden".
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
     let now = chrono::Utc::now();
     let due_date = body
         .due_date
@@ -843,39 +807,11 @@ pub struct UpdateMilestoneRequest {
 )]
 pub async fn update_milestone(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
     Json(body): Json<UpdateMilestoneRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    // `can_write(owner, name)` reports a missing repository as an `Err`, so it
-    // cannot be matched on directly without turning a 404 into a 500. Resolve
-    // the repository first, then check the permission against the model: an
-    // absent repo stays a 404 and a failed check reports the outage.
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
-    // The write check above was about `owner/name`, so the milestone it guards
+    // The write check the extractor ran was about `owner/name`, so the milestone it guards
     // has to be the one that lives there — matching `get_milestone`. Without the
     // `repo_id` comparison, write access to a single repository was enough to
     // edit the milestones of every other one, and a 403 on the mismatch would
@@ -929,35 +865,9 @@ pub async fn update_milestone(
 )]
 pub async fn delete_milestone(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path((owner, name, id)): Path<(String, String, i64)>,
+    Path((_, _, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    // Same shape as `update_milestone`: resolve the repository so a missing one
-    // stays a 404, then let a failed permission check surface as an outage.
-    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &name).await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return AppError::not_found("repository not found".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(user_id)).await {
-        Ok(true) => {}
-        Ok(false) => return AppError::forbidden("forbidden".to_string()).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
-    }
     // `delete_by_id` deletes whatever row carries that id, so the milestone has
     // to be read and matched against the repository whose write access was
     // checked first — otherwise write access to one repository deleted the

@@ -246,10 +246,10 @@ async fn require_artifact_write(
         .ok_or_else(|| AppError::not_found("repository not found"))?;
     let actor_id = extract_user_id(headers, &state.jwt_secret)
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    match rg_core::repo::service::can_write_repo(&state.db, &repo, Some(actor_id)).await {
+    match crate::api::repo_access::may_write(state, &repo, Some(actor_id)).await {
         Ok(true) => Ok(artifact),
         Ok(false) => Err(AppError::forbidden("write access denied")),
-        Err(error) => Err(AppError::from(error)),
+        Err(error) => Err(error),
     }
 }
 

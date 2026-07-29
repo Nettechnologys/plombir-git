@@ -1,4 +1,4 @@
-use crate::api::repo_access::{RepoAdmin, RepoAuthRead, RepoRead};
+use crate::api::repo_access::{self, RepoAdmin, RepoAuthRead, RepoRead};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
@@ -303,11 +303,10 @@ async fn authorize_approval(
         .as_deref()
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
-    let is_admin =
-        match rg_core::repo::service::can_admin_repo(&state.db, &repo, Some(actor_id)).await {
-            Ok(value) => value,
-            Err(error) => return Err(AppError::from(error).into_response()),
-        };
+    let is_admin = match repo_access::may_admin(state, &repo, Some(actor_id)).await {
+        Ok(value) => value,
+        Err(error) => return Err(error.into_response()),
+    };
     if !is_admin && !allowed.contains(&actor_id) {
         return Err(
             AppError::forbidden("user is not an allowed environment approver").into_response(),
