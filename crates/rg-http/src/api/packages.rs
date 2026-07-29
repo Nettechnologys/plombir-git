@@ -31,7 +31,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_user_id;
 use crate::api::repo_access::{CiRead, Packages, RepoWrite};
 use crate::AppState;
 
@@ -111,14 +110,6 @@ fn err_text(status: StatusCode, msg: &str) -> axum::response::Response {
         msg.to_string(),
     )
         .into_response()
-}
-
-/// H-3: Thin wrapper over the unified `extract_user_id` from `auth.rs`.
-/// New handlers should prefer the `AuthUser` extractor for compile-time auth.
-/// This wrapper is retained because packages.rs returns `AppError` (not bare tuples).
-fn auth(headers: &axum::http::HeaderMap, secret: &str) -> Result<i64, AppError> {
-    extract_user_id(headers, secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))
 }
 
 /// What a publish request resolved to, once the adapter's reading of the file
@@ -537,7 +528,6 @@ pub async fn get_version(
 )]
 pub async fn delete_version(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     Path((owner, name, pkg_type, pkg_name, version)): Path<(
         String,
         String,
@@ -547,11 +537,6 @@ pub async fn delete_version(
     )>,
     RepoWrite { .. }: RepoWrite,
 ) -> axum::response::Response {
-    let _user_id = match auth(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
 
