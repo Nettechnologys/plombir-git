@@ -257,6 +257,56 @@ pub(crate) fn extract_ci_job_claims(
     rg_core::auth::ci_token::validate_ci_token(token, jwt_secret, repo_id, required_scope)
 }
 
+/// Bind a CI job token's claims back to the rows they name, and answer whether
+/// the job is still one this token may speak for.
+///
+/// `validate_ci_token_signature` says it in its own documentation: *callers
+/// must still bind the embedded job/pipeline/repository IDs to persisted data*.
+/// A signature is not a session — it is fixed when the token is minted and
+/// stays good for the whole hour of its TTL, so a job that was cancelled, a
+/// pipeline that was deleted, or a token that leaked into a job log keeps its
+/// key until the clock runs out. Only the database knows otherwise, and it is
+/// asked here so that both consumers — the OIDC exchange and the repository
+/// read gate — ask it the same way.
+///
+/// Denials are `401`/`403` so a caller folding this into a boolean can tell
+/// them apart from a failed lookup, which propagates.
+pub(crate) async fn ci_job_binding(
+    state: &crate::AppState,
+    claims: &rg_core::auth::ci_token::CiJobClaims,
+) -> Result<
+    (
+        rg_db::entities::pipeline_job::Model,
+        rg_db::entities::pipeline::Model,
+    ),
+    crate::error::AppError,
+> {
+    use crate::error::AppError;
+
+    let job = match rg_db::ops::pipeline_ops::get_job(&state.db, claims.job_id).await {
+        Ok(Some(job)) if matches!(job.status.as_str(), "assigned" | "running") => job,
+        Ok(Some(_)) => return Err(AppError::forbidden("CI job is not running")),
+        Ok(None) => return Err(AppError::unauthorized("CI job no longer exists")),
+        Err(error) => return Err(AppError::from(error)),
+    };
+    let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
+        Ok(Some(stage)) => stage,
+        Ok(None) => return Err(AppError::unauthorized("CI stage no longer exists")),
+        Err(error) => return Err(AppError::from(error)),
+    };
+    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id).await
+    {
+        Ok(Some(pipeline))
+            if pipeline.id == claims.pipeline_id && pipeline.repo_id == claims.repo_id =>
+        {
+            pipeline
+        }
+        Ok(_) => return Err(AppError::unauthorized("CI token resource binding mismatch")),
+        Err(error) => return Err(AppError::from(error)),
+    };
+    Ok((job, pipeline))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

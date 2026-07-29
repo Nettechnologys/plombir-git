@@ -93,12 +93,12 @@ async fn check_read_inner(
         // repository. A check that could not run may not: that is our failure,
         // and swallowing it here would answer 403 to a caller whose token was
         // never the problem.
-        Err(denied)
-            if is_access_denial(&denied)
-                && actor_id.is_none()
-                && ci_job_grants(state, headers, repo, ci_scope) =>
-        {
-            Ok(())
+        Err(denied) if is_access_denial(&denied) && actor_id.is_none() => {
+            if ci_job_grants(state, headers, repo, ci_scope).await? {
+                Ok(())
+            } else {
+                Err(denied)
+            }
         }
         Err(error) => Err(error),
     }
@@ -231,18 +231,37 @@ pub(crate) async fn may_admin(
     decided(check_admin_for(state, repo, actor_id).await)
 }
 
-/// Whether the request carries a CI job token scoped to this repository.
-fn ci_job_grants(
+/// Whether the request carries a CI job token scoped to this repository *and
+/// still belonging to a running job*.
+///
+/// The signature half of that is free; the second half costs one primary-key
+/// read and is the whole point. A job token is minted for an hour, and its
+/// signature keeps verifying for that hour no matter what happened to the
+/// pipeline — a cancelled job, or a token that leaked into the job's own log,
+/// went on opening a private repository until the clock ran out. The OIDC
+/// exchange has always re-read the row; this is the same check, from the other
+/// consumer, through the same helper so the two cannot drift.
+///
+/// A failed lookup is not a denial: it propagates, so a database outage cannot
+/// silently downgrade a valid job token into "no CI token here".
+async fn ci_job_grants(
     state: &AppState,
     headers: &HeaderMap,
     repo: &rg_db::entities::repository::Model,
     ci_scope: Option<&str>,
-) -> bool {
-    match ci_scope {
-        Some(scope) => {
-            super::auth::extract_ci_job_claims(headers, &state.jwt_secret, repo.id, scope).is_some()
-        }
-        None => false,
+) -> Result<bool, AppError> {
+    let Some(scope) = ci_scope else {
+        return Ok(false);
+    };
+    let Some(claims) =
+        super::auth::extract_ci_job_claims(headers, &state.jwt_secret, repo.id, scope)
+    else {
+        return Ok(false);
+    };
+    match super::auth::ci_job_binding(state, &claims).await {
+        Ok(_) => Ok(true),
+        Err(error) if is_access_denial(&error) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
