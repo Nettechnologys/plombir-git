@@ -823,3 +823,214 @@ async fn an_lfs_object_that_was_never_marked_uploaded_leaves_no_blob() {
         "the failed upload kept its staging files"
     );
 }
+
+// ── Release assets ───────────────────────────────────────────
+
+/// Create a release and return its id.
+async fn create_release(base: &str, token: &str, owner: &str, repo: &str) -> i64 {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/releases"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "tag_name": "v1.0.0", "title": "release" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "create release failed");
+    response.json::<Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap()
+}
+
+/// A release asset whose bytes were refused must not leave its row behind.
+///
+/// This one runs the other way round from the uploads above: `upload_asset`
+/// inserts the metadata row *first*, to derive the blob key from the id it gets
+/// back, and only then writes the bytes. So the leak is a row rather than a
+/// file — and it is the worse of the two, because a row is what every listing
+/// walks. The release keeps advertising an asset, and each download of it dies
+/// on a blob that was never written; nothing on the happy path can tell,
+/// because the row looks exactly like a healthy one.
+///
+/// `upload_failure_status_tests` already pins the *status* of this failure to
+/// 500. What it does not check is that the row is gone afterwards, which is the
+/// half `warn_orphan_asset_row` exists for.
+#[tokio::test]
+async fn a_release_asset_whose_bytes_were_refused_leaves_no_row_behind() {
+    let (base, db, faults) = spawn_test_app_with_faults().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "asset_orphan", "asset_orphan@example.com").await;
+    create_repo(&base, &token, "orphan-asset").await;
+    let release_id = create_release(&base, &token, "asset_orphan", "orphan-asset").await;
+    let assets_url =
+        format!("{base}/api/v1/repos/asset_orphan/orphan-asset/releases/{release_id}/assets");
+
+    faults.fail_put();
+    let refused = client
+        .post(&assets_url)
+        .bearer_auth(&token)
+        .header("x-asset-filename", "payload.bin")
+        .body(b"forgekeep-release-asset".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        500,
+        "a blob store that refused the asset is the server's failure"
+    );
+
+    faults.heal();
+    let orphans = rg_db::ops::release_ops::list_assets(&db, release_id)
+        .await
+        .expect("listing the release assets must work once the store is healthy");
+    assert!(
+        orphans.is_empty(),
+        "the metadata row outlived the bytes it describes: {:?}",
+        orphans.iter().map(|a| &a.filename).collect::<Vec<_>>()
+    );
+
+    // Control: the identical request succeeds once the store accepts the bytes,
+    // so the assertion above is about the rollback and not about an upload that
+    // never got as far as inserting a row.
+    let accepted = client
+        .post(&assets_url)
+        .bearer_auth(&token)
+        .header("x-asset-filename", "payload.bin")
+        .body(b"forgekeep-release-asset".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.status(),
+        201,
+        "the upload must succeed once the blob store accepts the bytes"
+    );
+    assert_eq!(
+        rg_db::ops::release_ops::list_assets(&db, release_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a successful upload must leave exactly its own row"
+    );
+}
+
+// ── CI artifacts ─────────────────────────────────────────────
+
+/// A pipeline with one job, already assigned to `runner_id`.
+///
+/// The artifact route is runner-authenticated and refuses a job that is not
+/// assigned to the caller, so there is no shortcut to reaching the handler.
+async fn create_assigned_job(db: &rg_db::DatabaseConnection, repo_id: i64, runner_id: i64) -> i64 {
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        "1234567890123456789012345678901234567890",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+        .await
+        .unwrap();
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .unwrap();
+    rg_db::ops::pipeline_ops::assign_job(db, job.id, runner_id)
+        .await
+        .unwrap();
+    job.id
+}
+
+/// What a job's artifacts are called on disk, whatever their blob names are.
+///
+/// The key carries a UUID (`artifact_key`), so the test cannot name the file it
+/// is looking for — it asks whether the job's directory holds anything at all.
+fn artifact_leftovers(repo_root: &std::path::Path, job_id: i64) -> Vec<String> {
+    let dir = repo_root
+        .join("artifacts")
+        .join("jobs")
+        .join(job_id.to_string());
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A CI artifact whose row was never written must not leave its blob behind.
+///
+/// The bytes land in blob storage before the row that names them, and the row
+/// is the only thing that can ever find them again: the download route resolves
+/// an artifact by id, and CI retention expires artifacts by walking rows. A blob
+/// that outlives its failed insert is therefore not merely unreferenced, it is
+/// unreachable *and* immune to the cleanup that would otherwise bound the disk
+/// a runner can fill — every retry of the upload adds another copy, because the
+/// key carries a fresh UUID each time.
+#[tokio::test]
+async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&app.base, "artifact_orphan", "artifact_orphan@example.com").await;
+    let repo_id = create_repo(&app.base, &token, "orphan-artifact").await;
+    let runner =
+        rg_db::ops::runner_ops::register_runner(&app.db, "orphan-runner", "", None, None, None)
+            .await
+            .unwrap();
+    let job_id = create_assigned_job(&app.db, repo_id, runner.id).await;
+    let artifacts_url = format!(
+        "{}/api/v1/runners/{}/jobs/{}/artifacts",
+        app.base, runner.id, job_id
+    );
+
+    let fault = fail_db_writes(&app.db, "artifacts", DbWrite::Insert).await;
+    let failed = client
+        .post(&artifacts_url)
+        .bearer_auth(&runner.token)
+        .header("x-artifact-name", "report.txt")
+        .body(b"forgekeep-artifact-bytes".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a lost artifact row must fail the upload, not answer 201"
+    );
+    assert_eq!(
+        artifact_leftovers(&app.repo_root, job_id),
+        Vec::<String>::new(),
+        "the stored blob outlived the row that would have claimed it"
+    );
+
+    // Control: the same upload writes exactly one blob once the row can be
+    // recorded, so the emptiness above is the rollback and not a path that
+    // never stored anything to begin with.
+    fault.clear().await;
+    let accepted = client
+        .post(&artifacts_url)
+        .bearer_auth(&runner.token)
+        .header("x-artifact-name", "report.txt")
+        .body(b"forgekeep-artifact-bytes".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.status(),
+        201,
+        "the upload must succeed once the database accepts the row"
+    );
+    assert_eq!(
+        artifact_leftovers(&app.repo_root, job_id).len(),
+        1,
+        "a successful upload must leave exactly its own blob"
+    );
+}
