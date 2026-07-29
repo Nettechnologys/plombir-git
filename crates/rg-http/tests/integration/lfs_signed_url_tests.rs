@@ -121,6 +121,7 @@ async fn signed_lfs_urls_are_ttl_and_action_bound() {
         repo_id,
         &oid,
         expires,
+        None,
     );
     let expired = reqwest::Client::new()
         .get(format!(
@@ -263,6 +264,85 @@ async fn lfs_download_batch_answers_with_the_repository_read_gate() {
     );
 }
 
+/// Deactivating an account has to reach the capabilities it already handed out.
+///
+/// A signed LFS URL presents no credential, so the revocation middleware never
+/// sees it: the signature is valid, the expiry has not passed, and before the
+/// actor was bound into it there was nothing to look the account up by. An
+/// upload URL lives six hours, so an offboarded user kept write access to a
+/// private repository for the rest of the afternoon.
+#[tokio::test]
+async fn deactivating_an_account_revokes_its_outstanding_lfs_urls() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "lfs_revoked", "lfs_revoked@example.com").await;
+    create_repo(&base, &owner_token, "revoked-lfs", true).await;
+    let content = b"content behind a revoked account";
+    let oid = hex::encode(Sha256::digest(content));
+
+    let upload_batch = batch(
+        &base,
+        "lfs_revoked",
+        "revoked-lfs",
+        Some(&owner_token),
+        "upload",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(upload_batch.status(), 200);
+    let upload_href = upload_batch.json::<serde_json::Value>().await.unwrap()["objects"][0]
+        ["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        upload_href.contains("actor="),
+        "an authenticated issue must name the account it was issued to: {upload_href}"
+    );
+
+    // Baseline: the URL works while the account stands, so the rejection below
+    // is the deactivation and not a broken fixture.
+    let before = reqwest::Client::new()
+        .put(&upload_href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200);
+
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, None, Some(false))
+        .await
+        .expect("deactivate user");
+
+    let after = reqwest::Client::new()
+        .put(&upload_href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "an upload URL issued before the deactivation must stop working"
+    );
+
+    // Stripping the actor is the obvious way to ask for the old behaviour back;
+    // it has to read as a forgery, not as an anonymous issue.
+    let stripped: String = upload_href
+        .split('&')
+        .filter(|part| !part.starts_with("actor="))
+        .collect::<Vec<_>>()
+        .join("&");
+    let forged = reqwest::Client::new()
+        .put(&stripped)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 403);
+}
+
 #[test]
 fn lfs_action_signature_rejects_tampering_and_expiry() {
     use rg_core::lfs::service::{
@@ -271,7 +351,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
 
     let oid = "b".repeat(64);
     let expires = 2_000_000_000;
-    let signature = sign_action_url(b"secret", LfsActionKind::Upload, 7, &oid, expires);
+    let signature = sign_action_url(b"secret", LfsActionKind::Upload, 7, &oid, expires, Some(42));
     assert_eq!(
         verify_action_url(
             b"secret",
@@ -279,6 +359,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
+            Some(42),
             &signature,
             expires - 1,
         ),
@@ -291,6 +372,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
+            Some(42),
             &signature,
             expires - 1,
         ),
@@ -303,6 +385,38 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             8,
             &oid,
             expires,
+            Some(42),
+            &signature,
+            expires - 1,
+        ),
+        Err(LfsActionSignatureError::Invalid)
+    );
+    // Re-pointing the URL at another account is the interesting forgery now
+    // that the actor decides whether the URL still works: it has to break the
+    // signature rather than move the capability.
+    assert_eq!(
+        verify_action_url(
+            b"secret",
+            LfsActionKind::Upload,
+            7,
+            &oid,
+            expires,
+            Some(43),
+            &signature,
+            expires - 1,
+        ),
+        Err(LfsActionSignatureError::Invalid)
+    );
+    // And so is dropping `actor=` altogether, which is the cheaper way to ask
+    // for the pre-revocation behaviour back.
+    assert_eq!(
+        verify_action_url(
+            b"secret",
+            LfsActionKind::Upload,
+            7,
+            &oid,
+            expires,
+            None,
             &signature,
             expires - 1,
         ),
@@ -315,6 +429,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
+            Some(42),
             &signature,
             expires,
         ),

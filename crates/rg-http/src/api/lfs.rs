@@ -23,6 +23,10 @@ use rg_core::platform::fs::{discard_file_async, LFS_STORAGE_HINT};
 pub struct LfsActionQuery {
     expires: Option<i64>,
     signature: Option<String>,
+    /// The account the URL was issued to, echoed back so the signature can be
+    /// recomputed over it. It is covered by the HMAC, so neither editing nor
+    /// dropping it produces a URL that verifies.
+    actor: Option<i64>,
 }
 
 /// One actionable error for a filesystem failure on an LFS object path.
@@ -39,7 +43,45 @@ fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) ->
     ))
 }
 
-fn verify_signed_action(
+/// Does the account a signed URL was issued to still stand?
+///
+/// This is [`crate::api::auth::session_standing_middleware`]'s question, asked
+/// again here because the middleware cannot ask it: a presigned URL carries no
+/// session for it to read — that is the entire point of the shape, and the
+/// price is that the capability answers for itself for as long as it lives.
+/// Deactivating an account therefore left up to six hours of write access to a
+/// private repository standing, which is the same distance between "revoked"
+/// and "revoked, eventually" that the middleware was built to close.
+///
+/// Fails closed and keeps the two answers apart: `401` for an account that is
+/// gone or disabled, `503` for a database that could not be asked — a client
+/// is right to retry the second and wrong to retry the first.
+async fn signer_still_stands(state: &AppState, user_id: i64) -> Result<(), AppError> {
+    match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
+        Ok(Some(user)) if user.is_usable() => Ok(()),
+        Ok(_) => {
+            tracing::warn!(
+                user_id,
+                "rejecting signed LFS action URL: account is disabled or gone"
+            );
+            Err(AppError::unauthorized(
+                "LFS action URL belongs to a disabled account",
+            ))
+        }
+        Err(error) => {
+            tracing::error!(
+                user_id,
+                error = %format!("{error:#}"),
+                "could not verify account standing for a signed LFS action URL"
+            );
+            Err(AppError::service_unavailable(
+                "could not verify account standing",
+            ))
+        }
+    }
+}
+
+async fn verify_signed_action(
     state: &AppState,
     repo_id: i64,
     oid: &str,
@@ -55,10 +97,20 @@ fn verify_signed_action(
                 repo_id,
                 oid,
                 *expires,
+                query.actor,
                 signature,
                 chrono::Utc::now().timestamp(),
             ) {
-                Ok(()) => Ok(true),
+                Ok(()) => {
+                    // An anonymous issue has no account behind it to re-check:
+                    // it was handed out on a public repository, where the read
+                    // gate would let the same caller through with no
+                    // credentials at all.
+                    if let Some(user_id) = query.actor {
+                        signer_still_stands(state, user_id).await?;
+                    }
+                    Ok(true)
+                }
                 Err(rg_core::lfs::service::LfsActionSignatureError::Expired) => {
                     Err(AppError::gone("LFS action URL has expired"))
                 }
@@ -155,6 +207,7 @@ pub async fn batch(
         &repo,
         &req,
         state.jwt_secret.as_bytes(),
+        actor_id,
     )
     .await
     {
@@ -204,7 +257,9 @@ pub async fn upload_object(
         &oid,
         rg_core::lfs::service::LfsActionKind::Upload,
         &query,
-    ) {
+    )
+    .await
+    {
         Ok(signed) => signed,
         Err(error) => return error.into_response(),
     };
@@ -346,7 +401,9 @@ async fn authorize_lfs_download(
         oid,
         rg_core::lfs::service::LfsActionKind::Download,
         query,
-    ) {
+    )
+    .await
+    {
         Ok(signed) => signed,
         Err(error) => return Err(error.into_response()),
     };
