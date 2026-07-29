@@ -144,10 +144,9 @@ pub async fn update(
     if let Err(error) = validate_request(&state, &body).await {
         return error.into_response();
     }
-    let model = match rg_db::ops::ci_environment_ops::find_by_id(&state.db, id).await {
-        Ok(Some(model)) if model.repo_id == repo.id => model,
-        Ok(_) => return AppError::not_found("environment not found").into_response(),
-        Err(error) => return AppError::from(error).into_response(),
+    let model = match environment_in_repo(&state, repo.id, id).await {
+        Ok(model) => model,
+        Err(error) => return error.into_response(),
     };
     let mut active: rg_db::entities::ci_environment::ActiveModel = model.into();
     active.name = Set(body.name.trim().to_string());
@@ -172,10 +171,8 @@ pub async fn delete(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    match rg_db::ops::ci_environment_ops::find_by_id(&state.db, id).await {
-        Ok(Some(model)) if model.repo_id == repo.id => {}
-        Ok(_) => return AppError::not_found("environment not found").into_response(),
-        Err(error) => return AppError::from(error).into_response(),
+    if let Err(error) = environment_in_repo(&state, repo.id, id).await {
+        return error.into_response();
     }
     match rg_db::ops::ci_environment_ops::has_jobs(&state.db, id).await {
         Ok(true) => {
@@ -188,6 +185,31 @@ pub async fn delete(
     match rg_db::ops::ci_environment_ops::delete(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+/// Fetch a CI environment and re-anchor it to the repository the caller was
+/// authorized for.
+///
+/// `{id}` is a global `ci_environments` primary key while `RepoAdmin` only ever
+/// proves something about `{owner}/{name}`, so administering one repository must
+/// not reach another one's environments — which is where deployment secrets and
+/// the approver list live. A mismatch answers 404 rather than 403: a 403 would
+/// still confirm the id exists, which is most of what an id-walking caller wants
+/// to learn.
+///
+/// `update` and `delete` each spelled this comparison inline, and
+/// [`authorize_approval`] spelled a third copy. A named helper is the form
+/// `global_id_anchor_guard` can read — a comparison is not.
+async fn environment_in_repo(
+    state: &AppState,
+    repo_id: i64,
+    environment_id: i64,
+) -> Result<rg_db::entities::ci_environment::Model, AppError> {
+    match rg_db::ops::ci_environment_ops::find_by_id(&state.db, environment_id).await {
+        Ok(Some(model)) if model.repo_id == repo_id => Ok(model),
+        Ok(_) => Err(AppError::not_found("environment not found")),
+        Err(error) => Err(AppError::from(error)),
     }
 }
 
@@ -286,18 +308,19 @@ async fn authorize_approval(
             return Err(AppError::bad_request("job has no protected environment").into_response())
         }
     };
-    let environment =
-        match rg_db::ops::ci_environment_ops::find_by_id(&state.db, environment_id).await {
-            Ok(Some(environment)) if environment.repo_id == repo.id && environment.protected => {
-                environment
-            }
-            Ok(_) => {
-                return Err(
-                    AppError::bad_request("protected environment no longer exists").into_response(),
-                )
-            }
-            Err(error) => return Err(AppError::from(error).into_response()),
-        };
+    let environment = match environment_in_repo(state, repo.id, environment_id).await {
+        // Gone, belonging to another repository, or no longer protected: the
+        // job is waiting on an environment that cannot admit it, which makes
+        // the request stale rather than the resource missing — so this keeps
+        // answering 400, not the helper's 404.
+        Ok(environment) if environment.protected => environment,
+        Ok(_) | Err(AppError::NotFound(_)) => {
+            return Err(
+                AppError::bad_request("protected environment no longer exists").into_response(),
+            )
+        }
+        Err(error) => return Err(error.into_response()),
+    };
     let allowed: Vec<i64> = environment
         .allowed_approver_ids
         .as_deref()

@@ -126,6 +126,36 @@ async fn require_pr_manager(
     Ok((repo_model, actor_id, pr))
 }
 
+/// Fetch a review and re-anchor it to the pull request the caller was
+/// authorized for.
+///
+/// A review id is a global `pr_reviews` primary key while the gate above it
+/// only proves something about `{owner}/{name}`, and the route's `{number}`
+/// only names a pull request *within* that repository — so both halves have to
+/// be re-checked: the review must belong to this repository **and** to this
+/// pull request. Anchoring to the repository alone would still let a review on
+/// PR #7 be dismissed through the URL of PR #9.
+///
+/// A mismatch answers 404 rather than 403: a 403 would still confirm the id
+/// exists, which is most of what an id-walking caller wants to learn.
+///
+/// `get_review`, `dismiss_review` and `create_review_comment` each spelled the
+/// two-part comparison inline — and the third takes its id from the request
+/// *body*, where no path parameter announces it. A named helper is the form
+/// `global_id_anchor_guard` can read; a comparison is not.
+async fn review_in_pr(
+    state: &AppState,
+    repo_id: i64,
+    pr_id: i64,
+    review_id: i64,
+) -> Result<rg_db::entities::pr_review::Model, AppError> {
+    match rg_core::review::service::get_review(&state.db, review_id).await {
+        Ok(review) if review.repo_id == repo_id && review.pr_id == pr_id => Ok(review),
+        Ok(_) => Err(AppError::not_found("review not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 /// As with [`require_pr_manager`], authentication and repository read access
 /// are already proven by the handler's `RepoAuthRead`; this resolves the
 /// suggestion's source and checks write access on the *head* repository.
@@ -412,12 +442,9 @@ pub async fn get_review(
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
     };
-    match rg_core::review::service::get_review(&state.db, id).await {
-        Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => {
-            (StatusCode::OK, Json(review)).into_response()
-        }
-        Ok(_) => AppError::not_found("review not found").into_response(),
-        Err(e) => AppError::from(e).into_response(),
+    match review_in_pr(&state, repo_model.id, pr.id, id).await {
+        Ok(review) => (StatusCode::OK, Json(review)).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -453,10 +480,9 @@ pub async fn dismiss_review(
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let review = match rg_core::review::service::get_review(&state.db, id).await {
-        Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => review,
-        Ok(_) => return AppError::not_found("review not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let review = match review_in_pr(&state, repo_model.id, pr.id, id).await {
+        Ok(review) => review,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::review::service::dismiss_review(&state.db, review.id, user_id, req.message).await
@@ -918,10 +944,9 @@ pub async fn create_review_comment(
         Err(e) => return AppError::from(e).into_response(),
     };
     let review = match req.review_id {
-        Some(review_id) => match rg_core::review::service::get_review(&state.db, review_id).await {
-            Ok(review) if review.repo_id == repo_model.id && review.pr_id == pr.id => review,
-            Ok(_) => return AppError::not_found("review not found").into_response(),
-            Err(e) => return AppError::from(e).into_response(),
+        Some(review_id) => match review_in_pr(&state, repo_model.id, pr.id, review_id).await {
+            Ok(review) => review,
+            Err(e) => return e.into_response(),
         },
         None => match rg_core::review::service::submit_review(
             &state.db,

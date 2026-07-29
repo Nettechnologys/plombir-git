@@ -188,13 +188,9 @@ pub async fn get_import_status(
     AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    match rg_db::ops::import_task_ops::find_by_id(&state.db, id).await {
-        Ok(Some(task)) if task.user_id == user_id => {
-            (StatusCode::OK, Json(serde_json::json!(task))).into_response()
-        }
-        Ok(Some(_)) => AppError::not_found("import task not found").into_response(),
-        Ok(None) => AppError::not_found("import task not found").into_response(),
-        Err(e) => AppError::from(e).into_response(),
+    match import_task_of_user(&state, user_id, id).await {
+        Ok(task) => (StatusCode::OK, Json(serde_json::json!(task))).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -240,15 +236,36 @@ pub async fn delete_import(
     AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    match rg_db::ops::import_task_ops::find_by_id(&state.db, id).await {
-        Ok(Some(task)) if task.user_id == user_id => {
-            match rg_db::ops::import_task_ops::delete_by_id(&state.db, id).await {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(e) => AppError::from(e).into_response(),
-            }
-        }
-        Ok(Some(_)) => AppError::not_found("import task not found").into_response(),
-        Ok(None) => AppError::not_found("import task not found").into_response(),
+    if let Err(e) = import_task_of_user(&state, user_id, id).await {
+        return e.into_response();
+    }
+    match rg_db::ops::import_task_ops::delete_by_id(&state.db, id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Fetch an import task and re-anchor it to the account that authenticated.
+///
+/// `{id}` is a global `import_tasks` primary key and the route's only gate is
+/// `AuthUser` — being *some* account must not reach another one's imports,
+/// which carry the source-forge auth token the import was started with. The
+/// owner here plays the part the repository plays elsewhere in this family: the
+/// row names its scope, and the handler has to compare it.
+///
+/// A mismatch answers 404 rather than 403, for the same reason the repository
+/// anchors do: a 403 confirms the id exists.
+///
+/// `get_import_status` and `delete_import` each spelled the comparison inline.
+/// A named helper is the form `global_id_anchor_guard` can read.
+async fn import_task_of_user(
+    state: &AppState,
+    user_id: i64,
+    task_id: i64,
+) -> Result<rg_db::entities::import_task::Model, AppError> {
+    match rg_db::ops::import_task_ops::find_by_id(&state.db, task_id).await {
+        Ok(Some(task)) if task.user_id == user_id => Ok(task),
+        Ok(_) => Err(AppError::not_found("import task not found")),
+        Err(e) => Err(AppError::from(e)),
     }
 }

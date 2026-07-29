@@ -101,10 +101,9 @@ pub async fn update(
     RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<UpdateTagProtectionRequest>,
 ) -> impl IntoResponse {
-    let model = match rg_db::ops::protected_tag_ops::find_by_id(&state.db, id).await {
-        Ok(Some(v)) if v.repo_id == repo.id => v,
-        Ok(_) => return AppError::not_found("tag protection not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let model = match tag_protection_in_repo(&state, repo.id, id).await {
+        Ok(model) => model,
+        Err(e) => return e.into_response(),
     };
     let mut active: rg_db::entities::protected_tag::ActiveModel = model.into();
     active.allowed_user_ids = Set(Some(
@@ -123,14 +122,38 @@ pub async fn delete(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    match rg_db::ops::protected_tag_ops::find_by_id(&state.db, id).await {
-        Ok(Some(v)) if v.repo_id == repo.id => {}
-        Ok(_) => return AppError::not_found("tag protection not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    if let Err(e) = tag_protection_in_repo(&state, repo.id, id).await {
+        return e.into_response();
     }
     match rg_db::ops::protected_tag_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Fetch a tag protection rule and re-anchor it to the repository the caller
+/// was authorized for.
+///
+/// `{id}` is a global `protected_tags` primary key while `RepoAdmin` only ever
+/// proves something about `{owner}/{name}`, so administering one repository
+/// must not reach another one's rules. A mismatch answers 404 rather than 403:
+/// a 403 would still confirm the id exists, which is most of what an id-walking
+/// caller wants to learn.
+///
+/// `update` and `delete` each spelled this comparison inline. A named helper is
+/// the form `global_id_anchor_guard` can read — a comparison is not — so a third
+/// route that forgets the anchor now fails the build rather than review.
+async fn tag_protection_in_repo(
+    state: &AppState,
+    repo_id: i64,
+    protection_id: i64,
+) -> Result<rg_db::entities::protected_tag::Model, AppError> {
+    match rg_db::ops::protected_tag_ops::find_by_id(&state.db, protection_id).await {
+        Ok(Some(v)) if v.repo_id == repo_id => Ok(v),
+        Ok(_) => Err(AppError::not_found("tag protection not found")),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 

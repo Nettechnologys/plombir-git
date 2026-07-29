@@ -158,13 +158,37 @@ pub async fn delete_deploy_key(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    let key = match rg_db::ops::deploy_key_ops::find_by_id(&state.db, id).await {
-        Ok(Some(key)) if key.repo_id == repo.id => key,
-        Ok(_) => return AppError::not_found("deploy key not found").into_response(),
-        Err(error) => return AppError::from(error).into_response(),
+    let key = match deploy_key_in_repo(&state, repo.id, id).await {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
     };
     match rg_db::ops::deploy_key_ops::delete_by_id(&state.db, key.id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+/// Fetch a deploy key and re-anchor it to the repository the caller was
+/// authorized for.
+///
+/// `{id}` is a global `deploy_keys` primary key while `RepoAdmin` only ever
+/// proves something about `{owner}/{name}`, so administering one repository must
+/// not revoke another one's push credentials. A mismatch answers 404 rather than
+/// 403: a 403 would still confirm the id exists, which is most of what an
+/// id-walking caller wants to learn.
+///
+/// Only one route needs it today. It is a named helper rather than the inline
+/// comparison it replaces because `global_id_anchor_guard` can read a call and
+/// cannot read a comparison — so the second deploy-key route to be written is
+/// held to this by the build instead of by review.
+async fn deploy_key_in_repo(
+    state: &AppState,
+    repo_id: i64,
+    key_id: i64,
+) -> Result<rg_db::entities::deploy_key::Model, AppError> {
+    match rg_db::ops::deploy_key_ops::find_by_id(&state.db, key_id).await {
+        Ok(Some(key)) if key.repo_id == repo_id => Ok(key),
+        Ok(_) => Err(AppError::not_found("deploy key not found")),
+        Err(error) => Err(AppError::from(error)),
     }
 }
