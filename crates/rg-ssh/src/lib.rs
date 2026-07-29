@@ -318,16 +318,30 @@ struct ReceivePackContext {
     repo_name: String,
 }
 
+/// Who a session speaks for — and, just as importantly, *what row* said so.
+///
+/// The credential id is carried rather than dropped because authentication
+/// happens once and a connection carries any number of execs: without it the
+/// only thing a later exec could re-read is the account, and a revoked key
+/// would keep working for as long as the connection stayed open.
 #[derive(Clone, Debug)]
 enum AuthenticatedIdentity {
-    User(i64),
-    DeployKey { repo_id: i64, read_only: bool },
+    User {
+        user_id: i64,
+        /// The SSH key that spoke for the account, or `None` when the session
+        /// authenticated by password — there is no key row to revoke then.
+        ssh_key_id: Option<i64>,
+    },
+    /// A deploy key, named by its row alone: the repository it opens and
+    /// whether it may write are re-read on every exec, so caching them here
+    /// would only be a second, staler copy.
+    DeployKey { key_id: i64 },
 }
 
 impl AuthenticatedIdentity {
     fn user_id(&self) -> Option<i64> {
         match self {
-            Self::User(user_id) => Some(*user_id),
+            Self::User { user_id, .. } => Some(*user_id),
             Self::DeployKey { .. } => None,
         }
     }
@@ -397,7 +411,10 @@ impl Handler for SshHandler {
                         });
                     }
                 }
-                self.authenticated_identity = Some(AuthenticatedIdentity::User(key.user_id));
+                self.authenticated_identity = Some(AuthenticatedIdentity::User {
+                    user_id: key.user_id,
+                    ssh_key_id: Some(key.id),
+                });
                 if let Err(error) = rg_db::ops::ssh_key_ops::touch_last_used(db, key.id).await {
                     tracing::warn!(
                         key_id = key.id,
@@ -410,10 +427,8 @@ impl Handler for SshHandler {
             }
             Ok(None) => match rg_db::ops::deploy_key_ops::find_by_fingerprint(db, &fp_str).await {
                 Ok(Some(key)) => {
-                    self.authenticated_identity = Some(AuthenticatedIdentity::DeployKey {
-                        repo_id: key.repo_id,
-                        read_only: key.read_only,
-                    });
+                    self.authenticated_identity =
+                        Some(AuthenticatedIdentity::DeployKey { key_id: key.id });
                     if let Err(error) =
                         rg_db::ops::deploy_key_ops::touch_last_used(db, key.id).await
                     {
@@ -517,7 +532,10 @@ impl Handler for SshHandler {
                     .as_ref()
                     .map(|user| user.id)
                     .expect("an accepted password attempt resolved to an account");
-                self.authenticated_identity = Some(AuthenticatedIdentity::User(user_id));
+                self.authenticated_identity = Some(AuthenticatedIdentity::User {
+                    user_id,
+                    ssh_key_id: None,
+                });
                 tracing::info!(username, "SSH password auth accepted");
                 Ok(Auth::Accept)
             }
@@ -924,18 +942,52 @@ async fn authorize_git_service(
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
 
+    // "Who are you" is re-asked here, next to "what may you do", so the two
+    // cannot drift apart: `can_read_repo` / `can_write_repo` re-read the
+    // permission on every exec but know nothing about `is_active` /
+    // `deleted_at`, and the identity itself was resolved once, at
+    // authentication. One connection carries any number of execs — under
+    // `ControlMaster`, or a held `ssh -N`, that once was the whole lifetime of
+    // an offboarded developer's access.
     let allowed = match identity {
-        AuthenticatedIdentity::User(actor_id) => match service {
-            "git-upload-pack" => {
-                rg_core::repo::service::can_read_repo(db, &repo, Some(*actor_id)).await?
+        AuthenticatedIdentity::User {
+            user_id,
+            ssh_key_id,
+        } => {
+            match rg_db::ops::user_ops::find_by_id(db, *user_id).await? {
+                Some(user) if user.is_usable() => {}
+                _ => anyhow::bail!("account is disabled or gone"),
             }
-            "git-receive-pack" => {
-                rg_core::repo::service::can_write_repo(db, &repo, Some(*actor_id)).await?
+            // A password session has no key row to revoke; a key session does,
+            // and deleting the key is the other half of offboarding.
+            if let Some(key_id) = ssh_key_id {
+                if rg_db::ops::ssh_key_ops::find_by_id(db, *key_id)
+                    .await?
+                    .is_none_or(|key| key.user_id != *user_id)
+                {
+                    anyhow::bail!("the SSH key this session authenticated with is gone");
+                }
             }
-            _ => false,
-        },
-        AuthenticatedIdentity::DeployKey { repo_id, read_only } => {
-            deploy_key_allows(*repo_id, *read_only, repo.id, service)
+            match service {
+                "git-upload-pack" => {
+                    rg_core::repo::service::can_read_repo(db, &repo, Some(*user_id)).await?
+                }
+                "git-receive-pack" => {
+                    rg_core::repo::service::can_write_repo(db, &repo, Some(*user_id)).await?
+                }
+                _ => false,
+            }
+        }
+        AuthenticatedIdentity::DeployKey { key_id } => {
+            // Re-read rather than trust the cached pair: a key that was
+            // narrowed to read-only, or re-pointed, has to take effect on the
+            // next exec and not on the next connection.
+            let key = rg_db::ops::deploy_key_ops::find_by_id(db, *key_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the deploy key this session authenticated with is gone")
+                })?;
+            deploy_key_allows(key.repo_id, key.read_only, repo.id, service)
         }
     };
 
