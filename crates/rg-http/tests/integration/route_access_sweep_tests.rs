@@ -92,9 +92,17 @@ const ORG: &str = "sweeporg";
 /// Writing it also corrected two reasons that were simply untrue: the two
 /// `DELETE .../assets/{attachment_id}` rows were signed off as "answered 404 for
 /// every persona" while on the private repository they answer `401` to an
-/// anonymous caller and `403` to the outsider. They stay on the list — the
-/// public-repository half really is out of reach — but on a reason that
-/// describes them (card_3cc941a766a0).
+/// anonymous caller and `403` to the outsider. They stay on the list — no
+/// fixture here can seed a pull request — but on a reason that describes them
+/// (card_3cc941a766a0), and one that names *which* persona is the reason.
+///
+/// That second correction did not go far enough, which is the standing hazard
+/// of a reason written as prose: the rewritten text still claimed the public
+/// half answered `404` to *everyone*, when an anonymous caller has been getting
+/// `401` there all along — first from an `extract_user_id` call at the top of
+/// the handler body, now from the `RepoAuthRead` in its signature
+/// (card_41d5b5cf0cbb). Nothing in this file compares a reason to a status
+/// code, so only a reader re-measuring catches it.
 const NO_FIXTURE: &[(&str, &str)] = &[
     (
         "GET /api/v1/artifacts/{id}",
@@ -116,11 +124,13 @@ const NO_FIXTURE: &[(&str, &str)] = &[
     ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
-        "the handler resolves the pull request before it decides access, and seeding one \
-         needs commits on two branches — out of reach of this fixture. Measured, because \
-         the reason this row used to give was wrong: on the *private* repository the gate \
-         does answer (401 anonymous, 403 outsider), but on the public one every persona is \
-         answered 404 for want of a pull request, so the row cannot be judged as a whole",
+        "only the *owner* persona is out of reach: seeding a pull request needs commits on \
+         two branches, so the row answers 404 for want of one. The gate itself answers \
+         everybody else, and the row is listed on measured values rather than a guess — \
+         private: 401 anonymous, 403 outsider, 404 owner; public: 401 anonymous, 404 \
+         outsider, 404 owner. The anonymous 401 on the *public* repository is what the \
+         handler's `RepoAuthRead` says (card_41d5b5cf0cbb); the outsider gets as far as the \
+         missing pull request because reading a public repository is his right",
     ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",

@@ -1,14 +1,13 @@
 //! Issue, pull-request and comment attachment APIs.
 
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{body::Body, Json};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use crate::api::auth::extract_user_id;
 use crate::api::repo_access::{self, RepoAuthRead, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
@@ -104,13 +103,15 @@ pub async fn get_issue_attachment(
 pub async fn delete_issue_attachment(
     State(state): State<AppState>,
     Path((owner, repo, number, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
 ) -> Response {
     delete(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::Issue,
@@ -184,13 +185,15 @@ pub async fn get_pull_request_attachment(
 pub async fn delete_pull_request_attachment(
     State(state): State<AppState>,
     Path((owner, repo, number, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
 ) -> Response {
     delete(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::PullRequest,
@@ -264,13 +267,15 @@ pub async fn get_issue_comment_attachment(
 pub async fn delete_issue_comment_attachment(
     State(state): State<AppState>,
     Path((owner, repo, comment_id, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
 ) -> Response {
     delete(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::IssueComment,
@@ -344,13 +349,15 @@ pub async fn get_review_comment_attachment(
 pub async fn delete_review_comment_attachment(
     State(state): State<AppState>,
     Path((owner, repo, comment_id, attachment_id)): Path<(String, String, i64, i64)>,
-    headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
+    RepoAuthRead {
+        repo: repo_model,
+        actor_id,
+    }: RepoAuthRead,
 ) -> Response {
     delete(
         &state,
         repo_model,
-        &headers,
+        actor_id,
         &owner,
         &repo,
         TargetKind::ReviewComment,
@@ -631,20 +638,22 @@ async fn stream_attachment(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `user_id` arrives from the handler's [`RepoAuthRead`] argument, for the same
+/// reason [`create`] takes it that way: the session is what the route table
+/// declares, so it has to be a type in the signature rather than a line in the
+/// body. `DELETE` carries no body to trip over, so nothing *visibly* broke —
+/// but on a public repository `RepoRead` admitted an anonymous caller into the
+/// handler and only the first statement turned them away.
 async fn delete(
     state: &AppState,
     repo_model: rg_db::entities::repository::Model,
-    headers: &HeaderMap,
+    user_id: i64,
     _owner: &str,
     _repo_name: &str,
     kind: TargetKind,
     target_id: i64,
     attachment_id: i64,
 ) -> Response {
-    let user_id = match extract_user_id(headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
     let (repo, target) = match resolve(state, repo_model, kind, target_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
