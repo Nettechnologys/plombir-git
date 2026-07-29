@@ -1054,11 +1054,13 @@ async fn the_route_table_covers_the_whole_server() {
         }
     }
 
-    // Every `Foreign` sign-off must say something.
+    // Every `Foreign` sign-off must say something. What it *claims* — a named
+    // middleware, or the module that holds the gate — is checked against the
+    // route it sits on by `foreign_gate_guard`.
     for fact in &facts {
-        if let Access::Foreign(reason) = fact.access {
+        if let Access::Foreign(gate) = fact.access {
             assert!(
-                !reason.trim().is_empty(),
+                !gate.note().trim().is_empty(),
                 "{} is signed off as Foreign without a reason",
                 fact.label()
             );

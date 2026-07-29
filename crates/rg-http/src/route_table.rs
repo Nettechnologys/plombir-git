@@ -76,10 +76,53 @@ pub enum Access {
     InstanceAdmin,
     /// A different credential mechanism entirely — a runner token, an OCI
     /// bearer token, git-over-HTTP credentials, a CI job token, an LFS action
-    /// token, a WebSocket ticket. The string is the sign-off: it names the
-    /// mechanism, because these routes are the ones the sweep cannot drive with
-    /// a session token and therefore cannot check.
-    Foreign(&'static str),
+    /// token, a WebSocket ticket. These are the routes the sweep cannot drive
+    /// with a session token and therefore cannot check, so the sign-off names
+    /// the mechanism — see [`ForeignGate`].
+    Foreign(ForeignGate),
+}
+
+/// Where a [`Access::Foreign`] route's credential is actually checked.
+///
+/// `Foreign` is the one level the sweep answers `Expect::Unchecked` to, which
+/// makes it the one level that can quietly become an *exemption*: `POST
+/// /runners/register` declared `"CI runner: runner token via
+/// `authenticate_runner`"` while carrying no such layer — the real gate was an
+/// instance-admin session — and bought itself that exemption on the strength of
+/// a free-text string nobody compared to anything (card_cd6f512e2e52).
+///
+/// So the string is a *claim* now, and `tests/integration/foreign_gate_guard.rs`
+/// holds every `Foreign` route to it: the named layer has to be on the route,
+/// or the named module has to be where the handler actually lives. A route that
+/// can say neither has no business being `Foreign`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignGate {
+    /// The credential is checked by a middleware layer on the route itself.
+    /// `layer` is the name that layer was registered under — see
+    /// [`Wrap::credential`] — and the guard compares the two.
+    Middleware {
+        layer: &'static str,
+        note: &'static str,
+    },
+    /// The handler checks the credential itself, because the protocol carries
+    /// it in a shape no shared extractor understands: git-over-HTTP
+    /// credentials, an OCI scope token, an LFS action signature, a CI job
+    /// token, a WebSocket ticket. `module` is the source file the handler lives
+    /// in, relative to `crates/rg-http/src/`, and the guard checks that it
+    /// really does.
+    Handler {
+        module: &'static str,
+        note: &'static str,
+    },
+}
+
+impl ForeignGate {
+    /// The prose half of the sign-off: what the mechanism is.
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Middleware { note, .. } | Self::Handler { note, .. } => note,
+        }
+    }
 }
 
 impl Access {
@@ -113,6 +156,18 @@ pub struct RouteFact {
     pub path: String,
     /// The access level the route declares.
     pub access: Access,
+    /// The name of the credential middleware this route was registered with,
+    /// if any — see [`Wrap::credential`]. `None` covers both "no layer at all"
+    /// and "a layer that carries no credential", such as a body limit: neither
+    /// can stand in for the check a `Foreign` route claims.
+    pub credential: Option<&'static str>,
+    /// `std::any::type_name` of the handler — `rg_http::oci::list_tags`.
+    ///
+    /// Recorded by the same statement that registers the route, so a route
+    /// cannot claim to be gated inside a module its handler does not live in.
+    /// Best-effort by definition (the compiler owes nobody a stable spelling),
+    /// which is why only a test reads it.
+    pub handler: &'static str,
 }
 
 impl RouteFact {
@@ -139,10 +194,45 @@ pub(crate) struct RouteTable {
 /// Applied to a route's `MethodRouter` before it is registered — the per-route
 /// body limit and the credential middleware a few routes carry.
 ///
-/// A trait object rather than a function pointer: the wrappers close over the
-/// `AppState` (the runner token check is state-carrying middleware) and over
-/// the credential rate limiter.
-type Wrap<'a> = &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>;
+/// The layer is held as a trait object rather than a function pointer: the
+/// wrappers close over the `AppState` (the runner token check is state-carrying
+/// middleware) and over the credential rate limiter.
+///
+/// What the wrapper carries besides the closure is its *name*, and only when it
+/// is a credential check. A body limit and a runner-token gate are the same
+/// type to `axum` and were the same thing to this table, so "is the layer this
+/// route claims actually on it?" had no answer. Now it does: the name travels
+/// into the route's [`RouteFact`] and the `Foreign` guard reads it back.
+pub(crate) struct Wrap<'a> {
+    credential: Option<&'static str>,
+    apply: &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>,
+}
+
+impl<'a> Wrap<'a> {
+    /// A layer that carries no credential: a body limit, a rate limiter.
+    pub(crate) fn plain(
+        apply: &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>,
+    ) -> Self {
+        Self {
+            credential: None,
+            apply,
+        }
+    }
+
+    /// A layer that *is* this route's credential check.
+    ///
+    /// `layer` is what [`ForeignGate::Middleware`] is held to, so pass the same
+    /// constant on both sides rather than two spellings of one name.
+    pub(crate) fn credential(
+        layer: &'static str,
+        apply: &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>,
+    ) -> Self {
+        Self {
+            credential: Some(layer),
+            apply,
+        }
+    }
+}
 
 impl RouteTable {
     pub(crate) fn new(prefix: &'static str) -> Self {
@@ -173,11 +263,15 @@ impl RouteTable {
         method: &'static str,
         path: &'static str,
         method_router: MethodRouter<AppState>,
+        credential: Option<&'static str>,
+        handler: &'static str,
     ) -> Self {
         self.facts.push(RouteFact {
             method,
             path: format!("{}{}", self.prefix, path),
             access,
+            credential,
+            handler,
         });
         self.router = self.router.route(path, method_router);
         self
@@ -188,7 +282,14 @@ impl RouteTable {
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "GET", path, axum::routing::get(handler))
+        self.add(
+            access,
+            "GET",
+            path,
+            axum::routing::get(handler),
+            None,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn head<H, T>(self, access: Access, path: &'static str, handler: H) -> Self
@@ -196,7 +297,14 @@ impl RouteTable {
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "HEAD", path, axum::routing::head(handler))
+        self.add(
+            access,
+            "HEAD",
+            path,
+            axum::routing::head(handler),
+            None,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn post<H, T>(self, access: Access, path: &'static str, handler: H) -> Self
@@ -204,7 +312,14 @@ impl RouteTable {
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "POST", path, axum::routing::post(handler))
+        self.add(
+            access,
+            "POST",
+            path,
+            axum::routing::post(handler),
+            None,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn put<H, T>(self, access: Access, path: &'static str, handler: H) -> Self
@@ -212,7 +327,14 @@ impl RouteTable {
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "PUT", path, axum::routing::put(handler))
+        self.add(
+            access,
+            "PUT",
+            path,
+            axum::routing::put(handler),
+            None,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn patch<H, T>(self, access: Access, path: &'static str, handler: H) -> Self
@@ -220,7 +342,14 @@ impl RouteTable {
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "PATCH", path, axum::routing::patch(handler))
+        self.add(
+            access,
+            "PATCH",
+            path,
+            axum::routing::patch(handler),
+            None,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn delete<H, T>(self, access: Access, path: &'static str, handler: H) -> Self
@@ -228,7 +357,14 @@ impl RouteTable {
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "DELETE", path, axum::routing::delete(handler))
+        self.add(
+            access,
+            "DELETE",
+            path,
+            axum::routing::delete(handler),
+            None,
+            std::any::type_name::<H>(),
+        )
     }
 
     // ── Layered variants ───────────────────────────────────────────────────
@@ -243,13 +379,20 @@ impl RouteTable {
         access: Access,
         path: &'static str,
         handler: H,
-        wrap: Wrap<'_>,
+        wrap: &Wrap<'_>,
     ) -> Self
     where
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "GET", path, wrap(axum::routing::get(handler)))
+        self.add(
+            access,
+            "GET",
+            path,
+            (wrap.apply)(axum::routing::get(handler)),
+            wrap.credential,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn post_with<H, T>(
@@ -257,13 +400,20 @@ impl RouteTable {
         access: Access,
         path: &'static str,
         handler: H,
-        wrap: Wrap<'_>,
+        wrap: &Wrap<'_>,
     ) -> Self
     where
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "POST", path, wrap(axum::routing::post(handler)))
+        self.add(
+            access,
+            "POST",
+            path,
+            (wrap.apply)(axum::routing::post(handler)),
+            wrap.credential,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn put_with<H, T>(
@@ -271,13 +421,20 @@ impl RouteTable {
         access: Access,
         path: &'static str,
         handler: H,
-        wrap: Wrap<'_>,
+        wrap: &Wrap<'_>,
     ) -> Self
     where
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "PUT", path, wrap(axum::routing::put(handler)))
+        self.add(
+            access,
+            "PUT",
+            path,
+            (wrap.apply)(axum::routing::put(handler)),
+            wrap.credential,
+            std::any::type_name::<H>(),
+        )
     }
 
     pub(crate) fn patch_with<H, T>(
@@ -285,12 +442,19 @@ impl RouteTable {
         access: Access,
         path: &'static str,
         handler: H,
-        wrap: Wrap<'_>,
+        wrap: &Wrap<'_>,
     ) -> Self
     where
         H: Handler<T, AppState>,
         T: 'static,
     {
-        self.add(access, "PATCH", path, wrap(axum::routing::patch(handler)))
+        self.add(
+            access,
+            "PATCH",
+            path,
+            (wrap.apply)(axum::routing::patch(handler)),
+            wrap.credential,
+            std::any::type_name::<H>(),
+        )
     }
 }
