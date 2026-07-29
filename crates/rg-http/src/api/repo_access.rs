@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use axum::extract::{FromRequestParts, Path};
+use axum::extract::{FromRequest, FromRequestParts, Path, Request};
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
 
@@ -364,6 +364,112 @@ pub(crate) async fn require_owner(
 }
 
 // ---------------------------------------------------------------------------
+// Namespace gate: the target is named by the request *body*, not by the route
+// ---------------------------------------------------------------------------
+//
+// Every rule above starts from a repository the route already named, which is
+// why a path-based extractor can carry it. A handful of routes do not work that
+// way: they take the `owner/name` they are about to write into out of the JSON
+// body, and the repository may not even exist yet. `POST /imports` is the one
+// that made this visible — `target_owner` arrived from the body and was passed
+// straight to the import service, which happily filled *someone else's*
+// namespace with issues, releases and branches, or created a repository under
+// their account.
+//
+// The rule such a route needs is not "may I write to this repo" alone: it is
+// "may I write into this namespace at all", and that has two halves — the
+// repository exists (then it is the ordinary write gate) or it does not (then
+// it is the right to create under that owner, the same rule `create_repo`
+// applies to its `org` field).
+
+/// A request body that names the `owner/name` it wants to write into.
+///
+/// Implemented next to the request type it belongs to, so the derivation of the
+/// target name (an import may leave it out and have it read off the source URL)
+/// stays with the handler that owns the payload.
+pub trait TargetNamespace {
+    /// The account or organization the write is aimed at.
+    fn target_owner(&self) -> &str;
+    /// The repository name inside that namespace, already defaulted.
+    fn target_name(&self) -> String;
+}
+
+/// Require the right to write into `owner/name` when that pair comes from the
+/// request body rather than from the route.
+///
+/// An existing repository is decided by the ordinary write gate; a name that is
+/// still free is decided by [`require_namespace_create`]. Both answers come
+/// from this module, so a body-named target is not a second dialect of the
+/// rule.
+pub(crate) async fn require_namespace_write(
+    state: &AppState,
+    actor_id: i64,
+    owner: &str,
+    name: &str,
+) -> Result<(), AppError> {
+    let existing = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
+        .await
+        .map_err(AppError::from)?;
+
+    match existing {
+        Some(repo) => check_write_for(state, &repo, Some(actor_id)).await,
+        None => require_namespace_create(state, actor_id, owner)
+            .await
+            .map(|_| ()),
+    }
+}
+
+/// Require the right to create a *new* repository under `owner/`.
+///
+/// Two namespaces qualify: the caller's own account, and an organization the
+/// caller belongs to — the rule `create_repo` already applies to its `org`
+/// field. Returns the organization id when the namespace is one, so a caller
+/// that has to record it does not resolve the name a second time.
+///
+/// The owner name is resolved exactly the way the write path resolves it
+/// (username first, then organization), so the gate cannot end up looser than
+/// the thing it guards. An owner that is neither is a denial rather than a
+/// `404`: a caller with no right to that namespace learns nothing about
+/// whether the account exists.
+pub(crate) async fn require_namespace_create(
+    state: &AppState,
+    actor_id: i64,
+    owner: &str,
+) -> Result<Option<i64>, AppError> {
+    if let Some(user) = rg_db::ops::user_ops::find_by_username(&state.db, owner)
+        .await
+        .map_err(AppError::from)?
+    {
+        return if user.id == actor_id {
+            Ok(None)
+        } else {
+            Err(AppError::forbidden(
+                "you may not create a repository under this owner",
+            ))
+        };
+    }
+
+    if let Some(org) = rg_db::ops::org_ops::get_org_by_name(&state.db, owner)
+        .await
+        .map_err(AppError::from)?
+    {
+        return match rg_db::ops::org_ops::is_org_member(&state.db, org.id, actor_id)
+            .await
+            .map_err(AppError::from)?
+        {
+            true => Ok(Some(org.id)),
+            false => Err(AppError::forbidden(
+                "you are not a member of this organization",
+            )),
+        };
+    }
+
+    Err(AppError::forbidden(
+        "you may not create a repository under this owner",
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Typed access extractors
 // ---------------------------------------------------------------------------
 //
@@ -533,6 +639,45 @@ impl FromRequestParts<AppState> for RepoOwner {
         let (owner, name) = route_repo(parts, state).await?;
         let (repo, actor_id) = require_owner(state, &parts.headers, &owner, &name).await?;
         Ok(Self { repo, actor_id })
+    }
+}
+
+/// An authenticated caller who may write into the namespace their *body* names.
+///
+/// Mirrors [`require_namespace_write`]. This is the one extractor that reads the
+/// request body, because that is where the target lives: it deserializes the
+/// payload, asks the gate about the `owner/name` the payload names, and hands
+/// the handler both the caller and the already-parsed body. A handler that
+/// takes it cannot forget the check, and a handler that forgets to take it has
+/// no body to work with.
+///
+/// Being a body extractor, it must be the *last* argument of the handler.
+pub struct NamespaceWrite<B> {
+    pub actor_id: i64,
+    pub body: B,
+}
+
+impl<B> FromRequest<AppState> for NamespaceWrite<B>
+where
+    B: TargetNamespace + serde::de::DeserializeOwned + Send + 'static,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        // Authentication first, body second: an anonymous caller is turned away
+        // by `401` without the server parsing anything it was never going to
+        // act on — and without the shape of the payload deciding which of the
+        // two answers they get.
+        let actor_id = super::auth::extract_user_id(req.headers(), &state.jwt_secret)
+            .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+
+        let axum::Json(body) = axum::Json::<B>::from_request(req, state)
+            .await
+            .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+
+        require_namespace_write(state, actor_id, body.target_owner(), &body.target_name()).await?;
+
+        Ok(Self { actor_id, body })
     }
 }
 

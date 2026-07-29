@@ -44,12 +44,26 @@ failures.push(
   ]),
 );
 
-if (!/pub async fn get_import_status\([\s\S]*headers: HeaderMap,[\s\S]*extract_bearer_claims\(&headers, &state\.jwt_secret\)[\s\S]*task\.user_id == user_id/.test(backend)) {
+// Authentication is the `AuthUser` extractor, not a hand-rolled header read:
+// what these two assert is the *scoping* that follows it — a task belongs to
+// the user who started it and to nobody else. (They used to spell out
+// `headers: HeaderMap` + `extract_bearer_claims`, which is how the handlers
+// were written before the extractor migration; the check went on failing long
+// after the handlers were correct.)
+if (!/pub async fn get_import_status\([\s\S]*AuthUser\(user_id\): AuthUser,[\s\S]*task\.user_id == user_id/.test(backend)) {
   failures.push('GET /imports/{id} must authenticate and only return the current user task');
 }
 
-if (!/pub async fn delete_import\([\s\S]*headers: HeaderMap,[\s\S]*extract_bearer_claims\(&headers, &state\.jwt_secret\)[\s\S]*task\.user_id == user_id/.test(backend)) {
+if (!/pub async fn delete_import\([\s\S]*AuthUser\(user_id\): AuthUser,[\s\S]*task\.user_id == user_id/.test(backend)) {
   failures.push('DELETE /imports/{id} must authenticate and only delete the current user task');
+}
+
+// card_e736b5186281: the target namespace arrives in the *body*, so no
+// path-based extractor can gate it and the route table's `User` cannot state
+// it. `NamespaceWrite` is the gate; without it any authenticated user may
+// import into somebody else's `owner/name`.
+if (!/pub async fn start_import\([\s\S]*NamespaceWrite\s*\{[\s\S]*\}: NamespaceWrite<StartImportRequest>/.test(backend)) {
+  failures.push('POST /imports must take the NamespaceWrite gate over its target_owner');
 }
 
 for (const [name, pattern] of [

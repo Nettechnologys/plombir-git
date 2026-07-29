@@ -15,6 +15,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::api::auth::AuthUser;
+use crate::api::repo_access::{NamespaceWrite, TargetNamespace};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -59,6 +60,40 @@ fn default_true() -> bool {
     true
 }
 
+impl StartImportRequest {
+    /// The repository name the import will write to.
+    ///
+    /// The field is optional on the wire: leaving it out means "name it after
+    /// the source repository". The gate and the handler must agree on the
+    /// answer — a target the gate did not see is a target nobody authorized —
+    /// so the defaulting lives here rather than in either of them.
+    fn resolved_target_name(&self) -> String {
+        match self.target_name {
+            Some(ref n) if !n.is_empty() => n.clone(),
+            _ => {
+                let url = self
+                    .source_url
+                    .trim_end_matches('/')
+                    .trim_end_matches(".git");
+                url.split('/')
+                    .next_back()
+                    .unwrap_or("imported-repo")
+                    .to_string()
+            }
+        }
+    }
+}
+
+impl TargetNamespace for StartImportRequest {
+    fn target_owner(&self) -> &str {
+        &self.target_owner
+    }
+
+    fn target_name(&self) -> String {
+        self.resolved_target_name()
+    }
+}
+
 /// POST /api/v1/imports
 ///
 /// Start a new import from GitHub, GitLab, Gitea, or a generic Git remote.
@@ -71,12 +106,20 @@ fn default_true() -> bool {
         (status = 201, description = "Import started", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden (target namespace is someone else's)", body = serde_json::Value),
     ),
 )]
 pub async fn start_import(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
-    Json(body): Json<StartImportRequest>,
+    // The target namespace arrives in the body, so the gate is a body
+    // extractor: `target_owner` is decided by `api::repo_access` before this
+    // function runs. Without it any authenticated user could pour an import —
+    // issues, pull requests, releases, branches — into someone else's
+    // `owner/name`, or have a repository created under their account.
+    NamespaceWrite {
+        actor_id: user_id,
+        body,
+    }: NamespaceWrite<StartImportRequest>,
 ) -> impl IntoResponse {
     // Validate platform
     if !matches!(
@@ -95,20 +138,8 @@ pub async fn start_import(
         return AppError::bad_request(format!("invalid source URL: {e}")).into_response();
     }
 
-    // Resolve target name
-    let target_name = match body.target_name {
-        Some(ref n) if !n.is_empty() => n.clone(),
-        _ => {
-            let url = body
-                .source_url
-                .trim_end_matches('/')
-                .trim_end_matches(".git");
-            url.split('/')
-                .next_back()
-                .unwrap_or("imported-repo")
-                .to_string()
-        }
-    };
+    // The same name the gate authorized above.
+    let target_name = body.resolved_target_name();
 
     match rg_core::import::service::start_import(
         &state.db,
