@@ -77,23 +77,6 @@ pub async fn list_notifications_paginated(
     Ok((notifications, total))
 }
 
-/// Mark a notification as read.
-pub async fn mark_notification_read(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let model = notification::Entity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find notification")?
-        .ok_or_else(|| anyhow::anyhow!("notification {} not found", id))?;
-
-    let mut active: notification::ActiveModel = model.into();
-    active.is_read = Set(true);
-    active
-        .update(db)
-        .await
-        .context("db: mark notification read")?;
-    Ok(())
-}
-
 /// Mark a notification as read for its owning user.
 ///
 /// Returns `false` when this user has no notification with that id — the row
@@ -160,18 +143,6 @@ pub async fn unread_count(db: &DatabaseConnection, user_id: i64) -> Result<u64> 
         .context("db: unread notification count")?;
 
     Ok(count)
-}
-
-/// Delete a notification.
-pub async fn delete_notification(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let model = notification::Entity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find notification for delete")?
-        .ok_or_else(|| anyhow::anyhow!("notification {} not found", id))?;
-
-    model.delete(db).await.context("db: delete notification")?;
-    Ok(())
 }
 
 /// Delete a notification for its owning user.

@@ -70,10 +70,16 @@ pub async fn list_protections(
 }
 
 /// Get a branch protection rule by ID.
-pub async fn get_protection(
-    db: &DatabaseConnection,
-    protection_id: i64,
-) -> Result<ProtectedBranch> {
+///
+/// Deliberately **not** `pub`: a protection id is an instance-wide primary key,
+/// so a caller outside this module holding one has no way to know which
+/// repository it belongs to. The three unscoped primitives here exist only to
+/// be wrapped by their `*_for_repo` siblings below, which re-anchor the id to
+/// the repository the caller was actually authorized against. Making the
+/// distinction a matter of module visibility rather than of naming discipline
+/// means the wrong one is not merely discouraged from another crate — it is
+/// invisible there.
+async fn get_protection(db: &DatabaseConnection, protection_id: i64) -> Result<ProtectedBranch> {
     protected_branch_ops::find_by_id(db, protection_id)
         .await?
         .ok_or_else(|| crate::error::not_found("protection rule"))
@@ -94,9 +100,9 @@ pub async fn get_protection_for_repo(
     Ok(protection)
 }
 
-/// Update a branch protection rule.
+/// Update a branch protection rule. Unscoped — see [`get_protection`].
 #[allow(clippy::too_many_arguments)]
-pub async fn update_protection(
+async fn update_protection(
     db: &DatabaseConnection,
     protection_id: i64,
     require_pr: Option<bool>,
@@ -181,8 +187,8 @@ pub async fn update_protection_for_repo(
     .await
 }
 
-/// Delete a branch protection rule.
-pub async fn delete_protection(db: &DatabaseConnection, protection_id: i64) -> Result<()> {
+/// Delete a branch protection rule. Unscoped — see [`get_protection`].
+async fn delete_protection(db: &DatabaseConnection, protection_id: i64) -> Result<()> {
     protected_branch_ops::delete_by_id(db, protection_id).await
 }
 

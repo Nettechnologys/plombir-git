@@ -39,17 +39,19 @@ pub async fn list_notifications_paginated(
     notification_ops::list_notifications_paginated(db, user_id, unread_only, offset, limit).await
 }
 
-/// Mark a notification as read.
-pub async fn mark_read(db: &DatabaseConnection, id: i64) -> Result<()> {
-    notification_ops::mark_notification_read(db, id).await
-}
-
 /// Mark a notification as read for its owning user.
 ///
 /// A notification belonging to somebody else is reported as absent on purpose —
 /// confirming that id #4711 exists would leak the shape of another user's
 /// inbox. What must *not* be reported as absent is a failed query, which is why
 /// the ops layer answers with a bool and the marker is built here.
+///
+/// There is deliberately no `mark_read(db, id)` next to this one. There was:
+/// unscoped, `pub`, and — after the handler was moved onto the scoped variant —
+/// called by nobody. A notification id is an instance-wide primary key, so the
+/// unscoped twin was one forgotten suffix away from marking another user's row,
+/// and its being dead made that hazard free rather than harmless. The same
+/// applies to [`delete_notification_for_user`] below.
 pub async fn mark_read_for_user(db: &DatabaseConnection, id: i64, user_id: i64) -> Result<()> {
     notification_ops::mark_notification_read_for_user(db, id, user_id)
         .await?
@@ -65,11 +67,6 @@ pub async fn mark_all_read(db: &DatabaseConnection, user_id: i64) -> Result<u64>
 /// Get unread notification count.
 pub async fn unread_count(db: &DatabaseConnection, user_id: i64) -> Result<u64> {
     notification_ops::unread_count(db, user_id).await
-}
-
-/// Delete a notification.
-pub async fn delete_notification(db: &DatabaseConnection, id: i64) -> Result<()> {
-    notification_ops::delete_notification(db, id).await
 }
 
 /// Delete a notification for its owning user.
