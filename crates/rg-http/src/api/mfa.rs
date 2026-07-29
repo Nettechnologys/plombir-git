@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing;
 use utoipa::ToSchema;
 
-use crate::api::auth::{extract_user_id, AUTH_COOKIE_NAME};
+use crate::api::auth::{extract_user_id, AuthUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -199,12 +199,9 @@ pub struct EnableMfaResponse {
 )]
 pub async fn enable_mfa(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Json(req): Json<EnableMfaRequest>,
 ) -> Result<Json<EnableMfaResponse>, AppError> {
-    let user_id = extract_user_id(&headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("unauthorized"))?;
-
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
         .map_err(AppError::from)?
@@ -455,12 +452,10 @@ pub struct DisableMfaRequest {
 )]
 pub async fn disable_mfa(
     State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
     headers: HeaderMap,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = extract_user_id(&headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("unauthorized"))?;
-
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
         .map_err(AppError::from)?

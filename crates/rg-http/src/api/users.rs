@@ -13,7 +13,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::AUTH_COOKIE_NAME;
+use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -577,16 +577,9 @@ pub async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> i
 )]
 pub async fn create_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response();
-        }
-    };
-
     if body.name.trim().is_empty() {
         return AppError::bad_request("token name cannot be empty".to_string()).into_response();
     }

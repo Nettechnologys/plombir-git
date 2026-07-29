@@ -175,20 +175,13 @@ const RUN_LAST: &[(&str, &str)] = &[
 /// quietly — the list is a work queue, and it shrinks as handlers take their
 /// access level as an argument instead of fetching it mid-body.
 const EXTRACTOR_BEFORE_GATE: &[&str] = &[
-    // Not repository-scoped: the fix is `AuthUser` / an instance-admin
-    // extractor, both of which already exist.
-    "POST /api/v1/users/tokens",
-    "POST /api/v1/users/ssh-keys",
-    "POST /api/v1/users/mfa/enable",
-    "POST /api/v1/users/mfa/disable",
-    "POST /api/v1/repos",
-    "POST /api/v1/imports",
-    "POST /api/v1/orgs",
-    "POST /api/v1/orgs/{name}/members",
-    "POST /api/v1/orgs/{name}/teams",
-    "POST /api/v1/orgs/{name}/teams/{team_id}/members",
-    "POST /api/v1/admin/sso/providers",
-    "PATCH /api/v1/admin/sso/providers/{id}",
+    // The twelve non-repository entries are gone: `card_533a5ddff9d3` moved
+    // personal tokens, SSH keys, MFA enable/disable, repository and
+    // organization creation, imports, the org membership and team surface and
+    // the two SSO provider routes onto `AuthUser` / `OrgAdmin` /
+    // `InstanceAdmin`. The gate is an argument on each of them now, so it runs
+    // before axum reads the body.
+    //
     // Repository-scoped, gate written by hand inside the handler. Five entries
     // left this list when `card_f037c6e2e1f5` moved milestones, labels, mirrors,
     // commit statuses and repository transfer onto `RepoWrite` / `RepoOwner`:

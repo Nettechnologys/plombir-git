@@ -7,14 +7,14 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::extract_bearer_claims;
+use crate::api::auth::AuthUser;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -75,18 +75,9 @@ fn default_true() -> bool {
 )]
 pub async fn start_import(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Json(body): Json<StartImportRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
     // Validate platform
     if !matches!(
         body.platform.as_str(),
@@ -163,18 +154,9 @@ pub async fn start_import(
 )]
 pub async fn get_import_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
     match rg_db::ops::import_task_ops::find_by_id(&state.db, id).await {
         Ok(Some(task)) if task.user_id == user_id => {
             (StatusCode::OK, Json(serde_json::json!(task))).into_response()
@@ -197,16 +179,10 @@ pub async fn get_import_status(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn list_imports(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
+pub async fn list_imports(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> impl IntoResponse {
     match rg_db::ops::import_task_ops::find_by_user(&state.db, user_id, 20).await {
         Ok(tasks) => (StatusCode::OK, Json(serde_json::json!(tasks))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -230,18 +206,9 @@ pub async fn list_imports(State(state): State<AppState>, headers: HeaderMap) -> 
 )]
 pub async fn delete_import(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => return AppError::unauthorized("authentication required").into_response(),
-    };
-    let user_id: i64 = match claims.sub.parse() {
-        Ok(id) => id,
-        Err(_) => return AppError::unauthorized("invalid token subject").into_response(),
-    };
-
     match rg_db::ops::import_task_ops::find_by_id(&state.db, id).await {
         Ok(Some(task)) if task.user_id == user_id => {
             match rg_db::ops::import_task_ops::delete_by_id(&state.db, id).await {

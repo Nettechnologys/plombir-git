@@ -24,7 +24,7 @@ use crate::api::repo_access::{RepoAuthRead, RepoOwner, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::{
-    api::auth::{extract_bearer_claims, extract_user_id},
+    api::auth::{extract_bearer_claims, extract_user_id, AuthUser},
     openapi::PaginatedRepoResponse,
     AppState,
 };
@@ -132,24 +132,10 @@ pub struct RepoResponse {
 )]
 pub async fn create_repo(
     State(state): State<AppState>,
+    AuthUser(owner_id): AuthUser,
     headers: HeaderMap,
     Json(body): Json<CreateRepoRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
-    };
-
-    let owner_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-    let username = claims.username.clone();
-
     // Resolve org_id if org is specified
     let org_id = match &body.org {
         Some(org_name) => {
@@ -184,6 +170,10 @@ pub async fn create_repo(
         }
         Err(e) => return AppError::from(e).into_response(),
     };
+    // The name comes from the account row rather than from the token's
+    // `username` claim: a session minted before a rename still carries the old
+    // spelling, and this name ends up in the commit author and the audit entry.
+    let username = owner_user.username.clone();
     let owner_display = owner_user
         .display_name
         .clone()

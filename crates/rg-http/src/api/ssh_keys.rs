@@ -10,7 +10,7 @@ use sea_orm::Set;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{error::AppError, AppState};
+use crate::{api::auth::AuthUser, error::AppError, AppState};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSshKeyRequest {
@@ -90,14 +90,9 @@ pub async fn list_ssh_keys(State(state): State<AppState>, headers: HeaderMap) ->
 )]
 pub async fn create_ssh_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Json(body): Json<CreateSshKeyRequest>,
 ) -> impl IntoResponse {
-    let user_id = match authenticated_user_id(&headers, &state) {
-        Ok(id) => id,
-        Err(error) => return error.into_response(),
-    };
-
     let title = body.title.trim();
     if title.is_empty() {
         return AppError::bad_request("SSH key title cannot be empty").into_response();

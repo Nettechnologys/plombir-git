@@ -83,6 +83,34 @@ pub(crate) async fn require_instance_admin(state: &AppState, headers: &HeaderMap
     }
 }
 
+/// The instance-admin gate as a handler *argument*.
+///
+/// [`require_instance_admin`] states the rule; this states *where* it runs. A
+/// handler that also takes a body used to call the rule from inside its own
+/// body, which put it behind axum's `Json<_>` extractor: an anonymous caller
+/// was told its JSON was malformed instead of being turned away, because
+/// `FromRequest` runs after every `FromRequestParts`. Taking the gate as an
+/// argument puts it back in front of the body — and in front of the schema
+/// oracle a rejected body hands out.
+///
+/// The rejection is deliberately the same `403 admin required` the handlers
+/// answered before, so this is a reordering and not a change of contract.
+pub struct InstanceAdmin(pub i64);
+
+impl axum::extract::FromRequestParts<AppState> for InstanceAdmin {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_instance_admin(state, &parts.headers)
+            .await
+            .map(Self)
+            .ok_or_else(|| AppError::forbidden("admin required"))
+    }
+}
+
 // ── User management endpoints ─────────────────────────────────────────
 
 /// GET /api/v1/admin/users
@@ -554,13 +582,9 @@ fn validate_ldap_provider_request(
 )]
 pub async fn create_sso_provider(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
-
     let pt = if body.provider_type.is_empty() {
         "oauth2"
     } else {
@@ -655,14 +679,10 @@ pub async fn create_sso_provider(
 )]
 pub async fn update_sso_provider(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(id): Path<i64>,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
-
     let pt = if body.provider_type.is_empty() {
         "oauth2"
     } else {

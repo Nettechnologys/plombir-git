@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::api::auth::AuthUser;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -136,15 +137,10 @@ pub struct AddTeamMemberRequest {
 )]
 pub async fn create_org(
     State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
     headers: HeaderMap,
     Json(body): Json<CreateOrgRequest>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
     let visibility = body.visibility.as_deref().unwrap_or("public");
 
     match rg_core::org::create_org(
@@ -437,22 +433,10 @@ pub async fn list_org_members(
 )]
 pub async fn add_org_member(
     State(state): State<AppState>,
+    OrgAdmin { org, actor_id }: OrgAdmin,
     headers: HeaderMap,
-    Path(name): Path<String>,
     Json(body): Json<AddOrgMemberRequest>,
 ) -> impl IntoResponse {
-    let actor_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
-        return e.into_response();
-    }
-
     let role = body.role.as_deref().unwrap_or("member");
 
     match rg_core::org::add_org_member(&state.db, org.id, body.user_id, role).await {
@@ -566,22 +550,9 @@ pub async fn remove_org_member(
 )]
 pub async fn create_team(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
+    OrgAdmin { org, .. }: OrgAdmin,
     Json(body): Json<CreateTeamRequest>,
 ) -> impl IntoResponse {
-    let actor_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
-        return e.into_response();
-    }
-
     let permission = body.permission.as_deref().unwrap_or("read");
 
     match rg_core::org::create_team(
@@ -814,21 +785,10 @@ pub async fn list_team_members(
 )]
 pub async fn add_team_member(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((name, team_id)): Path<(String, i64)>,
+    OrgAdmin { org, .. }: OrgAdmin,
+    Path((_name, team_id)): Path<(String, i64)>,
     Json(body): Json<AddTeamMemberRequest>,
 ) -> impl IntoResponse {
-    let actor_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
-        return e.into_response();
-    }
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
@@ -995,6 +955,68 @@ async fn resolve_team_in_org(
         Ok(_) => Err(AppError::not_found("team not found")),
         Err(e) => Err(AppError::from(e)),
     }
+}
+
+// ── The org-admin gate as a handler argument ─────────────────
+//
+// `require_user` + `resolve_org` + `require_org_admin` is the same three-step
+// rule in every mutating handler, and a handler that also takes a body ran it
+// *after* `Json<_>`: axum runs every `FromRequestParts` before the single
+// `FromRequest`, so an anonymous caller was told its JSON was malformed rather
+// than being turned away, and a well-formed-looking rejection doubled as a
+// schema oracle. Stating the gate in the signature runs it first and makes
+// forgetting it a compile error rather than a review miss.
+
+/// An authenticated administrator of the organization named by `{name}`.
+///
+/// Same three steps, same order, same answers as the hand-written prologue it
+/// replaces: no session is `401`, an unknown organization is `404`, and a
+/// caller who is neither owner nor admin is `403`.
+pub struct OrgAdmin {
+    pub org: rg_db::entities::organization::Model,
+    pub actor_id: i64,
+}
+
+impl axum::extract::FromRequestParts<AppState> for OrgAdmin {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let actor_id = require_user(&parts.headers, &state.jwt_secret)?;
+        let name = org_name_in_path(parts, state).await?;
+        let org = resolve_org(&state.db, &name).await?;
+        require_org_admin(&state.db, &org, actor_id).await?;
+        Ok(Self { org, actor_id })
+    }
+}
+
+/// Pull the `{name}` capture an org-scoped route carries.
+///
+/// Read through `Path<HashMap<_, _>>` rather than a positional `Path<_>` so the
+/// one gate serves `/orgs/{name}/members` and
+/// `/orgs/{name}/teams/{team_id}/members` alike — a tuple would demand the
+/// exact arity of each route. Extracting it here does not consume it: axum
+/// reads the captures out of the request extensions, so the handler can still
+/// take its own `Path<...>`.
+async fn org_name_in_path(
+    parts: &mut axum::http::request::Parts,
+    state: &AppState,
+) -> Result<String, AppError> {
+    use axum::extract::FromRequestParts as _;
+
+    let Path(params) =
+        Path::<std::collections::HashMap<String, String>>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                AppError::internal("route carries no path parameters to authorize against")
+            })?;
+
+    params
+        .get("name")
+        .cloned()
+        .ok_or_else(|| AppError::internal("route is not organization-scoped: no {name} capture"))
 }
 
 fn org_to_response(org: &rg_db::entities::organization::Model) -> OrgResponse {
