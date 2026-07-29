@@ -93,6 +93,11 @@ pub struct AppState {
     /// enabled. Default `false`: the sign/verify endpoints return 404 until an
     /// operator turns the feature on.
     pub attestation_enabled: bool,
+    /// How often an already-open WebSocket re-checks that it may still be open,
+    /// in seconds — see [`ws::DEFAULT_WS_SESSION_RECHECK_SECS`], which is the
+    /// value every production instance uses. A field rather than a constant so
+    /// a test can drive the re-check without sleeping through a live interval.
+    pub ws_session_recheck_secs: u64,
     /// This instance's admin-toggled switches (maintenance mode, banner),
     /// backed by the `instance_settings` row in `db`. Lazily loaded, so
     /// `Default::default()` is the correct value at every construction site.
@@ -386,6 +391,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         git_idle_timeout_secs: config.git_idle_timeout_secs,
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
+        ws_session_recheck_secs: ws::DEFAULT_WS_SESSION_RECHECK_SECS,
         instance_settings: config.instance_settings,
     };
 

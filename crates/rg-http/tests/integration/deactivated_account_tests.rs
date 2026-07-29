@@ -13,7 +13,9 @@
 use base64::Engine as _;
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 
-use crate::common::{register_full, spawn_test_app_with_db};
+use crate::common::{
+    register_full, spawn_test_app_with_db, spawn_test_app_with_overrides, StateOverrides,
+};
 
 const INFO_REFS: &str = "info/refs?service=git-upload-pack";
 const PASSWORD: &str = "Qz7$wRtm";
@@ -247,6 +249,77 @@ async fn a_revoked_session_cannot_open_the_notification_socket() {
         by_subprotocol().await,
         401,
         "a revoked session still reaches the notification socket via a subprotocol"
+    );
+}
+
+/// card_f7128fd4a2e2: the gate above is a *request* middleware, and a socket
+/// that is already open makes no further requests — so before this it had
+/// nothing to intercept and the offboarded user's tab kept its push channel for
+/// as long as they left it open. The socket now re-asks the same question on an
+/// interval, and the baseline in the middle is what makes the close afterwards
+/// mean "deactivated" rather than "this connection was never going to survive".
+#[tokio::test]
+async fn a_deactivation_closes_a_notification_socket_that_is_already_open() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let (base, db) = spawn_test_app_with_overrides(StateOverrides {
+        ws_session_recheck_secs: Some(1),
+        ..Default::default()
+    })
+    .await;
+    let (jwt, user_id) = register_full(&base, "deact_live_ws", "deact_live_ws@example.com").await;
+
+    let url = format!(
+        "{}/api/v1/ws/notifications",
+        base.replacen("http://", "ws://", 1)
+    );
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        format!("bearer.{jwt}").parse().unwrap(),
+    );
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.status(), 101);
+
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("the socket must greet a live account")
+        .expect("the socket closed before the welcome frame")
+        .expect("the welcome frame must be readable");
+    let Message::Text(welcome) = welcome else {
+        panic!("expected a text welcome frame, got {welcome:?}");
+    };
+    assert!(
+        welcome.contains("\"connected\""),
+        "unexpected welcome frame: {welcome}"
+    );
+
+    // Baseline on live access: sit through several re-check intervals with the
+    // account intact. Silence here is what proves the re-check does not simply
+    // hang up on everyone.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(4), socket.next())
+            .await
+            .is_err(),
+        "the re-check closed a socket whose account is in good standing"
+    );
+
+    deactivate(&db, user_id).await;
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(Message::Close(_)) | Err(_) => return true,
+                Ok(_) => continue,
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        ended.unwrap_or(false),
+        "the notification socket outlived the deactivation of its account"
     );
 }
 

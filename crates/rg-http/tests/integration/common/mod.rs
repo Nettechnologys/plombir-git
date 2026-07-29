@@ -86,6 +86,10 @@ pub struct StateOverrides {
     pub blob_storage: Option<Arc<dyn rg_core::blob_storage::BlobStorage>>,
     /// Replaces the default per-test delivery tracker.
     pub delivery_tracker: Option<rg_core::task_tracker::TaskTracker>,
+    /// Shortens the interval at which an open WebSocket re-checks that it may
+    /// still be open. Production samples every 30s; a test that has to observe
+    /// the socket close cannot sit through that.
+    pub ws_session_recheck_secs: Option<u64>,
 }
 
 pub fn build_test_app_state(
@@ -137,6 +141,9 @@ pub fn build_test_app_state_with(
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).
         attestation_enabled: true,
+        ws_session_recheck_secs: overrides
+            .ws_session_recheck_secs
+            .unwrap_or(rg_http::ws::DEFAULT_WS_SESSION_RECHECK_SECS),
         // Empty memo over this state's own database — see
         // `rg_http::instance::InstanceSettingsCache`.
         instance_settings: Default::default(),
@@ -241,10 +248,19 @@ pub async fn spawn_test_app_with_routes_and_db() -> (
 /// to manipulate data directly (e.g. promoting admin users).
 #[allow(dead_code)]
 pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
+    spawn_test_app_with_overrides(StateOverrides::default()).await
+}
+
+/// [`spawn_test_app_with_db`] with individual pieces of the state replaced —
+/// for tests whose subject is a seam rather than the default wiring.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_overrides(
+    overrides: StateOverrides,
+) -> (String, rg_db::DatabaseConnection) {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).ok();
-    let state = build_test_app_state(db.clone(), repo_root);
+    let state = build_test_app_state_with(db.clone(), repo_root, overrides);
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

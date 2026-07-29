@@ -47,6 +47,79 @@ impl Drop for WsConnGuard {
 /// The broadcast channel capacity for real-time notifications.
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 
+/// How often a socket that is already open re-asks whether it may still be open.
+///
+/// The revocation gate ([`crate::api::auth::session_standing_middleware`]) is a
+/// *request* middleware, and a WebSocket makes exactly one request — the
+/// handshake. After that there is nothing for the middleware to intercept, so a
+/// deactivation reaches an open socket through no path at all: the offboarded
+/// user's tab keeps receiving pushes until they close it. This is that same
+/// gate, sampled, which bounds the window by an interval instead of by how long
+/// someone leaves a browser open. Cost is one primary-key read per socket per
+/// interval — the sockets are idle between pushes, so this is what they do.
+pub const DEFAULT_WS_SESSION_RECHECK_SECS: u64 = 30;
+
+/// Does the account behind an open socket still stand?
+///
+/// Fails closed, deliberately: "disabled" and "could not tell" both end the
+/// socket, because the alternative is that a database hiccup becomes the reason
+/// a revoked session keeps its stream. Closing is not a verdict the client has
+/// to live with — it reconnects, and the handshake goes through the same
+/// middleware every other request does, which answers `503` rather than `401`
+/// when it is the database that is unwell.
+async fn account_still_stands(db: &sea_orm::DatabaseConnection, user_id: i64) -> bool {
+    match rg_db::ops::user_ops::find_by_id(db, user_id).await {
+        Ok(Some(user)) => user.is_usable(),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::error!(
+                user_id,
+                error = %format!("{error:#}"),
+                "could not verify account standing for an open WebSocket"
+            );
+            false
+        }
+    }
+}
+
+/// May this user still read this repository's job logs?
+///
+/// Both halves are re-asked, not just the account: the handshake's answer came
+/// from `check_read_for`, and that answer can stop being true without the
+/// account going anywhere — the repository flips to private, a collaborator is
+/// removed. The repository row is re-read for the same reason.
+async fn job_log_access_still_stands(state: &AppState, repo_id: i64, user_id: i64) -> bool {
+    if !account_still_stands(&state.db, user_id).await {
+        return false;
+    }
+    match rg_db::ops::repo_ops::find_by_id(&state.db, repo_id).await {
+        Ok(Some(repository)) => {
+            crate::api::repo_access::check_read_for(state, &repository, Some(user_id))
+                .await
+                .is_ok()
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::error!(
+                repo_id,
+                user_id,
+                error = %format!("{error:#}"),
+                "could not verify repository access for an open job-log WebSocket"
+            );
+            false
+        }
+    }
+}
+
+/// The re-check cadence for one socket, floored at a second so a misconfigured
+/// zero cannot turn the arm into a busy loop against the database.
+fn session_recheck_interval(state: &AppState) -> tokio::time::Interval {
+    let period = std::time::Duration::from_secs(state.ws_session_recheck_secs.max(1));
+    // `interval_at` rather than `interval`: the first tick of the latter fires
+    // immediately, and the handshake checked standing microseconds ago.
+    tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+}
+
 /// A notification event sent over WebSocket.
 #[derive(Debug, Clone, Serialize)]
 pub struct NotificationEvent {
@@ -240,13 +313,12 @@ pub async fn ws_notifications_handler(
         ws
     };
 
-    upgrade.on_upgrade(move |socket| {
-        handle_ws_connection(socket, state.notification_hub.clone(), user_id)
-    })
+    upgrade.on_upgrade(move |socket| handle_ws_connection(socket, state, user_id))
 }
 
 /// Handle an individual WebSocket connection.
-async fn handle_ws_connection(socket: WebSocket, hub: NotificationHub, user_id: Option<i64>) {
+async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: Option<i64>) {
+    let hub = state.notification_hub.clone();
     let (mut sender, mut receiver) = socket.split();
 
     if user_id.is_none() {
@@ -297,8 +369,31 @@ async fn handle_ws_connection(socket: WebSocket, hub: NotificationHub, user_id: 
         return;
     }
 
+    let mut recheck = session_recheck_interval(&state);
+
     loop {
         tokio::select! {
+            _ = recheck.tick() => {
+                if !account_still_stands(&state.db, uid).await {
+                    tracing::warn!(
+                        user_id = uid,
+                        "closing a notification WebSocket: its account no longer stands"
+                    );
+                    if sender
+                        .send(Message::Text(
+                            serde_json::json!({"error": "session revoked"}).to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        // Client is already gone; the close below is a formality.
+                    }
+                    if sender.close().await.is_err() {
+                        // Client already disconnected.
+                    }
+                    break;
+                }
+            },
             event = user_rx.recv() => match event {
                 Ok(event) => {
                     let Ok(msg) = serde_json::to_string(&event) else {
@@ -434,9 +529,10 @@ pub async fn ws_job_log_handler(
         ws
     };
 
+    let repo_id = repository.id;
     upgrade
         .on_upgrade(move |socket| {
-            handle_job_log_connection(socket, state.notification_hub.clone(), job_id, user_id)
+            handle_job_log_connection(socket, state, job_id, repo_id, user_id)
         })
         .into_response()
 }
@@ -444,10 +540,12 @@ pub async fn ws_job_log_handler(
 /// Handle a job log WebSocket connection.
 async fn handle_job_log_connection(
     socket: WebSocket,
-    hub: NotificationHub,
+    state: AppState,
     job_id: i64,
+    repo_id: i64,
     user_id: i64,
 ) {
+    let hub = state.notification_hub.clone();
     let (mut sender, mut receiver) = socket.split();
     let _ws_guard = WsConnGuard::new();
     let mut rx = hub.subscribe_job(job_id).await;
@@ -467,8 +565,33 @@ async fn handle_job_log_connection(
         return;
     }
 
+    let mut recheck = session_recheck_interval(&state);
+
     loop {
         tokio::select! {
+            _ = recheck.tick() => {
+                if !job_log_access_still_stands(&state, repo_id, user_id).await {
+                    tracing::warn!(
+                        job_id,
+                        repo_id,
+                        user_id,
+                        "closing a job-log WebSocket: the reader may no longer read this repository"
+                    );
+                    if sender
+                        .send(Message::Text(
+                            serde_json::json!({"error": "access revoked"}).to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        // Client is already gone; the close below is a formality.
+                    }
+                    if sender.close().await.is_err() {
+                        // Client already disconnected.
+                    }
+                    break;
+                }
+            },
             event = rx.recv() => match event {
                 Ok(event) => {
                     let Ok(msg) = serde_json::to_string(&event) else {
