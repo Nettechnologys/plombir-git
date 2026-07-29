@@ -25,11 +25,7 @@ use crate::api::repo_access::{
 };
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
-use crate::{
-    api::auth::{extract_bearer_claims, extract_user_id},
-    openapi::PaginatedRepoResponse,
-    AppState,
-};
+use crate::{api::auth::extract_user_id, openapi::PaginatedRepoResponse, AppState};
 
 /// Helper to record audit log (fire-and-forget).
 #[allow(clippy::too_many_arguments)]
@@ -62,6 +58,38 @@ async fn record_audit(
 
     if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
         tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
+    }
+}
+
+/// The acting account's name for the audit trail, by the id a gate established.
+///
+/// Read from the account row, not from the session's `username` claim: a session
+/// minted before a rename still carries the old spelling, and this name is what
+/// a human reads in the journal. `create_repo` and `repo.fork` already name the
+/// actor this way; this is the same rule for the handlers that were passing
+/// `claims.sub` — a number — into the actor column (card_fcc07f8d1505).
+///
+/// The distinction that matters: this is a *name lookup*, never an
+/// authentication step. What stood here before was `extract_bearer_claims`,
+/// which re-derived identity from `Authorization: Bearer` alone while the gate
+/// above it accepts the HttpOnly `forgekeep_token` cookie as well — so the
+/// browser session the gate had just admitted got a `401` out of the handler
+/// body (card_7210b02c0ae9). Identity is the extractor's answer; a handler that
+/// asks again narrows it.
+///
+/// A missing row is the server's inconsistency, not the caller's fault: the id
+/// arrives from a gate that resolved it against a repository this account owns,
+/// so the account has to exist. Hence `500`, not another `401`.
+async fn audit_actor_name(
+    db: &sea_orm::DatabaseConnection,
+    actor_id: i64,
+) -> Result<String, AppError> {
+    match rg_db::ops::user_ops::find_by_id(db, actor_id).await {
+        Ok(Some(user)) => Ok(user.username),
+        Ok(None) => Err(AppError::internal(format!(
+            "authenticated actor {actor_id} has no account row"
+        ))),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
@@ -601,13 +629,11 @@ pub async fn delete_repo_handler(
         actor_id: user_id,
     }: RepoOwner,
 ) -> impl IntoResponse {
-    // `claims.sub` is only the audit trail's subject string; the ownership
-    // decision above it is the extractor's.
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response()
-        }
+    // Only the audit trail's actor name; the ownership decision above it is the
+    // extractor's and is not re-litigated here. See [`audit_actor_name`].
+    let actor_name = match audit_actor_name(&state.db, user_id).await {
+        Ok(name) => name,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::repo::service::delete_repo(&state.db, repo.id).await {
@@ -621,7 +647,7 @@ pub async fn delete_repo_handler(
             record_audit(
                 &state.db,
                 user_id,
-                &claims.sub,
+                &actor_name,
                 "repo.delete",
                 Some("repo"),
                 Some(repo.id),
@@ -817,13 +843,11 @@ pub async fn transfer_repo_handler(
         ..
     }: NamespaceCreate<TransferRequest>,
 ) -> impl IntoResponse {
-    // `claims.sub` is only the audit trail's subject string; both access
-    // decisions above it are the extractors'.
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response();
-        }
+    // Only the audit trail's actor name; both access decisions above it are the
+    // extractors' and are not re-litigated here. See [`audit_actor_name`].
+    let actor_name = match audit_actor_name(&state.db, user_id).await {
+        Ok(name) => name,
+        Err(e) => return e.into_response(),
     };
 
     match rg_core::repo::service::transfer_repo(
@@ -847,7 +871,7 @@ pub async fn transfer_repo_handler(
             record_audit(
                 &state.db,
                 user_id,
-                &claims.sub,
+                &actor_name,
                 "repo.transfer",
                 Some("repo"),
                 Some(repo.id),
