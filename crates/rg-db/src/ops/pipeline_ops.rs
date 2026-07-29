@@ -9,8 +9,14 @@ use crate::entities::{pipeline, pipeline_job, pipeline_stage};
 // ── Pipeline ops ─────────────────────────────────────────────────
 
 /// Create a new pipeline record.
+///
+/// Takes any [`ConnectionTrait`] — a pool *or* a transaction — because a
+/// pipeline row on its own is not a pipeline: until its stages and jobs are
+/// written too, its graph is a subset of what the CI config declared, and the
+/// job scheduler cannot tell the two apart. `rg_ci::trigger_pipeline` therefore
+/// writes the whole graph through one transaction; see the note there.
 pub async fn create_pipeline(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     repo_id: i64,
     commit_sha: &str,
     ref_name: &str,
@@ -113,8 +119,10 @@ pub async fn update_pipeline_status(
 // ── Stage ops ────────────────────────────────────────────────────
 
 /// Create a pipeline stage.
+///
+/// Connection-agnostic for the same reason as [`create_pipeline`].
 pub async fn create_stage(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     pipeline_id: i64,
     name: &str,
     stage_order: i32,
@@ -174,11 +182,15 @@ pub async fn update_stage_status(
 // ── Job ops ──────────────────────────────────────────────────────
 
 /// Create a pipeline job.
+///
+/// A job is born `pending`, i.e. schedulable the moment it is visible — so a
+/// caller building several of them writes through a transaction and lets the
+/// commit publish them all at once (see [`create_pipeline`]).
 // Wide by design: mirrors the pipeline_job column set (a params struct would just
 // re-list the same fields with no call-site clarity gain).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_job(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     stage_id: i64,
     name: &str,
     script: &str,
@@ -347,8 +359,11 @@ pub async fn stage_has_job_status(
 }
 
 /// Update job result.
+///
+/// Connection-agnostic: pipeline creation settles the status of jobs it skips
+/// inside the same transaction that wrote them.
 pub async fn update_job_result(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     id: i64,
     status: &str,
     exit_code: Option<i32>,

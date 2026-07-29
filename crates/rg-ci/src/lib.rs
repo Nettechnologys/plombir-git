@@ -36,6 +36,7 @@ pub mod runner;
 
 use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
+use sea_orm::TransactionTrait;
 
 use config::CiConfig;
 use runner::PipelineRunner;
@@ -181,123 +182,52 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
         }
     }
 
-    // 3. Create pipeline record
-    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
-        db,
+    // 3-5. Write the pipeline, its stages and its jobs — all of it or none.
+    //
+    // Every job row here is immediately schedulable work:
+    // `find_pending_job_matching_labels` picks pending, unassigned jobs from the
+    // whole database and nothing in that query can tell a half-written pipeline
+    // from a finished one. Written row by row, a failure part-way through left a
+    // pipeline whose graph was a *subset* of the declared one — and runners
+    // would take those jobs, finish them, and cascade the pipeline to `success`,
+    // so the log said "CI did not start" while the UI showed green.
+    //
+    // One transaction closes both halves of that: a failed build leaves no rows
+    // at all, and the jobs already inserted are invisible to any other
+    // connection until the commit publishes the complete graph — so the runner
+    // that polls between two `create_job` calls has nothing to find.
+    let tx = db
+        .begin()
+        .await
+        .context("db: begin pipeline creation transaction")?;
+    let graph = PipelineGraph {
         repo_id,
         commit_sha,
         ref_name,
         trigger_type,
         triggered_by,
-    )
-    .await?;
-
-    let pipeline_id = pipeline.id;
-
-    // 4. Create stages
-    let stage_names = config.stages.as_ref().cloned().unwrap_or_default();
-    let mut stage_id_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-
-    for (order, stage_name) in stage_names.iter().enumerate() {
-        let stage =
-            rg_db::ops::pipeline_ops::create_stage(db, pipeline_id, stage_name, order as i32)
-                .await?;
-        stage_id_map.insert(stage_name.clone(), stage.id);
-    }
-
-    // 5. Create jobs
-    for (job_name, job_config) in &config.jobs {
-        // Filter by `only` — if specified, skip jobs that don't match the ref
-        if let Some(only) = &job_config.only {
-            let ref_short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
-            if !only
-                .iter()
-                .any(|pattern| pattern == ref_short || pattern == ref_name)
-            {
-                continue;
+        config: &config,
+    };
+    let pipeline_id = match graph.create(&tx).await {
+        Ok(pipeline_id) => pipeline_id,
+        Err(error) => {
+            // The caller only ever sees the error that triggered the rollback,
+            // so a rollback that fails can only be reported here.
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(
+                    repo_id,
+                    commit_sha,
+                    error = %format!("{rollback_error:#}"),
+                    "half-built pipeline left behind: creating it failed and rolling it back failed too — \
+                     runners may pick up the jobs it did write and cascade an incomplete pipeline to success"
+                );
             }
+            return Err(error);
         }
-
-        let stage_name = job_config.stage.as_deref().unwrap_or("default");
-        let stage_id = stage_id_map.get(stage_name).copied().unwrap_or(-1);
-
-        if stage_id < 0 {
-            tracing::warn!(job = %job_name, stage = %stage_name, "Job references unknown stage, skipping");
-            continue;
-        }
-
-        // Serialize tags to JSON for storage
-        let tags_json = job_config
-            .tags
-            .as_ref()
-            .map(|t| serde_json::to_string(t).unwrap_or_default());
-        for variant in expand_matrix(job_name, job_config)? {
-            let variables_json = if variant.variables.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&variant.variables)?)
-            };
-            let cache_paths_json = job_config
-                .cache
-                .as_ref()
-                .map(|cache| serde_json::to_string(&cache.paths))
-                .transpose()?;
-            let job = rg_db::ops::pipeline_ops::create_job(
-                db,
-                stage_id,
-                &variant.name,
-                &job_config.script.join("\n"),
-                job_config.image.as_deref(),
-                tags_json.as_deref(),
-                variables_json.as_deref(),
-                job_config.cache.as_ref().map(|cache| cache.key.as_str()),
-                cache_paths_json.as_deref(),
-                job_config.allow_failure.unwrap_or(false),
-                job_config.timeout_seconds.map(|seconds| seconds as i64),
-                job_config.when.as_deref(),
-                job_config.condition.as_deref(),
-            )
-            .await?;
-            let should_run = if let Some(condition) = job_config.condition.as_deref() {
-                condition::evaluate_condition(
-                    condition,
-                    &job_condition_context(
-                        ref_name,
-                        trigger_type,
-                        commit_sha,
-                        &variant.variables,
-                        job_config,
-                    ),
-                )?
-            } else {
-                true
-            };
-            if !should_run {
-                let now = chrono::Utc::now().naive_utc();
-                rg_db::ops::pipeline_ops::update_job_result(
-                    db,
-                    job.id,
-                    "skipped",
-                    None,
-                    None,
-                    None,
-                    Some(now),
-                )
-                .await?;
-            } else if let Some(environment_name) = job_config.environment.as_deref() {
-                let environment =
-                    rg_db::ops::ci_environment_ops::find_by_name(db, repo_id, environment_name)
-                        .await?;
-                rg_db::ops::ci_environment_ops::attach_job(
-                    db,
-                    job.id,
-                    environment.as_ref(),
-                    environment_name,
-                )
-                .await?;
-            }
-        }
-    }
+    };
+    tx.commit()
+        .await
+        .context("db: commit pipeline creation transaction")?;
 
     for stage in rg_db::ops::pipeline_ops::list_stages_by_pipeline(db, pipeline_id).await? {
         rg_db::ops::pipeline_ops::try_update_stage(db, stage.id).await?;
@@ -351,6 +281,164 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
     }
 
     Ok(pipeline_id)
+}
+
+/// Everything one trigger has to write before its pipeline exists: the pipeline
+/// row, its stages, and every job of every stage.
+///
+/// Kept together so the whole graph can be written through a single
+/// transaction — a pipeline is either declared in full or not at all.
+struct PipelineGraph<'a> {
+    repo_id: i64,
+    commit_sha: &'a str,
+    ref_name: &'a str,
+    trigger_type: &'a str,
+    triggered_by: Option<i64>,
+    config: &'a CiConfig,
+}
+
+impl PipelineGraph<'_> {
+    /// Write the graph through `tx` and return the new pipeline's id.
+    ///
+    /// Nothing written here is schedulable until the caller commits, so the
+    /// intermediate states — a pipeline with no stages, a stage missing half its
+    /// jobs, a protected job not yet gated behind its environment — are never
+    /// observable by a runner.
+    async fn create(&self, tx: &sea_orm::DatabaseTransaction) -> Result<i64> {
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            tx,
+            self.repo_id,
+            self.commit_sha,
+            self.ref_name,
+            self.trigger_type,
+            self.triggered_by,
+        )
+        .await?;
+
+        let pipeline_id = pipeline.id;
+
+        let stage_names = self.config.stages.as_ref().cloned().unwrap_or_default();
+        let mut stage_id_map: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+
+        for (order, stage_name) in stage_names.iter().enumerate() {
+            let stage =
+                rg_db::ops::pipeline_ops::create_stage(tx, pipeline_id, stage_name, order as i32)
+                    .await?;
+            stage_id_map.insert(stage_name.clone(), stage.id);
+        }
+
+        self.create_jobs(tx, &stage_id_map).await?;
+        Ok(pipeline_id)
+    }
+
+    async fn create_jobs(
+        &self,
+        tx: &sea_orm::DatabaseTransaction,
+        stage_id_map: &std::collections::HashMap<String, i64>,
+    ) -> Result<()> {
+        let PipelineGraph {
+            repo_id,
+            commit_sha,
+            ref_name,
+            trigger_type,
+            config,
+            ..
+        } = *self;
+        for (job_name, job_config) in &config.jobs {
+            // Filter by `only` — if specified, skip jobs that don't match the ref
+            if let Some(only) = &job_config.only {
+                let ref_short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+                if !only
+                    .iter()
+                    .any(|pattern| pattern == ref_short || pattern == ref_name)
+                {
+                    continue;
+                }
+            }
+
+            let stage_name = job_config.stage.as_deref().unwrap_or("default");
+            let stage_id = stage_id_map.get(stage_name).copied().unwrap_or(-1);
+
+            if stage_id < 0 {
+                tracing::warn!(job = %job_name, stage = %stage_name, "Job references unknown stage, skipping");
+                continue;
+            }
+
+            // Serialize tags to JSON for storage
+            let tags_json = job_config
+                .tags
+                .as_ref()
+                .map(|t| serde_json::to_string(t).unwrap_or_default());
+            for variant in expand_matrix(job_name, job_config)? {
+                let variables_json = if variant.variables.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&variant.variables)?)
+                };
+                let cache_paths_json = job_config
+                    .cache
+                    .as_ref()
+                    .map(|cache| serde_json::to_string(&cache.paths))
+                    .transpose()?;
+                let job = rg_db::ops::pipeline_ops::create_job(
+                    tx,
+                    stage_id,
+                    &variant.name,
+                    &job_config.script.join("\n"),
+                    job_config.image.as_deref(),
+                    tags_json.as_deref(),
+                    variables_json.as_deref(),
+                    job_config.cache.as_ref().map(|cache| cache.key.as_str()),
+                    cache_paths_json.as_deref(),
+                    job_config.allow_failure.unwrap_or(false),
+                    job_config.timeout_seconds.map(|seconds| seconds as i64),
+                    job_config.when.as_deref(),
+                    job_config.condition.as_deref(),
+                )
+                .await?;
+                let should_run = if let Some(condition) = job_config.condition.as_deref() {
+                    condition::evaluate_condition(
+                        condition,
+                        &job_condition_context(
+                            ref_name,
+                            trigger_type,
+                            commit_sha,
+                            &variant.variables,
+                            job_config,
+                        ),
+                    )?
+                } else {
+                    true
+                };
+                if !should_run {
+                    let now = chrono::Utc::now().naive_utc();
+                    rg_db::ops::pipeline_ops::update_job_result(
+                        tx,
+                        job.id,
+                        "skipped",
+                        None,
+                        None,
+                        None,
+                        Some(now),
+                    )
+                    .await?;
+                } else if let Some(environment_name) = job_config.environment.as_deref() {
+                    let environment =
+                        rg_db::ops::ci_environment_ops::find_by_name(tx, repo_id, environment_name)
+                            .await?;
+                    rg_db::ops::ci_environment_ops::attach_job(
+                        tx,
+                        job.id,
+                        environment.as_ref(),
+                        environment_name,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,6 +1243,196 @@ mod matrix_tests {
                 .unwrap()
                 .iter()
                 .all(|job| job.status == "skipped")
+        );
+    }
+
+    /// A pipeline that fails half-way through being written leaves nothing
+    /// behind — and the rows it had already written were never schedulable in
+    /// the first place.
+    ///
+    /// Both halves matter. Without the first, the pipeline row survives with a
+    /// graph that is a subset of the declared one, the runners finish that
+    /// subset and the status cascade calls the pipeline `success`. Without the
+    /// second, a runner polling between two `create_job` calls picks up a job of
+    /// a pipeline that is about to be rolled back.
+    #[tokio::test]
+    async fn a_failed_pipeline_build_leaves_nothing_a_runner_can_pick_up() {
+        use sea_orm::{EntityTrait, PaginatorTrait};
+
+        let temp = tempfile::tempdir().unwrap();
+        // `first` is a perfectly good job. `second` fails in `expand_matrix`,
+        // which runs *while jobs are being written* — an empty matrix dimension
+        // is not part of `validate_execution_semantics`, so the failure lands
+        // after the pipeline row and both stages already exist.
+        std::fs::write(
+            temp.path().join(".forgekeep-ci.yml"),
+            "stages: [build, test]\nfirst:\n  stage: build\n  script: [echo one]\nsecond:\n  stage: test\n  script: [echo two]\n  matrix:\n    arch: []\n",
+        )
+        .unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git.run(&["init"], Some(temp.path())).unwrap().success());
+        assert!(git
+            .run(&["config", "user.name", "CI"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(
+                &["config", "user.email", "ci@example.com"],
+                Some(temp.path())
+            )
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["add", ".forgekeep-ci.yml"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["commit", "-m", "half-built"], Some(temp.path()))
+            .unwrap()
+            .success());
+        let sha = git
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+        // Two pooled connections on purpose: the second half of this test reads
+        // through the pool while a transaction holds the first, which is exactly
+        // the shape of a runner polling during a pipeline build.
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("half-built.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            2,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "half-built-owner",
+            "half-built@example.com",
+            "unused",
+            "Half Built Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("half-built".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = trigger_pipeline(TriggerPipelineParams {
+            db: &db,
+            repo_path: temp.path(),
+            repo_id: repo.id,
+            commit_sha: &sha,
+            ref_name: "refs/heads/main",
+            trigger_type: "push",
+            base_branch: None,
+            triggered_by: Some(user.id),
+            docker_enabled: false,
+            external_runners: true,
+            allow_host_runner: false,
+            jwt_secret: Some("secret"),
+            external_url: None,
+        })
+        .await
+        .unwrap_err();
+        // The original failure reaches the caller — the rollback does not
+        // rewrite it into a generic database error.
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("empty matrix dimension"),
+            "the config error should survive the rollback, got: {reported}"
+        );
+
+        // Nothing survived the failure: no pipeline to show green, no stage, no
+        // job for a runner to take.
+        assert!(
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a pipeline that could not be built must not stay in the database"
+        );
+        assert_eq!(
+            rg_db::entities::pipeline_stage::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            rg_db::entities::pipeline_job::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(rg_db::ops::pipeline_ops::find_pending_job(&db)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The other half: a graph that is still being written is invisible to
+        // the query the runners poll with, so there is no window in which an
+        // incomplete pipeline can be scheduled.
+        let tx = db.begin().await.unwrap();
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &tx,
+            repo.id,
+            &sha,
+            "refs/heads/main",
+            "push",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&tx, pipeline.id, "build", 0)
+            .await
+            .unwrap();
+        rg_db::ops::pipeline_ops::create_job(
+            &tx, stage.id, "first", "echo one", None, None, None, None, None, false, None, None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
+                .await
+                .unwrap()
+                .is_none(),
+            "an uncommitted job must not be schedulable"
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            rg_db::entities::pipeline_job::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            0
         );
     }
 

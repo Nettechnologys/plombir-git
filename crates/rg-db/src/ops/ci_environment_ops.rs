@@ -17,8 +17,10 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<ci_en
         .await
         .context("db: find CI environment")
 }
+/// Connection-agnostic: pipeline creation resolves a job's environment inside
+/// the transaction that writes the job.
 pub async fn find_by_name(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     repo_id: i64,
     name: &str,
 ) -> Result<Option<ci_environment::Model>> {
@@ -49,8 +51,14 @@ pub async fn delete(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Attach a job to its environment, gating it behind approval when the
+/// environment is protected.
+///
+/// Connection-agnostic: this is part of building a job, so it runs inside the
+/// pipeline-creation transaction — a protected job must never become visible
+/// as plain `pending` first.
 pub async fn attach_job(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     job_id: i64,
     environment: Option<&ci_environment::Model>,
     environment_name: &str,
