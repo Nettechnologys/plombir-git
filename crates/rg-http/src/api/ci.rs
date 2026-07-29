@@ -157,14 +157,10 @@ pub async fn get_pipeline(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let pipeline = match pipeline_in_repo(&state, &repo, id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
     };
-    if pipeline.repo_id != repo.id {
-        return AppError::not_found("pipeline not found").into_response();
-    }
 
     let stages = match rg_db::ops::pipeline_ops::list_stages_by_pipeline(&state.db, id).await {
         Ok(s) => s,
@@ -254,10 +250,9 @@ pub async fn get_job(
     Path((_, _, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
-        Ok(Some(p)) if p.repo_id == repo.id => p,
-        Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let pipeline = match pipeline_in_repo(&state, &repo, pipeline_id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
     };
 
     match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
@@ -313,10 +308,9 @@ pub async fn play_job(
     Path((owner, name, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
     RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
-        Ok(Some(pipeline)) if pipeline.repo_id == repo.id => pipeline,
-        Ok(Some(_)) | Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(error) => return AppError::from(error).into_response(),
+    let pipeline = match pipeline_in_repo(&state, &repo, pipeline_id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
     };
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) if job_belongs_to_pipeline(&state, pipeline_id, job.stage_id).await => job,
@@ -493,14 +487,10 @@ pub async fn retry_pipeline(
     Path((owner, name, id)): Path<(String, String, i64)>,
     RepoWrite { repo, actor_id }: RepoWrite,
 ) -> impl IntoResponse {
-    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let pipeline = match pipeline_in_repo(&state, &repo, id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
     };
-    if pipeline.repo_id != repo.id {
-        return AppError::not_found("pipeline not found").into_response();
-    }
 
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,
@@ -577,14 +567,10 @@ pub async fn cancel_pipeline(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return AppError::not_found("pipeline not found").into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+    let pipeline = match pipeline_in_repo(&state, &repo, id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
     };
-    if pipeline.repo_id != repo.id {
-        return AppError::not_found("pipeline not found").into_response();
-    }
 
     if pipeline.status != "running"
         && pipeline.status != "pending"
@@ -660,6 +646,42 @@ pub async fn cancel_pipeline(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Re-tie a pipeline id to the repository the gate admitted.
+///
+/// `{id}` / `{pipeline_id}` is an instance-wide `pipelines` primary key while
+/// `RepoRead` / `RepoWrite` only ever prove something about `{owner}/{name}`, so
+/// without this any pipeline on the instance could be read, retried or canceled
+/// through the URL of a repository the caller happens to have access to. A
+/// mismatch answers 404 rather than 403: a 403 would still confirm the id
+/// exists, which is most of what an id-walking caller wants to learn.
+///
+/// Five handlers in this file spelled the comparison inline, in three different
+/// shapes — `if pipeline.repo_id != repo.id`, a guarded `match` arm, and the
+/// same arm again — and a comparison is the one form `global_id_anchor_guard`
+/// cannot read: it sees a *call*, so an inline `if` is indistinguishable from no
+/// anchor at all. Naming it is what puts `api/ci.rs` in that guard's `ANCHORED`
+/// table, so the sixth pipeline route to be written is held to the anchor by the
+/// build rather than by review.
+///
+/// It is `pub(crate)` because `api/artifacts.rs` and `api/ci_environments.rs`
+/// need the identical rule and used to carry their own copies — the generator
+/// this whole family of defects comes from is "the gate was copied into the next
+/// module and drifted from the original". The copies had already drifted: the
+/// artifacts one converted a database failure through `AppError::internal`,
+/// which is an unconditional 500 and skips the `From<anyhow::Error>`
+/// classification that turns a connection outage into a retryable 503.
+pub(crate) async fn pipeline_in_repo(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    pipeline_id: i64,
+) -> Result<rg_db::entities::pipeline::Model, AppError> {
+    match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
+        Ok(Some(pipeline)) if pipeline.repo_id == repo.id => Ok(pipeline),
+        Ok(_) => Err(AppError::not_found("pipeline not found")),
+        Err(error) => Err(AppError::from(error)),
+    }
+}
 
 async fn resolve_repo_storage_owner(
     state: &AppState,

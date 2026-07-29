@@ -65,6 +65,20 @@
 //! `review_in_pr`, `import_task_of_user`. `issues.rs` and `webhooks.rs` were
 //! reduced the same way earlier.
 //!
+//! `api/ci.rs` was the largest of them and the last: *five* handlers compared
+//! `pipeline.repo_id` against `repo.id` in three different spellings, so the
+//! file held no call for this guard to read and was not in [`ANCHORED`] at all —
+//! its `{id}` passed the census on the weak "scope comparison" branch, and a
+//! sixth pipeline route could have been added with no anchor and nothing red.
+//! `ci::pipeline_in_repo` is that name, and it is the first anchor deliberately
+//! **shared across modules**: `api/artifacts.rs` and `api/ci_environments.rs`
+//! carried their own copies of the same rule, and the artifacts copy had already
+//! drifted — it converted a database failure through `AppError::internal`, which
+//! is a flat 500 and skips the classification that answers 503 on an outage.
+//! Anchors stay file-local by default, but "the same rule, spelled three times
+//! in three modules" is the generator this whole family of defects comes from,
+//! so the copies were collapsed rather than kept in step by hand.
+//!
 //! Form 3 is still *accepted*, because a single-use comparison that has never
 //! been copied is not worth a helper — `ssh_keys.rs` and `users.rs` each have
 //! one. It is simply not *demanded* of anything: nothing about it is checkable.
@@ -186,6 +200,21 @@ const ANCHORED: &[AnchoredFile] = &[
         &[("id", &["tag_protection_in_repo"])],
     ),
     (
+        "api/ci.rs",
+        &[
+            // `get_pipeline` / `retry_pipeline` / `cancel_pipeline` spell the
+            // pipeline id `id`; the two job routes carry it as `pipeline_id`.
+            // One helper answers for both, and it is the same one
+            // `api/artifacts.rs` and `api/ci_environments.rs` call.
+            ("id", &["pipeline_in_repo"]),
+            ("pipeline_id", &["pipeline_in_repo"]),
+            // A job belongs to a stage and a stage to a pipeline, so the job's
+            // anchor is the pipeline that `pipeline_in_repo` has just placed —
+            // the same chaining as `delivery_in_webhook`.
+            ("job_id", &["job_belongs_to_pipeline"]),
+        ],
+    ),
+    (
         "api/ci_environments.rs",
         &[
             ("id", &["environment_in_repo"]),
@@ -221,7 +250,9 @@ const ANCHORED: &[AnchoredFile] = &[
         &[
             // The pipeline id is instance-wide while `RepoRead` only proves
             // something about `{owner}/{name}`, so the listing route re-ties it
-            // to the repository the gate admitted.
+            // to the repository the gate admitted. The helper is `api/ci.rs`'s —
+            // an anchor is matched by the call, not by where it is defined, and
+            // this file used to hold a second copy of that rule.
             ("pipeline_id", &["pipeline_in_repo"]),
             // The upload route is a runner route: the job must belong to the
             // runner whose token the middleware already checked.

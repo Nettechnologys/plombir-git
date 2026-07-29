@@ -282,11 +282,13 @@ async fn authorize_approval(
     pipeline_id: i64,
     job_id: i64,
 ) -> Result<ApprovalContext, axum::response::Response> {
-    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
-        Ok(Some(pipeline)) if pipeline.repo_id == repo.id => pipeline,
-        Ok(_) => return Err(AppError::not_found("pipeline not found").into_response()),
-        Err(error) => return Err(AppError::from(error).into_response()),
-    };
+    // The pipeline half of the anchor is `api/ci.rs`'s rule verbatim, so it is
+    // that file's helper rather than a fourth copy of the comparison — the copy
+    // that used to sit here is what its doc comment means by "the gate was
+    // copied into the next module".
+    let pipeline = crate::api::ci::pipeline_in_repo(state, &repo, pipeline_id)
+        .await
+        .map_err(IntoResponse::into_response)?;
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) => job,
         Ok(None) => return Err(AppError::not_found("job not found").into_response()),

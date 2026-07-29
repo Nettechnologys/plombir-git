@@ -12,6 +12,7 @@ use std::path::{Path as FsPath, PathBuf};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
+use crate::api::ci::pipeline_in_repo;
 use crate::api::repo_access::{AnchoredRead, AnchoredWrite, RepoAnchor, RepoRead};
 use crate::error::AppError;
 use crate::AppState;
@@ -662,29 +663,6 @@ fn is_path_under(path: &FsPath, root: &FsPath) -> bool {
         (Ok(path), Ok(root)) => path.starts_with(root),
         _ => false,
     }
-}
-
-/// Re-tie a pipeline id to the repository the gate admitted.
-///
-/// `{id}` on the listing route is an instance-wide pipeline key while
-/// `RepoRead` only ever proved something about `{owner}/{name}` — so without
-/// this the artifacts of *any* pipeline could be listed through the URL of a
-/// repository the caller happens to be able to read. A mismatch answers `404`
-/// rather than `403`: a caller with no right to the pipeline has no right to
-/// learn that it exists either.
-async fn pipeline_in_repo(
-    state: &AppState,
-    repo: &rg_db::entities::repository::Model,
-    pipeline_id: i64,
-) -> Result<rg_db::entities::pipeline::Model, AppError> {
-    let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("pipeline not found"))?;
-    if pipeline.repo_id != repo.id {
-        return Err(AppError::not_found("pipeline not found"));
-    }
-    Ok(pipeline)
 }
 
 async fn repo_id_for_job(
