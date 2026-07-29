@@ -155,8 +155,7 @@ pub async fn create_ssh_key(
     responses(
         (status = 204, description = "SSH key deleted"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 403, description = "Cannot delete another user's key", body = serde_json::Value),
-        (status = 404, description = "SSH key not found", body = serde_json::Value),
+        (status = 404, description = "SSH key not found, or owned by another account", body = serde_json::Value),
     )
 )]
 pub async fn delete_ssh_key(
@@ -174,8 +173,11 @@ pub async fn delete_ssh_key(
         Ok(None) => return AppError::not_found("SSH key not found").into_response(),
         Err(error) => return AppError::from(error).into_response(),
     };
+    // Another account's key answers 404, not 403: a 403 would confirm the id
+    // exists, and `{id}` is a global primary key, so the pair would turn this
+    // route into an enumeration oracle over every SSH key on the instance.
     if key.user_id != user_id {
-        return AppError::forbidden("you can only delete your own SSH keys").into_response();
+        return AppError::not_found("SSH key not found").into_response();
     }
 
     match rg_db::ops::ssh_key_ops::delete_by_id(&state.db, id).await {

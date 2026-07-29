@@ -65,13 +65,15 @@ async fn ssh_key_lifecycle_validates_and_enforces_ownership() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["id"], key_id);
 
-    let forbidden = client
+    // Another account's key reads as absent, not as forbidden — see
+    // `user_scoped_id_scope_tests` for why the two answers must not differ.
+    let not_found = client
         .delete(format!("{base}/api/v1/users/ssh-keys/{key_id}"))
         .bearer_auth(&other_jwt)
         .send()
         .await
         .unwrap();
-    assert_eq!(forbidden.status(), 403);
+    assert_eq!(not_found.status(), 404);
 
     let deleted = client
         .delete(format!("{base}/api/v1/users/ssh-keys/{key_id}"))

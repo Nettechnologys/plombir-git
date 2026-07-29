@@ -639,6 +639,7 @@ pub async fn create_token(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Token not found, or owned by another account", body = serde_json::Value),
     ),
 )]
 pub async fn delete_token(
@@ -655,13 +656,16 @@ pub async fn delete_token(
 
     let token = match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
         Ok(Some(t)) => t,
-        _ => {
-            return AppError::not_found("token not found".to_string()).into_response();
-        }
+        Ok(None) => return AppError::not_found("token not found".to_string()).into_response(),
+        // A lookup that could not run is not a lookup that said "no row": the
+        // catch-all arm here reported a database outage as a missing token.
+        Err(e) => return AppError::from(e).into_response(),
     };
+    // Another account's token answers 404, not 403: a 403 would confirm the id
+    // exists, and `{id}` is a global primary key, so the pair would turn this
+    // route into an enumeration oracle over every token on the instance.
     if token.user_id != user_id {
-        return AppError::forbidden("you can only revoke your own tokens".to_string())
-            .into_response();
+        return AppError::not_found("token not found".to_string()).into_response();
     }
     match rg_db::ops::token_ops::delete_by_id(&state.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
