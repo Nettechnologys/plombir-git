@@ -436,3 +436,300 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
         Err(LfsActionSignatureError::Expired)
     );
 }
+
+// ── A signed URL is a capability, and a capability has to keep answering ────
+//
+// The three tests below are one argument in three shapes: a signed LFS action
+// URL must stop working the moment the access it was minted from stops
+// existing. It used to re-check the signature and the *account* and nothing
+// else, so dropping a collaborator left their download URLs good for the rest
+// of the hour and their upload URLs for the rest of the six — the account being
+// untouched the whole time, which is exactly what the standing check looks at.
+//
+// Each one carries its baseline in the same run and *before* the revocation: a
+// URL that answers 403 proves nothing on its own, since a URL that was never
+// valid answers 403 too.
+
+/// Add `username` to `owner/repo` as a writer, and return the collaborator row
+/// id the removal route needs.
+async fn add_collaborator(
+    base: &str,
+    owner_token: &str,
+    owner: &str,
+    repo: &str,
+    username: &str,
+) -> i64 {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/collaborators"))
+        .bearer_auth(owner_token)
+        .json(&serde_json::json!({"username": username, "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "fixture: adding '{username}' to {owner}/{repo} failed: {}",
+        response.status()
+    );
+    response.json::<serde_json::Value>().await.unwrap()["user_id"]
+        .as_i64()
+        .expect("collaborator user_id")
+}
+
+async fn remove_collaborator(base: &str, owner_token: &str, owner: &str, repo: &str, user_id: i64) {
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/collaborators/{user_id}"
+        ))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "fixture: removing collaborator {user_id} failed: {}",
+        response.status()
+    );
+}
+
+/// Dropping a collaborator has to reach the download URLs they already hold.
+#[tokio::test]
+async fn a_download_url_stops_working_when_the_collaborator_is_dropped() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "lfsrevowner", "lfsrevowner@example.com").await;
+    let (mate_token, _) = register_full(&base, "lfsrevmate", "lfsrevmate@example.com").await;
+    create_repo(&base, &owner_token, "revoke-dl", true).await;
+    let mate_id = add_collaborator(
+        &base,
+        &owner_token,
+        "lfsrevowner",
+        "revoke-dl",
+        "lfsrevmate",
+    )
+    .await;
+
+    // Seed the object as the owner, so the download below has something real to
+    // fetch and a 404 cannot be mistaken for a denial.
+    let content = b"revocation download content";
+    let oid = hex::encode(Sha256::digest(content));
+    let upload = batch(
+        &base,
+        "lfsrevowner",
+        "revoke-dl",
+        Some(&owner_token),
+        "upload",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(upload.status(), 200);
+    let upload_href = upload.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
+        ["upload"]["href"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        reqwest::Client::new()
+            .put(&upload_href)
+            .body(content.to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // The collaborator mints a download URL while they still may.
+    let download = batch(
+        &base,
+        "lfsrevowner",
+        "revoke-dl",
+        Some(&mate_token),
+        "download",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(download.status(), 200);
+    let href = download.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
+        ["download"]["href"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Baseline, before anything is revoked: this exact URL serves this object.
+    let before = reqwest::Client::new().get(&href).send().await.unwrap();
+    assert_eq!(
+        before.status(),
+        200,
+        "the URL never worked, so it stopping later would prove nothing"
+    );
+    assert_eq!(before.bytes().await.unwrap().as_ref(), content);
+
+    remove_collaborator(&base, &owner_token, "lfsrevowner", "revoke-dl", mate_id).await;
+
+    let after = reqwest::Client::new().get(&href).send().await.unwrap();
+    assert!(
+        matches!(after.status().as_u16(), 401 | 403 | 404),
+        "a dropped collaborator's download URL still serves the object ({})",
+        after.status()
+    );
+}
+
+/// The six-hour window is the one that matters: an upload URL outliving the
+/// write access it was minted from is a write to a private repository by
+/// somebody who no longer has any.
+#[tokio::test]
+async fn an_upload_url_stops_working_when_write_access_is_dropped() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "lfsupowner", "lfsupowner@example.com").await;
+    let (mate_token, _) = register_full(&base, "lfsupmate", "lfsupmate@example.com").await;
+    create_repo(&base, &owner_token, "revoke-up", true).await;
+    let mate_id =
+        add_collaborator(&base, &owner_token, "lfsupowner", "revoke-up", "lfsupmate").await;
+
+    // Two URLs minted in one batch, while the collaborator still has write
+    // access: the first is the baseline, the second is the probe. Both are
+    // equally valid at this point, which is what makes the pair an argument.
+    let baseline_content = b"still a collaborator";
+    let probe_content = b"no longer a collaborator";
+    let baseline_oid = hex::encode(Sha256::digest(baseline_content));
+    let probe_oid = hex::encode(Sha256::digest(probe_content));
+
+    let mut hrefs = Vec::new();
+    for (oid, content) in [
+        (&baseline_oid, &baseline_content[..]),
+        (&probe_oid, &probe_content[..]),
+    ] {
+        let minted = batch(
+            &base,
+            "lfsupowner",
+            "revoke-up",
+            Some(&mate_token),
+            "upload",
+            oid,
+            content.len(),
+        )
+        .await;
+        assert_eq!(minted.status(), 200);
+        hrefs.push(
+            minted.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]["upload"]
+                ["href"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+
+    let before = reqwest::Client::new()
+        .put(&hrefs[0])
+        .body(baseline_content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        before.status(),
+        200,
+        "the minted upload URL never worked, so it failing later would prove nothing"
+    );
+
+    remove_collaborator(&base, &owner_token, "lfsupowner", "revoke-up", mate_id).await;
+
+    let after = reqwest::Client::new()
+        .put(&hrefs[1])
+        .body(probe_content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(after.status().as_u16(), 401 | 403 | 404),
+        "a dropped collaborator's upload URL still writes to the repository ({})",
+        after.status()
+    );
+}
+
+/// An anonymous signed URL was waved through on the argument that the read gate
+/// would have admitted the same caller anyway. True when it was minted; the
+/// repository is allowed to stop being public afterwards.
+#[tokio::test]
+async fn an_anonymous_download_url_stops_working_when_the_repository_turns_private() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "lfspubowner", "lfspubowner@example.com").await;
+    let repo_id = create_repo(&base, &owner_token, "goes-private", false).await;
+
+    let content = b"public while it lasted";
+    let oid = hex::encode(Sha256::digest(content));
+    let upload = batch(
+        &base,
+        "lfspubowner",
+        "goes-private",
+        Some(&owner_token),
+        "upload",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(upload.status(), 200);
+    let upload_href = upload.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
+        ["upload"]["href"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        reqwest::Client::new()
+            .put(&upload_href)
+            .body(content.to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // Minted with no credentials at all, so the URL carries no actor.
+    let download = batch(
+        &base,
+        "lfspubowner",
+        "goes-private",
+        None,
+        "download",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(download.status(), 200);
+    let href = download.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
+        ["download"]["href"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let before = reqwest::Client::new().get(&href).send().await.unwrap();
+    assert_eq!(
+        before.status(),
+        200,
+        "the anonymous URL never worked, so it stopping later would prove nothing"
+    );
+
+    // No REST route flips visibility, so the fixture does it where the handler
+    // would: the row the read gate reads on every request.
+    {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let repo = rg_db::entities::repository::Entity::find_by_id(repo_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("fixture repository");
+        let mut repo: rg_db::entities::repository::ActiveModel = repo.into();
+        repo.is_private = Set(true);
+        repo.update(&db).await.expect("flip repository to private");
+    }
+
+    let after = reqwest::Client::new().get(&href).send().await.unwrap();
+    assert!(
+        matches!(after.status().as_u16(), 401 | 403 | 404),
+        "an anonymous URL minted while the repository was public still serves it after it \
+         turned private ({})",
+        after.status()
+    );
+}

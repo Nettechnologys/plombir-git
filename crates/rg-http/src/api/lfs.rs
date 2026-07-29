@@ -81,9 +81,41 @@ async fn signer_still_stands(state: &AppState, user_id: i64) -> Result<(), AppEr
     }
 }
 
-async fn verify_signed_action(
+/// Is this request carrying a signed action URL that is *still* good for what
+/// it asks?
+///
+/// Returns `Ok(true)` when a signature was presented and honoured — the caller
+/// then needs no further gate — and `Ok(false)` when none was presented at all,
+/// which leaves the ordinary credential path to decide.
+///
+/// "Honoured" is three questions, not one, and the URL used to answer only the
+/// first two. A signature proves the server issued this capability and that it
+/// has not expired. [`signer_still_stands`] proves the account behind it is
+/// still an account. Neither says anything about *access to this repository*,
+/// and that is the thing a signed URL most obviously outlives: drop a
+/// collaborator and their download URLs keep working for the rest of the hour
+/// and their upload URLs for the rest of the six. The account is untouched
+/// throughout, so the standing check is perfectly happy.
+///
+/// So the repository gate runs here too, against the actor the signature is
+/// issued to — `query.actor`, which is covered by the HMAC and therefore not
+/// something a caller can edit. It is the same pair the job-log WebSocket
+/// settled on when it hit this exact shape (`sol_5d659e316c85`): standing *and*
+/// a re-read of the repository, because the handshake's answer expires when the
+/// repository flips to private or a collaborator is dropped.
+///
+/// That covers the anonymous issue as well, which used to be waved through with
+/// the argument that "a public repository's read gate would admit this caller
+/// with no credentials at all". True when the URL was minted; not true an hour
+/// later, after the repository was made private. `check_read_for(…, None)`
+/// answers `401` for exactly that case and keeps admitting the anonymous caller
+/// while the repository really is public.
+///
+/// The cost is one permission read per object, which is what the unsigned
+/// branch has always paid.
+async fn authorize_signed_action(
     state: &AppState,
-    repo_id: i64,
+    repo_model: &rg_db::entities::repository::Model,
     oid: &str,
     action: rg_core::lfs::service::LfsActionKind,
     query: &LfsActionQuery,
@@ -94,7 +126,7 @@ async fn verify_signed_action(
             match rg_core::lfs::service::verify_action_url(
                 state.jwt_secret.as_bytes(),
                 action,
-                repo_id,
+                repo_model.id,
                 oid,
                 *expires,
                 query.actor,
@@ -102,12 +134,16 @@ async fn verify_signed_action(
                 chrono::Utc::now().timestamp(),
             ) {
                 Ok(()) => {
-                    // An anonymous issue has no account behind it to re-check:
-                    // it was handed out on a public repository, where the read
-                    // gate would let the same caller through with no
-                    // credentials at all.
                     if let Some(user_id) = query.actor {
                         signer_still_stands(state, user_id).await?;
+                    }
+                    match action {
+                        rg_core::lfs::service::LfsActionKind::Download => {
+                            repo_access::check_read_for(state, repo_model, query.actor).await?
+                        }
+                        rg_core::lfs::service::LfsActionKind::Upload => {
+                            repo_access::check_write_for(state, repo_model, query.actor).await?
+                        }
                     }
                     Ok(true)
                 }
@@ -251,9 +287,9 @@ pub async fn upload_object(
             Err(e) => return AppError::from(e).into_response(),
         };
 
-    let signed = match verify_signed_action(
+    let signed = match authorize_signed_action(
         &state,
-        repo_model.id,
+        &repo_model,
         &oid,
         rg_core::lfs::service::LfsActionKind::Upload,
         &query,
@@ -386,8 +422,10 @@ pub async fn download_object(
     }
 }
 
-/// Enforce download authorization: a valid signed action URL bypasses auth,
-/// otherwise the repository's own read gate decides.
+/// Enforce download authorization: either the request carries a signed action
+/// URL that still stands — signature, account and repository access, all three
+/// re-checked by [`authorize_signed_action`] — or the repository's own read
+/// gate decides on the caller's own credentials.
 async fn authorize_lfs_download(
     state: &AppState,
     repo_model: &rg_db::entities::repository::Model,
@@ -395,9 +433,9 @@ async fn authorize_lfs_download(
     query: &LfsActionQuery,
     headers: &HeaderMap,
 ) -> Result<(), axum::response::Response> {
-    let signed = match verify_signed_action(
+    let signed = match authorize_signed_action(
         state,
-        repo_model.id,
+        repo_model,
         oid,
         rg_core::lfs::service::LfsActionKind::Download,
         query,
