@@ -94,6 +94,7 @@ mod repo_watch_authz_tests;
 mod repo_write_failure_status_tests;
 mod review_lookup_failure_status_tests;
 mod route_access_sweep_tests;
+mod route_gate_rank_guard;
 mod runner_auth_tests;
 mod runner_workspace_tests;
 mod security_headers_tests;
