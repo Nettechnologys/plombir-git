@@ -20,8 +20,18 @@
 use axum::handler::Handler;
 use axum::routing::MethodRouter;
 use axum::Router;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::AppState;
+
+/// The names the credential middlewares answer to in the route table.
+///
+/// One constant per layer, used on both sides — by the [`Wrap`] constructor that
+/// attaches the middleware and by the [`Access::Foreign`] level that claims it —
+/// so the two cannot drift into two spellings of one name.
+pub const RUNNER_AUTH_LAYER: &str = "authenticate_runner";
+/// See [`RUNNER_AUTH_LAYER`].
+pub const DOCS_AUTH_LAYER: &str = "docs_auth_middleware";
 
 /// What a route requires of its caller.
 ///
@@ -203,34 +213,103 @@ pub(crate) struct RouteTable {
 /// type to `axum` and were the same thing to this table, so "is the layer this
 /// route claims actually on it?" had no answer. Now it does: the name travels
 /// into the route's [`RouteFact`] and the `Foreign` guard reads it back.
+///
+/// The name and the middleware are minted together, by the constructors below.
+/// Handing both to a general-purpose `credential(name, closure)` would have left
+/// the same gap one level down — the guard would read the *name* and believe it,
+/// while `credential("authenticate_runner", &body_limit)` passed every check
+/// green with no authentication anywhere on the route. So that constructor is
+/// private and each public one applies the layer it names.
 pub(crate) struct Wrap<'a> {
     credential: Option<&'static str>,
-    apply: &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>,
+    apply: Box<dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState> + 'a>,
 }
 
 impl<'a> Wrap<'a> {
     /// A layer that carries no credential: a body limit, a rate limiter.
     pub(crate) fn plain(
-        apply: &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>,
+        apply: impl Fn(MethodRouter<AppState>) -> MethodRouter<AppState> + 'a,
     ) -> Self {
         Self {
             credential: None,
-            apply,
+            apply: Box::new(apply),
         }
     }
 
     /// A layer that *is* this route's credential check.
     ///
-    /// `layer` is what [`ForeignGate::Middleware`] is held to, so pass the same
-    /// constant on both sides rather than two spellings of one name.
-    pub(crate) fn credential(
+    /// `layer` is what [`ForeignGate::Middleware`] is held to. Private: the
+    /// point of the name is that it cannot be claimed by a wrapper that does
+    /// not do the check, and the only way to keep that true is to let nobody
+    /// outside this module pair the two.
+    fn credential(
         layer: &'static str,
-        apply: &'a dyn Fn(MethodRouter<AppState>) -> MethodRouter<AppState>,
+        apply: impl Fn(MethodRouter<AppState>) -> MethodRouter<AppState> + 'a,
     ) -> Self {
         Self {
             credential: Some(layer),
-            apply,
+            apply: Box::new(apply),
         }
+    }
+}
+
+/// The credential layers themselves — the only wrappers allowed to answer to a
+/// name in [`RouteFact::credential`].
+///
+/// Each one is the whole pair: the constant a `Foreign` level claims, and the
+/// middleware that makes the claim true. A route gets both or neither.
+impl Wrap<'static> {
+    /// The runner-token gate: `authenticate_runner` refuses the request unless
+    /// the bearer token belongs to the runner named in the path.
+    pub(crate) fn runner_auth(state: &AppState) -> Self {
+        Self::credential(RUNNER_AUTH_LAYER, runner_auth_layer(state))
+    }
+
+    /// The runner-token gate over a raised body limit, for the cache upload.
+    ///
+    /// The limit rides along; it does not replace the check the route declares,
+    /// so the wrapper still answers to [`RUNNER_AUTH_LAYER`]. The gate is
+    /// applied last, i.e. outermost: an unauthenticated caller is turned away
+    /// before a gigabyte of body is read.
+    pub(crate) fn runner_auth_with_body_limit(state: &AppState, body_limit: usize) -> Self {
+        let gate = runner_auth_layer(state);
+        Self::credential(RUNNER_AUTH_LAYER, move |mr: MethodRouter<AppState>| {
+            gate(mr.layer(RequestBodyLimitLayer::new(body_limit)))
+        })
+    }
+
+    /// The API-docs gate.
+    ///
+    /// Outermost first: `pat_auth_middleware` translates a PAT into the bearer
+    /// token `docs_auth_middleware` then checks, so it has to run before it —
+    /// i.e. be applied last.
+    pub(crate) fn docs_auth(state: &AppState) -> Self {
+        let state = state.clone();
+        Self::credential(DOCS_AUTH_LAYER, move |mr: MethodRouter<AppState>| {
+            mr.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::pat_auth::docs_auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::pat_auth::pat_auth_middleware,
+            ))
+        })
+    }
+}
+
+/// The runner-token middleware as a `MethodRouter` wrapper, shared by the plain
+/// runner gate and the one that carries a body limit — so "the cache upload is
+/// also gated" is not a second spelling of the same layer.
+fn runner_auth_layer(
+    state: &AppState,
+) -> impl Fn(MethodRouter<AppState>) -> MethodRouter<AppState> + 'static {
+    let state = state.clone();
+    move |mr: MethodRouter<AppState>| {
+        mr.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::api::runners::authenticate_runner,
+        ))
     }
 }
 

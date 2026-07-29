@@ -20,18 +20,10 @@ use crate::route_table::Access::{
     RepoAuthRead, RepoOwner, RepoRead, RepoWrite, User,
 };
 use crate::route_table::ForeignGate::{Handler, Middleware};
-use crate::route_table::{RouteFact, RouteTable, Wrap};
+use crate::route_table::{RouteFact, RouteTable, Wrap, DOCS_AUTH_LAYER, RUNNER_AUTH_LAYER};
 use crate::{
     api, git_http, handlers, metrics, middleware, oci, pat_auth, rate_limit, security, ws, AppState,
 };
-
-/// The names the credential middlewares answer to in the route table.
-///
-/// One constant per layer, used on both sides — by the [`Wrap::credential`]
-/// that attaches it and by the [`Foreign`] level that claims it — so the two
-/// cannot drift into two spellings of the same name.
-const RUNNER_AUTH_LAYER: &str = "authenticate_runner";
-const DOCS_AUTH_LAYER: &str = "docs_auth_middleware";
 
 /// Sign-off for the routes whose credentials are not a ForgeKeep session, so
 /// the sweep cannot drive them with one. Spelled out here rather than at each
@@ -341,10 +333,9 @@ fn assemble(routers: &Routers) -> Router<AppState> {
 /// sweep and the contract checks read.
 fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
     // 10 GiB body limit for blob upload requests.
-    let upload_limit_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+    let upload_limit = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
         mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
-    };
-    let upload_limit = Wrap::plain(&upload_limit_fn);
+    });
 
     let (router, facts) = RouteTable::new("")
         // API version check
@@ -428,20 +419,9 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
 /// fallback hid it; in the test router, which had no fallback of its own, a
 /// missing route looked like an authorization problem to anyone debugging one.
 fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
-    // Outermost first: `pat_auth_middleware` translates a PAT into the bearer
-    // token `docs_auth_middleware` then checks, so it has to run before it —
-    // i.e. be applied last.
-    let docs_auth_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            pat_auth::docs_auth_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            pat_auth::pat_auth_middleware,
-        ))
-    };
-    let docs_auth = Wrap::credential(DOCS_AUTH_LAYER, &docs_auth_fn);
+    // The gate, and the name it answers to in the table, come from one
+    // constructor — see `Wrap::docs_auth`.
+    let docs_auth = Wrap::docs_auth(state);
 
     let (router, facts) = RouteTable::new("")
         .get_with(
@@ -630,7 +610,7 @@ pub(crate) fn build_all_routes(
     // same client-IP resolution as the global limiter. `layer()` returns the
     // same `MethodRouter<AppState>` type in both arms, so the attach-or-not
     // choice stays type-consistent.
-    let auth_rl_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+    let auth_rl = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
         match auth_rate_limiter {
             Some(limiter) => mr.layer(axum::middleware::from_fn_with_state(
                 limiter.clone(),
@@ -638,37 +618,25 @@ pub(crate) fn build_all_routes(
             )),
             None => mr,
         }
-    };
-    let auth_rl = Wrap::plain(&auth_rl_fn);
+    });
     // The runner token check. Applied per route rather than to a sub-router so
-    // that every route still passes through the one table that declares it.
-    let runner_auth_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            api::runners::authenticate_runner,
-        ))
-    };
-    let runner_auth = Wrap::credential(RUNNER_AUTH_LAYER, &runner_auth_fn);
-    // Raised body limits for the routes that carry an upload. Only the
-    // body-carrying method of a resource takes one; a limit on its `GET`
-    // sibling never applied to anything.
-    let limit_101mb_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(RequestBodyLimitLayer::new(101 * 1024 * 1024))
-    };
-    let limit_101mb = Wrap::plain(&limit_101mb_fn);
-    let limit_1gb_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024))
-    };
-    let limit_10gb_fn = |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
-    };
-    let limit_10gb = Wrap::plain(&limit_10gb_fn);
+    // that every route still passes through the one table that declares it —
+    // and built by the constructor that owns the layer's name, so a route
+    // recorded as carrying `authenticate_runner` carries it.
+    let runner_auth = Wrap::runner_auth(state);
     // The cache upload is both: a runner credential and a raised body limit.
     // It stays a credential wrapper — the limit rides along, it does not
     // replace the check the route declares.
-    let runner_auth_1gb_fn =
-        |mr: MethodRouter<AppState>| -> MethodRouter<AppState> { runner_auth_fn(limit_1gb_fn(mr)) };
-    let runner_auth_1gb = Wrap::credential(RUNNER_AUTH_LAYER, &runner_auth_1gb_fn);
+    let runner_auth_1gb = Wrap::runner_auth_with_body_limit(state, 1024 * 1024 * 1024);
+    // Raised body limits for the routes that carry an upload. Only the
+    // body-carrying method of a resource takes one; a limit on its `GET`
+    // sibling never applied to anything.
+    let limit_101mb = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(RequestBodyLimitLayer::new(101 * 1024 * 1024))
+    });
+    let limit_10gb = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
+    });
 
     // ── Git Smart HTTP routes ──────────────────────────────────────────────
     let (git, git_facts) = RouteTable::new("/git")

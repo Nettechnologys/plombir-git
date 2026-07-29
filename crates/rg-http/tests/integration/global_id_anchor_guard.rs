@@ -90,6 +90,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rg_http::route_table::RUNNER_AUTH_LAYER;
+
+use crate::common::spawn_test_app_with_routes;
+
 /// One rule: a path parameter, and the anchors any of which satisfies it.
 type AnchorRule = (&'static str, &'static [&'static str]);
 
@@ -238,7 +242,10 @@ const ANCHORED: &[AnchoredFile] = &[
 ///
 /// The reason is the point of the entry: this is the escape hatch, and an
 /// escape hatch without a written reason is just an exemption list. Each one
-/// names what does the anchoring instead.
+/// names what does the anchoring instead — and for the layer named here, the
+/// naming is not the end of it:
+/// [`the_runner_sign_off_names_a_layer_the_routes_carry`] holds every route
+/// these handlers are on to actually carrying it.
 const SIGNED_OFF: &[(&str, &str, &str, &str)] = &[
     (
         "api/runners.rs",
@@ -246,14 +253,15 @@ const SIGNED_OFF: &[(&str, &str, &str, &str)] = &[
         "runner_id",
         "`authenticate_runner` runs as a route layer on every runner route and refuses \
          the request unless the bearer token belongs to the runner named in the path, so \
-         the id is already the caller's own by the time the handler is entered",
+         the id is already the caller's own by the time the handler is entered — checked \
+         against the route table by `the_runner_sign_off_names_a_layer_the_routes_carry`",
     ),
     (
         "api/artifacts.rs",
         "upload_artifact",
         "runner_id",
         "same route layer as the `api/runners.rs` routes — the upload is a runner route \
-         that happens to live in this file",
+         that happens to live in this file, and is held to the layer by the same test",
     ),
 ];
 
@@ -978,6 +986,95 @@ fn every_anchoring_rule_still_matches_a_handler() {
             );
         }
     }
+}
+
+/// The runner sign-off says a *route layer* anchors `runner_id`. This asks the
+/// route table whether the layer is there.
+///
+/// Everything else in this file reads source, and source cannot show a
+/// middleware: the handlers signed off below take `runner_id` and hand it to
+/// `assigned_job` with nothing beside it, which is only safe because
+/// `authenticate_runner` already refused any token that does not belong to that
+/// runner. Until now the exemption rested on the sentence in [`SIGNED_OFF`]
+/// saying so — the same shape of claim that let `POST /runners/register` declare
+/// a runner-token middleware it did not carry (card_905f6e81efdd).
+///
+/// So the claim is checked where it can be: every route whose handler is one of
+/// the signed-off ones must have been registered with the runner credential
+/// layer. Drop `&runner_auth` from any of them and this fails, naming the route
+/// — the id it hands on is global from that moment.
+#[tokio::test]
+async fn the_runner_sign_off_names_a_layer_the_routes_carry() {
+    /// `api/runners.rs` → `rg_http::api::runners::` — the prefix a handler
+    /// defined in that file carries in its `type_name`.
+    fn module_prefix(rel: &str) -> String {
+        let stem = rel.strip_suffix(".rs").unwrap_or(rel);
+        format!("rg_http::{}::", stem.replace('/', "::"))
+    }
+
+    let mut exempt: HashSet<String> = HashSet::new();
+    for (rel, name, param, _) in SIGNED_OFF {
+        if *param != "runner_id" {
+            continue;
+        }
+        let text = fs::read_to_string(src_root().join(rel))
+            .unwrap_or_else(|e| panic!("SIGNED_OFF names {rel} but it cannot be read: {e}"));
+        for handler in handlers(&text) {
+            let sig = signature(&handler.body);
+            // Same precedence the census uses: an `InstanceAdmin` signature
+            // accounts for a global id on its own, so `delete_runner_admin` and
+            // its siblings never reach the sign-off and are not claiming the
+            // layer. They sit in `api/runners.rs` and are swept up by the
+            // blanket `*`, which is the only reason they appear here at all.
+            if mentions(sig, "InstanceAdmin") {
+                continue;
+            }
+            if (*name == "*" || handler.name == *name)
+                && path_params(sig).iter().any(|p| p == param)
+            {
+                exempt.insert(format!("{}{}", module_prefix(rel), handler.name));
+            }
+        }
+    }
+    assert!(
+        !exempt.is_empty(),
+        "no handler is signed off for `runner_id` any more — this test now checks nothing, so \
+         either the sign-off moved or this test outlived it"
+    );
+
+    let (_base, facts) = spawn_test_app_with_routes().await;
+    let mut checked = 0;
+    let mut offenders = Vec::new();
+    for fact in &facts {
+        if !exempt.contains(fact.handler) {
+            continue;
+        }
+        checked += 1;
+        if fact.credential != Some(RUNNER_AUTH_LAYER) {
+            offenders.push(format!(
+                "  {} → {} carries {}",
+                fact.label(),
+                fact.handler,
+                match fact.credential {
+                    Some(other) => format!("`{other}`"),
+                    None => "no credential layer".to_string(),
+                }
+            ));
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "none of the handlers signed off for `runner_id` is on a route — the sign-off describes \
+         a route layer, so a handler that reaches no route cannot be relying on one"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a handler signed off for `runner_id` is on a route that does not carry `{RUNNER_AUTH_LAYER}`.\n\
+         The sign-off is what excuses it from anchoring the id in its own body; without the layer \
+         the id is whatever the caller typed, and the job it opens is whoever's.\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// A sign-off names a handler that must still exist, or it is an exemption for

@@ -12,9 +12,16 @@
 //! Now the sign-off is a claim with a shape — `ForeignGate::Middleware { layer }`
 //! or `ForeignGate::Handler { module }` — and this file holds every `Foreign`
 //! route to it. Both halves of the claim are recorded by the same statement
-//! that registers the route (the layer's name through `Wrap::credential`, the
-//! handler's path through `type_name`), so neither can drift away from the
+//! that registers the route (the layer's name through the credential `Wrap`,
+//! the handler's path through `type_name`), so neither can drift away from the
 //! route it describes.
+//!
+//! What this file can no longer be asked is whether the *named* layer does any
+//! checking: it reads a string the wrapper carries. That half is closed by the
+//! compiler instead — `Wrap::credential` is private, and the only constructors
+//! that mint a name (`Wrap::runner_auth`, `Wrap::docs_auth`) build the
+//! middleware they name. There is no way to write down `authenticate_runner`
+//! and attach a body limit.
 
 use std::path::{Path, PathBuf};
 
@@ -77,9 +84,9 @@ async fn a_middleware_claim_names_a_layer_the_route_carries() {
     assert!(
         offenders.is_empty(),
         "a Foreign route claims a credential middleware it was not registered with.\n\
-         Register it through `*_with(..., &<the Wrap::credential layer>)`, or declare the level \
-         the route really has — the claim is what buys it `Expect::Unchecked` in the access \
-         sweep.\n{}",
+         Register it through `*_with(..., &<the credential Wrap>)` — `Wrap::runner_auth` and its \
+         siblings are the only wrappers that carry a name — or declare the level the route really \
+         has: the claim is what buys it `Expect::Unchecked` in the access sweep.\n{}",
         offenders.join("\n")
     );
 }
