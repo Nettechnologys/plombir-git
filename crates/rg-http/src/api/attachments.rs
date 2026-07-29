@@ -60,10 +60,10 @@ pub async fn list_issue_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/issues/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_issue_attachment(
     State(state): State<AppState>,
+    RepoRead { repo: repo_model }: RepoRead,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
@@ -138,10 +138,10 @@ pub async fn list_pull_request_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/pulls/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_pull_request_attachment(
     State(state): State<AppState>,
+    RepoRead { repo: repo_model }: RepoRead,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
@@ -216,10 +216,10 @@ pub async fn list_issue_comment_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/issues/comments/{comment_id}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_issue_comment_attachment(
     State(state): State<AppState>,
+    RepoRead { repo: repo_model }: RepoRead,
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(
@@ -294,10 +294,10 @@ pub async fn list_review_comment_attachments(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
 pub async fn create_review_comment_attachment(
     State(state): State<AppState>,
+    RepoRead { repo: repo_model }: RepoRead,
     Path((owner, repo, comment_id)): Path<(String, String, i64)>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
-    RepoRead { repo: repo_model }: RepoRead,
     multipart: Multipart,
 ) -> Response {
     create(

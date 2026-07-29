@@ -15,6 +15,13 @@
 //! in `api::admin`. It used to be a second `require_admin`, which made this
 //! guard ambiguous and — more to the point — had already been copied verbatim
 //! into `api::runners`, the exact duplication this phase exists to remove.
+//!
+//! It is deliberately absent from [`GATES`] below: `card_cd6f512e2e52` made it
+//! module-private, so `api::admin::InstanceAdmin` is the only way to reach it
+//! from anywhere else and the compiler enforces what this grep would only
+//! notice. The repository gates cannot follow suit — `api::repo_access` has to
+//! export `check_read_for` / `check_write_for` for the transports that resolve
+//! their own caller — which is why the grep is still the mechanism there.
 
 use std::fs;
 use std::path::{Path, PathBuf};

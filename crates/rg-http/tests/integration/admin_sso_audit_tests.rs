@@ -350,7 +350,11 @@ async fn admin_audit_list_requires_auth() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 401);
+    // 403, not 401: the audit routes are gated by the `InstanceAdmin` extractor
+    // now, so they answer with the same code as every other admin route rather
+    // than with a second opinion of their own (`admin_users_list_requires_auth`
+    // has pinned 403 all along).
+    assert_eq!(resp.status(), 403);
 }
 
 #[tokio::test]
@@ -439,7 +443,8 @@ async fn admin_login_attempts_are_protected_paginated_and_filterable() {
         .send()
         .await
         .unwrap();
-    assert_eq!(unauthenticated.status(), 401);
+    // 403 — see `admin_audit_list_requires_auth`: one admin gate, one code.
+    assert_eq!(unauthenticated.status(), 403);
 
     let (admin_token, admin_id) =
         register_full(&base, "login_auditor", "login_auditor@example.com").await;

@@ -450,9 +450,9 @@ pub async fn get_starred_status(
 )]
 pub async fn get_stargazers(
     State(state): State<AppState>,
+    RepoRead { repo }: RepoRead,
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
-    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
@@ -737,9 +737,9 @@ pub async fn fork_repo_handler(
 )]
 pub async fn list_forks_handler(
     State(state): State<AppState>,
+    RepoRead { .. }: RepoRead,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
-    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();

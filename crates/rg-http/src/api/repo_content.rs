@@ -155,9 +155,9 @@ pub struct GpgSignature {
 )]
 pub async fn list_tree(
     State(state): State<AppState>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<TreeQuery>,
-    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -254,9 +254,9 @@ fn is_empty_repo(repo_path: &std::path::Path) -> bool {
 )]
 pub async fn get_blob(
     State(state): State<AppState>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
     Path((owner, repo, path)): Path<(String, String, String)>,
     Query(params): Query<BlobQuery>,
-    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
@@ -304,9 +304,9 @@ pub async fn get_blob(
 )]
 pub async fn get_log(
     State(state): State<AppState>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<LogQuery>,
-    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // H-02: Validate owner/repo before constructing repository path
     if let Err(e) = rg_core::platform::validate_repo_path(&owner) {

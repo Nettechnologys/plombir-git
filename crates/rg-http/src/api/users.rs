@@ -644,16 +644,9 @@ pub async fn create_token(
 )]
 pub async fn delete_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response();
-        }
-    };
-
     let token = match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
         Ok(Some(t)) => t,
         Ok(None) => return AppError::not_found("token not found".to_string()).into_response(),

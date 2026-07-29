@@ -195,8 +195,34 @@ const EXTRACTOR_BEFORE_GATE: &[&str] = &[
     "POST /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
     "POST /api/v1/repos/{owner}/{name}/pulls/{number}/assets",
     "POST /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
-    "GET /api/v1/ai/repos/{owner}/{name}/search/code",
+    // `GET /api/v1/ai/repos/{owner}/{name}/search/code` left this list with
+    // `card_cd6f512e2e52`. It was never a *body* entry: its gate was a
+    // `RepoRead` argument all along, declared after `Query<SearchCodeQuery>`,
+    // whose required `q` answered first. Moving the gate ahead of the query is
+    // the whole fix — see
+    // [`no_route_answers_a_query_complaint_before_its_gate`], which is now the
+    // pass that would notice.
 ];
+
+/// Routes that answer a *query* complaint before they answer the access
+/// question — the same defect as [`EXTRACTOR_BEFORE_GATE`], reached through
+/// `Query<_>` instead of `Json<_>`.
+///
+/// Empty, and meant to stay that way: the list exists so that a route which
+/// regresses can be quarantined with a reason instead of the pass being
+/// switched off. See [`no_route_answers_a_query_complaint_before_its_gate`].
+const QUERY_BEFORE_GATE: &[&str] = &[];
+
+/// A query string no handler can deserialize, and no gate needs to.
+///
+/// Every name in it is a parameter this tree really declares as a number or a
+/// bool, so a handler that reads its query before it decides who is asking is
+/// guaranteed to trip on it. Names a handler does not declare are ignored by
+/// serde, so a route taking none of them is unaffected — which is the point:
+/// the pass separates "reads the query first" from "answers the question
+/// first", and asserts nothing else.
+const HOSTILE_QUERY: &str = "?page=zz&per_page=zz&page_size=zz&limit=zz&offset=zz\
+                             &unread_only=zz&success=zz&user_id=zz";
 
 /// Mismatches that are real defects, already filed, and not fixed yet.
 ///
@@ -796,6 +822,126 @@ async fn every_route_answers_its_declared_access_level() {
          {report}{}",
         failures.len(),
         healed.len(),
+        healed.join("\n"),
+    );
+}
+
+/// A hostile query string must not overtake the gate.
+///
+/// `Query<_>` is a `FromRequestParts` like `Json<_>` is a `FromRequest`, and
+/// axum runs a handler's arguments left to right — so a gate written as the
+/// first statement of the function *body* still runs after the query has been
+/// deserialized. `GET /api/v1/admin/users?per_page=abc` answered an anonymous
+/// caller `400`, with the serde error naming the parameter and its type,
+/// instead of `403`.
+///
+/// [`every_route_answers_its_declared_access_level`] cannot see this, and not
+/// by oversight: its `probe` sends a body only on `POST`/`PUT`/`PATCH` and a
+/// query string never, so every route answers on its defaults and the gate
+/// gets there in time. This pass drives the same table with a query that
+/// cannot deserialize as anything and asks the one question that survives the
+/// missing fixture — did the route still *decide*?
+///
+/// Deliberately narrow. It seeds nothing, so a route that resolves a
+/// non-existent repository first answers `404` and that is accepted; what is
+/// not accepted is `400`/`415`/`422`, which is a route telling a caller it was
+/// never going to admit what its parameters are called.
+#[tokio::test]
+async fn no_route_answers_a_query_complaint_before_its_gate() {
+    let (base, facts) = spawn_test_app_with_routes().await;
+    let client = Client::builder().build().expect("http client");
+    // Nothing is seeded: every probe here is anonymous, and the question is
+    // only which *kind* of answer comes back.
+    let seed = RepoSeed {
+        name: "nosuchrepo".to_string(),
+        comment_id: "1".to_string(),
+    };
+
+    let labels: BTreeSet<String> = facts.iter().map(RouteFact::label).collect();
+    for label in QUERY_BEFORE_GATE {
+        assert!(
+            labels.contains(*label),
+            "QUERY_BEFORE_GATE names '{label}', which is not a route any more — drop it"
+        );
+    }
+
+    let mut probed = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+    let mut quarantined: BTreeSet<String> = BTreeSet::new();
+
+    for fact in &facts {
+        let label = fact.label();
+        if listed(NO_FIXTURE, &label) {
+            continue;
+        }
+        // An anonymous caller is owed the same thing whatever the scope;
+        // `PrivateRepo` is simply the one where that is also true of the
+        // repository levels.
+        let expect = expectation(fact.access, Persona::Anonymous, Scope::PrivateRepo);
+        if !matches!(expect, Expect::Denied | Expect::Hidden) {
+            continue;
+        }
+
+        let url = format!("{base}{}{HOSTILE_QUERY}", fill(&fact.path, &seed));
+        let mut req = match fact.method {
+            "GET" => client.get(url),
+            "HEAD" => client.head(url),
+            "POST" => client.post(url),
+            "PUT" => client.put(url),
+            "PATCH" => client.patch(url),
+            "DELETE" => client.delete(url),
+            other => panic!("route table produced an unroutable method {other}"),
+        };
+        if matches!(fact.method, "POST" | "PUT" | "PATCH") {
+            req = req.json(&serde_json::json!({}));
+        }
+        let status = req.send().await.expect("hostile-query probe").status();
+        probed += 1;
+
+        if !matches!(status.as_u16(), 400 | 415 | 422) {
+            continue;
+        }
+        // A route already quarantined for reading its *body* first will
+        // complain about that body here too; it is the same defect and the
+        // main sweep is where its list is kept honest.
+        if EXTRACTOR_BEFORE_GATE.contains(&label.as_str()) {
+            continue;
+        }
+        if QUERY_BEFORE_GATE.contains(&label.as_str()) {
+            quarantined.insert(label);
+            continue;
+        }
+        offenders.push(format!(
+            "  {label} — declared {:?}, anonymous got {status}",
+            fact.access
+        ));
+    }
+
+    assert!(
+        probed > 50,
+        "only {probed} gated route(s) were driven — the filter is wrong, not the server"
+    );
+
+    let healed: Vec<String> = QUERY_BEFORE_GATE
+        .iter()
+        .filter(|label| !quarantined.contains(**label))
+        .map(|label| {
+            format!(
+                "  {label} now decides before it reads the query — drop it from QUERY_BEFORE_GATE"
+            )
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty() && healed.is_empty(),
+        "{} route(s) answered a query complaint to a caller they owed a denial, and {} \
+         stale quarantine entr(ies).\nThe gate is inside the handler body, behind a \
+         `Query<_>` argument that axum runs first. Take the access level as an argument \
+         *before* the query — `InstanceAdmin` / `AuthUser` / the `repo_access` extractors \
+         — so the decision happens before anything is parsed.\n{}{}",
+        offenders.len(),
+        healed.len(),
+        offenders.join("\n"),
         healed.join("\n"),
     );
 }

@@ -6,6 +6,82 @@ async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
         .expect("promote user to admin");
 }
 
+/// A query string the caller was never going to be allowed to send must not be
+/// parsed before the caller is turned away.
+///
+/// `Query<_>` is a `FromRequestParts` and axum runs a handler's arguments left
+/// to right, so a gate written as the first statement of the function *body*
+/// still runs after the query is deserialized. `?per_page=abc` therefore
+/// answered an anonymous caller `400` with serde's complaint — which names the
+/// parameter and the type it wanted — instead of `403`.
+///
+/// The four probes are one argument, not four assertions. The admin's `400` is
+/// what makes the anonymous `403` mean something: it shows the deserializer
+/// really does reject `abc`, so the denial is the gate having run first rather
+/// than a parser that happened to be lenient. The admin's `200` is the live
+/// baseline — without it every line here would still pass against a route that
+/// had simply stopped working.
+#[tokio::test]
+async fn admin_users_denies_before_it_parses_the_query() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/admin/users?per_page=abc");
+
+    let anon = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        anon.status(),
+        403,
+        "an anonymous caller was answered about the query instead of about itself"
+    );
+    let body = anon.text().await.unwrap();
+    assert!(
+        !body.contains("per_page") && !body.contains("u64"),
+        "the denial handed out the parameter's name or type: {body}"
+    );
+
+    let (user_token, _) = register_full(&base, "queryuser", "queryuser@example.com").await;
+    let outsider = client
+        .get(&url)
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        outsider.status(),
+        403,
+        "a signed-in non-admin was answered about the query instead of about itself"
+    );
+
+    let (admin_token, admin_id) =
+        register_full(&base, "queryadmin", "queryadmin@example.com").await;
+    promote_user_to_admin(&db, admin_id).await;
+
+    let admin = client
+        .get(&url)
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin.status(),
+        400,
+        "`per_page=abc` is supposed to be a bad request once you are past the gate — if it \
+         is not, the two denials above prove nothing about ordering"
+    );
+
+    let alive = client
+        .get(format!("{base}/api/v1/admin/users?per_page=5"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        alive.status(),
+        200,
+        "the route is dead, so every denial above is meaningless"
+    );
+}
+
 #[tokio::test]
 async fn admin_users_list_requires_auth() {
     let (base, _db) = spawn_test_app_with_db().await;

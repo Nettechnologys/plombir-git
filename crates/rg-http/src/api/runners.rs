@@ -9,7 +9,7 @@ use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
-use crate::api::admin::require_instance_admin;
+use crate::api::admin::InstanceAdmin;
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::{IntoParams, ToSchema};
@@ -86,13 +86,9 @@ pub struct RunnerInfoResponse {
 )]
 pub async fn get_runner_admin(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::unauthorized("admin authentication required").into_response();
-    }
-
     match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
         Ok(Some(r)) => (
             StatusCode::OK,
@@ -133,14 +129,9 @@ pub async fn get_runner_admin(
 )]
 pub async fn register(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Json(req): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin authentication required to register runners")
-            .into_response();
-    }
-
     let labels_json =
         serde_json::to_string(&req.labels.unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
 
@@ -1270,11 +1261,8 @@ pub struct FinishJobRequest {
 )]
 pub async fn list_runners_admin(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::unauthorized("admin authentication required").into_response();
-    }
     match rg_db::ops::runner_ops::list_all(&state.db).await {
         Ok(runners) => {
             let resp: Vec<RunnerInfoResponse> = runners
@@ -1390,12 +1378,9 @@ fn extract_runner_id_from_path(path: &str) -> Option<i64> {
 )]
 pub async fn delete_runner_admin(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::unauthorized("admin authentication required").into_response();
-    }
     match rg_db::ops::runner_ops::delete_runner(&state.db, runner_id).await {
         Ok(true) => (
             StatusCode::NO_CONTENT,

@@ -1,11 +1,11 @@
 //! REST API handlers for notifications.
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::api::auth::AuthUser;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -46,15 +46,9 @@ pub struct ListNotificationsQuery {
 )]
 pub async fn list_notifications(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Query(params): Query<ListNotificationsQuery>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
     let unread_only = params.unread_only.unwrap_or(false);
     let pagination = params.pagination.clamp();
     let offset = pagination.offset();
@@ -99,14 +93,10 @@ pub async fn list_notifications(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn unread_count(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
+pub async fn unread_count(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> impl IntoResponse {
     match rg_core::notification::unread_count(&state.db, user_id).await {
         Ok(count) => Json(serde_json::json!({"unread_count": count})).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -130,16 +120,9 @@ pub async fn unread_count(State(state): State<AppState>, headers: HeaderMap) -> 
 )]
 pub async fn mark_read(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
     match rg_core::notification::mark_read_for_user(&state.db, id, user_id).await {
         Ok(()) => Json(serde_json::json!({"id": id, "is_read": true})).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -157,14 +140,10 @@ pub async fn mark_read(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn mark_all_read(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
+pub async fn mark_all_read(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> impl IntoResponse {
     match rg_core::notification::mark_all_read(&state.db, user_id).await {
         Ok(count) => Json(serde_json::json!({"marked_read": count})).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -187,16 +166,9 @@ pub async fn mark_all_read(State(state): State<AppState>, headers: HeaderMap) ->
 )]
 pub async fn delete_notification(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
     match rg_core::notification::delete_notification_for_user(&state.db, id, user_id).await {
         Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
         Err(e) => AppError::from(e).into_response(),

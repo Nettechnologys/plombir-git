@@ -563,16 +563,10 @@ pub async fn callback(
 )]
 pub async fn refresh_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    crate::api::auth::AuthUser(user_id): crate::api::auth::AuthUser,
     Path(slug): Path<String>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    use crate::api::auth::extract_user_id;
-
-    // Require authenticated user
-    let user_id = extract_user_id(&headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-
     let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &slug)
         .await
         .map_err(AppError::from)?

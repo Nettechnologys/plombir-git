@@ -141,9 +141,9 @@ pub async fn ai_repo_summary(
 )]
 pub async fn ai_list_issues(
     State(state): State<AppState>,
+    RepoRead { .. }: RepoRead,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<IssueListQuery>,
-    RepoRead { .. }: RepoRead,
 ) -> Result<(StatusCode, Json<Vec<IssueSummary>>), AppError> {
     let state_filter = params.state.as_deref().unwrap_or("open");
 
@@ -185,9 +185,9 @@ pub async fn ai_list_issues(
 )]
 pub async fn ai_list_prs(
     State(state): State<AppState>,
+    RepoRead { .. }: RepoRead,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PrListQuery>,
-    RepoRead { .. }: RepoRead,
 ) -> Result<(StatusCode, Json<Vec<PrSummary>>), AppError> {
     let state_filter = params.state.as_deref().unwrap_or("open");
 
@@ -234,9 +234,9 @@ pub async fn ai_list_prs(
     tag = "ai",
 )]
 pub async fn ai_repo_tree(
+    RepoRead { .. }: RepoRead,
     Path((_, _)): Path<(String, String)>,
     Query(_params): Query<TreeQuery>,
-    RepoRead { .. }: RepoRead,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     Ok((
         StatusCode::NOT_IMPLEMENTED,
@@ -274,9 +274,9 @@ pub struct CodeSearchResult {
 )]
 pub async fn ai_search_code(
     State(state): State<AppState>,
+    RepoRead { repo }: RepoRead,
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<SearchCodeQuery>,
-    RepoRead { repo }: RepoRead,
 ) -> Result<(StatusCode, Json<Vec<CodeSearchResult>>), AppError> {
     let limit = params.limit.unwrap_or(20).min(100) as u64;
     let offset = 0u64;

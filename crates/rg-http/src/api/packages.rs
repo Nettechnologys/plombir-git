@@ -206,12 +206,12 @@ fn resolve_publish_info(
 )]
 pub async fn publish(
     State(state): State<AppState>,
-    Path((owner, name, pkg_type)): Path<(String, String, String)>,
-    Query(query): Query<PublishPackageQuery>,
-    headers: axum::http::HeaderMap,
     RepoWrite {
         actor_id: user_id, ..
     }: RepoWrite,
+    Path((owner, name, pkg_type)): Path<(String, String, String)>,
+    Query(query): Query<PublishPackageQuery>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
@@ -310,18 +310,18 @@ pub async fn publish(
 )]
 pub async fn publish_npm(
     State(state): State<AppState>,
+    gate: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<PublishPackageQuery>,
     headers: axum::http::HeaderMap,
-    gate: RepoWrite,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     publish(
         State(state),
+        gate,
         Path((owner, name, "npm".to_string())),
         Query(query),
         headers,
-        gate,
         body,
     )
     .await
@@ -1349,10 +1349,10 @@ pub async fn nuget_registration_index(
 /// NuGet Search Query API (3.5.0) — search packages by name.
 pub async fn nuget_search(
     State(state): State<AppState>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<NuGetSearchParams>,
-    CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
     let query = params.q.as_deref().unwrap_or("");
     let base_url = build_base_url(&headers);
@@ -1422,10 +1422,10 @@ pub struct NuGetSearchParams {
 /// RubyGems dependencies API — returns version info for dependency resolution.
 pub async fn rubygems_dependencies(
     State(state): State<AppState>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<RubyGemsDepsParams>,
-    CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
     let gem_list: Vec<&str> = params
         .gems

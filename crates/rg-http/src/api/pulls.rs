@@ -100,9 +100,9 @@ pub struct ListQuery {
 )]
 pub async fn list_prs(
     State(state): State<AppState>,
+    RepoRead { .. }: RepoRead,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<ListQuery>,
-    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     let state_filter = params.state.as_deref();
     let pagination = params.pagination.clamp();

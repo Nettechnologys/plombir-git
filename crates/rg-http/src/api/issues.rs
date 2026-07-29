@@ -212,9 +212,9 @@ pub struct CommentResponse {
 )]
 pub async fn list_issues(
     State(state): State<AppState>,
+    RepoRead { .. }: RepoRead,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<ListQuery>,
-    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     let state_filter = params.state.as_deref();
     let pagination = params.pagination.clamp();
@@ -685,9 +685,9 @@ pub struct ListMilestonesQuery {
 )]
 pub async fn list_milestones(
     State(state): State<AppState>,
+    RepoRead { repo }: RepoRead,
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<ListMilestonesQuery>,
-    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     match rg_db::ops::milestone_ops::list_by_repo(&state.db, repo.id, params.state.as_deref()).await
     {

@@ -71,7 +71,13 @@ pub struct UpdateUserRequest {
 
 /// Extract the current user ID from cookie or Bearer token and verify is_admin=true.
 /// Returns None if not authenticated or not an admin.
-pub(crate) async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+///
+/// Private to this module on purpose: the rule is reachable from a handler only
+/// through [`InstanceAdmin`], so "which extractor gates this route" is a
+/// question the compiler answers. A handler in another module cannot call the
+/// rule from inside its own body even if it wants to — which is the only way
+/// the ordering below stays true for handlers nobody has written yet.
+async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
     let user_id = extract_user_id(headers, &state.jwt_secret)?;
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
@@ -92,6 +98,14 @@ pub(crate) async fn require_instance_admin(state: &AppState, headers: &HeaderMap
 /// `FromRequest` runs after every `FromRequestParts`. Taking the gate as an
 /// argument puts it back in front of the body — and in front of the schema
 /// oracle a rejected body hands out.
+///
+/// The body is not the only extractor that overtakes an in-body gate. `Query<_>`
+/// and `Path<_>` are `FromRequestParts` too, and axum runs the handler's
+/// arguments left to right: a gate written as the first statement of the
+/// function body still runs *after* every one of them. `GET /admin/users?per_page=abc`
+/// answered an anonymous caller `400` with the serde error naming the parameter
+/// and its type, rather than `403`. Declaring the gate as the argument before
+/// them is what puts it first.
 ///
 /// The rejection is deliberately the same `403 admin required` the handlers
 /// answered before, so this is a reordering and not a change of contract.
@@ -125,12 +139,9 @@ impl axum::extract::FromRequestParts<AppState> for InstanceAdmin {
 )]
 pub async fn list_users(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     let params = params.clamp();
     match rg_core::user::service::list_users_admin(&state.db, params.offset(), params.limit()).await
     {
@@ -157,12 +168,9 @@ pub async fn list_users(
 )]
 pub async fn get_user(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     match rg_core::user::service::get_user_by_id(&state.db, user_id).await {
         Ok(Some(user)) => (StatusCode::OK, Json(serde_json::json!(user))).into_response(),
         Ok(None) => AppError::not_found("user not found").into_response(),
@@ -186,14 +194,11 @@ pub async fn get_user(
 )]
 pub async fn update_user(
     State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
     Json(body): Json<UpdateUserRequest>,
 ) -> impl IntoResponse {
-    let current_id = match require_instance_admin(&state, &headers).await {
-        Some(id) => id,
-        None => return AppError::forbidden("admin required").into_response(),
-    };
     let display_name_for_audit = body.display_name.clone();
     let display_name = body.display_name.map(Some);
     let bio = body.bio.map(Some);
@@ -252,13 +257,10 @@ pub async fn update_user(
 )]
 pub async fn unlock_user(
     State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
-    let current_id = match require_instance_admin(&state, &headers).await {
-        Some(id) => id,
-        None => return AppError::forbidden("admin required").into_response(),
-    };
     let target = match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
         Ok(Some(user)) => user,
         Ok(None) => return AppError::not_found("user not found").into_response(),
@@ -310,13 +312,10 @@ pub async fn unlock_user(
 )]
 pub async fn delete_user(
     State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
-    let current_id = match require_instance_admin(&state, &headers).await {
-        Some(id) => id,
-        None => return AppError::forbidden("admin required").into_response(),
-    };
     if current_id == user_id {
         return AppError::bad_request("cannot delete your own account").into_response();
     }
@@ -355,12 +354,9 @@ pub async fn delete_user(
 )]
 pub async fn list_orgs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     let params = params.clamp();
     match rg_db::ops::org_ops::list_all_orgs(&state.db, params.offset(), params.limit()).await {
         Ok((orgs, total)) => {
@@ -387,12 +383,9 @@ pub async fn list_orgs(
 )]
 pub async fn get_org(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     match rg_core::org::get_org_by_name(&state.db, &name).await {
         Ok(Some(org)) => {
             (StatusCode::OK, Json(serde_json::json!(org_response(&org)))).into_response()
@@ -418,13 +411,10 @@ pub async fn get_org(
 )]
 pub async fn delete_org(
     State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let current_id = match require_instance_admin(&state, &headers).await {
-        Some(id) => id,
-        None => return AppError::forbidden("admin required").into_response(),
-    };
     match rg_core::org::get_org_by_name(&state.db, &name).await {
         Ok(Some(org)) => match rg_core::org::delete_org(&state.db, org.id, org.id).await {
             Ok(()) => {
@@ -464,11 +454,8 @@ pub async fn delete_org(
 )]
 pub async fn list_sso_providers(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     match rg_db::ops::sso_provider_ops::list_all(&state.db).await {
         Ok(providers) => {
             let list: Vec<_> = providers.iter().map(sso_provider_response).collect();
@@ -491,12 +478,9 @@ pub async fn list_sso_providers(
 )]
 pub async fn get_sso_provider(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
         Ok(Some(p)) => (StatusCode::OK, Json(sso_provider_response(&p))).into_response(),
         Ok(None) => AppError::not_found("SSO provider not found").into_response(),
@@ -780,12 +764,9 @@ pub async fn update_sso_provider(
 )]
 pub async fn test_sso_provider_connection(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     let provider = match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
         Ok(Some(provider)) => provider,
         Ok(None) => return AppError::not_found("SSO provider not found").into_response(),
@@ -827,12 +808,9 @@ pub async fn test_sso_provider_connection(
 )]
 pub async fn delete_sso_provider(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     let provider = match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
         Ok(Some(provider)) => provider,
         Ok(None) => return AppError::not_found("SSO provider not found").into_response(),
@@ -896,10 +874,10 @@ fn sso_provider_response(p: &rg_db::entities::sso_provider::Model) -> serde_json
         (status = 401, description = "Admin access required"),
     ),
 )]
-pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
+pub async fn get_settings(
+    State(state): State<AppState>,
+    _admin: InstanceAdmin,
+) -> impl IntoResponse {
     let settings = state.instance_settings.get(&state.db).await;
     (StatusCode::OK, Json(serde_json::json!(settings))).into_response()
 }
@@ -918,12 +896,9 @@ pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> 
 )]
 pub async fn update_settings(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _admin: InstanceAdmin,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if require_instance_admin(&state, &headers).await.is_none() {
-        return AppError::forbidden("admin required").into_response();
-    }
     let updated = state
         .instance_settings
         .update(&state.db, |s| {

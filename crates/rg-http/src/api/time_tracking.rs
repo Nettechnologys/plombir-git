@@ -115,9 +115,9 @@ pub async fn add_time(
 )]
 pub async fn list_time_entries(
     State(state): State<AppState>,
+    RepoRead { .. }: RepoRead,
     Path((owner, name, number)): Path<(String, String, i64)>,
     Query(params): Query<PaginationParams>,
-    RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     // Time entries carry a free-form description written by collaborators, so
     // they are exactly as private as the repository. Without this gate the

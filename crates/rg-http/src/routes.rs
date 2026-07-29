@@ -1843,7 +1843,12 @@ pub(crate) fn build_all_routes(
             api::packages::download_file,
         )
         // ── CI/CD runners ──────────────────────────────────────────────────
-        .post(RUNNER_TOKEN, "/runners/register", api::runners::register)
+        // Registration is the one runner route a runner cannot already hold a
+        // token for — it is what hands the token out. The credential is an
+        // instance-admin session, so the level is `InstanceAdmin` and not
+        // `RUNNER_TOKEN`: declaring it `Foreign` bought the route an
+        // `Expect::Unchecked` exemption from the sweep it did not need.
+        .post(InstanceAdmin, "/runners/register", api::runners::register)
         .post_with(
             RUNNER_TOKEN,
             "/runners/{id}/heartbeat",

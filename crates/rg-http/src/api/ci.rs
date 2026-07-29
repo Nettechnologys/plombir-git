@@ -101,9 +101,9 @@ pub struct ListPipelinesQuery {
 )]
 pub async fn list_pipelines(
     State(state): State<AppState>,
+    RepoRead { repo }: RepoRead,
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<ListPipelinesQuery>,
-    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.pagination.clamp();
     let offset = pagination.offset();

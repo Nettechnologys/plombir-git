@@ -113,9 +113,9 @@ pub struct UpdateReleaseRequest {
 )]
 pub async fn list_releases(
     State(state): State<AppState>,
+    RepoRead { repo }: RepoRead,
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
-    RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
