@@ -996,24 +996,38 @@ pub async fn find_active_repo_by_owner_name(
     Ok(repo.filter(|r| r.deleted_at.is_none()))
 }
 
-/// Fork a repository. Returns the forked repo.
+/// A repository that was just forked, and the account name it landed under.
+///
+/// The name is returned rather than re-derived by the caller because it is the
+/// one that was actually used to build the directory on disk: an audit entry or
+/// a response that spells the fork's path differently from where it lives is a
+/// record of something that did not happen.
+pub struct ForkedRepo {
+    pub repo: rg_db::entities::repository::Model,
+    /// The forker's account name — the `owner` half of the fork's `owner/name`.
+    pub owner_username: String,
+}
+
+/// Fork `source_repo` into `user_id`'s namespace. Returns the forked repo.
+///
+/// **The read gate on the source is the caller's**, which is why the source
+/// arrives as an already-resolved model rather than as a name to look up: the
+/// HTTP route declares `RepoAuthRead` and the extractor hands the model over
+/// having already asked `api::repo_access` whether this caller may read it.
+/// This function used to re-decide that itself, off `can_read_repo` — a second
+/// copy of the rule, living one crate away from the gate it was supposed to
+/// mirror (card_b38bfb0f2b40).
 pub async fn fork_repo(
     db: &DatabaseConnection,
     user_id: i64,
     owner: &str,
-    repo_name: &str,
+    source_repo: &rg_db::entities::repository::Model,
     repo_root: &std::path::Path,
-) -> Result<rg_db::entities::repository::Model> {
-    // Absent source → 404, refused read → 403, name already taken → 400. Each
-    // outcome carries its own type so the clone, the `create_dir_all` and the
-    // queries in between keep their 5xx instead of all four answering 400.
-    let source_repo = find_repo_by_owner_name(db, owner, repo_name)
-        .await?
-        .ok_or_else(|| crate::error::not_found("repository"))?;
-
-    if source_repo.is_private && !can_read_repo(db, &source_repo, Some(user_id)).await? {
-        return Err(crate::error::forbidden("cannot read private repository"));
-    }
+) -> Result<ForkedRepo> {
+    // Name already taken → 400. Each outcome carries its own type so the clone,
+    // the `create_dir_all` and the queries in between keep their 5xx instead of
+    // both answering 400.
+    let repo_name = source_repo.name.as_str();
 
     // The forker id comes from a verified token, so a missing row here is our
     // inconsistency, not the caller's — it stays an untyped 500.
@@ -1106,7 +1120,10 @@ pub async fn fork_repo(
         );
     }
 
-    Ok(forked)
+    Ok(ForkedRepo {
+        repo: forked,
+        owner_username: forker.username,
+    })
 }
 
 /// List forks of a repository.

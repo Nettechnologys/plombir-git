@@ -658,43 +658,51 @@ pub struct ForkRequest {
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Source repository not readable by this caller", body = serde_json::Value),
+        (status = 404, description = "No such source repository", body = serde_json::Value),
     ),
 )]
 pub async fn fork_repo_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    // Forking reads the source, so the level the route table declares is the
+    // level the signature takes. The handler used to take no repository gate at
+    // all and let `rg_core::repo::service::fork_repo` decide, off its own
+    // `can_read_repo` — a copy of the rule one crate away from
+    // `api::repo_access`, where no guard in this crate could see it
+    // (card_b38bfb0f2b40). The extractor also widens what counts as a session:
+    // the old in-body `extract_bearer_claims` accepted only
+    // `Authorization: Bearer`, so the browser — which holds the HttpOnly
+    // `forgekeep_token` cookie and no header — got a `401` from the fork button.
+    RepoAuthRead {
+        repo: source,
+        actor_id: user_id,
+    }: RepoAuthRead,
     Path((owner, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let claims = match extract_bearer_claims(&headers, &state.jwt_secret) {
-        Some(c) => c,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response();
-        }
-    };
-    let user_id: i64 = match claims.sub.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => {
-            return AppError::unauthorized("invalid token subject".to_string()).into_response()
-        }
-    };
-
-    match rg_core::repo::service::fork_repo(&state.db, user_id, &owner, &name, &state.repo_root)
+    match rg_core::repo::service::fork_repo(&state.db, user_id, &owner, &source, &state.repo_root)
         .await
     {
-        Ok(repo) => {
+        Ok(rg_core::repo::service::ForkedRepo {
+            repo,
+            owner_username,
+        }) => {
             // Record audit log. The fork is named the way every other record in
             // this module names a repository — `owner/name` — not `<user id>/name`:
             // an audit row is read by a human looking for a path that exists.
+            // The name is the one the fork actually landed under, taken from the
+            // account row rather than from the session's `username` claim: a
+            // session minted before a rename still carries the old spelling.
             let details = serde_json::json!({
                 "source_owner": owner,
                 "source_name": name,
-                "fork_owner": claims.username
+                "fork_owner": owner_username
             });
-            let resource_name = format!("{}/{}", claims.username, name);
+            let resource_name = format!("{owner_username}/{}", repo.name);
             record_audit(
                 &state.db,
                 user_id,
-                &claims.sub,
+                &owner_username,
                 "repo.fork",
                 Some("repo"),
                 Some(repo.id),
@@ -711,10 +719,11 @@ pub async fn fork_repo_handler(
             // disagreement while every fork was a 500.
             (StatusCode::CREATED, Json(serde_json::json!(repo))).into_response()
         }
-        // Absent source → 404, private source the caller may not read → 403, name
-        // already taken in their account → 400. The `git clone --bare` behind all
-        // of them is ours and finally reports as a 5xx instead of handing the
-        // client the git command line in a 400 body.
+        // Absent source → 404 and a private source the caller may not read →
+        // 403, both from the extractor above; a name already taken in their
+        // account → 400 from here. The `git clone --bare` behind them is ours
+        // and reports as a 5xx instead of handing the client the git command
+        // line in a 400 body.
         Err(e) => AppError::from(e).into_response(),
     }
 }

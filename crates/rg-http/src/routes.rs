@@ -1704,8 +1704,10 @@ pub(crate) fn build_all_routes(
             api::releases::verify_asset_attestation,
         )
         // ── Fork / transfer ────────────────────────────────────────────────
-        // Forking needs a session and read access to the source, not ownership:
-        // `rg_core::repo::service::fork_repo` gates on `can_read_repo`.
+        // Forking needs a session and read access to the source, not ownership.
+        // The handler takes `RepoAuthRead` and hands the gated source model to
+        // `rg_core::repo::service::fork_repo`, which no longer re-decides
+        // anything of its own (card_b38bfb0f2b40).
         .post(
             RepoAuthRead,
             "/repos/{owner}/{name}/fork",

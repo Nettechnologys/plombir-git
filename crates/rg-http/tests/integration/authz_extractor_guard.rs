@@ -135,8 +135,57 @@ const ORG_MEMBERSHIP: &[&str] = &["is_org_member"];
 /// take the answer from one of them.
 const ORG_GATE_OWNERS: &[&str] = &["api/repo_access.rs", "api/orgs.rs"];
 
+/// The file that *defines* the permission predicates.
+///
+/// Every guard above stops at the edge of this crate, and that is exactly where
+/// the last copy of the read rule was found: `rg_core::repo::service::fork_repo`
+/// answered "may this caller read the source?" itself, with its own
+/// `can_read_repo` + `forbidden(...)` arm, while the route table declared
+/// `RepoAuthRead` and the handler took no gate at all (card_b38bfb0f2b40).
+///
+/// A blanket sign-off for the defining file is what let that sit there, so this
+/// one is narrower: inside it, only the `can_*` family may ask. A service
+/// function that decides access is the defect, whichever crate it lives in.
+const PREDICATE_HOME: &str = "rg-core/src/repo/service.rs";
+
+/// Files outside `rg-http` that legitimately ask a permission predicate, with
+/// the reason.
+///
+/// None of them gates *the caller*: the first two filter a list of **other**
+/// people against the repository, which is the `may_read` question this crate
+/// answers with `repo_access::may_read`. `rg-ssh` is a transport in the sense
+/// of `TRANSPORTS` above — it resolves its own caller from the public key — and
+/// it cannot route through `check_read_for`, because `api::repo_access` lives
+/// in `rg-http` and `rg-ssh` does not (and should not) depend on it. That the
+/// rule therefore has a second entry point is a known cost, not an oversight:
+/// it still calls the one implementation in `rg-core`, and writes no arm of its
+/// own beyond `allowed`/`insufficient repository permission`.
+const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
+    (
+        "rg-core/src/notification/mod.rs",
+        "filters watchers before delivery — the subject is each recipient, not the caller",
+    ),
+    (
+        "rg-core/src/review/codeowners.rs",
+        "filters CODEOWNERS candidates — the subject is each reviewer, not the caller",
+    ),
+    (
+        "rg-ssh/src/lib.rs",
+        "SSH transport: resolves its caller from the public key and cannot reach `api::repo_access` \
+         from outside `rg-http`",
+    ),
+];
+
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// `crates/` — the parent of this crate's directory.
+fn workspace_crates() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rg-http lives under crates/")
+        .to_path_buf()
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -372,6 +421,157 @@ fn the_extractors_are_actually_used() {
     );
 }
 
+/// The name of the top-level `fn` this line opens, if it opens one.
+///
+/// Deliberately blind to anything indented: the file this is used on is a flat
+/// list of free functions, and an indented `fn` inside one of them is a closure
+/// or a nested helper that belongs to whatever encloses it.
+fn top_level_fn_name(line: &str) -> Option<&str> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let at = line.find("fn ")?;
+    // Only the usual item prefixes may sit in front of it, so a `fn` inside a
+    // string literal or a trailing comment cannot rename the enclosing item.
+    if !line[..at].split_whitespace().all(|word| {
+        matches!(word, "pub" | "async" | "unsafe" | "const" | "extern") || word.starts_with("pub(")
+    }) {
+        return None;
+    }
+    let rest = &line[at + "fn ".len()..];
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
+}
+
+/// Predicate calls in the file that defines them, outside the `can_*` family.
+///
+/// The definitions themselves are not calls (`calls_gate` skips the `fn name(`
+/// line), and the two thin wrappers `can_read` / `can_write` are the family
+/// asking itself. Everything else in that file is a service function, and a
+/// service function deciding the caller's access is the defect this guards.
+fn predicate_home_offenders() -> Vec<String> {
+    let path = workspace_crates().join(PREDICATE_HOME);
+    assert!(
+        path.exists(),
+        "PREDICATE_HOME names {PREDICATE_HOME} but that file is gone — fix the constant"
+    );
+    let text = fs::read_to_string(&path).expect("read source file");
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut enclosing = "<file scope>";
+    let mut family_calls = 0usize;
+    let mut offenders = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        // The unit tests at the file's tail walk the permission matrix the
+        // predicates implement — the one place where calling them *is* the
+        // point. Anchored on the `#[cfg(test)] mod …` pair rather than on the
+        // attribute alone, so a `#[cfg(test)]` helper earlier in the file
+        // cannot silently end the scan.
+        if line.trim_start() == "#[cfg(test)]"
+            && lines[n + 1..]
+                .iter()
+                .take(2)
+                .any(|next| next.trim_start().starts_with("mod "))
+        {
+            break;
+        }
+        if let Some(name) = top_level_fn_name(line) {
+            enclosing = name;
+        }
+        for predicate in PREDICATES {
+            if calls_gate(line, predicate) {
+                if enclosing.starts_with("can_") {
+                    family_calls += 1;
+                } else {
+                    offenders.push(format!(
+                        "  {PREDICATE_HOME}:{} — {} (in `{enclosing}`)",
+                        n + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+
+    // `can_read` / `can_write` resolve a name and hand off to the model-taking
+    // predicate. If those stop being seen as family calls, the enclosing-function
+    // tracking has broken and the scan above proves nothing.
+    assert!(
+        family_calls >= 2,
+        "only {family_calls} predicate call(s) attributed to the `can_*` family in \
+         {PREDICATE_HOME} — the enclosing-function tracking is broken, not the file"
+    );
+    offenders
+}
+
+/// The fourth dialect: the rule written in a crate the guards above cannot see.
+///
+/// Every scan in this file stops at `crates/rg-http/src`, and the read rule had
+/// a live second implementation just outside it — in `fork_repo`, one call
+/// below a route that declared `RepoAuthRead`. So the predicates are barred
+/// across the whole workspace, not just this crate: a `rg-*` crate that decides
+/// repository access is writing a copy of the gate wherever it sits.
+#[test]
+fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
+    let crates_dir = workspace_crates();
+    let mut offenders = predicate_home_offenders();
+    let mut scanned = 0usize;
+
+    for entry in fs::read_dir(&crates_dir).expect("read crates dir") {
+        let krate = entry.expect("dir entry").path();
+        // `rg-http` is the subject of
+        // `the_permission_predicates_are_only_reachable_through_the_gate_module`,
+        // which scans it against a stricter owner list.
+        if krate.file_name().is_some_and(|name| name == "rg-http") {
+            continue;
+        }
+        let src = krate.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        for file in &files {
+            let rel = file
+                .strip_prefix(&crates_dir)
+                .expect("file under crates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            scanned += 1;
+            if rel == PREDICATE_HOME
+                || WORKSPACE_SIGNED_OFF
+                    .iter()
+                    .any(|(allowed, _)| rel == *allowed)
+            {
+                continue;
+            }
+            let text = fs::read_to_string(file).expect("read source file");
+            for (n, line) in text.lines().enumerate() {
+                for predicate in PREDICATES {
+                    if calls_gate(line, predicate) {
+                        offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        scanned > 50,
+        "only {scanned} file(s) scanned outside rg-http — the guard is not running"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a repository permission was decided outside `rg-http`'s gate module.\n\
+         A crate that serves HTTP takes the decision from an extractor; a crate that does not \
+         has to be signed off in WORKSPACE_SIGNED_OFF with the reason, the way `rg-ssh` is. \
+         Deciding it in a service function is how `fork_repo` came to hold a copy of the read \
+         rule that no guard in `rg-http` could see.\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// Every signed-off exception must name a file that still exists, so the list
 /// cannot quietly turn into a blanket allowance as files are renamed.
 #[test]
@@ -380,6 +580,13 @@ fn signed_off_exceptions_are_live() {
         assert!(
             src_root().join(rel).exists(),
             "SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the entry"
+        );
+        assert!(!reason.is_empty(), "{rel} is signed off without a reason");
+    }
+    for (rel, reason) in WORKSPACE_SIGNED_OFF {
+        assert!(
+            workspace_crates().join(rel).exists(),
+            "WORKSPACE_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the entry"
         );
         assert!(!reason.is_empty(), "{rel} is signed off without a reason");
     }

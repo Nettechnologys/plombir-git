@@ -136,6 +136,55 @@ async fn outsider_forks_public_repository_and_the_clone_lands_in_repo_root() {
     );
 }
 
+/// The fork button in the browser sends the HttpOnly `forgekeep_token` cookie
+/// and no `Authorization` header — the web client keeps its token in memory
+/// only, so after a page reload the cookie is the whole session.
+///
+/// The handler used to read the caller with `extract_bearer_claims`, which
+/// accepts the header and nothing else, so every fork from a reloaded tab was a
+/// `401` while the same account forked fine from `curl`. Anonymous is still a
+/// `401`: taking the cookie must not mean taking nobody.
+#[tokio::test]
+async fn a_cookie_session_may_fork_and_an_anonymous_caller_may_not() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (owner_token, _) = register_full(&base, "cookieowner", "cookieowner@example.com").await;
+    create_seeded_repo(&base, &owner_token, "cookieme", false).await;
+    let (outsider_token, outsider_id) =
+        register_full(&base, "cookieoutsider", "cookieoutsider@example.com").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/cookieowner/cookieme/fork");
+
+    let anonymous = client.post(&url).send().await.expect("request");
+    assert_eq!(
+        anonymous.status(),
+        401,
+        "a fork with no session at all must stay a 401"
+    );
+
+    let resp = client
+        .post(&url)
+        .header("cookie", format!("forgekeep_token={outsider_token}"))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 201,
+        "the cookie session is the same session as the bearer token, got {status} (body: {body})"
+    );
+    assert_eq!(
+        body["owner_id"].as_i64(),
+        Some(outsider_id),
+        "the fork belongs to the account the cookie names: {body}"
+    );
+    assert!(
+        repo_root.join("cookieoutsider/cookieme.git").is_dir(),
+        "the cookie-session fork is missing on disk"
+    );
+}
+
 /// A repository the forker already owns under that name is a `400`, not a `500`
 /// and not a silent second clone over the first one's directory.
 #[tokio::test]
