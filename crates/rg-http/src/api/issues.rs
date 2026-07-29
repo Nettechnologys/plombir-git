@@ -326,6 +326,37 @@ async fn require_milestone_in_repo(
     }
 }
 
+/// Resolve an `assignee_id` taken from a *request body* against the repository
+/// the route was authorized for — the same sub-class as
+/// [`require_milestone_in_repo`], and the last field on this route that was
+/// still written unexamined.
+///
+/// The id is global and was going straight into `issue.assignee_id`, so the
+/// row could name a user that does not exist, or one who cannot see the
+/// repository they are now assigned in. The impact is narrower than the
+/// milestone's — this is not a write into someone else's repository, and no
+/// notification path reaches an assignee — but the result is a phantom name in
+/// the UI and a foreign key pointing at nothing.
+///
+/// A user who cannot read the repository answers 404 rather than 403, for the
+/// same reason the milestone does: a 403 would confirm the account exists.
+async fn require_assignee_in_repo(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    assignee_id: i64,
+) -> Result<(), AppError> {
+    match rg_db::ops::user_ops::find_by_id(&state.db, assignee_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(AppError::not_found("user not found".to_string())),
+        Err(e) => return Err(AppError::from(e)),
+    }
+    match rg_core::repo::service::can_read_repo(&state.db, repo, Some(assignee_id)).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::not_found("user not found".to_string())),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/repos/{owner}/{name}/issues",
@@ -463,6 +494,14 @@ pub async fn update_issue(
 
     if let Some(Some(milestone_id)) = req.milestone_id {
         if let Err(e) = require_milestone_in_repo(&state, repo_model.id, milestone_id).await {
+            return e.into_response();
+        }
+    }
+
+    // `Some(None)` clears the assignee and needs no resolving — there is no id
+    // to check.
+    if let Some(Some(assignee_id)) = req.assignee_id {
+        if let Err(e) = require_assignee_in_repo(&state, &repo_model, assignee_id).await {
             return e.into_response();
         }
     }

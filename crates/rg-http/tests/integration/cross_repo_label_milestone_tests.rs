@@ -486,3 +486,110 @@ async fn test_invalid_label_update_is_still_bad_request() {
         .unwrap();
     assert_eq!(resp.status(), 400, "an invalid color must stay a 400");
 }
+
+/// The last body-supplied id on the issue route that was written unexamined.
+///
+/// `assignee_id` travelled from the request body straight into
+/// `issue.assignee_id` — the same sub-class as the milestone above, with a
+/// narrower blast radius: it is not a write into someone else's repository, and
+/// no notification path reaches an assignee. What was left is a foreign key
+/// pointing at nothing, and a name in the UI belonging to someone who cannot
+/// open the repository they are shown as working on.
+#[tokio::test]
+async fn test_issue_assignee_id_must_resolve_to_a_user_who_can_read_the_repo() {
+    use crate::common::register_full;
+
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    let (owner_token, owner_id) =
+        register_full(&base, "assigneeowner", "assigneeowner@example.com").await;
+    let (_outsider_token, outsider_id) =
+        register_full(&base, "assigneeoutsider", "assigneeoutsider@example.com").await;
+
+    let owner = "assigneeowner";
+    let repo = "assignee-scope";
+    let resp = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"name": repo, "is_private": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let issue: serde_json::Value = client
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/issues"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"title": "who does this"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let number = issue["number"].as_i64().expect("issue number");
+
+    let patch = |body: serde_json::Value| {
+        client
+            .patch(format!(
+                "{base}/api/v1/repos/{owner}/{repo}/issues/{number}"
+            ))
+            .bearer_auth(&owner_token)
+            .json(&body)
+            .send()
+    };
+
+    // Baseline first, so the 404s below prove the resolution check rather than
+    // a broken fixture: the owner can assign themselves exactly as before.
+    let resp = patch(serde_json::json!({"assignee_id": owner_id}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "assigning oneself must still work");
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["assignee_id"],
+        owner_id
+    );
+
+    // A user id that belongs to nobody.
+    let resp = patch(serde_json::json!({"assignee_id": owner_id + outsider_id + 10_000}))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "an assignee that does not exist must be 404"
+    );
+
+    // A real user who cannot see this private repository. 404 rather than 403:
+    // a 403 would confirm the account exists.
+    let resp = patch(serde_json::json!({"assignee_id": outsider_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "an assignee without read access must be 404"
+    );
+
+    // Neither rejection touched the row.
+    //
+    // Clearing the assignee is deliberately not asserted here: `assignee_id:
+    // null` currently deserializes to "field absent" rather than "clear it"
+    // (`Option<Option<i64>>` without `double_option`), so there is no reachable
+    // clear path to guard yet. That is card_a156a521ca3b, and it is a separate
+    // defect from resolving the id — the check added here sits on
+    // `Some(Some(id))` and stays correct once `Some(None)` becomes reachable.
+    let issue: serde_json::Value = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{number}"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(issue["assignee_id"], owner_id);
+}
