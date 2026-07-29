@@ -81,7 +81,10 @@ async fn assigned_runner_downloads_exact_commit_workspace_and_other_runner_is_de
         .send()
         .await
         .unwrap();
-    assert_eq!(denied.status(), 403);
+    // 404, not 403: another runner's job must not be tellable apart from a job
+    // that does not exist — see
+    // `runner_auth_tests::another_runners_job_id_is_indistinguishable_from_an_unused_one`.
+    assert_eq!(denied.status(), 404);
     let archive = client
         .get(format!(
             "{base}/api/v1/runners/{}/jobs/{}/workspace",

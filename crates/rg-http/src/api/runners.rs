@@ -443,7 +443,6 @@ pub async fn poll_job(
     ),
     responses(
         (status = 200, description = "Job started", body = serde_json::Value),
-        (status = 403, description = "Forbidden - job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
     ),
 )]
@@ -451,25 +450,9 @@ pub async fn start_job(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
-    // Verify the job is assigned to this runner
-    let job = match crate::metrics::time_db(
-        "pipeline.get_job",
-        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
-    )
-    .await
-    {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return AppError::not_found("job not found").into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "start_job: get_job failed");
-            return AppError::from(e).into_response();
-        }
-    };
-
-    if job.runner_id != Some(runner_id) {
-        return AppError::forbidden("job not assigned to this runner").into_response();
+    // The job itself is not needed past the gate; the call is the gate.
+    if let Err(error) = assigned_job(&state, runner_id, job_id).await {
+        return error.into_response();
     }
 
     let now = Some(chrono::Utc::now().naive_utc());
@@ -506,7 +489,6 @@ pub async fn start_job(
     request_body(content = String, description = "Log content (plain text)"),
     responses(
         (status = 200, description = "Log uploaded", body = serde_json::Value),
-        (status = 403, description = "Forbidden - job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
     ),
 )]
@@ -515,26 +497,10 @@ pub async fn upload_log(
     Path((runner_id, job_id)): Path<(i64, i64)>,
     body: String,
 ) -> impl IntoResponse {
-    // Verify the job is assigned to this runner
-    let job = match crate::metrics::time_db(
-        "pipeline.get_job",
-        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
-    )
-    .await
-    {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return AppError::not_found("job not found").into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "upload_log: get_job failed");
-            return AppError::from(e).into_response();
-        }
+    let job = match assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => job,
+        Err(error) => return error.into_response(),
     };
-
-    if job.runner_id != Some(runner_id) {
-        return AppError::forbidden("job not assigned to this runner").into_response();
-    }
 
     let body = match secrets_for_job(&state, job.stage_id).await {
         Ok(secrets) => rg_core::auth::encryption::mask_values(&body, &secrets),
@@ -565,7 +531,6 @@ pub async fn upload_log(
     ),
     responses(
         (status = 200, description = "Tar archive of the commit assigned to the job", content_type = "application/x-tar"),
-        (status = 403, description = "Job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job, stage, pipeline or repository not found", body = serde_json::Value),
     ),
 )]
@@ -573,13 +538,9 @@ pub async fn download_workspace(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
-    let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
-        Ok(Some(job)) if job.runner_id == Some(runner_id) => job,
-        Ok(Some(_)) => {
-            return AppError::forbidden("job not assigned to this runner").into_response()
-        }
-        Ok(None) => return AppError::not_found("job not found").into_response(),
-        Err(error) => return AppError::from(error).into_response(),
+    let job = match assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => job,
+        Err(error) => return error.into_response(),
     };
     let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
         Ok(Some(stage)) => stage,
@@ -774,7 +735,6 @@ fn stream_git_archive_with_idle(
     responses(
         (status = 200, description = "Cache archive", content_type = "application/x-tar"),
         (status = 400, description = "Missing or malformed x-cache-key header", body = serde_json::Value),
-        (status = 403, description = "Job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job has no cache configuration, or no cache entry for this key", body = serde_json::Value),
     ),
 )]
@@ -909,7 +869,6 @@ pub async fn download_cache(
     responses(
         (status = 204, description = "Cache entry stored"),
         (status = 400, description = "Job has no cache configuration, bad x-cache-key, or archive outside 1 byte..1 GiB", body = serde_json::Value),
-        (status = 403, description = "Job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job, stage or pipeline not found", body = serde_json::Value),
     ),
 )]
@@ -1017,25 +976,58 @@ async fn discard_unreferenced_cache_file(
     }
 }
 
+/// The job named by `{job_id}`, provided it is the one this runner was given.
+///
+/// `{job_id}` is an instance-wide primary key, so "somebody else's job" and "no
+/// such job" have to be indistinguishable from the outside: answering `403` to
+/// one and `404` to the other turns the pair into an existence oracle over every
+/// pipeline on the instance, private repositories included, and a runner needs
+/// nothing but a `for` loop to read it. A runner token is handed out by an
+/// instance admin, so the perimeter is a trusted runner rather than any account
+/// — which is why this was `low` and not why it was fine.
+///
+/// The rule is the project's, not this module's: `api::boards` states it as
+/// "a mismatch answers 404, not 403: a 403 would confirm the id exists", and
+/// the user- and repository-scoped axes already follow it. This is the runner
+/// axis, in one function rather than the six copies it replaces — the copies
+/// are how a rule ends up applied five times out of six.
+///
+/// The lookup's own failure stays a failure: `AppError::from` classifies a dead
+/// pool as a retryable `503`, so a check that could not run is never reported
+/// as a check that said no.
+pub(crate) async fn assigned_job(
+    state: &AppState,
+    runner_id: i64,
+    job_id: i64,
+) -> Result<rg_db::entities::pipeline_job::Model, AppError> {
+    let job = crate::metrics::time_db(
+        "pipeline.get_job",
+        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(runner_id, job_id, error = %format!("{error:#}"), "assigned_job: get_job failed");
+        AppError::from(error)
+    })?;
+    match job {
+        Some(job) if job.runner_id == Some(runner_id) => Ok(job),
+        _ => Err(AppError::not_found("job not found")),
+    }
+}
+
 async fn assigned_job_repo(
     state: &AppState,
     runner_id: i64,
     job_id: i64,
 ) -> Result<(rg_db::entities::pipeline_job::Model, i64), AppError> {
-    let job = rg_db::ops::pipeline_ops::get_job(&state.db, job_id)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("job not found"))?;
-    if job.runner_id != Some(runner_id) {
-        return Err(AppError::forbidden("job not assigned to this runner"));
-    }
+    let job = assigned_job(state, runner_id, job_id).await?;
     let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("pipeline stage not found"))?;
     let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("pipeline not found"))?;
     Ok((job, pipeline.repo_id))
 }
@@ -1133,7 +1125,6 @@ async fn secrets_for_job(state: &AppState, stage_id: i64) -> anyhow::Result<Vec<
     request_body(content = FinishJobRequest, description = "Job completion status"),
     responses(
         (status = 200, description = "Job finished", body = serde_json::Value),
-        (status = 403, description = "Forbidden - job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
     ),
 )]
@@ -1142,26 +1133,10 @@ pub async fn finish_job(
     Path((runner_id, job_id)): Path<(i64, i64)>,
     Json(req): Json<FinishJobRequest>,
 ) -> impl IntoResponse {
-    // Verify the job is assigned to this runner
-    let job = match crate::metrics::time_db(
-        "pipeline.get_job",
-        rg_db::ops::pipeline_ops::get_job(&state.db, job_id),
-    )
-    .await
-    {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return AppError::not_found("job not found").into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "finish_job: get_job failed");
-            return AppError::from(e).into_response();
-        }
+    let job = match assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => job,
+        Err(error) => return error.into_response(),
     };
-
-    if job.runner_id != Some(runner_id) {
-        return AppError::forbidden("job not assigned to this runner").into_response();
-    }
 
     let now = Some(chrono::Utc::now().naive_utc());
     // log is managed via upload_log; not updated on finish

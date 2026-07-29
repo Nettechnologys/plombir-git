@@ -56,7 +56,6 @@ pub struct UploadArtifactResponse {
     request_body(content = UploadArtifactRequest, description = "Artifact metadata"),
     responses(
         (status = 201, description = "Artifact created", body = UploadArtifactResponse),
-        (status = 403, description = "Forbidden - job not assigned to this runner", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
     ),
 )]
@@ -66,20 +65,14 @@ pub async fn upload_artifact(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Verify job belongs to this runner
-    let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return AppError::not_found("job not found").into_response();
-        }
-        Err(e) => {
-            return AppError::from(e).into_response();
-        }
+    // Verify job belongs to this runner. The same helper the runner routes use,
+    // so a job that is not this runner's is answered exactly as an unknown id is
+    // — see `api::runners::assigned_job` for why the two must not be tellable
+    // apart.
+    let job = match crate::api::runners::assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => job,
+        Err(error) => return error.into_response(),
     };
-
-    if job.runner_id != Some(runner_id) {
-        return AppError::forbidden("job not assigned to this runner").into_response();
-    }
 
     let repo_id = match repo_id_for_job(&state, &job).await {
         Ok(repo_id) => repo_id,
