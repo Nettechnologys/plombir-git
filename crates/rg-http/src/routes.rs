@@ -68,7 +68,11 @@ const OCI_DISCOVERY: Access = Foreign(Handler {
 /// signature into account before falling back to the read gate.
 const LFS_PROTOCOL: Access = Foreign(Handler {
     module: "api/lfs.rs",
-    gates: &["check_read_for", "check_write_for", "authorize_lfs_download"],
+    gates: &[
+        "check_read_for",
+        "check_write_for",
+        "authorize_lfs_download",
+    ],
     note: "Git LFS batch protocol: per-operation gate, own envelope",
 });
 const RUNNER_TOKEN: Access = Foreign(Middleware {
@@ -2094,7 +2098,11 @@ pub(crate) fn build_all_routes(
             api::ai::ai_search_code,
         )
         // ── WebSocket ──────────────────────────────────────────────────────
-        .get(WS_SESSION, "/ws/notifications", ws::ws_notifications_handler)
+        .get(
+            WS_SESSION,
+            "/ws/notifications",
+            ws::ws_notifications_handler,
+        )
         .get(WS_JOB_LOG, "/ws/job/{job_id}", ws::ws_job_log_handler)
         .finish();
 

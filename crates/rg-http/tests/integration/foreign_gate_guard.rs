@@ -240,7 +240,12 @@ const TERMINAL_GATES: &[&str] = &[
 ///
 /// `Err` when the module does not declare the function at all; every caller has
 /// to treat that as a failure rather than an empty answer.
-fn calls_a_gate(fns: &[Function], name: &str, gates: &[&str], depth: usize) -> Result<bool, String> {
+fn calls_a_gate(
+    fns: &[Function],
+    name: &str,
+    gates: &[&str],
+    depth: usize,
+) -> Result<bool, String> {
     let Some(function) = fns.iter().find(|f| f.name == name) else {
         return Err(format!("`{name}` is not declared at the top level"));
     };
