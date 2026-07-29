@@ -445,6 +445,29 @@ pub async fn find_latest_by_repo_and_commit(
         .context("db: find latest pipeline by repo and commit")
 }
 
+/// Find the merge-queue pipeline for a repo + speculative merge-group commit.
+///
+/// The merge queue creates the pipeline before it can record ownership of it on
+/// the queue entry, so the two can disagree. The group commit is built
+/// deterministically, which makes its SHA the key that finds an already-created
+/// pipeline again instead of building a second one (card_55282a865b8e).
+/// `trigger_type` is part of the filter because nothing but the queue may be
+/// adopted this way.
+pub async fn find_merge_group_pipeline(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    commit_sha: &str,
+) -> Result<Option<pipeline::Model>> {
+    pipeline::Entity::find()
+        .filter(pipeline::Column::RepoId.eq(repo_id))
+        .filter(pipeline::Column::CommitSha.eq(commit_sha))
+        .filter(pipeline::Column::TriggerType.eq("merge_group"))
+        .order_by_desc(pipeline::Column::Id)
+        .one(db)
+        .await
+        .context("db: find merge-group pipeline by commit")
+}
+
 // ── Status cascade helpers ──────────────────────────
 // After a job finishes, check if its stage is done; if so, update stage status.
 // After a stage finishes, check if all stages in the pipeline are done; if so, update pipeline status.

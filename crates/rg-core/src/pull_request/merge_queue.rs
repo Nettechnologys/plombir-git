@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{Duration, Utc};
 use sea_orm::{DatabaseConnection, EntityTrait, Set};
 
-use rg_db::entities::{merge_queue_entry, pull_request, repository};
+use rg_db::entities::{merge_queue_entry, pipeline, pull_request, repository};
 use rg_db::ops::{merge_queue_ops, pull_request_ops};
 
 use super::ci::PipelineCi;
@@ -375,27 +375,7 @@ async fn ensure_merge_group_ci(
             let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
                 .await?
                 .context("merge-group pipeline not found")?;
-            return Ok(match pipeline.status.as_str() {
-                "success" => MergeGroupState::Ready,
-                "failed" | "canceled" => {
-                    finish_entry(
-                        db,
-                        repo_root,
-                        entry,
-                        "failed",
-                        Some(format!(
-                            "merge-group pipeline #{} is {}",
-                            pipeline.id, pipeline.status
-                        )),
-                    )
-                    .await?;
-                    MergeGroupState::Failed
-                }
-                _ => MergeGroupState::Waiting(format!(
-                    "merge-group pipeline #{} is {}",
-                    pipeline.id, pipeline.status
-                )),
-            });
+            return merge_group_state(db, repo_root, entry, &pipeline).await;
         }
     }
 
@@ -428,6 +408,15 @@ async fn ensure_merge_group_ci(
         anyhow::bail!("git merge-tree did not return a tree id");
     }
     let message = format!("Merge queue group for PR #{}", pr.number);
+    // `commit-tree` hashes the author/committer timestamps, so leaving them to
+    // "now" gives a different `group_sha` on every pass — and the recovery below
+    // is keyed on that SHA being stable. The entry's own `created_at` is the
+    // natural pin: constant while the entry is queued, and reset by
+    // `merge_queue_ops::enqueue` when the PR is queued again, so a re-queue
+    // never inherits the previous attempt's group commit. Git's internal date
+    // format (`<unix ts> <offset>`) is used rather than RFC 3339 because it is
+    // the one form git parses without a locale- or precision-dependent guess.
+    let commit_date = format!("{} +0000", entry.created_at.timestamp());
     let commit_output = git.run_with_env(
         &[
             "commit-tree",
@@ -443,8 +432,10 @@ async fn ensure_merge_group_ci(
         &[
             ("GIT_AUTHOR_NAME", "ForgeKeep Merge Queue"),
             ("GIT_AUTHOR_EMAIL", "merge-queue@forgekeep.local"),
+            ("GIT_AUTHOR_DATE", commit_date.as_str()),
             ("GIT_COMMITTER_NAME", "ForgeKeep Merge Queue"),
             ("GIT_COMMITTER_EMAIL", "merge-queue@forgekeep.local"),
+            ("GIT_COMMITTER_DATE", commit_date.as_str()),
         ],
     )?;
     commit_output.ensure_success()?;
@@ -456,42 +447,134 @@ async fn ensure_merge_group_ci(
     if !ci.trigger.has_ci_config(&repo_path, &group_sha) {
         return Ok(MergeGroupState::Ready);
     }
-    let pipeline_id = ci
-        .trigger
-        .trigger_pipeline(crate::ci::TriggerPipelineParams {
-            db,
-            repo_path: &repo_path,
-            repo_id: repository.id,
-            commit_sha: &group_sha,
-            ref_name: &group_ref,
-            trigger_type: "merge_group",
-            // `merge_group` shares the `on: pull_request` filter, and the ref
-            // above is the synthetic group ref — the branch the filter is about
-            // is the one the queue is merging into.
-            base_branch: Some(&pr.base_branch),
-            triggered_by: Some(entry.enqueued_by_id),
-            docker_enabled: ci.docker_enabled,
-            external_runners: ci.external_runners,
-            allow_host_runner: ci.allow_host_runner,
-            jwt_secret: ci.jwt_secret,
-            external_url: ci.external_url,
-        })
-        .await?;
-    merge_queue_ops::set_merge_group(db, entry.id, &group_sha, &base_sha, &head_sha, pipeline_id)
-        .await?;
-    rg_db::ops::pr_event_ops::record(
+    // The pipeline is created before the row that owns it, so the two can
+    // disagree: when `set_merge_group` below fails, the entry keeps no trace of
+    // a pipeline that is already running, and the pass after it used to build
+    // another merge group and trigger another pipeline — one more per tick,
+    // forever, because the merge condition reads a `merge_group_pipeline_id`
+    // that never got written. The group SHA is deterministic, so that pipeline
+    // is still findable: adopt it instead of triggering a second one
+    // (card_55282a865b8e).
+    let pipeline = match rg_db::ops::pipeline_ops::find_merge_group_pipeline(
+        db,
+        repository.id,
+        &group_sha,
+    )
+    .await?
+    {
+        Some(existing) => {
+            tracing::warn!(
+                entry_id = entry.id,
+                pipeline_id = existing.id,
+                "adopting the merge-group pipeline already triggered for this group commit: the queue entry lost the row that owned it"
+            );
+            existing
+        }
+        None => {
+            let pipeline_id = ci
+                .trigger
+                .trigger_pipeline(crate::ci::TriggerPipelineParams {
+                    db,
+                    repo_path: &repo_path,
+                    repo_id: repository.id,
+                    commit_sha: &group_sha,
+                    ref_name: &group_ref,
+                    trigger_type: "merge_group",
+                    // `merge_group` shares the `on: pull_request` filter, and the
+                    // ref above is the synthetic group ref — the branch the filter
+                    // is about is the one the queue is merging into.
+                    base_branch: Some(&pr.base_branch),
+                    triggered_by: Some(entry.enqueued_by_id),
+                    docker_enabled: ci.docker_enabled,
+                    external_runners: ci.external_runners,
+                    allow_host_runner: ci.allow_host_runner,
+                    jwt_secret: ci.jwt_secret,
+                    external_url: ci.external_url,
+                })
+                .await?;
+            rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
+                .await?
+                .context("merge-group pipeline vanished right after it was triggered")?
+        }
+    };
+
+    if let Err(error) = merge_queue_ops::set_merge_group(
+        db,
+        entry.id,
+        &group_sha,
+        &base_sha,
+        &head_sha,
+        pipeline.id,
+    )
+    .await
+    {
+        // Deliberately no cancel of the pipeline here: the group SHA is stable,
+        // so the next pass finds this very pipeline and re-attempts the write.
+        // Cancelling would turn a transient database failure into a dead PR and
+        // throw away a CI run that is already paid for.
+        tracing::warn!(
+            entry_id = entry.id,
+            pipeline_id = pipeline.id,
+            error = %format!("{error:#}"),
+            "merge-queue entry could not record its merge-group pipeline; the next queue pass will adopt it"
+        );
+        return Err(error);
+    }
+
+    // The audit event is a side note of a state change that is now committed —
+    // losing it must not unwind the ownership just written, or the entry is back
+    // to owning nothing.
+    if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         repository.id,
         pr.id,
         None,
         "merge_group_created",
         None,
-        serde_json::json!({"commit_sha": group_sha, "pipeline_id": pipeline_id}),
+        serde_json::json!({"commit_sha": group_sha, "pipeline_id": pipeline.id}),
     )
-    .await?;
-    Ok(MergeGroupState::Waiting(format!(
-        "merge-group pipeline #{pipeline_id} is pending"
-    )))
+    .await
+    {
+        tracing::warn!(
+            entry_id = entry.id,
+            pipeline_id = pipeline.id,
+            error = %format!("{error:#}"),
+            "failed to record the merge_group_created event"
+        );
+    }
+
+    merge_group_state(db, repo_root, entry, &pipeline).await
+}
+
+/// The queue's verdict on a merge-group pipeline — shared by the entry that
+/// already owns one and the pass that has just created or adopted it, so an
+/// adopted pipeline that already finished is not reported as pending.
+async fn merge_group_state(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    entry: &merge_queue_entry::Model,
+    pipeline: &pipeline::Model,
+) -> Result<MergeGroupState> {
+    Ok(match pipeline.status.as_str() {
+        "success" => MergeGroupState::Ready,
+        "failed" | "canceled" => {
+            finish_entry(
+                db,
+                repo_root,
+                entry,
+                "failed",
+                Some(format!(
+                    "merge-group pipeline #{} is {}",
+                    pipeline.id, pipeline.status
+                )),
+            )
+            .await?;
+            MergeGroupState::Failed
+        }
+        status => {
+            MergeGroupState::Waiting(format!("merge-group pipeline #{} is {status}", pipeline.id))
+        }
+    })
 }
 
 pub async fn process_for_head_commit(
