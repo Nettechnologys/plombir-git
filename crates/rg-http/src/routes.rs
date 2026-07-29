@@ -31,19 +31,44 @@ use crate::{
 ///
 /// Each one names *where* its credential is checked, not merely that it is:
 /// a `Middleware` claim is compared against the layer the route was registered
-/// with, a `Handler` claim against the module its handler actually lives in.
-/// The one that made this necessary declared a runner-token middleware it did
-/// not carry — see [`crate::route_table::ForeignGate`].
+/// with, a `Handler` claim against the module its handler actually lives in
+/// *and* the gate function that handler has to reach. The one that made this
+/// necessary declared a runner-token middleware it did not carry — see
+/// [`crate::route_table::ForeignGate`].
+///
+/// The gate names are why there is one constant per mechanism rather than one
+/// per file: `/v2/` answers everybody the same challenge and reads nothing,
+/// while every other registry route goes through `require_access`; the
+/// notification socket proves who is calling and the job-log socket asks the
+/// repository gate on top of that. Those are different promises, and a single
+/// constant would have made the weakest of them the promise for all of them.
 const GIT_HTTP: Access = Foreign(Handler {
     module: "git_http.rs",
+    gates: &["check_git_access"],
     note: "git-over-HTTP: PAT / HTTP-Basic, `check_git_access` gate",
 });
 const OCI_TOKEN: Access = Foreign(Handler {
     module: "oci.rs",
+    gates: &["require_access"],
     note: "OCI registry: registry-scoped bearer token",
 });
+/// `GET /v2/` and `GET /v2` — the discovery challenge, which is the whole
+/// response: an unconditional `401` naming the realm a client fetches its token
+/// from, identical for every caller and derived from nothing but the request's
+/// own `Host`. There is no gate to reach because there is nothing behind it.
+const OCI_DISCOVERY: Access = Foreign(Handler {
+    module: "oci.rs",
+    gates: &[],
+    note: "OCI registry: constant `WWW-Authenticate` challenge, reads nothing",
+});
+/// The three LFS routes gate per operation and the batch endpoint gates both
+/// ways, so the sign-off names all three shapes the protocol uses: the two
+/// `repo_access` calls `batch` and `upload_object` make directly, and
+/// `download_object`'s own `authorize_lfs_download`, which takes an LFS action
+/// signature into account before falling back to the read gate.
 const LFS_PROTOCOL: Access = Foreign(Handler {
     module: "api/lfs.rs",
+    gates: &["check_read_for", "check_write_for", "authorize_lfs_download"],
     note: "Git LFS batch protocol: per-operation gate, own envelope",
 });
 const RUNNER_TOKEN: Access = Foreign(Middleware {
@@ -52,11 +77,24 @@ const RUNNER_TOKEN: Access = Foreign(Middleware {
 });
 const CI_JOB_TOKEN: Access = Foreign(Handler {
     module: "api/ci_oidc.rs",
+    gates: &["ci_job_binding"],
     note: "CI job token minted for a running job",
 });
-const WS_TICKET: Access = Foreign(Handler {
+/// The notification socket: a per-user stream, so the credential *is* the
+/// authorization — the hub only ever hands a connection its own user's
+/// notifications.
+const WS_SESSION: Access = Foreign(Handler {
     module: "ws.rs",
-    note: "WebSocket: token in `Sec-WebSocket-Protocol` or `?token=`",
+    gates: &["validate_token"],
+    note: "WebSocket: session token in `Sec-WebSocket-Protocol` or `?token=`",
+});
+/// The job-log socket: the ticket says who is calling, and what that user may
+/// read is the shared repository gate's decision, exactly as on the REST route
+/// serving the same logs.
+const WS_JOB_LOG: Access = Foreign(Handler {
+    module: "ws.rs",
+    gates: &["check_read_for"],
+    note: "WebSocket: session token, then the repository read gate",
 });
 const DOCS_AUTH: Access = Foreign(Middleware {
     layer: DOCS_AUTH_LAYER,
@@ -344,8 +382,8 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
         // registry client discovers where to get its token. Clients send the
         // trailing-slash form; the bare one is served too so a hand-typed URL
         // or a proxy that strips the slash still reaches the registry.
-        .get(OCI_TOKEN, "/v2/", oci::api_version_check)
-        .get(OCI_TOKEN, "/v2", oci::api_version_check)
+        .get(OCI_DISCOVERY, "/v2/", oci::api_version_check)
+        .get(OCI_DISCOVERY, "/v2", oci::api_version_check)
         // Token authentication
         // Advertised as the `realm` of the challenge above — the two have to
         // stay the same path.
@@ -2056,8 +2094,8 @@ pub(crate) fn build_all_routes(
             api::ai::ai_search_code,
         )
         // ── WebSocket ──────────────────────────────────────────────────────
-        .get(WS_TICKET, "/ws/notifications", ws::ws_notifications_handler)
-        .get(WS_TICKET, "/ws/job/{job_id}", ws::ws_job_log_handler)
+        .get(WS_SESSION, "/ws/notifications", ws::ws_notifications_handler)
+        .get(WS_JOB_LOG, "/ws/job/{job_id}", ws::ws_job_log_handler)
         .finish();
 
     // Accept Personal Access Tokens on the REST API by translating them to a

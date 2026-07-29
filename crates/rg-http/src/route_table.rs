@@ -120,8 +120,23 @@ pub enum ForeignGate {
     /// token, a WebSocket ticket. `module` is the source file the handler lives
     /// in, relative to `crates/rg-http/src/`, and the guard checks that it
     /// really does.
+    ///
+    /// `gates` is the other half, and the half that took a second card to
+    /// arrive: living in the named file was all this variant ever claimed, and
+    /// a handler that lives there while checking nothing satisfied it. So the
+    /// route also names the function its handler has to *reach* — directly or
+    /// through the helpers of its own module — and
+    /// `tests/integration/foreign_gate_guard.rs` walks the call graph to
+    /// confirm it. Several names mean "at least one of these", which is what a
+    /// protocol whose read and write paths gate separately actually promises.
+    ///
+    /// An empty slice is the one route shape with nothing to reach: a constant
+    /// answer that reads neither the caller nor the database — the registry's
+    /// `GET /v2/` discovery challenge. It is checked in the other direction
+    /// instead, so it cannot become a way to opt out of the check.
     Handler {
         module: &'static str,
+        gates: &'static [&'static str],
         note: &'static str,
     },
 }

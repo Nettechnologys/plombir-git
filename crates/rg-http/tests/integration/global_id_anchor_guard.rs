@@ -88,10 +88,13 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rg_http::route_table::RUNNER_AUTH_LAYER;
 
+use crate::common::source_scan::{
+    calls, functions, handlers, is_ident_char, relative, rust_files, src_root, Function,
+};
 use crate::common::spawn_test_app_with_routes;
 
 /// One rule: a path parameter, and the anchors any of which satisfies it.
@@ -358,83 +361,6 @@ const GATE_BINDINGS: &[(&str, &str)] = &[
     ("OrgRead", "org"),
 ];
 
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-/// One `fn` declared at column 0, ending at the `}` that closes it.
-///
-/// The body used to run on until the *next* `pub async fn`, which swept up
-/// whatever sat between the two — a private helper, the next handler's
-/// `#[utoipa::path]` block, its signature. That made a handler answerable for
-/// calls it does not make, and let one that takes no `Path` of its own inherit
-/// the next handler's parameters and be judged against rules that were never
-/// about it. rustfmt puts the closing brace of a top-level item in column 0 and
-/// nothing inside a function body there, so that brace is the exact end.
-struct Function {
-    name: String,
-    line: usize,
-    body: String,
-    is_handler: bool,
-}
-
-fn declared_fn(line: &str) -> Option<(String, bool)> {
-    // `pub(crate) async fn` counts as a handler candidate: nothing stops the
-    // router from taking one, and a census that only reads `pub async fn`
-    // would let a route hide behind the narrower visibility.
-    for (prefix, is_handler) in [
-        ("pub async fn ", true),
-        ("pub(crate) async fn ", true),
-        ("async fn ", false),
-        ("pub(crate) fn ", false),
-        ("pub fn ", false),
-        ("fn ", false),
-    ] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let name = rest
-                .split(['(', '<', ' '])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            return Some((name, is_handler));
-        }
-    }
-    None
-}
-
-fn functions(text: &str) -> Vec<Function> {
-    let mut out: Vec<Function> = Vec::new();
-    let mut open: Option<usize> = None;
-    for (n, line) in text.lines().enumerate() {
-        if open.is_none() {
-            if let Some((name, is_handler)) = declared_fn(line) {
-                out.push(Function {
-                    name,
-                    line: n + 1,
-                    body: String::new(),
-                    is_handler,
-                });
-                open = Some(out.len() - 1);
-            }
-        }
-        if let Some(index) = open {
-            out[index].body.push_str(line);
-            out[index].body.push('\n');
-            if line == "}" {
-                open = None;
-            }
-        }
-    }
-    out
-}
-
-fn handlers(text: &str) -> Vec<Function> {
-    functions(text)
-        .into_iter()
-        .filter(|f| f.is_handler)
-        .collect()
-}
-
 /// Everything up to the `)` that closes the parameter list.
 fn signature(body: &str) -> &str {
     match body.find(") ->") {
@@ -478,25 +404,6 @@ fn path_params(sig: &str) -> Vec<String> {
 
 fn is_global_id(param: &str) -> bool {
     !param.starts_with('_') && (param == "id" || param.ends_with("_id"))
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// A call to `name(`, ignoring its own definition and comment lines.
-fn calls(body: &str, name: &str) -> bool {
-    body.lines().any(|line| {
-        let code = line.trim_start();
-        if code.starts_with("//") || code.starts_with("use ") {
-            return false;
-        }
-        if code.contains(&format!("fn {name}(")) {
-            return false;
-        }
-        line.find(&format!("{name}("))
-            .is_some_and(|at| !line[..at].chars().next_back().is_some_and(is_ident_char))
-    })
 }
 
 /// The body with every `//` comment blanked out, byte lengths preserved so that
@@ -736,24 +643,6 @@ fn has_scope_comparison(code: &str, scoped: &HashSet<String>) -> bool {
         }
     }
     false
-}
-
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).expect("read src dir") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn relative(path: &Path) -> String {
-    path.strip_prefix(src_root())
-        .expect("file under src/")
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn anchors_for(file: &str, param: &str) -> Option<&'static [&'static str]> {
