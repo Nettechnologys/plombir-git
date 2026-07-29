@@ -631,7 +631,11 @@ async fn a_transfer_whose_row_was_lost_leaves_the_tree_with_its_owner() {
         .send()
         .await
         .unwrap();
-    assert_eq!(created.status(), 201, "baseline: the destination org exists");
+    assert_eq!(
+        created.status(),
+        201,
+        "baseline: the destination org exists"
+    );
     let joined = client
         .post(format!("{}/api/v1/orgs/xfercorp/members", app.base))
         .bearer_auth(&org_owner_token)

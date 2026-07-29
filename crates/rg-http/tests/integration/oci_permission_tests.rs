@@ -24,11 +24,9 @@ fn basic_auth(username: &str, password: &str) -> String {
     )
 }
 
-async fn request_oci_token(
-    base: &str,
-    scope: &str,
-    auth_header: Option<String>,
-) -> rg_core::auth::oci_token::OciTokenClaims {
+/// The raw scoped bearer token `GET /v2/auth/token` hands out — the string a
+/// docker client then presents on every request until it expires.
+async fn request_oci_token_raw(base: &str, scope: &str, auth_header: Option<String>) -> String {
     let client = reqwest::Client::new();
     let mut req = client
         .get(format!("{}/v2/auth/token", base))
@@ -40,8 +38,20 @@ async fn request_oci_token(
     let resp = req.send().await.unwrap();
     assert_eq!(resp.status(), 200, "token request failed");
     let body: serde_json::Value = resp.json().await.unwrap();
-    let token = body["token"].as_str().unwrap();
-    rg_core::auth::oci_token::validate_oci_token(token, "test-secret-key").expect("valid OCI token")
+    body["token"]
+        .as_str()
+        .expect("token in response")
+        .to_string()
+}
+
+async fn request_oci_token(
+    base: &str,
+    scope: &str,
+    auth_header: Option<String>,
+) -> rg_core::auth::oci_token::OciTokenClaims {
+    let token = request_oci_token_raw(base, scope, auth_header).await;
+    rg_core::auth::oci_token::validate_oci_token(&token, "test-secret-key")
+        .expect("valid OCI token")
 }
 
 #[tokio::test]
@@ -444,5 +454,279 @@ async fn a_failed_finalize_separates_a_wrong_digest_from_a_broken_registry() {
     assert!(
         message.contains(&staged.display().to_string()),
         "the 500 must name the staging path: {message}"
+    );
+}
+
+// ── A scoped token outliving the access it was minted for ────────────────
+//
+// An OCI scoped token is a capability: `get_token` runs the repository gate and
+// freezes its answer into the `scope` string. What the string cannot carry is
+// the answer's shelf life. Drop the collaborator, deactivate the account, and
+// the token keeps saying `pull,push` for the rest of its 300 seconds — long
+// enough to push a tag into a private registry, and invisible to
+// `session_standing_middleware`, which parses `sub` as a user id while an OCI
+// token carries a username there.
+//
+// Every test below mints its baseline *before* the revocation and in the same
+// run: a token that answers 401 proves nothing on its own, since a token that
+// was never good answers 401 too.
+
+/// Add `username` to `owner/repo` as a writer, returning the id the removal
+/// route takes.
+async fn add_collaborator(
+    base: &str,
+    owner_token: &str,
+    owner: &str,
+    repo: &str,
+    username: &str,
+) -> i64 {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/collaborators"))
+        .bearer_auth(owner_token)
+        .json(&serde_json::json!({"username": username, "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "fixture: adding '{username}' to {owner}/{repo} failed: {}",
+        response.status()
+    );
+    response.json::<serde_json::Value>().await.unwrap()["user_id"]
+        .as_i64()
+        .expect("collaborator user_id")
+}
+
+async fn remove_collaborator(base: &str, owner_token: &str, owner: &str, repo: &str, user_id: i64) {
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/collaborators/{user_id}"
+        ))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "fixture: removing collaborator {user_id} failed: {}",
+        response.status()
+    );
+}
+
+/// `POST /v2/{owner}/{repo}/blobs/uploads/` — the first request of a
+/// `docker push`, and the cheapest one that needs `push`.
+async fn start_upload_with(
+    base: &str,
+    owner: &str,
+    repo: &str,
+    oci_token: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v2/{owner}/{repo}/blobs/uploads/"))
+        .bearer_auth(oci_token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `GET /v2/{owner}/{repo}/tags/list` — the cheapest request that needs `pull`.
+async fn list_tags_with(base: &str, owner: &str, repo: &str, oci_token: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base}/v2/{owner}/{repo}/tags/list"))
+        .bearer_auth(oci_token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Dropping a collaborator has to reach the scoped tokens they already hold.
+#[tokio::test]
+async fn a_scoped_token_stops_working_when_the_collaborator_is_dropped() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "ocirevowner", "ocirevowner@example.com").await;
+    register_full(&base, "ocirevmate", "ocirevmate@example.com").await;
+    create_repo(&base, &owner_token, "revoke-oci", true).await;
+    let mate_id = add_collaborator(
+        &base,
+        &owner_token,
+        "ocirevowner",
+        "revoke-oci",
+        "ocirevmate",
+    )
+    .await;
+
+    // The collaborator takes a token while they still may. The gate ran here,
+    // and its answer is now frozen into the token for the next five minutes.
+    let token = request_oci_token_raw(
+        &base,
+        "repository:ocirevowner/revoke-oci:pull,push",
+        Some(basic_auth("ocirevmate", "Qz7$wRtm")),
+    )
+    .await;
+
+    let push_before = start_upload_with(&base, "ocirevowner", "revoke-oci", &token).await;
+    assert_eq!(
+        push_before.status(),
+        202,
+        "the token never granted a push, so it failing later would prove nothing"
+    );
+    let pull_before = list_tags_with(&base, "ocirevowner", "revoke-oci", &token).await;
+    assert_ne!(
+        pull_before.status(),
+        401,
+        "the token never granted a pull, so it failing later would prove nothing"
+    );
+
+    remove_collaborator(&base, &owner_token, "ocirevowner", "revoke-oci", mate_id).await;
+
+    let push_after = start_upload_with(&base, "ocirevowner", "revoke-oci", &token).await;
+    assert_eq!(
+        push_after.status(),
+        401,
+        "a dropped collaborator's token still starts a push into the private registry"
+    );
+    let pull_after = list_tags_with(&base, "ocirevowner", "revoke-oci", &token).await;
+    assert_eq!(
+        pull_after.status(),
+        401,
+        "a dropped collaborator's token still pulls from the private registry"
+    );
+
+    // The refusal has to be one docker can read: the OCI envelope, not the
+    // AppError body, and the code the spec names for it.
+    let body: serde_json::Value = push_after.json().await.unwrap();
+    assert_eq!(
+        body["errors"][0]["code"], "UNAUTHORIZED",
+        "the refusal must keep the OCI error-envelope: {body}"
+    );
+    assert!(
+        body.get("error").is_none(),
+        "the refusal must not be the AppError JSON body: {body}"
+    );
+}
+
+/// Deactivating an account has to reach the scoped tokens it already holds.
+///
+/// This is the half `session_standing_middleware` cannot reach: it resolves a
+/// caller by parsing `sub` as a user id, and an OCI token puts a username
+/// there, so an offboarded account's token was never even looked at.
+#[tokio::test]
+async fn deactivating_an_account_revokes_its_unexpired_oci_token() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "ocigoneowner", "ocigoneowner@example.com").await;
+    create_repo(&base, &owner_token, "gone-oci", true).await;
+
+    let token = request_oci_token_raw(
+        &base,
+        "repository:ocigoneowner/gone-oci:pull,push",
+        Some(basic_auth("ocigoneowner", "Qz7$wRtm")),
+    )
+    .await;
+
+    let before = start_upload_with(&base, "ocigoneowner", "gone-oci", &token).await;
+    assert_eq!(
+        before.status(),
+        202,
+        "the token never granted a push, so it failing later would prove nothing"
+    );
+
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, None, Some(false))
+        .await
+        .expect("deactivate user");
+
+    let after = start_upload_with(&base, "ocigoneowner", "gone-oci", &token).await;
+    assert_eq!(
+        after.status(),
+        401,
+        "a deactivated account's unexpired token still pushes to its private registry"
+    );
+    let pull = list_tags_with(&base, "ocigoneowner", "gone-oci", &token).await;
+    assert_eq!(
+        pull.status(),
+        401,
+        "a deactivated account's unexpired token still pulls from its private registry"
+    );
+}
+
+/// A token that outlived its *repository* rather than its holder.
+///
+/// The anonymous case: a public image's token is minted for `anonymous` and the
+/// gate admits it because the repository is public. Flip the repository to
+/// private and the frozen scope still says `pull`.
+#[tokio::test]
+async fn an_anonymous_scoped_token_stops_working_when_the_repository_turns_private() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "ociflipowner", "ociflipowner@example.com").await;
+    create_repo(&base, &owner_token, "flip-oci", false).await;
+
+    let token = request_oci_token_raw(&base, "repository:ociflipowner/flip-oci:pull", None).await;
+
+    let before = list_tags_with(&base, "ociflipowner", "flip-oci", &token).await;
+    assert_ne!(
+        before.status(),
+        401,
+        "the anonymous token never pulled, so it failing later would prove nothing"
+    );
+
+    // No REST route flips visibility, so the fixture writes the row the read
+    // gate reads on every request — the same way the LFS revocation tests do.
+    {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        let repo = rg_db::entities::repository::Entity::find()
+            .filter(rg_db::entities::repository::Column::Name.eq("flip-oci"))
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("fixture repository");
+        let repo_id = repo.id;
+        let mut repo: rg_db::entities::repository::ActiveModel = repo.into();
+        repo.is_private = Set(true);
+        repo.update(&db).await.expect("flip repository to private");
+        rg_core::repo::service::invalidate_perm_cache_all(&db);
+        let _ = repo_id;
+    }
+
+    let after = list_tags_with(&base, "ociflipowner", "flip-oci", &token).await;
+    assert_eq!(
+        after.status(),
+        401,
+        "a token minted while the repository was public still pulls after it turned private"
+    );
+}
+
+/// A database that cannot answer is not a credentials problem.
+///
+/// The scoped branch now makes DB calls of its own — resolving `sub` to an
+/// account, then asking the repository gate — and each is a place where a
+/// failure could be folded into "not allowed". Folded, it answers 401, which is
+/// the one status that sends docker straight back to the token endpoint to loop
+/// instead of backing off. With a perfectly valid token presented, an outage
+/// must still read as an outage.
+#[tokio::test]
+async fn a_database_outage_under_a_scoped_token_is_503_not_401() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "ocioutowner", "ocioutowner@example.com").await;
+    create_repo(&base, &owner_token, "outage-oci", true).await;
+
+    let token = request_oci_token_raw(
+        &base,
+        "repository:ocioutowner/outage-oci:pull,push",
+        Some(basic_auth("ocioutowner", "Qz7$wRtm")),
+    )
+    .await;
+
+    db.close().await.expect("close pool");
+
+    let response = list_tags_with(&base, "ocioutowner", "outage-oci", &token).await;
+    assert_eq!(
+        response.status(),
+        503,
+        "an outage under a valid scoped token must stay retryable, not read as a bad credential"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body.get("errors").and_then(|e| e.as_array()).is_some(),
+        "the outage must keep the OCI error-envelope: {body}"
     );
 }

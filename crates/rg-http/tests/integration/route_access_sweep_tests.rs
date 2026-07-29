@@ -1572,7 +1572,10 @@ async fn the_out_of_reach_routes_are_still_out_of_reach() {
         }
     }
 
-    assert!(probed > 0, "NO_FIXTURE is empty — the guard is not guarding");
+    assert!(
+        probed > 0,
+        "NO_FIXTURE is empty — the guard is not guarding"
+    );
     assert!(
         offenders.is_empty(),
         "{} NO_FIXTURE row(s) are no longer out of reach.\nThey are skipped by every persona \

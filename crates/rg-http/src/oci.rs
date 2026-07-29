@@ -33,6 +33,11 @@ const DOCKER_UPLOAD_UUID: HeaderName = HeaderName::from_static("docker-upload-uu
 const RANGE: HeaderName = HeaderName::from_static("range");
 const DOCKER_API_VERSION: HeaderName = HeaderName::from_static("docker-distribution-api-version");
 
+/// The `sub` an OCI token minted without credentials carries. It is a literal,
+/// not a username: no account may hold it, and `token_subject` reads it as
+/// "there is nobody behind this token", not as "look this account up".
+const ANONYMOUS_SUBJECT: &str = "anonymous";
+
 // ── helpers ──────────────────────────────────────────────────
 
 /// Build an OCI `{errors:[{code,message}]}` envelope.
@@ -163,13 +168,64 @@ fn granted(decision: Result<(), AppError>) -> Result<bool, AppError> {
     }
 }
 
+/// Who an OCI scoped token was minted for, as far as the *present* is
+/// concerned.
+///
+/// A scoped token names its subject by username, which is not something the
+/// repository gate takes and not something the revocation middleware can read
+/// (`api::auth::session_standing_middleware` parses `sub` as a user id, so an
+/// OCI token is invisible to it). Resolving the name back to a live account is
+/// therefore this file's job, and it is the same question
+/// `api::lfs::signer_still_stands` asks of a signed URL's actor.
+enum TokenSubject {
+    /// The token names no account at all — issued to `anonymous`, so the gate
+    /// answers it as it answers a caller with no credentials.
+    Anonymous,
+    /// A live account the gate can be asked about.
+    User(i64),
+    /// The named account is gone or deactivated. The token keeps its signature
+    /// and its scope; it no longer has anybody behind it.
+    Gone,
+}
+
+/// Resolve a scoped token's `sub` into the actor the repository gate takes.
+///
+/// Fails closed on a denial ([`TokenSubject::Gone`]) and keeps a *failed*
+/// lookup an error, so a database outage stays a 503 instead of collapsing into
+/// the 401 that sends docker straight back for another token.
+async fn token_subject(state: &AppState, sub: &str) -> Result<TokenSubject, AppError> {
+    if sub == ANONYMOUS_SUBJECT {
+        return Ok(TokenSubject::Anonymous);
+    }
+    match rg_db::ops::user_ops::find_by_username(&state.db, sub).await {
+        Ok(Some(user)) if user.is_usable() => Ok(TokenSubject::User(user.id)),
+        Ok(_) => {
+            tracing::warn!(
+                subject = sub,
+                "rejecting an OCI scoped token: the account behind it is disabled or gone"
+            );
+            Ok(TokenSubject::Gone)
+        }
+        Err(error) => {
+            tracing::error!(
+                subject = sub,
+                error = %format!("{error:#}"),
+                "could not verify the account behind an OCI scoped token"
+            );
+            Err(AppError::from(error))
+        }
+    }
+}
+
 /// Check if the request has access to perform an OCI repo action.
 ///
 /// The registry decides *who* is calling — a ForgeKeep user JWT, an OCI scoped
 /// bearer token, or nobody — and the shared repository gate in
-/// `api::repo_access` decides what that caller may do. OCI scoped tokens are
-/// the one credential the gate cannot read: they carry no user, only the scope
-/// they were signed with, and `get_token` already ran the same gate to mint it.
+/// `api::repo_access` decides what that caller may do. That holds for the
+/// scoped token too: it names its caller by username rather than by id, so
+/// resolving it costs a lookup ([`token_subject`]), but the permission decision
+/// is still the gate's and is still taken now rather than read off a capability
+/// minted up to five minutes ago.
 async fn check_access(
     state: &AppState,
     headers: &HeaderMap,
@@ -196,24 +252,65 @@ async fn check_access(
         return Ok((allowed, allowed.then_some(uid)));
     }
 
-    // Try OCI Bearer token (scope-based).
+    // An OCI scoped token. Its scope is a *capability*: `get_token` ran this
+    // same gate to mint it, and the scope string is that answer, frozen. What
+    // it does not carry is the answer's shelf life — drop the collaborator or
+    // deactivate the account and the token keeps saying `pull,push` for the
+    // rest of its 300 seconds, which is time enough to push a tag into a
+    // private registry. So the scope only decides whether this token is *about*
+    // this repository and this action; whether that is still allowed is asked
+    // again, of the gate, against the account the token names.
     if let Some(claims) =
         bearer_token(headers).and_then(|token| validate_oci_token(token, &state.jwt_secret))
     {
-        if let Some(scope_str) = claims.scope {
-            for single_scope in scope_str.split_whitespace() {
-                if let Some(parsed) = ParsedScope::parse(single_scope) {
-                    if parsed.matches_repo(owner, repo) && parsed.has_action(required_action) {
-                        return Ok((true, None));
-                    }
+        let scoped_for_this = claims
+            .scope
+            .iter()
+            .flat_map(|s| s.split_whitespace())
+            .any(|s| {
+                ParsedScope::parse(s).is_some_and(|parsed| {
+                    parsed.matches_repo(owner, repo) && parsed.has_action(required_action)
+                })
+            });
+
+        if scoped_for_this {
+            let actor = match token_subject(state, &claims.sub).await? {
+                TokenSubject::Anonymous => None,
+                TokenSubject::User(uid) => Some(uid),
+                // Nobody behind the token: it grants nothing of its own. The
+                // request carries on as an unauthenticated one, so a public
+                // repository still answers a pull — the token cannot leave its
+                // holder worse off than presenting no credentials at all.
+                TokenSubject::Gone => {
+                    return anonymous_pull(state, &repo_model, required_action).await
                 }
+            };
+
+            let allowed = match required_action {
+                "pull" => granted(repo_access::check_read_for(state, &repo_model, actor).await)?,
+                "push" => granted(repo_access::check_write_for(state, &repo_model, actor).await)?,
+                _ => false,
+            };
+            if allowed {
+                return Ok((true, actor));
             }
+            // Denied on this token's own terms; the public-pull fallback below
+            // is the only thing that can still admit it.
         }
     }
 
-    // For pull, allow anonymous only when the backing ForgeKeep repo is public.
+    anonymous_pull(state, &repo_model, required_action).await
+}
+
+/// What this repository owes a caller with no credentials: a public repository
+/// answers a pull, everything else is a denial.
+async fn anonymous_pull(
+    state: &AppState,
+    repo_model: &rg_db::entities::repository::Model,
+    required_action: &str,
+) -> Result<(bool, Option<i64>), AppError> {
     if required_action == "pull" {
-        let allowed = granted(repo_access::check_read_for(state, &repo_model, None).await)?;
+        let allowed = granted(repo_access::check_read_for(state, repo_model, None).await)?;
         return Ok((allowed, None));
     }
 
@@ -313,7 +410,7 @@ async fn authenticate_basic(
     db: &DatabaseConnection,
     headers: &HeaderMap,
 ) -> anyhow::Result<(String, Option<i64>)> {
-    let anonymous = || Ok(("anonymous".to_string(), None));
+    let anonymous = || Ok((ANONYMOUS_SUBJECT.to_string(), None));
 
     let Some(auth_header) = headers.get(header::AUTHORIZATION) else {
         return anonymous();
@@ -498,7 +595,11 @@ pub async fn get_token(
     };
 
     // Generate token (TTL: 300s for normal, 60s for anonymous)
-    let ttl = if username == "anonymous" { 60 } else { 300 };
+    let ttl = if username == ANONYMOUS_SUBJECT {
+        60
+    } else {
+        300
+    };
     let token = match generate_oci_token(&username, &granted_scope, &state.jwt_secret, ttl) {
         Ok(t) => t,
         Err(e) => {
@@ -992,17 +1093,16 @@ pub async fn start_upload(
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let user_id = match require_access(&state, &headers, &owner, &repo, "push").await {
-        Ok(user_id) => user_id,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = require_access(&state, &headers, &owner, &repo, "push").await {
+        return resp;
+    }
 
     // Check for cross-repo mount
     if let (Some(mount), Some(from)) = (params.get("mount"), params.get("from")) {
         return handle_mount(&state, &headers, &owner, &repo, mount, from).await;
     }
 
-    let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo, user_id).await {
+    let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo).await {
         Ok(r) => r,
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
@@ -1178,10 +1278,9 @@ pub async fn complete_upload(
     Query(params): Query<std::collections::HashMap<String, String>>,
     body: Body,
 ) -> Response {
-    let user_id = match require_access(&state, &headers, &owner, &repo, "push").await {
-        Ok(user_id) => user_id,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = require_access(&state, &headers, &owner, &repo, "push").await {
+        return resp;
+    }
     let expected_digest = match params.get("digest") {
         Some(d) => d.clone(),
         None => {
@@ -1204,7 +1303,7 @@ pub async fn complete_upload(
         );
     }
 
-    let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo, user_id).await {
+    let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo).await {
         Ok(r) => r,
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
@@ -1386,28 +1485,35 @@ async fn find_oci_repo(
     }
 }
 
+/// The `oci_repository` row for `owner/repo`, created on the first push.
+///
+/// The namespace is `owner/repo` — the path the client asked for — and it is
+/// resolved as such. It used to be resolved against *the caller* instead
+/// whenever one was known (`find_by_owner_and_name(actor_id, repo)`), which is
+/// only the same query when the caller happens to be the owner. A collaborator
+/// pushing the first image of a repository they do not own looked up
+/// `their-id/repo`, found nothing, and got `500 repository not found` for a
+/// push the gate had just allowed. Nobody noticed because the actor reaching
+/// here was almost always `None`: docker authenticates with a scoped token, and
+/// that branch of `check_access` returned no actor at all.
+///
+/// `owner_id` on the row means the namespace's owner, so it comes off the
+/// repository, not off whoever happens to be pushing.
 async fn find_or_create_oci_repo(
     db: &DatabaseConnection,
     owner: &str,
     repo: &str,
-    owner_id: Option<i64>,
 ) -> anyhow::Result<rg_db::entities::oci_repository::Model> {
-    let forgekeep_repo = if let Some(id) = owner_id.filter(|&id| id > 0) {
-        rg_db::ops::repo_ops::find_by_owner_and_name(db, id, repo)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?
-    } else {
-        rg_core::repo::service::find_repo_by_owner_name(db, owner, repo)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?
-    };
+    let forgekeep_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?;
 
     let namespace = format!("{}/{}", owner, repo);
     rg_db::ops::oci_ops::find_or_create_repo(
         db,
         forgekeep_repo.id,
         &namespace,
-        owner_id.unwrap_or(0),
+        forgekeep_repo.owner_id,
     )
     .await
     .map_err(Into::into)
