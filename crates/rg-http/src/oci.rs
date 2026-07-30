@@ -1208,6 +1208,47 @@ async fn handle_mount(
     }
 }
 
+/// Fetch an upload session and re-anchor it to the repository the caller was
+/// authorized for.
+///
+/// `{uuid}` is an instance-wide key: `oci_upload` rows are found by it alone,
+/// while `require_access` only ever proves something about the `{owner}/{repo}`
+/// in the path. Resolving the session without tying the two together let a
+/// caller with `push` on *any* repository name somebody else's active session
+/// and drive the writes that follow — the progress row and, on finalize, the
+/// row's deletion. The bytes never crossed over (the staging path is built from
+/// `{owner}/{repo}`), so what leaked was not content but control: the victim's
+/// client was handed a `Range` for a session it no longer owned.
+///
+/// A session in another repository answers exactly like one that never existed
+/// — `404 BLOB_UPLOAD_UNKNOWN` — because the alternative confirms the uuid to
+/// whoever guessed it, and OCI clients already know that code.
+///
+/// It is a named helper rather than an inline comparison because
+/// `global_id_anchor_guard` can read a call and cannot read an `if`.
+async fn upload_in_repo(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    uuid: &str,
+) -> Result<rg_db::entities::oci_upload::Model, Response> {
+    let unknown = || oci_not_found(error_codes::BLOB_UPLOAD_UNKNOWN, "upload session not found");
+
+    // No `oci_repository` row means no session can belong here — including the
+    // case where the repository itself is gone. `find_oci_repo` never creates.
+    let oci_repo = match find_oci_repo(&state.db, owner, repo).await {
+        Ok(Some(oci_repo)) => oci_repo,
+        Ok(None) => return Err(unknown()),
+        Err(e) => return Err(oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"))),
+    };
+
+    match rg_db::ops::oci_ops::find_upload(&state.db, uuid).await {
+        Ok(Some(upload)) if upload.oci_repository_id == oci_repo.id => Ok(upload),
+        Ok(_) => Err(unknown()),
+        Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"))),
+    }
+}
+
 /// `PATCH /v2/{owner}/{repo}/blobs/uploads/{uuid}` — chunked upload.
 /// Streams the request body directly to the upload file—never buffers
 /// the entire chunk in memory.
@@ -1221,14 +1262,11 @@ pub async fn chunk_upload(
         return resp;
     }
 
-    // Verify upload session exists
-    match rg_db::ops::oci_ops::find_upload(&state.db, &uuid).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return oci_not_found(error_codes::BLOB_UPLOAD_UNKNOWN, "upload session not found");
-        }
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
-    }
+    // Verify the upload session exists *in the gated repository*.
+    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(upload) => upload,
+        Err(resp) => return resp,
+    };
 
     // Stream body to upload file
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
@@ -1238,14 +1276,33 @@ pub async fn chunk_upload(
             // it while the session row still holds the old offset hands the
             // client a position the server does not agree with, so a failed
             // progress write has to fail the chunk rather than be swallowed.
-            if let Err(e) =
-                rg_db::ops::oci_ops::update_upload_progress(&state.db, &uuid, total_size).await
+            match rg_db::ops::oci_ops::update_upload_progress(
+                &state.db,
+                upload.oci_repository_id,
+                &uuid,
+                total_size,
+            )
+            .await
             {
-                return oci_err(
-                    oci_status_for(&e),
-                    "UNKNOWN",
-                    &format!("failed to record upload progress for session {uuid}: {e}"),
-                );
+                Ok(0) => {
+                    // The row was there a moment ago and matched this
+                    // repository, so nothing was written because the session
+                    // has since gone (expiry sweep, a concurrent finalize).
+                    // Reporting a `Range` off a row that no longer exists is
+                    // the same lie as reporting one off a stale row.
+                    return oci_not_found(
+                        error_codes::BLOB_UPLOAD_UNKNOWN,
+                        "upload session not found",
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return oci_err(
+                        oci_status_for(&e),
+                        "UNKNOWN",
+                        &format!("failed to record upload progress for session {uuid}: {e}"),
+                    );
+                }
             }
 
             let range_end = total_size.saturating_sub(1);
@@ -1292,6 +1349,16 @@ pub async fn complete_upload(
         }
     };
 
+    // The session this finalizes must belong to the gated repository. The
+    // staging file below is keyed by `{owner}/{repo}` and so was never anybody
+    // else's, but the row is not: finalizing ends by deleting the session, and
+    // keyed on the uuid alone that delete landed on whichever repository held
+    // it — a stranger's `docker push` cancelled from outside.
+    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(upload) => upload,
+        Err(resp) => return resp,
+    };
+
     // If body is provided (single-chunk upload), stream it to the upload file first
     // Check by reading the first frame: if there's data, stream the rest
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
@@ -1303,10 +1370,9 @@ pub async fn complete_upload(
         );
     }
 
-    let oci_repo = match find_or_create_oci_repo(&state.db, &owner, &repo).await {
-        Ok(r) => r,
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
-    };
+    // The repository the session was anchored to, not a second lookup that
+    // could resolve — or create — a different one.
+    let oci_repo_id = upload.oci_repository_id;
 
     // Finalize: stream-read upload file, verify digest, move to blob storage
     match state
@@ -1330,7 +1396,7 @@ pub async fn complete_upload(
             // told worked, so the failure has to reach it.
             if let Err(e) = rg_db::ops::oci_ops::insert_blob(
                 &state.db,
-                oci_repo.id,
+                oci_repo_id,
                 &digest,
                 "application/octet-stream",
                 size,
@@ -1385,7 +1451,8 @@ pub async fn complete_upload(
             // Clean up upload session. The blob is committed at this point, so a
             // failure here leaks a session row rather than losing data — worth a
             // warning, not a failed push.
-            if let Err(e) = rg_db::ops::oci_ops::delete_upload(&state.db, &uuid).await {
+            if let Err(e) = rg_db::ops::oci_ops::delete_upload(&state.db, oci_repo_id, &uuid).await
+            {
                 tracing::warn!(
                     upload_uuid = %uuid,
                     error = %format!("{e:#}"),
@@ -1460,6 +1527,15 @@ async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow:
             .await
             .map_err(|error| staged(&error))?;
     }
+
+    // `tokio::fs::File` buffers, and `write_all` returns once the bytes are
+    // queued for the blocking pool — not once they are in the file. `metadata`
+    // asks the *file*, so without this flush the size below is whatever had
+    // landed by then: under load a chunk reads back as the offset before it,
+    // and that number is both the `Range` the client resumes from and the
+    // `bytes_uploaded` recorded for the session. The client then re-sends bytes
+    // it already sent, and the push dies at the digest — as the client's fault.
+    file.flush().await.map_err(|error| staged(&error))?;
 
     let size = file.metadata().await.map_err(|error| staged(&error))?.len() as i64;
     Ok(size)

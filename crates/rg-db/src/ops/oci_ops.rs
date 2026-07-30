@@ -264,22 +264,33 @@ pub async fn find_upload(
         .await
 }
 
-/// Update upload progress.
+/// Update upload progress of a session **inside** `oci_repo_id`.
+///
+/// The uuid is instance-wide while the caller of the HTTP layer was only ever
+/// admitted to one `{owner}/{repo}`, so the repository is part of the `WHERE`
+/// rather than an argument the caller may forget: an update filtered on the
+/// uuid alone rewrote another repository's session offset, and the victim's
+/// client resumed its push from a position nobody agreed on.
+///
+/// Returns the number of rows written, so a caller that matched nothing learns
+/// it instead of reading `Ok(())` as "recorded".
 pub async fn update_upload_progress(
     db: &DatabaseConnection,
+    oci_repo_id: i64,
     uuid: &str,
     bytes_uploaded: i64,
-) -> Result<(), DbErr> {
+) -> Result<u64, DbErr> {
     use oci_upload::Entity as Upload;
-    Upload::update_many()
+    let result = Upload::update_many()
         .col_expr(
             oci_upload::Column::BytesUploaded,
             Expr::value(bytes_uploaded),
         )
         .filter(oci_upload::Column::Uuid.eq(uuid))
+        .filter(oci_upload::Column::OciRepositoryId.eq(oci_repo_id))
         .exec(db)
         .await?;
-    Ok(())
+    Ok(result.rows_affected)
 }
 
 /// Complete an upload (set digest).
@@ -297,11 +308,20 @@ pub async fn complete_upload(
     Ok(())
 }
 
-/// Delete an upload session.
-pub async fn delete_upload(db: &DatabaseConnection, uuid: &str) -> Result<u64, DbErr> {
+/// Delete an upload session **inside** `oci_repo_id`.
+///
+/// Same reason as [`update_upload_progress`]: finalizing a push ends with the
+/// session row being dropped, and a delete keyed on the instance-wide uuid
+/// alone dropped whichever repository's session happened to carry it.
+pub async fn delete_upload(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    uuid: &str,
+) -> Result<u64, DbErr> {
     use oci_upload::Entity as Upload;
     let result = Upload::delete_many()
         .filter(oci_upload::Column::Uuid.eq(uuid))
+        .filter(oci_upload::Column::OciRepositoryId.eq(oci_repo_id))
         .exec(db)
         .await?;
     Ok(result.rows_affected)

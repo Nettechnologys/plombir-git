@@ -27,8 +27,10 @@
 //!
 //! So the population is counted first and classified second:
 //! [`every_global_id_a_handler_takes_is_accounted_for`] walks every
-//! `pub async fn` under `src/`, takes every path parameter named `id` or
-//! `*_id`, and demands that each one be anchored in a way this file can *read*.
+//! `pub async fn` under `src/`, takes every path parameter that names an
+//! instance-wide key ([`is_global_id`] — `id` / `*_id`, and since
+//! card_1cfb4519ff04 `uuid` / `*_uuid` too), and demands that each one be
+//! anchored in a way this file can *read*.
 //! Five such ways exist, and they are tried in order:
 //!
 //! 1. **Instance gate.** The signature carries `InstanceAdmin`. Addressing rows
@@ -270,6 +272,18 @@ const ANCHORED: &[AnchoredFile] = &[
         ],
     ),
     (
+        "oci.rs",
+        &[
+            // `{uuid}` names a blob-upload session, and sessions are found by
+            // that uuid alone — the `oci_upload` row carries its repository,
+            // but nothing compared the two. `PATCH` rewrote the offset of a
+            // stranger's session and `PUT` deleted its row, both from inside a
+            // repository the caller legitimately holds `push` on. One helper
+            // answers for both handlers.
+            ("uuid", &["upload_in_repo"]),
+        ],
+    ),
+    (
         "ws.rs",
         &[
             // The log socket walks job → stage → pipeline → repository and then
@@ -353,6 +367,11 @@ const LEAF_COMPARISONS: &[(&str, &str, &[&str])] = &[
         "resolve_team_in_org",
         &["team.org_id == org_id"],
     ),
+    (
+        "oci.rs",
+        "upload_in_repo",
+        &["upload.oci_repository_id == oci_repo.id"],
+    ),
 ];
 
 /// The `rg_core::release::service` functions that take a release or asset id
@@ -417,7 +436,7 @@ const RELEASE_PRIMITIVE_SIGNED_OFF: &[(&str, &str)] = &[];
 /// The number is written down so that adding a route which takes one is a
 /// deliberate act: the census fails until the new pair is classified *and* this
 /// count is updated. It is the denominator the plan for this guard was missing.
-const CENSUS_TOTAL: usize = 124;
+const CENSUS_TOTAL: usize = 126;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.
@@ -476,8 +495,27 @@ fn path_params(sig: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Whether a path parameter names a key that is unique across the instance
+/// rather than inside the gated container.
+///
+/// The name is the only signal a source scan has, and for a while the rule was
+/// "`id` or `*_id`" — which is a statement about spelling, not about scope. The
+/// OCI registry addresses an upload session by `{uuid}`, a key drawn from the
+/// same instance-wide pool as any primary key, and `src/oci.rs` was therefore
+/// not merely unanchored but outside the denominator: the census counted zero
+/// pairs there, so its `0/0` read the same as full coverage (card_1cfb4519ff04).
+///
+/// `uuid` / `*_uuid` is the widening that finding forced. The other non-`_id`
+/// path parameters were re-read at the same time and are scoped by
+/// construction, not by an anchor: `digest` and `oid` are content addresses
+/// whose lookups build a path from `{owner}/{repo}`, `reference` / `version` /
+/// `pkg_name` / `secret_name` / `number` name a row *within* a container the
+/// gate proved. They stay out of the census on purpose — but the fact that a
+/// parameter's name is a weak proxy for its scope is now written down here
+/// rather than assumed.
 fn is_global_id(param: &str) -> bool {
-    !param.starts_with('_') && (param == "id" || param.ends_with("_id"))
+    !param.starts_with('_')
+        && (param == "id" || param == "uuid" || param.ends_with("_id") || param.ends_with("_uuid"))
 }
 
 /// The body with every `//` comment blanked out, byte lengths preserved so that

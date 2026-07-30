@@ -71,6 +71,7 @@ mod notification_websocket_cookie_tests;
 mod oauth_pkce_tests;
 mod oci_permission_tests;
 mod oci_push_pull_tests;
+mod oci_upload_session_scope_tests;
 mod openapi_docs_auth_tests;
 mod org_scoped_id_scope_sweep_tests;
 mod org_team_authz_tests;
