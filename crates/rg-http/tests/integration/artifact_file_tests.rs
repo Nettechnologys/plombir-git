@@ -357,7 +357,9 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
     // but it also holds trivially if both sides answer `403`, which would be the
     // bug with the fixture merely made consistent. The code is pinned as well.
     assert_eq!(
-        get_answer(&client, &metadata, Some(&outsider_token)).await.0,
+        get_answer(&client, &metadata, Some(&outsider_token))
+            .await
+            .0,
         404,
         "an outsider was told the artifact exists"
     );

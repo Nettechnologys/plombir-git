@@ -109,6 +109,7 @@ use reqwest::{Client, StatusCode};
 use rg_http::route_table::RouteFact;
 use sea_orm::Set;
 
+use crate::common::answer::Answer;
 use crate::common::{register_full, spawn_test_app_with_routes_and_db};
 
 const ATTACKER: &str = "scopeattacker";
@@ -1052,60 +1053,6 @@ fn fill(path: &str, owner: &str, repo: &str, targets: &HashMap<&'static str, i64
     out
 }
 
-/// One answer, whole.
-///
-/// The body is kept *untruncated* on purpose. `drive` used to return
-/// `body.chars().take(160)`, which is harmless while the body is only ever
-/// quoted in a failure message and fatal the moment it is compared: a clipped
-/// JSON body does not parse, the `request_id` normalization below never runs,
-/// and two answers that say the same thing differ by a uuid forever. Clipping
-/// happens in [`Answer::excerpt`], at the point of reporting, and nowhere else.
-struct Answer {
-    status: StatusCode,
-    body: String,
-}
-
-impl Answer {
-    /// Everything a caller learns, minus what is fresh on every response.
-    ///
-    /// `AppError::into_response` sets `request_id: None` and the tracing
-    /// middleware stamps a uuid into the envelope further down the stack, so a
-    /// raw body comparison is red between any two requests. The status is part
-    /// of the shape: `401` and `404` are both [`masked`], but a caller who gets
-    /// one for a foreign id and the other for an absent one has still learned
-    /// which is which.
-    fn shape(&self) -> (u16, String) {
-        let normalized = match serde_json::from_str::<serde_json::Value>(&self.body) {
-            Ok(mut parsed) => {
-                if let Some(object) = parsed.as_object_mut() {
-                    object.remove("request_id");
-                    if let Some(error) = object.get_mut("error").and_then(|e| e.as_object_mut()) {
-                        error.remove("request_id");
-                    }
-                }
-                parsed.to_string()
-            }
-            // Not JSON — an empty `HEAD` body, or a handler that answers in
-            // some other shape. Compared verbatim rather than waved through.
-            Err(_) => self.body.clone(),
-        };
-        (self.status.as_u16(), normalized)
-    }
-
-    /// For failure messages only — never for comparison.
-    fn excerpt(&self) -> String {
-        self.body.chars().take(160).collect()
-    }
-
-    /// Whether the two shapes being equal actually asserted anything about a
-    /// body. A `HEAD` route answers nothing by protocol, so its pair is a
-    /// statement about the status alone and must not be counted towards the
-    /// anti-vacuity floor.
-    fn speaks(&self) -> bool {
-        !self.body.trim().is_empty()
-    }
-}
-
 async fn drive(
     fx: &Fixture,
     fact: &RouteFact,
@@ -1144,10 +1091,7 @@ async fn drive(
             ),
         ),
     };
-    let response = request.send().await.expect("scope sweep request");
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Answer { status, body }
+    Answer::of(request.send().await.expect("scope sweep request")).await
 }
 
 /// **Pass one's** predicate: the probe was refused *without* being told the id

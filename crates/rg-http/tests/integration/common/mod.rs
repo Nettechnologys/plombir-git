@@ -5,6 +5,7 @@ pub use rg_http;
 
 use rg_core::package_registry::oci::OciStorage;
 
+pub mod answer;
 pub mod fault;
 pub mod source_scan;
 

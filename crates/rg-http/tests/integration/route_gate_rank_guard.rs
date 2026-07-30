@@ -57,7 +57,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+
+use crate::common::source_scan::{
+    anchored_aliases, call_args, leading_ident, param_base_types, relative, rust_files,
+    signature_params, src_root, AnchorKind,
+};
 
 /// The repository access levels, weakest first.
 ///
@@ -220,10 +224,6 @@ const SIGNED_OFF: &[(&str, &str, Rank, &str)] = &[
 /// no-op, which is worse than a red one — nobody investigates a passing test.
 const MIN_ROWS: usize = 300;
 
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
 fn read(rel: &str) -> String {
     let path = src_root().join(rel);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -327,52 +327,6 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-/// The top-level arguments of the call whose `(` sits at byte offset `open`, or
-/// `None` when the parentheses never balance.
-fn call_args(src: &str, open: usize) -> Option<Vec<String>> {
-    let bytes = src.as_bytes();
-    let mut args: Vec<String> = Vec::new();
-    let mut depth = 0usize;
-    let mut start = open + 1;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    args.push(src[start..i].trim().to_string());
-                    // Rust's trailing comma leaves an empty tail segment.
-                    if args.last().is_some_and(String::is_empty) {
-                        args.pop();
-                    }
-                    return Some(args);
-                }
-            }
-            b',' if depth == 1 => {
-                args.push(src[start..i].trim().to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Whether `text` is a path expression naming a free function —
 /// `api::issues::update_issue`. This is what separates a route registration from
 /// any other three-argument `.get(…)` in the file.
@@ -387,14 +341,6 @@ fn is_handler_path(text: &str) -> bool {
                 .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
                 && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
         })
-}
-
-/// The identifier `text` starts with — `Foreign(Handler { … })` ⇒ `Foreign`.
-fn leading_ident(text: &str) -> &str {
-    let end = text
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(text.len());
-    &text[..end]
 }
 
 /// `const GIT_HTTP: Access = Foreign(Handler { … });` ⇒ `GIT_HTTP` → `Foreign`.
@@ -503,144 +449,23 @@ fn handler_location(handler: &str) -> (String, String) {
     (format!("{}.rs", segments.join("/")), name.to_string())
 }
 
-/// The top-level parameters of `fn name` in `text`, or `None` when it is not
-/// declared there.
+/// The rung each anchored alias in the tree carries.
 ///
-/// Anchored on column 0: rustfmt puts a top-level item there and nothing inside
-/// a function body, so an inner helper or a closure cannot be mistaken for the
-/// handler.
-///
-/// The parameter list is located from the *name*, not from the first `(` on the
-/// line. `pub(crate) async fn openapi_handler(_: AuthUser)` has a paren three
-/// characters in, and reading from there parses `(crate)` as the signature — so
-/// every `pub(crate)` handler read as taking one parameter called `crate` and
-/// therefore no gate at all. The failure direction was safe (such a handler is
-/// reported as ungated, never as gated), but it made the level unstatable: a
-/// route could not declare `User` over a `pub(crate)` handler however correct
-/// that handler was.
-fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
-    let mut offset = 0usize;
-    for line in text.lines() {
-        let params_at = [
-            "pub async fn ",
-            "pub(crate) async fn ",
-            "async fn ",
-            "pub fn ",
-            "pub(crate) fn ",
-            "fn ",
-        ]
-        .iter()
-        .find_map(|prefix| {
-            let tail = line.strip_prefix(prefix)?.strip_prefix(name)?;
-            // A generic list may sit between the name and the parameters:
-            // `fn handler<T>(…)`.
-            let open = match tail.as_bytes().first()? {
-                b'(' => 0,
-                b'<' => tail.find('(')?,
-                _ => return None,
-            };
-            Some(prefix.len() + name.len() + open)
-        });
-        if let Some(open) = params_at {
-            return call_args(text, offset + open);
-        }
-        offset += line.len() + 1;
-    }
-    None
-}
-
-/// The declared type of one parameter — the text after the `:` that separates
-/// pattern from type at nesting depth zero.
-///
-/// The depth matters: `Path((owner, name, number)): Path<(String, String, i64)>`
-/// and `RepoAuthRead { repo, actor_id }: RepoAuthRead` both carry colons inside
-/// the *pattern*, and splitting at the first one reads a field name as the type.
-/// So does `state: axum::extract::State<AppState>`, whose `::` pairs are not
-/// separators at all.
-fn param_type(param: &str) -> Option<&str> {
-    let bytes = param.as_bytes();
-    let mut depth = 0i32;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' | b'<' => depth += 1,
-            b')' | b']' | b'}' | b'>' => depth -= 1,
-            b':' if depth == 0 => {
-                if bytes.get(i + 1) == Some(&b':') {
-                    i += 2;
-                    continue;
-                }
-                return Some(param[i + 1..].trim());
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// `pub type ArtifactRead = AnchoredRead<Artifact>;` across the tree.
-///
-/// The anchored extractors are the shape a route takes when its path names no
-/// repository — `/artifacts/{id}` resolves one out of the artifact — and each
-/// anchor declares its own alias pair beside it. Reading them out of the tree
-/// rather than listing them here means a new anchor is understood the day it is
-/// written; and an alias this misses reads as a handler with no gate at all,
-/// which is an offender, so the failure direction is the safe one.
+/// The population is read by [`anchored_aliases`], which
+/// `anchored_scope_sweep_tests` drives the same routes off — one census, so the
+/// guard that checks an anchored route's rung and the sweep that probes it
+/// cannot come to disagree about which anchors exist. All this adds is the
+/// mapping onto [`Rank`], which is this file's own scale.
 fn anchored_ranks() -> BTreeMap<String, Rank> {
-    let mut files = Vec::new();
-    rust_files(&src_root(), &mut files);
-    let mut out = BTreeMap::new();
-    for file in &files {
-        let text = fs::read_to_string(file).expect("read source file");
-        for line in text.lines() {
-            let Some((alias, target)) = line
-                .trim_start()
-                .strip_prefix("pub type ")
-                .and_then(|rest| rest.split_once('='))
-            else {
-                continue;
+    anchored_aliases()
+        .into_iter()
+        .map(|anchor| {
+            let rank = match anchor.kind {
+                AnchorKind::Read => Rank::Read,
+                AnchorKind::Write => Rank::Write,
             };
-            let rank = match leading_ident(target.trim()) {
-                "AnchoredRead" => Rank::Read,
-                "AnchoredWrite" => Rank::Write,
-                _ => continue,
-            };
-            out.insert(alias.trim().to_string(), rank);
-        }
-    }
-    out
-}
-
-fn relative(path: &Path) -> String {
-    path.strip_prefix(src_root())
-        .expect("file under src/")
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).expect("read src dir") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-/// The extractor type names a signature carries, reduced to the base name the
-/// tables are keyed on.
-///
-/// `AuthUser(user_id): AuthUser`, `OrgAdmin { org, .. }: OrgAdmin` and
-/// `admin: crate::api::admin::InstanceAdmin` all yield the bare type name: the
-/// path prefix is dropped, and so is anything a generic or a pattern adds.
-fn taken_types(params: &[String]) -> Vec<&str> {
-    params
-        .iter()
-        .filter_map(|param| param_type(param))
-        .map(|ty| leading_ident(ty.rsplit("::").next().unwrap_or(ty).trim()))
+            (anchor.alias, rank)
+        })
         .collect()
 }
 
@@ -650,7 +475,7 @@ fn taken_types(params: &[String]) -> Vec<&str> {
 /// Strongest rather than first: a handler taking two gates sits behind both, so
 /// the level it actually enforces is the higher one.
 fn taken_rank(params: &[String], anchored: &BTreeMap<String, Rank>) -> Option<Rank> {
-    taken_types(params)
+    param_base_types(params)
         .into_iter()
         .filter_map(|base| {
             TAKEN
@@ -788,7 +613,7 @@ fn no_non_repository_row_leaves_its_gate_to_the_handler_body() {
             )
         });
 
-        let taken = taken_types(&params);
+        let taken = param_base_types(&params);
         if !taken.iter().any(|ty| accepted.contains(ty)) {
             offenders.push(format!(
                 "  routes.rs:{} — {} declares {level} and `{}` takes none of {accepted:?}",

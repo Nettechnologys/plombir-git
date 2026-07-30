@@ -20,6 +20,7 @@ mod admin_org_tests;
 mod admin_settings_tests;
 mod admin_sso_audit_tests;
 mod admin_user_tests;
+mod anchored_scope_sweep_tests;
 mod api_tests;
 mod archive_failure_status_tests;
 mod artifact_file_tests;
