@@ -1072,10 +1072,11 @@ async fn creating_pr_requests_matching_codeowner_user() {
         .unwrap();
 
     let team_pr = insert_pr(&db, repo_id, owner_id, 3).await;
-    let mut repository = rg_db::ops::repo_ops::find_by_owner_and_name(&db, owner_id, "owned-code")
-        .await
-        .unwrap()
-        .unwrap();
+    let mut repository =
+        rg_db::ops::repo_ops::find_personal_by_owner_and_name(&db, owner_id, "owned-code")
+            .await
+            .unwrap()
+            .unwrap();
     repository.org_id = Some(org.id);
     let requested = rg_core::review::codeowners::request_codeowners(
         &db,

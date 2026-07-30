@@ -235,6 +235,12 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
 }
 
 /// Find a repository by owner name (user or org) and repo name.
+///
+/// The two branches are two namespaces, not two ways of spelling one. A
+/// username resolves to the *personal* namespace only: an organization's
+/// repository is stored under `owner_id = org.owner_id` (see [`resolve_owner`]),
+/// so looking it up by `owner_id` alone answered `/{org-owner}/{repo}` with the
+/// organization's repository as well (card_92019cc97dcd).
 pub async fn find_repo_by_owner_name(
     db: &DatabaseConnection,
     owner: &str,
@@ -242,7 +248,7 @@ pub async fn find_repo_by_owner_name(
 ) -> Result<Option<rg_db::entities::repository::Model>> {
     // Try as user
     if let Some(user) = user_ops::find_by_username(db, owner).await? {
-        return repo_ops::find_by_owner_and_name(db, user.id, repo_name).await;
+        return repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name).await;
     }
 
     // Try as organization
@@ -251,6 +257,62 @@ pub async fn find_repo_by_owner_name(
     }
 
     Ok(None)
+}
+
+/// Refuse `name` if it is already taken in the namespace it is being claimed
+/// in — `Some(org_id)` for an organization, `None` for `owner_id`'s personal
+/// account.
+///
+/// One helper rather than a copy per call site, because the check is the part
+/// that has to know which namespace it is asking about: `create_repo_with_opts`,
+/// `fork_repo` and `transfer_repo` each asked `find_by_owner_and_name(owner_id,
+/// name)`, which for an organization is *its owner's* account. That found the
+/// repository being transferred as its own destination collision, so a
+/// repository could be moved into an organization but never back out
+/// (card_92019cc97dcd).
+///
+/// `taken_message` is the caller's, because the three sites answer the same
+/// refusal in their own words ("already exists", "…in your account", "…at
+/// destination") and those wordings are what their tests read.
+///
+/// `except_repo_id` is the repository the name is being claimed *for*, when one
+/// already exists — a transfer moves a row rather than adding one, and a row
+/// never collides with itself.
+async fn ensure_repo_name_free(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    org_id: Option<i64>,
+    name: &str,
+    except_repo_id: Option<i64>,
+    taken_message: &str,
+) -> Result<()> {
+    let occupies = |found: Option<rg_db::entities::repository::Model>| {
+        found.filter(|repo| Some(repo.id) != except_repo_id)
+    };
+
+    let taken = match org_id {
+        Some(org_id) => repo_ops::find_by_org_and_name(db, org_id, name).await?,
+        None => repo_ops::find_personal_by_owner_and_name(db, owner_id, name).await?,
+    };
+    if occupies(taken).is_some() {
+        return Err(crate::error::invalid_request(taken_message.to_string()));
+    }
+
+    // The namespace is free but the table is not: `repositories` still carries
+    // `UNIQUE (owner_id, name)` from its first migration, and an organization's
+    // row hangs off its owner's account, so one `name` per account is all the
+    // schema can hold regardless of namespace. Say that, as the caller's `400`,
+    // instead of letting the insert or the ownership update come back as an
+    // anonymous 5xx. Delete this branch with the constraint (card_615e00843297).
+    let account_slot = repo_ops::find_in_owner_account_by_name(db, owner_id, name).await?;
+    if occupies(account_slot).is_some() {
+        return Err(crate::error::invalid_request(format!(
+            "repository name '{name}' is already used by another namespace on the owning account; \
+             pick a different name until one name per account stops being a database constraint"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Check whether `actor_id` (None = anonymous) can read the given repo.
@@ -464,15 +526,19 @@ pub async fn create_repo_with_opts(
         crate::error::invalid_request(format!("invalid repository name: {name} ({error})"))
     })?;
 
-    // Check name conflict (per owner)
-    if repo_ops::find_by_owner_and_name(db, owner_id, name)
-        .await?
-        .is_some()
-    {
-        return Err(crate::error::invalid_request(format!(
-            "repository '{name}' already exists"
-        )));
-    }
+    // Check name conflict — in the namespace being created in, which is the
+    // organization when `opts.org_id` names one and the owner's account
+    // otherwise. Not `owner_id` alone: that is the same account for a user and
+    // for every organization they own.
+    ensure_repo_name_free(
+        db,
+        owner_id,
+        opts.org_id,
+        name,
+        None,
+        &format!("repository '{name}' already exists"),
+    )
+    .await?;
 
     // Determine path prefix: org name or user name
     let path_prefix = if let Some(oid) = opts.org_id {
@@ -1035,14 +1101,17 @@ pub async fn fork_repo(
         .await?
         .ok_or_else(|| anyhow::anyhow!("user not found"))?;
 
-    if repo_ops::find_by_owner_and_name(db, user_id, repo_name)
-        .await?
-        .is_some()
-    {
-        return Err(crate::error::invalid_request(format!(
-            "repository '{repo_name}' already exists in your account"
-        )));
-    }
+    // A fork lands in the forker's own account, so the namespace it has to be
+    // free in is their personal one — never an organization they happen to own.
+    ensure_repo_name_free(
+        db,
+        user_id,
+        None,
+        repo_name,
+        None,
+        &format!("repository '{repo_name}' already exists in your account"),
+    )
+    .await?;
 
     let source_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
     let target_path = repo_root.join(format!("{}/{}.git", forker.username, repo_name));
@@ -1167,14 +1236,16 @@ pub async fn transfer_repo(
 
     let (new_owner_id, new_org_id, new_owner_name) = resolve_owner(db, new_owner).await?;
 
-    if repo_ops::find_by_owner_and_name(db, new_owner_id, repo_name)
-        .await?
-        .is_some()
-    {
-        return Err(crate::error::invalid_request(format!(
-            "repository '{repo_name}' already exists at destination"
-        )));
-    }
+    ensure_repo_name_free(
+        db,
+        new_owner_id,
+        new_org_id,
+        repo_name,
+        // A transfer moves this row; it is not a second repository of that name.
+        Some(repo.id),
+        &format!("repository '{repo_name}' already exists at destination"),
+    )
+    .await?;
 
     let old_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
     let new_path = repo_root.join(format!("{}/{}.git", new_owner_name, repo_name));
@@ -1212,9 +1283,13 @@ pub async fn transfer_repo(
     // Ownership (and thus who can read/write) changed — drop cached decisions.
     invalidate_perm_cache_repo(db, repo.id);
 
-    repo_ops::find_by_owner_and_name(db, new_owner_id, repo_name)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found after transfer"))
+    // Read the moved row back from the namespace it landed in — the same
+    // `(owner_id, org_id)` pair `update_owner` just wrote.
+    let moved = match new_org_id {
+        Some(org_id) => repo_ops::find_by_org_and_name(db, org_id, repo_name).await?,
+        None => repo_ops::find_personal_by_owner_and_name(db, new_owner_id, repo_name).await?,
+    };
+    moved.ok_or_else(|| anyhow::anyhow!("repository not found after transfer"))
 }
 
 // ── Commit Status ──────────────────────────────────────────────────────

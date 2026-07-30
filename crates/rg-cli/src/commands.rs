@@ -471,7 +471,7 @@ pub(crate) async fn cmd_index_repo(
     if parts.len() != 2 {
         anyhow::bail!("Invalid repo slug format. Expected: owner/name");
     }
-    let owner_username = parts[0];
+    let owner_name = parts[0];
     let repo_name = parts[1];
 
     tracing::info!(
@@ -480,17 +480,16 @@ pub(crate) async fn cmd_index_repo(
     );
     let db = dbconn::connect(&db_url).await?;
 
-    // Find owner by username
-    let owner = rg_db::ops::user_ops::find_by_username(&db, owner_username)
-        .await
-        .context("Failed to find owner")?
-        .ok_or_else(|| anyhow::anyhow!("User not found: {}", owner_username))?;
-
-    // Find repository by owner_id and name
-    let repo = rg_db::ops::repo_ops::find_by_owner_and_name(&db, owner.id, repo_name)
+    // The slug's owner half is a namespace, and the server's canonical resolver
+    // is the one that knows both kinds: a username reaches that account's own
+    // repositories, an organization name reaches the organization's. Resolving
+    // it here as a username and then filtering on `owner_id` alone meant
+    // `org/name` never worked while `org-owner/name` reached the
+    // organization's repository under the wrong path (card_92019cc97dcd).
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, owner_name, repo_name)
         .await
         .context("Failed to find repository")?
-        .ok_or_else(|| anyhow::anyhow!("Repository not found: {}/{}", owner_username, repo_name))?;
+        .ok_or_else(|| anyhow::anyhow!("Repository not found: {}/{}", owner_name, repo_name))?;
 
     tracing::info!(
         repo_id = repo.id,
@@ -504,7 +503,7 @@ pub(crate) async fn cmd_index_repo(
 
     // Construct repo path
     let repo_path =
-        std::path::Path::new(&repo_root).join(format!("{}/{}.git", owner_username, repo_name));
+        std::path::Path::new(&repo_root).join(format!("{}/{}.git", owner_name, repo_name));
 
     if !repo_path.exists() {
         anyhow::bail!("Repository path does not exist: {}", repo_path.display());

@@ -82,10 +82,11 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     rg_db::ops::repo_ops::update_stars_count(&db, repo.id)
         .await
         .expect("update star counter with backend-specific placeholders");
-    let counted_repo = rg_db::ops::repo_ops::find_by_owner_and_name(&db, user.id, &repo_name)
-        .await
-        .expect("read repository")
-        .expect("repository exists");
+    let counted_repo =
+        rg_db::ops::repo_ops::find_personal_by_owner_and_name(&db, user.id, &repo_name)
+            .await
+            .expect("read repository")
+            .expect("repository exists");
     assert_eq!(counted_repo.stars_count, 1);
 
     let page = rg_core::wiki::service::create_page(

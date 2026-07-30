@@ -162,7 +162,7 @@ async fn queue_waits_for_speculative_merge_group_ci_before_updating_base() {
     assert_eq!(queued.status(), 200, "{}", queued.text().await.unwrap());
     let queued = rg_db::ops::merge_queue_ops::list_by_repo(
         &db,
-        rg_db::ops::repo_ops::find_by_owner_and_name(
+        rg_db::ops::repo_ops::find_personal_by_owner_and_name(
             &db,
             rg_db::ops::user_ops::find_by_username(&db, "queue-ci-owner")
                 .await
@@ -328,7 +328,7 @@ async fn a_queue_pass_adopts_the_merge_group_pipeline_instead_of_triggering_anot
         201
     );
 
-    let repo_id = rg_db::ops::repo_ops::find_by_owner_and_name(
+    let repo_id = rg_db::ops::repo_ops::find_personal_by_owner_and_name(
         &db,
         rg_db::ops::user_ops::find_by_username(&db, "queue-adopt-owner")
             .await
@@ -571,7 +571,7 @@ async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
         200
     );
 
-    let repo_id = rg_db::ops::repo_ops::find_by_owner_and_name(
+    let repo_id = rg_db::ops::repo_ops::find_personal_by_owner_and_name(
         &db,
         rg_db::ops::user_ops::find_by_username(&db, "queue-fail-owner")
             .await

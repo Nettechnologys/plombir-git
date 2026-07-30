@@ -401,7 +401,7 @@ async fn create_repo(fx: &Fixture, token: &str, name: &str) {
 
 /// Look the repository's row up so the direct inserts below can point at it.
 async fn repo_id(db: &rg_db::DatabaseConnection, owner_id: i64, name: &str) -> i64 {
-    rg_db::ops::repo_ops::find_by_owner_and_name(db, owner_id, name)
+    rg_db::ops::repo_ops::find_personal_by_owner_and_name(db, owner_id, name)
         .await
         .expect("fixture: repository lookup")
         .unwrap_or_else(|| panic!("fixture: repository {name} of user {owner_id} is missing"))

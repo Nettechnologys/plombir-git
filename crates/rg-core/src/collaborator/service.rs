@@ -147,7 +147,7 @@ async fn resolve_repo(
     let user = rg_db::ops::user_ops::find_by_username(db, owner)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))?;
-    repo_ops::find_by_owner_and_name(db, user.id, repo_name)
+    repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
 }

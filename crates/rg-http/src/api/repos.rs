@@ -315,7 +315,7 @@ pub async fn list_repos(
         .ok()
         .flatten()
     {
-        match rg_db::ops::repo_ops::list_by_owner_visible_to(
+        match rg_db::ops::repo_ops::list_personal_by_owner_visible_to(
             &state.db, user.id, viewer_id, offset, limit,
         )
         .await

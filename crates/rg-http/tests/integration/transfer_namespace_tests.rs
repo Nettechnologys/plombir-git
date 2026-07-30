@@ -41,6 +41,18 @@ async fn create_repo(base: &str, token: &str, name: &str) -> u16 {
         .as_u16()
 }
 
+async fn create_repo_in_org(base: &str, token: &str, name: &str, org: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": name, "org": org }))
+        .send()
+        .await
+        .expect("request")
+        .status()
+        .as_u16()
+}
+
 async fn repo_visible_at(base: &str, token: &str, owner: &str, name: &str) -> bool {
     reqwest::Client::new()
         .get(format!("{base}/api/v1/repos/{owner}/{name}"))
@@ -147,14 +159,6 @@ async fn an_unknown_destination_is_denied_rather_than_reported_missing() {
 
 /// The baseline, in the same test as the denials: the transfers that *are*
 /// legitimate still work, and the repository really moves.
-///
-/// The move back out of the organization is deliberately not asserted here.
-/// It is refused today for a reason that has nothing to do with this gate:
-/// an organization's repository is stored under `org.owner_id`, and
-/// `repo_ops::find_by_owner_and_name` filters on `owner_id` alone, so the
-/// destination-collision check inside `transfer_repo` finds the repository
-/// *itself* and answers `400 already exists at destination` — see
-/// card_92019cc97dcd.
 #[tokio::test]
 async fn an_org_member_transfers_into_the_organization() {
     let base = spawn_test_app().await;
@@ -177,6 +181,49 @@ async fn an_org_member_transfers_into_the_organization() {
     assert!(
         repo_visible_at(&base, &member_token, "tp4corp", "widgets").await,
         "the accepted transfer did not actually move the repository"
+    );
+}
+
+/// The way back out, which is the transfer that used to be impossible.
+///
+/// An organization's repository is stored under `org.owner_id`, and the
+/// destination-collision check asked `find_by_owner_and_name(new_owner_id,
+/// name)` — for the organization's owner, the same account. So the check found
+/// the repository *itself* and answered `400 already exists at destination`: a
+/// repository could enter an organization and never leave (card_92019cc97dcd).
+///
+/// Only the organization's owner can do this — a transfer into an organization
+/// rewrites `owner_id` to the organization's owner, so the member who moved it
+/// in is no longer its owner. That is the pre-existing ownership rule, asserted
+/// here as the baseline it is rather than changed.
+#[tokio::test]
+async fn an_org_repository_transfers_back_out_to_its_owners_account() {
+    let base = spawn_test_app().await;
+    let (owner_token, _) = register_full(&base, "tp6-owner", "tp6-owner@example.com").await;
+
+    create_org(&base, &owner_token, "tp6corp").await;
+    assert_eq!(
+        create_repo_in_org(&base, &owner_token, "gadgets", "tp6corp").await,
+        201,
+        "baseline: the organization has a repository to hand back"
+    );
+    assert!(
+        repo_visible_at(&base, &owner_token, "tp6corp", "gadgets").await,
+        "baseline: it answers at the organization's path"
+    );
+
+    assert_eq!(
+        transfer(&base, &owner_token, "tp6corp", "gadgets", "tp6-owner").await,
+        200,
+        "the organization's owner cannot take their own repository back out"
+    );
+    assert!(
+        repo_visible_at(&base, &owner_token, "tp6-owner", "gadgets").await,
+        "the accepted transfer did not actually move the repository"
+    );
+    assert!(
+        !repo_visible_at(&base, &owner_token, "tp6corp", "gadgets").await,
+        "the repository still answers at the organization it left"
     );
 }
 

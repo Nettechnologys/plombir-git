@@ -181,15 +181,18 @@ pub async fn resolve_head_ref(
         if head_owner_user.id != target_repo.owner_id {
             // Different owner — this is a fork PR
             // Find the fork repo by the head owner (user may have forked the same repo)
-            let fork_repo =
-                repo_ops::find_by_owner_and_name(db, head_owner_user.id, &target_repo.name)
-                    .await?
-                    .ok_or_else(|| {
-                        crate::error::invalid_request(format!(
-                            "no repository '{}/{}' found for head owner",
-                            head_owner, target_repo.name
-                        ))
-                    })?;
+            let fork_repo = repo_ops::find_personal_by_owner_and_name(
+                db,
+                head_owner_user.id,
+                &target_repo.name,
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::error::invalid_request(format!(
+                    "no repository '{}/{}' found for head owner",
+                    head_owner, target_repo.name
+                ))
+            })?;
 
             // Verify it's actually a fork of the target
             if fork_repo.origin_repo_id != Some(target_repo_id) && fork_repo.id != target_repo_id {
@@ -1916,7 +1919,7 @@ async fn resolve_repo(
     let user = user_ops::find_by_username(db, owner)
         .await?
         .ok_or_else(|| NotFound::new("owner"))?;
-    repo_ops::find_by_owner_and_name(db, user.id, repo_name)
+    repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name)
         .await?
         .ok_or_else(|| NotFound::new("repository").into())
 }

@@ -65,10 +65,14 @@ async fn maintenance_mode_rejects_a_mutating_request_with_503() {
     // The repo really was not created — the rejection happened before the
     // handler, not after it.
     assert!(
-        rg_db::ops::repo_ops::find_by_owner_and_name(&db, user_id, "blocked-by-maintenance")
-            .await
-            .unwrap()
-            .is_none(),
+        rg_db::ops::repo_ops::find_personal_by_owner_and_name(
+            &db,
+            user_id,
+            "blocked-by-maintenance"
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "the request was rejected but the write still landed"
     );
 }

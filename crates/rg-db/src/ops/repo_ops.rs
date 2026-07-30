@@ -28,8 +28,48 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Repo>
         .context("db: find repo by id")
 }
 
-/// Find a repo by (owner_id, name). Excludes soft-deleted repos.
-pub async fn find_by_owner_and_name(
+/// Find a repo in a user's **personal** namespace — `owner_id` *and* no
+/// organization. Excludes soft-deleted repos.
+///
+/// The `org_id IS NULL` half is the point. A repository belongs to exactly one
+/// namespace, a user account or an organization, but the row hangs off a user
+/// either way: an organization's repository carries `owner_id = org.owner_id`
+/// (see `rg_core::repo::service::resolve_owner`). So a filter on `owner_id`
+/// alone answers "anything in this account *or* in any organization this
+/// account owns", which made `/{org}/{repo}` and `/{org-owner}/{repo}` resolve
+/// to the same row and made "is this name taken?" reach across the namespace
+/// boundary (card_92019cc97dcd).
+///
+/// For the organization side use [`find_by_org_and_name`]; to resolve an
+/// `owner/name` pair where `owner` may be either, use
+/// `rg_core::repo::service::find_repo_by_owner_name`.
+pub async fn find_personal_by_owner_and_name(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    name: &str,
+) -> Result<Option<Repo>> {
+    RepoEntity::find()
+        .filter(repository::Column::OwnerId.eq(owner_id))
+        .filter(repository::Column::OrgId.is_null())
+        .filter(repository::Column::Name.eq(name))
+        .filter(repository::Column::DeletedAt.is_null())
+        .one(db)
+        .await
+        .context("db: find personal repo by owner and name")
+}
+
+/// Any repo named `name` hanging off `owner_id`'s account — **both** namespaces
+/// at once, the personal one and every organization this account owns.
+///
+/// This is deliberately not a namespace lookup and is almost never what a
+/// caller wants; [`find_personal_by_owner_and_name`] is. It exists for one
+/// reason: `repositories` still carries the `UNIQUE (owner_id, name)` table
+/// constraint from its first migration, so the *table* cannot yet hold a
+/// personal `alice/db` next to an `acme/db` owned by alice even though those
+/// are different namespaces. Callers use this to answer that collision as a
+/// `400` naming the real cause instead of letting the insert surface as a 5xx.
+/// It goes away with the constraint (card_615e00843297).
+pub async fn find_in_owner_account_by_name(
     db: &DatabaseConnection,
     owner_id: i64,
     name: &str,
@@ -40,18 +80,23 @@ pub async fn find_by_owner_and_name(
         .filter(repository::Column::DeletedAt.is_null())
         .one(db)
         .await
-        .context("db: find repo by owner and name")
+        .context("db: find repo by owner account and name")
 }
 
-/// List all non-deleted repos owned by a user.
-pub async fn list_by_owner(db: &DatabaseConnection, owner_id: i64) -> Result<Vec<Repo>> {
+/// List all non-deleted repos in a user's **personal** namespace.
+///
+/// `org_id IS NULL` for the same reason as
+/// [`find_personal_by_owner_and_name`]: without it, the repositories of every
+/// organization this user owns are listed as if they were their own.
+pub async fn list_personal_by_owner(db: &DatabaseConnection, owner_id: i64) -> Result<Vec<Repo>> {
     RepoEntity::find()
         .filter(repository::Column::OwnerId.eq(owner_id))
+        .filter(repository::Column::OrgId.is_null())
         .filter(repository::Column::DeletedAt.is_null())
         .order_by_asc(repository::Column::Name)
         .all(db)
         .await
-        .context("db: list repos by owner")
+        .context("db: list personal repos by owner")
 }
 
 /// The repos `viewer_id` (`None` = anonymous) is allowed to see: every public
@@ -91,8 +136,17 @@ fn visible_to(viewer_id: Option<i64>) -> Condition {
         )
 }
 
-/// Paginated list of non-deleted repos owned by a user that `viewer_id` may see.
-pub async fn list_by_owner_visible_to(
+/// Paginated list of non-deleted repos in a user's **personal** namespace that
+/// `viewer_id` may see.
+///
+/// `org_id IS NULL` is the namespace half and is separate from `visible_to`:
+/// that one answers "may this viewer see the row", this one "does the row
+/// belong to the account being listed". An organization's repository hangs off
+/// its owner's `owner_id`, so without the filter `GET /repos/{org-owner}`
+/// advertised the organization's repositories as the owner's own
+/// (card_92019cc97dcd). They are listed by `GET /repos/{org}`, which goes
+/// through [`list_by_org_visible_to`].
+pub async fn list_personal_by_owner_visible_to(
     db: &DatabaseConnection,
     owner_id: i64,
     viewer_id: Option<i64>,
@@ -101,6 +155,7 @@ pub async fn list_by_owner_visible_to(
 ) -> Result<(Vec<Repo>, i64)> {
     let base = RepoEntity::find()
         .filter(repository::Column::OwnerId.eq(owner_id))
+        .filter(repository::Column::OrgId.is_null())
         .filter(repository::Column::DeletedAt.is_null())
         .filter(visible_to(viewer_id))
         .order_by_asc(repository::Column::Name);
@@ -109,13 +164,13 @@ pub async fn list_by_owner_visible_to(
         .clone()
         .count(db)
         .await
-        .context("db: count repos by owner")? as i64;
+        .context("db: count personal repos by owner")? as i64;
     let repos = base
         .offset(offset)
         .limit(limit)
         .all(db)
         .await
-        .context("db: list repos by owner (paginated)")?;
+        .context("db: list personal repos by owner (paginated)")?;
 
     Ok((repos, total))
 }
