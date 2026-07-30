@@ -29,11 +29,16 @@ use std::path::{Path, PathBuf};
 
 /// The gate functions that must not be called outside `api::repo_access`.
 ///
-/// `check_read_for` / `check_write_for` are in here for a different reason than
-/// the rest: they take the actor as an *argument*, so a REST handler calling one
-/// would be free to pass whichever user id it happened to have in scope. They
-/// exist for the transports that genuinely resolve their own caller — see
-/// `TRANSPORTS` below — and a handler that can take an extractor must.
+/// `check_read_for` / `check_write_for` / `check_admin_for` are in here for a
+/// different reason than the rest: they take the actor as an *argument*, so a
+/// REST handler calling one would be free to pass whichever user id it happened
+/// to have in scope. They exist for the transports that genuinely resolve their
+/// own caller — see `TRANSPORTS` below — and a handler that can take an
+/// extractor must. All three are listed even though only the first two are
+/// reached from outside `api::repo_access` today: the omission of the third was
+/// the same defect as the one `PREDICATES` had — a family member left out of the
+/// name list, so the first handler to call it would have been the guard's blind
+/// spot rather than its failure.
 ///
 /// `require_namespace_write` / `require_namespace_create` guard the routes whose
 /// target is named by the request *body* (`POST /imports`, `POST /repos`, the
@@ -63,6 +68,7 @@ const GATES: &[&str] = &[
     "check_read_with_ci",
     "check_read_for",
     "check_write_for",
+    "check_admin_for",
 ];
 
 /// Files that legitimately hold their own gate, with the reason.
@@ -118,7 +124,52 @@ const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "ws.rs"];
 /// resolves its own caller, or `may_read` / `may_write` / `may_admin` for a
 /// handler that needs access as a *question* — "is this caller also a writer?",
 /// on top of a gate it has already passed.
-const PREDICATES: &[&str] = &["can_read_repo", "can_write_repo", "can_admin_repo"];
+///
+/// `can_read` / `can_write` are the same three predicates in a fourth dialect:
+/// they take `(owner, name)` strings instead of a repository model, resolve the
+/// name themselves, and hand off to the `*_repo` pair. Listing only the pair let
+/// a handler write `rg_core::repo::service::can_read(&state.db, &owner, &name,
+/// uid)` with its own `Ok(false) => forbidden(…)` arm and stay green on every
+/// guard in this file at once — no `require_*` to find, no `check_read` to find,
+/// and no `can_*_repo` either. The rule is the rule whichever argument it takes.
+const PREDICATES: &[&str] = &[
+    "can_read_repo",
+    "can_write_repo",
+    "can_admin_repo",
+    "can_read",
+    "can_write",
+];
+
+/// The files that may ask a predicate directly, with the reason.
+///
+/// `api::repo_access` is the gate itself — `check_*_for`, `may_*` and the
+/// `require_*` implementations are built on these predicates, so barring it
+/// would bar the one implementation everything else is meant to route through.
+///
+/// `git_http.rs` is the exception the fourth dialect exists for, and it is
+/// signed off rather than migrated: `check_git_access` holds `owner` / `repo` as
+/// strings from the URL, not a resolved model, and it needs to tell "no such
+/// repository" apart from "the lookup failed" — `can_read` / `can_write` mark
+/// the first with a typed `rg_core::error::NotFound`, and answering `404` to a
+/// database outage is what that distinction was added to stop (a clone gives up
+/// on a 404, and CI / mirrors do not retry one). `check_read_for` flattens both
+/// into a single refusal, so routing through it would put the bug back.
+///
+/// Note this list is *not* [`SIGNED_OFF`]: being a protocol with its own
+/// credentials buys you the right to resolve your own caller, not the right to
+/// write the permission rule. `oci.rs`, `api/lfs.rs` and `ws.rs` are signed off
+/// there and deliberately absent here — see [`TRANSPORTS`].
+const PREDICATE_SIGNED_OFF: &[(&str, &str)] = &[
+    (
+        "api/repo_access.rs",
+        "the gate itself: check_*_for / may_* / require_* are built on these predicates",
+    ),
+    (
+        "git_http.rs",
+        "git-over-HTTP: has owner/name strings rather than a model, and needs the typed \
+         `NotFound` that `can_read` / `can_write` carry to answer 404 instead of 5xx",
+    ),
+];
 
 /// The organization-membership predicate — the third dialect, and the one both
 /// guards above were blind to.
@@ -323,7 +374,8 @@ fn repository_gates_are_only_reachable_through_the_extractors() {
 /// rule has one implementation no matter which shape asks for it.
 #[test]
 fn the_permission_predicates_are_only_reachable_through_the_gate_module() {
-    let offenders = predicate_offenders(PREDICATES, &["api/repo_access.rs"]);
+    let owners: Vec<&str> = PREDICATE_SIGNED_OFF.iter().map(|(rel, _)| *rel).collect();
+    let offenders = predicate_offenders(PREDICATES, &owners);
 
     assert!(
         offenders.is_empty(),
@@ -332,8 +384,11 @@ fn the_permission_predicates_are_only_reachable_through_the_gate_module() {
          CiRead<_>) when the answer gates the whole handler; call \
          `repo_access::may_read` / `may_write` / `may_admin` when you need it as a question on \
          top of a gate you already passed; call `check_read_for` / `check_write_for` when the \
-         protocol resolves its own caller. Writing the rule again with `can_*_repo` is how the \
-         copies this phase exists to remove got made.\n{}",
+         protocol resolves its own caller. Writing the rule again with `can_read_repo` — or with \
+         the name-resolving `can_read` / `can_write` pair, which is the same rule with a lookup \
+         in front — is how the copies this phase exists to remove got made. If the answer really \
+         has to come from the predicate itself, add the file to PREDICATE_SIGNED_OFF with the \
+         reason, the way `git_http.rs` is.\n{}",
         offenders.join("\n")
     );
 }
@@ -588,6 +643,38 @@ fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
          rule that no guard in `rg-http` could see.\n{}",
         offenders.join("\n")
     );
+}
+
+/// A predicate sign-off has to keep being true in both directions.
+///
+/// The forward half is the guard above: the listed file may decide access. The
+/// backward half is here, and it is the half that rots silently — the entry
+/// stops describing a file that asks the rule and becomes a standing exemption
+/// for whatever that file does next. `git_http.rs` is signed off *because* it
+/// calls `can_read` / `can_write` for the `NotFound` distinction; a `git_http.rs`
+/// that no longer calls them has no claim on the exception, and the next hand-
+/// rolled gate written there would be invisible.
+#[test]
+fn predicate_sign_offs_still_ask_the_predicate() {
+    for (rel, reason) in PREDICATE_SIGNED_OFF {
+        let path = src_root().join(rel);
+        assert!(
+            path.exists(),
+            "PREDICATE_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the entry"
+        );
+        assert!(!reason.is_empty(), "{rel} is signed off without a reason");
+
+        let text = fs::read_to_string(&path).expect("read source file");
+        let asks = text
+            .lines()
+            .any(|line| PREDICATES.iter().any(|p| calls_gate(line, p)));
+        assert!(
+            asks,
+            "{rel} is signed off to decide repository access directly ({reason}) but calls none \
+             of {PREDICATES:?} any more. The reason no longer describes the file, so the entry is \
+             a blanket allowance over whatever it does instead — drop it."
+        );
+    }
 }
 
 /// Every signed-off exception must name a file that still exists, so the list
