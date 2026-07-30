@@ -20,6 +20,13 @@
 //! open to anonymous callers on a public repository and closed on a private
 //! one, while `RepoWrite` is closed on both.
 //!
+//! A row owed [`Expect::Hidden`] is asked once more again, against an
+//! organization name nothing created, and the two replies are compared whole.
+//! That is a different kind of question from the rest of the sweep: everywhere
+//! else the oracle is a status, and a mask is a claim about what the caller
+//! *learns* — which lives just as much in the message underneath the status as
+//! in the status itself (card_81e6649615c1).
+//!
 //! The owner pass is the baseline the other two need. A route that answers
 //! "denied" to everyone proves nothing — the fixture could simply be broken —
 //! so the same run checks that the owner is *not* denied, and re-checks the
@@ -62,6 +69,15 @@ const OUTSIDER: &str = "sweepoutsider";
 const PRIVATE_REPO: &str = "sweepprivate";
 const PUBLIC_REPO: &str = "sweeppublic";
 const ORG: &str = "sweeporg";
+
+/// An organization name nothing in this fixture ever creates.
+///
+/// The reference reply the private organization has to be indistinguishable
+/// from. [`Expect::Hidden`] is a claim about what a caller *learns*, and a `404`
+/// on its own says nothing about that — an organization that does not exist
+/// answers `404` too. Only the two replies side by side answer the question,
+/// which is why the sweep needs a second name to point at (card_81e6649615c1).
+const ABSENT_ORG: &str = "sweepabsentorg";
 
 // ── The exceptions, spelled out ────────────────────────────────────────────
 //
@@ -332,6 +348,15 @@ enum Expect {
     /// `401` stays admissible and is not a leak: a gate that authenticates
     /// before it resolves anything answers an anonymous caller the same way
     /// whether the organization exists or not.
+    ///
+    /// Strengthening the *status* predicate was only half of it, and the other
+    /// half is why this variant is the one the sweep judges by body as well. A
+    /// status is one bit of a reply; the oracle simply moved into the other
+    /// half — `require_namespace_create` answered a single `403` to three
+    /// refusals with two different messages under it, and no wording of an
+    /// `Expect` could have reached that (card_2179245d41db). So a `Hidden` cell
+    /// is asked twice: once about the fixture's private organization, once about
+    /// [`ABSENT_ORG`], and the two replies have to be the same reply.
     Hidden,
     /// Not asserted; the caller holds the reason.
     Unchecked,
@@ -566,7 +591,11 @@ fn is_repo_path(path: &str) -> bool {
 /// a non-existent milestone or webhook id cannot change the verdict. A route
 /// where it *does* change the verdict is a route whose gate runs too late —
 /// which is one of the things this sweep is for.
-fn fill(path: &str, repo: &RepoSeed) -> String {
+///
+/// `org` is a parameter rather than a constant because the paired probe behind
+/// [`Expect::Hidden`] needs the same URL twice with one word changed: the
+/// fixture's private organization, and [`ABSENT_ORG`].
+fn fill(path: &str, repo: &RepoSeed, org: &str) -> String {
     let is_org_route = path.starts_with("/api/v1/orgs/") || path.starts_with("/api/v1/admin/orgs/");
 
     let mut out = String::new();
@@ -578,7 +607,7 @@ fn fill(path: &str, repo: &RepoSeed) -> String {
         let name = raw.strip_prefix('*').unwrap_or(raw);
         out.push_str(match name {
             "owner" => OWNER,
-            "name" if is_org_route => ORG,
+            "name" if is_org_route => org,
             "name" | "repo" => &repo.name,
             // Comments are numbered instance-wide while the handlers scope them
             // to the repository in the path, so this one has to come from the
@@ -612,13 +641,52 @@ fn fill(path: &str, repo: &RepoSeed) -> String {
 
 // ── Driving one route ──────────────────────────────────────────────────────
 
+/// One probe's answer: the status, and the body with the volatile part removed.
+///
+/// The body is kept whole rather than truncated because it is compared, not just
+/// printed — see [`Answer::excerpt`] for the reporting half.
+struct Answer {
+    status: StatusCode,
+    /// The reply body, `error.request_id` stripped.
+    ///
+    /// That field is the one part of an error envelope that differs between any
+    /// two requests: `AppError::into_response` leaves it `None` and the tracing
+    /// middleware stamps a fresh uuid into it further down the stack, so a raw
+    /// comparison of two identical denials is permanently red. Same
+    /// normalisation as `create_in_full` in `create_repo_namespace_tests`, which
+    /// is where that trap cost an hour.
+    ///
+    /// A body that is not JSON is kept verbatim: nothing else in the tree
+    /// answers a denial that way, and silently accepting one would be the sort
+    /// of quiet pass-through this file exists to refuse.
+    body: String,
+}
+
+impl Answer {
+    /// The first 160 characters, for the report.
+    fn excerpt(&self) -> String {
+        self.body.chars().take(160).collect()
+    }
+}
+
+fn normalized(body: &str) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    if let Some(error) = json.get_mut("error").and_then(|e| e.as_object_mut()) {
+        error.remove("request_id");
+    }
+    json.to_string()
+}
+
 async fn probe(
     fx: &Fixture,
     fact: &RouteFact,
     persona: Persona,
     repo: &RepoSeed,
-) -> (StatusCode, String) {
-    let url = format!("{}{}", fx.base, fill(&fact.path, repo));
+    org: &str,
+) -> Answer {
+    let url = format!("{}{}", fx.base, fill(&fact.path, repo, org));
     let mut req = match fact.method {
         "GET" => fx.client.get(url),
         "HEAD" => fx.client.head(url),
@@ -642,7 +710,10 @@ async fn probe(
     let resp = req.send().await.expect("sweep request");
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    (status, body.chars().take(160).collect())
+    Answer {
+        status,
+        body: normalized(&body),
+    }
 }
 
 /// `owner private-repo GET /api/v1/repos/{owner}/{name}` — how a single
@@ -760,6 +831,13 @@ async fn every_route_answers_its_declared_access_level() {
     let mut failures: BTreeSet<String> = BTreeSet::new();
     let mut gate_not_reached: BTreeSet<String> = BTreeSet::new();
     let mut fell_over: BTreeSet<String> = BTreeSet::new();
+    // The paired-probe half of `Expect::Hidden`: which cells were actually asked
+    // the second question, over how many distinct routes, which could not be
+    // asked it at all, and which answered the two questions differently.
+    let mut paired: BTreeSet<String> = BTreeSet::new();
+    let mut paired_routes: BTreeSet<String> = BTreeSet::new();
+    let mut unpaired: Vec<String> = Vec::new();
+    let mut oracles: Vec<String> = Vec::new();
 
     for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
         // The baseline, taken before the pass rather than inferred after it:
@@ -801,14 +879,48 @@ async fn every_route_answers_its_declared_access_level() {
                     Scope::PublicRepo => public_seed,
                     _ => private_seed,
                 };
-                let (status, body) = probe(&fx, fact, persona, repo).await;
-                let outcome = judge(expect, status);
+                let label = fact.label();
+                let key = cell(persona, scope, fact);
+                let answer = probe(&fx, fact, persona, repo, ORG).await;
+
+                // The body half of a masked denial. `judge` reads one bit of the
+                // reply, and a mask is a claim about the whole of it, so the
+                // same request goes out a second time against a name nothing
+                // created: if the two replies differ in any way a caller can
+                // see, the difference *is* the existence oracle the `404` was
+                // there to close.
+                if expect == Expect::Hidden {
+                    if fill(&fact.path, repo, ABSENT_ORG) == fill(&fact.path, repo, ORG) {
+                        unpaired.push(format!(
+                            "  {key}\n      declared {:?}, and the organization name is nowhere \
+                             in its path — there is no second name to compare the reply against, \
+                             so the mask is still judged by status alone",
+                            fact.access,
+                        ));
+                    } else {
+                        let absent = probe(&fx, fact, persona, repo, ABSENT_ORG).await;
+                        paired.insert(key.clone());
+                        paired_routes.insert(label.clone());
+                        if (answer.status, &answer.body) != (absent.status, &absent.body) {
+                            oracles.push(format!(
+                                "  {key}\n      '{ORG}' (private, exists) → {} {}\n\
+                                 \x20     '{ABSENT_ORG}' (no such organization) → {} {}",
+                                answer.status,
+                                answer.excerpt(),
+                                absent.status,
+                                absent.excerpt(),
+                            ));
+                        }
+                    }
+                }
+
+                let outcome = judge(expect, answer.status);
                 if outcome == Outcome::Match {
                     continue;
                 }
 
-                let label = fact.label();
-                let key = cell(persona, scope, fact);
+                let status = answer.status;
+                let body = answer.excerpt();
                 let note = match outcome {
                     Outcome::GateNotReached if EXTRACTOR_BEFORE_GATE.contains(&label.as_str()) => {
                         gate_not_reached.insert(label.clone());
@@ -879,6 +991,43 @@ async fn every_route_answers_its_declared_access_level() {
         healed.len(),
         healed.join("\n"),
     );
+
+    // Nothing is waved through: a `Hidden` cell the pair cannot be pointed at is
+    // a cell whose mask is still taken on the strength of one status code, and
+    // it has to say so out loud rather than pass quietly.
+    assert!(
+        unpaired.is_empty(),
+        "{} `Expect::Hidden` cell(s) could not be paired against a second name.\nGive the pass \
+         a way to ask the same route about something that does not exist, or take the \
+         `Expect::Hidden` off the level — an unpaired mask is the status-only oracle this pass \
+         stopped accepting.\n{}",
+        unpaired.len(),
+        unpaired.join("\n"),
+    );
+    // And the pair must actually have run. Relabel the organization routes and
+    // the whole body half would go quiet without a single assertion firing —
+    // which is exactly how the status half went vacuous before it
+    // (card_c46c354ec3ae).
+    assert!(
+        paired.len() >= 20 && paired_routes.len() >= 10,
+        "only {} `Expect::Hidden` cell(s) across {} route(s) were asked the paired question — \
+         the table, not the gate, is what changed, and the body half of every masking claim is \
+         now proving nothing",
+        paired.len(),
+        paired_routes.len(),
+    );
+    assert!(
+        oracles.is_empty(),
+        "{} of {} masked denial(s), over {} route(s), can be told apart from the same request \
+         against an organization that does not exist.\nThe status matches and the reply does \
+         not, so the mask is decoration: a caller reads existence off the difference. Both \
+         branches owe one reply — `resolve_org` and `require_org_visible` both answer \
+         `organization not found` for precisely this reason.\n{}",
+        oracles.len(),
+        paired.len(),
+        paired_routes.len(),
+        oracles.join("\n"),
+    );
 }
 
 /// A hostile query string must not overtake the gate.
@@ -937,7 +1086,7 @@ async fn no_route_answers_a_query_complaint_before_its_gate() {
             continue;
         }
 
-        let url = format!("{base}{}{HOSTILE_QUERY}", fill(&fact.path, &seed));
+        let url = format!("{base}{}{HOSTILE_QUERY}", fill(&fact.path, &seed, ORG));
         let mut req = match fact.method {
             "GET" => client.get(url),
             "HEAD" => client.head(url),
@@ -1346,7 +1495,7 @@ async fn no_public_route_names_the_private_repo() {
         if !matches!(fact.method, "GET" | "HEAD") {
             continue;
         }
-        let url = format!("{}{}", fx.base, fill(&fact.path, &seed));
+        let url = format!("{}{}", fx.base, fill(&fact.path, &seed, ORG));
         let req = if fact.method == "HEAD" {
             fx.client.head(url)
         } else {
@@ -1504,7 +1653,7 @@ async fn the_self_filtering_routes_show_public_and_hide_private() {
             .iter()
             .find(|f| f.label() == label)
             .expect("probe names a route in the table");
-        fill(&fact.path, &seed)
+        fill(&fact.path, &seed, ORG)
     };
 
     let mut failures: Vec<String> = Vec::new();
@@ -1735,15 +1884,17 @@ async fn the_out_of_reach_routes_are_still_out_of_reach() {
 
         for seed in &seeds {
             for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
-                let (status, body) = probe(&fx, fact, persona, seed).await;
+                let answer = probe(&fx, fact, persona, seed, ORG).await;
                 probed += 1;
-                if !status.is_success() {
+                if !answer.status.is_success() {
                     continue;
                 }
                 offenders.push(format!(
-                    "  {} {} {label} answered {status} (excused as: {reason})\n    {body}",
+                    "  {} {} {label} answered {} (excused as: {reason})\n    {}",
                     persona.label(),
                     seed.name,
+                    answer.status,
+                    answer.excerpt(),
                 ));
             }
             // Only the repository-scoped rows have anything to say about a
