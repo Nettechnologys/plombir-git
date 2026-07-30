@@ -334,11 +334,26 @@ const BODY_BORNE_IDS: &[(&str, &str, &str)] = &[
 /// issue or the pull request — and compares that. Delete either `if` and the
 /// file still compiles, every type still lines up, and any repository member
 /// can read and delete attachments on any comment on the instance.
-const LEAF_COMPARISONS: &[(&str, &str, &[&str])] = &[(
-    "api/attachments.rs",
-    "resolve",
-    &["issue.repo_id != repo.id", "pull.repo_id != repo.id"],
-)];
+/// `orgs.rs` is the second, and it is here for the same reason one axis over.
+/// `resolve_team_in_org` passes the census on the *scoped call* branch — the
+/// handlers hand it `org.id` beside the `team_id`, which is all a source reader
+/// can see — so what the guard actually checks is the shape of the call site,
+/// and the guard files were the only thing that had ever looked at the callee.
+/// Delete the `if` inside it and every call site still reads correctly, every
+/// type still lines up, and any organization admin can reach every team on the
+/// instance through their own path.
+const LEAF_COMPARISONS: &[(&str, &str, &[&str])] = &[
+    (
+        "api/attachments.rs",
+        "resolve",
+        &["issue.repo_id != repo.id", "pull.repo_id != repo.id"],
+    ),
+    (
+        "api/orgs.rs",
+        "resolve_team_in_org",
+        &["team.org_id == org_id"],
+    ),
+];
 
 /// The `rg_core::release::service` functions that take a release or asset id
 /// with no repository beside it, and the one file allowed to call them.

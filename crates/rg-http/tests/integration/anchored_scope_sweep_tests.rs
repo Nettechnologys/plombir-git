@@ -70,9 +70,7 @@ use reqwest::{Client, StatusCode};
 use rg_http::route_table::RouteFact;
 
 use crate::common::answer::Answer;
-use crate::common::source_scan::{
-    anchored_aliases, anchored_handlers, handler_type_name, Anchor,
-};
+use crate::common::source_scan::{anchored_aliases, anchored_handlers, handler_type_name, Anchor};
 use crate::common::{register_full, seed_artifact, spawn_test_app_with_routes_and_db};
 
 const OWNER: &str = "anchorowner";

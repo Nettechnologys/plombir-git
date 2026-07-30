@@ -170,6 +170,20 @@ impl Access {
                 | Self::RepoOwner
         )
     }
+
+    /// Whether the level is about the *organization* named in the path.
+    ///
+    /// The twin of [`is_repo_scoped`](Self::is_repo_scoped), and it exists for
+    /// the same reason: a level that proves something about a *container* leaves
+    /// every global id in the path unproven, so the id-scope sweeps select their
+    /// population by asking which container the gate settled. There was no way
+    /// to ask that about an organization, and the three sweeps that existed all
+    /// keyed on `is_repo_scoped` — which is exactly why the org axis went
+    /// unswept while every one of them read as covering the table
+    /// (card_40e6878aea09).
+    pub fn is_org_scoped(self) -> bool {
+        matches!(self, Self::OrgRead | Self::OrgAdmin)
+    }
 }
 
 /// One `(method, path, access)` row of the route table.
