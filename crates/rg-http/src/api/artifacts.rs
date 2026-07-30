@@ -36,6 +36,10 @@ impl RepoAnchor for Artifact {
 
     const PARAM: &'static str = "id";
 
+    fn masked() -> AppError {
+        AppError::not_found("artifact not found")
+    }
+
     async fn resolve(
         state: &AppState,
         artifact_id: i64,
@@ -43,35 +47,65 @@ impl RepoAnchor for Artifact {
         let artifact = rg_db::ops::artifact_ops::get_by_id(&state.db, artifact_id)
             .await
             .map_err(AppError::internal)?
-            .ok_or_else(|| AppError::not_found("artifact not found"))?;
-        // Retention has a date on the row and a sweep that gets to it later;
-        // between the two the artifact is already past its policy, so it is
-        // answered as gone rather than served for however long the sweep lags.
+            .ok_or_else(Self::masked)?;
+        let job = rg_db::ops::pipeline_ops::get_job(&state.db, artifact.job_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| broken_chain(artifact_id, "job", artifact.job_id))?;
+        let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| broken_chain(artifact_id, "stage", job.stage_id))?;
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| broken_chain(artifact_id, "pipeline", stage.pipeline_id))?;
+        let repo = rg_db::entities::repository::Entity::find_by_id(pipeline.repo_id)
+            .one(&state.db)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| broken_chain(artifact_id, "repository", pipeline.repo_id))?;
+        Ok((artifact, repo))
+    }
+
+    /// Retention has a date on the row and a sweep that gets to it later;
+    /// between the two the artifact is already past its policy, so it is
+    /// answered as gone rather than served for however long the sweep lags.
+    ///
+    /// Judged here rather than in `resolve` so the answer lands *after* the
+    /// gate: `artifact expired` and `artifact not found` are distinguishable,
+    /// and an outsider who can tell them apart enumerates every artifact that
+    /// ever existed in a private repository, which is the whole of what the
+    /// masking is for.
+    fn admit(artifact: &Self::Row) -> Result<(), AppError> {
         if artifact
             .expires_at
             .is_some_and(|expires| expires <= chrono::Utc::now())
         {
             return Err(AppError::not_found("artifact expired"));
         }
-        let job = rg_db::ops::pipeline_ops::get_job(&state.db, artifact.job_id)
-            .await
-            .map_err(AppError::internal)?
-            .ok_or_else(|| AppError::not_found("job not found"))?;
-        let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
-            .await
-            .map_err(AppError::internal)?
-            .ok_or_else(|| AppError::not_found("stage not found"))?;
-        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
-            .await
-            .map_err(AppError::internal)?
-            .ok_or_else(|| AppError::not_found("pipeline not found"))?;
-        let repo = rg_db::entities::repository::Entity::find_by_id(pipeline.repo_id)
-            .one(&state.db)
-            .await
-            .map_err(AppError::internal)?
-            .ok_or_else(|| AppError::not_found("repository not found"))?;
-        Ok((artifact, repo))
+        Ok(())
     }
+}
+
+/// A link of artifact → job → stage → pipeline → repository that does not
+/// resolve.
+///
+/// The caller is answered exactly as if the artifact were absent, because until
+/// the walk reaches a repository there is no gate to run and therefore no one
+/// this row may be admitted to — and the four texts this replaces
+/// (`job not found` and friends) each confirmed to an outsider that the artifact
+/// id itself was real. The detail an operator needs does not go to the caller;
+/// it goes to the log, where a chain that cannot be walked belongs.
+fn broken_chain(artifact_id: i64, link: &str, link_id: i64) -> AppError {
+    tracing::warn!(
+        artifact_id,
+        link,
+        link_id,
+        "artifact is orphaned: its {link} row is missing, so no repository can be resolved to \
+         authorize against — answering as if the artifact were absent"
+    );
+    Artifact::masked()
 }
 
 /// Read access to the repository the artifact belongs to — the metadata and
@@ -256,7 +290,8 @@ pub async fn list_pipeline_artifacts(
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
-        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No such artifact, or none this caller may see — \
+                                     the two are one answer on purpose", body = serde_json::Value),
     ),
 )]
 pub async fn get_artifact(
@@ -292,8 +327,8 @@ pub async fn get_artifact(
     ),
     responses(
         (status = 200, description = "Artifact binary stream", content_type = "application/octet-stream"),
-        (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 404, description = "Artifact file not found", body = serde_json::Value),
+        (status = 404, description = "No such artifact, none this caller may see, or its bytes \
+                                     are gone — one answer on purpose", body = serde_json::Value),
     ),
 )]
 pub async fn download_artifact(
@@ -371,7 +406,12 @@ pub async fn download_artifact(
     responses(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
-        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 401, description = "No session — answered before the artifact is looked up, \
+                                     so it says nothing about the id", body = serde_json::Value),
+        (status = 403, description = "The caller can see the repository but may not write to it",
+         body = serde_json::Value),
+        (status = 404, description = "No such artifact, or none this caller may see — \
+                                     the two are one answer on purpose", body = serde_json::Value),
     ),
 )]
 pub async fn delete_artifact(

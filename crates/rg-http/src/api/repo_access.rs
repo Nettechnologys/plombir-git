@@ -846,10 +846,18 @@ impl FromRequestParts<AppState> for RepoAdmin {
 ///
 /// An implementation resolves, and decides nothing: it turns the id into the
 /// row and the repository that owns it, and the extractor over it turns away a
-/// caller with no right to that repository. A row that is missing (or expired,
-/// or otherwise not to be served) is the implementation's to report, and it
-/// reports `404` — the id is instance-wide, so "no such row" and "not in a
-/// repository you may see" have to be the same answer.
+/// caller with no right to that repository. A row that is missing is the
+/// implementation's to report, and it reports [`RepoAnchor::masked`] — the id is
+/// instance-wide, so "no such row" and "not in a repository you may see" have to
+/// be the same answer.
+///
+/// Both halves of that sentence are load-bearing, and only the first one used to
+/// be implemented. `resolve` answered `404` and the gate behind it answered
+/// `403`, so any account that could log in could walk `{id}` and read off which
+/// rows the instance holds — the enumeration oracle of card_1419723e0606. The
+/// answer is one value now, [`masked`](RepoAnchor::masked), returned by the
+/// implementation for an absent row and by the extractors for a refused one, so
+/// the two cannot be told apart and cannot drift into two texts.
 pub trait RepoAnchor: Send + Sync + 'static {
     /// The row the id addresses. Handed to the handler beside the repository,
     /// so a gate that had to fetch it is not paid for twice.
@@ -858,11 +866,54 @@ pub trait RepoAnchor: Send + Sync + 'static {
     /// The path parameter carrying the id.
     const PARAM: &'static str;
 
+    /// The one answer for an id the caller may not know the fate of: absent,
+    /// or naming a row in a repository they cannot see.
+    ///
+    /// A `404` in the noun of the domain. [`resolve`](RepoAnchor::resolve) must
+    /// return *this* for a missing row rather than build its own, because the
+    /// masking is only worth what the two answers have in common: an outsider
+    /// who gets `artifact not found` for one id and `not found` for another has
+    /// still learned which is which.
+    fn masked() -> AppError;
+
     /// Resolve the row and the repository that owns it.
+    ///
+    /// Reports a missing row as [`masked`](RepoAnchor::masked) and decides
+    /// nothing else. In particular it does not judge whether a row it *did*
+    /// find is still to be served — that is [`admit`](RepoAnchor::admit), which
+    /// runs after the gate.
     fn resolve(
         state: &AppState,
         id: i64,
     ) -> impl Future<Output = Result<(Self::Row, rg_db::entities::repository::Model), AppError>> + Send;
+
+    /// Whether a row the caller is allowed to see is nonetheless not to be
+    /// served — an artifact past its retention date, for the one anchor that
+    /// has such a state.
+    ///
+    /// Separate from [`resolve`](RepoAnchor::resolve), and after the gate, for
+    /// the reason the gate is masked at all: `404 artifact expired` and
+    /// `404 artifact not found` are two answers, and a caller who can tell them
+    /// apart can still enumerate the rows that once existed. Past the gate the
+    /// distinction costs nothing — the caller can read the repository, so being
+    /// told *why* the row is gone reveals nothing they could not already see —
+    /// and is worth keeping, because "expired" is the answer an owner needs.
+    fn admit(_row: &Self::Row) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// Reduce a refusal on an anchored route to the answer an absent id gets.
+///
+/// Only a *denial* is masked. A check that could not run stays what it was, for
+/// the reason [`decided`] exists: reporting a database outage as `404` sends the
+/// caller off to look for a row that is very much there.
+fn masked_denial<A: RepoAnchor>(error: AppError) -> AppError {
+    if is_access_denial(&error) {
+        A::masked()
+    } else {
+        error
+    }
 }
 
 /// Pull the instance-wide id an anchored route carries.
@@ -889,6 +940,17 @@ async fn route_id(parts: &mut Parts, state: &AppState, param: &str) -> Result<i6
 /// the row of a private one does not.
 ///
 /// Mirrors [`RepoRead`] for the routes whose path names no repository.
+///
+/// Every refusal is [`RepoAnchor::masked`] — the `401` an anonymous caller draws
+/// on a private repository as much as the `403` an authenticated outsider draws.
+/// The path-based [`RepoRead`] keeps both codes, and the difference is not an
+/// inconsistency: there the caller supplied `{owner}/{name}` and learns nothing
+/// from being refused by name, while here the caller supplied an integer, and
+/// *any* answer other than the one an absent id gets confirms the integer hit a
+/// row. That is also why the `401` cannot be kept for the anonymous case the way
+/// [`AnchoredWrite`] keeps it: this gate has nothing to authenticate before the
+/// row is resolved, so its `401` would arrive strictly after the lookup — an
+/// oracle with no token required at all.
 pub struct AnchoredRead<A: RepoAnchor> {
     pub row: A::Row,
     pub repo: rg_db::entities::repository::Model,
@@ -903,7 +965,10 @@ impl<A: RepoAnchor> FromRequestParts<AppState> for AnchoredRead<A> {
     ) -> Result<Self, Self::Rejection> {
         let id = route_id(parts, state, A::PARAM).await?;
         let (row, repo) = A::resolve(state, id).await?;
-        check_read(state, &parts.headers, &repo).await?;
+        check_read(state, &parts.headers, &repo)
+            .await
+            .map_err(masked_denial::<A>)?;
+        A::admit(&row)?;
         Ok(Self { row, repo })
     }
 }
@@ -914,6 +979,20 @@ impl<A: RepoAnchor> FromRequestParts<AppState> for AnchoredRead<A> {
 /// Mirrors [`RepoWrite`], and keeps [`RepoAuthRead`]'s order: a missing token is
 /// a `401` *before* anything is looked up, so the gate does not double as an
 /// existence oracle for the rows of private repositories.
+///
+/// Past that `401` it takes visibility and permission as two questions, in that
+/// order — the cut `OrgAdmin` draws for organizations:
+///
+/// - a caller who cannot *read* the repository is answered
+///   [`RepoAnchor::masked`], because the row is not theirs to know about;
+/// - a caller who can read it but not write is answered `403`, unmasked. They
+///   can already see the row, so refusing them by permission tells them nothing
+///   they did not have, and a `404` here would only make a real denial unreadable.
+///
+/// Both steps are needed, and the second alone was what this extractor had.
+/// Masking that only one gate of a resource performs is not masking at all: the
+/// caller picks the level by picking the verb, so `DELETE` confirmed with `403`
+/// exactly what `GET` refuses to confirm.
 pub struct AnchoredWrite<A: RepoAnchor> {
     pub row: A::Row,
     pub repo: rg_db::entities::repository::Model,
@@ -931,6 +1010,10 @@ impl<A: RepoAnchor> FromRequestParts<AppState> for AnchoredWrite<A> {
             .ok_or_else(|| AppError::unauthorized("authentication required"))?;
         let id = route_id(parts, state, A::PARAM).await?;
         let (row, repo) = A::resolve(state, id).await?;
+        check_read_for(state, &repo, Some(actor_id))
+            .await
+            .map_err(masked_denial::<A>)?;
+        A::admit(&row)?;
         check_write_for(state, &repo, Some(actor_id)).await?;
         Ok(Self {
             row,
