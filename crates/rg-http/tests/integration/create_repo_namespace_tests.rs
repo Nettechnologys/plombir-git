@@ -18,35 +18,70 @@
 //!
 //! The denials and the baseline live in the same test on purpose: a `403` proves
 //! a refusal only if the legitimate call next to it still answers `201`.
+//!
+//! card_2179245d41db: the second round is about *bodies*. The gate answered one
+//! status to every refusal and two different messages underneath it, so the
+//! oracle this file was written to close had simply moved one level down — out
+//! of reach of a test that reads `.status()` and of `route_access_sweep_tests`,
+//! which judges every persona on its status code alone. Every assertion below
+//! that claims two callers cannot be told apart now compares the response body
+//! as well.
 
 use crate::common::{register_full, spawn_test_app};
 
-async fn create_in(base: &str, token: &str, name: &str, org: Option<&str>) -> u16 {
+/// The full reply, not just its code — the refusals in this file are supposed
+/// to be indistinguishable, and a status-only assertion cannot see the half of
+/// the reply where the difference actually lived.
+///
+/// `request_id` is dropped before comparing: the tracing middleware stamps a
+/// fresh uuid on every response, so it differs between any two requests and
+/// carries nothing about which branch answered. Everything else — the status,
+/// the error `code`, the `message` — is compared verbatim.
+async fn create_in_full(
+    base: &str,
+    token: &str,
+    name: &str,
+    org: Option<&str>,
+) -> (u16, serde_json::Value) {
     let mut body = serde_json::json!({ "name": name });
     if let Some(org) = org {
         body["org"] = serde_json::json!(org);
     }
-    reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .post(format!("{base}/api/v1/repos"))
         .bearer_auth(token)
         .json(&body)
         .send()
         .await
-        .expect("request")
-        .status()
-        .as_u16()
+        .expect("request");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("response body");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
+    if let Some(error) = json.get_mut("error").and_then(|e| e.as_object_mut()) {
+        error.remove("request_id");
+    }
+    (status, json)
 }
 
-async fn create_org(base: &str, token: &str, name: &str) {
+async fn create_in(base: &str, token: &str, name: &str, org: Option<&str>) -> u16 {
+    create_in_full(base, token, name, org).await.0
+}
+
+async fn create_org_with(base: &str, token: &str, name: &str, visibility: &str) {
     let status = reqwest::Client::new()
         .post(format!("{base}/api/v1/orgs"))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "name": name, "visibility": "public" }))
+        .json(&serde_json::json!({ "name": name, "visibility": visibility }))
         .send()
         .await
         .expect("create org")
         .status();
     assert_eq!(status, 201, "baseline: the organization exists");
+}
+
+async fn create_org(base: &str, token: &str, name: &str) {
+    create_org_with(base, token, name, "public").await;
 }
 
 async fn add_org_member(base: &str, token: &str, org: &str, user_id: i64) {
@@ -111,12 +146,21 @@ async fn creating_in_an_organization_needs_membership() {
     );
 }
 
-/// An organization nobody has heard of is a denial, not a `404`.
+/// An organization nobody has heard of is a denial, not a `404` — and the
+/// denial reads the same as the one an existing organization produces, all the
+/// way down to the message.
 ///
 /// The old handler answered `404 organization not found`, which is a free
 /// existence check on every namespace name for any account that can log in: a
 /// `403` and a `404` told apart mean "this org exists but you are not in it" and
 /// "this name is unused". The gate gives one answer to both.
+///
+/// card_2179245d41db: it gave one *status* to both and two messages —
+/// `you are not a member of this organization` against an organization that
+/// exists, `you may not create a repository under this owner` against a free
+/// name — so the split this test was written to catch survived it untouched.
+/// Comparing the bodies is what makes the assertion mean what its name says;
+/// re-splitting the messages has to fail here.
 #[tokio::test]
 async fn an_unknown_organization_is_denied_rather_than_reported_missing() {
     let base = spawn_test_app().await;
@@ -124,18 +168,28 @@ async fn an_unknown_organization_is_denied_rather_than_reported_missing() {
     let (outsider_token, _) = register_full(&base, "cn2-out", "cn2-out@example.com").await;
 
     create_org(&base, &owner_token, "cn2corp").await;
+    // The private one is the case the card measured: masked everywhere else on
+    // the instance, so if any reply is going to single it out it is this one.
+    create_org_with(&base, &owner_token, "cn2secret", "private").await;
 
-    let unknown = create_in(&base, &outsider_token, "ghost", Some("no-such-org-here")).await;
-    let existing = create_in(&base, &outsider_token, "ghost", Some("cn2corp")).await;
+    let unknown = create_in_full(&base, &outsider_token, "ghost", Some("no-such-org-here")).await;
+    let public = create_in_full(&base, &outsider_token, "ghost", Some("cn2corp")).await;
+    let private = create_in_full(&base, &outsider_token, "ghost", Some("cn2secret")).await;
 
     assert_eq!(
-        unknown, 403,
+        unknown.0, 403,
         "an unknown namespace was reported missing instead of refused"
     );
     assert_eq!(
-        unknown, existing,
-        "the reply tells an outsider apart an organization that exists ({existing}) from a name \
-         that is free ({unknown}) — that is an account-existence oracle"
+        unknown, public,
+        "the reply tells an outsider apart an organization that exists ({public:?}) from a name \
+         that is free ({unknown:?}) — that is an account-existence oracle"
+    );
+    assert_eq!(
+        unknown, private,
+        "the reply tells an outsider apart a *private* organization ({private:?}) from a name \
+         that is free ({unknown:?}) — every other route on the instance masks that org behind a \
+         404, and this one hands it over in the body of a 403"
     );
 }
 
@@ -143,16 +197,28 @@ async fn an_unknown_organization_is_denied_rather_than_reported_missing() {
 /// and by the same resolution order the write path uses (username first, then
 /// organization) — so `org` cannot be used to smuggle a repository under another
 /// user either.
+///
+/// Refused the same way, too: the third branch of the gate is the one that ran
+/// here, and it has to be unreadable apart from the other two for the same
+/// reason they are unreadable apart from each other.
 #[tokio::test]
 async fn creating_under_another_users_account_is_refused() {
     let base = spawn_test_app().await;
     let (victim_token, _) = register_full(&base, "cn3-victim", "cn3-victim@example.com").await;
     let (token, _) = register_full(&base, "cn3-user", "cn3-user@example.com").await;
 
+    let stranger = create_in_full(&base, &token, "planted", Some("cn3-victim")).await;
+    let free_name = create_in_full(&base, &token, "planted", Some("cn3-nobody")).await;
+
     assert_eq!(
-        create_in(&base, &token, "planted", Some("cn3-victim")).await,
-        403,
+        stranger.0, 403,
         "a repository was created under a stranger's account"
+    );
+    assert_eq!(
+        stranger, free_name,
+        "the reply tells an existing account ({stranger:?}) apart from a name nobody holds \
+         ({free_name:?}) — that is a username-existence oracle on a route that needs no such \
+         answer"
     );
     assert!(
         !repo_exists_at(&base, &victim_token, "cn3-victim", "planted").await,

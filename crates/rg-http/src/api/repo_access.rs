@@ -472,9 +472,20 @@ pub(crate) async fn require_namespace_write(
 ///
 /// The owner name is resolved exactly the way the write path resolves it
 /// (username first, then organization), so the gate cannot end up looser than
-/// the thing it guards. An owner that is neither is a denial rather than a
-/// `404`: a caller with no right to that namespace learns nothing about
-/// whether the account exists.
+/// the thing it guards.
+///
+/// Every refusal is the same `403` with the same body, and that sameness is the
+/// whole of what the gate hides: *which* of the three reasons applied — a
+/// stranger's account, an organization the caller is not in, or a name nobody
+/// has taken. It does not hide whether the name is in use, and no gate on this
+/// route could: the namespace is global, so `POST /orgs` answers
+/// `organization name 'x' is already taken` to any account that can log in.
+/// This comment used to promise that "a caller with no right to that namespace
+/// learns nothing about whether the account exists" while the code below split
+/// the denial into two texts — false twice over, by the neighbouring route and
+/// by this function's own body (card_2179245d41db). The one text is kept
+/// because a reason-by-reason denial is still worth not handing out for free,
+/// not because it makes the name a secret.
 pub(crate) async fn require_namespace_create(
     state: &AppState,
     actor_id: i64,
@@ -506,8 +517,12 @@ pub(crate) async fn require_namespace_create(
             .map_err(AppError::from)?
         {
             true => Ok(Some(org.id)),
+            // Same text as the other two denials on purpose: the status was
+            // already `403` for all three, so a second wording bought the
+            // caller a membership/existence split under a single code — an
+            // oracle one level below where the route sweep looks.
             false => Err(AppError::forbidden(
-                "you are not a member of this organization",
+                "you may not create a repository under this owner",
             )),
         };
     }

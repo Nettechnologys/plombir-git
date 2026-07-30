@@ -820,8 +820,18 @@ async fn require_org_admin(
 }
 
 /// Visibility gate for org-scoped routes. A public org is world-readable; a
-/// private one answers `404` — not `403` — to everyone outside it, so the
-/// endpoint cannot be used to enumerate private organizations by name.
+/// private one answers `404` — not `403` — to everyone outside it, so no
+/// org-scoped route confirms its members, teams, settings or repositories.
+///
+/// The name itself is not what the `404` protects, and this comment used to say
+/// otherwise ("so the endpoint cannot be used to enumerate private
+/// organizations by name"). Organization names live in one global namespace
+/// with usernames, so `POST /orgs` answers `organization name 'x' is already
+/// taken` to any account that can log in — an existence check on any name, one
+/// request, no `404` involved (card_2179245d41db). What this gate is worth is
+/// the *contents*: an outsider who already knows a private org is there still
+/// cannot read a member list off it, and the `404` keeps a name they guessed
+/// from being confirmed on the read path too.
 ///
 /// Every org gate runs it, reading and mutating alike: masking that only one
 /// level performs is not masking, because the caller picks the level by picking
@@ -879,8 +889,9 @@ async fn resolve_team_in_org(
 ///
 /// Same steps, same order, same answers as the hand-written prologue it
 /// replaces: a public organization resolves for anybody, a private one is a
-/// `404` — not a `403` — to everyone outside it, so the route is not an
-/// existence oracle over private organization names.
+/// `404` — not a `403` — to everyone outside it, so the route reveals nothing
+/// about the organization it refuses to show. Not the same thing as hiding the
+/// name: see [`require_org_visible`] for what the `404` does and does not buy.
 ///
 /// `viewer` is `None` for an anonymous caller, and that is precisely why this is
 /// its own extractor rather than a weaker rung of [`OrgAdmin`]: the level admits
