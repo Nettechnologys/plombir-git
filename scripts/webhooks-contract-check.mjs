@@ -49,7 +49,7 @@ for (const [method, route] of [
 //
 // Rewritten to read each handler on its own instead of the file as a whole: a
 // file-wide count of five stays green when one door drops the call and another
-// gains a second one. Three assertions, none satisfiable by the other two:
+// gains a second one. Four assertions, none satisfiable by the others:
 //
 //   1. The router *declares* `RepoAdmin` for all seven routes. That declaration
 //      is what `route_access_sweep_tests::
@@ -59,10 +59,13 @@ for (const [method, route] of [
 //      level while the handler quietly stops asking, and (1) would not notice.
 //   3. Each id-taking handler re-anchors the hook to the repository the gate
 //      authorized, not to the one the path asked for.
+//   4. `redeliver` anchors the delivery to the hook (3) just returned — the
+//      second link of the same chain, since `{delivery_id}` is global too.
 //
 // The gate names and the scoping helper are read out of the modules that define
 // them rather than spelled out here. A hard-coded list of symbol names is
-// exactly what rotted the first time.
+// exactly what rotted the first time — and (4) rotted the same way a second
+// time by pinning the *shape* of the comparison instead of the chain.
 
 const repoAccess = readFileSync(path.join(root, 'crates/rg-http/src/api/repo_access.rs'), 'utf8');
 
@@ -157,10 +160,14 @@ for (const [handler, types, hookIdAt, deliveryIdAt] of [
   const repoId = gateBinding ? `${gateBinding[2]}\\.id` : '\\w+\\.id';
   const hookId = tuple.bindings[hookIdAt];
 
-  const scoped = scopingHelpers.some((helper) =>
-    new RegExp(`\\b${helper}\\(\\s*&state\\.db\\s*,\\s*${repoId}\\s*,\\s*${hookId}\\s*\\)`).test(fn.body),
-  );
-  if (!scoped) {
+  /** `<helper>(&state.db, <owner>, <id>)` — an anchor call, whatever it is named. */
+  const anchorCall = (helper, ownerId, id) =>
+    new RegExp(`\\b${helper}\\(\\s*&state\\.db\\s*,\\s*${ownerId}\\s*,\\s*${id}\\s*\\)`);
+
+  const hookAnchor = scopingHelpers
+    .map((helper) => anchorCall(helper, repoId, hookId))
+    .find((call) => call.test(fn.body));
+  if (hookAnchor === undefined) {
     failures.push(
       `Webhook handler ${handler} must re-anchor hook id \`${hookId}\` to the repository the gate ` +
         `authorized — none of ${scopingHelpers.map((helper) => `${helper}(&state.db, <repo>.id, ${hookId})`).join(', ')} ` +
@@ -177,8 +184,36 @@ for (const [handler, types, hookIdAt, deliveryIdAt] of [
   if (!new RegExp(`\\b${deliveryId}\\b`).test(fn.body)) {
     failures.push(`Webhook handler ${handler} destructures delivery id \`${deliveryId}\` but never uses it.`);
   }
-  if (!/\.webhook_id\s*==\s*\w+\.id/.test(fn.body)) {
-    failures.push('Webhook redelivery must verify the delivery belongs to the routed hook before redelivering.');
+
+  // `{delivery_id}` is a global `webhook_deliveries` primary key, so the second
+  // link of the chain: the delivery has to hang off the hook the anchor above
+  // just returned, not off any row in scope.
+  //
+  // The row is found by reading what that anchor call was bound to, so the
+  // assertion names no symbol of its own. Either spelling counts — a named
+  // helper (which is what `global_id_anchor_guard::ANCHORED` requires, and what
+  // this used to demand *not* be used) or the inline comparison it wraps. This
+  // assert has rotted twice by pinning one form: it required a literal
+  // `.webhook_id == <x>.id` right up until the comparison moved into
+  // `delivery_in_webhook`, i.e. it went red on the refactor that made the
+  // guarantee stronger (card_4548d995d90c).
+  const hookRow = hookAnchor
+    ? new RegExp(`let\\s+(\\w+)\\s*=\\s*(?:match\\s+)?${hookAnchor.source}`).exec(fn.body)?.[1]
+    : undefined;
+  const hookRowId = hookRow ? `${hookRow}\\.id` : '\\w+\\.id';
+
+  const deliveryAnchored =
+    scopingHelpers.some((helper) => anchorCall(helper, hookRowId, deliveryId).test(fn.body)) ||
+    new RegExp(`\\.webhook_id\\s*==\\s*${hookRowId}`).test(fn.body);
+  if (!deliveryAnchored) {
+    const hook = hookRow ?? '<hook>';
+    failures.push(
+      `Webhook handler ${handler} must verify delivery id \`${deliveryId}\` belongs to the hook it ` +
+        `just anchored (\`${hook}\`) before redelivering: neither ` +
+        `\`<helper>(&state.db, ${hook}.id, ${deliveryId})\` nor an inline \`.webhook_id == ${hook}.id\` ` +
+        'is present. `{delivery_id}` is a global webhook_deliveries primary key, so admin of one ' +
+        "repository must not replay another one's deliveries",
+    );
   }
 }
 

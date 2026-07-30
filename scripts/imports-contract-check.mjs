@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/imports.rs');
@@ -44,25 +44,97 @@ failures.push(
   ]),
 );
 
-// Authentication is the `AuthUser` extractor, not a hand-rolled header read:
-// what these two assert is the *scoping* that follows it — a task belongs to
-// the user who started it and to nobody else. (They used to spell out
-// `headers: HeaderMap` + `extract_bearer_claims`, which is how the handlers
-// were written before the extractor migration; the check went on failing long
-// after the handlers were correct.)
-if (!/pub async fn get_import_status\([\s\S]*AuthUser\(user_id\): AuthUser,[\s\S]*task\.user_id == user_id/.test(backend)) {
-  failures.push('GET /imports/{id} must authenticate and only return the current user task');
+// ── The user gate and the per-user scoping of `{id}` ──────────────────────
+//
+// `{id}` is a global `import_tasks` primary key and the only gate on these two
+// routes is `AuthUser`, so each owes a second refusal beyond "is authenticated":
+// a task somebody else started. An import task carries the source-forge auth
+// token it was started with, so that is a credential read, not a metadata read.
+//
+// Authentication is the extractor, not a hand-rolled header read — these used
+// to spell out `headers: HeaderMap` + `extract_bearer_claims`, which is how the
+// handlers were written before the extractor migration, and the check went on
+// failing long after the handlers were correct (sol_a8174e6f3b09).
+//
+// That fix pinned the *next* form instead of the behaviour, and it rotted the
+// same way — silently, and in the dangerous direction:
+//
+//   /pub async fn get_import_status\([\s\S]*task\.user_id == user_id/
+//
+// `[\s\S]*` spans the whole module, so when the comparison moved out of both
+// handlers into the private `import_task_of_user` — which sits *below* them —
+// the regex kept matching by reaching past the handler it names into the
+// helper. Both asserts went VACUOUS: deleting the scoping call from
+// `get_import_status` outright, turning it into a cross-account read, still
+// passed. Handler-scoped from here, so a file-wide match cannot stand in for
+// the door being asserted (card_4548d995d90c).
+//
+// Comments are stripped so a commented-out handler reads as a deleted one.
+const backendCode = stripRustComments(backend);
+
+// The module-private `async fn`s of imports.rs — that is what a handler calls
+// to re-anchor a task to an account.
+const anchors = [...backendCode.matchAll(/^async fn (\w+)/gm)].map((m) => m[1]);
+if (anchors.length === 0) {
+  failures.push(
+    'This check can no longer read the private helpers of api/imports.rs that it derives the ' +
+      'scoping assertions from, so their verdicts below mean nothing. Fix the parsing, not the ' +
+      'handlers.',
+  );
 }
 
-if (!/pub async fn delete_import\([\s\S]*AuthUser\(user_id\): AuthUser,[\s\S]*task\.user_id == user_id/.test(backend)) {
-  failures.push('DELETE /imports/{id} must authenticate and only delete the current user task');
+for (const [handler, route] of [
+  ['get_import_status', 'GET /imports/{id}'],
+  ['delete_import', 'DELETE /imports/{id}'],
+]) {
+  const fn = rustFnBlock(backendCode, handler);
+  if (fn === null) {
+    failures.push(`api/imports.rs no longer defines a \`pub async fn ${handler}\` this check can read`);
+    continue;
+  }
+
+  // Both bindings are read out of the signature rather than assumed, so
+  // renaming either is not a contract change.
+  const actor = /AuthUser\((\w+)\)\s*:\s*AuthUser/.exec(fn.params);
+  if (actor === null) {
+    failures.push(`${route} must authenticate: handler ${handler} does not take the AuthUser extractor`);
+  }
+  const taskId = /Path\((\w+)\)\s*:\s*Path<i64>/.exec(fn.params);
+  if (taskId === null) {
+    failures.push(`${route} must destructure Path<i64>: handler ${handler} does not`);
+  }
+  if (actor === null || taskId === null || anchors.length === 0) {
+    continue;
+  }
+
+  // Either spelling counts — the named helper `global_id_anchor_guard::ANCHORED`
+  // requires, or the inline comparison it wraps. What is asserted is that *this*
+  // handler ties *its* task id to *its* authenticated actor, which is what both
+  // spellings mean and neither symbol name does.
+  const scoped =
+    anchors.some((helper) =>
+      new RegExp(`\\b${helper}\\(\\s*&state(?:\\.db)?\\s*,\\s*${actor[1]}\\s*,\\s*${taskId[1]}\\s*\\)`).test(fn.body),
+    ) || new RegExp(`\\.user_id\\s*==\\s*${actor[1]}\\b`).test(fn.body);
+  if (!scoped) {
+    failures.push(
+      `${route} must anchor task id \`${taskId[1]}\` to the authenticated account \`${actor[1]}\`: ` +
+        `neither \`<helper>(&state, ${actor[1]}, ${taskId[1]})\` nor an inline ` +
+        `\`task.user_id == ${actor[1]}\` is present in ${handler}. \`{id}\` is a global import_tasks ` +
+        'primary key, and the row carries the source-forge auth token the import was started with',
+    );
+  }
 }
 
 // card_e736b5186281: the target namespace arrives in the *body*, so no
 // path-based extractor can gate it and the route table's `User` cannot state
 // it. `NamespaceWrite` is the gate; without it any authenticated user may
-// import into somebody else's `owner/name`.
-if (!/pub async fn start_import\([\s\S]*NamespaceWrite\s*\{[\s\S]*\}: NamespaceWrite<StartImportRequest>/.test(backend)) {
+// import into somebody else's `owner/name`. Scoped to the handler for the same
+// reason as the two above — file-wide, this matched any module that mentions
+// the gate anywhere.
+const startImport = rustFnBlock(backendCode, 'start_import');
+if (startImport === null) {
+  failures.push('api/imports.rs no longer defines a `pub async fn start_import` this check can read');
+} else if (!/NamespaceWrite\s*\{[\s\S]*\}\s*:\s*NamespaceWrite<StartImportRequest>/.test(startImport.params)) {
   failures.push('POST /imports must take the NamespaceWrite gate over its target_owner');
 }
 
