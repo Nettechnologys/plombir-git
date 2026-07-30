@@ -420,6 +420,56 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
 
 // ── public: call tool ─────────────────────────────────────
 
+/// Signature shared by every tool handler: arguments in, response text out.
+type ToolHandler = fn(&AppState, &Value) -> String;
+
+/// The table [`call_tool`] dispatches through — and the machine-readable answer
+/// to "which tools does this server actually implement?".
+///
+/// It is data rather than `match` arms on purpose: arms are invisible at
+/// runtime, so nothing could compare the surface advertised by [`list_tools`]
+/// with the surface that answers. Both drift directions are silent —
+/// advertised-but-undispatched (the agent sees a tool, every call answers
+/// `-32601`) and dispatched-but-unadvertised (implemented and unreachable).
+/// With the dispatcher as a table, `advertised_tools_match_the_dispatch_table`
+/// compares the two sets instead of re-listing the names by hand.
+const TOOL_DISPATCH: &[(&str, ToolHandler)] = &[
+    // read
+    ("list_repos", tool_list_repos),
+    ("read_file", tool_read_file),
+    ("read_dir", tool_read_dir),
+    ("get_issue", tool_get_issue),
+    ("get_pr", tool_get_pr),
+    ("get_pr_diff", tool_get_pr_diff),
+    // issues write
+    ("create_issue", tool_create_issue),
+    ("update_issue", tool_update_issue),
+    ("comment_issue", tool_comment_issue),
+    ("set_issue_labels", tool_set_issue_labels),
+    // pulls write
+    ("create_pr", tool_create_pr),
+    ("merge_pr", tool_merge_pr),
+    ("request_reviewers", tool_request_reviewers),
+    // reviews write
+    ("create_review", tool_create_review),
+    ("create_review_comment", tool_create_review_comment),
+    ("apply_suggestion", tool_apply_suggestion),
+    // CI
+    ("list_pipelines", tool_list_pipelines),
+    ("get_pipeline", tool_get_pipeline),
+    ("retry_pipeline", tool_retry_pipeline),
+    ("cancel_pipeline", tool_cancel_pipeline),
+    ("get_ci_job", tool_get_ci_job),
+    // search
+    ("search", tool_search),
+    // AI
+    ("ai_repo_summary", tool_ai_repo_summary),
+    ("ai_list_issues", tool_ai_list_issues),
+    ("ai_list_prs", tool_ai_list_prs),
+    ("ai_repo_tree", tool_ai_repo_tree),
+    ("ai_search_code", tool_ai_search_code),
+];
+
 /// Dispatch a JSON-RPC tool call to the appropriate tool handler.
 pub fn call_tool(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
     let params = match &req.params {
@@ -441,42 +491,9 @@ pub fn call_tool(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    let result = match name {
-        // read
-        "list_repos" => tool_list_repos(state, &args),
-        "read_file" => tool_read_file(state, &args),
-        "read_dir" => tool_read_dir(state, &args),
-        "get_issue" => tool_get_issue(state, &args),
-        "get_pr" => tool_get_pr(state, &args),
-        "get_pr_diff" => tool_get_pr_diff(state, &args),
-        // issues write
-        "create_issue" => tool_create_issue(state, &args),
-        "update_issue" => tool_update_issue(state, &args),
-        "comment_issue" => tool_comment_issue(state, &args),
-        "set_issue_labels" => tool_set_issue_labels(state, &args),
-        // pulls write
-        "create_pr" => tool_create_pr(state, &args),
-        "merge_pr" => tool_merge_pr(state, &args),
-        "request_reviewers" => tool_request_reviewers(state, &args),
-        // reviews write
-        "create_review" => tool_create_review(state, &args),
-        "create_review_comment" => tool_create_review_comment(state, &args),
-        "apply_suggestion" => tool_apply_suggestion(state, &args),
-        // CI
-        "list_pipelines" => tool_list_pipelines(state, &args),
-        "get_pipeline" => tool_get_pipeline(state, &args),
-        "retry_pipeline" => tool_retry_pipeline(state, &args),
-        "cancel_pipeline" => tool_cancel_pipeline(state, &args),
-        "get_ci_job" => tool_get_ci_job(state, &args),
-        // search
-        "search" => tool_search(state, &args),
-        // AI
-        "ai_repo_summary" => tool_ai_repo_summary(state, &args),
-        "ai_list_issues" => tool_ai_list_issues(state, &args),
-        "ai_list_prs" => tool_ai_list_prs(state, &args),
-        "ai_repo_tree" => tool_ai_repo_tree(state, &args),
-        "ai_search_code" => tool_ai_search_code(state, &args),
-        _ => {
+    let result = match TOOL_DISPATCH.iter().find(|(tool, _)| *tool == name) {
+        Some((_, handler)) => handler(state, &args),
+        None => {
             return make_error(req.id.clone(), -32601, &format!("unknown tool: {}", name));
         }
     };
@@ -987,6 +1004,7 @@ fn tool_ai_search_code(state: &AppState, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn state() -> AppState {
         AppState::new("http://localhost:8080".into(), String::new())
@@ -1016,62 +1034,63 @@ mod tests {
             .unwrap_or_default()
     }
 
-    #[test]
-    fn list_tools_exposes_full_agent_surface() {
+    /// Tool names as an MCP client learns them, straight from the `tools/list` reply.
+    fn advertised_tool_names() -> Vec<String> {
         let resp = list_tools(&state(), &req("tools/list", Value::Null));
-        let tools = resp
-            .result
+        resp.result
             .unwrap()
             .get("tools")
             .unwrap()
             .as_array()
             .unwrap()
-            .clone();
-        let names: Vec<String> = tools
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
+            .collect()
+    }
 
-        // The read-only baseline plus every write/CI/search/AI wrapper.
-        for expected in [
-            "list_repos",
-            "read_file",
-            "read_dir",
-            "get_issue",
-            "get_pr",
-            "get_pr_diff",
-            "create_issue",
-            "update_issue",
-            "comment_issue",
-            "set_issue_labels",
-            "create_pr",
-            "merge_pr",
-            "request_reviewers",
-            "create_review",
-            "create_review_comment",
-            "apply_suggestion",
-            "list_pipelines",
-            "get_pipeline",
-            "retry_pipeline",
-            "cancel_pipeline",
-            "get_ci_job",
-            "search",
-            "ai_repo_summary",
-            "ai_list_issues",
-            "ai_list_prs",
-            "ai_repo_tree",
-            "ai_search_code",
-        ] {
-            assert!(
-                names.contains(&expected.to_string()),
-                "missing tool: {expected}"
-            );
-        }
-        // No duplicate tool names.
-        let mut sorted = names.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), names.len(), "duplicate tool names present");
+    /// The gate this crate's agent surface hangs on: what `tools/list` advertises
+    /// and what `call_tool` dispatches must be the *same* set — compared against
+    /// each other, never against a third list written by hand (such a list is
+    /// exactly what a new tool forgets to update, leaving both drift directions
+    /// green).
+    #[test]
+    fn advertised_tools_match_the_dispatch_table() {
+        let advertised = advertised_tool_names();
+        let dispatched: Vec<&str> = TOOL_DISPATCH.iter().map(|(name, _)| *name).collect();
+
+        // Two empty sets compare equal; a vacuous pass would be worse than no gate.
+        assert!(!dispatched.is_empty(), "dispatch table is empty");
+        assert!(!advertised.is_empty(), "tools/list advertises nothing");
+
+        let advertised_set: BTreeSet<&str> = advertised.iter().map(String::as_str).collect();
+        let dispatched_set: BTreeSet<&str> = dispatched.iter().copied().collect();
+
+        // Duplicates would let a set comparison pass while a name is served twice
+        // (in `TOOL_DISPATCH` the second entry is dead — `find` stops at the first).
+        assert_eq!(
+            advertised_set.len(),
+            advertised.len(),
+            "duplicate tool names in tools/list"
+        );
+        assert_eq!(
+            dispatched_set.len(),
+            dispatched.len(),
+            "duplicate tool names in TOOL_DISPATCH"
+        );
+
+        let undispatched: Vec<&&str> = advertised_set.difference(&dispatched_set).collect();
+        assert!(
+            undispatched.is_empty(),
+            "advertised by tools/list but absent from TOOL_DISPATCH — an agent sees these \
+             and every call answers -32601: {undispatched:?}"
+        );
+
+        let unadvertised: Vec<&&str> = dispatched_set.difference(&advertised_set).collect();
+        assert!(
+            unadvertised.is_empty(),
+            "dispatched by call_tool but never advertised — implemented and unreachable: \
+             {unadvertised:?}"
+        );
     }
 
     #[test]

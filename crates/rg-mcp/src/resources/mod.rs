@@ -38,6 +38,22 @@ pub fn list_resources(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcRespons
 
 // ── public: read ────────────────────────────────────
 
+/// Signature shared by every resource handler.
+type ResourceHandler = fn(&AppState, &JsonRpcRequest, &str) -> JsonRpcResponse;
+
+/// URI schemes [`read_resource`] can actually serve, as data.
+///
+/// Same reason as `tools::TOOL_DISPATCH`: an `if / else if` chain of
+/// `starts_with` is invisible at runtime, so nothing could compare the schemes
+/// advertised by [`list_resources`] with the schemes that answer. As a table
+/// the two sets are comparable, and `advertised_resources_match_the_dispatch_table`
+/// fails on either drift direction.
+const RESOURCE_DISPATCH: &[(&str, ResourceHandler)] = &[
+    ("repo://", handle_repo_meta),
+    ("file://", handle_file_content),
+    ("issue://", handle_issue_details),
+];
+
 pub fn read_resource(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
     let params = match &req.params {
         Some(v) => v.clone(),
@@ -54,18 +70,16 @@ pub fn read_resource(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse 
     };
 
     // dispatch by URI scheme
-    if uri.starts_with("repo://") {
-        handle_repo_meta(state, req, &uri)
-    } else if uri.starts_with("file://") {
-        handle_file_content(state, req, &uri)
-    } else if uri.starts_with("issue://") {
-        handle_issue_details(state, req, &uri)
-    } else {
-        make_error(
+    match RESOURCE_DISPATCH
+        .iter()
+        .find(|(scheme, _)| uri.starts_with(scheme))
+    {
+        Some((_, handler)) => handler(state, req, &uri),
+        None => make_error(
             req.id.clone(),
             -32602,
             &format!("unsupported URI scheme: {}", uri),
-        )
+        ),
     }
 }
 
@@ -155,5 +169,84 @@ fn handle_issue_details(state: &AppState, req: &JsonRpcRequest, uri: &str) -> Js
             make_success(req.id.clone(), serde_json::json!({ "contents": contents }))
         }
         Err(e) => make_error(req.id.clone(), -32000, &e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn state() -> AppState {
+        AppState::new("http://localhost:8080".into(), String::new())
+    }
+
+    fn req(method: &str) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Value::from(1),
+            method: method.into(),
+            params: None,
+        }
+    }
+
+    /// The `resources/list` twin of the `tools/list` gate: what the server
+    /// advertises and what it can actually serve must be the same set of URI
+    /// schemes, compared against each other rather than against a hand-written
+    /// third list.
+    #[test]
+    fn advertised_resources_match_the_dispatch_table() {
+        let resp = list_resources(&state(), &req("resources/list"));
+        let advertised: Vec<String> = resp
+            .result
+            .unwrap()
+            .get("resources")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let uri = r["uri"].as_str().unwrap();
+                let end = uri.find("://").expect("advertised uri carries no scheme") + 3;
+                uri[..end].to_string()
+            })
+            .collect();
+
+        assert!(!advertised.is_empty(), "resources/list advertises nothing");
+        assert!(!RESOURCE_DISPATCH.is_empty(), "dispatch table is empty");
+
+        let advertised_set: BTreeSet<&str> = advertised.iter().map(String::as_str).collect();
+        let dispatched_set: BTreeSet<&str> = RESOURCE_DISPATCH
+            .iter()
+            .map(|(scheme, _)| *scheme)
+            .collect();
+
+        assert_eq!(
+            dispatched_set.len(),
+            RESOURCE_DISPATCH.len(),
+            "duplicate scheme in RESOURCE_DISPATCH"
+        );
+
+        let undispatched: Vec<&&str> = advertised_set.difference(&dispatched_set).collect();
+        assert!(
+            undispatched.is_empty(),
+            "advertised by resources/list but not served by read_resource — every read \
+             answers 'unsupported URI scheme': {undispatched:?}"
+        );
+
+        let unadvertised: Vec<&&str> = dispatched_set.difference(&advertised_set).collect();
+        assert!(
+            unadvertised.is_empty(),
+            "served by read_resource but never advertised — implemented and undiscoverable: \
+             {unadvertised:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_scheme_is_rejected() {
+        let mut r = req("resources/read");
+        r.params = Some(serde_json::json!({ "uri": "gopher://o/n" }));
+        let resp = read_resource(&state(), &r);
+        assert_eq!(resp.error.unwrap().code, -32602);
     }
 }
