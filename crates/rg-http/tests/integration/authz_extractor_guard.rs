@@ -186,7 +186,32 @@ const PREDICATE_SIGNED_OFF: &[(&str, &str)] = &[
 /// Only `get_org_by_name`'s companion is barred, not `get_org_by_name` itself:
 /// resolving a name is not deciding anything, and half the tree legitimately
 /// does it. Deciding *membership* is the part that has to come from a gate.
-const ORG_MEMBERSHIP: &[&str] = &["is_org_member"];
+///
+/// `is_org_member` was the whole list, and one name is not the rule. The same
+/// question is answered a second way — `find_org_member` followed by a look at
+/// `member.role` — and that is the dialect the code actually prefers:
+/// `api::orgs::is_org_admin` asks it, and so do
+/// `rg_core::repo::service::can_write_repo` / `can_admin_repo`. A handler that
+/// wrote the pair out by hand named no barred function at all, which is the
+/// same omission `can_read` / `can_write` were two lists up.
+///
+/// The team pair is the same rule one level further down: when the role
+/// comparison says "ordinary member", `is_member_of_write_team` /
+/// `is_member_of_admin_team` are what it falls through to, so they are the
+/// third way to spell "may this member write here".
+///
+/// `list_org_members` and `is_team_member` are absent on purpose.
+/// `list_org_members` answers about the organization rather than about the
+/// caller — it *is* the member list, which `api::orgs` serves behind
+/// `require_org_visible`. `is_team_member` names a team, and a team on its own
+/// grants nothing: the permission sits on the team row, which is why the two
+/// `is_member_of_*_team` predicates join it before the answer means anything.
+const ORG_MEMBERSHIP: &[&str] = &[
+    "is_org_member",
+    "find_org_member",
+    "is_member_of_write_team",
+    "is_member_of_admin_team",
+];
 
 /// The two files that own an organization rule, and may therefore ask about
 /// membership directly.
@@ -197,6 +222,34 @@ const ORG_MEMBERSHIP: &[&str] = &["is_org_member"];
 /// a failed lookup as ours rather than as a refusal). Every other file has to
 /// take the answer from one of them.
 const ORG_GATE_OWNERS: &[&str] = &["api/repo_access.rs", "api/orgs.rs"];
+
+/// The file that *defines* the membership predicates.
+///
+/// Nothing in it calls them — every one is a query of its own — so it needs no
+/// exemption today, and it deliberately does not get one in advance. The data
+/// layer holds no policy, so the first op that reuses a sibling internally is
+/// the moment to decide whether that reuse is a lookup or a rule; a sign-off
+/// written now would answer that question for whoever writes it.
+const MEMBERSHIP_OPS: &str = "rg-db/src/ops/org_ops.rs";
+
+/// The file outside `rg-http` that wraps the membership predicates.
+///
+/// `rg_core::org::is_org_member` / `find_org_member` are one-line pass-throughs
+/// to [`MEMBERSHIP_OPS`], and they are what `api::orgs` calls. Signing the file
+/// off wholesale is exactly the mistake [`PREDICATE_HOME`] exists to avoid — it
+/// is a service module, and the next function in it to decide membership would
+/// inherit the exemption, the way `fork_repo` did with the read rule. So the
+/// rule here is the same shape and just as narrow: inside this file, only a
+/// function delegating to its own namesake may ask.
+const MEMBERSHIP_WRAPPER_HOME: &str = "rg-core/src/org/mod.rs";
+
+/// Files outside `rg-http` that legitimately ask about organization membership.
+///
+/// Empty, and worth keeping empty: the two files that ask today are the
+/// predicate home and the wrapper home above, and both are scanned by a rule
+/// narrower than a sign-off. This list is where the next exception goes, with
+/// its reason, the way `rg-ssh` is carried in [`WORKSPACE_SIGNED_OFF`].
+const ORG_MEMBERSHIP_SIGNED_OFF: &[(&str, &str)] = &[];
 
 /// The file that *defines* the permission predicates.
 ///
@@ -411,9 +464,10 @@ fn the_org_membership_predicate_is_only_reachable_through_a_gate_module() {
          For \"may this caller put a repository here\", take `NamespaceCreate` / `NamespaceWrite` \
          from `crate::api::repo_access` — it answers the namespace question and hands back the \
          organization id it resolved. For \"may this caller see or administer the organization\", \
-         use the `OrgRead` / `OrgAdmin` extractors in `api::orgs`. Asking `is_org_member` here \
-         writes the rule a second time, and the second copy is where the swallowed `Err` and the \
-         `404` existence oracle came from.\n{}",
+         use the `OrgRead` / `OrgAdmin` extractors in `api::orgs`. Asking any of \
+         {ORG_MEMBERSHIP:?} here writes the rule a second time — whether it is spelled \
+         `is_org_member` or as `find_org_member` plus a look at `member.role` — and the second \
+         copy is where the swallowed `Err` and the `404` existence oracle came from.\n{}",
         offenders.join("\n")
     );
 }
@@ -516,17 +570,30 @@ fn top_level_fn_name(line: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-/// Predicate calls in the file that defines them, outside the `can_*` family.
+/// Calls to `names` inside the file that owns them, outside the family that is
+/// allowed to ask.
 ///
 /// The definitions themselves are not calls (`calls_gate` skips the `fn name(`
-/// line), and the two thin wrappers `can_read` / `can_write` are the family
-/// asking itself. Everything else in that file is a service function, and a
-/// service function deciding the caller's access is the defect this guards.
-fn predicate_home_offenders() -> Vec<String> {
-    let path = workspace_crates().join(PREDICATE_HOME);
+/// line). `may_ask` receives the enclosing top-level function and the name it
+/// calls, and decides whether that pairing is the family asking itself: for
+/// [`PREDICATE_HOME`] the family is `can_*`, for [`MEMBERSHIP_WRAPPER_HOME`] it
+/// is a wrapper delegating to its own namesake. Everything else in such a file
+/// is a service function, and a service function deciding the caller's access
+/// is the defect this guards.
+///
+/// `min_family_calls` is a self-test rather than a rule about the code: if the
+/// family stops being seen asking at all, the enclosing-function tracking has
+/// broken and an empty offender list proves nothing.
+fn home_offenders(
+    home: &str,
+    names: &[&str],
+    may_ask: impl Fn(&str, &str) -> bool,
+    min_family_calls: usize,
+) -> Vec<String> {
+    let path = workspace_crates().join(home);
     assert!(
         path.exists(),
-        "PREDICATE_HOME names {PREDICATE_HOME} but that file is gone — fix the constant"
+        "{home} is named as a rule's home in this guard but that file is gone — fix the constant"
     );
     let text = fs::read_to_string(&path).expect("read source file");
     let lines: Vec<&str> = text.lines().collect();
@@ -551,13 +618,13 @@ fn predicate_home_offenders() -> Vec<String> {
         if let Some(name) = top_level_fn_name(line) {
             enclosing = name;
         }
-        for predicate in PREDICATES {
+        for predicate in names {
             if calls_gate(line, predicate) {
-                if enclosing.starts_with("can_") {
+                if may_ask(enclosing, predicate) {
                     family_calls += 1;
                 } else {
                     offenders.push(format!(
-                        "  {PREDICATE_HOME}:{} — {} (in `{enclosing}`)",
+                        "  {home}:{} — {} (in `{enclosing}`)",
                         n + 1,
                         line.trim()
                     ));
@@ -566,35 +633,38 @@ fn predicate_home_offenders() -> Vec<String> {
         }
     }
 
-    // `can_read` / `can_write` resolve a name and hand off to the model-taking
-    // predicate. If those stop being seen as family calls, the enclosing-function
-    // tracking has broken and the scan above proves nothing.
     assert!(
-        family_calls >= 2,
-        "only {family_calls} predicate call(s) attributed to the `can_*` family in \
-         {PREDICATE_HOME} — the enclosing-function tracking is broken, not the file"
+        family_calls >= min_family_calls,
+        "only {family_calls} call(s) of {names:?} attributed to the family that owns them in \
+         {home}, expected at least {min_family_calls} — the enclosing-function tracking is \
+         broken, not the file"
     );
     offenders
 }
 
-/// The fourth dialect: the rule written in a crate the guards above cannot see.
+/// Every call to one of `names` in the `rg-*` crates other than `rg-http`,
+/// together with the number of files walked.
 ///
-/// Every scan in this file stops at `crates/rg-http/src`, and the read rule had
-/// a live second implementation just outside it — in `fork_repo`, one call
-/// below a route that declared `RepoAuthRead`. So the predicates are barred
-/// across the whole workspace, not just this crate: a `rg-*` crate that decides
-/// repository access is writing a copy of the gate wherever it sits.
-#[test]
-fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
+/// `homes` are the files scanned by [`home_offenders`] under a narrower rule
+/// than a sign-off; skipping them here is what keeps that rule the only one
+/// that applies to them. `signed_off` is the ordinary exception list.
+///
+/// The count comes back with the offenders because an empty result means two
+/// very different things — nobody decides the rule out here, or the walk never
+/// ran — and only the caller can assert which one it got.
+fn other_crate_offenders(
+    names: &[&str],
+    homes: &[&str],
+    signed_off: &[(&str, &str)],
+) -> (Vec<String>, usize) {
     let crates_dir = workspace_crates();
-    let mut offenders = predicate_home_offenders();
+    let mut offenders = Vec::new();
     let mut scanned = 0usize;
 
     for entry in fs::read_dir(&crates_dir).expect("read crates dir") {
         let krate = entry.expect("dir entry").path();
-        // `rg-http` is the subject of
-        // `the_permission_predicates_are_only_reachable_through_the_gate_module`,
-        // which scans it against a stricter owner list.
+        // `rg-http` is the subject of the crate-scoped guards above, which scan
+        // it against a stricter owner list.
         if krate.file_name().is_some_and(|name| name == "rg-http") {
             continue;
         }
@@ -612,23 +682,45 @@ fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
                 .to_string_lossy()
                 .replace('\\', "/");
             scanned += 1;
-            if rel == PREDICATE_HOME
-                || WORKSPACE_SIGNED_OFF
-                    .iter()
-                    .any(|(allowed, _)| rel == *allowed)
+            if homes.contains(&rel.as_str())
+                || signed_off.iter().any(|(allowed, _)| rel == *allowed)
             {
                 continue;
             }
             let text = fs::read_to_string(file).expect("read source file");
             for (n, line) in text.lines().enumerate() {
-                for predicate in PREDICATES {
-                    if calls_gate(line, predicate) {
+                for name in names {
+                    if calls_gate(line, name) {
                         offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
                     }
                 }
             }
         }
     }
+
+    (offenders, scanned)
+}
+
+/// The fourth dialect: the rule written in a crate the guards above cannot see.
+///
+/// Every scan in this file stops at `crates/rg-http/src`, and the read rule had
+/// a live second implementation just outside it — in `fork_repo`, one call
+/// below a route that declared `RepoAuthRead`. So the predicates are barred
+/// across the whole workspace, not just this crate: a `rg-*` crate that decides
+/// repository access is writing a copy of the gate wherever it sits.
+#[test]
+fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
+    let mut offenders = home_offenders(
+        PREDICATE_HOME,
+        PREDICATES,
+        // `can_read` / `can_write` resolve a name and hand off to the
+        // model-taking predicate: the family asking itself.
+        |enclosing, _| enclosing.starts_with("can_"),
+        2,
+    );
+    let (mut elsewhere, scanned) =
+        other_crate_offenders(PREDICATES, &[PREDICATE_HOME], WORKSPACE_SIGNED_OFF);
+    offenders.append(&mut elsewhere);
 
     assert!(
         scanned > 50,
@@ -643,6 +735,100 @@ fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
          rule that no guard in `rg-http` could see.\n{}",
         offenders.join("\n")
     );
+}
+
+/// Membership, in the crates the org guard used to stop short of.
+///
+/// `the_org_membership_predicate_is_only_reachable_through_a_gate_module` walks
+/// `crates/rg-http/src` and nothing else, while [`PREDICATES`] had already been
+/// widened to the whole workspace — after `fork_repo` was found holding a copy
+/// of the read rule one crate over. Membership is reachable from exactly the
+/// same place: `rg_core::org::is_org_member` is a live `pub` function, so a
+/// service function in `rg-core` answering "is this caller in the organization"
+/// would have passed every guard in this file at once. The scan is the rule's
+/// reach, not the crate the guard happens to live in.
+#[test]
+fn the_org_membership_predicate_is_not_decided_in_the_other_crates_either() {
+    // Org membership is one of the terms of the repository rule, so the `can_*`
+    // family asking it in the predicate home is that rule's implementation, not
+    // a second copy of it.
+    let mut offenders = home_offenders(
+        PREDICATE_HOME,
+        ORG_MEMBERSHIP,
+        |enclosing, _| enclosing.starts_with("can_"),
+        3,
+    );
+    // In the wrapper home, only a pass-through to its own namesake may ask.
+    offenders.extend(home_offenders(
+        MEMBERSHIP_WRAPPER_HOME,
+        ORG_MEMBERSHIP,
+        |enclosing, name| enclosing == name,
+        2,
+    ));
+    let (mut elsewhere, scanned) = other_crate_offenders(
+        ORG_MEMBERSHIP,
+        &[PREDICATE_HOME, MEMBERSHIP_WRAPPER_HOME],
+        ORG_MEMBERSHIP_SIGNED_OFF,
+    );
+    offenders.append(&mut elsewhere);
+
+    assert!(
+        scanned > 50,
+        "only {scanned} file(s) scanned outside rg-http — the guard is not running"
+    );
+    assert!(
+        offenders.is_empty(),
+        "organization membership was decided outside a gate module.\n\
+         The answer has to come from `api::repo_access` (`NamespaceCreate` / `NamespaceWrite`) \
+         or from `api::orgs` (`OrgRead` / `OrgAdmin`), whichever crate the caller sits in. A \
+         crate that cannot reach either — none can today — has to be signed off in \
+         ORG_MEMBERSHIP_SIGNED_OFF with the reason, the way `rg-ssh` is for the repository \
+         predicates. Asking here writes the rule a second time in a crate no guard in \
+         `rg-http` can see, which is how the read rule came to live in `fork_repo`.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The barred names have to keep naming something.
+///
+/// A rename that empties the list turns every guard over it green and silent in
+/// the same commit — the failure mode a source grep is most exposed to, and the
+/// reason the release-primitive guard next door carries the same check.
+#[test]
+fn every_membership_predicate_still_exists() {
+    let path = workspace_crates().join(MEMBERSHIP_OPS);
+    let text = fs::read_to_string(&path).expect("read rg-db org ops");
+    for name in ORG_MEMBERSHIP {
+        assert!(
+            text.contains(&format!("pub async fn {name}(")),
+            "ORG_MEMBERSHIP names `{name}`, but {MEMBERSHIP_OPS} no longer defines it — follow \
+             the rename or drop the entry, or the guard quietly stops covering it"
+        );
+    }
+}
+
+/// An org gate owner that stopped asking holds a blanket exemption, not a
+/// reason — the same rot [`predicate_sign_offs_still_ask_the_predicate`] catches
+/// on the repository side.
+#[test]
+fn the_org_gate_owners_still_ask_about_membership() {
+    for owner in ORG_GATE_OWNERS {
+        let path = src_root().join(owner);
+        assert!(
+            path.exists(),
+            "ORG_GATE_OWNERS names {owner} but that file is gone — fix the list"
+        );
+        let text = fs::read_to_string(&path).expect("read source file");
+        let asks = text
+            .lines()
+            .any(|line| ORG_MEMBERSHIP.iter().any(|name| calls_gate(line, name)));
+        assert!(
+            asks,
+            "{owner} may decide organization membership directly, but asks none of \
+             {ORG_MEMBERSHIP:?} any more. The entry has stopped describing the file and is now \
+             an allowance over whatever it does instead — drop it from ORG_GATE_OWNERS."
+        );
+    }
 }
 
 /// A predicate sign-off has to keep being true in both directions.
@@ -692,6 +878,16 @@ fn signed_off_exceptions_are_live() {
         assert!(
             workspace_crates().join(rel).exists(),
             "WORKSPACE_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the entry"
+        );
+        assert!(!reason.is_empty(), "{rel} is signed off without a reason");
+    }
+    // Empty today. Listed anyway so the first entry added here is held to the
+    // same two conditions as the rest, rather than to none.
+    for (rel, reason) in ORG_MEMBERSHIP_SIGNED_OFF {
+        assert!(
+            workspace_crates().join(rel).exists(),
+            "ORG_MEMBERSHIP_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the \
+             entry"
         );
         assert!(!reason.is_empty(), "{rel} is signed off without a reason");
     }
