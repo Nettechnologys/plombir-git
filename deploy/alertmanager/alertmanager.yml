@@ -36,6 +36,17 @@ route:
       repeat_interval: 24h
 
 # Receivers
+#
+# The credentials below are placeholders, and deliberately ones Alertmanager
+# accepts: it validates `api_url` as a URL at load time and refuses to start on
+# anything that is not one. The angle-bracket placeholders that used to sit here
+# (`<SLACK_WEBHOOK_URL>`) meant this file could not be loaded at all — the whole
+# observability stack came up with Alertmanager in a restart loop, and nothing
+# in CI opened the file to say so.
+#
+# The host is `.invalid`, a TLD reserved by RFC 2606 that can never resolve. An
+# operator who forgets to replace it gets a DNS failure in the Alertmanager log,
+# not alerts delivered to somebody else's webhook.
 receivers:
   - name: 'default'
     webhook_configs:
@@ -44,14 +55,14 @@ receivers:
 
   - name: 'pagerduty'
     pagerduty_configs:
-      - service_key: '<PAGERDUTY_SERVICE_KEY>'  # Set via env or secret
+      - service_key: 'replace-me'  # Set via env or secret
         send_resolved: true
         severity: 'critical'
         description: '{{ .GroupLabels.alertname }} - {{ .CommonAnnotations.summary }}'
 
   - name: 'slack'
     slack_configs:
-      - api_url: '<SLACK_WEBHOOK_URL>'  # Set via env or secret
+      - api_url: 'https://hooks.slack.invalid/replace-me'  # Set via env or secret
         channel: '#forgekeep-alerts'
         send_resolved: true
         title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
@@ -65,7 +76,7 @@ receivers:
 
   - name: 'slack-info'
     slack_configs:
-      - api_url: '<SLACK_WEBHOOK_URL>'  # Set via env or secret
+      - api_url: 'https://hooks.slack.invalid/replace-me'  # Set via env or secret
         channel: '#forgekeep-info'
         send_resolved: false
         title: '[INFO] {{ .GroupLabels.alertname }}'

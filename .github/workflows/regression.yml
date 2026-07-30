@@ -302,10 +302,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ripgrep
 
-      # The 33 contract checks are pure Node reading repository sources: no npm
+      # The contract checks are pure Node reading repository sources: no npm
       # install, no build, no running backend. The whole set takes ~1s, so it is
       # the cheapest gate in this workflow and deliberately has no dependencies
-      # on the other jobs.
+      # on the other jobs. (Their count is deliberately not written here — the
+      # runner globs them and reports it, and a number in a comment is one more
+      # thing that silently stops being true.)
       #
       # The runner globs scripts/*-contract-check.mjs rather than listing them,
       # so a check added in a PR gates that same PR. Checks that are red for a
@@ -393,6 +395,154 @@ jobs:
           for compose in "${composes[@]}"; do
             echo "Validating ${compose}"
             docker compose -f "${compose}" config >/dev/null
+          done
+
+  # The observability stack's configuration is production configuration, and
+  # `deploy-config` above does not cover it: `docker compose config` merges and
+  # prints compose YAML, and never opens the files compose bind-mounts into the
+  # Prometheus, Alertmanager and Grafana containers. So nothing in this workflow
+  # read them, and both drifted — the Alertmanager config as committed could not
+  # be *loaded at all* (angle-bracket placeholders where `api_url` needs a URL),
+  # which means the stack came up with that container in a restart loop.
+  #
+  # This job is the syntax half of the coverage. The semantic half — a rule
+  # grouping by a label the exporter does not emit — is
+  # `scripts/observability-contract-check.mjs` in the contract-checks job above,
+  # and it has to be separate because to promtool `by (route)` over a histogram
+  # with no `route` label is perfectly valid PromQL. Neither half subsumes the
+  # other: promtool catches a malformed expression the contract check cannot
+  # parse either, the contract check catches the silent drift promtool accepts.
+  #
+  # Both tools ship inside the official images and nowhere else, so they are run
+  # from containers rather than installed — and from the *same image tag* the
+  # compose file starts, read out of it rather than written twice. A pinned
+  # duplicate here would validate the config with a promtool that is not the one
+  # loading it the moment somebody bumps the stack, which is the drift this job
+  # exists to catch, one level up. (Pinned, in either spelling: a floating
+  # `latest` would turn main red on an unrelated PR, as the clippy job explains.)
+  #
+  # The globs and their empty branches are the ratchet, same as deploy-config: a
+  # second rule file or a renamed directory must fail loudly instead of quietly
+  # passing a loop over nothing.
+  observability-config:
+    name: Prometheus and Alertmanager config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COMPOSE: deploy/docker-compose.observability.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read the image tags the stack actually runs
+        id: images
+        run: |
+          set -euo pipefail
+          for service in prometheus alertmanager; do
+            image="$(grep -oE "image: prom/${service}:[^[:space:]]+" "${COMPOSE}" | head -1 | cut -d' ' -f2)"
+            if [ -z "${image}" ]; then
+              echo "${COMPOSE} no longer pins a prom/${service} image." >&2
+              exit 1
+            fi
+            echo "${service}=${image}" >>"${GITHUB_OUTPUT}"
+            echo "${service}: ${image}"
+          done
+
+      # `check config` resolves `rule_files:` relative to the config file, so the
+      # directory is mounted whole and the alert rules get validated here too;
+      # `check rules` then covers any rule file the config does not reference.
+      - name: Validate Prometheus config and alert rules
+        env:
+          IMAGE: ${{ steps.images.outputs.prometheus }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          configs=(deploy/prometheus/prometheus*.yml)
+          rules=(deploy/prometheus/alerts*.yml)
+          if [ "${#configs[@]}" -eq 0 ] || [ "${#rules[@]}" -eq 0 ]; then
+            echo "deploy/prometheus/ no longer holds a prometheus*.yml and an alerts*.yml." >&2
+            exit 1
+          fi
+
+          promtool() {
+            docker run --rm -v "${PWD}/deploy/prometheus:/cfg:ro" \
+              --entrypoint promtool "${IMAGE}" "$@"
+          }
+          for config in "${configs[@]}"; do
+            promtool check config "/cfg/$(basename "${config}")"
+          done
+          for rule in "${rules[@]}"; do
+            promtool check rules "/cfg/$(basename "${rule}")"
+          done
+
+      - name: Validate Alertmanager config
+        env:
+          IMAGE: ${{ steps.images.outputs.alertmanager }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          configs=(deploy/alertmanager/*.yml)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "deploy/alertmanager/ no longer holds a *.yml." >&2
+            exit 1
+          fi
+          for config in "${configs[@]}"; do
+            docker run --rm -v "${PWD}/deploy/alertmanager:/cfg:ro" \
+              --entrypoint amtool "${IMAGE}" \
+              check-config "/cfg/$(basename "${config}")"
+          done
+
+      # Every bind-mount source in the observability compose is a file committed
+      # to this repository, which makes their existence checkable — and worth
+      # checking, because Docker's failure mode here is silent: a mount source
+      # that does not exist is *created as an empty directory*, so a renamed
+      # alerts.yml gets Prometheus a directory where it expects a rule file.
+      # `docker compose config` validates the YAML and never looks at the paths.
+      #
+      # Deliberately only this compose file. `docker-compose.hostdir.yml` mounts
+      # `./forgekeep.toml` and `./data`, which the operator creates and the
+      # repository must not contain — checking those here would fail on purpose.
+      - name: Every mounted config file exists
+        run: |
+          set -euo pipefail
+          missing=0
+          mounts="$(sed -nE 's|^[[:space:]]+- (\./[^:]+):.*|\1|p' "${COMPOSE}")"
+          if [ -z "${mounts}" ]; then
+            echo "${COMPOSE} declares no relative bind mounts — the parse broke." >&2
+            exit 1
+          fi
+          while read -r mount; do
+            path="deploy/${mount#./}"
+            if [ -e "${path}" ]; then
+              echo "ok  ${path}"
+            else
+              echo "MISSING  ${path} — compose would create an empty directory there." >&2
+              missing=1
+            fi
+          done <<<"${mounts}"
+          exit "${missing}"
+
+      # Grafana has no offline config linter, but the failure that hit here was
+      # not one a linter would have caught: a panel with `[$route]` — a template
+      # variable in the range-interval position — is JSON a dashboard loads and
+      # then renders as an error instead of a graph. The contract check asserts
+      # that; this only asserts the files parse, so a dashboard broken by a bad
+      # merge fails here rather than at provisioning time on the server.
+      - name: Validate dashboard JSON
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          dashboards=(deploy/grafana/dashboards/*.json)
+          if [ "${#dashboards[@]}" -eq 0 ]; then
+            echo "deploy/grafana/dashboards/ no longer holds a *.json." >&2
+            exit 1
+          fi
+          for dashboard in "${dashboards[@]}"; do
+            echo "Parsing ${dashboard}"
+            node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "${dashboard}"
           done
 
   # The image built by `Dockerfile` is the only artifact that ever reaches a

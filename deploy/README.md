@@ -227,14 +227,14 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `http_requests_total` | Counter | method, route, status | Total HTTP requests |
-| `http_request_duration_seconds` | Histogram | - | Request duration |
+| `http_request_duration_seconds` | Histogram | route | Request duration |
 | `http_requests_in_flight` | Gauge | - | Current in-flight requests |
 
 ### Database Metrics
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `db_queries_total` | Counter | operation | Total DB queries |
-| `db_query_duration_seconds` | Histogram | - | Query duration |
+| `db_query_duration_seconds` | Histogram | operation | Query duration |
 
 ### Git Metrics
 | Metric | Type | Labels | Description |

@@ -14,14 +14,20 @@ pub static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
 /// HTTP request metrics.
 pub mod http_requests {
-    use prometheus::{Histogram, HistogramOpts, IntCounterVec, IntGauge, Opts, Registry};
+    use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry};
     use std::sync::OnceLock;
 
     /// Counter: total HTTP requests by method, route, status.
     pub static REQUEST_COUNT: OnceLock<IntCounterVec> = OnceLock::new();
 
-    /// Histogram: request duration (seconds).
-    pub static REQUEST_DURATION: OnceLock<Histogram> = OnceLock::new();
+    /// Histogram: request duration (seconds) by route.
+    ///
+    /// Labelled by `route` — the same normalized `MatchedPath` template the
+    /// counter uses — because every consumer of this series groups by it:
+    /// `SlowRequestDuration` reports `{{ $labels.route }}`, and the latency
+    /// panels legend by route. Without the label those queries collapse to one
+    /// global series and the alert fires saying "P95 on  exceeds 1s".
+    pub static REQUEST_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 
     /// Gauge: current in-flight requests.
     pub static IN_FLIGHT: OnceLock<IntGauge> = OnceLock::new();
@@ -37,7 +43,7 @@ pub mod http_requests {
             .map_err(|_| prometheus::Error::Msg("REQUEST_COUNT already set".into()))?;
         registry.register(Box::new(request_count))?;
 
-        let request_duration = Histogram::with_opts(
+        let request_duration = HistogramVec::new(
             HistogramOpts::new(
                 "http_request_duration_seconds",
                 "HTTP request duration in seconds",
@@ -45,6 +51,7 @@ pub mod http_requests {
             .buckets(vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
             ]),
+            &["route"],
         )?;
         REQUEST_DURATION
             .set(request_duration.clone())
@@ -66,14 +73,20 @@ pub mod http_requests {
 
 /// Database metrics.
 pub mod db {
-    use prometheus::{Histogram, HistogramOpts, IntCounterVec, Registry};
+    use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, Registry};
     use std::sync::OnceLock;
 
     /// Counter: total database queries by operation.
     pub static QUERY_COUNT: OnceLock<IntCounterVec> = OnceLock::new();
 
-    /// Histogram: database query duration (seconds).
-    pub static QUERY_DURATION: OnceLock<Histogram> = OnceLock::new();
+    /// Histogram: database query duration (seconds) by operation.
+    ///
+    /// Same label as the counter next to it: `SlowDatabaseQueries` exists to
+    /// answer *which* operation got slow, and the DB latency panel legends by
+    /// operation. The label vocabulary is the curated set passed to
+    /// [`super::time_db`], so the cardinality is the same one `db_queries_total`
+    /// already carries.
+    pub static QUERY_DURATION: OnceLock<HistogramVec> = OnceLock::new();
 
     /// Register all database metrics with the registry.
     pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
@@ -86,12 +99,13 @@ pub mod db {
             .map_err(|_| prometheus::Error::Msg("QUERY_COUNT already set".into()))?;
         registry.register(Box::new(query_count))?;
 
-        let query_duration = Histogram::with_opts(
+        let query_duration = HistogramVec::new(
             HistogramOpts::new(
                 "db_query_duration_seconds",
                 "Database query duration in seconds",
             )
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+            &["operation"],
         )?;
         QUERY_DURATION
             .set(query_duration.clone())
@@ -431,7 +445,8 @@ pub mod recorder {
             c.with_label_values(&[operation]).inc();
         }
         if let Some(h) = db::QUERY_DURATION.get() {
-            h.observe(duration.as_secs_f64());
+            h.with_label_values(&[operation])
+                .observe(duration.as_secs_f64());
         }
     }
 

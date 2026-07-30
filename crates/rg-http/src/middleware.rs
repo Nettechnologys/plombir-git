@@ -51,7 +51,7 @@ pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
             .inc();
     }
     if let Some(h) = REQUEST_DURATION.get() {
-        h.observe(elapsed);
+        h.with_label_values(&[&route]).observe(elapsed);
     }
 
     response

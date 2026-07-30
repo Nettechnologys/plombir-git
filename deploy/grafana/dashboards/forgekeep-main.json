@@ -56,12 +56,12 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[$route])))",
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{route=~\"$route\"}[5m])))",
           "legendFormat": "p95 {{route}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[$route])))",
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket{route=~\"$route\"}[5m])))",
           "legendFormat": "p99 {{route}}",
           "refId": "B"
         }
