@@ -1,3 +1,10 @@
+# syntax=docker/dockerfile:1
+# ^ Must stay the first line: once any other comment or instruction has been
+# read, a parser directive is just a comment. It selects the external BuildKit
+# Dockerfile frontend, which stage 2a needs for `COPY --parents` — the flag is
+# stable there, but the daemon's builtin parser rejects it outright
+# (`unknown flag: --parents`).
+#
 # === ForgeKeep Dockerfile ===
 # Multi-stage build: frontend (SvelteKit) + Rust builder + minimal runtime.
 #
@@ -39,41 +46,51 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2a. Copy workspace manifests for dependency caching
+# 2a. Copy workspace manifests for dependency caching.
+#
+#     `--parents` is what makes the wildcard usable: a plain
+#     `COPY crates/*/Cargo.toml crates/` flattens every match onto the single
+#     destination path, so all nine manifests land in `crates/Cargo.toml` and
+#     the last one wins. That is why this used to be nine hand-written lines
+#     that a tenth workspace member would have silently missed.
+#
+#     Only the manifests are copied on purpose — this layer is the cache key of
+#     stage 2c, so it must not see a single `.rs` file, or every source edit
+#     would rebuild the whole dependency tree.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/rg-cli/Cargo.toml    crates/rg-cli/
-COPY crates/rg-core/Cargo.toml   crates/rg-core/
-COPY crates/rg-git/Cargo.toml    crates/rg-git/
-COPY crates/rg-ssh/Cargo.toml    crates/rg-ssh/
-COPY crates/rg-http/Cargo.toml   crates/rg-http/
-COPY crates/rg-db/Cargo.toml     crates/rg-db/
-COPY crates/rg-ci/Cargo.toml     crates/rg-ci/
-COPY crates/rg-runner/Cargo.toml crates/rg-runner/
-COPY crates/rg-mcp/Cargo.toml    crates/rg-mcp/
+COPY --parents crates/*/Cargo.toml ./
 
-# 2b. Create dummy source files so cargo can resolve all workspace members
-#     Bin crates need main.rs; lib crates need lib.rs
-RUN mkdir -p crates/rg-cli/src && echo 'fn main() {}' > crates/rg-cli/src/main.rs \
-    && mkdir -p crates/rg-mcp/src && echo 'fn main() {}' > crates/rg-mcp/src/main.rs \
-    && mkdir -p crates/rg-runner/src && echo 'fn main() {}' > crates/rg-runner/src/main.rs
-RUN for crate in rg-core rg-git rg-ssh rg-http rg-db rg-ci; do \
-      mkdir -p crates/$crate/src && echo '' > crates/$crate/src/lib.rs; \
+# 2b. Stub out every workspace member so cargo can resolve the graph before the
+#     real sources exist.
+#
+#     Both target files are written for each crate, rather than deciding per
+#     crate which one it needs: that decision is exactly the per-crate list this
+#     stage is trying not to have. The cost is a handful of extra empty targets
+#     compiled once (an auto-discovered `rg-core` bin, an `rg_cli` lib, and so
+#     on); the stubs are deleted again in 2d before the real sources arrive.
+RUN for manifest in crates/*/Cargo.toml; do \
+      src="$(dirname "${manifest}")/src"; \
+      mkdir -p "${src}"; \
+      : > "${src}/lib.rs"; \
+      echo 'fn main() {}' > "${src}/main.rs"; \
     done
 
-# 2c. Cache all crate dependencies (dummy code is valid Rust, will compile)
+# 2c. Cache all crate dependencies (the stubs are valid Rust and compile)
 RUN cargo build --release
 
-# 2d. Copy actual source, touch to force rebuild, and compile
+# 2d. Drop the stubs, copy the real sources, and compile for real.
+#
+#     The stubs are removed first because `COPY` overwrites but never deletes:
+#     a stub `main.rs` left in a lib-only crate would stay in the tree as an
+#     auto-discovered binary target built from `fn main() {}`.
+#
+#     `touch` is not cosmetic — cargo's fingerprint is mtime-based and `COPY`
+#     preserves the build context's timestamps, so without it cargo can consider
+#     the artifacts built from the stubs newer than the sources that replaced
+#     them and skip the rebuild entirely.
+RUN find crates -name '*.rs' -delete
 COPY crates/ crates/
-RUN touch crates/rg-cli/src/main.rs \
-    crates/rg-mcp/src/main.rs \
-    crates/rg-runner/src/main.rs \
-    crates/rg-core/src/lib.rs \
-    crates/rg-git/src/lib.rs \
-    crates/rg-ssh/src/lib.rs \
-    crates/rg-http/src/lib.rs \
-    crates/rg-db/src/lib.rs \
-    crates/rg-ci/src/lib.rs \
+RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --bin forgekeep --bin forgekeep-runner --bin forgekeep-mcp
 
 # Strip symbols to reduce binary size
