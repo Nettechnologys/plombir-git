@@ -319,8 +319,19 @@ enum Expect {
     /// The gate must turn this caller away — `401` or `403`.
     Denied,
     /// The gate must turn this caller away *without* confirming the resource
-    /// exists — `401`, `403` or `404`. Used where masking is the deliberate
-    /// design, as it is for a private organization.
+    /// exists — `401` or `404`, and specifically **not** `403`. Used where
+    /// masking is the deliberate design, as it is for a private organization.
+    ///
+    /// `403` used to be accepted here, which made the whole expectation
+    /// vacuous: `403` is the one denial that confirms the resource exists, so
+    /// the oracle admitted exactly the answer its own name forbids. That is how
+    /// the `OrgAdmin` hole survived a green sweep — `PATCH /orgs/{name}`
+    /// answered `403` on a private organization and `404` on an unknown one,
+    /// and the sweep called both a match (card_c46c354ec3ae).
+    ///
+    /// `401` stays admissible and is not a leak: a gate that authenticates
+    /// before it resolves anything answers an anonymous caller the same way
+    /// whether the organization exists or not.
     Hidden,
     /// Not asserted; the caller holds the reason.
     Unchecked,
@@ -401,7 +412,9 @@ fn judge(expect: Expect, status: StatusCode) -> Outcome {
         return Outcome::ServerError;
     }
     let denied = matches!(status.as_u16(), 401 | 403);
-    let hidden = denied || status == StatusCode::NOT_FOUND;
+    // Deliberately *not* `denied || 404`: `403` confirms the resource exists,
+    // which is the one thing a masked denial may not do.
+    let hidden = matches!(status.as_u16(), 401 | 404);
     let satisfied = match expect {
         Expect::Allowed => !denied,
         Expect::Denied => denied,

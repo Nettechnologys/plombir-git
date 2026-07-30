@@ -418,3 +418,253 @@ async fn a_private_org_is_not_readable_from_outside() {
         );
     }
 }
+
+/// Send one request, gate first: returns only the status code.
+///
+/// Every route below takes its access level as a handler argument, so the body
+/// is deserialized *after* the access decision — but a well-formed body is sent
+/// anyway, so a `400`/`422` can never be mistaken for a denial.
+async fn status_of(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    token: Option<&str>,
+    body: &serde_json::Value,
+) -> reqwest::StatusCode {
+    let mut req = client.request(method, url).json(body);
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    req.send().await.expect("request").status()
+}
+
+/// Every mutating org route, as `(method, path after the org name, body)`.
+///
+/// The ids are filled from the fixture, but which org a `team_id` belongs to is
+/// deliberately not made to match: the gate answers before any handler reads the
+/// id, and a route where the id changes the verdict is a route whose gate runs
+/// too late.
+fn org_admin_routes(
+    team_id: i64,
+    user_id: i64,
+) -> Vec<(reqwest::Method, String, serde_json::Value)> {
+    use reqwest::Method;
+
+    vec![
+        (
+            Method::PATCH,
+            String::new(),
+            serde_json::json!({"display_name": "renamed by a stranger"}),
+        ),
+        (Method::DELETE, String::new(), serde_json::json!({})),
+        (
+            Method::POST,
+            "/members".to_string(),
+            serde_json::json!({"user_id": user_id, "role": "owner"}),
+        ),
+        (
+            Method::DELETE,
+            format!("/members/{user_id}"),
+            serde_json::json!({}),
+        ),
+        (
+            Method::POST,
+            "/teams".to_string(),
+            serde_json::json!({"name": "backdoor", "permission": "admin"}),
+        ),
+        (
+            Method::DELETE,
+            format!("/teams/{team_id}"),
+            serde_json::json!({}),
+        ),
+        (
+            Method::POST,
+            format!("/teams/{team_id}/members"),
+            serde_json::json!({"user_id": user_id, "role": "member"}),
+        ),
+        (
+            Method::DELETE,
+            format!("/teams/{team_id}/members/{user_id}"),
+            serde_json::json!({}),
+        ),
+    ]
+}
+
+/// card_c46c354ec3ae: the `OrgAdmin` gate must mask a private organization
+/// exactly as far as the read gate does.
+///
+/// `a_private_org_is_not_readable_from_outside` above drives five `GET`s and is
+/// satisfied by all of them — while the eight mutating routes on the same paths
+/// answered `403` on a private organization and `404` on an unknown one. So the
+/// masking the read gate provides came off by changing the verb: `PATCH
+/// /orgs/{name}` confirmed by name what `GET /orgs/{name}` refuses to.
+///
+/// Both codes are measured in one test on purpose. A private org asserted to
+/// answer `404` proves nothing on its own — an absent org answers `404` too, and
+/// the whole question is whether the two are distinguishable.
+#[tokio::test]
+async fn the_org_admin_gate_masks_a_private_org_as_far_as_the_read_gate_does() {
+    let base = spawn_test_app().await;
+    let (owner_token, _) = register_full(&base, "mask-owner", "mask-owner@example.com").await;
+    let (outsider_token, outsider_id) =
+        register_full(&base, "mask-outsider", "mask-out@example.com").await;
+    let (member_token, member_id) =
+        register_full(&base, "mask-member", "mask-mem@example.com").await;
+    create_org(&base, &owner_token, "mask-private", "private").await;
+    create_org(&base, &owner_token, "mask-public", "public").await;
+    let private_team = create_team(&base, &owner_token, "mask-private", "hidden-devs").await;
+    let public_team = create_team(&base, &owner_token, "mask-public", "open-devs").await;
+
+    let client = reqwest::Client::new();
+    let orgs = format!("{base}/api/v1/orgs");
+
+    // A plain member of the private org, for the third pass below.
+    let added = status_of(
+        &client,
+        reqwest::Method::POST,
+        &format!("{orgs}/mask-private/members"),
+        Some(&owner_token),
+        &serde_json::json!({"user_id": member_id, "role": "member"}),
+    )
+    .await;
+    assert_eq!(added, 201, "fixture: adding the plain member failed");
+
+    // 1. The outsider: a private org and an org that does not exist must be
+    //    indistinguishable — same code, and that code is not `403`.
+    for (method, suffix, body) in org_admin_routes(private_team, outsider_id) {
+        let private = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-private{suffix}"),
+            Some(&outsider_token),
+            &body,
+        )
+        .await;
+        let absent = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-nosuchorg{suffix}"),
+            Some(&outsider_token),
+            &body,
+        )
+        .await;
+        assert_eq!(
+            private, absent,
+            "{method} /orgs/{{name}}{suffix}: a private org answered {private} and an absent one \
+             {absent} — the difference is the existence oracle"
+        );
+        assert_eq!(
+            private, 404,
+            "{method} /orgs/{{name}}{suffix}: a private org owes an outsider 404"
+        );
+    }
+
+    // 2. An anonymous caller is `401` either way — the gate authenticates before
+    //    it resolves anything, so it cannot leak what it has not looked up.
+    for (method, suffix, body) in org_admin_routes(private_team, outsider_id) {
+        let private = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-private{suffix}"),
+            None,
+            &body,
+        )
+        .await;
+        let absent = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-nosuchorg{suffix}"),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(private, 401, "{method} /orgs/{{name}}{suffix} owes 401");
+        assert_eq!(absent, 401, "{method} /orgs/{{name}}{suffix} owes 401");
+    }
+
+    // 3. A *public* org keeps answering `403`: its existence is not a secret, so
+    //    masking it would only make the refusal harder to read. This is the half
+    //    that would break if the visibility check were made unconditional.
+    for (method, suffix, body) in org_admin_routes(public_team, outsider_id) {
+        let status = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-public{suffix}"),
+            Some(&outsider_token),
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{method} /orgs/{{name}}{suffix}: a public org owes an outsider a plain 403"
+        );
+    }
+
+    // 4. A member of the private org gets `403`, not `404`: they can already see
+    //    the organization, so refusing them by permission leaks nothing. The gate
+    //    hides the org from strangers, it does not hide it from its own people.
+    for (method, suffix, body) in org_admin_routes(private_team, outsider_id) {
+        let status = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-private{suffix}"),
+            Some(&member_token),
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{method} /orgs/{{name}}{suffix}: a member of the private org owes 403, not 404"
+        );
+    }
+
+    // 5. Baseline, in the same run: the owner still gets through every one of
+    //    them. Without it the four passes above are equally satisfied by a
+    //    fixture that never worked. Ordered so the destructive ones come last.
+    let baseline: Vec<(reqwest::Method, String, serde_json::Value)> = vec![
+        (
+            reqwest::Method::PATCH,
+            String::new(),
+            serde_json::json!({"display_name": "renamed by its owner"}),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/teams/{private_team}/members"),
+            serde_json::json!({"user_id": member_id, "role": "member"}),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/teams/{private_team}/members/{member_id}"),
+            serde_json::json!({}),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/teams/{private_team}"),
+            serde_json::json!({}),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/members/{member_id}"),
+            serde_json::json!({}),
+        ),
+        (
+            reqwest::Method::DELETE,
+            String::new(),
+            serde_json::json!({}),
+        ),
+    ];
+    for (method, suffix, body) in baseline {
+        let status = status_of(
+            &client,
+            method.clone(),
+            &format!("{orgs}/mask-private{suffix}"),
+            Some(&owner_token),
+            &body,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "baseline: the owner must still pass {method} /orgs/{{name}}{suffix}, got {status}"
+        );
+    }
+}

@@ -819,9 +819,13 @@ async fn require_org_admin(
     }
 }
 
-/// Read gate for org-scoped data. A public org is world-readable; a private one
-/// answers `404` — not `403` — to everyone outside it, so the endpoint cannot be
-/// used to enumerate private organizations by name.
+/// Visibility gate for org-scoped routes. A public org is world-readable; a
+/// private one answers `404` — not `403` — to everyone outside it, so the
+/// endpoint cannot be used to enumerate private organizations by name.
+///
+/// Every org gate runs it, reading and mutating alike: masking that only one
+/// level performs is not masking, because the caller picks the level by picking
+/// the verb.
 async fn require_org_visible(
     db: &sea_orm::DatabaseConnection,
     org: &rg_db::entities::organization::Model,
@@ -904,9 +908,17 @@ impl axum::extract::FromRequestParts<AppState> for OrgRead {
 
 /// An authenticated administrator of the organization named by `{name}`.
 ///
-/// Same three steps, same order, same answers as the hand-written prologue it
+/// Same steps, same order, same answers as the hand-written prologue it
 /// replaces: no session is `401`, an unknown organization is `404`, and a
-/// caller who is neither owner nor admin is `403`.
+/// caller who is neither its owner nor an admin is `403`.
+///
+/// It runs [`require_org_visible`] before [`require_org_admin`] for the reason
+/// that gate exists at all: without it a private organization answered `403`
+/// here while an unknown one answered `404`, so the masking [`OrgRead`] provides
+/// came off by changing the verb on a neighbouring route — `PATCH /orgs/{name}`
+/// confirmed by name what `GET /orgs/{name}` refuses to. Visibility first makes
+/// both answers `404`. A *member* of the private organization still gets `403`:
+/// they can already see it, so refusing them by permission leaks nothing.
 pub struct OrgAdmin {
     pub org: rg_db::entities::organization::Model,
     pub actor_id: i64,
@@ -922,6 +934,7 @@ impl axum::extract::FromRequestParts<AppState> for OrgAdmin {
         let actor_id = require_user(&parts.headers, &state.jwt_secret)?;
         let name = org_name_in_path(parts, state).await?;
         let org = resolve_org(&state.db, &name).await?;
+        require_org_visible(&state.db, &org, Some(actor_id)).await?;
         require_org_admin(&state.db, &org, actor_id).await?;
         Ok(Self { org, actor_id })
     }

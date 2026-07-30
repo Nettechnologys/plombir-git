@@ -80,7 +80,10 @@ pub enum Access {
     /// private one is visible to its members only — and answers `404` rather
     /// than `403`, so it is not an existence oracle either.
     OrgRead,
-    /// An owner/admin of the organization in the path.
+    /// An owner/admin of the organization in the path. Masks a private
+    /// organization exactly as [`Access::OrgRead`] does — an outsider is `404`,
+    /// not `403` — because otherwise the masking is defeated by changing the
+    /// verb on the same path.
     OrgAdmin,
     /// Instance administrator.
     InstanceAdmin,
