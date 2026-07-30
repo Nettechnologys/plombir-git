@@ -102,12 +102,12 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
 
 use rg_http::route_table::RUNNER_AUTH_LAYER;
 
 use crate::common::source_scan::{
-    calls, functions, handlers, is_ident_char, relative, rust_files, src_root, Function,
+    calls, crate_relative, functions, handlers, is_ident_char, relative, rust_files, src_root,
+    workspace_crates, Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -346,12 +346,18 @@ const LEAF_COMPARISONS: &[(&str, &str, &[&str])] = &[(
 /// The guard above only reads the files in [`ANCHORED`], so on its own it says
 /// nothing about a *second* module deciding to reach a release directly —
 /// which is the same hole one file over. These are the primitives the anchoring
-/// convention exists for, so they are barred everywhere else in `rg-http`, the
-/// way `authz_extractor_guard` bars the raw `require_*` gates: an id-taking
-/// call outside the file that anchors ids is the defect, wherever it appears.
+/// convention exists for, so they are barred everywhere else in the
+/// **workspace**, the way `authz_extractor_guard` bars the raw `require_*`
+/// gates: an id-taking call outside the file that anchors ids is the defect,
+/// wherever it appears. They are `pub` in `rg_core::release::service`, so
+/// "wherever" is every crate that can depend on `rg-core`, not just this one —
+/// see [`the_unscoped_release_primitives_are_not_reached_from_the_other_crates_either`].
 ///
 /// `create_release` and `list_releases` are absent on purpose — both take the
-/// repository id itself and are scoped by their own signature.
+/// repository id itself and are scoped by their own signature. That is not a
+/// detail to lose in a later edit: the importer in `rg-core` calls
+/// `create_release` twice, and it is the deliberate absence of that name here
+/// that keeps those calls legitimate rather than signed off.
 const RELEASE_PRIMITIVES: &[&str] = &[
     "get_release",
     "update_release",
@@ -368,6 +374,28 @@ const RELEASE_PRIMITIVES: &[&str] = &[
 
 /// The file that owns the release/asset anchoring helpers.
 const RELEASE_API: &str = "api/releases.rs";
+
+/// Where the barred primitives are defined, relative to `crates/`.
+///
+/// It is walked like every other file rather than signed off. The definitions
+/// read `pub async fn get_release(` and any call between them would be a bare
+/// name, so the qualified path this guard looks for does not occur there and no
+/// exemption is needed — while a blanket sign-off would quietly cover the
+/// *next* function added to that module, which is the mistake
+/// `authz_extractor_guard` had to undo for `rg-core/src/org/mod.rs`.
+const RELEASE_SERVICE_HOME: &str = "rg-core/src/release/service.rs";
+
+/// Files outside `rg-http` allowed to reach a release or asset by its global
+/// id, each with the reason.
+///
+/// Empty on purpose, and the emptiness is the statement rather than an
+/// oversight: nothing outside the HTTP layer holds a release id today, and the
+/// only call `rg-core` makes into that module is `create_release`, which takes
+/// the repository id itself and is deliberately absent from
+/// [`RELEASE_PRIMITIVES`]. An empty list with a reason can be read and argued
+/// with; no list at all is what the guard had before, and that is
+/// indistinguishable from a rule nobody ever extended past its own crate.
+const RELEASE_PRIMITIVE_SIGNED_OFF: &[(&str, &str)] = &[];
 
 /// How many (handler, path parameter) pairs in `src/` name a global id.
 ///
@@ -825,6 +853,46 @@ fn handlers_holding_a_global_id_anchor_it_to_the_authorized_repository() {
     );
 }
 
+/// Every line of `text` that reaches one of [`RELEASE_PRIMITIVES`] by its
+/// qualified path, or imports the module that path is spelled through.
+///
+/// `rel` only labels the offenders, so the same rule reads the same way in
+/// `crates/rg-http/src` and in the rest of the workspace — the two callers
+/// differ in which tree they walk and in nothing else. That matters more than
+/// the saved lines: the crate-scoped guard existed for a while before the
+/// workspace one, and a second, hand-copied line rule is how the two would have
+/// drifted apart.
+fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+
+    for (n, line) in text.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        if !line.contains("release::service") {
+            continue;
+        }
+        // An import would let the qualified path — the thing this guard reads
+        // — disappear from the call site entirely, whether it names the
+        // functions (`use rg_core::release::service::delete_asset;`) or only
+        // the module (`use rg_core::release::service;`, and then a bare
+        // `service::delete_asset(…)` this scan cannot see).
+        if code.starts_with("use ") {
+            offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
+            continue;
+        }
+        for name in RELEASE_PRIMITIVES {
+            if line.contains(&format!("release::service::{name}(")) {
+                offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
+                break;
+            }
+        }
+    }
+
+    offenders
+}
+
 #[test]
 fn the_unscoped_release_primitives_are_only_reachable_from_the_file_that_anchors_ids() {
     let mut files = Vec::new();
@@ -841,26 +909,7 @@ fn the_unscoped_release_primitives_are_only_reachable_from_the_file_that_anchors
             continue;
         }
         let text = fs::read_to_string(file).expect("read source file");
-        for (n, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            if !line.contains("release::service::") {
-                continue;
-            }
-            // An import would let the qualified path — the thing this guard
-            // reads — disappear from the call site entirely.
-            if code.starts_with("use ") {
-                offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
-                continue;
-            }
-            for name in RELEASE_PRIMITIVES {
-                if line.contains(&format!("release::service::{name}(")) {
-                    offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
-                }
-            }
-        }
+        offenders.extend(release_primitive_offenders(&rel, &text));
     }
 
     assert!(
@@ -871,6 +920,80 @@ fn the_unscoped_release_primitives_are_only_reachable_from_the_file_that_anchors
          that is done (`release_in_repo` / `asset_in_repo`). Anchor the id there and pass the \
          resolved model on, or give the service function a `repo_id` of its own and check it \
          inside.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The same rule, in the crates the guard above cannot see.
+///
+/// [`the_unscoped_release_primitives_are_only_reachable_from_the_file_that_anchors_ids`]
+/// walks `crates/rg-http/src` and stops there — its own doc comment said "barred
+/// everywhere else in `rg-http`", which was honest and was also the whole
+/// problem. The eleven names it bars are `pub` in `rg_core::release::service`,
+/// so a job in `rg-ci`, a handler in `rg-mcp`, or another service function in
+/// `rg-core` deleting an asset by its id would have sat one crate over from
+/// every assertion in this file and been read by none of them.
+///
+/// This is the third time the same widening has been needed: `PREDICATES` after
+/// `fork_repo` was found holding a copy of the repository read rule, then
+/// `ORG_MEMBERSHIP`, now these. The lesson each time is the same — the scan
+/// belongs to the rule's reach, not to the crate the guard happens to live in,
+/// and `pub` is what sets that reach.
+///
+/// Nothing is red today, and that is the point of doing it while nothing is:
+/// the guard is what stops the first such call from being written, and a guard
+/// added after the fact is a post-mortem.
+#[test]
+fn the_unscoped_release_primitives_are_not_reached_from_the_other_crates_either() {
+    let crates_dir = workspace_crates();
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
+
+    for entry in fs::read_dir(&crates_dir).expect("read crates dir") {
+        let krate = entry.expect("dir entry").path();
+        // `rg-http` is the subject of the guard above, which holds it to the
+        // stricter rule: there, one named file *may* reach the primitives.
+        if krate.file_name().is_some_and(|name| name == "rg-http") {
+            continue;
+        }
+        let src = krate.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        for file in &files {
+            let rel = crate_relative(file);
+            scanned += 1;
+            if RELEASE_PRIMITIVE_SIGNED_OFF
+                .iter()
+                .any(|(allowed, _)| rel == *allowed)
+            {
+                continue;
+            }
+            let text = fs::read_to_string(file).expect("read source file");
+            offenders.extend(release_primitive_offenders(&rel, &text));
+        }
+    }
+
+    // An empty offender list means one of two things — nobody out here reaches
+    // a release by its id, or the walk never ran — and only this tells them
+    // apart. It is the assertion the crate-scoped guard makes with `files.len()`.
+    assert!(
+        scanned > 50,
+        "only {scanned} file(s) scanned outside rg-http — the guard is not running"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a release or asset was reached by its global id from outside `rg-http`.\n\
+         Those service functions take an id with no repository beside them, so the caller is \
+         what keeps them inside the right repository — and out here there is no gate in the \
+         signature to be that proof at all. Anchor the id in {RELEASE_API}, where \
+         `release_in_repo` / `asset_in_repo` do it, and pass the resolved model on; or give the \
+         service function a `repo_id` of its own and check it inside. A caller that legitimately \
+         addresses the whole instance goes in `RELEASE_PRIMITIVE_SIGNED_OFF` with the reason \
+         written down — the list is empty, not absent.\n{}",
         offenders.join("\n")
     );
 }
@@ -1090,11 +1213,10 @@ fn every_body_borne_id_still_has_its_anchor() {
 /// source-grep test turns into decoration.
 #[test]
 fn every_barred_release_primitive_still_exists() {
-    let service = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rg-core/src/release/service.rs")
-        .canonicalize()
-        .expect("rg-core release service");
-    let text = fs::read_to_string(&service).expect("read rg-core release service");
+    let service = workspace_crates().join(RELEASE_SERVICE_HOME);
+    let text = fs::read_to_string(&service).unwrap_or_else(|e| {
+        panic!("RELEASE_SERVICE_HOME names {RELEASE_SERVICE_HOME}, which cannot be read: {e}")
+    });
 
     for name in RELEASE_PRIMITIVES {
         assert!(

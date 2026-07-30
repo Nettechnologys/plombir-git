@@ -33,6 +33,21 @@ pub fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
+/// `crates/` — the parent of this crate's directory, and the tree a guard has
+/// to walk when the rule it enforces is not confined to `rg-http`.
+///
+/// A `pub` function in `rg-core` is reachable from every crate that can depend
+/// on it, so a guard that stops at [`src_root`] is narrower than its own rule:
+/// `fork_repo` held a second copy of the repository read rule one crate over
+/// for exactly as long as the predicate guard scanned only this crate.
+#[allow(dead_code)]
+pub fn workspace_crates() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rg-http lives under crates/")
+        .to_path_buf()
+}
+
 /// Every `.rs` file under `dir`, recursively.
 #[allow(dead_code)]
 pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -52,6 +67,18 @@ pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 pub fn relative(path: &Path) -> String {
     path.strip_prefix(src_root())
         .expect("file under src/")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// A path under [`workspace_crates`], spelled the way the workspace-wide
+/// sign-off lists spell it: `rg-core/src/release/service.rs`. The crate name
+/// is part of it, because out there the crate is the first thing you need to
+/// know about an offending line.
+#[allow(dead_code)]
+pub fn crate_relative(path: &Path) -> String {
+    path.strip_prefix(workspace_crates())
+        .expect("file under crates/")
         .to_string_lossy()
         .replace('\\', "/")
 }
