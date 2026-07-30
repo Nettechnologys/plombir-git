@@ -431,6 +431,84 @@ const RELEASE_SERVICE_HOME: &str = "rg-core/src/release/service.rs";
 /// indistinguishable from a rule nobody ever extended past its own crate.
 const RELEASE_PRIMITIVE_SIGNED_OFF: &[(&str, &str)] = &[];
 
+/// One family of `rg-db` primitives that address a row by a key unique across
+/// the whole instance, and the files allowed to reach them.
+struct UnscopedRowPrimitives {
+    /// The `ops` module the calls are spelled through. Doubles as the marker a
+    /// line must carry before it is worth reading, and as the module an import
+    /// would hide the call behind.
+    module: &'static str,
+    /// Where the primitives are defined, relative to `crates/`.
+    home: &'static str,
+    /// The names that take a global key with no container beside it.
+    names: &'static [&'static str],
+    /// Files, relative to `crates/`, allowed to call them — each with the
+    /// reason. The reason is the point of the entry, exactly as in
+    /// [`SIGNED_OFF`]: an allow-list without one is just an exemption list.
+    anchored_by: &'static [(&'static str, &'static str)],
+}
+
+/// The database primitives one layer below [`RELEASE_PRIMITIVES`], and their
+/// anchors.
+///
+/// [`RELEASE_PRIMITIVES`] bars `rg-core` service functions. These are the
+/// `rg-db` `ops` functions underneath them: the ones whose `WHERE` names a
+/// single instance-wide key and no container at all, so nothing in the callee
+/// can object to an id from the wrong repository. The convention is the same
+/// one this whole file exists for — an id is re-tied to the gated container by
+/// a named helper, and the helper is the only caller — and so is the rule: the
+/// primitive is barred everywhere else in the workspace, because `pub` is what
+/// sets a rule's reach.
+///
+/// card_07c571dfdf95 is why the table exists. Two of these primitives had **no
+/// callers**: `oci_ops::complete_upload` (`UPDATE … WHERE uuid = ?`) and
+/// `attachment_ops::find_by_uuid`. A dead unscoped primitive is worse than a
+/// live one, not better — nobody has ever had reason to read it, and the next
+/// handler finds it by name. Both were deleted rather than listed, which is why
+/// neither appears below; the entries that remain are the ones with a real
+/// anchor, and this table is what keeps that anchor the only way in.
+///
+/// The *writers* of `oci_upload` are deliberately absent for the same reason
+/// `create_release` is absent from [`RELEASE_PRIMITIVES`]:
+/// `update_upload_progress` and `delete_upload` take `oci_repo_id` and filter
+/// on it, so they are scoped by their own signature and need no caller to be
+/// careful. That absence is load-bearing — adding them here would say the
+/// opposite of what the code does.
+const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
+    UnscopedRowPrimitives {
+        module: "attachment_ops",
+        home: "rg-db/src/ops/attachment_ops.rs",
+        names: &["find_by_id", "delete_by_id", "increment_download_count"],
+        anchored_by: &[
+            (
+                "rg-core/src/attachment.rs",
+                "`get_attachment` is the anchor: it reads the row by its global id and then \
+                 refuses it — as a 404 — unless `attachment.repo_id` is the repository the \
+                 request was gated on and the target matches. The two writers in this file are \
+                 only ever handed `attachment.id` off a model that call has already placed",
+            ),
+            (
+                "rg-http/src/api/attachments.rs",
+                "`stream_attachment` bumps the download counter on the model \
+                 `rg_core::attachment::get_attachment` handed back one call earlier, so the id \
+                 is anchored before this file ever sees it",
+            ),
+        ],
+    },
+    UnscopedRowPrimitives {
+        module: "oci_ops",
+        home: "rg-db/src/ops/oci_ops.rs",
+        names: &["find_upload"],
+        anchored_by: &[(
+            "rg-http/src/oci.rs",
+            "`upload_in_repo` is the anchor — it compares \
+             `upload.oci_repository_id == oci_repo.id` and answers `BLOB_UPLOAD_UNKNOWN` \
+             otherwise. Every OCI handler goes through it rather than through the read; going \
+             through the read directly is what card_1cfb4519ff04 was",
+        )],
+    },
+];
+
 /// How many (handler, path parameter) pairs in `src/` name a global id.
 ///
 /// The number is written down so that adding a route which takes one is a
@@ -906,16 +984,28 @@ fn handlers_holding_a_global_id_anchor_it_to_the_authorized_repository() {
     );
 }
 
-/// Every line of `text` that reaches one of [`RELEASE_PRIMITIVES`] by its
+/// Every line of `text` that reaches one of `names` through `module`'s
 /// qualified path, or imports the module that path is spelled through.
 ///
 /// `rel` only labels the offenders, so the same rule reads the same way in
-/// `crates/rg-http/src` and in the rest of the workspace — the two callers
-/// differ in which tree they walk and in nothing else. That matters more than
-/// the saved lines: the crate-scoped guard existed for a while before the
+/// `crates/rg-http/src` and in the rest of the workspace — the callers differ
+/// in which tree they walk and in nothing else. That matters more than the
+/// saved lines: the crate-scoped guard existed for a while before the
 /// workspace one, and a second, hand-copied line rule is how the two would have
 /// drifted apart.
-fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
+///
+/// The module and the names are parameters rather than the two literals they
+/// started as because a third caller now exists —
+/// [`the_unscoped_row_primitives_are_only_reachable_from_the_files_that_anchor_them`]
+/// asks the same question of the `rg-db` primitives one layer below. Writing
+/// that scan out a second time is precisely the drift this doc comment already
+/// warned about.
+fn unscoped_primitive_offenders(
+    rel: &str,
+    text: &str,
+    module: &str,
+    names: &[&str],
+) -> Vec<String> {
     let mut offenders = Vec::new();
 
     for (n, line) in text.lines().enumerate() {
@@ -923,7 +1013,7 @@ fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
         if code.starts_with("//") {
             continue;
         }
-        if !line.contains("release::service") {
+        if !line.contains(module) {
             continue;
         }
         // An import would let the qualified path — the thing this guard reads
@@ -935,8 +1025,8 @@ fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
             offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
             continue;
         }
-        for name in RELEASE_PRIMITIVES {
-            if line.contains(&format!("release::service::{name}(")) {
+        for name in names {
+            if line.contains(&format!("{module}::{name}(")) {
                 offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
                 break;
             }
@@ -944,6 +1034,11 @@ fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
     }
 
     offenders
+}
+
+/// [`unscoped_primitive_offenders`] for the release family.
+fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
+    unscoped_primitive_offenders(rel, text, "release::service", RELEASE_PRIMITIVES)
 }
 
 #[test]
@@ -1047,6 +1142,80 @@ fn the_unscoped_release_primitives_are_not_reached_from_the_other_crates_either(
          service function a `repo_id` of its own and check it inside. A caller that legitimately \
          addresses the whole instance goes in `RELEASE_PRIMITIVE_SIGNED_OFF` with the reason \
          written down — the list is empty, not absent.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The same rule as the two tests above, one layer down: the `rg-db`
+/// primitives of [`UNSCOPED_ROW_PRIMITIVES`].
+///
+/// It is a single walk over every crate rather than the crate-scoped /
+/// workspace-scoped pair the release guard needs, because these anchors do not
+/// all live in `rg-http`: `attachment_ops` is anchored in `rg-core` and reached
+/// from `rg-http`, so a rule that split the workspace at the crate boundary
+/// would have to say the same thing twice. Paths are crate-relative
+/// throughout — out here the crate is the first thing you need to know about an
+/// offending line.
+///
+/// The defining modules are **not** exempted. They spell their own functions
+/// bare (`pub async fn find_by_id(`), so the qualified path this scan reads
+/// never occurs there and no exemption is needed — while a blanket sign-off
+/// would quietly cover the *next* function added to those modules, which is the
+/// mistake [`RELEASE_SERVICE_HOME`] already records for `rg-core/src/org/mod.rs`.
+#[test]
+fn the_unscoped_row_primitives_are_only_reachable_from_the_files_that_anchor_them() {
+    let crates_dir = workspace_crates();
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
+
+    for entry in fs::read_dir(&crates_dir).expect("read crates dir") {
+        let src = entry.expect("dir entry").path().join("src");
+        if !src.is_dir() {
+            continue;
+        }
+
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        for file in &files {
+            let rel = crate_relative(file);
+            scanned += 1;
+            let text = fs::read_to_string(file).expect("read source file");
+            for family in UNSCOPED_ROW_PRIMITIVES {
+                if family
+                    .anchored_by
+                    .iter()
+                    .any(|(allowed, _)| rel == *allowed)
+                {
+                    continue;
+                }
+                offenders.extend(unscoped_primitive_offenders(
+                    &rel,
+                    &text,
+                    family.module,
+                    family.names,
+                ));
+            }
+        }
+    }
+
+    // An empty offender list means one of two things — nobody reaches these
+    // rows by a global key, or the walk never ran — and only this tells them
+    // apart.
+    assert!(
+        scanned > 50,
+        "only {scanned} file(s) scanned — the guard is not running"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a row was reached by a key that is unique across the whole instance, from a file that \
+         does not anchor it.\n\
+         These `rg-db` primitives filter on that key alone: the row they return may belong to \
+         any repository on the instance, and nothing inside the callee can object. Go through \
+         the anchor named in `UNSCOPED_ROW_PRIMITIVES` — it re-ties the id to the container the \
+         access gate actually checked and answers 404 on a mismatch — or give the primitive a \
+         container column of its own and put it in the `WHERE`, the way \
+         `oci_ops::update_upload_progress` takes `oci_repo_id`. A file that legitimately belongs \
+         on the short list goes in `anchored_by` with the reason written down.\n{}",
         offenders.join("\n")
     );
 }
@@ -1277,5 +1446,54 @@ fn every_barred_release_primitive_still_exists() {
             "RELEASE_PRIMITIVES names `{name}`, but rg-core no longer exposes it — drop the \
              entry or follow the rename, or the guard quietly stops covering it"
         );
+    }
+}
+
+/// Same, for [`UNSCOPED_ROW_PRIMITIVES`] — plus the half the release table has
+/// no equivalent of.
+///
+/// A barred name that no longer exists guards nothing, and that is the failure
+/// the test above already names. The second assertion is the one this table
+/// needs on its own account: every entry in `anchored_by` claims a file is the
+/// anchor, and a file that has stopped calling the primitive altogether is a
+/// standing permission for something nobody does any more — the next call
+/// written there would be admitted with no anchor in sight and nothing red.
+#[test]
+fn every_barred_row_primitive_still_exists_and_its_anchors_still_reach_it() {
+    for family in UNSCOPED_ROW_PRIMITIVES {
+        let home = workspace_crates().join(family.home);
+        let text = fs::read_to_string(&home).unwrap_or_else(|e| {
+            panic!(
+                "UNSCOPED_ROW_PRIMITIVES names {}, which cannot be read: {e}",
+                family.home
+            )
+        });
+
+        for name in family.names {
+            assert!(
+                text.contains(&format!("pub async fn {name}(")),
+                "UNSCOPED_ROW_PRIMITIVES bars `{}::{name}`, but {} no longer defines it — drop \
+                 the entry or follow the rename, or the guard quietly stops covering it",
+                family.module,
+                family.home
+            );
+        }
+
+        for (allowed, _) in family.anchored_by {
+            let path = workspace_crates().join(allowed);
+            let source = fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("UNSCOPED_ROW_PRIMITIVES names {allowed} as an anchor, but it cannot be read: {e}")
+            });
+            assert!(
+                family
+                    .names
+                    .iter()
+                    .any(|name| source.contains(&format!("{}::{name}(", family.module))),
+                "{allowed} is allowed to reach `{}` but calls none of it any more — the entry is \
+                 now a standing exemption for nothing, and the next call written there gets in \
+                 unnoticed. Drop it from `anchored_by`",
+                family.module
+            );
+        }
     }
 }

@@ -16,19 +16,22 @@ pub async fn create(
     model.insert(db).await.context("db: create attachment")
 }
 
+/// Read an attachment by its instance-wide primary key.
+///
+/// The row carries no proof of who may see it, so the caller is what keeps it
+/// inside the right repository: `rg_core::attachment::get_attachment` is the
+/// one anchor, and it answers 404 unless `attachment.repo_id` is the
+/// repository the request was gated on and the target matches. That is the
+/// whole reason the lookup by `uuid` is gone — it did the same thing by a key
+/// nobody could anchor at all, had no callers, and was one autocomplete away
+/// from a handler skipping the compare (card_07c571dfdf95). The guard test
+/// `the_unscoped_row_primitives_are_only_reachable_from_the_files_that_anchor_them`
+/// keeps the reader below reachable only from the anchor.
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<AttachmentModel>> {
     AttachmentEntity::find_by_id(id)
         .one(db)
         .await
         .context("db: find attachment by id")
-}
-
-pub async fn find_by_uuid(db: &DatabaseConnection, uuid: &str) -> Result<Option<AttachmentModel>> {
-    AttachmentEntity::find()
-        .filter(attachment::Column::Uuid.eq(uuid))
-        .one(db)
-        .await
-        .context("db: find attachment by uuid")
 }
 
 pub async fn list_by_issue(

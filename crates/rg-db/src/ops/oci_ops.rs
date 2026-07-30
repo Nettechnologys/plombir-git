@@ -231,6 +231,14 @@ pub async fn decrement_blob_ref(db: &DatabaseConnection, blob_id: i64) -> Result
 // ── OCI Upload ──────────────────────────────────────────────
 
 /// Create a new upload session.
+///
+/// `digest` is born `NULL` and stays that way: finalizing a push writes the
+/// digest onto the `oci_blob` row and drops the session, so the session's own
+/// column is never filled in. It used to have a writer — `complete_upload`,
+/// which had no callers and matched on the uuid alone, i.e. the one primitive
+/// left that could rewrite another repository's session (card_07c571dfdf95).
+/// Nothing reads the column either, so the writer was removed rather than
+/// given the `oci_repo_id` its neighbours take.
 pub async fn create_upload(
     db: &DatabaseConnection,
     oci_repo_id: i64,
@@ -291,21 +299,6 @@ pub async fn update_upload_progress(
         .exec(db)
         .await?;
     Ok(result.rows_affected)
-}
-
-/// Complete an upload (set digest).
-pub async fn complete_upload(
-    db: &DatabaseConnection,
-    uuid: &str,
-    digest: &str,
-) -> Result<(), DbErr> {
-    use oci_upload::Entity as Upload;
-    Upload::update_many()
-        .col_expr(oci_upload::Column::Digest, Expr::value(digest.to_string()))
-        .filter(oci_upload::Column::Uuid.eq(uuid))
-        .exec(db)
-        .await?;
-    Ok(())
 }
 
 /// Delete an upload session **inside** `oci_repo_id`.
