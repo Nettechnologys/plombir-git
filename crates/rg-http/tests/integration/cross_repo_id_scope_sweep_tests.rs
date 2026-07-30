@@ -62,9 +62,21 @@
 //! that does not exist answered `404`, so the pair enumerated every review
 //! comment on the instance from a pull request of one's own. The scope was
 //! never the hole; the *difference between the two refusals* was. That is the
-//! reason [`denied`] accepts `401`/`403`/`404` and nothing else: a refusal that
-//! needs its own status code is not a refusal this sweep can read, and neither
-//! can a caller.
+//! reason a refusal needing its own status code is not a refusal this sweep can
+//! read, and neither can a caller.
+//!
+//! # Two passes, two predicates
+//!
+//! The passes ask opposite questions, so they cannot share one word for
+//! "refused". Pass one wants to know whether the probe was *masked* — refused
+//! without being told the row exists — and for that [`masked`] admits `401` and
+//! `404` but not `403`, because `403` is the answer this sweep's whole subject
+//! matter forbids (`api::boards`: "a mismatch answers 404, not 403: a 403 would
+//! confirm the id exists"). Pass two wants to know whether the fixture is still
+//! alive, and there every denial counts, `403` included — hence [`refused`].
+//!
+//! They were one predicate named `denied`, spelt `401 | 403 | 404`, and pass one
+//! therefore scored a hit on the existence oracle as a pass.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -1007,7 +1019,31 @@ async fn drive(
     (status, body.chars().take(160).collect())
 }
 
-fn denied(status: StatusCode) -> bool {
+/// **Pass one's** predicate: the probe was refused *without* being told the id
+/// exists — `401` or `404`, and specifically **not** `403`.
+///
+/// This is an oracle-strength assertion, not a denial one. The doctrine for
+/// exactly these ids is written in `api::boards` — "a mismatch answers 404, not
+/// 403: a 403 would confirm the id exists" — so a `403` here is the sweep
+/// accepting the one answer its own subject matter forbids. `route_access_sweep`
+/// had the same defect in `Expect::Hidden` and it is how the `OrgAdmin` hole
+/// survived a green run (`card_c46c354ec3ae`); this is the third site.
+///
+/// `401` stays admissible and is not a leak: a route that authenticates before
+/// it resolves anything answers the same way whether the id exists or not.
+fn masked(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 404)
+}
+
+/// **Pass two's** predicate: the owner was turned away in their own repository,
+/// by any denial at all — `401`, `403` or `404`.
+///
+/// Deliberately wider than [`masked`], and for the opposite reason. Pass two
+/// asserts the fixture is *alive*, so every refusal has to count: a `403` to the
+/// victim on the victim's own row means the baseline is dead and the probe's
+/// denial above proved nothing. Narrowing this to `masked` would read a `403`
+/// baseline as a healthy one and hand back a vacuous green.
+fn refused(status: StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 404)
 }
 
@@ -1175,7 +1211,18 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
         let (status, body) =
             drive(&fx, fact, ATTACKER, HOST, &fx.attacker_token, targets, &ids).await;
         verdicts.insert(fact.label(), status);
-        if denied(status) {
+        if masked(status) {
+            continue;
+        }
+        if status == StatusCode::FORBIDDEN {
+            leaks.push(format!(
+                "  {}\n      answered 403 for a row belonging to {VICTIM}/{VAULT}. The scope may \
+                 well have held — but the refusal confirmed the id exists, which is the one thing \
+                 a masked denial may not do: walking the id space from a repository of one's own \
+                 enumerates the instance. Owed 404, as `api::boards` puts it — a mismatch answers \
+                 404, not 403.\n      body: {body}",
+                fact.label()
+            ));
             continue;
         }
         if inconclusive(status) {
@@ -1203,13 +1250,16 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
     let mut proved = 0usize;
     for (fact, targets) in &probes {
         let (status, body) = drive(&fx, fact, VICTIM, VAULT, &fx.victim_token, targets, &ids).await;
-        if !denied(status) {
+        if !refused(status) {
             // The strongest form of the control: this exact request *worked*
-            // where the ids live, and was refused where they do not.
+            // where the ids live, and was masked where they do not. Paired
+            // against `masked`, not `refused` — a probe that answered `403` has
+            // already failed above, and counting it here would let the
+            // anti-vacuity floor be met by the very answers the sweep rejects.
             if status.is_success()
                 && verdicts
                     .get(&fact.label())
-                    .is_some_and(|probe| denied(*probe))
+                    .is_some_and(|probe| masked(*probe))
             {
                 proved += 1;
             }
@@ -1251,7 +1301,7 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
         healed.join("\n"),
     );
 
-    // Not a coverage counter — a non-vacuity one. `denied` accepts `404`, and a
+    // Not a coverage counter — a non-vacuity one. `masked` accepts `404`, and a
     // fixture that quietly stopped seeding would hand out `404` everywhere and
     // read as a clean bill of health. This counts the routes where the *same*
     // request succeeded against the repository the ids live in, so the denial
