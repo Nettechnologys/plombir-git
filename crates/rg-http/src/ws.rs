@@ -424,6 +424,23 @@ pub async fn push_job_log(hub: &NotificationHub, job_id: i64, log: &str) {
     hub.push_job_log(job_id, log).await;
 }
 
+/// The one answer for a job id the caller may not know the fate of: absent, or
+/// living in a repository they cannot see.
+///
+/// `{job_id}` is an instance-wide primary key and this route's path names no
+/// repository, so the two have to be the same reply — the rule
+/// [`crate::api::repo_access::RepoAnchor::masked`] states for the REST routes of
+/// exactly this shape, and the rule `api::boards` writes down in one line: "a
+/// mismatch answers 404, not 403: a 403 would confirm the id exists".
+///
+/// It is a function rather than four literals because the masking is only worth
+/// what the answers have in common: an outsider told `job not found` for one id
+/// and `access denied` for another has learned precisely the thing the `404` was
+/// there not to tell him — and so has one told `job not found` and `not found`.
+fn job_not_found() -> crate::error::AppError {
+    crate::error::AppError::not_found("job not found")
+}
+
 /// GET /api/v1/ws/job/:job_id — WebSocket for real-time job log streaming.
 ///
 /// Authenticates via the HttpOnly cookie, a `Sec-WebSocket-Protocol:
@@ -449,33 +466,49 @@ pub async fn ws_job_log_handler(
 
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) => job,
-        Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
+        Ok(None) => return job_not_found().into_response(),
         Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
         Ok(Some(stage)) => stage,
-        Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
+        Ok(None) => return job_not_found().into_response(),
         Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id).await
     {
         Ok(Some(pipeline)) => pipeline,
-        Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
+        Ok(None) => return job_not_found().into_response(),
         Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     let repository = match rg_db::ops::repo_ops::find_by_id(&state.db, pipeline.repo_id).await {
         Ok(Some(repository)) => repository,
-        Ok(None) => return crate::error::AppError::not_found("job not found").into_response(),
+        Ok(None) => return job_not_found().into_response(),
         Err(error) => return crate::error::AppError::from(error).into_response(),
     };
     // The handshake resolved *who* is calling out of the subprotocol / query
     // token, because a browser cannot set `Authorization` on a WebSocket. What
     // that user may read is the shared repository gate's decision, exactly as
     // it would be on the REST route serving the same logs.
+    //
+    // What the caller is *told* is not that decision, though, and this is where
+    // it parts company with the REST route: there the path named the repository,
+    // so a `403` teaches nothing the caller did not already supply, while here
+    // the caller supplied an opaque integer and any answer other than the one an
+    // absent id gets confirms the integer hit a row. So the refusal is folded
+    // into [`job_not_found`] — the same collapse `masked_denial` performs for
+    // `/artifacts/{id}`, and for the same reason.
+    //
+    // Only a *denial* is folded. A check that could not run stays what it was,
+    // or a database outage would answer `404` and send the caller off looking
+    // for a job that is very much there.
     if let Err(error) =
         crate::api::repo_access::check_read_for(&state, &repository, Some(user_id)).await
     {
-        return error.into_response();
+        return if crate::api::repo_access::is_access_denial(&error) {
+            job_not_found().into_response()
+        } else {
+            error.into_response()
+        };
     }
 
     let upgrade = if let Some(proto) = protocol_echo {

@@ -54,6 +54,14 @@
 //!   `cross_repo_id_scope_sweep_tests` drives every repository-scoped route
 //!   that carries an instance-wide id against a repository the id does not
 //!   belong to.
+//! - **An [`Access::Foreign`] row is not driven at all**, and that exemption is
+//!   about the *credential* — no fixture here holds a runner token or an OCI
+//!   bearer token. It is not a statement about the row's conduct, and reading it
+//!   as one is how `/api/v1/ws/job/{job_id}` answered `403` for a stranger's
+//!   private job and `404` for an id that never existed (card_6b2cadf41876).
+//!   `foreign_id_scope_sweep_tests` asks those rows the one question that needs
+//!   no foreign credential, because the same caller drives both halves of it:
+//!   is a real id tellable apart from an absent one?
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -412,6 +420,13 @@ fn expectation(access: Access, persona: Persona, scope: Scope) -> Expect {
         // Signed off in the route table itself: a runner token, an OCI bearer
         // token, git credentials, a CI job token, a WebSocket ticket. The sweep
         // holds none of those.
+        //
+        // What it buys is *this* pass, and only because a persona here cannot
+        // authenticate. It is not a licence to skip questions a persona could
+        // ask — `foreign_id_scope_sweep_tests` puts the transport's own
+        // credential behind the wheel and compares a real id against an absent
+        // one, which is the question this row let through for four axes of the
+        // same defect (card_6b2cadf41876).
         Access::Foreign(_) => Expect::Unchecked,
     }
 }
