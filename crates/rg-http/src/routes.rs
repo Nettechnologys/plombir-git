@@ -89,8 +89,8 @@ const CI_JOB_TOKEN: Access = Foreign(Handler {
 /// notifications.
 const WS_SESSION: Access = Foreign(Handler {
     module: "ws.rs",
-    gates: &["validate_token"],
-    note: "WebSocket: session token in `Sec-WebSocket-Protocol` or `?token=`",
+    gates: &["ws_session"],
+    note: "WebSocket: session from the HttpOnly cookie, `Sec-WebSocket-Protocol` or `?token=`",
 });
 /// The job-log socket: the ticket says who is calling, and what that user may
 /// read is the shared repository gate's decision, exactly as on the REST route
@@ -98,7 +98,7 @@ const WS_SESSION: Access = Foreign(Handler {
 const WS_JOB_LOG: Access = Foreign(Handler {
     module: "ws.rs",
     gates: &["check_read_for"],
-    note: "WebSocket: session token, then the repository read gate",
+    note: "WebSocket: session via `ws_session`, then the repository read gate",
 });
 /// Build a restrictive CORS layer.
 ///

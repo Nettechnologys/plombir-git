@@ -58,7 +58,11 @@ pub(crate) const AUTH_COOKIE_NAME: &str = "forgekeep_token";
 
 /// Extract a JWT from the `Cookie` header (M-4: HttpOnly cookie auth).
 ///
-/// Returns the raw token string if a valid `forgekeep_token` cookie is present.
+/// Returns the raw token string if a non-empty [`AUTH_COOKIE_NAME`] cookie is
+/// present. This is the *only* reader of that cookie in the crate — a second one
+/// lived in [`crate::ws`] with the name written out as a literal, which is how a
+/// rename would have quietly stopped authenticating browser WebSockets
+/// (card_24a8ef566056).
 fn extract_token_from_cookie(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get("cookie")?.to_str().ok()?;
     for cookie in cookie_header.split(';') {
@@ -105,6 +109,87 @@ fn extract_bearer_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims
     rg_core::auth::jwt::validate_token(token, jwt_secret)
 }
 
+/// Every `bearer.<jwt>` token offered in the `Sec-WebSocket-Protocol` header,
+/// each paired with the protocol string it was offered as.
+///
+/// The browser WebSocket API does not allow setting custom headers, so the
+/// subprotocol field is the only way to pass a token without exposing it in the
+/// URL — query parameters leak into server logs, browser history and the
+/// `Referer` header. The protocol string comes back alongside the token because
+/// a server that does not echo the client's selected subprotocol fails the
+/// handshake (RFC 6455 §4.1).
+///
+/// One reader, two consumers: [`presented_session_user_ids`] below checks every
+/// offered token against the revocation gate, and [`ws_session`] resolves the
+/// first one — the one a handler will actually act on.
+fn bearer_subprotocols(headers: &HeaderMap) -> Vec<(String, String)> {
+    let Some(raw) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter_map(|protocol| {
+            protocol
+                .strip_prefix("bearer.")
+                .map(|token| (protocol.to_string(), token.to_string()))
+        })
+        .collect()
+}
+
+/// The session a WebSocket handshake presented, and the subprotocol to echo.
+pub(crate) struct WsSession {
+    /// The `Sec-WebSocket-Protocol` value to select in the upgrade response,
+    /// when the token arrived as one. `None` for the cookie and query shapes,
+    /// which offer no subprotocol to echo.
+    pub(crate) protocol_echo: Option<String>,
+    /// The account this handshake authenticated, or `None` when no shape carried
+    /// a valid user session.
+    pub(crate) user_id: Option<i64>,
+}
+
+/// Resolve the session a WebSocket handshake presents.
+///
+/// Three spellings are accepted, in this order: the HttpOnly cookie (what a
+/// browser sends on a same-origin upgrade, and the *only* shape it can offer on
+/// `/ws/notifications`), a `bearer.<jwt>` subprotocol, and a legacy `?token=`
+/// query parameter.
+///
+/// This lives here rather than in [`crate::ws`] because it is a reading of a
+/// session, and the copy that lived there had already drifted: it spelled the
+/// cookie's name as a literal instead of [`AUTH_COOKIE_NAME`], so renaming the
+/// constant would have left the browser's only way into the notification socket
+/// looking for a cookie nobody sets — and failing silently, since an
+/// unauthenticated notification socket opens and then reports the error in a
+/// frame (card_24a8ef566056). Both WebSocket handlers now share this one
+/// resolution, and it sits next to [`presented_session_user_ids`], which has to
+/// agree with it about what counts as a presented session.
+pub(crate) fn ws_session(
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+    jwt_secret: &str,
+) -> WsSession {
+    let (protocol_echo, token) = match extract_token_from_cookie(headers) {
+        Some(token) => (None, Some(token)),
+        None => match bearer_subprotocols(headers).into_iter().next() {
+            Some((protocol, token)) => (Some(protocol), Some(token)),
+            None => (None, query_token.map(str::to_string)),
+        },
+    };
+
+    let user_id = token
+        .as_deref()
+        .and_then(|token| rg_core::auth::jwt::validate_token(token, jwt_secret))
+        .and_then(|claims| claims.sub.parse::<i64>().ok());
+
+    WsSession {
+        protocol_echo,
+        user_id,
+    }
+}
+
 /// Every session JWT this request presents, resolved to its user id.
 ///
 /// A session may arrive in any of the shapes this server accepts: the HttpOnly
@@ -132,15 +217,8 @@ fn presented_session_user_ids(
     }
 
     // WebSocket handshake shapes — `ws::ws_notifications_handler` accepts both.
-    if let Some(raw) = headers
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-    {
-        for proto in raw.split(',') {
-            if let Some(token) = proto.trim().strip_prefix("bearer.") {
-                candidates.push(token.to_string());
-            }
-        }
+    for (_, token) in bearer_subprotocols(headers) {
+        candidates.push(token);
     }
     if let Some(query) = query {
         for pair in query.split('&') {
@@ -353,7 +431,7 @@ mod tests {
         for (shape, name, value) in [
             ("Bearer", "authorization", format!("Bearer {jwt}")),
             ("token", "authorization", format!("token {jwt}")),
-            ("cookie", "cookie", format!("forgekeep_token={jwt}")),
+            ("cookie", "cookie", format!("{AUTH_COOKIE_NAME}={jwt}")),
             ("Basic password", "authorization", basic("alice", &jwt)),
             (
                 "Basic username",
@@ -386,7 +464,10 @@ mod tests {
     fn the_same_session_in_two_places_is_one_lookup() {
         let jwt = session(7);
         let mut h = headers("authorization", format!("Bearer {jwt}"));
-        h.insert("cookie", format!("forgekeep_token={jwt}").parse().unwrap());
+        h.insert(
+            "cookie",
+            format!("{AUTH_COOKIE_NAME}={jwt}").parse().unwrap(),
+        );
         assert_eq!(
             presented_session_user_ids(&h, Some(&format!("token={jwt}")), SECRET),
             vec![7]
@@ -437,5 +518,120 @@ mod tests {
                 "{value} was read as a session"
             );
         }
+    }
+
+    /// The cookie's name is a wire contract, and this is the one place it is
+    /// deliberately typed twice.
+    ///
+    /// Nothing in the frontend names it — the cookie is HttpOnly, so the browser
+    /// attaches it without JavaScript ever seeing it. What *does* name it are
+    /// out-of-crate callers a `cargo` build cannot see:
+    /// `scripts/browser-admin-smoke.mjs` sets it over CDP, and
+    /// `scripts/notification-websocket-contract-check.mjs` documents it as the
+    /// notification socket's only credential. Renaming the constant is therefore
+    /// legitimate but not free, and this assertion is what says so out loud
+    /// instead of letting those two scripts break in a later run.
+    #[test]
+    fn the_auth_cookie_is_named_on_the_wire_as_the_out_of_crate_callers_expect() {
+        assert_eq!(
+            AUTH_COOKIE_NAME, "forgekeep_token",
+            "renaming the auth cookie also means updating scripts/browser-admin-smoke.mjs \
+             and scripts/notification-websocket-contract-check.mjs"
+        );
+    }
+
+    /// The cookie is the browser's only way into `/ws/notifications`: it cannot
+    /// put a header on an upgrade, and the contract check forbids the frontend
+    /// from using `?token=` or a subprotocol. So a cookie handshake must resolve
+    /// to an account — and must offer no subprotocol to echo, since the client
+    /// selected none.
+    #[test]
+    fn a_handshake_carrying_only_the_auth_cookie_is_a_session() {
+        let jwt = session(42);
+        let resolved = ws_session(
+            &headers("cookie", format!("{AUTH_COOKIE_NAME}={jwt}")),
+            None,
+            SECRET,
+        );
+        assert_eq!(resolved.user_id, Some(42));
+        assert!(
+            resolved.protocol_echo.is_none(),
+            "a cookie handshake offers no subprotocol, so none may be echoed"
+        );
+    }
+
+    /// A `bearer.<jwt>` subprotocol has to come back in the upgrade response:
+    /// a client that offers one and is selected none closes the connection.
+    #[test]
+    fn a_subprotocol_handshake_is_a_session_and_gets_its_protocol_echoed() {
+        let jwt = session(7);
+        let resolved = ws_session(
+            &headers("sec-websocket-protocol", format!("bearer.{jwt}")),
+            None,
+            SECRET,
+        );
+        assert_eq!(resolved.user_id, Some(7));
+        assert_eq!(resolved.protocol_echo, Some(format!("bearer.{jwt}")));
+    }
+
+    /// The legacy `?token=` shape still resolves, and still echoes nothing.
+    #[test]
+    fn a_query_token_handshake_is_a_session() {
+        let jwt = session(9);
+        let resolved = ws_session(&HeaderMap::new(), Some(&jwt), SECRET);
+        assert_eq!(resolved.user_id, Some(9));
+        assert!(resolved.protocol_echo.is_none());
+    }
+
+    /// No shape carrying a valid user session authenticates nobody — and an
+    /// invalid token must not be mistaken for one either.
+    #[test]
+    fn a_handshake_without_a_valid_session_authenticates_nobody() {
+        for (what, headers_in, query) in [
+            ("nothing at all", HeaderMap::new(), None),
+            (
+                "an empty cookie",
+                headers("cookie", format!("{AUTH_COOKIE_NAME}=")),
+                None,
+            ),
+            (
+                "a cookie under another name",
+                headers("cookie", format!("some_other_token={}", session(1))),
+                None,
+            ),
+            (
+                "a garbage subprotocol token",
+                headers("sec-websocket-protocol", "bearer.not-a-jwt".to_string()),
+                None,
+            ),
+            ("a garbage query token", HeaderMap::new(), Some("not-a-jwt")),
+        ] {
+            assert_eq!(
+                ws_session(&headers_in, query, SECRET).user_id,
+                None,
+                "a handshake presenting {what} was read as a session"
+            );
+        }
+    }
+
+    /// Precedence is cookie first, and it is load-bearing for the echo: the
+    /// subprotocol that lost must not be selected in the response, because the
+    /// server would then be claiming a protocol it did not authenticate with.
+    #[test]
+    fn the_cookie_is_preferred_over_a_subprotocol_offered_alongside_it() {
+        let cookie_session = session(1);
+        let protocol_session = session(2);
+        let mut h = headers("cookie", format!("{AUTH_COOKIE_NAME}={cookie_session}"));
+        h.insert(
+            "sec-websocket-protocol",
+            format!("bearer.{protocol_session}").parse().unwrap(),
+        );
+
+        let resolved = ws_session(&h, None, SECRET);
+        assert_eq!(resolved.user_id, Some(1));
+        assert!(
+            resolved.protocol_echo.is_none(),
+            "the cookie won, so the unused subprotocol must not be selected"
+        );
     }
 }

@@ -1,9 +1,14 @@
 //! WebSocket real-time notification push.
 //!
-//! Clients connect to `ws://host/api/v1/ws/notifications` and authenticate
-//! via the `Sec-WebSocket-Protocol` subprotocol header (`bearer.<jwt>`).
-//! Query-parameter fallback (`?token=<jwt>`) is retained for backward
-//! compatibility but should not be used by new clients.
+//! Clients connect to `ws://host/api/v1/ws/notifications` and authenticate with
+//! the HttpOnly session cookie (what a browser sends on a same-origin upgrade)
+//! or a `Sec-WebSocket-Protocol: bearer.<jwt>` subprotocol. The query-parameter
+//! fallback (`?token=<jwt>`) is retained for backward compatibility but should
+//! not be used by new clients.
+//!
+//! Reading a session out of a handshake is not this module's job — it belongs to
+//! [`crate::api::auth::ws_session`], which owns the cookie's name and is shared
+//! with the revocation gate. This module holds the socket loops.
 //!
 //! Security: per-user notification channels and per-job log channels ensure
 //! clients only receive the streams they explicitly subscribed to.
@@ -22,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::api::auth::{ws_session, WsSession};
 use crate::AppState;
 
 /// RAII guard for the `forgekeep_ws_connections` gauge: bumps it on
@@ -249,42 +255,6 @@ pub struct WsQuery {
     token: Option<String>,
 }
 
-/// Extract a Bearer token from the `Sec-WebSocket-Protocol` header.
-///
-/// The browser WebSocket API does not allow setting custom headers, so the
-/// subprotocol field is the only way to pass a token without exposing it in
-/// the URL (query params leak into server logs, browser history, and the
-/// Referer header).
-///
-/// Returns `Some((protocol_string, token))` if a `bearer.` prefixed protocol
-/// is found, `None` otherwise.
-fn extract_bearer_from_protocol(headers: &HeaderMap) -> Option<(String, String)> {
-    let raw = headers.get("sec-websocket-protocol")?.to_str().ok()?;
-    for proto in raw.split(',') {
-        let trimmed = proto.trim();
-        if let Some(token) = trimmed.strip_prefix("bearer.") {
-            return Some((trimmed.to_string(), token.to_string()));
-        }
-    }
-    None
-}
-
-/// Extract a Bearer token from the `Cookie` header (M-4: HttpOnly cookie auth).
-///
-/// Returns the raw token string if a valid `forgekeep_token` cookie is present.
-fn extract_token_from_cookie(headers: &HeaderMap) -> Option<String> {
-    let cookie_header = headers.get("cookie")?.to_str().ok()?;
-    for cookie in cookie_header.split(';') {
-        let cookie = cookie.trim();
-        if let Some(token) = cookie.strip_prefix("forgekeep_token=") {
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
-}
-
 /// GET /api/v1/ws/notifications — WebSocket upgrade handler.
 pub async fn ws_notifications_handler(
     ws: WebSocketUpgrade,
@@ -292,22 +262,14 @@ pub async fn ws_notifications_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // M-4/M-5: Authenticate via HttpOnly cookie (preferred for browsers),
-    // then Sec-WebSocket-Protocol subprotocol, then query parameter (legacy).
-    let (proto_echo, token) = match extract_token_from_cookie(&headers) {
-        Some(t) => (None, Some(t)),
-        None => match extract_bearer_from_protocol(&headers) {
-            Some((proto, token)) => (Some(proto), Some(token)),
-            None => (None, query.token),
-        },
-    };
+    // M-4/M-5: the cookie is the browser's only shape here, so the reading of
+    // it belongs with the constant that names it — see `api::auth::ws_session`.
+    let WsSession {
+        protocol_echo,
+        user_id,
+    } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
 
-    let user_id = token
-        .as_deref()
-        .and_then(|t| rg_core::auth::jwt::validate_token(t, &state.jwt_secret))
-        .and_then(|c| c.sub.parse::<i64>().ok());
-
-    let upgrade = if let Some(proto) = proto_echo {
+    let upgrade = if let Some(proto) = protocol_echo {
         ws.protocols([proto])
     } else {
         ws
@@ -464,8 +426,8 @@ pub async fn push_job_log(hub: &NotificationHub, job_id: i64, log: &str) {
 
 /// GET /api/v1/ws/job/:job_id — WebSocket for real-time job log streaming.
 ///
-/// Authenticates via `Sec-WebSocket-Protocol: bearer.<jwt>` subprotocol
-/// (preferred) or `?token=<jwt>` query parameter (legacy fallback).
+/// Authenticates via the HttpOnly cookie, a `Sec-WebSocket-Protocol:
+/// bearer.<jwt>` subprotocol, or a `?token=<jwt>` query parameter (legacy).
 /// Frontend subscribes to receive `job_log` events filtered by the specified job_id.
 pub async fn ws_job_log_handler(
     ws: WebSocketUpgrade,
@@ -474,19 +436,12 @@ pub async fn ws_job_log_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    // M-4/M-5: Authenticate via cookie (preferred), subprotocol, or query param
-    let (proto_echo, token) = match extract_token_from_cookie(&headers) {
-        Some(t) => (None, Some(t)),
-        None => match extract_bearer_from_protocol(&headers) {
-            Some((proto, token)) => (Some(proto), Some(token)),
-            None => (None, query.token),
-        },
-    };
-
-    let user_id = token
-        .as_deref()
-        .and_then(|t| rg_core::auth::jwt::validate_token(t, &state.jwt_secret))
-        .and_then(|c| c.sub.parse::<i64>().ok());
+    // The same reading of a handshake as the notification socket above, from the
+    // same place — see `api::auth::ws_session`.
+    let WsSession {
+        protocol_echo,
+        user_id,
+    } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
 
     let Some(user_id) = user_id else {
         return crate::error::AppError::unauthorized("authentication required").into_response();
@@ -523,7 +478,7 @@ pub async fn ws_job_log_handler(
         return error.into_response();
     }
 
-    let upgrade = if let Some(proto) = proto_echo {
+    let upgrade = if let Some(proto) = protocol_echo {
         ws.protocols([proto])
     } else {
         ws

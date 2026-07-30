@@ -5,8 +5,9 @@
 // HttpOnly `forgekeep_token` cookie the browser sends automatically on a
 // same-origin upgrade (M-4/M-5). The token must NOT be leaked into the URL
 // query string, nor passed as a Sec-WebSocket-Protocol subprotocol — the
-// backend `ws_notifications_handler` reads the cookie first
-// (crates/rg-http/src/ws.rs `extract_token_from_cookie`).
+// backend `ws_notifications_handler` reads the cookie first, through
+// crates/rg-http/src/api/auth.rs `ws_session` — which is also where the cookie's
+// name lives (`AUTH_COOKIE_NAME`). Renaming it means updating this file too.
 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';

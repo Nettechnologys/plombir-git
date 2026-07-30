@@ -64,6 +64,7 @@ mod merge_queue_ci_tests;
 mod mfa_disable_lockout_tests;
 mod mirror_tests;
 mod notification_tests;
+mod notification_websocket_cookie_tests;
 mod oauth_pkce_tests;
 mod oci_permission_tests;
 mod oci_push_pull_tests;
