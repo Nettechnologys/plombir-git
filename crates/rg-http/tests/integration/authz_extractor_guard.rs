@@ -21,8 +21,26 @@
 //! module-private, so `api::admin::InstanceAdmin` is the only way to reach it
 //! from anywhere else and the compiler enforces what this grep would only
 //! notice. The repository gates cannot follow suit — `api::repo_access` has to
-//! export `check_read_for` / `check_write_for` for the transports that resolve
-//! their own caller — which is why the grep is still the mechanism there.
+//! export `check_read_for` / `check_write_for` to the transports that resolve
+//! their own caller, and those live in other modules of this crate — which is
+//! why the grep is still the mechanism *inside* `rg-http`.
+//!
+//! They do stop one step short of public, though, and that step is the whole
+//! answer to the workspace question: every name in [`GATES`] is `pub(crate)`,
+//! so a crate that depends on `rg-http` cannot call one however it spells the
+//! path. `pub mod api;` / `pub mod repo_access;` make the *module* reachable
+//! and the functions in it are not — a distinction worth writing down, because
+//! reading only the module declarations says the opposite.
+//!
+//! So the rule has two halves and a test each.
+//! [`the_repository_gates_are_crate_private`] pins the compiler's half, which
+//! is the half actually holding today; without it, one word in a signature
+//! retires the guarantee silently.
+//! [`the_repository_gates_are_not_called_from_the_other_crates_either`] is the
+//! grep behind it, and it is deliberately kept even though it cannot fire while
+//! the first one passes: the day a gate is widened on purpose, the call sites
+//! are what is left to answer for, and that is not the day to start writing the
+//! scan.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,6 +73,11 @@ use std::path::{Path, PathBuf};
 /// living in exactly that blind spot with a prologue of its own for four routes
 /// (card_1ec383429aea); when the path names no repository, the shape to take is
 /// `AnchoredRead` / `AnchoredWrite`, which resolves and then asks the gate here.
+///
+/// A name added here has to be `pub(crate) async fn` in [`GATES_HOME`] — see
+/// [`the_repository_gates_are_crate_private`], which is both the visibility pin
+/// and the check that this list still names something. A rename that empties it
+/// turns every guard over it green in the same commit.
 const GATES: &[&str] = &[
     "require_read",
     "require_read_with_ci",
@@ -287,10 +310,31 @@ const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
     ),
     (
         "rg-ssh/src/lib.rs",
-        "SSH transport: resolves its caller from the public key and cannot reach `api::repo_access` \
-         from outside `rg-http`",
+        "SSH transport: resolves its caller from the public key, and does not depend on `rg-http` \
+         at all — the dependency graph, not the visibility of one module, is what puts \
+         `api::repo_access` out of its reach",
     ),
 ];
+
+/// The file that *defines* the repository gates, spelled workspace-relative.
+///
+/// The crate name is part of it because the question asked of this file —
+/// "can anything outside `rg-http` call one of these?" — is a question about
+/// the crate boundary, so it is read through [`workspace_crates`] the way
+/// [`MEMBERSHIP_OPS`] is, not through [`src_root`].
+const GATES_HOME: &str = "rg-http/src/api/repo_access.rs";
+
+/// Files outside `rg-http` that legitimately call a repository gate, with the
+/// reason.
+///
+/// Empty, and it cannot be otherwise while
+/// [`the_repository_gates_are_crate_private`] passes: `pub(crate)` means an
+/// entry here would name a file that does not compile. It is written out rather
+/// than left absent for the same reason the release-primitive guard next door
+/// carries an empty list — an absent list is indistinguishable from a rule
+/// nobody extended, and this is the line the first legitimate exception has to
+/// be argued on.
+const GATES_WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[];
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -789,6 +833,87 @@ fn the_org_membership_predicate_is_not_decided_in_the_other_crates_either() {
     );
 }
 
+/// The compiler's half of the gate rule: `pub(crate)`, never `pub`.
+///
+/// `repository_gates_are_only_reachable_through_the_extractors` walks
+/// `crates/rg-http/src` and stops, and every sibling rule that stopped at that
+/// edge turned out to be narrower than itself — `PREDICATES`, `ORG_MEMBERSHIP`
+/// and the release primitives each had to be widened after a copy was found one
+/// crate over. This list is the one that does *not* need widening for that
+/// reason, and it is worth being precise about why: not because the module is
+/// unreachable — `pub mod api;` and `pub mod repo_access;` make it perfectly
+/// reachable, and `rg-cli` already depends on `rg-http` — but because every
+/// function in it is `pub(crate)`. The gate is barred outside this crate by the
+/// compiler, which is a stronger guarantee than any grep, and it was resting on
+/// nothing but the absence of a reason to change it.
+///
+/// One word in one signature retires it. That is what this test costs to keep
+/// and what it buys.
+///
+/// It doubles as the liveness check the barred lists all need: a rename that
+/// empties [`GATES`] turns
+/// `repository_gates_are_only_reachable_through_the_extractors` green and
+/// silent in the same commit, exactly as
+/// [`every_membership_predicate_still_exists`] guards against next door.
+#[test]
+fn the_repository_gates_are_crate_private() {
+    let path = workspace_crates().join(GATES_HOME);
+    let text = fs::read_to_string(&path).expect("read the gate module");
+
+    for gate in GATES {
+        assert!(
+            !text.contains(&format!("pub async fn {gate}(")),
+            "`{gate}` is `pub` in {GATES_HOME}, so every crate that depends on `rg-http` can now \
+             call the gate directly — `resolve_repo` plus `{gate}` is a complete gate written by \
+             hand, and no guard in this file walks the crate that would write it. Narrow it back \
+             to `pub(crate)`. If the wider visibility is genuinely wanted, say why here and lean \
+             on `the_repository_gates_are_not_called_from_the_other_crates_either` for the call \
+             sites — that scan exists for this day."
+        );
+        assert!(
+            text.contains(&format!("pub(crate) async fn {gate}(")),
+            "GATES names `{gate}`, but {GATES_HOME} no longer defines it as \
+             `pub(crate) async fn` — follow the rename or drop the entry, or every guard over \
+             this list quietly stops covering it"
+        );
+    }
+}
+
+/// The gates, in the crates no scan in this file reaches.
+///
+/// This one cannot fail while [`the_repository_gates_are_crate_private`] holds,
+/// and that is the point of writing it now rather than later: it is the second
+/// half of a rule whose first half is one word wide. The three sibling lists
+/// were each widened *after* a live copy of the rule was found outside
+/// `rg-http` — `fork_repo` for the read predicate, `create_repo` for
+/// membership. Here there is no copy to find, because the compiler never let
+/// one be written; if that ever changes deliberately, the scan is already in
+/// place and the exception has a list to be argued into.
+#[test]
+fn the_repository_gates_are_not_called_from_the_other_crates_either() {
+    // No home to exempt: [`GATES_HOME`] lives inside `rg-http`, which
+    // `other_crate_offenders` skips wholesale. The predicate guards pass one
+    // because their rule is defined in `rg-core`, out in the scanned tree.
+    let (offenders, scanned) = other_crate_offenders(GATES, &[], GATES_WORKSPACE_SIGNED_OFF);
+
+    assert!(
+        scanned > 50,
+        "only {scanned} file(s) scanned outside rg-http — the guard is not running"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a repository access gate was called from outside `rg-http`.\n\
+         A crate that serves HTTP takes the decision from an extractor (RepoRead / RepoAuthRead \
+         / RepoWrite / RepoAdmin / RepoOwner / CiRead<_>); a crate speaking another protocol \
+         resolves its own caller and asks `check_read_for` / `check_write_for` — from inside \
+         `rg-http`, where those live. Assembling the gate out here instead — `resolve_repo` \
+         followed by `check_read` — is a second implementation in a crate the guards above \
+         cannot see, which is how `fork_repo` came to hold a copy of the read rule. If a crate \
+         really has to call one, sign it off in GATES_WORKSPACE_SIGNED_OFF with the reason.\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// The barred names have to keep naming something.
 ///
 /// A rename that empties the list turns every guard over it green and silent in
@@ -887,6 +1012,17 @@ fn signed_off_exceptions_are_live() {
         assert!(
             workspace_crates().join(rel).exists(),
             "ORG_MEMBERSHIP_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the \
+             entry"
+        );
+        assert!(!reason.is_empty(), "{rel} is signed off without a reason");
+    }
+    // Empty for a stronger reason than the list above — `pub(crate)` makes an
+    // entry here uncompilable — but held to the same conditions, because the
+    // day it stops being empty is the day the visibility changed.
+    for (rel, reason) in GATES_WORKSPACE_SIGNED_OFF {
+        assert!(
+            workspace_crates().join(rel).exists(),
+            "GATES_WORKSPACE_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the \
              entry"
         );
         assert!(!reason.is_empty(), "{rel} is signed off without a reason");
