@@ -9,7 +9,15 @@
 //! exists"); these tests hold the user-scoped half of it. Each one carries a
 //! live baseline — the owner's own id still works in the same run — so the
 //! test cannot pass by having broken the route for everybody.
+//!
+//! `user_scoped_id_scope_sweep_tests` now walks *every* route of this shape off
+//! the route table, which is what makes the seventh one somebody adds visible.
+//! These two stay because they are the readable statement of the rule — a
+//! failure here names one route and one resource, where the sweep names a
+//! population — and because a fixture built through the public API is a second
+//! opinion on the rows the sweep inserts through `rg_db`.
 
+use crate::common::answer::Answer;
 use crate::common::{register_user, spawn_test_app};
 
 const OWNER_KEY: &str =
@@ -21,16 +29,11 @@ const OTHER_KEY: &str =
 /// has to be indistinguishable from.
 const UNUSED_ID: i64 = 999_999;
 
-/// The distinguishing part of an error body. `request_id` is fresh on every
-/// response by design, so comparing whole bodies would never match; what must
-/// not differ between "someone else's row" and "no such row" is the code and
-/// the message.
-fn error_shape(body: &serde_json::Value) -> (Option<&str>, Option<&str>) {
-    (
-        body["error"]["code"].as_str(),
-        body["error"]["message"].as_str(),
-    )
-}
+// The comparison used to be a local `error_shape` that read `error.code` and
+// `error.message` and nothing else — weaker than it looked, because a difference
+// in any other field of the envelope was invisible to it. `Answer::shape` is the
+// whole reply minus the `request_id` that is fresh on every response, and it is
+// the same comparison the three sweeps make.
 
 #[tokio::test]
 async fn another_accounts_token_id_is_indistinguishable_from_an_unused_one() {
@@ -50,31 +53,33 @@ async fn another_accounts_token_id_is_indistinguishable_from_an_unused_one() {
     let created: serde_json::Value = created.json().await.unwrap();
     let token_id = created["id"].as_i64().unwrap();
 
-    let stranger = client
-        .delete(format!("{base}/api/v1/users/tokens/{token_id}"))
-        .bearer_auth(&other)
-        .send()
-        .await
-        .unwrap();
-    let stranger_status = stranger.status();
-    let stranger_body: serde_json::Value = stranger.json().await.unwrap();
+    let stranger = Answer::of(
+        client
+            .delete(format!("{base}/api/v1/users/tokens/{token_id}"))
+            .bearer_auth(&other)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(
-        stranger_status, 404,
+        stranger.status, 404,
         "another account's token id must not be confirmed with a 403"
     );
 
-    let unused = client
-        .delete(format!("{base}/api/v1/users/tokens/{UNUSED_ID}"))
-        .bearer_auth(&other)
-        .send()
-        .await
-        .unwrap();
-    let unused_status = unused.status();
-    let unused_body: serde_json::Value = unused.json().await.unwrap();
-    assert_eq!(unused_status, 404);
+    let unused = Answer::of(
+        client
+            .delete(format!("{base}/api/v1/users/tokens/{UNUSED_ID}"))
+            .bearer_auth(&other)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(unused.status, 404);
     assert_eq!(
-        error_shape(&stranger_body),
-        error_shape(&unused_body),
+        stranger.shape(),
+        unused.shape(),
         "an existing token and an unused id must answer the same thing"
     );
 
@@ -120,31 +125,33 @@ async fn another_accounts_ssh_key_id_is_indistinguishable_from_an_unused_one() {
     let own_key: serde_json::Value = own_key.json().await.unwrap();
     let own_key_id = own_key["id"].as_i64().unwrap();
 
-    let stranger = client
-        .delete(format!("{base}/api/v1/users/ssh-keys/{key_id}"))
-        .bearer_auth(&other)
-        .send()
-        .await
-        .unwrap();
-    let stranger_status = stranger.status();
-    let stranger_body: serde_json::Value = stranger.json().await.unwrap();
+    let stranger = Answer::of(
+        client
+            .delete(format!("{base}/api/v1/users/ssh-keys/{key_id}"))
+            .bearer_auth(&other)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(
-        stranger_status, 404,
+        stranger.status, 404,
         "another account's SSH key id must not be confirmed with a 403"
     );
 
-    let unused = client
-        .delete(format!("{base}/api/v1/users/ssh-keys/{UNUSED_ID}"))
-        .bearer_auth(&other)
-        .send()
-        .await
-        .unwrap();
-    let unused_status = unused.status();
-    let unused_body: serde_json::Value = unused.json().await.unwrap();
-    assert_eq!(unused_status, 404);
+    let unused = Answer::of(
+        client
+            .delete(format!("{base}/api/v1/users/ssh-keys/{UNUSED_ID}"))
+            .bearer_auth(&other)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(unused.status, 404);
     assert_eq!(
-        error_shape(&stranger_body),
-        error_shape(&unused_body),
+        stranger.shape(),
+        unused.shape(),
         "an existing SSH key and an unused id must answer the same thing"
     );
 

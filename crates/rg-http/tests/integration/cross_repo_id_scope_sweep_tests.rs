@@ -110,6 +110,7 @@ use rg_http::route_table::RouteFact;
 use sea_orm::Set;
 
 use crate::common::answer::Answer;
+use crate::common::route_path::placeholders;
 use crate::common::{register_full, spawn_test_app_with_routes_and_db};
 
 const ATTACKER: &str = "scopeattacker";
@@ -1509,14 +1510,4 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
          stopped reaching them",
         probes.len(),
     );
-}
-
-/// The placeholder names of a path, in order.
-fn placeholders(path: &str) -> impl Iterator<Item = &str> {
-    path.split('{').skip(1).filter_map(|chunk| {
-        chunk
-            .split('}')
-            .next()
-            .map(|name| name.strip_prefix('*').unwrap_or(name))
-    })
 }

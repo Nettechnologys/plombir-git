@@ -1,3 +1,4 @@
+use crate::common::answer::Answer;
 use crate::common::{register_full, spawn_test_app_with_db};
 use sea_orm::{ActiveModelTrait, Set};
 use sha2::{Digest, Sha256};
@@ -49,41 +50,20 @@ async fn create_assigned_job(
     (pipeline.id, job.id)
 }
 
-/// Everything a caller learns from one refusal, minus what is fresh on every
-/// response.
-///
-/// The status alone is not it. Two `404`s that differ by their `message` are two
-/// answers, and telling them apart is the whole of what an enumeration oracle
-/// needs — so the body travels with the code, normalized only of the
-/// `request_id` the tracing middleware stamps into every error envelope (a raw
-/// body comparison is red between any two requests).
-fn shape(status: reqwest::StatusCode, body: &str) -> (u16, String) {
-    let normalized = match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(mut parsed) => {
-            if let Some(error) = parsed
-                .as_object_mut()
-                .and_then(|o| o.get_mut("error"))
-                .and_then(|e| e.as_object_mut())
-            {
-                error.remove("request_id");
-            }
-            parsed.to_string()
-        }
-        // Not JSON — an empty body, or a handler answering in another shape.
-        // Compared verbatim rather than waved through.
-        Err(_) => body.to_string(),
-    };
-    (status.as_u16(), normalized)
-}
+// "Everything a caller learns from one refusal" used to be a third copy of the
+// same normalizer here — the status beside the body, minus the `request_id` that
+// is fresh on every response. `common::answer::Answer` is that one copy, and the
+// reason it is one: this file's version normalized only `error.request_id` while
+// the sweeps' versions had already learned to strip the envelope's top-level one
+// too, so two answers that said the same thing could still differ by a uuid
+// here.
 
 async fn get_answer(client: &reqwest::Client, url: &str, token: Option<&str>) -> (u16, String) {
     let mut request = client.get(url);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.unwrap();
-    let status = response.status();
-    shape(status, &response.text().await.unwrap())
+    Answer::of(request.send().await.unwrap()).await.shape()
 }
 
 async fn delete_answer(client: &reqwest::Client, url: &str, token: Option<&str>) -> (u16, String) {
@@ -91,9 +71,7 @@ async fn delete_answer(client: &reqwest::Client, url: &str, token: Option<&str>)
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.unwrap();
-    let status = response.status();
-    shape(status, &response.text().await.unwrap())
+    Answer::of(request.send().await.unwrap()).await.shape()
 }
 
 #[tokio::test]
