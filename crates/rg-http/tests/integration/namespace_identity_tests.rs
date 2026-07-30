@@ -146,23 +146,23 @@ async fn an_owners_repository_listing_excludes_the_organizations_repositories() 
     );
 }
 
-/// The name-collision half. `create_repo_with_opts` asked
-/// `find_by_owner_and_name(owner_id, name)`, which for an organization is *its
-/// owner's* account, so an organization repository blocked the owner's personal
-/// one and the refusal named neither the namespace nor the reason.
+/// The name-collision half, and the last piece of the boundary to land.
 ///
-/// The two namespaces still cannot hold the same name at the same time, but the
-/// reason is now one specific thing and it is stated: `repositories` carries
-/// `UNIQUE (owner_id, name)` from its first migration, and an organization's row
-/// hangs off its owner's account id. Relaxing that is card_615e00843297 — a
-/// cross-backend migration with a real design question in it (MySQL has no
-/// partial unique index), which is why it is not this change.
+/// `create_repo_with_opts` used to ask `find_by_owner_and_name(owner_id, name)`,
+/// which for an organization is *its owner's* account, so an organization
+/// repository blocked the owner's personal one. card_92019cc97dcd fixed the
+/// query; the *table* still could not hold both, because `repositories` was born
+/// with `UNIQUE (owner_id, name)` and an organization's row hangs off its
+/// owner's account id. Until card_615e00843297 replaced that constraint with
+/// `UNIQUE (namespace_key, name)`, this test asserted the `400` the schema
+/// forced and named it as such.
 ///
-/// When it lands, this test fails at the `400` below, which is the point: the
-/// assertion is here so the constraint cannot be relaxed without someone
-/// noticing that this is the behaviour it was holding up.
+/// Now the two namespaces genuinely coexist, and both halves are asserted here:
+/// the same name in the other namespace is accepted *and* both repositories
+/// answer at their own paths afterwards — a `201` that leaves one of them
+/// unreachable would be a worse outcome than the refusal it replaced.
 #[tokio::test]
-async fn a_cross_namespace_name_collision_is_refused_for_a_stated_reason() {
+async fn the_same_name_lives_in_a_personal_account_and_in_an_organization_it_owns() {
     let base = spawn_test_app().await;
     let (token, _) = register_full(&base, "ni3-owner", "ni3-owner@example.com").await;
 
@@ -175,31 +175,75 @@ async fn a_cross_namespace_name_collision_is_refused_for_a_stated_reason() {
         "baseline: the organization's repository exists"
     );
 
-    // Same name in the *other* namespace. Still refused — by the table, not by
-    // the namespace check — and the body has to say which of the two it is.
     let (status, body) = create_repo_in(&base, &token, "twin", None).await;
     assert_eq!(
-        status, 400,
-        "a same-named personal repository was accepted — if the UNIQUE (owner_id, name) \
-         constraint is gone, this test is what has to be updated (card_615e00843297)"
-    );
-    assert!(
-        body.contains("another namespace on the owning account"),
-        "the refusal does not say the collision is the account-wide database constraint \
-         rather than a repository of that name in this namespace: {body}"
+        status, 201,
+        "the owner's personal namespace still cannot hold a name their organization uses ({body})"
     );
 
-    // And the organization's repository is untouched by the refused attempt.
     assert_eq!(
         get_repo_status(&base, &token, "ni3corp", "twin").await,
         200,
-        "the refused creation disturbed the repository it collided with"
+        "the organization's repository stopped answering once its personal twin existed"
+    );
+    assert_eq!(
+        get_repo_status(&base, &token, "ni3-owner", "twin").await,
+        200,
+        "the personal repository was reported created but does not answer"
+    );
+
+    let personal = listed_repo_names(&base, &token, "ni3-owner").await;
+    assert_eq!(
+        personal,
+        vec!["twin".to_string()],
+        "the owner's listing does not show exactly their own `twin`"
+    );
+    let org = listed_repo_names(&base, &token, "ni3corp").await;
+    assert_eq!(
+        org,
+        vec!["twin".to_string()],
+        "the organization's listing does not show exactly its own `twin`"
+    );
+}
+
+/// The other half of the same constraint: within *one* namespace the name is
+/// still taken, and the refusal is the namespace check's, not the table's.
+#[tokio::test]
+async fn a_name_already_used_in_the_same_namespace_is_still_refused() {
+    let base = spawn_test_app().await;
+    let (token, _) = register_full(&base, "ni5-owner", "ni5-owner@example.com").await;
+
+    assert_eq!(
+        create_repo_in(&base, &token, "solo", None).await.0,
+        201,
+        "baseline: the personal repository exists"
+    );
+    assert_eq!(
+        create_repo_in(&base, &token, "solo", None).await.0,
+        400,
+        "a second personal repository of the same name was accepted"
+    );
+
+    create_org(&base, &token, "ni5corp").await;
+    assert_eq!(
+        create_repo_in(&base, &token, "solo", Some("ni5corp"))
+            .await
+            .0,
+        201,
+        "baseline: the organization may take the name too"
+    );
+    assert_eq!(
+        create_repo_in(&base, &token, "solo", Some("ni5corp"))
+            .await
+            .0,
+        400,
+        "a second repository of the same name in one organization was accepted"
     );
 }
 
 /// A same-named repository in an organization the caller does *not* own must not
-/// interfere at all: the collision the schema still enforces is per account, and
-/// a stranger's organization is a different account.
+/// interfere at all — the boundary is not only between an account and the
+/// organizations it owns, it is between every pair of namespaces.
 #[tokio::test]
 async fn a_foreign_organizations_repository_does_not_block_the_same_name() {
     let base = spawn_test_app().await;

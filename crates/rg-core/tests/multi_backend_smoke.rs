@@ -5,6 +5,31 @@
 
 use sea_orm::{NotSet, Set};
 
+/// A repository row in the namespace given by `org_id` (`None` = personal).
+fn namespace_repo(
+    owner_id: i64,
+    org_id: Option<i64>,
+    name: &str,
+) -> rg_db::entities::repository::ActiveModel {
+    let now = chrono::Utc::now();
+    rg_db::entities::repository::ActiveModel {
+        id: NotSet,
+        owner_id: Set(owner_id),
+        name: Set(name.to_string()),
+        description: Set(None),
+        is_private: Set(false),
+        default_branch: Set("main".to_string()),
+        fork_id: Set(None),
+        stars_count: Set(0),
+        forks_count: Set(0),
+        org_id: Set(org_id),
+        created_at: Set(now),
+        updated_at: Set(now),
+        deleted_at: Set(None),
+        origin_repo_id: Set(None),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
@@ -89,6 +114,52 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .expect("repository exists");
     assert_eq!(counted_repo.stars_count, 1);
 
+    // card_615e00843297: `repositories` used to hold one name per *account*, so
+    // a personal repository and one in an organization the same account owns
+    // could not share a name. The replacement — a `namespace_key` generated
+    // column plus `UNIQUE (namespace_key, name)` — is spelled differently on
+    // each backend (`STORED` here, `VIRTUAL` on MySQL, a table rebuild on
+    // SQLite), so "the migration applied" is not the same claim as "it
+    // enforces the right thing". Assert the behaviour, on the real server.
+    let org = rg_db::ops::org_ops::create_org(
+        &db,
+        &format!("{username}org"),
+        None,
+        None,
+        user.id,
+        "public",
+    )
+    .await
+    .expect("create an organization owned by the same account");
+
+    let twin = format!("twin{suffix}");
+    let personal_twin = rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, None, &twin))
+        .await
+        .expect("create the personal repository");
+    rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, Some(org.id), &twin))
+        .await
+        .expect(
+            "the two namespaces still cannot hold the same name — the account-wide \
+             constraint is still on this backend",
+        );
+    assert!(
+        rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, None, &twin))
+            .await
+            .is_err(),
+        "a duplicate name inside one namespace was accepted — uniqueness has to stay \
+         enforced by the database, not only by the service layer"
+    );
+
+    rg_db::ops::repo_ops::soft_delete(&db, personal_twin.id)
+        .await
+        .expect("soft-delete the personal repository");
+    rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, None, &twin))
+        .await
+        .expect(
+            "a soft-deleted repository still reserves its name: every lookup filters \
+             `deleted_at IS NULL`, so recreating it surfaced as an anonymous 5xx",
+        );
+
     let page = rg_core::wiki::service::create_page(
         &db,
         repo.id,
@@ -149,6 +220,11 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     rg_db::ops::repo_ops::delete_by_id(&db, repo.id)
         .await
         .expect("delete smoke-test repository");
+    // `organizations.owner_id` carries no foreign key, so deleting the user
+    // below would leave this row behind.
+    rg_db::ops::org_ops::delete_org(&db, org.id)
+        .await
+        .expect("delete smoke-test organization");
     rg_db::ops::user_ops::delete_by_id(&db, user.id)
         .await
         .expect("delete smoke-test user");

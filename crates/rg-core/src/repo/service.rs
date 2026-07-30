@@ -298,20 +298,6 @@ async fn ensure_repo_name_free(
         return Err(crate::error::invalid_request(taken_message.to_string()));
     }
 
-    // The namespace is free but the table is not: `repositories` still carries
-    // `UNIQUE (owner_id, name)` from its first migration, and an organization's
-    // row hangs off its owner's account, so one `name` per account is all the
-    // schema can hold regardless of namespace. Say that, as the caller's `400`,
-    // instead of letting the insert or the ownership update come back as an
-    // anonymous 5xx. Delete this branch with the constraint (card_615e00843297).
-    let account_slot = repo_ops::find_in_owner_account_by_name(db, owner_id, name).await?;
-    if occupies(account_slot).is_some() {
-        return Err(crate::error::invalid_request(format!(
-            "repository name '{name}' is already used by another namespace on the owning account; \
-             pick a different name until one name per account stops being a database constraint"
-        )));
-    }
-
     Ok(())
 }
 

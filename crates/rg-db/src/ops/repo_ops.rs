@@ -58,31 +58,6 @@ pub async fn find_personal_by_owner_and_name(
         .context("db: find personal repo by owner and name")
 }
 
-/// Any repo named `name` hanging off `owner_id`'s account — **both** namespaces
-/// at once, the personal one and every organization this account owns.
-///
-/// This is deliberately not a namespace lookup and is almost never what a
-/// caller wants; [`find_personal_by_owner_and_name`] is. It exists for one
-/// reason: `repositories` still carries the `UNIQUE (owner_id, name)` table
-/// constraint from its first migration, so the *table* cannot yet hold a
-/// personal `alice/db` next to an `acme/db` owned by alice even though those
-/// are different namespaces. Callers use this to answer that collision as a
-/// `400` naming the real cause instead of letting the insert surface as a 5xx.
-/// It goes away with the constraint (card_615e00843297).
-pub async fn find_in_owner_account_by_name(
-    db: &DatabaseConnection,
-    owner_id: i64,
-    name: &str,
-) -> Result<Option<Repo>> {
-    RepoEntity::find()
-        .filter(repository::Column::OwnerId.eq(owner_id))
-        .filter(repository::Column::Name.eq(name))
-        .filter(repository::Column::DeletedAt.is_null())
-        .one(db)
-        .await
-        .context("db: find repo by owner account and name")
-}
-
 /// List all non-deleted repos in a user's **personal** namespace.
 ///
 /// `org_id IS NULL` for the same reason as
