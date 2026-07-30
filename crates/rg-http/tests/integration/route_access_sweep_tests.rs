@@ -1001,21 +1001,181 @@ async fn no_route_answers_a_query_complaint_before_its_gate() {
     );
 }
 
-/// Files allowed to call `Router::route` directly, with the reason.
-const ROUTE_CALL_SIGNED_OFF: &[(&str, &str)] = &[
+/// On what grounds a file is allowed to call `Router::route` directly.
+///
+/// The reason beside each entry is prose, and prose is not checked. The variant
+/// is the part [`every_route_call_sign_off_still_holds`] can read back: it says
+/// *which* claim the entry is making, so the claim can be measured against the
+/// file instead of trusted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RouteCallSignOff {
+    /// The table itself. `.route` here *is* the implementation of the thing
+    /// every other module has to go through, so it is production code by
+    /// definition and there is nothing further to check.
+    TheTable,
+    /// Test scaffolding: the calls exist only inside the file's `#[cfg(test)]`
+    /// module, so no route the server serves can come from them. Checkable, and
+    /// checked — a call that moves out of that module fails the guard.
+    TestScaffold,
+}
+
+/// Files allowed to call `Router::route` directly, with the grounds and reason.
+///
+/// Read back by [`every_route_call_sign_off_still_holds`]: the file has to still
+/// exist, still carry a route call the entry buys something for, and — for a
+/// [`RouteCallSignOff::TestScaffold`] — keep every one of those calls inside its
+/// `#[cfg(test)]` module. Without that this was the one exemption list in the
+/// authz guards nothing re-read, so a production `.route(...)` added to a signed
+/// file would have been exempt for good (card_543ed2598323).
+const ROUTE_CALL_SIGNED_OFF: &[(&str, RouteCallSignOff, &str)] = &[
     (
         "route_table.rs",
+        RouteCallSignOff::TheTable,
         "the table itself: the one place a route is registered, and it takes an `Access`",
     ),
     (
         "security.rs",
+        RouteCallSignOff::TestScaffold,
         "a two-route scaffold inside `#[cfg(test)]`, to drive the header middleware",
     ),
     (
         "rate_limit.rs",
+        RouteCallSignOff::TestScaffold,
         "a one-route scaffold inside `#[cfg(test)]`, to drive the limiter middleware",
     ),
 ];
+
+/// `crates/rg-http/src`, the tree both route-call guards walk.
+fn src_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Lines of `text` that mount something on a bare `axum::Router`, as
+/// `(1-based line, trimmed line)`.
+///
+/// Shared by the guard and its reverse check so the two cannot disagree about
+/// what counts as registering a route — a list of names that one caller knows
+/// and another does not is the defect this phase keeps finding.
+///
+/// `nest_service` is in here with the two `route*` forms because it mounts a
+/// whole tower `Service` at a path, and a `Service` is not built by `.route`
+/// calls this guard could catch further down. `fallback_service` is *not*: it
+/// claims no path of its own, it answers the ones nothing claimed, and what it
+/// answers with is a separate question (card_dd8497e4fd58).
+///
+/// Comment lines are skipped — `RouteTable`'s own doc comment quotes the chained
+/// `.route(path, post(h).layer(l))` form it replaced.
+fn route_mount_lines(text: &str) -> Vec<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(n, line)| {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                return None;
+            }
+            let mounts = code.contains(".route(")
+                || code.contains(".route_service(")
+                || code.contains(".nest_service(");
+            mounts.then_some((n + 1, code))
+        })
+        .collect()
+}
+
+/// The 1-based line the file's `#[cfg(test)] mod …` block starts on.
+///
+/// Anchored on the `#[cfg(test)]` + `mod` *pair* rather than on the attribute
+/// alone, the same way `authz_extractor_guard::predicate_home_offenders` finds
+/// this boundary. `rate_limit.rs` is why: it carries three `#[cfg(test)]`
+/// helpers a hundred lines above its test module, and anchoring on the attribute
+/// would put the boundary at the first of them and wave the rest of the file
+/// through.
+fn test_module_start(text: &str) -> Option<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().enumerate().find_map(|(n, line)| {
+        let is_pair = line.trim_start() == "#[cfg(test)]"
+            && lines[n + 1..]
+                .iter()
+                .take(2)
+                .any(|next| next.trim_start().starts_with("mod "));
+        is_pair.then_some(n + 1)
+    })
+}
+
+/// Every sign-off still describes the file it names.
+///
+/// The list is the widest exemption in this file — an entry turns the guard off
+/// for a whole source file — and it was the only one nothing read back. Not even
+/// "the file exists": a rename left the entry behind as a standing indulgence for
+/// whatever took that name next, and the `#[cfg(test)]` claim two of the three
+/// entries make was never compared to where the calls actually are.
+///
+/// So each entry is measured here:
+///
+/// - the file exists, and the reason is not empty — as
+///   `authz_extractor_guard::signed_off_exceptions_are_live` does for its list;
+/// - the file still mounts *something* on a bare `Router`, or the entry buys
+///   nothing and should go;
+/// - a [`RouteCallSignOff::TestScaffold`] keeps every one of those mounts inside
+///   its `#[cfg(test)]` module. This is the half that matters: a served
+///   `.route(...)` added to `security.rs` or `rate_limit.rs` never reaches a
+///   `RouteFact`, so the persona sweep, `foreign_gate_guard` and
+///   `route_gate_rank_guard` are all blind to it at once.
+#[test]
+fn every_route_call_sign_off_still_holds() {
+    let src = src_root();
+    let mut offenders = Vec::new();
+
+    for (rel, grounds, reason) in ROUTE_CALL_SIGNED_OFF {
+        let path = src.join(rel);
+        assert!(
+            path.exists(),
+            "ROUTE_CALL_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the \
+             entry rather than leaving it to exempt whatever takes that name next"
+        );
+        assert!(
+            !reason.trim().is_empty(),
+            "{rel} is signed off without a reason"
+        );
+
+        let text = std::fs::read_to_string(&path).expect("read signed-off source file");
+        let mounts = route_mount_lines(&text);
+        assert!(
+            !mounts.is_empty(),
+            "ROUTE_CALL_SIGNED_OFF exempts {rel} ({reason}) and it registers no route at all \
+             any more — the entry buys nothing, drop it"
+        );
+
+        if *grounds != RouteCallSignOff::TestScaffold {
+            continue;
+        }
+
+        let boundary = test_module_start(&text).unwrap_or_else(|| {
+            panic!(
+                "{rel} is signed off as test scaffolding ({reason}) and has no \
+                 `#[cfg(test)] mod` at all — the claim cannot be true, so either the file \
+                 changed shape or the grounds are wrong"
+            )
+        });
+        for (line, code) in mounts {
+            if line < boundary {
+                offenders.push(format!(
+                    "  {rel}:{line} — {code}\n      (the `#[cfg(test)] mod` begins at \
+                     {rel}:{boundary})"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a file signed off as test scaffolding registers a route outside its `#[cfg(test)]` \
+         module, which means the route is served and nothing declares who may call it. The \
+         sign-off does not cover it: register it through `RouteTable` (`crate::route_table`), \
+         which cannot take a route without an `Access` level, or move the call into the test \
+         module the sign-off describes.\n{}",
+        offenders.join("\n")
+    );
+}
 
 /// A route may only be born through [`RouteTable`], which cannot register one
 /// without an access level.
@@ -1025,6 +1185,10 @@ const ROUTE_CALL_SIGNED_OFF: &[(&str, &str)] = &[
 /// `Router::new().route(...)` and merging that in. This guard closes the gap:
 /// it is a grep because the failure it guards against is a line of code that
 /// was *not* written, and no request can exercise that.
+///
+/// What counts as registering a route is [`route_mount_lines`], shared with
+/// [`every_route_call_sign_off_still_holds`] — which is the other half of this
+/// guard, and reads its exemption list back.
 #[test]
 fn no_route_is_registered_outside_the_table() {
     fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -1038,7 +1202,7 @@ fn no_route_is_registered_outside_the_table() {
         }
     }
 
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = src_root();
     let mut files = Vec::new();
     rust_files(&src, &mut files);
     assert!(
@@ -1055,19 +1219,13 @@ fn no_route_is_registered_outside_the_table() {
             .replace('\\', "/");
         if ROUTE_CALL_SIGNED_OFF
             .iter()
-            .any(|(allowed, _)| rel == *allowed)
+            .any(|(allowed, _, _)| rel == *allowed)
         {
             continue;
         }
         let text = std::fs::read_to_string(file).expect("read source file");
-        for (n, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            if code.contains(".route(") || code.contains(".route_service(") {
-                offenders.push(format!("  {rel}:{} — {}", n + 1, code));
-            }
+        for (line, code) in route_mount_lines(&text) {
+            offenders.push(format!("  {rel}:{line} — {code}"));
         }
     }
 
@@ -1077,7 +1235,9 @@ fn no_route_is_registered_outside_the_table() {
          call it. Register it through `RouteTable` (`crate::route_table`) instead — its \
          `get`/`post`/… all take an `Access` level, which is what the route-access sweep \
          walks. If this really is test scaffolding rather than a served route, add the file \
-         to ROUTE_CALL_SIGNED_OFF with the reason.\n{}",
+         to ROUTE_CALL_SIGNED_OFF with `RouteCallSignOff::TestScaffold` and the reason — and \
+         keep the calls inside the `#[cfg(test)]` module, which is the part the sign-off \
+         promises and `every_route_call_sign_off_still_holds` measures.\n{}",
         offenders.join("\n")
     );
 }
