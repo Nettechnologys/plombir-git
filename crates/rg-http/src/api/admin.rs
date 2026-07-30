@@ -77,6 +77,13 @@ pub struct UpdateUserRequest {
 /// question the compiler answers. A handler in another module cannot call the
 /// rule from inside its own body even if it wants to — which is the only way
 /// the ordering below stays true for handlers nobody has written yet.
+///
+/// The visibility is load-bearing rather than tidy, so it is asserted:
+/// `authz_extractor_guard::the_instance_admin_gate_is_module_private` is what
+/// fails if a `pub` lands here. It is also why this name is absent from that
+/// file's `GATES` list — the compiler covers what the grep there would only
+/// notice, and widening this signature means bringing the name under a grep in
+/// the same commit.
 async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
     let user_id = extract_user_id(headers, &state.jwt_secret)?;
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)

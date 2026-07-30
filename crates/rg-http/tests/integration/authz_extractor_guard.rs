@@ -20,10 +20,13 @@
 //! It is deliberately absent from [`GATES`] below: `card_cd6f512e2e52` made it
 //! module-private, so `api::admin::InstanceAdmin` is the only way to reach it
 //! from anywhere else and the compiler enforces what this grep would only
-//! notice. The repository gates cannot follow suit — `api::repo_access` has to
-//! export `check_read_for` / `check_write_for` to the transports that resolve
-//! their own caller, and those live in other modules of this crate — which is
-//! why the grep is still the mechanism *inside* `rg-http`.
+//! notice — and [`the_instance_admin_gate_is_module_private`] is what holds the
+//! compiler to it, because an exclusion bought with a compile-time property has
+//! to assert that property or it outlives it. The repository gates cannot
+//! follow suit — `api::repo_access` has to export `check_read_for` /
+//! `check_write_for` to the transports that resolve their own caller, and those
+//! live in other modules of this crate — which is why the grep is still the
+//! mechanism *inside* `rg-http`.
 //!
 //! They do stop one step short of public, though, and that step is the whole
 //! answer to the workspace question: every name in [`GATES`] is `pub(crate)`,
@@ -335,6 +338,18 @@ const GATES_HOME: &str = "rg-http/src/api/repo_access.rs";
 /// nobody extended, and this is the line the first legitimate exception has to
 /// be argued on.
 const GATES_WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[];
+
+/// The *instance*-admin gate, and the file that defines it.
+///
+/// Not an entry in [`GATES`] and deliberately so — see the note at the top of
+/// this file. The exclusion is paid for entirely by the definition being
+/// module-private, which is a payment
+/// [`the_instance_admin_gate_is_module_private`] collects rather than assumes.
+///
+/// Spelled workspace-relative like [`GATES_HOME`], because the question asked of
+/// the file is about a boundary — here the module's, not the crate's.
+const INSTANCE_ADMIN_HOME: &str = "rg-http/src/api/admin.rs";
+const INSTANCE_ADMIN_GATE: &str = "require_instance_admin";
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -877,6 +892,90 @@ fn the_repository_gates_are_crate_private() {
              this list quietly stops covering it"
         );
     }
+}
+
+/// The same rule the other way round: the one gate that is *excluded* from the
+/// grep, and the property it is excluded on.
+///
+/// [`the_repository_gates_are_crate_private`] pins a compile-time guarantee the
+/// barred list rests on. Here the guarantee is what buys the name its way *out*
+/// of that list: `require_instance_admin` is absent from [`GATES`] because
+/// nothing outside `api::admin` can call it, so `api::admin::InstanceAdmin` is
+/// the only way a handler reaches the rule and the compiler says so without
+/// being asked. Which makes the exclusion strictly worse off than an entry: the
+/// grep would at least have named the function.
+///
+/// One word retires it, in the direction the sibling test does not watch.
+/// `async fn` → `pub(crate) async fn` compiles clean — the return type is
+/// `Option<i64>`, so nothing is private-in-public — and after it every handler
+/// in `rg-http` may call the gate from inside its own body, behind whatever body
+/// or query extractor its signature happens to take first. That is exactly the
+/// shape `InstanceAdmin` exists to prevent, and exactly the shape this name has
+/// a history of: it was copied verbatim into `api::runners` once already
+/// (`card_cd6f512e2e52`), and the neighbouring `route_gate_rank_guard` only sees
+/// the mismatch when the *table* still declares `InstanceAdmin` — a row that
+/// declares `User` and re-writes the instance check by hand walks past it.
+///
+/// The definition line is read rather than a set of widened spellings searched
+/// for, because the widenings do not form a closed list: `pub`, `pub(crate)`,
+/// `pub(super)` and `pub(in crate::api)` all retire the guarantee, and only the
+/// last one is unguessable. What the line must be is the whole assertion.
+///
+/// Finding exactly one definition is the liveness half, the job
+/// [`every_membership_predicate_still_exists`] does for `ORG_MEMBERSHIP`: a
+/// rename that leaves [`INSTANCE_ADMIN_GATE`] naming nothing has to be loud,
+/// because this file's note about the compiler would then be about a function
+/// that no longer exists.
+#[test]
+fn the_instance_admin_gate_is_module_private() {
+    let path = workspace_crates().join(INSTANCE_ADMIN_HOME);
+    let text = fs::read_to_string(&path).expect("read the instance-admin module");
+
+    let needle = format!("fn {INSTANCE_ADMIN_GATE}(");
+    let definitions: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let code = line.trim_start();
+            !code.starts_with("//") && !code.starts_with("use ") && code.contains(&needle)
+        })
+        .map(|(n, line)| (n + 1, line.trim()))
+        .collect();
+
+    let listing = || {
+        definitions
+            .iter()
+            .map(|(n, code)| format!("  {INSTANCE_ADMIN_HOME}:{n} — {code}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert_eq!(
+        definitions.len(),
+        1,
+        "expected exactly one definition of `{INSTANCE_ADMIN_GATE}` in {INSTANCE_ADMIN_HOME}, \
+         found {}:\n{}\nNone means the name was renamed or removed, and this file's note that the \
+         compiler bars the gate is then a note about nothing — follow the rename here. More than \
+         one means the rule has a second implementation in its own home, which is the duplication \
+         `InstanceAdmin` was introduced to end.",
+        definitions.len(),
+        listing()
+    );
+
+    let (_, definition) = definitions[0];
+    assert!(
+        definition.starts_with(&format!("async fn {INSTANCE_ADMIN_GATE}(")),
+        "`{INSTANCE_ADMIN_GATE}` is no longer module-private:\n{}\n\
+         Every handler in this crate can now call the instance-admin rule from inside its own \
+         body — behind the `Json<_>` / `Query<_>` / `Path<_>` extractor its signature takes \
+         first, which is the ordering bug `InstanceAdmin` was introduced to fix. Narrow it back \
+         to `async fn`. If the wider visibility is genuinely wanted, the name has to come under a \
+         grep in the same commit: it is missing from GATES *because* the compiler barred it, and \
+         that trade cannot be un-made silently — GATES is asserted against GATES_HOME, so an \
+         instance-admin gate that is no longer module-private needs a barred list of its own plus \
+         a sign-off for the `InstanceAdmin` extractor's own call site.",
+        listing()
+    );
 }
 
 /// The gates, in the crates no scan in this file reaches.
