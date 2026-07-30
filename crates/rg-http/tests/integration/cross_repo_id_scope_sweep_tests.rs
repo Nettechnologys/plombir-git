@@ -19,11 +19,14 @@
 //! Two accounts. The **victim** owns a private repository with one of every
 //! resource in it; the **attacker** owns a repository of their own with nothing
 //! but the locators a path needs (issue `#1`, pull request `#1`, a wiki page).
-//! Each route is then driven twice, and the two requests differ in exactly one
-//! character-range — *which repository the path names*:
+//! Each route is then driven three times, and any two of the requests differ in
+//! exactly one character-range:
 //!
 //! - **the probe** — the attacker's own repository, the victim's ids. Owed
 //!   `401`/`403`/`404`.
+//! - **the reference** — the attacker's own repository again, same session, but
+//!   ids that never existed ([`ABSENT_ID`]). Owed the same answer as the probe,
+//!   *body included*.
 //! - **the baseline** — the victim's repository, the same victim ids, the
 //!   victim's own session. Owed anything but a denial.
 //!
@@ -31,6 +34,17 @@
 //! because the fixture never seeded it, because the body was rejected, because
 //! the id was never valid — would otherwise read as a *passing security test*.
 //! Here it reads as a dead fixture and fails the run.
+//!
+//! Neither is the reference. A masked status is half of what a caller learns,
+//! and this sweep used to assert only that half: `body` was pulled out of every
+//! response and used for nothing but the text of a failure message. A handler
+//! answering `404 "release belongs to another repository"` for a foreign id and
+//! `404 "release not found"` for one that never existed would have enumerated
+//! every release on the instance under a green run — which is not hypothetical,
+//! it is where the oracle went in `card_2179245d41db`: `require_namespace_create`
+//! covered two different messages with one `403`, and no strictness applied to a
+//! status could have seen it. Two answers side by side are the only thing that
+//! answers "what did the caller learn".
 //!
 //! # What is deliberately not probed
 //!
@@ -77,6 +91,15 @@
 //!
 //! They were one predicate named `denied`, spelt `401 | 403 | 404`, and pass one
 //! therefore scored a hit on the existence oracle as a pass.
+//!
+//! The reference probe rides along inside pass one rather than becoming a third
+//! pass of its own, because it is only owed where pass one found a masked
+//! refusal: a `403` has already failed, and a `422` never reached the lookup, so
+//! there is nothing there to compare. Its three failure modes are separate lists
+//! on purpose — a body that gave the answer away is a leak in the server, a cell
+//! that could not be paired is a hole in the sweep, and a route that outgrew
+//! [`BODY_MAY_DIFFER`] is a stale allowance. Folding them together would report
+//! the second as the first.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -222,6 +245,60 @@ struct Ids {
     time_entry: i64,
     release: i64,
     asset: i64,
+}
+
+/// An id no row on the instance has ever carried.
+///
+/// The reference answer a foreign id has to be indistinguishable from. Every
+/// primary key the fixture creates comes out of a sequence that starts at 1, so
+/// one value this far out stands in for all of them. Named after
+/// `user_scoped_id_scope_tests::UNUSED_ID`, which holds the same line for the
+/// `/users/…` half of the same doctrine.
+const ABSENT_ID: i64 = 999_999;
+
+impl Ids {
+    /// The same struct with every id replaced by one that never existed.
+    ///
+    /// Spelt out field by field rather than derived from [`Ids::default`]: a
+    /// zero would also be an id no row carries, but reading `0` in a URL leaves
+    /// the next person wondering whether it is a sentinel or a real key.
+    fn absent() -> Self {
+        Self {
+            deploy_key: ABSENT_ID,
+            milestone: ABSENT_ID,
+            label: ABSENT_ID,
+            issue_comment: ABSENT_ID,
+            issue_attachment: ABSENT_ID,
+            comment_attachment: ABSENT_ID,
+            pr_attachment: ABSENT_ID,
+            pr_review: ABSENT_ID,
+            review_comment: ABSENT_ID,
+            review_comment_attachment: ABSENT_ID,
+            wiki_revision: ABSENT_ID,
+            hook: ABSENT_ID,
+            delivery: ABSENT_ID,
+            pipeline: ABSENT_ID,
+            job: ABSENT_ID,
+            environment: ABSENT_ID,
+            branch_protection: ABSENT_ID,
+            tag_protection: ABSENT_ID,
+            board: ABSENT_ID,
+            column: ABSENT_ID,
+            card: ABSENT_ID,
+            time_entry: ABSENT_ID,
+            release: ABSENT_ID,
+            asset: ABSENT_ID,
+        }
+    }
+}
+
+/// The same placeholders a route's probe fills, all pointed at [`ABSENT_ID`].
+///
+/// Derived from the route's own target map rather than listed here, so a route
+/// that gains a placeholder gets its reference probe for free instead of
+/// panicking in [`fill`] — or worse, quietly losing its body comparison.
+fn nowhere(targets: &HashMap<&'static str, i64>) -> HashMap<&'static str, i64> {
+    targets.keys().map(|name| (*name, ABSENT_ID)).collect()
 }
 
 struct Fixture {
@@ -975,6 +1052,60 @@ fn fill(path: &str, owner: &str, repo: &str, targets: &HashMap<&'static str, i64
     out
 }
 
+/// One answer, whole.
+///
+/// The body is kept *untruncated* on purpose. `drive` used to return
+/// `body.chars().take(160)`, which is harmless while the body is only ever
+/// quoted in a failure message and fatal the moment it is compared: a clipped
+/// JSON body does not parse, the `request_id` normalization below never runs,
+/// and two answers that say the same thing differ by a uuid forever. Clipping
+/// happens in [`Answer::excerpt`], at the point of reporting, and nowhere else.
+struct Answer {
+    status: StatusCode,
+    body: String,
+}
+
+impl Answer {
+    /// Everything a caller learns, minus what is fresh on every response.
+    ///
+    /// `AppError::into_response` sets `request_id: None` and the tracing
+    /// middleware stamps a uuid into the envelope further down the stack, so a
+    /// raw body comparison is red between any two requests. The status is part
+    /// of the shape: `401` and `404` are both [`masked`], but a caller who gets
+    /// one for a foreign id and the other for an absent one has still learned
+    /// which is which.
+    fn shape(&self) -> (u16, String) {
+        let normalized = match serde_json::from_str::<serde_json::Value>(&self.body) {
+            Ok(mut parsed) => {
+                if let Some(object) = parsed.as_object_mut() {
+                    object.remove("request_id");
+                    if let Some(error) = object.get_mut("error").and_then(|e| e.as_object_mut()) {
+                        error.remove("request_id");
+                    }
+                }
+                parsed.to_string()
+            }
+            // Not JSON — an empty `HEAD` body, or a handler that answers in
+            // some other shape. Compared verbatim rather than waved through.
+            Err(_) => self.body.clone(),
+        };
+        (self.status.as_u16(), normalized)
+    }
+
+    /// For failure messages only — never for comparison.
+    fn excerpt(&self) -> String {
+        self.body.chars().take(160).collect()
+    }
+
+    /// Whether the two shapes being equal actually asserted anything about a
+    /// body. A `HEAD` route answers nothing by protocol, so its pair is a
+    /// statement about the status alone and must not be counted towards the
+    /// anti-vacuity floor.
+    fn speaks(&self) -> bool {
+        !self.body.trim().is_empty()
+    }
+}
+
 async fn drive(
     fx: &Fixture,
     fact: &RouteFact,
@@ -983,7 +1114,7 @@ async fn drive(
     token: &str,
     targets: &HashMap<&'static str, i64>,
     ids: &Ids,
-) -> (StatusCode, String) {
+) -> Answer {
     let url = format!("{}{}", fx.base, fill(&fact.path, owner, repo, targets));
     let mut request = match fact.method {
         "GET" => fx.client.get(url),
@@ -1016,7 +1147,7 @@ async fn drive(
     let response = request.send().await.expect("scope sweep request");
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    (status, body.chars().take(160).collect())
+    Answer { status, body }
 }
 
 /// **Pass one's** predicate: the probe was refused *without* being told the id
@@ -1058,6 +1189,16 @@ fn inconclusive(status: StatusCode) -> bool {
 /// Checked both ways: a route that starts answering the question has to leave
 /// the list, so it cannot quietly become a blanket allowance.
 const NO_VERDICT: &[(&str, &str)] = &[];
+
+/// Routes whose two refusals legitimately say different things, each with the
+/// reason.
+///
+/// A named list rather than a softer predicate: the failure this guards against
+/// is one handler's wording, so the excuse has to name that handler. Checked
+/// both ways like [`NO_VERDICT`] — an entry whose route has started answering
+/// identically fails the run, so a fixed handler cannot leave a standing
+/// allowance behind it.
+const BODY_MAY_DIFFER: &[(&str, &str)] = &[];
 
 // ── The sweep ──────────────────────────────────────────────────────────────
 
@@ -1206,12 +1347,86 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
     let mut no_verdict: BTreeSet<String> = BTreeSet::new();
     let mut verdicts: HashMap<String, StatusCode> = HashMap::new();
 
+    // ── The body half of the oracle ────────────────────────────────────────
+    //
+    // A masked status is half an answer. The other half is what the body says,
+    // and the sweep used to read `body` only to quote it in a failure message —
+    // so a handler that answered `404 "release belongs to another repository"`
+    // for a foreign id and `404 "release not found"` for one that never existed
+    // enumerated the instance under a green run. That is not a hypothetical: it
+    // is where the oracle went in `card_2179245d41db`, one status covering two
+    // wordings, and no strictness applied to `masked` could have seen it.
+    //
+    // So every masked cell is asked twice — the same route, the same attacker,
+    // the same repository of their own, and ids that never existed — and the two
+    // answers have to match.
+    let mut oracles: Vec<String> = Vec::new();
+    let mut unpaired: Vec<String> = Vec::new();
+    let mut identical: BTreeSet<String> = BTreeSet::new();
+    let mut paired = 0usize;
+    let absent = Ids::absent();
+
     // ── Pass one: the attacker's repository, the victim's ids ──────────────
     for (fact, targets) in &probes {
-        let (status, body) =
-            drive(&fx, fact, ATTACKER, HOST, &fx.attacker_token, targets, &ids).await;
+        let foreign = drive(&fx, fact, ATTACKER, HOST, &fx.attacker_token, targets, &ids).await;
+        let status = foreign.status;
         verdicts.insert(fact.label(), status);
         if masked(status) {
+            // ── The reference probe: the same request, at nothing ──────────
+            let absent_targets = nowhere(targets);
+            let unused = drive(
+                &fx,
+                fact,
+                ATTACKER,
+                HOST,
+                &fx.attacker_token,
+                &absent_targets,
+                &absent,
+            )
+            .await;
+            let signed_off = BODY_MAY_DIFFER
+                .iter()
+                .any(|(entry, _)| *entry == fact.label());
+            if !masked(unused.status) {
+                // Not skipped quietly. A cell whose reference probe never got a
+                // masked refusal has no body comparison at all, and leaving it
+                // to the status alone is exactly the oracle this pass exists to
+                // close — so it fails the run instead of thinning out silently.
+                unpaired.push(format!(
+                    "  {}\n      an id that never existed answered {} where a row of \
+                     {VICTIM}/{VAULT}'s answered {status}. Read it either way and it fails: if \
+                     the handler really does refuse the two differently, that difference *is* the \
+                     oracle and the {status} above is masking nothing; if the request merely never \
+                     reached the lookup, then nothing was compared and this route's oracle is \
+                     still status-only. Fix the handler, give the route a body in `body_for` that \
+                     survives its own deserializer, or sign it off in BODY_MAY_DIFFER with the \
+                     reason.\n      absent: {}",
+                    fact.label(),
+                    unused.status,
+                    unused.excerpt()
+                ));
+            } else if foreign.shape() == unused.shape() {
+                identical.insert(fact.label());
+                // Counted only where a body was actually compared. A `HEAD`
+                // route answers nothing by protocol, and letting its empty-vs-
+                // empty match satisfy the floor below would rebuild the vacuum
+                // this counter exists to detect.
+                if foreign.speaks() && unused.speaks() {
+                    paired += 1;
+                }
+            } else if !signed_off {
+                oracles.push(format!(
+                    "  {}\n      refused both a row of {VICTIM}/{VAULT}'s and an id that never \
+                     existed, but not with the same answer — so the pair tells a caller which of \
+                     the two they hit, and walking the id space from a repository of one's own \
+                     enumerates the instance. The status was masked; the body gave it away.\n      \
+                     foreign ({status}): {}\n      absent  ({}): {}",
+                    fact.label(),
+                    foreign.excerpt(),
+                    unused.status,
+                    unused.excerpt()
+                ));
+            }
             continue;
         }
         if status == StatusCode::FORBIDDEN {
@@ -1220,8 +1435,9 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
                  well have held — but the refusal confirmed the id exists, which is the one thing \
                  a masked denial may not do: walking the id space from a repository of one's own \
                  enumerates the instance. Owed 404, as `api::boards` puts it — a mismatch answers \
-                 404, not 403.\n      body: {body}",
-                fact.label()
+                 404, not 403.\n      body: {}",
+                fact.label(),
+                foreign.excerpt()
             ));
             continue;
         }
@@ -1231,8 +1447,9 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
                 leaks.push(format!(
                     "  {}\n      answered {status} — the request never reached the id lookup, so \
                      nothing was proven. Give the route a body in `body_for`, or add it to \
-                     NO_VERDICT with the reason.\n      body: {body}",
-                    fact.label()
+                     NO_VERDICT with the reason.\n      body: {}",
+                    fact.label(),
+                    foreign.excerpt()
                 ));
             }
             continue;
@@ -1240,8 +1457,9 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
         leaks.push(format!(
             "  {}\n      answered {status} for a row belonging to {VICTIM}/{VAULT}. The gate on \
              {ATTACKER}/{HOST} passed honestly; the id was never scoped to the repository in the \
-             path.\n      body: {body}",
-            fact.label()
+             path.\n      body: {}",
+            fact.label(),
+            foreign.excerpt()
         ));
     }
 
@@ -1249,7 +1467,8 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
     let mut dead: Vec<String> = Vec::new();
     let mut proved = 0usize;
     for (fact, targets) in &probes {
-        let (status, body) = drive(&fx, fact, VICTIM, VAULT, &fx.victim_token, targets, &ids).await;
+        let baseline = drive(&fx, fact, VICTIM, VAULT, &fx.victim_token, targets, &ids).await;
+        let status = baseline.status;
         if !refused(status) {
             // The strongest form of the control: this exact request *worked*
             // where the ids live, and was masked where they do not. Paired
@@ -1272,8 +1491,9 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
         dead.push(format!(
             "  {}\n      the owner is denied ({status}) in their own repository, so the {probe_status} \
              the probe got proves nothing. Either the fixture never seeded this row, or the probe \
-             above destroyed it.\n      body: {body}",
-            fact.label()
+             above destroyed it.\n      body: {}",
+            fact.label(),
+            baseline.excerpt()
         ));
     }
 
@@ -1286,17 +1506,35 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
             ));
         }
     }
+    for (label, reason) in BODY_MAY_DIFFER {
+        if identical.contains(*label) {
+            healed.push(format!(
+                "  {label} now answers a foreign id and an absent one identically — drop it from \
+                 BODY_MAY_DIFFER (was: {reason})"
+            ));
+        }
+    }
 
     assert!(
-        leaks.is_empty() && dead.is_empty() && healed.is_empty(),
-        "cross-repository id scope: {} route(s) reached another repository's rows, {} dead \
-         baseline(s), {} stale quarantine entr(ies), out of {} probed ({} signed off).\n{}{}{}",
+        leaks.is_empty()
+            && oracles.is_empty()
+            && unpaired.is_empty()
+            && dead.is_empty()
+            && healed.is_empty(),
+        "cross-repository id scope: {} route(s) reached another repository's rows, {} told a \
+         foreign id apart from an absent one, {} could not be paired against an absent id, {} \
+         dead baseline(s), {} stale quarantine entr(ies), out of {} probed ({} signed \
+         off).\n{}{}{}{}{}",
         leaks.len(),
+        oracles.len(),
+        unpaired.len(),
         dead.len(),
         healed.len(),
         probes.len(),
         skipped.len(),
         leaks.join("\n"),
+        oracles.join("\n"),
+        unpaired.join("\n"),
         dead.join("\n"),
         healed.join("\n"),
     );
@@ -1311,6 +1549,20 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
         "only {proved} of {} probed route(s) both served the id in its own repository and \
          refused it in another. The sweep's denials are only meaningful where that pair holds, \
          so either the fixture stopped seeding or the routes stopped answering",
+        probes.len(),
+    );
+
+    // The same floor for the body half. Without it, a rename that moved every
+    // id-carrying route out of `coverage`'s reach — or a change that turned the
+    // masked answers into empty bodies — would take the whole comparison quiet
+    // while every assertion above stayed green: exactly how the status half went
+    // vacuous in `card_c46c354ec3ae`.
+    assert!(
+        paired >= 60,
+        "only {paired} of {} probed route(s) had their masked refusal compared against an absent \
+         id's, body and all. The oracle-in-the-body half of this sweep is only asserted where \
+         that pair holds, so either the routes stopped answering with a body or `coverage` \
+         stopped reaching them",
         probes.len(),
     );
 }
