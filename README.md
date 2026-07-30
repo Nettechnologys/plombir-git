@@ -298,8 +298,16 @@ rather than ad-hoc shell snippets — for example:
 # Full regression: backend tests, frontend checks/build, runtime smoke
 node scripts/full-interface-regression.mjs
 
-# Backend OpenAPI smoke against a running server
+# Backend OpenAPI smoke against a running server. Replays every documented
+# operation, so point it at a throwaway instance — it registers a user, sends
+# sampled bodies and calls the delete verbs.
 BACKEND_URL=http://127.0.0.1:8080 node scripts/openapi-interface-smoke.mjs
+
+# The read-only half of the same script: one anonymous GET per documented path,
+# asserting only that a route claims it. This is what CI runs against the built
+# image, and it is safe against any instance.
+OPENAPI_SMOKE_ROUTING_ONLY=1 BACKEND_URL=http://127.0.0.1:8080 \
+  node scripts/openapi-interface-smoke.mjs
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and the available

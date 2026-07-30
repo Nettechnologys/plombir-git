@@ -614,7 +614,7 @@ jobs:
           changed="$(git diff --name-only "${BASE_SHA}" HEAD)"
           echo "Files changed against ${BASE_SHA}:"
           printf '%s\n' "${changed}"
-          if printf '%s\n' "${changed}" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|crates/|web/|\.github/workflows/regression\.yml)'; then
+          if printf '%s\n' "${changed}" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|crates/|web/|scripts/openapi-interface-smoke\.mjs|\.github/workflows/regression\.yml)'; then
             echo "build=true" >>"${GITHUB_OUTPUT}"
             echo "An input of the image build changed — building."
           else
@@ -694,6 +694,16 @@ jobs:
       # Locally the health endpoint answers 2s after start; the loop allows 60.
       # Logs are dumped on failure because a container that died has already
       # said why, and without this the step would report only a timeout.
+      # For the OpenAPI routing check at the end of the next step. Pinned rather
+      # than taken from the runner image, for the same reason the contract-check
+      # job pins it: the version a gate runs under should be a decision, not an
+      # image detail that changes under it.
+      - name: Install Node
+        if: steps.scope.outputs.build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Boot the built image and check it serves
         if: steps.scope.outputs.build == 'true'
         run: |
@@ -744,3 +754,30 @@ jobs:
             docker logs forgekeep-smoke >&2 || true
             exit 1
           fi
+
+          # And a server that serves is not yet one that serves what its spec
+          # advertises. This replays the published OpenAPI document against the
+          # container and asserts that every path in it is claimed by a route.
+          #
+          # It runs here, inside this step, because this is the only job with a
+          # live server — and the container is removed by the trap the moment
+          # the step ends, so a separate step would find nothing to talk to.
+          #
+          # This is also the only place the assertion is worth anything: the
+          # image is the one artefact where the SPA bundle exists, so an
+          # unrouted path answers `200 text/html` exactly as it would in
+          # production. That is the failure the smoke was blind to for its whole
+          # life — it requested every path without the `/api/v1` mount prefix,
+          # got the SPA, and printed 288 green ticks (card_b23fa617838f).
+          #
+          # OPENAPI_SMOKE_ROUTING_ONLY keeps it to the anonymous, read-only pass:
+          # one GET per advertised path, no registration, no bodies, no delete
+          # verbs. The full replay stays a manual tool for a throwaway instance
+          # — see scripts/full-interface-regression.mjs.
+          OPENAPI_SMOKE_ROUTING_ONLY=1 \
+          BACKEND_URL=http://127.0.0.1:18080 \
+            node scripts/openapi-interface-smoke.mjs || {
+              echo "The published OpenAPI spec does not match the routes this image serves." >&2
+              docker logs forgekeep-smoke >&2 || true
+              exit 1
+            }

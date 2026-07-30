@@ -43,22 +43,37 @@ const ROUTER = join(root, 'crates/rg-http/src/routes.rs');
 const OPENAPI = join(root, 'crates/rg-http/src/openapi.rs');
 const API_DIR = join(root, 'crates/rg-http/src/api');
 
-// The nest prefix of the REST router. Annotations are written both with it
-// (`/api/v1/ai/…`) and without (`/repos/…`), so both sides are canonicalised
-// to the prefix-less spelling before comparison — the same convention
-// `api-client-contract-check.mjs` normalises to via OPENAPI_BASE_PATH.
+// The nest prefix of the REST router, applied by `RouteTable::new("/api/v1")`.
+// A route table row carries it; an `#[utoipa::path]` annotation does not, so
+// the mounted URL is canonicalised to the annotation's prefix-less spelling
+// before comparison — the same convention `api-client-contract-check.mjs`
+// normalises to via OPENAPI_BASE_PATH.
 //
-// That the two spellings coexist in the spec at all is a separate defect
-// (card_b23fa617838f): utoipa publishes the annotation string verbatim and the
-// document declares no `servers`, so most paths are short by this prefix. It is
-// deliberately NOT this gate's business — this one asserts that the two
-// declarations of a route agree, not which of them the spec should print.
+// Annotations used to be written BOTH ways — six under `/api/v1/ai/…`, 282
+// without — and the published document declared no `servers`, so most of it
+// advertised URLs the server does not serve (card_b23fa617838f). The prefix now
+// lives in exactly one place on the spec side, the `servers(...)` entry of
+// `#[openapi(...)]`, and the two assertions below are what keep it there: with
+// a document-level server, an annotation that spells the prefix again resolves
+// to `/api/v1/api/v1/…`.
 const API_PREFIX = '/api/v1';
 
 /** A URL as the spec spells it: relative to the REST prefix, if it carries one. */
 function canonicalUrl(url) {
   if (url === API_PREFIX) return '/';
   return url.startsWith(`${API_PREFIX}/`) ? url.slice(API_PREFIX.length) : url;
+}
+
+/**
+ * The `url = "…"` strings of the `servers(...)` list in `#[openapi(...)]`.
+ *
+ * Returns `[]` when the list is absent — which is the defect state, not a parse
+ * failure, and reads as such at the call site.
+ */
+function declaredServers(source) {
+  const block = stripRustComments(source).match(/\bservers\(([\s\S]*?)\n {4}\),/);
+  if (!block) return [];
+  return [...block[1].matchAll(/url\s*=\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
 }
 
 // Mounted handlers that are intentionally absent from the spec.
@@ -127,7 +142,25 @@ function documentedHandlers(source) {
 
 const failures = [];
 
-const documented = documentedHandlers(readFileSync(OPENAPI, 'utf8'));
+const openapiSource = readFileSync(OPENAPI, 'utf8');
+
+// ── Where the prefix is written ───────────────────────────────────────────
+//
+// Exactly one place, or the spec lies about its own URLs in one of two
+// directions: no `servers` at all and every path is short by `/api/v1`, or a
+// `servers` entry plus annotations that repeat the prefix and resolve to
+// `/api/v1/api/v1/…`. Both are silent — utoipa publishes whatever it is given
+// and no client complains until a request 404s.
+const servers = declaredServers(openapiSource);
+if (!servers.includes(API_PREFIX)) {
+  failures.push(
+    `crates/rg-http/src/openapi.rs declares servers(${servers.map((url) => `"${url}"`).join(', ') || '<none>'}) — ` +
+      `the REST router mounts every documented path under ${API_PREFIX}, so the document must declare it as a ` +
+      'server URL. Without it every path in the spec resolves against the document origin and misses the router.',
+  );
+}
+
+const documented = documentedHandlers(openapiSource);
 // A parse that understood almost nothing would report the whole surface as
 // undocumented — loud, but for the wrong reason. Say so directly instead.
 if (documented.size < 200) {
@@ -198,6 +231,21 @@ for (const handler of [...documented].sort()) {
 const annotations = loadUtoipaPaths(API_DIR);
 const uncomparable = [];
 let extraMounts = 0;
+
+// The other half of the single-prefix rule: every annotation is relative to the
+// `servers` entry asserted above. This is checked over every annotation found,
+// not just the mounted-and-documented ones compared below, because a prefixed
+// path is wrong wherever it is written.
+for (const [handler, annotation] of [...annotations].sort()) {
+  if (annotation.path === null) continue;
+  if (annotation.path === API_PREFIX || annotation.path.startsWith(`${API_PREFIX}/`)) {
+    failures.push(
+      `${handler} is annotated path = "${annotation.path}" (${annotation.file}:${annotation.line}) — the ` +
+        `${API_PREFIX} prefix belongs to the document's servers(...) entry alone, so this publishes ` +
+        `${API_PREFIX}${annotation.path}. Write the path relative to the router's nest prefix.`,
+    );
+  }
+}
 
 for (const [handler, rows] of [...mounted].sort()) {
   if (!documented.has(handler)) continue;

@@ -1,10 +1,60 @@
 #!/usr/bin/env node
 
+// Replay the published OpenAPI spec against a running server.
+//
+// The spec is the contract a generated client, Swagger UI's "Try it out" and a
+// human reading `/api-docs/` all go by, so the question this asks is the one
+// they ask: does the URL the document advertises reach the endpoint it claims?
+//
+// For a long time it could not answer that. It built every request as
+// `BACKEND_URL + path` while the router mounts the whole REST API under
+// `/api/v1`, so all 288 requests went to a path no route claims — where the SPA
+// fallback answers `index.html` with HTTP 200. The only failure threshold was
+// `>= 500`, so those 200s printed as ✅ and the run passed having exercised the
+// frontend shell 288 times (card_b23fa617838f).
+//
+// Both halves are fixed here, and the fix for the first is what makes the
+// second possible:
+//
+//   * the request base comes from the spec's own `servers[0].url` — the
+//     document now declares where its paths live, so this script no longer
+//     guesses (and a spec that stops declaring it fails loudly below);
+//   * a path that is not routed is detected rather than assumed. "404 fails"
+//     would be wrong in both directions: an unmounted path does not 404 in
+//     production, it returns the SPA, while `GET /repos/testuser/testrepo`
+//     legitimately 404s because that repository does not exist. So the fallback
+//     is CALIBRATED — one request to a path that certainly is not mounted, per
+//     method — and any advertised path answered the same way is reported as
+//     unrouted.
+//
+// Two passes, because they have different costs. The routing pass is anonymous,
+// read-only and deterministic: one GET per advertised path, asserting only that
+// the router answers (401, 403, 404 and 405 all prove it did). That is the pass
+// CI runs, via OPENAPI_SMOKE_ROUTING_ONLY=1. The replay pass then exercises
+// every (path, method) with a generated token and a sampled body, which mutates
+// state and is for a throwaway instance.
+
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
 const API_BASE = `${BACKEND_URL}/api/v1`;
 const OPENAPI_URL = `${BACKEND_URL}/api-docs/openapi.json`;
 const OPENAPI_TOKEN = process.env.OPENAPI_TOKEN || null;
 const OPENAPI_REQUIRE_AUTH = String(process.env.OPENAPI_REQUIRE_AUTH || '1') === '1';
+const ROUTING_ONLY = String(process.env.OPENAPI_SMOKE_ROUTING_ONLY || '0') === '1';
+
+// A path no route will ever claim, used to learn what "not routed" looks like
+// on this server. Deliberately not a plausible endpoint name: the calibration
+// is worthless if the probe ever matches something.
+const ABSENT_PATH = '/__forgekeep_openapi_smoke_absent__';
+
+// A path the spec declares for POST only. Probed with GET, it must draw a
+// router answer (405) — the control that proves the calibration above still
+// discriminates. If this endpoint ever moves, the control fails and says so
+// rather than letting the routing pass degrade into a no-op.
+const ROUTED_CONTROL_PATH = '/users/login';
+
+// Where requests are sent: the spec's own `servers[0].url`, resolved against
+// BACKEND_URL. Assigned once the document has been read.
+let REQUEST_BASE = BACKEND_URL;
 
 const SAMPLE_BY_NAME = {
   owner: 'testuser',
@@ -247,7 +297,7 @@ function buildParamsFromSpec(op, pathItem, openapiDoc) {
 
 function buildPath(rawPath, pathParams) {
   const path = resolveTemplate(rawPath, pathParams);
-  return `${BACKEND_URL}${path}`;
+  return `${REQUEST_BASE}${path}`;
 }
 
 function buildQueryFromParams(queryParams) {
@@ -274,7 +324,15 @@ function isParameterMismatch(method, rawPath, resolvedPath, pathParams) {
   if (!FAIL_ON_PARAMETER_MISMATCH) return false;
   const raw = String(rawPath || '');
   const cleanRaw = raw.split('?')[0].replace(/\/+$/g, '');
-  const cleanResolved = String(resolvedPath || '').split('?')[0].replace(/^https?:\/\/[^/]+/, '').replace(/\/+$/g, '');
+  // The whole request base comes off, not just the origin: `REQUEST_BASE` now
+  // carries the spec's server prefix as well, and comparing `/api/v1/repos/x`
+  // against the spec's `/repos/{owner}` would report every path as a
+  // substitution mismatch.
+  const withoutBase = String(resolvedPath || '').split('?')[0];
+  const cleanResolved = (withoutBase.startsWith(REQUEST_BASE)
+    ? withoutBase.slice(REQUEST_BASE.length)
+    : withoutBase.replace(/^https?:\/\/[^/]+/, '')
+  ).replace(/\/+$/g, '');
 
   if (!cleanRaw.includes('{') && !cleanRaw.includes('}')) return false;
   const rawSegments = cleanRaw.split('/').filter(Boolean);
@@ -379,6 +437,70 @@ function isFailureStatus(status) {
   return status >= 500;
 }
 
+/**
+ * Resolve the base every advertised path is relative to, from the spec itself.
+ *
+ * A relative `servers` URL is resolved by the consumer against the document's
+ * own origin (OpenAPI 3.0 §4.7.5), which is what this reproduces; an absolute
+ * one is honoured as written, so a spec that names a public hostname is
+ * replayed against that hostname rather than silently against BACKEND_URL.
+ *
+ * A document with no `servers` is the defect this script exists to catch, not a
+ * missing feature to work around — so it stops here instead of falling back to
+ * the origin and replaying 288 requests at the SPA.
+ */
+function resolveRequestBase(doc) {
+  const servers = Array.isArray(doc.servers) ? doc.servers : [];
+  const url = String(servers[0]?.url || '').trim().replace(/\/+$/g, '');
+  if (!url) {
+    console.log(
+      '❌ The OpenAPI document declares no servers(...), so it does not say where its paths are served.\n' +
+        '   Every path in it is then resolved against the document origin, which the REST router does not\n' +
+        '   claim — the SPA fallback answers instead. Declare the mount prefix in the servers(...) entry of\n' +
+        '   #[openapi(...)] in crates/rg-http/src/openapi.rs.',
+    );
+    process.exit(1);
+  }
+  if (/^https?:\/\//i.test(url)) return url;
+  return `${BACKEND_URL}${url.startsWith('/') ? url : `/${url}`}`;
+}
+
+/**
+ * What a response looks like to the router question: status plus media type.
+ *
+ * Enough to tell a routed answer from the fallback (`200 text/html` with a
+ * bundle on disk, `404 text/plain` without one) and never enough to confuse two
+ * routed answers with each other — every documented endpoint answers JSON,
+ * including its errors (`AppError` in crates/rg-http/src/error.rs).
+ */
+function responseSignature(res) {
+  const type = String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  return `${res.status} ${type || '<no content-type>'}`;
+}
+
+/**
+ * The signature of "this server routes nothing here", measured per method.
+ *
+ * Per method because the fallback is not one handler: `ServeDir` serves the
+ * bundle for GET and rejects the other verbs, so a POST to an absent path
+ * answers differently from a GET to the same path. Calibrating once with GET
+ * and comparing a POST against it would clear every POST in the spec.
+ */
+const fallbackSignatures = new Map();
+async function fallbackSignatureFor(method) {
+  const cached = fallbackSignatures.get(method);
+  if (cached !== undefined) return cached;
+
+  const probe = await requestWithTimeout(`${REQUEST_BASE}${ABSENT_PATH}`, { method: method.toUpperCase() });
+  if (!probe.ok || !probe.response) {
+    console.log(`❌ Could not probe ${method.toUpperCase()} ${ABSENT_PATH}: ${probe.error?.message || 'network error'}`);
+    process.exit(1);
+  }
+  const signature = responseSignature(probe.response);
+  fallbackSignatures.set(method, signature);
+  return signature;
+}
+
 console.log('Full interface smoke test started');
 console.log(`backend: ${BACKEND_URL}`);
 console.log(`openapi: ${OPENAPI_URL}`);
@@ -440,13 +562,112 @@ const paths = openapi.paths || {};
 const components = openapi.components || {};
 const openapiDoc = { ...openapi, components };
 
+REQUEST_BASE = resolveRequestBase(openapi);
+checks.push(`✅ Spec declares its own base: requests go to ${REQUEST_BASE}`);
+
+// The base this script bootstraps with — `ensureToken` has to register a user
+// before it can read the spec that says where registration lives — is the same
+// prefix, and now that the spec declares one the two can be compared instead of
+// both being asserted by hand.
+if (REQUEST_BASE !== API_BASE) {
+  console.log(
+    `❌ The spec is served under ${REQUEST_BASE}, but this script bootstraps its token against ${API_BASE}.\n` +
+      '   One of the two is stale. Fix the servers(...) entry in crates/rg-http/src/openapi.rs or API_BASE here.',
+  );
+  process.exit(1);
+}
+
+// ── Pass 1: every advertised path is routed ───────────────────────────────
+//
+// Anonymous and GET-only, so it mutates nothing and can run against any live
+// instance. A 401, 403, 404 or 405 all count as routed: each of them can only
+// come from the router or a handler, never from the fallback that answers a
+// path no route claims.
+
+const fallbackGet = await fallbackSignatureFor('get');
+const controlResp = await requestWithTimeout(`${REQUEST_BASE}${ROUTED_CONTROL_PATH}`, { method: 'GET' });
+if (!controlResp.ok || !controlResp.response) {
+  console.log(`❌ Could not probe the routing control GET ${ROUTED_CONTROL_PATH}: ${controlResp.error?.message || 'network error'}`);
+  process.exit(1);
+}
+const controlSignature = responseSignature(controlResp.response);
+if (controlSignature === fallbackGet) {
+  console.log(
+    `❌ The routing check cannot discriminate: a mounted path (GET ${ROUTED_CONTROL_PATH}) and an absent one\n` +
+      `   (GET ${ABSENT_PATH}) both answer "${controlSignature}". Either ${ROUTED_CONTROL_PATH} stopped being\n` +
+      '   mounted, or the fallback changed shape — until this is fixed the pass below would assert nothing.',
+  );
+  process.exit(1);
+}
+checks.push(`✅ Routing probe calibrated: unrouted answers "${fallbackGet}", the control answers "${controlSignature}"`);
+
+let unrouted = 0;
+for (const [rawPath, item] of Object.entries(paths)) {
+  const methods = item || {};
+  const firstOperation = Object.values(methods).find((op) => op && typeof op === 'object') || {};
+  const params = buildParamsFromSpec(firstOperation, methods, openapiDoc);
+  const url = buildPath(rawPath, params.path);
+
+  const probe = await requestWithTimeout(url, { method: 'GET' });
+  if (!probe.ok || !probe.response) {
+    checks.push(`❌ GET ${url}: ${probe.error.message}`);
+    failed += 1;
+    continue;
+  }
+
+  if (responseSignature(probe.response) === fallbackGet) {
+    checks.push(
+      `❌ ${rawPath}: advertised by the spec but no route claims ${url} — the request fell through to the ` +
+        `fallback (${fallbackGet}). A client generated from this spec goes to the same place.`,
+    );
+    failed += 1;
+    unrouted += 1;
+  }
+}
+checks.push(`✅ Routing pass: ${Object.keys(paths).length - unrouted}/${Object.keys(paths).length} advertised paths are routed`);
+
+if (ROUTING_ONLY) {
+  for (const line of checks) console.log(line);
+  if (failed > 0) {
+    console.log(`\n❌ OpenAPI routing check failed: ${failed} problem(s) across ${Object.keys(paths).length} advertised paths`);
+    process.exit(1);
+  }
+  console.log(`\n✅ OpenAPI routing check passed: ${Object.keys(paths).length} advertised paths are routed`);
+  process.exit(0);
+}
+
+// ── Pass 2: replay every operation ────────────────────────────────────────
+//
+// Mutating: it registers a user, sends sampled bodies and calls the delete
+// verbs. For a throwaway instance, not a populated one.
+
 if (!token) {
   token = await ensureToken();
 }
-if (token) {
-  checks.push('✅ JWT token generated; protected endpoints will be replayed with an auth header');
+
+// How many operations will actually carry the token, counted rather than
+// claimed. `shouldAuth` goes by what the document declares, and the document
+// declares no `securitySchemes` and no per-operation `security` at all — so
+// today this is zero, every protected endpoint is replayed anonymously, and the
+// replay pass below stops at the 401 wall instead of reaching the handler
+// (card_018b2dd39652). This used to print "protected endpoints will be replayed
+// with an auth header" unconditionally, which was the pleasant version of the
+// same fact.
+const authed = Object.values(paths)
+  .flatMap((item) => Object.entries(item || {}))
+  .filter(([method, operation]) => shouldInclude(String(method).toLowerCase())
+    && !SKIP_METHODS.has(String(method).toLowerCase())
+    && shouldAuth(operation, openapiDoc)).length;
+
+if (!token) {
+  checks.push('⚠️ No token could be generated; every endpoint runs anonymously (many will return 401)');
+} else if (authed === 0) {
+  checks.push(
+    '⚠️ A token was generated but the spec declares no security for any operation, so none of the replay '
+      + 'below carries it — protected endpoints are exercised only as far as their auth gate',
+  );
 } else {
-  checks.push('⚠️ Protected endpoints will run without an auth header (some will return 401)');
+  checks.push(`✅ JWT token generated; ${authed} operation(s) declare security and will carry an auth header`);
 }
 
 const entries = Object.entries(paths);
@@ -490,7 +711,14 @@ for (const [rawPath, item] of entries) {
       continue;
     }
 
-    if (isFailureStatus(req.response.status)) {
+    const fallbackForMethod = await fallbackSignatureFor(lower);
+    if (responseSignature(req.response) === fallbackForMethod) {
+      checks.push(
+        `❌ ${lower.toUpperCase()} ${resolvedPath}: not routed — answered like an absent path ` +
+          `(${fallbackForMethod}), so the spec advertises an operation the server does not serve.`,
+      );
+      failed += 1;
+    } else if (isFailureStatus(req.response.status)) {
       checks.push(`❌ ${lower.toUpperCase()} ${resolvedPath}: HTTP ${req.response.status}`);
       failed += 1;
     } else {

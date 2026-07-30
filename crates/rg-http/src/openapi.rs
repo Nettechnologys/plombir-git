@@ -26,6 +26,30 @@ pub struct PaginatedRepoResponse {
             This API provides repository management, issue tracking, pull requests, \
             CI/CD pipelines, wiki, LFS, webhooks, and more.",
     ),
+    // Where the paths below are actually served.
+    //
+    // Every `#[utoipa::path(path = "…")]` string is published verbatim, and
+    // they are written relative to the router's nest prefix — `"/repos/{owner}"`
+    // for a route mounted at `/api/v1/repos/{owner}` by
+    // `RouteTable::new("/api/v1")` in `routes::build_all_routes`. Without this
+    // declaration the document said nothing about that prefix, so every
+    // consumer resolved the paths against the document's own origin: a
+    // generated client, Swagger UI's "Try it out", and
+    // `scripts/openapi-interface-smoke.mjs` all requested `/repos/…`, which no
+    // route claims and the SPA fallback answers with `index.html`
+    // (card_b23fa617838f).
+    //
+    // A relative server URL is resolved by the consumer against the document's
+    // origin (OpenAPI 3.0 §4.7.5), which is what makes one spelling work for
+    // localhost, the deploy behind a reverse proxy, and the smoke alike.
+    //
+    // This is the ONE place the prefix is written on the spec side, and
+    // `scripts/openapi-route-coverage-contract-check.mjs` enforces that: an
+    // annotation that spells `/api/v1` itself would now resolve to
+    // `/api/v1/api/v1/…` and fails that gate.
+    servers(
+        (url = "/api/v1", description = "The REST API, relative to the server's own origin"),
+    ),
     paths(
         // Users
         crate::api::users::register,

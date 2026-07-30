@@ -95,7 +95,7 @@ pub struct SearchCodeQuery {
 /// GET /api/v1/ai/repos/{owner}/{name}/summary
 #[utoipa::path(
     get,
-    path = "/api/v1/ai/repos/{owner}/{name}/summary",
+    path = "/ai/repos/{owner}/{name}/summary",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
@@ -126,7 +126,7 @@ pub async fn ai_repo_summary(
 /// GET /api/v1/ai/repos/{owner}/{name}/issues
 #[utoipa::path(
     get,
-    path = "/api/v1/ai/repos/{owner}/{name}/issues",
+    path = "/ai/repos/{owner}/{name}/issues",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
@@ -170,7 +170,7 @@ pub async fn ai_list_issues(
 /// GET /api/v1/ai/repos/{owner}/{name}/prs
 #[utoipa::path(
     get,
-    path = "/api/v1/ai/repos/{owner}/{name}/prs",
+    path = "/ai/repos/{owner}/{name}/prs",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
@@ -219,7 +219,7 @@ pub async fn ai_list_prs(
 /// GET /api/v1/ai/repos/{owner}/{name}/tree
 #[utoipa::path(
     get,
-    path = "/api/v1/ai/repos/{owner}/{name}/tree",
+    path = "/ai/repos/{owner}/{name}/tree",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
@@ -257,7 +257,7 @@ pub struct CodeSearchResult {
 /// GET /api/v1/ai/repos/{owner}/{name}/search/code
 #[utoipa::path(
     get,
-    path = "/api/v1/ai/repos/{owner}/{name}/search/code",
+    path = "/ai/repos/{owner}/{name}/search/code",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
@@ -335,7 +335,7 @@ pub struct IndexResponse {
 /// POST /api/v1/ai/repos/{owner}/{name}/index
 #[utoipa::path(
     post,
-    path = "/api/v1/ai/repos/{owner}/{name}/index",
+    path = "/ai/repos/{owner}/{name}/index",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),

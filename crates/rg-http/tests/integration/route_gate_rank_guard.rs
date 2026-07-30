@@ -714,13 +714,19 @@ fn the_route_table_parser_reads_every_registration() {
     // are registered. `RouteTable` is `pub(crate)`, so that is checkable here
     // rather than assumed: a second builder site elsewhere in the crate would be
     // a whole family of routes this guard never looks at.
+    //
+    // Comments come off first, for the same reason they do in the parse above —
+    // and here the direction is the other one: a doc comment that *names* the
+    // builder to explain where a URL comes from is prose, not a registration.
+    // Scanning the raw text made this fail on `openapi.rs` for a sentence about
+    // `RouteTable::new("/api/v1")`, which teaches whoever hits it to write a
+    // vaguer comment rather than to move a route.
     let mut files = Vec::new();
     rust_files(&src_root(), &mut files);
     let builders: Vec<String> = files
         .iter()
         .filter(|file| {
-            fs::read_to_string(file)
-                .expect("read source file")
+            strip_comments(&fs::read_to_string(file).expect("read source file"))
                 .contains("RouteTable")
         })
         .map(|file| relative(file))
