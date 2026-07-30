@@ -321,6 +321,15 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// The published OpenAPI document, rendered once when the router was built.
+///
+/// It is built there rather than here because that is where the route table
+/// exists — every operation's `security` is derived from the access level its
+/// route declares, see [`crate::openapi::stamp_security`]. `Bytes` so handing it
+/// to a response is a refcount bump, not a copy of the whole document.
+#[derive(Clone)]
+pub(crate) struct OpenApiSpec(pub(crate) axum::body::Bytes);
+
 /// GET /api-docs/openapi.json — serve the OpenAPI specification.
 ///
 /// The gate is [`AuthUser`], taken as an argument rather than applied as a
@@ -331,11 +340,14 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// (card_fb094ba6d323). `AuthUser` reads every shape of session this server
 /// issues, and a Personal Access Token still arrives here as a Bearer JWT
 /// because `pat_auth_middleware` translates it on the way in.
-pub(crate) async fn openapi_handler(_: AuthUser) -> impl IntoResponse {
+pub(crate) async fn openapi_handler(
+    _: AuthUser,
+    axum::Extension(spec): axum::Extension<OpenApiSpec>,
+) -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        openapi::openapi_spec(),
+        spec.0,
     )
 }
 

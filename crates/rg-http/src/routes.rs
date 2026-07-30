@@ -22,7 +22,8 @@ use crate::route_table::Access::{
 use crate::route_table::ForeignGate::{Handler, Middleware};
 use crate::route_table::{RouteFact, RouteTable, Wrap, RUNNER_AUTH_LAYER};
 use crate::{
-    api, git_http, handlers, metrics, middleware, oci, pat_auth, rate_limit, security, ws, AppState,
+    api, git_http, handlers, metrics, middleware, oci, openapi, pat_auth, rate_limit, security, ws,
+    AppState,
 };
 
 /// Sign-off for the routes whose credentials are not a ForgeKeep session, so
@@ -458,7 +459,34 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
 /// authorization problem to anyone debugging one. The gate has since moved into
 /// the handlers' signatures, but the shape stays: a layer here is one this
 /// sub-router's four routes carry, not one the whole tree inherits.
-fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
+fn build_docs_routes(
+    state: &AppState,
+    api_facts: &[RouteFact],
+) -> (Router<AppState>, Vec<RouteFact>) {
+    // The document is built here, once, because this is where the route table
+    // exists: every operation's `security` is derived from the access level its
+    // route declares (`openapi::stamp_security`) rather than written a third
+    // time by hand. Serving it from `Bytes` keeps the per-request cost to an
+    // Arc bump instead of re-rendering 287 operations.
+    let (spec, stamp) = openapi::spec_json(api_facts);
+    if stamp.unresolved.is_empty() {
+        tracing::debug!(
+            required = stamp.required,
+            optional = stamp.optional,
+            anonymous = stamp.anonymous,
+            "openapi: security derived from the route table"
+        );
+    } else {
+        tracing::error!(
+            unresolved = stamp.unresolved.len(),
+            operations = ?stamp.unresolved,
+            "openapi: operations advertised at URLs no route table row matches. They are \
+             published as requiring a session — the safe direction — but the document and the \
+             router disagree about those URLs, so their access levels are guesses"
+        );
+    }
+    let spec = axum::body::Bytes::from(spec);
+
     // The gate itself is `AuthUser`, taken by each handler — so these rows
     // declare `User` and are driven by the persona sweep like any other
     // authenticated route. They used to declare `Foreign(Middleware)` over a
@@ -478,12 +506,22 @@ fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
         ))
     });
 
+    // The same PAT bridge, plus the document itself. Only this one route reads
+    // it, so only this one route carries it.
+    let spec_bridge = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(axum::Extension(handlers::OpenApiSpec(spec.clone())))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                pat_auth::pat_auth_middleware,
+            ))
+    });
+
     let (router, facts) = RouteTable::new("")
         .get_with(
             User,
             "/api-docs/openapi.json",
             handlers::openapi_handler,
-            &pat_bridge,
+            &spec_bridge,
         )
         .get_with(
             User,
@@ -2127,7 +2165,10 @@ pub(crate) fn build_all_routes(
     ));
 
     let (v2, v2_facts) = build_v2_routes(state);
-    let (docs, docs_facts) = build_docs_routes(state);
+    // The docs router is built last because it needs the REST table: every
+    // documented path is mounted under `/api/v1`, and the access level each of
+    // them declares is what the published `security` is derived from.
+    let (docs, docs_facts) = build_docs_routes(state, &api_facts);
 
     let facts = api_facts
         .into_iter()

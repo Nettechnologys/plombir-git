@@ -76,6 +76,20 @@ function declaredServers(source) {
   return [...block[1].matchAll(/url\s*=\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
 }
 
+/**
+ * The `&Ident` entries of the `modifiers(...)` list in `#[openapi(...)]`.
+ *
+ * Returns `[]` when the list is absent — the defect state, not a parse failure.
+ */
+function declaredModifiers(source) {
+  const block = stripRustComments(source).match(/\bmodifiers\(([^)]*)\)/);
+  if (!block) return [];
+  return block[1]
+    .split(',')
+    .map((entry) => entry.trim().replace(/^&/, ''))
+    .filter(Boolean);
+}
+
 // Mounted handlers that are intentionally absent from the spec.
 //
 // Every entry here is an ecosystem-native protocol surface: the URL, the media
@@ -157,6 +171,26 @@ if (!servers.includes(API_PREFIX)) {
     `crates/rg-http/src/openapi.rs declares servers(${servers.map((url) => `"${url}"`).join(', ') || '<none>'}) — ` +
       `the REST router mounts every documented path under ${API_PREFIX}, so the document must declare it as a ` +
       'server URL. Without it every path in the spec resolves against the document origin and misses the router.',
+  );
+}
+
+// ── Where the access levels come from ─────────────────────────────────────
+//
+// `utoipa` derives nothing about authentication, so a document without
+// `SecurityAddon` declares no `securitySchemes` and reads as an entirely
+// anonymous API — which is what it did for its whole life, until
+// card_018b2dd39652. Only the wiring is asserted here: which operation requires
+// which scheme is derived from the `Access` level of its route table row, and
+// comparing those two is a job for the build that can read both sides —
+// `crates/rg-http/tests/integration/openapi_security_guard.rs` drives the served
+// document against the facts of the same build. Re-deriving it here from the
+// source would be a third copy of a decision that already exists twice, which is
+// the failure mode this whole check was written against.
+if (!declaredModifiers(openapiSource).includes('SecurityAddon')) {
+  failures.push(
+    'crates/rg-http/src/openapi.rs no longer declares modifiers(&SecurityAddon) — the published ' +
+      'document would carry no components.securitySchemes, so Swagger UI loses its "Authorize" ' +
+      'button and every operation reads as anonymous however the route table gates it.',
   );
 }
 

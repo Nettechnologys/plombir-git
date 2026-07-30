@@ -5,15 +5,214 @@
 //!   - OpenAPI JSON: GET /api-docs/openapi.json
 //!   - Swagger UI:    GET /api-docs/
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use utoipa::OpenApi;
+use utoipa::openapi::path::{Operation, PathItem};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
+use utoipa::{Modify, OpenApi};
+
+use crate::route_table::{Access, RouteFact};
+
+/// Where the documented paths are mounted, spelled once more where code can
+/// read it: the `servers(...)` entry of `#[openapi(...)]` is a literal the macro
+/// consumes, and [`stamp_security`] has to resolve an annotation's prefix-less
+/// path back to the route table row that carries the prefix.
+///
+/// The two spellings agreeing is not left to a reading:
+/// `openapi-route-coverage-contract-check.mjs` asserts the `servers(...)` entry
+/// is `/api/v1`, and `openapi_security_guard` asserts the served document
+/// declares the same string this constant holds — a divergence would make every
+/// lookup below miss, which the same guard fails on.
+pub const API_SERVER_PREFIX: &str = "/api/v1";
+
+/// The scheme a ForgeKeep session satisfies.
+///
+/// A Personal Access Token satisfies it too: `pat_auth::pat_auth_middleware`
+/// translates a PAT into the session JWT the handlers read, on the way in.
+pub const SESSION_SCHEME: &str = "bearerAuth";
+
+/// The scheme a route that checks its own credential requires — the levels the
+/// route table signs off as [`Access::Foreign`].
+pub const FOREIGN_SCHEME: &str = "foreignToken";
 
 /// Paginated response wrapper for repository listing.
 #[derive(utoipa::ToSchema)]
 pub struct PaginatedRepoResponse {
     pub data: Vec<crate::api::repos::RepoResponse>,
     pub pagination: crate::pagination::PaginationMeta,
+}
+
+/// Publishes the two credentials this API takes.
+///
+/// `utoipa` derives nothing about authentication on its own, so without this the
+/// document declared no `securitySchemes` at all: Swagger UI had no "Authorize"
+/// button, a generated client had no field to put a token in, and
+/// `scripts/openapi-interface-smoke.mjs` — which decides from the document
+/// whether to send one — replayed every protected endpoint anonymously and
+/// stopped at the 401 wall (card_018b2dd39652).
+///
+/// The schemes are the static half. Which operation requires which one is the
+/// derived half, and it is not written here: see [`stamp_security`].
+pub struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            SESSION_SCHEME,
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .description(Some(
+                        "A ForgeKeep session token, or a Personal Access Token — the API accepts \
+                         either, because a PAT is translated into a session token on the way in. \
+                         Obtain one from `POST /users/login` or `POST /users/tokens`.",
+                    ))
+                    .build(),
+            ),
+        );
+        components.add_security_scheme(
+            FOREIGN_SCHEME,
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "A credential the endpoint checks itself instead of going through the \
+                         session gate: a CI runner token, a CI job token, an LFS action token. A \
+                         session token is **not** accepted on these — the operation's description \
+                         names the one it wants.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
+
+/// What [`stamp_security`] did, so a caller can report it instead of assuming.
+#[derive(Debug, Default)]
+pub struct SecurityStamp {
+    /// Operations that now demand a credential.
+    pub required: usize,
+    /// Operations that accept a credential without demanding one — the levels
+    /// whose answer depends on whether the resource is public.
+    pub optional: usize,
+    /// Operations left anonymous, because the route they name is public.
+    pub anonymous: usize,
+    /// `"GET /foo"` for every operation no route table row matched. Published as
+    /// requiring a session — the safe direction — and reported here, because an
+    /// unresolved operation means the document and the router disagree about a
+    /// URL and the level below it is a guess.
+    pub unresolved: Vec<String>,
+}
+
+impl SecurityStamp {
+    /// Operations carrying a `security` list — the number the smoke counts back.
+    pub fn declared(&self) -> usize {
+        self.required + self.optional
+    }
+}
+
+/// The `security` requirement naming one scheme and no scopes.
+fn requirement(scheme: &str) -> SecurityRequirement {
+    SecurityRequirement::new(scheme, Vec::<String>::new())
+}
+
+/// Every operation of a `PathItem`, paired with its HTTP method.
+///
+/// `PathItem` keeps one field per verb rather than a map, so this is the only
+/// place the eight of them are enumerated; a verb missing here would be an
+/// operation silently published without security.
+fn operations_mut(item: &mut PathItem) -> Vec<(&'static str, &mut Operation)> {
+    let mut out: Vec<(&'static str, &mut Operation)> = Vec::new();
+    if let Some(op) = item.get.as_mut() {
+        out.push(("GET", op));
+    }
+    if let Some(op) = item.put.as_mut() {
+        out.push(("PUT", op));
+    }
+    if let Some(op) = item.post.as_mut() {
+        out.push(("POST", op));
+    }
+    if let Some(op) = item.delete.as_mut() {
+        out.push(("DELETE", op));
+    }
+    if let Some(op) = item.options.as_mut() {
+        out.push(("OPTIONS", op));
+    }
+    if let Some(op) = item.head.as_mut() {
+        out.push(("HEAD", op));
+    }
+    if let Some(op) = item.patch.as_mut() {
+        out.push(("PATCH", op));
+    }
+    if let Some(op) = item.trace.as_mut() {
+        out.push(("TRACE", op));
+    }
+    out
+}
+
+/// Give every operation the `security` its route declares.
+///
+/// The access level is already stated exactly once, in the `RouteTable` row that
+/// registers the route (`crate::route_table::Access`). Writing
+/// `security(("bearerAuth" = []))` into 287 `#[utoipa::path]` annotations would
+/// have made a third copy of a decision that already exists twice; this derives
+/// it from the one that the persona sweep, the gate-rank guard and the contract
+/// checks all read, so the document cannot drift away from the router without
+/// the route table moving first.
+///
+/// Public levels are left with no `security` key at all — that is what "anyone
+/// may call this" means to a client, and `Access::PublicFiltered` is included
+/// because its filtering is a property of the *answer*, not a demand on the
+/// caller.
+pub(crate) fn stamp_security(
+    doc: &mut utoipa::openapi::OpenApi,
+    facts: &[RouteFact],
+) -> SecurityStamp {
+    let by_route: HashMap<(&str, &str), Access> = facts
+        .iter()
+        .map(|fact| ((fact.method, fact.path.as_str()), fact.access))
+        .collect();
+
+    let mut stamp = SecurityStamp::default();
+    for (path, item) in doc.paths.paths.iter_mut() {
+        let mounted = format!("{API_SERVER_PREFIX}{path}");
+        for (method, operation) in operations_mut(item) {
+            match by_route.get(&(method, mounted.as_str())).copied() {
+                Some(access) if access.is_public() => {
+                    operation.security = None;
+                    stamp.anonymous += 1;
+                }
+                // Anonymous for a public repository or organization, not for a
+                // private one. An empty requirement alongside the named one is
+                // how OpenAPI spells "optional": a client may send a token, and
+                // what it can see depends on whether it did.
+                Some(Access::RepoRead | Access::OrgRead) => {
+                    operation.security = Some(vec![
+                        SecurityRequirement::default(),
+                        requirement(SESSION_SCHEME),
+                    ]);
+                    stamp.optional += 1;
+                }
+                Some(Access::Foreign(_)) => {
+                    operation.security = Some(vec![requirement(FOREIGN_SCHEME)]);
+                    stamp.required += 1;
+                }
+                Some(_) => {
+                    operation.security = Some(vec![requirement(SESSION_SCHEME)]);
+                    stamp.required += 1;
+                }
+                None => {
+                    operation.security = Some(vec![requirement(SESSION_SCHEME)]);
+                    stamp.required += 1;
+                    stamp.unresolved.push(format!("{method} {path}"));
+                }
+            }
+        }
+    }
+    stamp
 }
 
 /// ForgeKeep API — OpenAPI specification.
@@ -50,6 +249,11 @@ pub struct PaginatedRepoResponse {
     servers(
         (url = "/api/v1", description = "The REST API, relative to the server's own origin"),
     ),
+    // Publishes `components.securitySchemes`. Which operation requires which
+    // scheme is not written here and not written in the annotations either — it
+    // is derived from the route table by `stamp_security`, which `spec_json`
+    // runs before the document is served.
+    modifiers(&SecurityAddon),
     paths(
         // Users
         crate::api::users::register,
@@ -498,9 +702,23 @@ pub struct PaginatedRepoResponse {
 )]
 pub struct ApiDoc;
 
-/// Return the OpenAPI spec as a JSON string.
-pub fn openapi_spec() -> String {
-    ApiDoc::openapi().to_pretty_json().unwrap_or_default()
+/// The document as it is published, and what deriving its `security` found.
+///
+/// Built once, when the router is built, because that is the one moment the
+/// route table exists: `routes::build_docs_routes` hands the facts in and puts
+/// the result behind the `/api-docs/openapi.json` handler. There is no
+/// facts-free spelling of this on purpose — one existed, and a document served
+/// without the access levels is exactly the defect this pair fixes.
+pub(crate) fn spec_json(facts: &[RouteFact]) -> (String, SecurityStamp) {
+    let mut doc = ApiDoc::openapi();
+    let stamp = stamp_security(&mut doc, facts);
+    // A failure here is deterministic — the document is built from compile-time
+    // data — so it is a fault of this binary, not of a request, and it surfaces
+    // at startup rather than as an empty spec served forever with a 200.
+    let json = doc
+        .to_pretty_json()
+        .expect("the OpenAPI document must serialize");
+    (json, stamp)
 }
 
 /// Lazy-initialized Swagger UI config (avoids re-computing on every request).

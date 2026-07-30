@@ -577,6 +577,64 @@ if (REQUEST_BASE !== API_BASE) {
   process.exit(1);
 }
 
+// ── What the document says about access ───────────────────────────────────
+//
+// Asserted before either pass, so the routing-only run CI does is the one that
+// notices. A routing probe cannot see this half of the contract: it sends no
+// token, and a 401 counts as "routed" — which is exactly how the document went
+// its whole life declaring no `securitySchemes` and no per-operation `security`
+// at all, telling every reader the entire API was anonymous (card_018b2dd39652).
+//
+// `security` is derived from the access level each route declares in the
+// `RouteTable`; the mechanical comparison of the two lives in the build that can
+// read both sides, `crates/rg-http/tests/integration/openapi_security_guard.rs`.
+// What is left for here is what only a live document shows: that the derivation
+// reached the wire, and that every scheme an operation names is one the document
+// actually defines — a requirement pointing at an undefined scheme is invalid
+// OpenAPI, and Swagger UI answers it by showing no field at all.
+const securitySchemes = Object.keys(components.securitySchemes || {});
+const operationEntries = Object.values(paths)
+  .flatMap((item) => Object.entries(item || {}))
+  .filter(([method, operation]) => shouldInclude(String(method).toLowerCase())
+    && operation && typeof operation === 'object');
+const declaringSecurity = operationEntries.filter(([, operation]) => shouldAuth(operation, openapiDoc));
+const namedSchemes = new Set(
+  operationEntries
+    .flatMap(([, operation]) => (Array.isArray(operation.security) ? operation.security : []))
+    .flatMap((requirement) => Object.keys(requirement || {})),
+);
+const undefinedSchemes = [...namedSchemes].filter((name) => !securitySchemes.includes(name));
+
+if (securitySchemes.length === 0) {
+  console.log(
+    '❌ The published document declares no components.securitySchemes, so it says the whole API is\n' +
+      '   anonymous: Swagger UI has no "Authorize" button and a generated client has no field for a\n' +
+      '   token. Check that #[openapi(...)] in crates/rg-http/src/openapi.rs still carries\n' +
+      '   modifiers(&SecurityAddon).',
+  );
+  process.exit(1);
+}
+if (declaringSecurity.length === 0) {
+  console.log(
+    `❌ The document defines ${securitySchemes.length} security scheme(s) but not one of its\n` +
+      `   ${operationEntries.length} operations requires any of them. The per-operation derivation\n` +
+      '   (openapi::stamp_security, fed by the route table) did not reach the served document.',
+  );
+  process.exit(1);
+}
+if (undefinedSchemes.length > 0) {
+  console.log(
+    `❌ Operations require security scheme(s) the document never defines: ${undefinedSchemes.join(', ')}.\n` +
+      `   Defined: ${securitySchemes.join(', ') || '<none>'}. A client cannot satisfy a requirement it\n` +
+      '   cannot look up.',
+  );
+  process.exit(1);
+}
+checks.push(
+  `✅ Access is documented: ${declaringSecurity.length}/${operationEntries.length} operations require ` +
+    `one of ${securitySchemes.join(', ')}`,
+);
+
 // ── Pass 1: every advertised path is routed ───────────────────────────────
 //
 // Anonymous and GET-only, so it mutates nothing and can run against any live
@@ -646,13 +704,18 @@ if (!token) {
 }
 
 // How many operations will actually carry the token, counted rather than
-// claimed. `shouldAuth` goes by what the document declares, and the document
-// declares no `securitySchemes` and no per-operation `security` at all — so
-// today this is zero, every protected endpoint is replayed anonymously, and the
-// replay pass below stops at the 401 wall instead of reaching the handler
-// (card_018b2dd39652). This used to print "protected endpoints will be replayed
-// with an auth header" unconditionally, which was the pleasant version of the
-// same fact.
+// claimed. `shouldAuth` goes by what the document declares, which is why this
+// number was zero for as long as the document declared nothing: every protected
+// endpoint was replayed anonymously and the pass below stopped at the 401 wall
+// instead of reaching the handler (card_018b2dd39652). It used to print
+// "protected endpoints will be replayed with an auth header" unconditionally,
+// which was the pleasant version of the same fact.
+//
+// The token is a session token, so the operations requiring `foreignToken` — a
+// runner token, a CI job token, an LFS action token — are counted in but are
+// still answered at their gate. That is a property of those endpoints, not a
+// gap here: the document names a different credential for them, and this script
+// has none to offer.
 const authed = Object.values(paths)
   .flatMap((item) => Object.entries(item || {}))
   .filter(([method, operation]) => shouldInclude(String(method).toLowerCase())
