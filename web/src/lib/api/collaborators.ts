@@ -22,6 +22,11 @@ export const collaborators = {
       method: 'PATCH',
       body: JSON.stringify({ permission }),
     }),
-  remove: (owner: string, repo: string, userId: number) =>
-    request<void>(`/repos/${owner}/${repo}/collaborators/${userId}`, { method: 'DELETE' }),
+  // `{id}` here is the collaborator's **user** id, while `{id}` on the PATCH
+  // above is the `repo_collaborators` row id — the same URL position, two
+  // different keys. axum refuses to mount the two verbs with different segment
+  // names, so the URL cannot carry the distinction and callers must: pass
+  // `collaborator.user_id`, not `collaborator.id`.
+  remove: (owner: string, repo: string, id: number) =>
+    request<void>(`/repos/${owner}/${repo}/collaborators/${id}`, { method: 'DELETE' }),
 };

@@ -1,6 +1,7 @@
 // Helpers for asserting against source files from the contract checks.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * Extract the block matched by `re`, or record a failure and return `null`.
@@ -258,6 +259,79 @@ export function loadRouteTable(routerPath) {
 }
 
 /**
+ * Resolve the nest prefix each `RouteTable` row is registered under.
+ *
+ * A path literal in `routes.rs` is relative to its table: `"/repos/{owner}"` in
+ * the `RouteTable::new("/api/v1")` chain is served at `/api/v1/repos/{owner}`.
+ * Any comparison against a URL declared *elsewhere* — an `#[utoipa::path]`
+ * annotation, a frontend call — is meaningless without that prefix, so it is
+ * resolved here rather than assumed by each caller.
+ *
+ * Two hops, because the table is built in two shapes:
+ *
+ *   1. Directly — the nearest preceding `RouteTable::new("…")` *inside the same
+ *      top-level fn*. The enclosing-fn bound is what stops a helper defined
+ *      after `build_docs_routes` from inheriting that function's `""`.
+ *   2. Through `.with(helper)` — `maven_layout_routes` & co. take the table as
+ *      an argument, so their rows carry no `RouteTable::new` at all. Their
+ *      prefix is the one at the `.with(...)` call site.
+ *
+ * A helper reached from two different prefixes is ambiguous and resolves to
+ * `null`, as does anything the two hops cannot place. `null` means "unknown",
+ * not "root": a caller comparing URLs must skip such a row out loud instead of
+ * comparing it against the wrong base.
+ */
+function routePrefixResolver(src) {
+  const fns = [];
+  const fnRe = /^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)/gm;
+  let match;
+  while ((match = fnRe.exec(src)) !== null) fns.push({ name: match[1], start: match.index });
+
+  const tables = [];
+  const tableRe = /RouteTable::new\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)/g;
+  while ((match = tableRe.exec(src)) !== null) tables.push({ index: match.index, prefix: match[1] });
+
+  /** The last entry of `list` at or before `index`, or `null`. */
+  const lastBefore = (list, index, key) => {
+    let found = null;
+    for (const entry of list) {
+      if (entry[key] > index) break;
+      found = entry;
+    }
+    return found;
+  };
+
+  // Hop 1: the table opened in this fn, or the fn itself when there is none.
+  const direct = (index) => {
+    const fn = lastBefore(fns, index, 'start');
+    const table = lastBefore(tables, index, 'index');
+    if (table && (!fn || table.index > fn.start)) return { prefix: table.prefix };
+    return { fn: fn ? fn.name : null };
+  };
+
+  // Hop 2: `.with(helper)` hands the helper the caller's table.
+  const viaWith = new Map();
+  const withRe = /\.with\s*\(\s*(\w+)\s*\)/g;
+  while ((match = withRe.exec(src)) !== null) {
+    const site = direct(match.index);
+    if (site.prefix === undefined) continue;
+    const helper = match[1];
+    if (viaWith.has(helper) && viaWith.get(helper) !== site.prefix) {
+      viaWith.set(helper, null); // reached from two prefixes — ambiguous
+      continue;
+    }
+    viaWith.set(helper, site.prefix);
+  }
+
+  return (index) => {
+    const site = direct(index);
+    if (site.prefix !== undefined) return site.prefix;
+    if (site.fn === null) return null;
+    return viaWith.has(site.fn) ? viaWith.get(site.fn) : null;
+  };
+}
+
+/**
  * Every handler path mounted by a `RouteTable` build, regardless of how the URL
  * was spelled.
  *
@@ -273,11 +347,15 @@ export function loadRouteTable(routerPath) {
  * So this reads the third argument instead, which is a handler path in every
  * spelling, and reports the path literal only when there happens to be one.
  *
- * Returns `{ handler, method, path|null, line }` rows; one per registration, so
- * a handler mounted under several URLs appears several times.
+ * Returns `{ handler, method, path|null, prefix|null, line }` rows; one per
+ * registration, so a handler mounted under several URLs appears several times.
+ * `prefix` is the sub-router's nest prefix (see `routePrefixResolver`), so
+ * `prefix + path` is the URL the server actually answers on; `null` means the
+ * prefix could not be established, not that there is none.
  */
 export function parseMountedHandlers(source) {
   const src = stripRustComments(source);
+  const prefixAt = routePrefixResolver(src);
   const rows = [];
   const re = new RegExp(`\\.(${ROUTE_METHODS.join('|')})(?:_with)?\\s*\\(`, 'g');
   let match;
@@ -295,6 +373,7 @@ export function parseMountedHandlers(source) {
       handler: handler.replace(/^crate::/, ''),
       method: match[1].toUpperCase(),
       path: pathLiteral ? pathLiteral[1] : null,
+      prefix: prefixAt(match.index),
       line: src.slice(0, match.index).split('\n').length,
     });
   }
@@ -317,6 +396,191 @@ export function loadMountedHandlers(routerPath) {
     );
   }
   return rows;
+}
+
+// ── OpenAPI annotations ────────────────────────────────────────────────────
+//
+// Every handler declares its route twice: once as a row in the `RouteTable`,
+// once as `#[utoipa::path(method, path = "…")]` above the function. The second
+// copy is what the published spec is built from — and nothing compared the two,
+// so a URL could be changed in the router alone and the spec would go on
+// advertising the old one. Reading the annotations here is what lets the
+// coverage gate compare (method, path) instead of handler names only.
+
+/** HTTP operations `#[utoipa::path]` accepts as its leading argument. */
+const UTOIPA_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options', 'trace', 'connect'];
+
+/**
+ * Lower bound on a healthy annotation sweep of `crates/rg-http/src/api`
+ * (~288 handlers carry one). Same reasoning as `MIN_PARSED_ROUTES`: a parser
+ * that quietly understands nothing would turn every (method, path) assertion
+ * into a no-op that reports perfect agreement.
+ */
+const MIN_PARSED_ANNOTATIONS = 200;
+
+/**
+ * The value of a top-level `key = "…"` in an attribute body.
+ *
+ * Depth-aware on purpose: `responses(...)` and `params(...)` carry `= "…"`
+ * pairs of their own, and a flat regex would happily read one of those as the
+ * operation's path.
+ */
+function attributeStringValue(body, key) {
+  let depth = 0;
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === '"') {
+      i += 1;
+      while (i < body.length) {
+        if (body[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (body[i] === '"') break;
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+    else if (depth === 0) {
+      const rest = body.slice(i);
+      const hit = new RegExp(`^${key}\\s*=\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(rest);
+      // Guard against matching the tail of a longer identifier.
+      if (hit && (i === 0 || !/[\w:]/.test(body[i - 1]))) return hit[1];
+    }
+    i += 1;
+  }
+  return null;
+}
+
+/**
+ * The `#[utoipa::path(...)]` annotations of one Rust source file.
+ *
+ * `modulePath` is the Rust module the file defines (`api::collaborators`), so
+ * the rows key by the same `api::module::handler` spelling the router uses.
+ *
+ * The annotation must sit directly above the handler — only further attributes
+ * may come between. An annotation this cannot attribute to a function is
+ * returned with `handler: null` rather than dropped, so the caller can fail on
+ * it: a silently skipped annotation is a hole in the very comparison these rows
+ * exist for.
+ *
+ * Returns `{ handler|null, method|null, path|null, file, line }` rows.
+ */
+export function parseUtoipaPaths(source, modulePath, file) {
+  const src = stripRustComments(source);
+  const rows = [];
+  const token = '#[utoipa::path(';
+  let cursor = 0;
+  while (true) {
+    const start = src.indexOf(token, cursor);
+    if (start === -1) break;
+
+    let i = start + token.length;
+    let depth = 1;
+    while (i < src.length && depth > 0) {
+      const ch = src[i];
+      if (ch === '"') {
+        i += 1;
+        while (i < src.length) {
+          if (src[i] === '\\') {
+            i += 2;
+            continue;
+          }
+          if (src[i] === '"') break;
+          i += 1;
+        }
+      } else if (ch === '(') depth += 1;
+      else if (ch === ')') depth -= 1;
+      i += 1;
+    }
+    if (depth !== 0) {
+      throw new Error(`Unbalanced #[utoipa::path(...)] in ${file} — the annotation form changed.`);
+    }
+
+    const body = src.slice(start + token.length, i - 1);
+    cursor = i;
+
+    const owner = /^\]\s*(?:#\[[^\]]*\]\s*)*pub(?:\(crate\))?\s+async\s+fn\s+(\w+)/.exec(src.slice(i));
+    const method = new RegExp(`^\\s*(${UTOIPA_METHODS.join('|')})\\s*,`, 'i').exec(body);
+
+    rows.push({
+      handler: owner ? `${modulePath}::${owner[1]}` : null,
+      method: method ? method[1].toUpperCase() : null,
+      path: attributeStringValue(body, 'path'),
+      file,
+      line: src.slice(0, start).split('\n').length,
+    });
+  }
+  return rows;
+}
+
+/** `crates/rg-http/src/api/packages/npm.rs` under `api/` → `api::packages::npm`. */
+function moduleForFile(relativePath, rootModule) {
+  const segments = relativePath.replace(/\.rs$/, '').split('/');
+  if (segments[segments.length - 1] === 'mod') segments.pop();
+  return [rootModule, ...segments].join('::');
+}
+
+/**
+ * Sweep `apiDir` for `#[utoipa::path]` annotations, keyed by handler.
+ *
+ * Throws when the sweep comes back implausibly small or when one handler
+ * carries two annotations — in both cases the assertions built on top would be
+ * quietly weaker than they read, and the resolver, not the caller, is what
+ * needs fixing.
+ */
+export function loadUtoipaPaths(apiDir, rootModule = 'api') {
+  const files = [];
+  const walk = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name.startsWith('.')) continue;
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(join(dir, entry.name), relative);
+      else if (entry.isFile() && entry.name.endsWith('.rs')) files.push(relative);
+    }
+  };
+  walk(apiDir, '');
+
+  const byHandler = new Map();
+  const unattributed = [];
+  for (const relative of files) {
+    const source = readFileSync(join(apiDir, relative), 'utf8');
+    for (const row of parseUtoipaPaths(source, moduleForFile(relative, rootModule), relative)) {
+      if (row.handler === null) {
+        unattributed.push(`${row.file}:${row.line}`);
+        continue;
+      }
+      if (byHandler.has(row.handler)) {
+        const first = byHandler.get(row.handler);
+        throw new Error(
+          `${row.handler} carries two #[utoipa::path] annotations (${first.file}:${first.line} and ` +
+            `${row.file}:${row.line}). Only one can reach the spec — fix the source, or teach ` +
+            'loadUtoipaPaths() in scripts/lib/rust-source.mjs which one wins.',
+        );
+      }
+      byHandler.set(row.handler, row);
+    }
+  }
+
+  if (unattributed.length > 0) {
+    throw new Error(
+      `${unattributed.length} #[utoipa::path(...)] annotation(s) in ${apiDir} could not be attributed to a ` +
+        `handler (${unattributed.join(', ')}). The annotation is expected directly above a ` +
+        '`pub async fn` — fix parseUtoipaPaths() in scripts/lib/rust-source.mjs rather than ignoring them.',
+    );
+  }
+  if (byHandler.size < MIN_PARSED_ANNOTATIONS) {
+    throw new Error(
+      `Annotation parser understood only ${byHandler.size} #[utoipa::path(...)] annotations in ${apiDir} ` +
+        `(expected at least ${MIN_PARSED_ANNOTATIONS}). The annotation form probably changed — fix ` +
+        'parseUtoipaPaths() in scripts/lib/rust-source.mjs rather than the checks that use it.',
+    );
+  }
+  return byHandler;
 }
 
 /** The row for `method path`, or `undefined`. */

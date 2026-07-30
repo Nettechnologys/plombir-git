@@ -196,15 +196,15 @@ pub async fn update_permission(
 }
 
 /// Remove a collaborator from a repo.
-/// DELETE /api/v1/repos/:owner/:name/collaborators/:user_id
+/// DELETE /api/v1/repos/:owner/:name/collaborators/:id
 #[utoipa::path(
     delete,
-    path = "/repos/{owner}/{name}/collaborators/{user_id}",
+    path = "/repos/{owner}/{name}/collaborators/{id}",
     tag = "Collaborators",
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
-        ("user_id" = i64, Path, description = "user_id"),
+        ("id" = i64, Path, description = "collaborator user id"),
     ),
     responses(
         (status = 204, description = "Removed"),

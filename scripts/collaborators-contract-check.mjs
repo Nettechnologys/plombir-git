@@ -21,13 +21,18 @@ const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');
 const failures = [];
 
-if (!/patch,\s*\n\s*path\s*=\s*"\/repos\/\{owner\}\/\{name\}\/collaborators\/\{id\}"/.test(backend)) {
-  failures.push('Backend collaborator PATCH route is missing or changed');
-}
-
-if (!/delete,\s*\n\s*path\s*=\s*"\/repos\/\{owner\}\/\{name\}\/collaborators\/\{user_id\}"/.test(backend)) {
-  failures.push('Backend collaborator DELETE route is missing or changed');
-}
+// The `#[utoipa::path]` URLs are deliberately NOT re-asserted here.
+//
+// They used to be, one hand-written regex per verb — and that is how the drift
+// this file now avoids got in and stayed: the DELETE pin was copied from the
+// annotation rather than from the router, so it pinned `{user_id}` while the
+// route mounted `{id}`, and the check went green on a spec that documented a
+// URL the server does not serve. A per-endpoint copy of a URL is one more
+// declaration to keep in sync, not a check.
+//
+// `openapi-route-coverage-contract-check.mjs` now compares every annotation
+// against its route table row mechanically, for all 286 documented handlers.
+// Adding a copy back here would weaken that, not strengthen it.
 
 // Changing or revoking someone's access is repo administration — both routes
 // must say so, or the sweep would be checking a level the router never claims.
@@ -62,7 +67,12 @@ for (const [file, source] of clients) {
     failures.push(`${path.relative(root, file)} must expose collaborators.updatePermission`);
   }
 
-  if (!/\/collaborators\/\$\{id\}`[\s\S]*method:\s*'PATCH'/.test(source)) {
+  // Both verbs now spell the segment `${id}` — axum will not mount them with
+  // different names — so the method has to sit inside the same match as the
+  // URL. With `[\s\S]*` between them, the PATCH template plus the DELETE method
+  // further down the file satisfied the DELETE assertion, and either call site
+  // could drift with the check none the wiser.
+  if (!/\/collaborators\/\$\{id\}`,\s*\{\s*method:\s*'PATCH'/.test(source)) {
     failures.push(`${path.relative(root, file)} must PATCH /collaborators/{id}`);
   }
 
@@ -70,16 +80,22 @@ for (const [file, source] of clients) {
     failures.push(`${path.relative(root, file)} must send the backend permission payload`);
   }
 
-  if (!/remove\s*:\s*\([^)]*\buserId\b[^)]*\)\s*=>/.test(source)) {
+  if (!/remove\s*:\s*\([^)]*\bid\b[^)]*\)\s*=>/.test(source)) {
     failures.push(`${path.relative(root, file)} must expose collaborators.remove`);
   }
 
-  if (!/\/collaborators\/\$\{userId\}`[\s\S]*method:\s*'DELETE'/.test(source)) {
-    failures.push(`${path.relative(root, file)} must DELETE /collaborators/{user_id}`);
+  if (!/\/collaborators\/\$\{id\}`,\s*\{\s*method:\s*'DELETE'/.test(source)) {
+    failures.push(`${path.relative(root, file)} must DELETE /collaborators/{id}`);
   }
 
-  if (/\/collaborators\/\$\{userId\}\/remove`[\s\S]*method:\s*'POST'/.test(source)) {
-    failures.push(`${path.relative(root, file)} must not use legacy POST /collaborators/{user_id}/remove`);
+  // The removal must still carry the collaborator's *user* id, whatever the URL
+  // segment is called — the page holds both keys and only one of them works.
+  if (!/collaborators\.remove\([^)]*\.user_id\s*\)/.test(settingsPage)) {
+    failures.push('Collaborators settings page must remove by collaborator.user_id, not the row id');
+  }
+
+  if (/\/collaborators\/\$\{id\}\/remove`[\s\S]*method:\s*'POST'/.test(source)) {
+    failures.push(`${path.relative(root, file)} must not use legacy POST /collaborators/{id}/remove`);
   }
 }
 
