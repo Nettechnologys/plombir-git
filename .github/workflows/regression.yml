@@ -363,13 +363,234 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate main compose
+      # Globs deploy/docker-compose*.yml rather than naming the files, for the
+      # same reason the contract-check runner does: the two named here used to
+      # be all of them, and `docker-compose.hostdir.yml` — the variant this
+      # repository recommends for a real deployment, and the one whose bind-mount
+      # traps cost a day of debugging — was added later and validated by nobody.
+      # A compose file added in a PR now gets checked by that same PR.
+      #
+      # The empty-glob branch is the ratchet: if the files are renamed or moved,
+      # this fails loudly instead of quietly passing a loop over nothing.
+      #
+      # deploy/.env is created first because hostdir's `env_file` requires it to
+      # exist, and the main compose reads FORGEKEEP_JWT_SECRET out of it. It is
+      # a throwaway secret for a throwaway runner, but it is still removed after.
+      - name: Validate every compose file
         run: |
+          set -euo pipefail
           cp deploy/.env.example deploy/.env
           secret="$(openssl rand -hex 32)"
           sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" deploy/.env
-          docker compose -f deploy/docker-compose.yml config >/tmp/forgekeep-compose-main.yml
-          rm -f deploy/.env
+          trap 'rm -f deploy/.env' EXIT
 
-      - name: Validate observability compose
-        run: docker compose -f deploy/docker-compose.observability.yml config >/tmp/forgekeep-compose-observability.yml
+          shopt -s nullglob
+          composes=(deploy/docker-compose*.yml)
+          if [ "${#composes[@]}" -eq 0 ]; then
+            echo "No deploy/docker-compose*.yml found — the glob no longer matches anything." >&2
+            exit 1
+          fi
+          for compose in "${composes[@]}"; do
+            echo "Validating ${compose}"
+            docker compose -f "${compose}" config >/dev/null
+          done
+
+  # The image built by `Dockerfile` is the only artifact that ever reaches a
+  # server, and until this job existed nothing in this workflow opened that file.
+  # `deploy-config` above looks like coverage and is not: `docker compose config`
+  # merges and prints compose YAML, and never reads the `Dockerfile` that
+  # `build.dockerfile` points at. The wiring was checked; the image was not.
+  #
+  # What that left unchecked is not a second `cargo build`. The image has its own
+  # failure modes, and every one of them is invisible to the other jobs here:
+  #   * two by-name lists of `crates/*/Cargo.toml` — the COPY block in stage 2a
+  #     and the `touch` list in stage 2d. A tenth workspace member that nobody
+  #     adds to both fails `cargo build --release` on a manifest it cannot read.
+  #   * a by-name list of frontend inputs in stage 1: a config file not named
+  #     there is simply absent from the build. `web/.npmrc` already is, so the
+  #     image's `npm ci` is laxer than the one the `frontend` job runs.
+  #   * artifact paths hardcoded in stage 3 (`target/release/*`,
+  #     `/build/web/build`). Moving adapter-static's output breaks the image and
+  #     nothing else.
+  #   * a pinned toolchain (`rust:1.95.0-slim-bookworm`) drifting away from the
+  #     floating `dtolnay/rust-toolchain@stable` every other job installs.
+  # Each of those used to surface during a deploy, on the server.
+  #
+  # Nothing is pushed. The proof wanted here is that the image builds and its
+  # binaries run; a registry would need credentials this workflow has no reason
+  # to hold.
+  #
+  # Cost is why this one is path-gated instead of unconditional — it is the most
+  # expensive job in the file by a wide margin, since `[profile.release]` is
+  # `lto = true` with `codegen-units = 1`. Measured cold on 24 cores: 103s for
+  # the dependency layer, 967s for the workspace build and the fat-LTO link of
+  # the three binaries, ~18 minutes end to end for a 243 MB image. A two-core
+  # hosted runner is well short of that, which is what the 120-minute ceiling
+  # leaves room for; adjust it against a real run rather than downwards on
+  # principle.
+  #
+  # The filter is a closed set rather than a guess: the Dockerfile's COPY
+  # statements name every path that can enter the build (Cargo.toml, Cargo.lock,
+  # crates/, web/), and .dockerignore and this workflow decide what the build
+  # sees. Push to main and workflow_dispatch build unconditionally, so main is
+  # never merely assumed to be shippable.
+  docker-image:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        # Full history: the path gate diffs against the pull request's base
+        # commit, which a depth-1 checkout does not have.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The decision is a step, not a job-level `if`, so the job always runs and
+      # always reports. A required check that resolves to "skipped" looks exactly
+      # like one that was never configured.
+      - name: Decide whether this change can reach the image
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" != "pull_request" ] || [ -z "${BASE_SHA}" ]; then
+            echo "build=true" >>"${GITHUB_OUTPUT}"
+            echo "Event is ${EVENT_NAME} — building unconditionally."
+            exit 0
+          fi
+          changed="$(git diff --name-only "${BASE_SHA}" HEAD)"
+          echo "Files changed against ${BASE_SHA}:"
+          printf '%s\n' "${changed}"
+          if printf '%s\n' "${changed}" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|crates/|web/|\.github/workflows/regression\.yml)'; then
+            echo "build=true" >>"${GITHUB_OUTPUT}"
+            echo "An input of the image build changed — building."
+          else
+            echo "build=false" >>"${GITHUB_OUTPUT}"
+            echo "This pull request touches no input of the image build — skipping it."
+          fi
+
+      - name: Set up Buildx
+        if: steps.scope.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      # cache-from/to type=gha is what keeps a source-only pull request
+      # affordable: stage 2c compiles the whole dependency tree and only has to
+      # be redone when Cargo.lock or a crate manifest changes. mode=max is
+      # required for that — the default caches only the exported image, and a
+      # multi-stage build gets no reuse from it at all.
+      #
+      # The budget it shares is worth knowing about: GitHub gives a repository
+      # 10 GB of Actions cache in total, the same pool `Swatinem/rust-cache`
+      # draws on in six jobs above, and eviction is LRU across all of it. Its own
+      # `scope` keeps this build's entries from colliding with those, not from
+      # competing with them.
+      #
+      # `load: true` because the next step runs the binaries: without it the
+      # image stays inside buildx and never reaches the daemon.
+      - name: Build the production image
+        if: steps.scope.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: forgekeep:ci
+          cache-from: type=gha,scope=forgekeep-image
+          cache-to: type=gha,scope=forgekeep-image,mode=max
+
+      # A built image is not yet a working one. The runtime stage is a different
+      # base (debian:bookworm-slim) from the builder (rust:1.95.0-slim-bookworm),
+      # so a shared library the build linked against and the runtime does not
+      # install produces a binary that compiles, copies, and then refuses to
+      # start — on the server, in a restart loop, with the failure a line in
+      # `docker logs` nobody reads until the deploy is already broken.
+      #
+      # `--help` rather than `--version`: none of the three declare a version
+      # flag, and clap answers `--version` with exit 2. The point is not the
+      # output anyway — `forgekeep-mcp` prints nothing at all here, since it
+      # ignores argv and serves MCP over stdin, which is at EOF. The point is
+      # that the binary loads its libraries and runs as the image's own
+      # unprivileged user. `timeout` is there so a binary that ever starts
+      # blocking fails this step instead of sitting until the job ceiling — set
+      # far above the ~1s these actually take, because the bound exists to catch
+      # a hang, and a bound tight enough to also catch a busy runner would make
+      # this gate flaky, which is worse than not having it.
+      - name: Run the binaries in the built image
+        if: steps.scope.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          for binary in forgekeep forgekeep-runner forgekeep-mcp; do
+            echo "Running ${binary}"
+            timeout 300 docker run --rm forgekeep:ci "${binary}" --help >/dev/null
+          done
+
+      # And a binary that starts is not yet a server that serves. This boots the
+      # image the way `deploy/docker-compose.yml` does — the image's own CMD, a
+      # JWT secret from the environment, nothing mounted — and then asks it the
+      # two questions a broken image answers differently:
+      #
+      #   * `/health` reports the database, filesystem and git subsystems. An
+      #     image missing libsqlite3 in the runtime stage, or one whose /data
+      #     directories were never created with the right owner, fails here.
+      #   * `/` must be the SPA. The frontend is built in a separate stage and
+      #     copied to a path hardcoded in stage 3; if adapter-static's output
+      #     moves, every other job stays green and this is the only place the
+      #     server ends up with no frontend to serve.
+      #
+      # Locally the health endpoint answers 2s after start; the loop allows 60.
+      # Logs are dumped on failure because a container that died has already
+      # said why, and without this the step would report only a timeout.
+      - name: Boot the built image and check it serves
+        if: steps.scope.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f forgekeep-smoke >/dev/null 2>&1 || true' EXIT
+
+          docker run -d --name forgekeep-smoke \
+            -e FORGEKEEP_JWT_SECRET="$(openssl rand -hex 32)" \
+            -p 127.0.0.1:18080:8080 \
+            forgekeep:ci
+
+          # Silent while polling (`-fs`, no `-S`): a refused connection during
+          # the first second is the expected state, not a diagnostic, and
+          # printing it once per attempt makes a passing run read like a failing
+          # one. The authoritative attempt below keeps `-S` and does report.
+          for _ in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:18080/health >/tmp/forgekeep-health.json; then
+              break
+            fi
+            sleep 1
+          done
+
+          if ! curl -fsS http://127.0.0.1:18080/health >/tmp/forgekeep-health.json; then
+            echo "The container never became healthy. Its logs:" >&2
+            docker logs forgekeep-smoke >&2 || true
+            exit 1
+          fi
+          cat /tmp/forgekeep-health.json
+
+          # The body is checked as well as the status code, and the two are not
+          # the same assertion today only by the handler's choice: `health` in
+          # crates/rg-http/src/handlers.rs answers 503 whenever a subsystem is
+          # down, so `curl -f` above already rejects a degraded container. What
+          # this catches is that choice changing — the status code and the
+          # reported `status` drifting apart, which is the direction such a
+          # handler usually drifts, since "degraded" reads as something short of
+          # a hard failure. `/health`'s body, not its code, is what the image's
+          # own HEALTHCHECK and the frontend's readiness banner go by.
+          if ! grep -q '"status":"ok"' /tmp/forgekeep-health.json; then
+            echo "The container is up but reports an unhealthy subsystem." >&2
+            docker logs forgekeep-smoke >&2 || true
+            exit 1
+          fi
+
+          if ! curl -fsS http://127.0.0.1:18080/ | grep -qi '<!doctype html'; then
+            echo "The server is healthy but / is not the frontend — check the" >&2
+            echo "web/build copy in the Dockerfile's runtime stage." >&2
+            docker logs forgekeep-smoke >&2 || true
+            exit 1
+          fi
