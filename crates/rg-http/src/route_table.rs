@@ -258,6 +258,12 @@ impl<'a> Wrap<'a> {
     /// point of the name is that it cannot be claimed by a wrapper that does
     /// not do the check, and the only way to keep that true is to let nobody
     /// outside this module pair the two.
+    ///
+    /// The visibility is load-bearing rather than tidy — half of
+    /// `foreign_gate_guard` reads the name back and believes it — so it is
+    /// asserted: `foreign_gate_guard::the_credential_constructor_is_private` is
+    /// what fails if a `pub` lands here, and its sibling is what fails if the
+    /// call moves out of the block of named constructors below.
     fn credential(
         layer: &'static str,
         apply: impl Fn(MethodRouter<AppState>) -> MethodRouter<AppState> + 'a,

@@ -27,11 +27,22 @@
 //! handler's own module to find it.
 //!
 //! What this file can no longer be asked is whether the *named* layer does any
-//! checking: it reads a string the wrapper carries. That half is closed by the
-//! compiler instead — `Wrap::credential` is private, and the only constructors
-//! that mint a name (`Wrap::runner_auth` and its body-limit sibling) build the
-//! middleware they name. There is no way to write down `authenticate_runner`
-//! and attach a body limit.
+//! checking: it reads a string the wrapper carries. That half rests on
+//! `Wrap::credential` being private — the only constructors that mint a name
+//! (`Wrap::runner_auth` and its body-limit sibling) build the middleware they
+//! name, so `authenticate_runner` cannot be written down next to a body limit.
+//! The compiler enforces it and [`the_credential_constructor_is_private`] is
+//! what holds the compiler to it, because a guard whose coverage is bought with
+//! a compile-time property is one word away from covering nothing
+//! (`card_eba65d156601`).
+//!
+//! Only the *pairing* is closed that way, and it is worth being exact about the
+//! rest: that each named constructor attaches the layer it names is semantics
+//! no source guard here proves.
+//! [`the_credential_name_is_minted_only_by_the_naming_constructors`] takes the
+//! cheap half of it — every mint of a name stays inside `impl Wrap<'static>`,
+//! where a constructor that names a layer it does not apply sits next to two
+//! that do — and a reader is owed the difference.
 //!
 //! Nor does it claim that the gate it *reaches* decides correctly — that a
 //! reached `check_read_for` still asks `rg-core` is
@@ -479,4 +490,242 @@ async fn every_foreign_sign_off_says_what_the_mechanism_is() {
             );
         }
     }
+}
+
+// ── The half handed to the compiler ────────────────────────────────────────
+//
+// Everything above reads the route table. What follows reads the source of the
+// table itself, because the half this file's header hands to the compiler —
+// "the name cannot be claimed by a wrapper that does not do the check" — is one
+// word wide and nothing was asking the compiler about it. The sibling shape is
+// `authz_extractor_guard::the_repository_gates_are_crate_private` and
+// `the_instance_admin_gate_is_module_private`: a guarantee a guard's coverage
+// rests on has to be asserted where the guard rests on it.
+
+/// The credential wrapper's home, relative to `crates/rg-http/src/`.
+const WRAP_HOME: &str = "route_table.rs";
+
+/// The constructor that pairs a credential *name* with an arbitrary closure.
+const WRAP_CONSTRUCTOR: &str = "credential";
+
+/// The wrapper's own declaration — the fields the constructor writes.
+const WRAP_STRUCT: &str = "struct Wrap<'a> {";
+
+/// The block of named constructors, each of which applies the layer it names.
+/// The only place allowed to call [`WRAP_CONSTRUCTOR`].
+const NAMING_IMPL: &str = "impl Wrap<'static> {";
+
+fn wrap_home() -> String {
+    fs::read_to_string(src_root().join(WRAP_HOME)).expect("read the route table module")
+}
+
+/// A comment or a `use` line — prose and imports, not the code these two guards
+/// read. `route_table.rs` quotes the very `credential(name, closure)` call it
+/// exists to keep unwritable, so reading its comments would find the defect in
+/// the sentence warning against it.
+fn is_prose(line: &str) -> bool {
+    let code = line.trim_start();
+    code.starts_with("//") || code.starts_with("use ")
+}
+
+/// The 1-based inclusive line span of the block whose opening line contains
+/// `header`, by brace counting over the non-prose lines.
+fn block_span(text: &str, header: &str) -> (usize, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| !is_prose(line) && line.contains(header))
+        .unwrap_or_else(|| {
+            panic!(
+                "{WRAP_HOME} no longer declares `{header}`. It was renamed or moved, and both \
+                 guards below are then about a shape that is not there — follow the rename here."
+            )
+        });
+
+    let mut depth = 0usize;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        if is_prose(line) {
+            continue;
+        }
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
+        if depth == 0 {
+            return (start + 1, start + offset + 1);
+        }
+    }
+    panic!("`{header}` in {WRAP_HOME} is never closed — the guard cannot tell where it ends");
+}
+
+/// `  route_table.rs:257 — fn credential(` for each hit, for a failure a reader
+/// can act on without opening the file.
+fn listing(hits: &[(usize, &str)]) -> String {
+    hits.iter()
+        .map(|(n, code)| format!("  {WRAP_HOME}:{n} — {code}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The compiler's half of this file's rule: `Wrap::credential` is private, so a
+/// credential *name* and the closure it travels with can only be paired inside
+/// `route_table`.
+///
+/// [`a_middleware_claim_names_a_layer_the_route_carries`] compares two strings
+/// and believes the wrapper's. That is sound only while nothing outside this
+/// module can mint the string: `routes.rs` already imports both `Wrap` and
+/// `RUNNER_AUTH_LAYER`, so one `pub(crate)` on the constructor is the whole
+/// distance to
+///
+/// ```ignore
+/// Wrap::credential(RUNNER_AUTH_LAYER, |mr| mr.layer(RequestBodyLimitLayer::new(n)))
+/// ```
+///
+/// — a route declaring `Foreign(ForeignGate::Middleware { layer: RUNNER_AUTH_LAYER })`,
+/// green through every check above, with no authentication anywhere on it and
+/// `Expect::Unchecked` bought in the access sweep on top. That is the
+/// `/runners/register` defect this file was written for (`card_cd6f512e2e52`),
+/// re-entered through the guard's own blind spot.
+///
+/// The struct's field is asserted with it because it is the same pairing one
+/// level down: a visible `credential` field is a `Wrap { credential: Some(..),
+/// apply: .. }` literal written anywhere in the crate, i.e. the constructor's
+/// hole with the constructor left untouched.
+///
+/// The definition line is read whole rather than a set of widened spellings
+/// searched for — `pub`, `pub(crate)`, `pub(super)`, `pub(in crate::…)` do not
+/// form a closed list and the last is unguessable, the lesson
+/// [`the_instance_admin_gate_is_module_private`] paid for by mutation.
+/// Requiring exactly one definition is the liveness half: a rename that leaves
+/// this guard matching nothing has to be loud, or it goes green while guarding
+/// air.
+#[test]
+fn the_credential_constructor_is_private() {
+    let text = wrap_home();
+    let needle = format!("fn {WRAP_CONSTRUCTOR}(");
+
+    let definitions: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !is_prose(line) && line.contains(&needle))
+        .map(|(n, line)| (n + 1, line.trim()))
+        .collect();
+
+    assert_eq!(
+        definitions.len(),
+        1,
+        "expected exactly one definition of `Wrap::{WRAP_CONSTRUCTOR}` in {WRAP_HOME}, found \
+         {}:\n{}\nNone means the constructor was renamed or removed, and this file's header — \
+         which tells the reader the compiler closes the \"does the named layer check anything\" \
+         half — is then a claim about nothing. More than one means the name can be minted in two \
+         places, and only one of them is guarded.",
+        definitions.len(),
+        listing(&definitions)
+    );
+
+    let (_, definition) = definitions[0];
+    assert!(
+        definition.starts_with(&needle),
+        "`Wrap::{WRAP_CONSTRUCTOR}` is no longer private to `route_table`:\n{}\n\
+         Any module in this crate can now pair a credential name with a closure that does not \
+         check it — `Wrap::{WRAP_CONSTRUCTOR}(RUNNER_AUTH_LAYER, |mr| mr.layer(body_limit))` \
+         registers a route that declares `Foreign(ForeignGate::Middleware {{ layer }})`, passes \
+         every check in this file, and authenticates nobody. Narrow it back to `fn \
+         {WRAP_CONSTRUCTOR}(`. If the wider visibility is genuinely wanted, then the claim this \
+         file reads back is no longer worth more than the string it is written in, and the \
+         header has to stop promising the compiler closes that half.",
+        listing(&definitions)
+    );
+
+    let (start, end) = block_span(&text, WRAP_STRUCT);
+    let fields: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|(n, line)| {
+            (start..=end).contains(&(n + 1))
+                && !is_prose(line)
+                && line.contains(&format!("{WRAP_CONSTRUCTOR}:"))
+        })
+        .map(|(n, line)| (n + 1, line.trim()))
+        .collect();
+
+    assert_eq!(
+        fields.len(),
+        1,
+        "expected exactly one `{WRAP_CONSTRUCTOR}` field in `{WRAP_STRUCT}`, found {}:\n{}\n\
+         The field is what the constructor writes; if it moved or was renamed, the constructor \
+         above is no longer the thing that mints the name and this guard is watching the wrong \
+         door.",
+        fields.len(),
+        listing(&fields)
+    );
+
+    assert!(
+        fields[0].1.starts_with(&format!("{WRAP_CONSTRUCTOR}:")),
+        "the `{WRAP_CONSTRUCTOR}` field of `Wrap` is no longer private to `route_table`:\n{}\n\
+         A visible field is the private constructor's hole with the constructor left alone: \
+         `Wrap {{ {WRAP_CONSTRUCTOR}: Some(RUNNER_AUTH_LAYER), apply: .. }}` written in any \
+         module of this crate mints the same unbacked claim. Narrow it back.",
+        listing(&fields)
+    );
+}
+
+/// The second half, taken as far as a source guard honestly can: the only
+/// callers of `Wrap::credential` are the named constructors that apply the
+/// layer they name.
+///
+/// "Each naming constructor attaches the middleware it names" is semantics and
+/// this test does not prove it — `Wrap::runner_auth` swapping
+/// `runner_auth_layer` for a body limit stays green here, and only reading it
+/// catches that. What this does catch is the drift that needs no lie: a new
+/// constructor somewhere else in the module minting a name out of its own
+/// argument, which is the general-purpose `credential(name, closure)` the
+/// module's doc comment says was deliberately not written. Keeping the call
+/// inside `impl Wrap<'static>` keeps every mint of a name next to its
+/// neighbours, where the missing layer is visible to a reader.
+///
+/// Call sites are found by the bare name rather than by a list of spellings —
+/// `Self::credential(`, `Wrap::credential(`, an aliased import — for the same
+/// reason the sibling guard reads the definition line whole.
+#[test]
+fn the_credential_name_is_minted_only_by_the_naming_constructors() {
+    let text = wrap_home();
+    let (start, end) = block_span(&text, NAMING_IMPL);
+    let definition = format!("fn {WRAP_CONSTRUCTOR}(");
+
+    let call_sites: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            !is_prose(line)
+                && line.contains(&format!("{WRAP_CONSTRUCTOR}("))
+                && !line.contains(&definition)
+        })
+        .map(|(n, line)| (n + 1, line.trim()))
+        .collect();
+
+    assert!(
+        !call_sites.is_empty(),
+        "nothing in {WRAP_HOME} calls `Wrap::{WRAP_CONSTRUCTOR}` any more. Either no route \
+         carries a credential layer — in which case `ForeignGate::Middleware` claims nothing and \
+         `a_middleware_claim_names_a_layer_the_route_carries` is asserting over an empty set — or \
+         the name is now minted some other way, which is the thing both of these guards exist to \
+         see."
+    );
+
+    let strays: Vec<(usize, &str)> = call_sites
+        .iter()
+        .filter(|(n, _)| !(start..=end).contains(n))
+        .copied()
+        .collect();
+
+    assert!(
+        strays.is_empty(),
+        "a credential name is minted outside `{NAMING_IMPL}` ({WRAP_HOME}:{start}-{end}):\n{}\n\
+         That block is the whole rule the route table's claim rests on: one constructor per \
+         layer, each applying the middleware it names, all of them side by side. A constructor \
+         elsewhere — worse, one that takes the name as an argument — is the general-purpose \
+         `{WRAP_CONSTRUCTOR}(name, closure)` this module refused to write, and it hands the next \
+         route a `Foreign` sign-off with nothing behind it. Move it into the block, or say here \
+         what now holds a named wrapper to doing the check it names.",
+        listing(&strays)
+    );
 }
