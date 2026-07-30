@@ -29,7 +29,7 @@
 //! What this file can no longer be asked is whether the *named* layer does any
 //! checking: it reads a string the wrapper carries. That half is closed by the
 //! compiler instead — `Wrap::credential` is private, and the only constructors
-//! that mint a name (`Wrap::runner_auth`, `Wrap::docs_auth`) build the
+//! that mint a name (`Wrap::runner_auth` and its body-limit sibling) build the
 //! middleware they name. There is no way to write down `authenticate_runner`
 //! and attach a body limit.
 //!

@@ -509,10 +509,19 @@ fn handler_location(handler: &str) -> (String, String) {
 /// Anchored on column 0: rustfmt puts a top-level item there and nothing inside
 /// a function body, so an inner helper or a closure cannot be mistaken for the
 /// handler.
+///
+/// The parameter list is located from the *name*, not from the first `(` on the
+/// line. `pub(crate) async fn openapi_handler(_: AuthUser)` has a paren three
+/// characters in, and reading from there parses `(crate)` as the signature — so
+/// every `pub(crate)` handler read as taking one parameter called `crate` and
+/// therefore no gate at all. The failure direction was safe (such a handler is
+/// reported as ungated, never as gated), but it made the level unstatable: a
+/// route could not declare `User` over a `pub(crate)` handler however correct
+/// that handler was.
 fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
     let mut offset = 0usize;
     for line in text.lines() {
-        let declares = [
+        let params_at = [
             "pub async fn ",
             "pub(crate) async fn ",
             "async fn ",
@@ -521,13 +530,19 @@ fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
             "fn ",
         ]
         .iter()
-        .find_map(|prefix| line.strip_prefix(prefix))
-        .is_some_and(|rest| {
-            rest.strip_prefix(name)
-                .is_some_and(|tail| tail.starts_with('(') || tail.starts_with('<'))
+        .find_map(|prefix| {
+            let tail = line.strip_prefix(prefix)?.strip_prefix(name)?;
+            // A generic list may sit between the name and the parameters:
+            // `fn handler<T>(…)`.
+            let open = match tail.as_bytes().first()? {
+                b'(' => 0,
+                b'<' => tail.find('(')?,
+                _ => return None,
+            };
+            Some(prefix.len() + name.len() + open)
         });
-        if declares {
-            return call_args(text, offset + line.find('(')?);
+        if let Some(open) = params_at {
+            return call_args(text, offset + open);
         }
         offset += line.len() + 1;
     }

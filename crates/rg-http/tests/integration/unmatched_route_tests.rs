@@ -31,26 +31,31 @@ async fn an_unmatched_path_is_not_an_authorization_problem() {
             status, 404,
             "{path} is claimed by no route and must answer as such, got {status}: {body}"
         );
+        // The body the gate would answer with, whatever gate it is: the layer
+        // said "api docs requires authentication", `AuthUser` says
+        // "authentication required". The status above is the real assertion;
+        // this one names the symptom so a regression reads as itself.
         assert!(
-            !body.contains("api docs requires authentication"),
-            "{path} answered with the API-docs gate: {body}"
+            !body.contains("authentication"),
+            "{path} answered with an authentication gate: {body}"
         );
     }
 }
 
-/// The docs gate must still be a gate — moving it from the sub-router onto its
-/// four routes is only correct if those routes are still shut.
+/// The docs gate must still be a gate — moving it off the sub-router, first
+/// onto its four routes and then into the handlers' signatures, is only correct
+/// if those routes are still shut.
 ///
-/// The rest of that contract (a JWT and a PAT both open it) is
+/// The rest of that contract (a cookie session, a JWT and a PAT all open it) is
 /// `openapi_docs_auth_tests`; this asserts the one thing that would break if
-/// the layer went missing entirely.
+/// the gate went missing entirely.
 #[tokio::test]
 async fn the_api_docs_gate_survived_moving_onto_its_routes() {
     let base = spawn_test_app().await;
 
     for path in ["/api-docs/openapi.json", "/api-docs/"] {
         let response = reqwest::get(format!("{base}{path}")).await.unwrap();
-        assert_eq!(response.status(), 401, "{path} must require a bearer token");
+        assert_eq!(response.status(), 401, "{path} must require a session");
     }
 }
 

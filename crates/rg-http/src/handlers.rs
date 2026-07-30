@@ -7,6 +7,7 @@ use axum::extract::{Extension, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use crate::api::auth::AuthUser;
 use crate::{openapi, security, AppState};
 
 /// Directory holding the built SvelteKit bundle, **relative to the working
@@ -321,7 +322,16 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /api-docs/openapi.json — serve the OpenAPI specification.
-pub(crate) async fn openapi_handler() -> impl IntoResponse {
+///
+/// The gate is [`AuthUser`], taken as an argument rather than applied as a
+/// bespoke layer. What stood here before was `docs_auth_middleware`, which read
+/// `Authorization: Bearer` and nothing else — so a browser, which cannot set a
+/// header on a plain navigation and sends the HttpOnly session cookie instead,
+/// was answered `401` on the one surface that exists for browsers
+/// (card_fb094ba6d323). `AuthUser` reads every shape of session this server
+/// issues, and a Personal Access Token still arrives here as a Bearer JWT
+/// because `pat_auth_middleware` translates it on the way in.
+pub(crate) async fn openapi_handler(_: AuthUser) -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -330,7 +340,11 @@ pub(crate) async fn openapi_handler() -> impl IntoResponse {
 }
 
 /// GET /api-docs/{*tail} — serve Swagger UI static files.
+///
+/// `AuthUser` comes first deliberately: ahead of `Path<_>`, so the access
+/// question is answered before any extractor can answer something else.
 pub(crate) async fn swagger_ui_handler(
+    _: AuthUser,
     axum::extract::Path(tail): axum::extract::Path<String>,
 ) -> Response {
     let path = if tail.is_empty() { "/" } else { &tail };
@@ -338,7 +352,7 @@ pub(crate) async fn swagger_ui_handler(
 }
 
 /// GET /api-docs[/] — serve Swagger UI index.
-pub(crate) async fn swagger_ui_root_handler() -> Response {
+pub(crate) async fn swagger_ui_root_handler(_: AuthUser) -> Response {
     swagger_ui_response("/")
 }
 

@@ -20,7 +20,7 @@ use crate::route_table::Access::{
     RepoAuthRead, RepoOwner, RepoRead, RepoWrite, User,
 };
 use crate::route_table::ForeignGate::{Handler, Middleware};
-use crate::route_table::{RouteFact, RouteTable, Wrap, DOCS_AUTH_LAYER, RUNNER_AUTH_LAYER};
+use crate::route_table::{RouteFact, RouteTable, Wrap, RUNNER_AUTH_LAYER};
 use crate::{
     api, git_http, handlers, metrics, middleware, oci, pat_auth, rate_limit, security, ws, AppState,
 };
@@ -100,11 +100,6 @@ const WS_JOB_LOG: Access = Foreign(Handler {
     gates: &["check_read_for"],
     note: "WebSocket: session token, then the repository read gate",
 });
-const DOCS_AUTH: Access = Foreign(Middleware {
-    layer: DOCS_AUTH_LAYER,
-    note: "API docs: `docs_auth_middleware` over PAT/JWT",
-});
-
 /// Build a restrictive CORS layer.
 ///
 /// If `FORGEKEEP_CORS_ORIGINS` is set (comma-separated URLs), only those
@@ -453,42 +448,60 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
 
 /// Build API docs routes with authentication required.
 ///
-/// The gate is attached per route rather than to the sub-router. `Router::layer`
+/// Layers are attached per route rather than to the sub-router. `Router::layer`
 /// wraps a router's *fallback* along with its routes, and this sub-router is
-/// merged into the tree — so the layered fallback became the answer for every
-/// path no route claims, and an unmatched URL replied `401 api docs requires
-/// authentication` instead of a 404 (card_dd8497e4fd58). In production the SPA
-/// fallback hid it; in the test router, which had no fallback of its own, a
-/// missing route looked like an authorization problem to anyone debugging one.
+/// merged into the tree — so back when the docs gate was a layer, the layered
+/// fallback became the answer for every path no route claims, and an unmatched
+/// URL replied `401 api docs requires authentication` instead of a 404
+/// (card_dd8497e4fd58). In production the SPA fallback hid it; in the test
+/// router, which had no fallback of its own, a missing route looked like an
+/// authorization problem to anyone debugging one. The gate has since moved into
+/// the handlers' signatures, but the shape stays: a layer here is one this
+/// sub-router's four routes carry, not one the whole tree inherits.
 fn build_docs_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
-    // The gate, and the name it answers to in the table, come from one
-    // constructor — see `Wrap::docs_auth`.
-    let docs_auth = Wrap::docs_auth(state);
+    // The gate itself is `AuthUser`, taken by each handler — so these rows
+    // declare `User` and are driven by the persona sweep like any other
+    // authenticated route. They used to declare `Foreign(Middleware)` over a
+    // `docs_auth_middleware` that read `Authorization: Bearer` and nothing
+    // else, which bought the sweep's exemption *and* locked every browser out
+    // of the one surface built for browsers (card_fb094ba6d323).
+    //
+    // What is left here is the PAT translation, which is not a gate: it turns a
+    // Personal Access Token into the Bearer JWT `AuthUser` understands, exactly
+    // as the same layer does for `/api/v1`. A request with no credentials, or
+    // with a session cookie, passes through it untouched and is answered by the
+    // handler's own gate.
+    let pat_bridge = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+        mr.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            pat_auth::pat_auth_middleware,
+        ))
+    });
 
     let (router, facts) = RouteTable::new("")
         .get_with(
-            DOCS_AUTH,
+            User,
             "/api-docs/openapi.json",
             handlers::openapi_handler,
-            &docs_auth,
+            &pat_bridge,
         )
         .get_with(
-            DOCS_AUTH,
+            User,
             "/api-docs",
             handlers::swagger_ui_root_handler,
-            &docs_auth,
+            &pat_bridge,
         )
         .get_with(
-            DOCS_AUTH,
+            User,
             "/api-docs/",
             handlers::swagger_ui_root_handler,
-            &docs_auth,
+            &pat_bridge,
         )
         .get_with(
-            DOCS_AUTH,
+            User,
             "/api-docs/{*tail}",
             handlers::swagger_ui_handler,
-            &docs_auth,
+            &pat_bridge,
         )
         .finish();
 

@@ -4,32 +4,12 @@
 //! extracts the authenticated actor for the Git-over-HTTP endpoints.
 
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use sea_orm::DatabaseConnection;
 
-use crate::api;
 use crate::error;
 use crate::AppState;
-
-/// API docs endpoint access requires an authenticated JWT/PAT bearer token.
-pub(crate) async fn docs_auth_middleware(
-    State(state): State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    if api::auth::extract_bearer_claims(req.headers(), &state.jwt_secret).is_none() {
-        let mut response =
-            (StatusCode::UNAUTHORIZED, "api docs requires authentication").into_response();
-        if let Ok(challenge) = HeaderValue::from_str("Bearer") {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, challenge);
-        }
-        return response;
-    }
-    next.run(req).await
-}
 
 /// Resolve a Personal Access Token, honouring expiry and the owner's standing.
 ///

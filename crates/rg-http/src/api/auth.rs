@@ -90,7 +90,16 @@ pub(crate) fn extract_user_id(headers: &HeaderMap, jwt_secret: &str) -> Option<i
 
 /// Extract and validate the Bearer JWT Claims from the Authorization header.
 /// Returns Some(Claims) for valid user tokens, None for invalid or CI tokens.
-pub(crate) fn extract_bearer_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
+///
+/// Deliberately narrower than `pub(crate)`: this reads **one** of the shapes a
+/// session arrives in, so every gate that called it directly was a gate a
+/// browser could not pass — the HttpOnly cookie is invisible to it. Four such
+/// gates were found and fixed one at a time (card_7210b02c0ae9,
+/// card_b38bfb0f2b40, card_64aeec457364, card_fb094ba6d323); the visibility is
+/// what stops a fifth from being written. Callers outside this module want
+/// [`extract_user_id`] or the [`AuthUser`] extractor, both of which read the
+/// cookie first and fall back to this.
+fn extract_bearer_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     rg_core::auth::jwt::validate_token(token, jwt_secret)

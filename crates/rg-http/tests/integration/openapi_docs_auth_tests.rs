@@ -63,6 +63,51 @@ async fn api_docs_openapi_accepts_jwt_and_pat() {
         .starts_with("application/json"));
 }
 
+/// card_fb094ba6d323: the docs gate used to read `Authorization: Bearer` and
+/// nothing else.
+///
+/// Swagger UI is a browser surface, and a browser cannot put a header on a
+/// plain navigation — it sends the HttpOnly `forgekeep_token` cookie. So the one
+/// audience `/api-docs/` exists for was answered `401` on the HTML itself,
+/// before any script ran, while `curl -H "Authorization: Bearer …"` worked
+/// fine. The gate is `AuthUser` now, which reads the cookie first.
+///
+/// The anonymous request is in this test rather than only in
+/// [`api_docs_ui_requires_auth`] on purpose: a `401` proves the gate turned
+/// somebody away only next to a `200` proving it lets the right caller in. A
+/// broken fixture would otherwise read as a passing security test.
+#[tokio::test]
+async fn api_docs_accepts_a_cookie_session_and_still_refuses_an_anonymous_caller() {
+    let base = spawn_test_app().await;
+    let jwt = register_user(&base, "docscookie", "docscookie@example.com", "Qz7$wRtm").await;
+    let client = reqwest::Client::new();
+
+    for path in ["/api-docs/", "/api-docs/openapi.json"] {
+        let with_cookie = client
+            .get(format!("{}{}", base, path))
+            .header("cookie", format!("forgekeep_token={jwt}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            with_cookie.status(),
+            200,
+            "{path} refused a browser carrying the session cookie"
+        );
+
+        let anonymous = client
+            .get(format!("{}{}", base, path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous.status(),
+            401,
+            "{path} let an anonymous caller in — the baseline above proves the fixture works"
+        );
+    }
+}
+
 #[tokio::test]
 async fn api_docs_ui_requires_auth() {
     let base = spawn_test_app().await;

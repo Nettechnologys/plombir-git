@@ -30,8 +30,6 @@ use crate::AppState;
 /// attaches the middleware and by the [`Access::Foreign`] level that claims it —
 /// so the two cannot drift into two spellings of one name.
 pub const RUNNER_AUTH_LAYER: &str = "authenticate_runner";
-/// See [`RUNNER_AUTH_LAYER`].
-pub const DOCS_AUTH_LAYER: &str = "docs_auth_middleware";
 
 /// What a route requires of its caller.
 ///
@@ -293,25 +291,6 @@ impl Wrap<'static> {
         let gate = runner_auth_layer(state);
         Self::credential(RUNNER_AUTH_LAYER, move |mr: MethodRouter<AppState>| {
             gate(mr.layer(RequestBodyLimitLayer::new(body_limit)))
-        })
-    }
-
-    /// The API-docs gate.
-    ///
-    /// Outermost first: `pat_auth_middleware` translates a PAT into the bearer
-    /// token `docs_auth_middleware` then checks, so it has to run before it —
-    /// i.e. be applied last.
-    pub(crate) fn docs_auth(state: &AppState) -> Self {
-        let state = state.clone();
-        Self::credential(DOCS_AUTH_LAYER, move |mr: MethodRouter<AppState>| {
-            mr.layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                crate::pat_auth::docs_auth_middleware,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                crate::pat_auth::pat_auth_middleware,
-            ))
         })
     }
 }
