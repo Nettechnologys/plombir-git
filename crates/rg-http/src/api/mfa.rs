@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing;
 use utoipa::ToSchema;
 
-use crate::api::auth::{extract_user_id, AuthUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -128,11 +128,8 @@ pub struct SetupMfaResponse {
 )]
 pub async fn setup_mfa(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
 ) -> Result<Json<SetupMfaResponse>, AppError> {
-    let user_id = extract_user_id(&headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("unauthorized"))?;
-
     // Get username to include in TOTP label
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
@@ -404,11 +401,8 @@ pub async fn verify_mfa(
 )]
 pub async fn get_backup_codes(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = extract_user_id(&headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("unauthorized"))?;
-
     let codes = rg_db::ops::mfa_backup_code_ops::list_codes(&state.db, user_id)
         .await
         .map_err(AppError::from)?;

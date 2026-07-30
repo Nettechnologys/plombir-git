@@ -457,12 +457,7 @@ pub async fn logout(headers: HeaderMap) -> impl IntoResponse {
     )
 )]
 /// GET /api/v1/users/me — returns the current user's profile.
-pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => return AppError::unauthorized("missing or invalid token").into_response(),
-    };
-
+pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> impl IntoResponse {
     match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
         Ok(Some(user)) => (
             StatusCode::OK,
@@ -535,14 +530,10 @@ fn hash_token(token: &str) -> String {
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required".to_string()).into_response();
-        }
-    };
-
+pub async fn list_tokens(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> impl IntoResponse {
     match rg_db::ops::token_ops::list_by_user(&state.db, user_id).await {
         Ok(tokens) => {
             let tokens: Vec<AccessTokenResponse> = tokens

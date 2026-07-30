@@ -201,20 +201,7 @@ pub async fn create_org(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn get_org(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
-        return e.into_response();
-    }
-
+pub async fn get_org(OrgRead { org, .. }: OrgRead) -> impl IntoResponse {
     Json(org_to_response(&org)).into_response()
 }
 
@@ -229,14 +216,10 @@ pub async fn get_org(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
-pub async fn list_orgs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = match super::auth::extract_user_id(&headers, &state.jwt_secret) {
-        Some(id) => id,
-        None => {
-            return AppError::unauthorized("authentication required").into_response();
-        }
-    };
-
+pub async fn list_orgs(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> impl IntoResponse {
     match rg_core::org::list_user_orgs(&state.db, user_id).await {
         Ok(orgs) => {
             let resp: Vec<OrgResponse> = orgs.iter().map(org_to_response).collect();
@@ -263,22 +246,15 @@ pub async fn list_orgs(State(state): State<AppState>, headers: HeaderMap) -> imp
 )]
 pub async fn update_org(
     State(state): State<AppState>,
+    // Ahead of `Json<_>` because it has to run ahead of it: the gate used to be
+    // the first three statements of this body, which put it *behind* the
+    // deserializer, and an anonymous caller was told its payload was malformed
+    // instead of being turned away — a rejection that doubles as a schema
+    // oracle. As an argument it runs first, and forgetting it is a compile error.
+    OrgAdmin { org, actor_id }: OrgAdmin,
     headers: HeaderMap,
-    Path(name): Path<String>,
     Json(body): Json<UpdateOrgRequest>,
 ) -> impl IntoResponse {
-    let user_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, user_id).await {
-        return e.into_response();
-    }
-
     match rg_core::org::update_org(
         &state.db,
         org.id,
@@ -296,7 +272,7 @@ pub async fn update_org(
             });
             record_audit(
                 &state.db,
-                user_id,
+                actor_id,
                 &org.name,
                 "org.update",
                 Some("org"),
@@ -329,26 +305,23 @@ pub async fn update_org(
 )]
 pub async fn delete_org(
     State(state): State<AppState>,
+    // `OrgAdmin` is the level the route declares, and taking it here is what
+    // makes that declaration enforced rather than merely written down. It is a
+    // *floor*, not the whole rule: deleting an organization is owner-only, and
+    // `rg_core::org::delete_org` still enforces exactly that below — an admin
+    // who is not the owner passes this gate and is refused there, as before.
+    // The gate is not redundant for it, though. Without it the level was carried
+    // by `require_user` plus whatever the service happened to check, so lowering
+    // the service's rule to admin would have widened the route silently.
+    OrgAdmin { org, actor_id }: OrgAdmin,
     headers: HeaderMap,
-    Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let user_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-
-    // No `require_org_admin` here on purpose: deleting an organization is
-    // owner-only, and `rg_core::org::delete_org` enforces exactly that.
-    match rg_core::org::delete_org(&state.db, org.id, user_id).await {
+    match rg_core::org::delete_org(&state.db, org.id, actor_id).await {
         Ok(()) => {
             let details = serde_json::json!({"name": org.name});
             record_audit(
                 &state.db,
-                user_id,
+                actor_id,
                 &org.name,
                 "org.delete",
                 Some("org"),
@@ -385,18 +358,8 @@ pub async fn delete_org(
 )]
 pub async fn list_org_members(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
+    OrgRead { org, .. }: OrgRead,
 ) -> impl IntoResponse {
-    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
-        return e.into_response();
-    }
-
     match rg_core::org::list_org_members(&state.db, org.id).await {
         Ok(members) => {
             let resp: Vec<OrgMemberResponse> = members
@@ -491,21 +454,10 @@ pub async fn add_org_member(
 )]
 pub async fn remove_org_member(
     State(state): State<AppState>,
+    OrgAdmin { org, actor_id }: OrgAdmin,
     headers: HeaderMap,
-    Path((name, user_id)): Path<(String, i64)>,
+    Path((_name, user_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    let actor_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
-        return e.into_response();
-    }
-
     match rg_core::org::remove_org_member(&state.db, org.id, user_id).await {
         Ok(()) => {
             let details = serde_json::json!({
@@ -593,18 +545,8 @@ pub async fn create_team(
 )]
 pub async fn list_org_teams(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
+    OrgRead { org, .. }: OrgRead,
 ) -> impl IntoResponse {
-    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
-        return e.into_response();
-    }
-
     match rg_core::org::list_org_teams(&state.db, org.id).await {
         Ok(teams) => {
             let resp: Vec<TeamResponse> = teams
@@ -641,17 +583,9 @@ pub async fn list_org_teams(
 )]
 pub async fn get_team(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((name, team_id)): Path<(String, i64)>,
+    OrgRead { org, .. }: OrgRead,
+    Path((_name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
-        return e.into_response();
-    }
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
@@ -687,20 +621,9 @@ pub async fn get_team(
 )]
 pub async fn delete_team(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((name, team_id)): Path<(String, i64)>,
+    OrgAdmin { org, .. }: OrgAdmin,
+    Path((_name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    let actor_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
-        return e.into_response();
-    }
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
@@ -732,17 +655,9 @@ pub async fn delete_team(
 )]
 pub async fn list_team_members(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((name, team_id)): Path<(String, i64)>,
+    OrgRead { org, .. }: OrgRead,
+    Path((_name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
-    let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_visible(&state.db, &org, viewer).await {
-        return e.into_response();
-    }
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
@@ -830,20 +745,9 @@ pub async fn add_team_member(
 )]
 pub async fn remove_team_member(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((name, team_id, user_id)): Path<(String, i64, i64)>,
+    OrgAdmin { org, .. }: OrgAdmin,
+    Path((_name, team_id, user_id)): Path<(String, i64, i64)>,
 ) -> impl IntoResponse {
-    let actor_id = match require_user(&headers, &state.jwt_secret) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
-    };
-    let org = match resolve_org(&state.db, &name).await {
-        Ok(org) => org,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = require_org_admin(&state.db, &org, actor_id).await {
-        return e.into_response();
-    }
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
@@ -966,6 +870,37 @@ async fn resolve_team_in_org(
 // than being turned away, and a well-formed-looking rejection doubled as a
 // schema oracle. Stating the gate in the signature runs it first and makes
 // forgetting it a compile error rather than a review miss.
+
+/// A caller allowed to read the organization named by `{name}`.
+///
+/// Same steps, same order, same answers as the hand-written prologue it
+/// replaces: a public organization resolves for anybody, a private one is a
+/// `404` — not a `403` — to everyone outside it, so the route is not an
+/// existence oracle over private organization names.
+///
+/// `viewer` is `None` for an anonymous caller, and that is precisely why this is
+/// its own extractor rather than a weaker rung of [`OrgAdmin`]: the level admits
+/// a caller with no identity to report, so there is no `actor_id` to hand over
+/// and no scale the two levels share.
+pub struct OrgRead {
+    pub org: rg_db::entities::organization::Model,
+    pub viewer: Option<i64>,
+}
+
+impl axum::extract::FromRequestParts<AppState> for OrgRead {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let viewer = super::auth::extract_user_id(&parts.headers, &state.jwt_secret);
+        let name = org_name_in_path(parts, state).await?;
+        let org = resolve_org(&state.db, &name).await?;
+        require_org_visible(&state.db, &org, viewer).await?;
+        Ok(Self { org, viewer })
+    }
+}
 
 /// An authenticated administrator of the organization named by `{name}`.
 ///

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing;
 use utoipa::ToSchema;
 
+use crate::api::auth::AuthUser;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -710,14 +711,9 @@ async fn store_refreshed_oauth_tokens(
 )]
 pub async fn unlink_oauth_account(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    use crate::api::auth::extract_user_id;
-
-    let user_id = extract_user_id(&headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-
     // Find and delete the OAuth account link
     let accounts = rg_db::ops::oauth_account_ops::find_by_user_id(&state.db, user_id)
         .await

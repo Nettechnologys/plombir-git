@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -42,11 +42,6 @@ impl From<rg_db::entities::ssh_key::Model> for SshKeyResponse {
     }
 }
 
-fn authenticated_user_id(headers: &HeaderMap, state: &AppState) -> Result<i64, AppError> {
-    super::auth::extract_user_id(headers, &state.jwt_secret)
-        .ok_or_else(|| AppError::unauthorized("authentication required"))
-}
-
 #[utoipa::path(
     get,
     path = "/users/ssh-keys",
@@ -56,12 +51,10 @@ fn authenticated_user_id(headers: &HeaderMap, state: &AppState) -> Result<i64, A
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     )
 )]
-pub async fn list_ssh_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_id = match authenticated_user_id(&headers, &state) {
-        Ok(id) => id,
-        Err(error) => return error.into_response(),
-    };
-
+pub async fn list_ssh_keys(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> impl IntoResponse {
     match rg_db::ops::ssh_key_ops::list_by_user(&state.db, user_id).await {
         Ok(keys) => (
             StatusCode::OK,
@@ -160,14 +153,9 @@ pub async fn create_ssh_key(
 )]
 pub async fn delete_ssh_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthUser(user_id): AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let user_id = match authenticated_user_id(&headers, &state) {
-        Ok(id) => id,
-        Err(error) => return error.into_response(),
-    };
-
     let key = match rg_db::ops::ssh_key_ops::find_by_id(&state.db, id).await {
         Ok(Some(key)) => key,
         Ok(None) => return AppError::not_found("SSH key not found").into_response(),

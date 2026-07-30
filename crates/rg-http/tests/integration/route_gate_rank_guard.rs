@@ -32,14 +32,28 @@
 //! And a rung is not the whole rule — a handler may legitimately widen access
 //! for one specific person, which is what every entry in [`SIGNED_OFF`] is.
 //!
-//! The scope is the **repository** rungs, and that boundary is worth stating
-//! plainly, because a guard whose coverage nobody has written down is read as
-//! covering the table. `Access::User`, `OrgRead`, `OrgAdmin` and `InstanceAdmin`
-//! have extractors of their own (`AuthUser`, `OrgRead` / `OrgAdmin` in
-//! `api::orgs`, `InstanceAdmin` in `api::admin`) and the identical defect is
-//! open on 18 of those rows today — declared level in the table, gate written
-//! out by hand in the body, no symptom on a `GET` or a `DELETE`. That is
-//! `card_34fd642a7538`, not something this file quietly passes.
+//! The scope is the whole table, in two passes, because the comparison differs
+//! by family. The repository rungs form a scale and are compared as one:
+//! [`no_handler_takes_a_weaker_gate_than_its_route_declares`]. `Access::User`,
+//! `OrgRead`, `OrgAdmin` and `InstanceAdmin` lie on no shared scale — `OrgRead`
+//! admits an anonymous caller to a public organization, `User` proves a session
+//! and nothing about any organization — so each names the *set* of extractors
+//! that answers it in [`NON_REPO`], checked by
+//! [`no_non_repository_row_leaves_its_gate_to_the_handler_body`].
+//!
+//! That second pass is `card_34fd642a7538`, and it was worth writing rather than
+//! recording as out of scope: 18 rows declared a non-repository level while
+//! taking nothing but `HeaderMap`, and each of them answered correctly only
+//! because its author had not forgotten the prologue. `api::orgs::update_org`
+//! was the sharp edge — `OrgAdmin` in the table, `Json<UpdateOrgRequest>` in the
+//! signature, and the gate three statements into a body the deserializer reached
+//! first.
+//!
+//! Both passes leave alone `Public` and `PublicFiltered`, which promise nothing a
+//! signature could be held to, and `Foreign`, which is
+//! `foreign_gate_guard`'s. That those three are the *only* levels neither pass
+//! compares is itself asserted, so a new `Access` variant cannot quietly become a
+//! family both of them skip — which is exactly what these 18 rows were.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -91,6 +105,52 @@ const TAKEN: &[(&str, Rank)] = &[
     ("RepoWrite", Rank::Write),
     ("RepoAdmin", Rank::Admin),
     ("RepoOwner", Rank::Owner),
+];
+
+/// The levels that are *not* about a repository, and every extractor type that
+/// proves one.
+///
+/// A second table rather than more rungs on [`Rank`], because these levels do
+/// not lie on that scale and do not lie on a shared one of their own.
+/// `Access::OrgRead` admits an anonymous caller to a *public* organization,
+/// exactly as `RepoRead` does for a public repository — so it is not "`User`
+/// plus an organization", and a handler behind it may hold no session at all.
+/// `Access::User` is the opposite shape: a session, and nothing about any
+/// organization. Ordering the two would invent a relation the code does not
+/// have. What each level does have is a *set* of extractors that answer it, and
+/// that is what this states.
+///
+/// The sets are closed by hand, and every entry is a claim about the extractor's
+/// own body rather than about its name. `OrgAdmin` requires a session and
+/// resolves the organization before it answers, so it proves `User` and
+/// `OrgRead` as well as itself. `RepoAuthRead` and every rung above it require a
+/// session, so each proves `User`. `RepoRead` and `CiRead` do not — a public
+/// repository is anonymously readable — and are deliberately absent, as is
+/// `OrgRead` from the `User` row for the same reason.
+///
+/// `NamespaceCreate<_>` / `NamespaceWrite<_>` are on the `User` row because each
+/// resolves an `actor_id` before it answers: `POST /repos` and `POST /imports`
+/// declare `User` and are gated by one of them rather than by a prologue. They
+/// are also why this is a set membership and not a name comparison — a level can
+/// be proven by more than the extractor that shares its name.
+const NON_REPO: &[(&str, &[&str])] = &[
+    (
+        "User",
+        &[
+            "AuthUser",
+            "OrgAdmin",
+            "InstanceAdmin",
+            "RepoAuthRead",
+            "RepoWrite",
+            "RepoAdmin",
+            "RepoOwner",
+            "NamespaceCreate",
+            "NamespaceWrite",
+        ],
+    ),
+    ("OrgRead", &["OrgRead", "OrgAdmin"]),
+    ("OrgAdmin", &["OrgAdmin"]),
+    ("InstanceAdmin", &["InstanceAdmin"]),
 ];
 
 /// Handlers that deliberately take a weaker extractor than their row declares:
@@ -555,17 +615,29 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The extractor type names a signature carries, reduced to the base name the
+/// tables are keyed on.
+///
+/// `AuthUser(user_id): AuthUser`, `OrgAdmin { org, .. }: OrgAdmin` and
+/// `admin: crate::api::admin::InstanceAdmin` all yield the bare type name: the
+/// path prefix is dropped, and so is anything a generic or a pattern adds.
+fn taken_types(params: &[String]) -> Vec<&str> {
+    params
+        .iter()
+        .filter_map(|param| param_type(param))
+        .map(|ty| leading_ident(ty.rsplit("::").next().unwrap_or(ty).trim()))
+        .collect()
+}
+
 /// The strongest repository gate these parameters carry, or `None` for a
 /// signature that carries none.
 ///
 /// Strongest rather than first: a handler taking two gates sits behind both, so
 /// the level it actually enforces is the higher one.
 fn taken_rank(params: &[String], anchored: &BTreeMap<String, Rank>) -> Option<Rank> {
-    params
-        .iter()
-        .filter_map(|param| param_type(param))
-        .filter_map(|ty| {
-            let base = leading_ident(ty.rsplit("::").next().unwrap_or(ty).trim());
+    taken_types(params)
+        .into_iter()
+        .filter_map(|base| {
             TAKEN
                 .iter()
                 .find(|(name, _)| *name == base)
@@ -662,6 +734,76 @@ fn no_handler_takes_a_weaker_gate_than_its_route_declares() {
          extractor behind it to make the mismatch visible, so nothing fails. Raise the extractor \
          to the declared level, or, if the handler really does widen access for one specific \
          person, sign it off in SIGNED_OFF with the reason.\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The same promise on the rows whose level is not about a repository.
+///
+/// Split from the pass above because the comparison is a different one, not
+/// because the defect is: `Access::User` / `OrgRead` / `OrgAdmin` /
+/// `InstanceAdmin` have extractors of their own, and a row that declares one of
+/// them while its handler takes only `HeaderMap` is gated by whatever the body
+/// remembers to do — the identical hole, on the identical `GET` and `DELETE`
+/// rows where no body extractor exists to make it visible.
+///
+/// There is no rung arithmetic here, so there is no floor to sign off to and no
+/// [`SIGNED_OFF`] equivalent. A row either carries an extractor that proves its
+/// level or it does not.
+#[test]
+fn no_non_repository_row_leaves_its_gate_to_the_handler_body() {
+    let mut offenders = Vec::new();
+    let mut checked: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+
+    for row in parse_routes().rows {
+        let Some((level, accepted)) = NON_REPO.iter().find(|(name, _)| *name == row.access) else {
+            continue;
+        };
+        *checked.entry(level).or_default() += 1;
+
+        let (file, name) = handler_location(&row.handler);
+        let text = sources.entry(file.clone()).or_insert_with(|| read(&file));
+        let params = signature_params(text, &name).unwrap_or_else(|| {
+            panic!(
+                "{} names `{}`, and `{name}` is not a top-level fn in {file} — the signature \
+                 reader is blind, not the route",
+                row.label(),
+                row.handler
+            )
+        });
+
+        let taken = taken_types(&params);
+        if !taken.iter().any(|ty| accepted.contains(ty)) {
+            offenders.push(format!(
+                "  routes.rs:{} — {} declares {level} and `{}` takes none of {accepted:?}",
+                row.line,
+                row.label(),
+                row.handler
+            ));
+        }
+    }
+
+    for (level, _) in NON_REPO {
+        assert!(
+            checked.get(level).copied().unwrap_or(0) > 0,
+            "no route declares `{level}` any more — either the level is dead or the parse is wrong"
+        );
+    }
+    let total: usize = checked.values().sum();
+    assert!(
+        total > 60,
+        "only {total} non-repository row(s) compared ({checked:?}) — the guard is not running"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a route declares a non-repository level its handler does not take.\n\
+         The `Access` in the route table is the contract; the extractor in the signature is what \
+         enforces it. Where the signature carries no such extractor the route is gated by whatever \
+         the handler body happens to remember to do — and on a `GET` or a `DELETE` there is no \
+         body extractor behind it to turn the omission into a visible symptom, so nothing fails. \
+         Take the gate as a handler argument, ahead of `Path<_>` / `Query<_>`, instead of writing \
+         it out in the body.\n{}",
         offenders.join("\n")
     );
 }
@@ -786,7 +928,11 @@ fn the_route_table_parser_reads_every_registration() {
         unknown.join("\n")
     );
 
-    for (name, _) in DECLARED {
+    for name in DECLARED
+        .iter()
+        .map(|(name, _)| name)
+        .chain(NON_REPO.iter().map(|(name, _)| name))
+    {
         assert!(
             known.iter().any(|variant| variant == name),
             "`Access::{name}` is compared by this guard but no longer exists in route_table.rs"
@@ -796,6 +942,27 @@ fn the_route_table_parser_reads_every_registration() {
             "no route declares `{name}` any more — either the rung is dead or the parse is wrong"
         );
     }
+
+    // The two tables have to cover the table between them, minus the levels
+    // that name no gate at all. A variant that is in neither is a family of
+    // rows both passes skip in silence — which is how `User` / `OrgRead` /
+    // `OrgAdmin` stayed uncompared while this file read as covering the table.
+    let uncompared: Vec<&String> = known
+        .iter()
+        .filter(|variant| {
+            !matches!(variant.as_str(), "Public" | "PublicFiltered" | "Foreign")
+                && !DECLARED.iter().any(|(name, _)| name == variant)
+                && !NON_REPO.iter().any(|(name, _)| name == variant)
+        })
+        .collect();
+    assert!(
+        uncompared.is_empty(),
+        "`Access` has level(s) neither pass compares: {uncompared:?}.\n\
+         `Public` / `PublicFiltered` promise nothing to hold a signature to, and `Foreign` is \
+         `foreign_gate_guard`'s to check. Anything else needs an entry in `DECLARED` (if it is a \
+         repository rung) or in `NON_REPO` (with the extractors that prove it) — otherwise its \
+         rows are skipped here without a word."
+    );
 }
 
 /// The `Access` variant names, read out of `route_table.rs`.
