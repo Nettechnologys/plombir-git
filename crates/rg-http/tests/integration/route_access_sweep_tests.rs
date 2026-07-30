@@ -20,12 +20,22 @@
 //! open to anonymous callers on a public repository and closed on a private
 //! one, while `RepoWrite` is closed on both.
 //!
-//! A row owed [`Expect::Hidden`] is asked once more again, against an
-//! organization name nothing created, and the two replies are compared whole.
-//! That is a different kind of question from the rest of the sweep: everywhere
-//! else the oracle is a status, and a mask is a claim about what the caller
-//! *learns* — which lives just as much in the message underneath the status as
-//! in the status itself (card_81e6649615c1).
+//! A row owed [`Expect::Hidden`] is asked once more again — against an
+//! organization name nothing created, or, on an anchored route, against a row id
+//! nothing created — and the two replies are compared whole. That is a different
+//! kind of question from the rest of the sweep: everywhere else the oracle is a
+//! status, and a mask is a claim about what the caller *learns* — which lives
+//! just as much in the message underneath the status as in the status itself
+//! (card_81e6649615c1).
+//!
+//! Which rows those are is the sweep's third axis, and it does not come from the
+//! route table. An *anchored* route — one whose path names no repository and
+//! resolves it out of the row its id addresses — declares the same `RepoRead` a
+//! path-based one declares, so the level cannot tell them apart. The census
+//! comes from the handlers' signatures instead, read through the same
+//! `common::source_scan` helpers `anchored_scope_sweep_tests` reads, because two
+//! passes counting different populations means the weaker one is the real
+//! ceiling (card_41ec8f1a29a3).
 //!
 //! The owner pass is the baseline the other two need. A route that answers
 //! "denied" to everyone proves nothing — the fixture could simply be broken —
@@ -68,7 +78,11 @@ use std::collections::{BTreeSet, HashMap};
 use reqwest::{Client, StatusCode};
 use rg_http::route_table::{Access, RouteFact};
 
-use crate::common::{create_issue, register_user, spawn_test_app_with_routes};
+use crate::common::source_scan::anchored_handler_targets;
+use crate::common::{
+    create_issue, register_user, seed_artifact, spawn_test_app_with_routes,
+    spawn_test_app_with_routes_and_db,
+};
 
 const PW: &str = "Qz7$wRtm";
 
@@ -86,6 +100,14 @@ const ORG: &str = "sweeporg";
 /// answers `404` too. Only the two replies side by side answer the question,
 /// which is why the sweep needs a second name to point at (card_81e6649615c1).
 const ABSENT_ORG: &str = "sweepabsentorg";
+
+/// A row id nothing in this fixture ever creates.
+///
+/// [`ABSENT_ORG`]'s counterpart on the anchored routes. Their paths carry no
+/// name to vary — the repository is resolved out of the row the id addresses —
+/// so the second question a masked cell is asked varies the *id* instead, and
+/// the two replies have to be the same reply.
+const ABSENT_ID: &str = "999999";
 
 // ── The exceptions, spelled out ────────────────────────────────────────────
 //
@@ -127,24 +149,21 @@ const ABSENT_ORG: &str = "sweepabsentorg";
 /// the handler body, now from the `RepoAuthRead` in its signature
 /// (card_41d5b5cf0cbb). Nothing in this file compares a reason to a status
 /// code, so only a reader re-measuring catches it.
+///
+/// The three artifact rows used to be here, excused as "this fixture builds no
+/// pipeline — every persona is answered 404 before any gate runs". True, and
+/// that was the problem: the excuse was also the *only* thing keeping the rows
+/// out of a matrix that would have judged them wrong. An anchored route declares
+/// `RepoRead` like a path-based one, `expectation` read the level and owed the
+/// outsider `Expect::Denied`, and `Denied` accepts `401` **or** `403` — the one
+/// answer `AnchoredRead` exists to never send. The row was latent rather than
+/// live only because nothing drove it (card_41ec8f1a29a3).
+///
+/// So the fixture seeds an artifact now and the rows are judged: `Expect::Hidden`
+/// for the two personas who cannot read the repository it lives in, paired
+/// against [`ABSENT_ID`] the way an organization row is paired against
+/// [`ABSENT_ORG`].
 const NO_FIXTURE: &[(&str, &str)] = &[
-    (
-        "GET /api/v1/artifacts/{id}",
-        "the repository is resolved from the artifact id, and this fixture builds no \
-         pipeline — every persona is answered 404 before any gate runs",
-    ),
-    (
-        "GET /api/v1/artifacts/{id}/download",
-        "same as GET /api/v1/artifacts/{id}",
-    ),
-    (
-        "DELETE /api/v1/artifacts/{id}",
-        "the same missing artifact as GET /api/v1/artifacts/{id} for the two personas that \
-         carry a session — 404 for the outsider and the owner alike. The anonymous caller is \
-         `401`, and from the gate rather than from the row: `ArtifactWrite` authenticates \
-         before it resolves anything, so a missing artifact and one in a private repository \
-         look the same from outside (card_1ec383429aea)",
-    ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
         "only the *owner* persona is out of reach: seeding a pull request needs commits on \
@@ -365,6 +384,13 @@ enum Expect {
     /// `Expect` could have reached that (card_2179245d41db). So a `Hidden` cell
     /// is asked twice: once about the fixture's private organization, once about
     /// [`ABSENT_ORG`], and the two replies have to be the same reply.
+    ///
+    /// The organization is not the only thing a route can mask. An *anchored*
+    /// route masks a row id — the caller supplied an opaque integer and may not
+    /// learn whether it hit anything — so its second question varies
+    /// [`ABSENT_ID`] instead of the name. Which of the two a cell is paired on
+    /// follows from the route rather than from the variant: the path either
+    /// names an organization or resolves a repository out of a row.
     Hidden,
     /// Not asserted; the caller holds the reason.
     Unchecked,
@@ -377,10 +403,41 @@ enum Expect {
 /// `401` to an anonymous caller and `403` to an authenticated outsider, and
 /// `repo_read_gate_tests` pins exactly that. Here the question is only whether
 /// the gate answered at all.
-fn expectation(access: Access, persona: Persona, scope: Scope) -> Expect {
+///
+/// `anchored` is the third axis, and it is not derivable from the other two.
+/// An anchored route declares the same `RepoRead` a path-based one declares —
+/// the level says which repository admits the caller, not how the gate found
+/// it — so the level alone cannot tell the two shapes apart. It arrives from
+/// the same census `anchored_scope_sweep_tests` reads, and it has to: judging an
+/// anchored row as `Denied` accepts the `403` that row's own doctrine forbids
+/// (card_41ec8f1a29a3).
+fn expectation(access: Access, persona: Persona, scope: Scope, anchored: bool) -> Expect {
     use Persona::{Anonymous, Outsider, Owner};
 
     match access {
+        // ── The anchored levels ────────────────────────────────────────────
+        //
+        // A route whose path names no repository resolves one out of the row
+        // its id addresses, and from there every refusal owes the answer an
+        // absent id gets. The caller supplied an opaque integer, so `403` — the
+        // one denial that confirms the integer hit a row — is precisely what
+        // `AnchoredRead` and `AnchoredWrite` refuse to send, and `Denied`
+        // accepts `401` *or* `403`.
+        //
+        // The owner is owed `Allowed` because the row this fixture seeds lives
+        // in the owner's own private repository. That is also what fixes
+        // `Hidden` for the other two: neither can read that repository, so
+        // nothing they are told may set the row apart from an absent id. A row
+        // seeded in a repository an outsider *can* read would owe the write
+        // half an unmasked `403` instead — `AnchoredWrite`'s second step — so
+        // this arm is a claim about the fixture as much as about the level. The
+        // fixture half is not left implicit: the sweep reads the seeded artifact
+        // back as the owner before the passes start, so a row that never
+        // uploaded is reported as a dead fixture rather than as six green masks.
+        access if anchored && access.is_repo_scoped() => match persona {
+            Owner => Expect::Allowed,
+            _ => Expect::Hidden,
+        },
         // Neither public level can be failed here — see the module note and
         // `the_self_filtering_routes_show_public_and_hide_private`, which is
         // where `PublicFiltered` is actually held to something.
@@ -530,7 +587,10 @@ impl Fixture {
     }
 }
 
-async fn create_repo(fx: &Fixture, name: &str, private: bool) {
+/// Create one of the fixture's repositories and return its id — the anchored
+/// rows are seeded through the database, which knows a repository by id and not
+/// by `{owner}/{name}`.
+async fn create_repo(fx: &Fixture, name: &str, private: bool) -> i64 {
     let resp = fx
         .client
         .post(format!("{}/api/v1/repos", fx.base))
@@ -540,6 +600,9 @@ async fn create_repo(fx: &Fixture, name: &str, private: bool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "fixture: creating repo '{name}' failed");
+    resp.json::<serde_json::Value>().await.expect("repo json")["id"]
+        .as_i64()
+        .expect("repo id")
 }
 
 /// A *private* organization owned by the fixture owner, with one team in it.
@@ -589,6 +652,29 @@ struct RepoSeed {
     /// number 1 — and the handlers refuse a comment belonging to another
     /// repository, which is exactly the cross-repo scoping earlier cards fixed.
     comment_id: String,
+}
+
+/// The rows this fixture seeded for the anchored routes, one per
+/// [`RepoAnchor`](../../src/api/repo_access.rs) implementor it knows how to
+/// build. All of them live in the *private* repository — see the anchored arm of
+/// [`expectation`] for why that is load-bearing rather than incidental.
+struct Seeded {
+    artifact: i64,
+}
+
+/// The id addressing the row this fixture seeded for one anchor.
+///
+/// `None` is not an oversight to paper over with `1`: an anchored route filled
+/// with an id that addresses nothing is a probe whose `404` proves the row is
+/// masked when it only proves the row is absent. A new anchor is either seeded
+/// here or signed off in [`NO_FIXTURE`]; the sweep fails until one of the two
+/// has happened. Keyed on the anchor rather than on the alias, because
+/// `ArtifactRead` and `ArtifactWrite` address the same row.
+fn anchored_id(target: &str, seeded: &Seeded) -> Option<i64> {
+    match target {
+        "Artifact" => Some(seeded.artifact),
+        _ => None,
+    }
 }
 
 // ── Path filling ───────────────────────────────────────────────────────────
@@ -654,6 +740,28 @@ fn fill(path: &str, repo: &RepoSeed, org: &str) -> String {
     out
 }
 
+/// Fill an anchored route's path with one row id.
+///
+/// [`fill`] cannot do this, and not by omission: it fills every placeholder it
+/// does not recognise with `1`, which is right for the locators a repository
+/// gate answers *before* — a milestone, a webhook — and wrong for this one. Here
+/// the id is what the gate resolves the repository from, so a guessed value
+/// drives the probe at a row that does not exist and the `404` it earns reads
+/// as a mask.
+///
+/// A path carrying anything besides the anchored id returns `None`: the second
+/// placeholder is a locator this fixture would have to seed, and the caller
+/// signs the route off rather than guessing — the same rule
+/// `anchored_scope_sweep_tests` keeps.
+fn fill_anchored(path: &str, id: &str) -> Option<String> {
+    let open = path.find('{')?;
+    let close = path[open..].find('}')? + open;
+    if path[close + 1..].contains('{') {
+        return None;
+    }
+    Some(format!("{}{id}{}", &path[..open], &path[close + 1..]))
+}
+
 // ── Driving one route ──────────────────────────────────────────────────────
 
 /// One probe's answer: the status, and the body with the volatile part removed.
@@ -701,7 +809,13 @@ async fn probe(
     repo: &RepoSeed,
     org: &str,
 ) -> Answer {
-    let url = format!("{}{}", fx.base, fill(&fact.path, repo, org));
+    drive(fx, fact, persona, &fill(&fact.path, repo, org)).await
+}
+
+/// [`probe`] with the path already filled — for the anchored routes, whose
+/// placeholder [`fill`] cannot fill (see [`fill_anchored`]).
+async fn drive(fx: &Fixture, fact: &RouteFact, persona: Persona, path: &str) -> Answer {
+    let url = format!("{}{path}", fx.base);
     let mut req = match fact.method {
         "GET" => fx.client.get(url),
         "HEAD" => fx.client.head(url),
@@ -744,8 +858,13 @@ fn listed(list: &[(&str, &str)], label: &str) -> bool {
 // ── The sweep ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn every_route_answers_its_declared_access_level() {
-    let (base, facts) = spawn_test_app_with_routes().await;
+    // The database handle is here for the anchored rows and nothing else: their
+    // repository is resolved out of an artifact, and an artifact needs a runner,
+    // a pipeline, a stage and a job under it — a walk this harness exposes no
+    // API for.
+    let (base, facts, db) = spawn_test_app_with_routes_and_db().await;
     // No cookie jar: every persona is identified by the bearer token this test
     // attaches, never by a `Set-Cookie` a previous request happened to leave
     // behind.
@@ -760,9 +879,33 @@ async fn every_route_answers_its_declared_access_level() {
         owner_token,
         outsider_token,
     };
-    create_repo(&fx, PRIVATE_REPO, true).await;
+    let private_repo_id = create_repo(&fx, PRIVATE_REPO, true).await;
     create_repo(&fx, PUBLIC_REPO, false).await;
     create_org_with_team(&fx).await;
+    // One artifact in the *private* repository, which is what makes the anchored
+    // rows judgeable at all: without it every anchored route answers `404` for
+    // want of a row, and a wall of `404`s satisfies `Expect::Hidden` while
+    // proving nothing about the gate behind it.
+    let seeded = Seeded {
+        artifact: seed_artifact(&fx.base, &fx.client, &db, private_repo_id, "sweep-runner").await,
+    };
+    // The anchored baseline, taken before the passes for the reason the
+    // repository one is: a fixture whose artifact never uploaded would answer
+    // the owner `404` too, and the six masked cells below would be measuring an
+    // absent row rather than a working mask.
+    let (status, body) = fx
+        .get_as(
+            Some(&fx.owner_token),
+            &format!("/api/v1/artifacts/{}", seeded.artifact),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fixture is dead: the owner cannot read the artifact this sweep seeded in their own \
+         private repository ({status}) — every anchored mask below would be a 404 for want of a \
+         row: {body}"
+    );
     // An issue and a comment in each repository, so the routes that resolve one
     // of those before the repository are asked a real question rather than
     // answered 404. Issue *numbers* restart per repository, comment *ids* do
@@ -853,6 +996,39 @@ async fn every_route_answers_its_declared_access_level() {
     let mut paired_routes: BTreeSet<String> = BTreeSet::new();
     let mut unpaired: Vec<String> = Vec::new();
     let mut oracles: Vec<String> = Vec::new();
+    // The anchored axis: which cells were judged by the masked predicate rather
+    // than by the one their `Access` level alone would have chosen, and which
+    // anchored routes this fixture could not address at all.
+    let anchors = anchored_handler_targets();
+    // The other direction of the same equivalence, and the cheaper half to get
+    // wrong: a route that declares a repository level while naming no repository
+    // in its path *is* the anchored shape, whether or not anybody took the
+    // extractor. One that has the shape and not the gate is back where the
+    // artifact routes started — a prologue in the handler body, resolving the
+    // row and deciding by hand — and it is invisible to both sweeps at once:
+    // `anchored_scope_sweep_tests` reads its population out of the signatures,
+    // and the pass below would judge it by `Expect::Denied`.
+    let shaped_but_unanchored: Vec<String> = facts
+        .iter()
+        .filter(|fact| {
+            fact.access.is_repo_scoped()
+                && !is_repo_path(&fact.path)
+                && !anchors.contains_key(fact.handler)
+        })
+        .map(|fact| format!("  {} — {}", fact.label(), fact.handler))
+        .collect();
+    assert!(
+        shaped_but_unanchored.is_empty(),
+        "{} route(s) declare a repository level and name no repository in their path, without \
+         taking an anchored extractor.\nThe repository is being resolved somewhere, and where \
+         that is a prologue rather than `AnchoredRead`/`AnchoredWrite` the refusal is unmasked \
+         by default — a `403` confirming that the caller's opaque id hit a row. Take the \
+         extractor, or give the anchor its `RepoAnchor` impl.\n{}",
+        shaped_but_unanchored.len(),
+        shaped_but_unanchored.join("\n"),
+    );
+    let mut anchored_cells: BTreeSet<String> = BTreeSet::new();
+    let mut anchored_gaps: BTreeSet<String> = BTreeSet::new();
 
     for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
         // The baseline, taken before the pass rather than inferred after it:
@@ -885,8 +1061,37 @@ async fn every_route_answers_its_declared_access_level() {
                 &[Scope::Global]
             };
 
+            let anchor = anchors.get(fact.handler);
+            // The anchored arm of `expectation` only fires on a repository
+            // level, and silence is the wrong answer to a row that has an
+            // anchored gate and declares something else: it would fall through
+            // to a generic arm — `Access::Public` is owed `Expect::Allowed`, and
+            // every non-denial satisfies that — with nothing to say it had.
+            //
+            // Nor is it covered next door. `route_gate_rank_guard` compares a
+            // declaration against the extractor in the signature, but through
+            // two hand-closed tables: `DECLARED` for the five repository rungs
+            // and `NON_REPO` for `User` / `OrgRead` / `OrgAdmin` /
+            // `InstanceAdmin`. `Public`, `PublicFiltered` and `Foreign` are in
+            // neither, so a row declaring one of those is skipped by both of its
+            // passes — and an anchored handler under such a declaration would be
+            // gated at runtime and unjudged by every sweep that reads the table.
+            // The one anchored level `NON_REPO` does reach is `User`, whose
+            // accepted set names no anchored alias; that row fails there.
+            if anchor.is_some() && !fact.access.is_repo_scoped() {
+                anchored_gaps.insert(format!(
+                    "  {}\n      declared {:?} while its handler takes an anchored extractor. \
+                     An anchored gate answers a masked refusal; a level that is not about a \
+                     repository is judged by a predicate that knows nothing about masking, so \
+                     the row would pass on the `403` the anchor exists to never send",
+                    fact.label(),
+                    fact.access,
+                ));
+                continue;
+            }
+
             for &scope in scopes {
-                let expect = expectation(fact.access, persona, scope);
+                let expect = expectation(fact.access, persona, scope, anchor.is_some());
                 if expect == Expect::Unchecked {
                     continue;
                 }
@@ -896,35 +1101,72 @@ async fn every_route_answers_its_declared_access_level() {
                 };
                 let label = fact.label();
                 let key = cell(persona, scope, fact);
-                let answer = probe(&fx, fact, persona, repo, ORG).await;
+
+                // Where the two questions this cell may be asked differ. A
+                // path-based row varies the organization name; an anchored row
+                // has no name in its path to vary, so it varies the id its
+                // repository is resolved from.
+                let (url, twin) = match anchor {
+                    None => (
+                        fill(&fact.path, repo, ORG),
+                        Some(fill(&fact.path, repo, ABSENT_ORG)),
+                    ),
+                    Some(target) => {
+                        let Some(id) = anchored_id(target, &seeded) else {
+                            anchored_gaps.insert(format!(
+                                "  {label}\n      gated through the `{target}` anchor, and this \
+                                 fixture seeds no row of it. Give `anchored_id` a line, or sign \
+                                 the route off in NO_FIXTURE — filling the id by guesswork turns \
+                                 the 404 of an absent row into a passing mask",
+                            ));
+                            continue;
+                        };
+                        match fill_anchored(&fact.path, &id.to_string()) {
+                            Some(url) => (url, fill_anchored(&fact.path, ABSENT_ID)),
+                            None => {
+                                anchored_gaps.insert(format!(
+                                    "  {label}\n      gated through the `{target}` anchor, and \
+                                     its path carries something besides the anchored id. Seed \
+                                     that locator, or sign the route off in NO_FIXTURE",
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let answer = drive(&fx, fact, persona, &url).await;
 
                 // The body half of a masked denial. `judge` reads one bit of the
                 // reply, and a mask is a claim about the whole of it, so the
-                // same request goes out a second time against a name nothing
-                // created: if the two replies differ in any way a caller can
-                // see, the difference *is* the existence oracle the `404` was
-                // there to close.
+                // same request goes out a second time against the twin above —
+                // a name nothing created, or an id nothing created: if the two
+                // replies differ in any way a caller can see, the difference
+                // *is* the existence oracle the `404` was there to close.
                 if expect == Expect::Hidden {
-                    if fill(&fact.path, repo, ABSENT_ORG) == fill(&fact.path, repo, ORG) {
-                        unpaired.push(format!(
-                            "  {key}\n      declared {:?}, and the organization name is nowhere \
-                             in its path — there is no second name to compare the reply against, \
-                             so the mask is still judged by status alone",
+                    if anchor.is_some() {
+                        anchored_cells.insert(key.clone());
+                    }
+                    match twin.filter(|twin| *twin != url) {
+                        None => unpaired.push(format!(
+                            "  {key}\n      declared {:?}, and there is nothing in its path to \
+                             vary — no second name and no second id to compare the reply \
+                             against, so the mask is still judged by status alone",
                             fact.access,
-                        ));
-                    } else {
-                        let absent = probe(&fx, fact, persona, repo, ABSENT_ORG).await;
-                        paired.insert(key.clone());
-                        paired_routes.insert(label.clone());
-                        if (answer.status, &answer.body) != (absent.status, &absent.body) {
-                            oracles.push(format!(
-                                "  {key}\n      '{ORG}' (private, exists) → {} {}\n\
-                                 \x20     '{ABSENT_ORG}' (no such organization) → {} {}",
-                                answer.status,
-                                answer.excerpt(),
-                                absent.status,
-                                absent.excerpt(),
-                            ));
+                        )),
+                        Some(twin) => {
+                            let absent = drive(&fx, fact, persona, &twin).await;
+                            paired.insert(key.clone());
+                            paired_routes.insert(label.clone());
+                            if (answer.status, &answer.body) != (absent.status, &absent.body) {
+                                oracles.push(format!(
+                                    "  {key}\n      exists → {} {}\n\
+                                     \x20     absent ({twin}) → {} {}",
+                                    answer.status,
+                                    answer.excerpt(),
+                                    absent.status,
+                                    absent.excerpt(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1034,14 +1276,37 @@ async fn every_route_answers_its_declared_access_level() {
     assert!(
         oracles.is_empty(),
         "{} of {} masked denial(s), over {} route(s), can be told apart from the same request \
-         against an organization that does not exist.\nThe status matches and the reply does \
+         against something that does not exist.\nThe status matches and the reply does \
          not, so the mask is decoration: a caller reads existence off the difference. Both \
          branches owe one reply — `resolve_org` and `require_org_visible` both answer \
-         `organization not found` for precisely this reason.\n{}",
+         `organization not found` for precisely this reason, and `RepoAnchor::masked` is the \
+         one answer an anchored route gives an absent row and a refused one alike.\n{}",
         oracles.len(),
         paired.len(),
         paired_routes.len(),
         oracles.join("\n"),
+    );
+
+    // The anchored axis, held to the same two rules as the rest: nothing is
+    // waved through, and the axis has to have been exercised.
+    assert!(
+        anchored_gaps.is_empty(),
+        "{} anchored route(s) could not be addressed by this fixture.\nAn anchored route is \
+         judged by `Expect::Hidden` — a `403` from it confirms the caller's opaque id hit a row \
+         — and that verdict is only worth the row it was measured against.\n{}",
+        anchored_gaps.len(),
+        anchored_gaps.iter().cloned().collect::<Vec<_>>().join("\n"),
+    );
+    // Rename the artifact routes, or let the anchored extractors fall out of the
+    // signatures the census reads, and every anchored row would quietly go back
+    // to being judged by `Expect::Denied` — the predicate that accepts the one
+    // answer its own doctrine forbids (card_41ec8f1a29a3). This is what says so.
+    assert!(
+        anchored_cells.len() >= 4,
+        "only {} anchored cell(s) were judged as masked. The anchored census comes from the \
+         handlers' signatures, so a rename that hid it would leave every anchored row judged by \
+         `Expect::Denied`, which accepts the `403` that confirms a private row exists",
+        anchored_cells.len(),
     );
 }
 
@@ -1087,6 +1352,7 @@ async fn no_route_answers_a_query_complaint_before_its_gate() {
     let mut probed = 0usize;
     let mut offenders: Vec<String> = Vec::new();
     let mut quarantined: BTreeSet<String> = BTreeSet::new();
+    let anchors = anchored_handler_targets();
 
     for fact in &facts {
         let label = fact.label();
@@ -1096,7 +1362,12 @@ async fn no_route_answers_a_query_complaint_before_its_gate() {
         // An anonymous caller is owed the same thing whatever the scope;
         // `PrivateRepo` is simply the one where that is also true of the
         // repository levels.
-        let expect = expectation(fact.access, Persona::Anonymous, Scope::PrivateRepo);
+        let expect = expectation(
+            fact.access,
+            Persona::Anonymous,
+            Scope::PrivateRepo,
+            anchors.contains_key(fact.handler),
+        );
         if !matches!(expect, Expect::Denied | Expect::Hidden) {
             continue;
         }

@@ -473,3 +473,68 @@ pub async fn create_issue(
         body["number"].as_i64().unwrap(),
     )
 }
+
+/// One artifact in `repo`, uploaded through the runner route so its bytes are on
+/// disk and the download route has something to serve. Returns its
+/// instance-wide id.
+///
+/// Shared rather than copied because two sweeps seed it and both judge the
+/// anchored routes by what it answers: `anchored_scope_sweep_tests` compares a
+/// real id against an absent one, and `route_access_sweep_tests` owes every
+/// non-owner persona the masked refusal that comparison defines. A fixture that
+/// drifted between them would leave one of the two proving something else.
+///
+/// The walk — runner → pipeline → stage → job → artifact — is the shortest one
+/// the upload route accepts; there is no API for the middle of it, which is why
+/// this needs the database handle.
+#[allow(dead_code)]
+pub async fn seed_artifact(
+    base: &str,
+    client: &reqwest::Client,
+    db: &rg_db::DatabaseConnection,
+    repo: i64,
+    runner_name: &str,
+) -> i64 {
+    let runner = rg_db::ops::runner_ops::register_runner(db, runner_name, "", None, None, None)
+        .await
+        .expect("register runner");
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo,
+        "1234567890123456789012345678901234567890",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .expect("create pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+        .await
+        .expect("create stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("create job");
+    rg_db::ops::pipeline_ops::assign_job(db, job.id, runner.id)
+        .await
+        .expect("assign job");
+
+    let response = client
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/artifacts",
+            runner.id, job.id
+        ))
+        .bearer_auth(&runner.token)
+        .header("x-artifact-name", "report.txt")
+        .body("artifact bytes")
+        .send()
+        .await
+        .expect("upload artifact");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status, 201, "the fixture artifact was not uploaded: {body}");
+    serde_json::from_str::<serde_json::Value>(&body).expect("upload json")["id"]
+        .as_i64()
+        .expect("artifact id")
+}

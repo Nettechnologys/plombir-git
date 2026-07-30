@@ -65,17 +65,15 @@
 //! with the route that needs it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 
 use reqwest::{Client, StatusCode};
 use rg_http::route_table::RouteFact;
 
 use crate::common::answer::Answer;
 use crate::common::source_scan::{
-    anchored_aliases, functions, param_base_types, relative, rust_files, signature_params,
-    src_root, Anchor,
+    anchored_aliases, anchored_handlers, handler_type_name, Anchor,
 };
-use crate::common::{register_full, spawn_test_app_with_routes_and_db};
+use crate::common::{register_full, seed_artifact, spawn_test_app_with_routes_and_db};
 
 const OWNER: &str = "anchorowner";
 const OUTSIDER: &str = "anchoroutsider";
@@ -150,105 +148,13 @@ async fn create_private_repo(fx: &Fixture, name: &str) -> i64 {
         .expect("repo id")
 }
 
-/// One artifact, uploaded through the runner route so its bytes are on disk and
-/// the download route has something to serve.
-async fn seed_artifact(fx: &Fixture, db: &rg_db::DatabaseConnection, repo: i64) -> i64 {
-    let runner = rg_db::ops::runner_ops::register_runner(db, "anchor-runner", "", None, None, None)
-        .await
-        .expect("register runner");
-    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
-        db,
-        repo,
-        "1234567890123456789012345678901234567890",
-        "refs/heads/main",
-        "manual",
-        None,
-    )
-    .await
-    .expect("create pipeline");
-    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
-        .await
-        .expect("create stage");
-    let job = rg_db::ops::pipeline_ops::create_job(
-        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
-    )
-    .await
-    .expect("create job");
-    rg_db::ops::pipeline_ops::assign_job(db, job.id, runner.id)
-        .await
-        .expect("assign job");
-
-    let response = fx
-        .client
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/artifacts",
-            fx.base, runner.id, job.id
-        ))
-        .bearer_auth(&runner.token)
-        .header("x-artifact-name", "report.txt")
-        .body("artifact bytes")
-        .send()
-        .await
-        .expect("upload artifact");
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    assert_eq!(status, 201, "the fixture artifact was not uploaded: {body}");
-    serde_json::from_str::<serde_json::Value>(&body).expect("upload json")["id"]
-        .as_i64()
-        .expect("artifact id")
-}
-
 // ── Reading the population ─────────────────────────────────────────────────
 
-/// One handler whose signature takes an anchored extractor.
-struct AnchoredHandler {
-    /// The file it is declared in, relative to `src/` — `api/artifacts.rs`.
-    file: String,
-    /// The function name — `get_artifact`.
-    name: String,
-    /// The alias its signature names — `ArtifactRead`.
-    alias: String,
-}
-
-/// Every handler in the tree that takes one of `aliases`.
-///
-/// Read from the source rather than from the route table because the alias is
-/// only visible in a signature: `RouteFact` records the handler's `type_name`
-/// and its declared `Access`, and `RepoRead` is what an anchored route declares
-/// too — the route table cannot tell an anchored gate from a path-based one.
-fn anchored_handlers(aliases: &BTreeSet<&str>) -> Vec<AnchoredHandler> {
-    let mut files = Vec::new();
-    rust_files(&src_root(), &mut files);
-    files.sort();
-    let mut out = Vec::new();
-    for file in &files {
-        let text = fs::read_to_string(file).expect("read source file");
-        for function in functions(&text) {
-            let Some(params) = signature_params(&text, &function.name) else {
-                continue;
-            };
-            for base in param_base_types(&params) {
-                if let Some(alias) = aliases.get(base) {
-                    out.push(AnchoredHandler {
-                        file: relative(file),
-                        name: function.name.clone(),
-                        alias: (*alias).to_string(),
-                    });
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// `api/artifacts.rs` + `get_artifact` ⇒ `rg_http::api::artifacts::get_artifact`,
-/// the spelling `RouteFact::handler` carries.
-fn handler_type_name(file: &str, name: &str) -> String {
-    let stem = file.strip_suffix(".rs").unwrap_or(file);
-    let module = stem.strip_suffix("/mod").unwrap_or(stem);
-    format!("rg_http::{}::{name}", module.replace('/', "::"))
-}
+// `AnchoredHandler` / `anchored_handlers` / `handler_type_name` live in
+// `common::source_scan` beside `anchored_aliases`: `route_access_sweep_tests`
+// judges an anchored row by a different predicate than a path-based one, and it
+// has to read the population from the same place this file does, or the two
+// passes drift and the weaker one becomes the ceiling (card_41ec8f1a29a3).
 
 /// Fill an anchored route's path with one id.
 ///
@@ -347,7 +253,7 @@ async fn no_anchored_route_confirms_a_row_of_a_private_repository() {
     };
     let repo = create_private_repo(&fx, VAULT).await;
     let seeded = Seeded {
-        artifact: seed_artifact(&fx, &db, repo).await,
+        artifact: seed_artifact(&fx.base, &fx.client, &db, repo, "anchor-runner").await,
     };
 
     assert!(

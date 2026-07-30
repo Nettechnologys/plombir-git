@@ -458,6 +458,88 @@ pub fn anchored_aliases() -> Vec<Anchor> {
     out
 }
 
+/// One handler whose signature takes an anchored extractor.
+#[allow(dead_code)]
+pub struct AnchoredHandler {
+    /// The file it is declared in, relative to `src/` — `api/artifacts.rs`.
+    pub file: String,
+    /// The function name — `get_artifact`.
+    pub name: String,
+    /// The alias its signature names — `ArtifactRead`.
+    pub alias: String,
+}
+
+/// Every handler in the tree that takes one of `aliases`.
+///
+/// Read from the source rather than from the route table because the alias is
+/// only visible in a signature: `RouteFact` records the handler's `type_name`
+/// and its declared `Access`, and `RepoRead` is what an anchored route declares
+/// too — the route table cannot tell an anchored gate from a path-based one.
+#[allow(dead_code)]
+pub fn anchored_handlers(aliases: &BTreeSet<&str>) -> Vec<AnchoredHandler> {
+    let mut files = Vec::new();
+    rust_files(&src_root(), &mut files);
+    files.sort();
+    let mut out = Vec::new();
+    for file in &files {
+        let text = fs::read_to_string(file).expect("read source file");
+        for function in functions(&text) {
+            let Some(params) = signature_params(&text, &function.name) else {
+                continue;
+            };
+            for base in param_base_types(&params) {
+                if let Some(alias) = aliases.get(base) {
+                    out.push(AnchoredHandler {
+                        file: relative(file),
+                        name: function.name.clone(),
+                        alias: (*alias).to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `api/artifacts.rs` + `get_artifact` ⇒ `rg_http::api::artifacts::get_artifact`,
+/// the spelling `RouteFact::handler` carries.
+#[allow(dead_code)]
+pub fn handler_type_name(file: &str, name: &str) -> String {
+    let stem = file.strip_suffix(".rs").unwrap_or(file);
+    let module = stem.strip_suffix("/mod").unwrap_or(stem);
+    format!("rg_http::{}::{name}", module.replace('/', "::"))
+}
+
+/// Every handler in the tree gated by an anchored extractor, mapped to the
+/// [`RepoAnchor`](../../src/api/repo_access.rs) implementor its gate resolves the
+/// repository through: `rg_http::api::artifacts::get_artifact` ⇒ `Artifact`.
+///
+/// The census in one call, keyed the way `RouteFact::handler` spells a handler —
+/// for the callers that only need to ask a route "are you anchored, and what row
+/// addresses you?". `route_access_sweep_tests` judges an anchored row by a
+/// different predicate than a path-based one, and the two passes have to be
+/// counting the same routes or the weaker of them silently becomes the ceiling.
+#[allow(dead_code)]
+pub fn anchored_handler_targets() -> BTreeMap<String, String> {
+    let anchors = anchored_aliases();
+    let by_alias: BTreeMap<&str, &Anchor> = anchors
+        .iter()
+        .map(|anchor| (anchor.alias.as_str(), anchor))
+        .collect();
+    let aliases: BTreeSet<&str> = by_alias.keys().copied().collect();
+    anchored_handlers(&aliases)
+        .iter()
+        .filter_map(|handler| {
+            let anchor = by_alias.get(handler.alias.as_str())?;
+            Some((
+                handler_type_name(&handler.file, &handler.name),
+                anchor.target.clone(),
+            ))
+        })
+        .collect()
+}
+
 /// `AnchoredRead<crate::api::artifacts::Artifact>;` ⇒ `Artifact`.
 ///
 /// The generic argument, stripped of any module path it is spelled with, so the
