@@ -13,7 +13,7 @@ async fn admin_sso_list_requires_auth() {
         .await
         .unwrap();
 
-    assert!(resp.status() == 401 || resp.status() == 403);
+    assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]
@@ -306,7 +306,7 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         .send()
         .await
         .unwrap();
-    assert_eq!(unauthenticated_test.status(), 403);
+    assert_eq!(unauthenticated_test.status(), 401);
 
     let failed_test = client
         .post(format!(
@@ -354,11 +354,9 @@ async fn admin_audit_list_requires_auth() {
         .await
         .unwrap();
 
-    // 403, not 401: the audit routes are gated by the `InstanceAdmin` extractor
-    // now, so they answer with the same code as every other admin route rather
-    // than with a second opinion of their own (`admin_users_list_requires_auth`
-    // has pinned 403 all along).
-    assert_eq!(resp.status(), 403);
+    // The shared `InstanceAdmin` extractor owns this distinction for every
+    // admin route: no session is 401, while a signed-in non-admin is 403.
+    assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]
@@ -449,8 +447,9 @@ async fn admin_login_attempts_are_protected_paginated_and_filterable() {
         .send()
         .await
         .unwrap();
-    // 403 — see `admin_audit_list_requires_auth`: one admin gate, one code.
-    assert_eq!(unauthenticated.status(), 403);
+    // See `admin_audit_list_requires_auth`: one shared gate, with 401 for an
+    // absent session and 403 only after an authenticated non-admin verdict.
+    assert_eq!(unauthenticated.status(), 401);
 
     let (admin_token, admin_id) =
         register_full(&base, "login_auditor", "login_auditor@example.com").await;

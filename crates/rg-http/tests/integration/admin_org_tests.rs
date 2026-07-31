@@ -11,7 +11,7 @@ async fn admin_orgs_list_requires_auth() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]

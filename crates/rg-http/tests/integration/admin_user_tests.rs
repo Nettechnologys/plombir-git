@@ -14,10 +14,10 @@ async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
 /// to right, so a gate written as the first statement of the function *body*
 /// still runs after the query is deserialized. `?per_page=abc` therefore
 /// answered an anonymous caller `400` with serde's complaint — which names the
-/// parameter and the type it wanted — instead of `403`.
+/// parameter and the type it wanted — instead of `401`.
 ///
 /// The four probes are one argument, not four assertions. The admin's `400` is
-/// what makes the anonymous `403` mean something: it shows the deserializer
+/// what makes the anonymous `401` mean something: it shows the deserializer
 /// really does reject `abc`, so the denial is the gate having run first rather
 /// than a parser that happened to be lenient. The admin's `200` is the live
 /// baseline — without it every line here would still pass against a route that
@@ -31,7 +31,7 @@ async fn admin_users_denies_before_it_parses_the_query() {
     let anon = client.get(&url).send().await.unwrap();
     assert_eq!(
         anon.status(),
-        403,
+        401,
         "an anonymous caller was answered about the query instead of about itself"
     );
     let body = anon.text().await.unwrap();
@@ -93,7 +93,7 @@ async fn admin_users_list_requires_auth() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]

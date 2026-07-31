@@ -14,6 +14,114 @@ use axum::response::IntoResponse;
 
 use crate::common::{build_test_app_state, register_user, setup_test_db, spawn_test_app_with_db};
 
+async fn instance_admin_probe(_admin: rg_http::api::admin::InstanceAdmin) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// Drive the public `InstanceAdmin` extractor without the global session
+/// middleware. The production router correctly has both layers, but on a closed
+/// pool the session layer also returns 503; letting it answer first would make a
+/// broken admin extractor look fixed.
+async fn instance_admin_probe_response(
+    state: rg_http::AppState,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use tower::ServiceExt as _;
+
+    let mut request = axum::http::Request::builder()
+        .uri("/instance-admin-probe")
+        .body(axum::body::Body::empty())
+        .expect("build instance-admin probe request");
+    request.headers_mut().extend(headers);
+
+    axum::Router::new()
+        .route(
+            "/instance-admin-probe",
+            axum::routing::get(instance_admin_probe),
+        )
+        .with_state(state)
+        .oneshot(request)
+        .await
+        .expect("instance-admin probe response")
+}
+
+/// Acceptance for card_fe74604899f7: absence, denial and a gate that could not
+/// run are three different outcomes. This targets the extractor itself so the
+/// outage assertion cannot pass vacuously through `session_standing_middleware`.
+#[tokio::test]
+async fn instance_admin_gate_distinguishes_401_403_and_503() {
+    use sea_orm::ActiveModelTrait;
+    use sea_orm::ActiveValue::Set;
+
+    const NON_ADMIN_ID: i64 = 900_301;
+    const ADMIN_ID: i64 = 900_302;
+
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+
+    let now = chrono::Utc::now();
+    for (id, username, is_admin) in [
+        (NON_ADMIN_ID, "instance-gate-user", false),
+        (ADMIN_ID, "instance-gate-admin", true),
+    ] {
+        rg_db::entities::user::ActiveModel {
+            id: Set(id),
+            username: Set(username.to_string()),
+            email: Set(format!("{username}@example.test")),
+            password_hash: Set(String::new()),
+            is_admin: Set(is_admin),
+            is_active: Set(true),
+            auth_provider: Set("local".to_string()),
+            mfa_enabled: Set(false),
+            login_attempts: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert instance-admin gate fixture user");
+    }
+
+    let state = build_test_app_state(db.clone(), repo_root);
+
+    let anonymous =
+        instance_admin_probe_response(state.clone(), axum::http::HeaderMap::new()).await;
+    assert_eq!(
+        anonymous.status(),
+        StatusCode::UNAUTHORIZED,
+        "an admin route without a session must answer 401"
+    );
+
+    let denied =
+        instance_admin_probe_response(state.clone(), bearer(NON_ADMIN_ID, "instance-gate-user"))
+            .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "an authenticated non-admin must answer 403"
+    );
+
+    let admitted =
+        instance_admin_probe_response(state.clone(), bearer(ADMIN_ID, "instance-gate-admin")).await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::NO_CONTENT,
+        "healthy baseline: the fixture admin must pass the gate"
+    );
+
+    db.close().await.expect("close instance-admin fixture pool");
+
+    let outage =
+        instance_admin_probe_response(state, bearer(ADMIN_ID, "instance-gate-admin")).await;
+    assert_eq!(
+        outage.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a failed admin lookup must answer 503, not admin required"
+    );
+}
+
 /// A connection-level `DbErr` raised inside `runners::download_workspace`
 /// (the handler named in the card) must surface as 503, not 500.
 #[tokio::test]

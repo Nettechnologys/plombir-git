@@ -70,7 +70,10 @@ pub struct UpdateUserRequest {
 // ── Admin middleware: require is_admin ────────────────────────────────
 
 /// Extract the current user ID from cookie or Bearer token and verify is_admin=true.
-/// Returns None if not authenticated or not an admin.
+///
+/// Missing authentication, a negative admin decision and a failed database
+/// lookup are deliberately three different outcomes: the first is `401`, the
+/// second is `403`, and the third remains a server-side error.
 ///
 /// Private to this module on purpose: the rule is reachable from a handler only
 /// through [`InstanceAdmin`], so "which extractor gates this route" is a
@@ -84,15 +87,17 @@ pub struct UpdateUserRequest {
 /// file's `GATES` list — the compiler covers what the grep there would only
 /// notice, and widening this signature means bringing the name under a grep in
 /// the same commit.
-async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Option<i64> {
-    let user_id = extract_user_id(headers, &state.jwt_secret)?;
+async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Result<i64, AppError> {
+    let user_id = extract_user_id(headers, &state.jwt_secret)
+        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
-        .ok()??;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::unauthorized("invalid token subject"))?;
     if user.is_admin {
-        Some(user_id)
+        Ok(user_id)
     } else {
-        None
+        Err(AppError::forbidden("admin required"))
     }
 }
 
@@ -111,11 +116,11 @@ async fn require_instance_admin(state: &AppState, headers: &HeaderMap) -> Option
 /// arguments left to right: a gate written as the first statement of the
 /// function body still runs *after* every one of them. `GET /admin/users?per_page=abc`
 /// answered an anonymous caller `400` with the serde error naming the parameter
-/// and its type, rather than `403`. Declaring the gate as the argument before
+/// and its type, rather than `401`. Declaring the gate as the argument before
 /// them is what puts it first.
 ///
-/// The rejection is deliberately the same `403 admin required` the handlers
-/// answered before, so this is a reordering and not a change of contract.
+/// Rejections preserve the gate's actual outcome: no session is `401`, a
+/// non-admin is `403`, and a failed account lookup is a server error.
 pub struct InstanceAdmin(pub i64);
 
 impl axum::extract::FromRequestParts<AppState> for InstanceAdmin {
@@ -128,7 +133,6 @@ impl axum::extract::FromRequestParts<AppState> for InstanceAdmin {
         require_instance_admin(state, &parts.headers)
             .await
             .map(Self)
-            .ok_or_else(|| AppError::forbidden("admin required"))
     }
 }
 
