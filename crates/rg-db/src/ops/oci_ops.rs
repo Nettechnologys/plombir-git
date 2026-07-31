@@ -29,7 +29,15 @@ pub async fn find_or_create_repo(
     namespace: &str,
     owner_id: i64,
 ) -> Result<oci_repository::Model, DbErr> {
-    if let Some(r) = find_repo_by_id(db, repo_id).await? {
+    use oci_repository::Entity as OciRepo;
+
+    let find_existing = || {
+        OciRepo::find()
+            .filter(oci_repository::Column::RepoId.eq(repo_id))
+            .filter(oci_repository::Column::Namespace.eq(namespace))
+            .one(db)
+    };
+    if let Some(r) = find_existing().await? {
         return Ok(r);
     }
     let now = Utc::now();
@@ -42,7 +50,26 @@ pub async fn find_or_create_repo(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    m.insert(db).await
+    OciRepo::insert(m)
+        .on_conflict(
+            OnConflict::columns([
+                oci_repository::Column::RepoId,
+                oci_repository::Column::Namespace,
+            ])
+            // MySQL needs a harmless assignment for its DO NOTHING polyfill;
+            // PostgreSQL and SQLite emit DO NOTHING for this conflict target.
+            .do_nothing_on([oci_repository::Column::Id])
+            .to_owned(),
+        )
+        .do_nothing()
+        .exec(db)
+        .await?;
+
+    find_existing().await?.ok_or_else(|| {
+        DbErr::Custom(format!(
+            "OCI repository {namespace} was absent after conflict-safe creation"
+        ))
+    })
 }
 
 // ── OCI Manifest ────────────────────────────────────────────

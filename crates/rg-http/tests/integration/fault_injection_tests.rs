@@ -358,6 +358,96 @@ async fn concurrent_pushes_of_the_same_blob_both_succeed() {
     assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
 }
 
+/// The first two uploads for a ForgeKeep repository can both observe that its
+/// OCI row is absent. The unique namespace index serializes creation, but the
+/// losing request must reuse the winner's row rather than surface the conflict.
+#[tokio::test]
+async fn concurrent_first_uploads_share_one_oci_repository() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&app.base, "oci_repo_race", "oci_repo_race@example.com").await;
+    let repo_id = create_repo(&app.base, &token, "first-upload").await;
+
+    let start = || {
+        client
+            .post(format!(
+                "{}/v2/oci_repo_race/first-upload/blobs/uploads/",
+                app.base
+            ))
+            .bearer_auth(&token)
+            .send()
+    };
+    let (first, second) = tokio::join!(start(), start());
+
+    let mut upload_uuids = Vec::new();
+    for response in [first.unwrap(), second.unwrap()] {
+        let status = response.status();
+        let upload_uuid = response
+            .headers()
+            .get("docker-upload-uuid")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status, 202,
+            "one concurrent first upload lost repository creation: {body}"
+        );
+        assert!(
+            !body.contains("UNIQUE constraint") && !body.contains("duplicate key"),
+            "a database constraint escaped through the OCI response: {body}"
+        );
+        upload_uuids.push(upload_uuid.expect("start upload must return Docker-Upload-UUID"));
+    }
+    assert_ne!(
+        upload_uuids[0], upload_uuids[1],
+        "each successful request must own a distinct upload session"
+    );
+
+    let rows = rg_db::entities::oci_repository::Entity::find()
+        .filter(rg_db::entities::oci_repository::Column::RepoId.eq(repo_id))
+        .filter(rg_db::entities::oci_repository::Column::Namespace.eq("oci_repo_race/first-upload"))
+        .count(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the namespace must have exactly one OCI row");
+}
+
+/// Conflict handling is deliberately scoped to the unique namespace race. A
+/// real insert failure must still fail the request instead of being mistaken
+/// for a concurrently-created row.
+#[tokio::test]
+async fn an_oci_repository_insert_failure_still_returns_5xx() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(
+        &app.base,
+        "oci_repo_insert_fault",
+        "oci_repo_insert_fault@example.com",
+    )
+    .await;
+    create_repo(&app.base, &token, "broken-first-upload").await;
+    let fault = fail_db_writes(&app.db, "oci_repository", DbWrite::Insert).await;
+
+    let response = client
+        .post(format!(
+            "{}/v2/oci_repo_insert_fault/broken-first-upload/blobs/uploads/",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(
+        status.is_server_error(),
+        "a real OCI repository insert failure must stay 5xx, got {status}: {body}"
+    );
+
+    fault.clear().await;
+}
+
 /// Retrying a digest-addressed manifest PUT is a successful no-op.
 ///
 /// Only the request that creates the manifest row owns its blob-reference
