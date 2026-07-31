@@ -382,6 +382,137 @@ async fn seed_repo_with_outsider(
     )
 }
 
+/// Acceptance for card_560e1791b200: a job from this pipeline is readable, a
+/// real job from another pipeline stays masked as absent, and a failure in the
+/// ownership lookup is neither of those answers.
+///
+/// The fault is deliberately narrower than a closed pool. Closing the pool
+/// would make `session_standing_middleware`, `RepoRead`, or `pipeline_in_repo`
+/// answer 503 before `job_belongs_to_pipeline` ran, so the test would stay green
+/// if that helper still returned `false` on error. Removing only
+/// `pipeline_stages` leaves every earlier lookup healthy and makes both CI
+/// handlers fail exactly at the ownership check. The helper's unit test covers
+/// the connection-level branch and its exact retryable 503 classification.
+#[tokio::test]
+async fn job_pipeline_ownership_distinguishes_absence_from_lookup_failure() {
+    use sea_orm::ConnectionTrait;
+
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let (owner, repo_name, repo, _outsider_id, _outsider) =
+        seed_repo_with_outsider(&db, false).await;
+
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "1111111111111111111111111111111111111111",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .expect("create target pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "target", 0)
+        .await
+        .expect("create target stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db,
+        stage.id,
+        "target-job",
+        "echo target",
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        Some("manual"),
+        None,
+    )
+    .await
+    .expect("create target job");
+
+    let other_pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "2222222222222222222222222222222222222222",
+        "refs/heads/other",
+        "manual",
+        None,
+    )
+    .await
+    .expect("create other pipeline");
+    let other_stage = rg_db::ops::pipeline_ops::create_stage(&db, other_pipeline.id, "other", 0)
+        .await
+        .expect("create other stage");
+    let other_job = rg_db::ops::pipeline_ops::create_job(
+        &db,
+        other_stage.id,
+        "other-job",
+        "echo other",
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        Some("manual"),
+        None,
+    )
+    .await
+    .expect("create other job");
+
+    let state = build_test_app_state(db.clone(), repo_root);
+    let headers = bearer(repo.owner_id, owner);
+    let own_path = format!(
+        "/api/v1/repos/{owner}/{repo_name}/pipelines/{}/jobs/{}",
+        pipeline.id, job.id
+    );
+    let foreign_path = format!(
+        "/api/v1/repos/{owner}/{repo_name}/pipelines/{}/jobs/{}",
+        pipeline.id, other_job.id
+    );
+
+    let own = get_through_router(state.clone(), &own_path, headers.clone()).await;
+    assert_eq!(
+        own.status(),
+        StatusCode::OK,
+        "healthy baseline: the target pipeline must expose its own job"
+    );
+
+    let foreign = get_through_router(state.clone(), &foreign_path, headers.clone()).await;
+    assert_eq!(
+        foreign.status(),
+        StatusCode::NOT_FOUND,
+        "healthy baseline: an existing job from another pipeline stays masked"
+    );
+
+    // One batch keeps the connection-local PRAGMA and DROP on the same pooled
+    // connection. Foreign-key enforcement must be off so the existing job rows
+    // survive and the handler still reaches the ownership lookup.
+    db.execute_unprepared("PRAGMA foreign_keys = OFF;\nDROP TABLE pipeline_stages;")
+        .await
+        .expect("break only the pipeline-stage ownership lookup");
+
+    let broken_get = get_through_router(state.clone(), &own_path, headers.clone()).await;
+    assert!(
+        broken_get.status().is_server_error(),
+        "a failed GET ownership lookup must be 5xx, not {}",
+        broken_get.status()
+    );
+
+    let play_path = format!("{own_path}/play");
+    let broken_play = through_router(state, "POST", &play_path, headers, None).await;
+    assert!(
+        broken_play.status().is_server_error(),
+        "a failed play ownership lookup must be 5xx, not {}",
+        broken_play.status()
+    );
+}
+
 /// The card's two densest paths must classify the failure at their own DB
 /// boundary. The attachment call receives a pre-resolved `RepoRead`, while the
 /// artifact probe mounts the production `ArtifactRead` extractor without the

@@ -261,7 +261,11 @@ pub async fn get_job(
 
     match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(j)) => {
-            if !job_belongs_to_pipeline(&state, pipeline.id, j.stage_id).await {
+            let belongs = match job_belongs_to_pipeline(&state.db, pipeline.id, j.stage_id).await {
+                Ok(belongs) => belongs,
+                Err(error) => return error.into_response(),
+            };
+            if !belongs {
                 return AppError::not_found("job not found").into_response();
             }
             Json(JobResponse {
@@ -317,10 +321,17 @@ pub async fn play_job(
         Err(error) => return error.into_response(),
     };
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
-        Ok(Some(job)) if job_belongs_to_pipeline(&state, pipeline_id, job.stage_id).await => job,
-        Ok(Some(_)) | Ok(None) => return AppError::not_found("job not found").into_response(),
+        Ok(Some(job)) => job,
+        Ok(None) => return AppError::not_found("job not found").into_response(),
         Err(error) => return AppError::from(error).into_response(),
     };
+    let belongs = match job_belongs_to_pipeline(&state.db, pipeline_id, job.stage_id).await {
+        Ok(belongs) => belongs,
+        Err(error) => return error.into_response(),
+    };
+    if !belongs {
+        return AppError::not_found("job not found").into_response();
+    }
     if pipeline.status != "manual" || job.status != "manual" || job.when_condition != "manual" {
         return AppError::bad_request("job is not awaiting manual action").into_response();
     }
@@ -703,19 +714,18 @@ async fn resolve_repo_storage_owner(
         .ok_or_else(|| AppError::internal("repository owner not found"))
 }
 
-async fn job_belongs_to_pipeline(state: &AppState, pipeline_id: i64, stage_id: i64) -> bool {
-    match rg_db::ops::pipeline_ops::list_stages_by_pipeline(&state.db, pipeline_id).await {
-        Ok(stages) => stages.iter().any(|stage| stage.id == stage_id),
-        Err(e) => {
-            tracing::error!(
-                error = %format!("{e:#}"),
-                pipeline_id,
-                stage_id,
-                "failed to verify job pipeline ownership"
-            );
-            false
-        }
-    }
+/// Keep "this stage belongs elsewhere" separate from "the ownership lookup
+/// could not run". Callers may turn only the first outcome into a masked 404;
+/// database failures keep their `AppError` classification (503 for an outage).
+async fn job_belongs_to_pipeline(
+    db: &rg_db::DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+) -> Result<bool, AppError> {
+    rg_db::ops::pipeline_ops::list_stages_by_pipeline(db, pipeline_id)
+        .await
+        .map(|stages| stages.iter().any(|stage| stage.id == stage_id))
+        .map_err(AppError::from)
 }
 
 fn resolve_commit_sha(
@@ -754,5 +764,28 @@ fn resolve_commit_sha(
             let short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
             Ok(repo.rev_parse_single(short).ok().map(|id| id.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn job_pipeline_ownership_connection_outage_is_retryable() {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect test database");
+        db.clone().close().await.expect("close test database");
+
+        let error = job_belongs_to_pipeline(&db, 1, 1)
+            .await
+            .expect_err("a closed pool cannot answer the ownership check");
+
+        assert_eq!(
+            error.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a connection outage must stay retryable instead of becoming false"
+        );
     }
 }
