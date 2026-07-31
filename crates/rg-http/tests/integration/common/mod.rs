@@ -255,6 +255,30 @@ pub async fn spawn_test_app_with_db() -> (String, rg_db::DatabaseConnection) {
     spawn_test_app_with_overrides(StateOverrides::default()).await
 }
 
+/// Spawn the test app and retain the exact state installed in its router.
+///
+/// Protocol tests normally exercise the server over HTTP. A `HEAD` response,
+/// however, deliberately carries no body on the wire, so tests that must also
+/// inspect a protocol-specific error envelope can invoke the same production
+/// handler with this cloned state after proving the routed status separately.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_state() -> (String, rg_db::DatabaseConnection, rg_http::AppState) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).ok();
+    let state = build_test_app_state(db.clone(), repo_root);
+    let app = rg_http::create_router_for_test(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    (base_url, db, state)
+}
+
 /// [`spawn_test_app_with_db`] with individual pieces of the state replaced —
 /// for tests whose subject is a seam rather than the default wiring.
 #[allow(dead_code)]

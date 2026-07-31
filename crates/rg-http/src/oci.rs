@@ -1059,18 +1059,39 @@ pub async fn head_blob(
         }
     };
     if exists {
-        // Get blob size from DB if available
-        let size = match find_oci_repo(&state.db, &owner, &repo).await {
-            Ok(Some(oci_repo)) => rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &digest)
-                .await
-                .ok()
-                .flatten()
-                .map(|b| b.size),
-            _ => None,
+        // The metadata row is the registry's source of truth for the size. Bytes
+        // without that row are an inconsistent object, not a zero-byte blob.
+        let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
+            Ok(Some(oci_repo)) => oci_repo,
+            Ok(None) => {
+                return oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!(
+                        "OCI repository metadata is missing for {owner}/{repo}, but blob {digest} exists in storage"
+                    ),
+                );
+            }
+            Err(error) => {
+                return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"));
+            }
         };
-        let size_hdr = size
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "0".to_string());
+        let size = match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &digest).await {
+            Ok(Some(blob)) => blob.size,
+            Ok(None) => {
+                return oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!(
+                        "OCI blob metadata is missing for {owner}/{repo}@{digest}, but the blob exists in storage"
+                    ),
+                );
+            }
+            Err(error) => {
+                return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"));
+            }
+        };
+        let size_hdr = size.to_string();
         (
             StatusCode::OK,
             [

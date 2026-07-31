@@ -1,5 +1,13 @@
-use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_oci_root};
+use crate::common::{
+    register_full, spawn_test_app_with_db, spawn_test_app_with_oci_root, spawn_test_app_with_state,
+};
+use axum::{
+    body::to_bytes,
+    extract::{Path, State},
+    http::{header, HeaderMap},
+};
 use base64::Engine as _;
+use sea_orm::ConnectionTrait;
 
 async fn create_repo(base: &str, token: &str, name: &str, is_private: bool) {
     let client = reqwest::Client::new();
@@ -223,9 +231,15 @@ async fn the_advertised_token_realm_is_a_path_the_registry_serves() {
 /// `HEAD .../blobs/<digest>` returned 404. A client has no reason to retry
 /// something it was told succeeded, so the image stayed broken. This walks the
 /// real push sequence and then reads the blob back.
+///
+/// The same invariant runs in reverse too: once storage confirms the bytes,
+/// missing or unreadable metadata must be a server error rather than a
+/// successful zero-byte blob. The routed `HEAD` proves the wire status; a direct
+/// call to the same production handler also exposes the OCI envelope that HTTP
+/// correctly omits from a HEAD response body.
 #[tokio::test]
 async fn a_created_blob_is_retrievable_right_after_the_push() {
-    let (base, _db) = spawn_test_app_with_db().await;
+    let (base, db, state) = spawn_test_app_with_state().await;
     let client = reqwest::Client::new();
     let (token, _user_id) =
         register_full(&base, "oci_push_owner", "oci_push_owner@example.com").await;
@@ -293,6 +307,14 @@ async fn a_created_blob_is_retrievable_right_after_the_push() {
         200,
         "push answered 201 but the blob is not retrievable"
     );
+    let expected_length = payload.len().to_string();
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_length.as_str()),
+        "HEAD must report the recorded blob size"
+    );
 
     let fetched = client
         .get(format!(
@@ -305,6 +327,71 @@ async fn a_created_blob_is_retrievable_right_after_the_push() {
         .unwrap();
     assert_eq!(fetched.status(), 200);
     assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
+
+    db.execute_unprepared("DELETE FROM oci_blob")
+        .await
+        .expect("delete blob metadata");
+
+    let missing_row = client
+        .head(format!(
+            "{}/v2/oci_push_owner/pushed-image/blobs/{}",
+            base, digest
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_row.status(),
+        500,
+        "stored bytes without their metadata row must not become 200 Content-Length: 0"
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let missing_row = rg_http::oci::head_blob(
+        State(state.clone()),
+        headers.clone(),
+        Path((
+            "oci_push_owner".to_string(),
+            "pushed-image".to_string(),
+            digest.clone(),
+        )),
+    )
+    .await;
+    assert_eq!(missing_row.status(), 500);
+    let missing_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(missing_row.into_body(), usize::MAX)
+            .await
+            .expect("read missing-row OCI envelope"),
+    )
+    .expect("missing-row response is OCI JSON");
+    assert_eq!(missing_body["errors"][0]["code"], "UNKNOWN");
+
+    db.execute_unprepared("DROP TABLE oci_blob")
+        .await
+        .expect("drop oci_blob");
+    let broken_lookup = rg_http::oci::head_blob(
+        State(state),
+        headers,
+        Path((
+            "oci_push_owner".to_string(),
+            "pushed-image".to_string(),
+            digest,
+        )),
+    )
+    .await;
+    assert_eq!(broken_lookup.status(), 500);
+    let broken_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(broken_lookup.into_body(), usize::MAX)
+            .await
+            .expect("read lookup-failure OCI envelope"),
+    )
+    .expect("lookup failure is OCI JSON");
+    assert_eq!(broken_body["errors"][0]["code"], "UNKNOWN");
 }
 
 /// Start an upload session and stage `payload` in it, returning the session
