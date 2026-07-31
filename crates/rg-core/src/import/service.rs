@@ -488,7 +488,7 @@ async fn resolve_or_create_target_repo(
     // Try to find existing repo via the repo service (handles user+org lookup)
     if let Some(repo) = crate::repo::service::find_repo_by_owner_name(db, target_owner, target_name)
         .await
-        .unwrap_or(None)
+        .context("failed to look up existing target repository")?
     {
         tracing::info!(repo_id = repo.id, "Found existing target repo");
         return Ok(repo.id);
@@ -1531,6 +1531,41 @@ pub async fn start_import(
     import_task_ops::find_by_id(db, task.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("import task not found after creation"))
+}
+
+#[cfg(test)]
+mod target_repo_resolution_tests {
+    use super::*;
+
+    /// The first lookup is the branch decision: its failure must not be
+    /// rewritten as `None` and followed by the owner-resolution/create path.
+    ///
+    /// A closed real SQLite pool exercises the production query stack. The
+    /// first-lookup context is the distinguishing assertion: the old
+    /// `.unwrap_or(None)` implementation swallowed it, retried the owner query,
+    /// and returned that later error instead.
+    #[tokio::test]
+    async fn a_failed_existing_repo_lookup_does_not_enter_the_create_branch() {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite pool");
+        let closed_db = db.clone();
+        db.close().await.expect("close SQLite pool");
+        let repo_root = tempfile::tempdir().expect("temporary repository root");
+
+        let error = resolve_or_create_target_repo(&closed_db, "alice", "widgets", repo_root.path())
+            .await
+            .expect_err("the failed existence check must abort target resolution");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to look up existing target repository"
+        );
+        assert!(
+            !repo_root.path().join("alice/widgets.git").exists(),
+            "a failed existence check entered the repository creation branch"
+        );
+    }
 }
 
 #[cfg(test)]
