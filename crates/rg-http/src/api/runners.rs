@@ -258,8 +258,28 @@ pub async fn poll_job(
         // Fetch runner labels for tag matching
         let runner_labels: Vec<String> =
             match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
-                Ok(Some(r)) => serde_json::from_str(&r.labels).unwrap_or_default(),
-                _ => Vec::new(),
+                Ok(Some(runner)) => match serde_json::from_str(&runner.labels) {
+                    Ok(labels) => labels,
+                    Err(error) => {
+                        tracing::error!(
+                            runner_id,
+                            error = %error,
+                            "poll_job: stored runner labels are invalid JSON"
+                        );
+                        return Err(AppError::internal("invalid runner labels").into_response());
+                    }
+                },
+                Ok(None) => {
+                    return Err(AppError::not_found("runner not found").into_response());
+                }
+                Err(error) => {
+                    tracing::error!(
+                        runner_id,
+                        error = %format!("{error:#}"),
+                        "poll_job: runner lookup failed"
+                    );
+                    return Err(AppError::from(error).into_response());
+                }
             };
 
         loop {
@@ -274,44 +294,89 @@ pub async fn poll_job(
             {
                 Ok(Some(job)) => {
                     // Found a job — assign it to this runner
-                    if let Err(e) =
+                    if let Err(error) =
                         rg_db::ops::pipeline_ops::assign_job(&state.db, job.id, runner_id).await
                     {
                         tracing::error!(
                             job_id = job.id,
                             runner_id,
-                            error = %format!("{e:#}"),
+                            error = %format!("{error:#}"),
                             "poll_job: failed to assign job"
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        continue;
+                        return Err(AppError::from(error).into_response());
                     }
                     // Mark job as assigned
                     let now = Some(chrono::Utc::now().naive_utc());
-                    if let Err(e) = rg_db::ops::pipeline_ops::update_job_result(
+                    if let Err(error) = rg_db::ops::pipeline_ops::update_job_result(
                         &state.db, job.id, "assigned", None, None, now, None,
                     )
                     .await
                     {
                         tracing::error!(
                             job_id = job.id,
-                            error = %format!("{e:#}"),
+                            error = %format!("{error:#}"),
                             "Failed to update job result to assigned"
                         );
+                        return Err(AppError::from(error).into_response());
                     }
 
                     // Fetch stage to get pipeline_id
-                    let mut pipeline_id = 0i64;
-                    let mut pipeline = None;
-                    if let Ok(Some(stage)) =
-                        rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await
-                    {
-                        pipeline_id = stage.pipeline_id;
-                        pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id)
+                    let stage =
+                        match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
                             .await
-                            .ok()
-                            .flatten();
-                    }
+                        {
+                            Ok(Some(stage)) => stage,
+                            Ok(None) => {
+                                tracing::error!(
+                                    job_id = job.id,
+                                    stage_id = job.stage_id,
+                                    "poll_job: assigned job has no pipeline stage"
+                                );
+                                return Err(AppError::internal(
+                                    "assigned job has no pipeline stage",
+                                )
+                                .into_response());
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id = job.id,
+                                    stage_id = job.stage_id,
+                                    error = %format!("{error:#}"),
+                                    "poll_job: pipeline stage lookup failed after assignment"
+                                );
+                                return Err(AppError::from(error).into_response());
+                            }
+                        };
+                    let pipeline_id = stage.pipeline_id;
+                    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(
+                        &state.db,
+                        pipeline_id,
+                    )
+                    .await
+                    {
+                        Ok(Some(pipeline)) => pipeline,
+                        Ok(None) => {
+                            tracing::error!(
+                                job_id = job.id,
+                                stage_id = job.stage_id,
+                                pipeline_id,
+                                "poll_job: assigned job has no pipeline"
+                            );
+                            return Err(
+                                AppError::internal("assigned job has no pipeline").into_response()
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                job_id = job.id,
+                                stage_id = job.stage_id,
+                                pipeline_id,
+                                error = %format!("{error:#}"),
+                                "poll_job: pipeline lookup failed after assignment"
+                            );
+                            return Err(AppError::from(error).into_response());
+                        }
+                    };
 
                     let mut variables = job
                         .variables
@@ -334,60 +399,64 @@ pub async fn poll_job(
                     ] {
                         variables.remove(reserved);
                     }
-                    if let Some(pipeline) = &pipeline {
-                        match decrypted_repo_secrets(&state, pipeline.repo_id).await {
-                            Ok(secrets) => {
-                                for (name, value) in secrets {
-                                    variables.insert(name, serde_json::json!(value));
-                                }
+                    match decrypted_repo_secrets(&state, pipeline.repo_id).await {
+                        Ok(secrets) => {
+                            for (name, value) in secrets {
+                                variables.insert(name, serde_json::json!(value));
                             }
-                            Err(error) => {
-                                tracing::error!(
-                                    pipeline_id,
-                                    error = %format!("{error:#}"),
-                                    "failed to load CI secrets for external runner"
-                                );
-                                return Err(AppError::internal(
-                                    "failed to prepare job environment",
-                                )
-                                .into_response());
-                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                pipeline_id,
+                                error = %format!("{error:#}"),
+                                "failed to load CI secrets for external runner"
+                            );
+                            return Err(AppError::from(error).into_response());
                         }
                     }
                     variables.insert("CI".into(), serde_json::json!("true"));
                     variables.insert("FORGEKEEP".into(), serde_json::json!("true"));
                     variables.insert("CI_PIPELINE_ID".into(), serde_json::json!(pipeline_id));
-                    if let Some(pipeline) = &pipeline {
-                        variables.insert(
-                            "CI_COMMIT_SHA".into(),
-                            serde_json::json!(pipeline.commit_sha),
-                        );
-                        variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
-                        variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
-                        variables
-                            .insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
-                        if let Ok(token) = rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
-                            pipeline.repo_id,
-                            pipeline.id,
-                            job.id,
-                            "repo:read packages:read",
-                            &state.jwt_secret,
-                            job.timeout_seconds
-                                .unwrap_or(state.job_timeout_secs as i64)
-                                .clamp(60, 86_400)
-                                + 300,
-                        ) {
+                    variables.insert(
+                        "CI_COMMIT_SHA".into(),
+                        serde_json::json!(pipeline.commit_sha),
+                    );
+                    variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
+                    variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
+                    variables.insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
+                    match rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
+                        pipeline.repo_id,
+                        pipeline.id,
+                        job.id,
+                        "repo:read packages:read",
+                        &state.jwt_secret,
+                        job.timeout_seconds
+                            .unwrap_or(state.job_timeout_secs as i64)
+                            .clamp(60, 86_400)
+                            + 300,
+                    ) {
+                        Ok(token) => {
                             variables.insert("CI_JOB_TOKEN".into(), serde_json::json!(token));
                         }
-                        if let Some(url) = state.external_url.as_deref() {
-                            variables.insert(
-                                "CI_OIDC_TOKEN_URL".into(),
-                                serde_json::json!(format!(
-                                    "{}/api/v1/ci/oidc/token",
-                                    url.trim_end_matches('/')
-                                )),
+                        Err(error) => {
+                            tracing::error!(
+                                job_id = job.id,
+                                pipeline_id,
+                                error = %format!("{error:#}"),
+                                "failed to generate CI job token for external runner"
                             );
+                            return Err(AppError::internal("failed to prepare job environment")
+                                .into_response());
                         }
+                    }
+                    if let Some(url) = state.external_url.as_deref() {
+                        variables.insert(
+                            "CI_OIDC_TOKEN_URL".into(),
+                            serde_json::json!(format!(
+                                "{}/api/v1/ci/oidc/token",
+                                url.trim_end_matches('/')
+                            )),
+                        );
                     }
 
                     let resp = PollJobResponse {
@@ -1194,64 +1263,116 @@ pub async fn finish_job(
         return AppError::from(e).into_response();
     }
 
-    // Metrics: job left the running set — count its outcome and, if we know when
-    // it started, its execution duration.
-    let job_duration = job
-        .started_at
-        .and_then(|started| (chrono::Utc::now().naive_utc() - started).to_std().ok());
-    crate::metrics::recorder::ci_job_finished(&req.status, job_duration);
-
     // Mark runner as online (ready for next job)
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "online").await {
         tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as online");
     }
 
     // Cascade: check if stage is done, then if pipeline is done
-    if let Ok(Some(_stage_status)) =
-        rg_db::ops::pipeline_ops::try_update_stage(&state.db, job.stage_id).await
-    {
+    let stage_status =
+        match rg_db::ops::pipeline_ops::try_update_stage(&state.db, job.stage_id).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(
+                    stage_id = job.stage_id,
+                    error = %format!("{error:#}"),
+                    "Failed to update stage after job completion"
+                );
+                return AppError::from(error).into_response();
+            }
+        };
+    if stage_status.is_some() {
         // Stage is done — get pipeline_id and check pipeline
-        if let Ok(Some(stage)) =
-            rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await
-        {
-            match rg_db::ops::pipeline_ops::try_update_pipeline(&state.db, stage.pipeline_id).await
-            {
-                Ok(Some(status)) => {
-                    // Metrics: the pipeline reached a terminal status.
-                    crate::metrics::recorder::ci_pipeline_finished(&status);
-                    if status == "success" {
-                        if let Ok(Some(pipeline)) =
-                            rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
-                                .await
-                        {
-                            // "CI went green, so the PR goes in" is what
-                            // auto-merge is for — and the merge commit it lands
-                            // on the base branch owes the same post-push
-                            // automation a push does. Until card_73a1ec5b32f3
-                            // the merge happened here and its ref move was
-                            // dropped, so that commit got no pipeline, no `push`
-                            // webhook and no watch notification.
-                            state
-                                .evaluate_merges_and_spawn_hooks(
-                                    pipeline.repo_id,
-                                    &pipeline.commit_sha,
-                                    None,
-                                )
-                                .await;
+        let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
+            Ok(Some(stage)) => stage,
+            Ok(None) => {
+                tracing::error!(
+                    job_id,
+                    stage_id = job.stage_id,
+                    "finish_job: completed stage disappeared before pipeline roll-up"
+                );
+                return AppError::internal("pipeline stage not found after job completion")
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id,
+                    stage_id = job.stage_id,
+                    error = %format!("{error:#}"),
+                    "finish_job: failed to reload completed stage"
+                );
+                return AppError::from(error).into_response();
+            }
+        };
+        match rg_db::ops::pipeline_ops::try_update_pipeline(&state.db, stage.pipeline_id).await {
+            Ok(Some(status)) => {
+                if status == "success" {
+                    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(
+                        &state.db,
+                        stage.pipeline_id,
+                    )
+                    .await
+                    {
+                        Ok(Some(pipeline)) => pipeline,
+                        Ok(None) => {
+                            tracing::error!(
+                                job_id,
+                                pipeline_id = stage.pipeline_id,
+                                "finish_job: completed pipeline disappeared before post-push hooks"
+                            );
+                            return AppError::internal("pipeline not found after job completion")
+                                .into_response();
                         }
-                    }
+                        Err(error) => {
+                            tracing::error!(
+                                job_id,
+                                pipeline_id = stage.pipeline_id,
+                                error = %format!("{error:#}"),
+                                "finish_job: failed to reload completed pipeline"
+                            );
+                            return AppError::from(error).into_response();
+                        }
+                    };
+                    // "CI went green, so the PR goes in" is what
+                    // auto-merge is for — and the merge commit it lands
+                    // on the base branch owes the same post-push
+                    // automation a push does. Until card_73a1ec5b32f3
+                    // the merge happened here and its ref move was
+                    // dropped, so that commit got no pipeline, no `push`
+                    // webhook and no watch notification.
+                    state
+                        .evaluate_merges_and_spawn_hooks(
+                            pipeline.repo_id,
+                            &pipeline.commit_sha,
+                            None,
+                        )
+                        .await;
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(
-                        pipeline_id = stage.pipeline_id,
-                        error = %format!("{e:#}"),
-                        "Failed to update pipeline after stage completion"
-                    );
-                }
+                // Metrics: the pipeline reached a terminal status. Emit only
+                // after all mandatory context was loaded, so a runner retry
+                // after a failed lookup does not double-count the completion.
+                crate::metrics::recorder::ci_pipeline_finished(&status);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    pipeline_id = stage.pipeline_id,
+                    error = %format!("{error:#}"),
+                    "Failed to update pipeline after stage completion"
+                );
+                return AppError::from(error).into_response();
             }
         }
     }
+
+    // Metrics: job left the running set — count its outcome and, if we know when
+    // it started, its execution duration. This is deliberately after roll-up:
+    // a failed roll-up makes the runner retry `finish`, and recording before it
+    // would count the same job once per retry.
+    let job_duration = job
+        .started_at
+        .and_then(|started| (chrono::Utc::now().naive_utc() - started).to_std().ok());
+    crate::metrics::recorder::ci_job_finished(&req.status, job_duration);
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
