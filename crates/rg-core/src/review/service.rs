@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use rg_db::entities::pr_review::{self, Model as PrReview};
 use rg_db::entities::pull_request;
 use rg_db::entities::review_comment::{self, Model as ReviewComment};
-use rg_db::ops::{pr_review_ops, pull_request_ops, repo_ops, review_comment_ops};
+use rg_db::ops::{pr_review_ops, pull_request_ops, review_comment_ops};
 
 // ── Review actions ────────────────────────────────────────────────────
 
@@ -649,10 +649,7 @@ async fn resolve_repo(
     owner: &str,
     repo_name: &str,
 ) -> Result<rg_db::entities::repository::Model> {
-    let user = rg_db::ops::user_ops::find_by_username(db, owner)
-        .await?
-        .ok_or_else(|| crate::error::not_found("owner"))?;
-    repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name)
+    crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
 }

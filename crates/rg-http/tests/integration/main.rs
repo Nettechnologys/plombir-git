@@ -74,6 +74,7 @@ mod oci_push_pull_tests;
 mod oci_upload_session_scope_tests;
 mod openapi_docs_auth_tests;
 mod openapi_security_guard;
+mod org_repo_service_resolution_tests;
 mod org_scoped_id_scope_sweep_tests;
 mod org_team_authz_tests;
 mod org_tests;
