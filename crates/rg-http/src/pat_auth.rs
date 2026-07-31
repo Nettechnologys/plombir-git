@@ -21,35 +21,37 @@ use crate::AppState;
 async fn resolve_pat(
     db: &DatabaseConnection,
     token: &str,
-) -> Option<(
-    rg_db::entities::access_token::Model,
-    rg_db::entities::user::Model,
-)> {
+) -> anyhow::Result<
+    Option<(
+        rg_db::entities::access_token::Model,
+        rg_db::entities::user::Model,
+    )>,
+> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
 
-    let tok = rg_db::ops::token_ops::find_by_hash(db, &hash)
-        .await
-        .ok()??;
+    let Some(tok) = rg_db::ops::token_ops::find_by_hash(db, &hash).await? else {
+        return Ok(None);
+    };
     if let Some(expires_at) = tok.expires_at {
         if expires_at < chrono::Utc::now() {
-            return None; // expired
+            return Ok(None); // expired
         }
     }
-    let owner = rg_db::ops::user_ops::find_by_id(db, tok.user_id)
-        .await
-        .ok()??;
+    let Some(owner) = rg_db::ops::user_ops::find_by_id(db, tok.user_id).await? else {
+        return Ok(None);
+    };
     if !owner.is_usable() {
         tracing::warn!(
             user_id = tok.user_id,
             token_id = tok.id,
             "rejecting personal access token: account is disabled or gone"
         );
-        return None;
+        return Ok(None);
     }
-    Some((tok, owner))
+    Ok(Some((tok, owner)))
 }
 
 /// Scope required when a PAT is used for a REST request.
@@ -113,9 +115,7 @@ pub(crate) async fn pat_auth_middleware(
             }
         }
         Ok(None) => {}
-        Err(()) => {
-            return error::AppError::forbidden("personal access token scope denied").into_response()
-        }
+        Err(err) => return err.into_response(),
     }
     next.run(req).await
 }
@@ -127,7 +127,7 @@ async fn pat_to_bearer_jwt(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     required_scope: Option<&str>,
-) -> Result<Option<String>, ()> {
+) -> Result<Option<String>, error::AppError> {
     let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -170,20 +170,25 @@ async fn pat_to_bearer_jwt(
         if rg_core::auth::jwt::validate_token(&cand, &state.jwt_secret).is_some() {
             return Ok(Some(cand));
         }
-        if let Some((pat, owner)) = resolve_pat(&state.db, &cand).await {
+        if let Some((pat, owner)) = resolve_pat(&state.db, &cand)
+            .await
+            .map_err(error::AppError::from)?
+        {
             if required_scope
                 .is_some_and(|scope| !rg_core::auth::pat_scope::has_scope(&pat.scopes, scope))
             {
-                return Err(());
+                return Err(error::AppError::forbidden(
+                    "personal access token scope denied",
+                ));
             }
-            if let Ok(jwt) = rg_core::auth::jwt::generate_token(
+            let jwt = rg_core::auth::jwt::generate_token(
                 pat.user_id,
                 &owner.username,
                 &state.jwt_secret,
                 1,
-            ) {
-                return Ok(Some(jwt));
-            }
+            )
+            .map_err(error::AppError::from)?;
+            return Ok(Some(jwt));
         }
     }
     Ok(None)
@@ -193,33 +198,43 @@ async fn pat_to_bearer_jwt(
 ///
 /// Supports both JWT session tokens and Personal Access Tokens (PATs),
 /// presented either as `Authorization: Bearer <token>` or HTTP Basic auth
-/// (`git clone https://user:<token>@host/...`). Returns `None` for anonymous
-/// access (public repos still work; private repos are then rejected).
+/// (`git clone https://user:<token>@host/...`). Returns `Ok(None)` for
+/// anonymous access (public repos still work; private repos are then rejected)
+/// and propagates failures while looking up a presented PAT.
 pub(crate) async fn extract_actor_id(
     db: &DatabaseConnection,
     headers: &axum::http::HeaderMap,
     jwt_secret: &str,
-) -> Option<i64> {
-    let auth_str = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+) -> anyhow::Result<Option<i64>> {
+    let Some(auth_str) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
 
     if let Some(token) = auth_str.strip_prefix("Bearer ") {
         // JWT session token first, then fall back to a PAT.
         if let Some(claims) = rg_core::auth::jwt::validate_token(token, jwt_secret) {
-            return claims.sub.parse().ok();
+            return Ok(claims.sub.parse().ok());
         }
-        return resolve_pat(db, token)
-            .await
+        return Ok(resolve_pat(db, token)
+            .await?
             .filter(|(pat, _)| rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo"))
-            .map(|(pat, _)| pat.user_id);
+            .map(|(pat, _)| pat.user_id));
     }
 
     if let Some(encoded) = auth_str.strip_prefix("Basic ") {
         use base64::Engine as _;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .ok()?;
-        let credentials = String::from_utf8(decoded).ok()?;
-        let (username, password) = credentials.split_once(':')?;
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            return Ok(None);
+        };
+        let Ok(credentials) = String::from_utf8(decoded) else {
+            return Ok(None);
+        };
+        let Some((username, password)) = credentials.split_once(':') else {
+            return Ok(None);
+        };
         // Git clients carry the token in either the password (`user:token`) or
         // the username (`token:x-oauth-basic`) field — try both, JWT then PAT.
         for candidate in [password, username] {
@@ -227,15 +242,15 @@ pub(crate) async fn extract_actor_id(
                 continue;
             }
             if let Some(claims) = rg_core::auth::jwt::validate_token(candidate, jwt_secret) {
-                return claims.sub.parse().ok();
+                return Ok(claims.sub.parse().ok());
             }
-            if let Some((pat, _)) = resolve_pat(db, candidate).await {
+            if let Some((pat, _)) = resolve_pat(db, candidate).await? {
                 if rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo") {
-                    return Some(pat.user_id);
+                    return Ok(Some(pat.user_id));
                 }
             }
         }
     }
 
-    None
+    Ok(None)
 }

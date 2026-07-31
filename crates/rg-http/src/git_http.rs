@@ -352,7 +352,16 @@ pub(crate) async fn handle_info_refs(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Extract actor from auth header
-    let actor_id = extract_actor_id(&state.db, &headers, &state.jwt_secret).await;
+    let actor_id = match extract_actor_id(&state.db, &headers, &state.jwt_secret).await {
+        Ok(actor_id) => actor_id,
+        Err(e) => {
+            return (
+                git_db_status(&e),
+                [(header::CONTENT_TYPE, "text/plain")],
+                git_failure_body("resolve git credential", &e),
+            );
+        }
+    };
     let require_write = service == "git-receive-pack";
 
     // Check access
@@ -566,7 +575,17 @@ pub(crate) async fn handle_git_upload_pack(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Check read access
-    let actor_id = extract_actor_id(&state.db, &headers, &state.jwt_secret).await;
+    let actor_id = match extract_actor_id(&state.db, &headers, &state.jwt_secret).await {
+        Ok(actor_id) => actor_id,
+        Err(e) => {
+            return (
+                git_db_status(&e),
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(git_failure_body("resolve git credential", &e)),
+            )
+                .into_response();
+        }
+    };
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, false).await {
         return (resp.0, resp.1, Body::from(resp.2)).into_response();
     }
@@ -789,7 +808,16 @@ pub(crate) async fn handle_git_receive_pack(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Check write access
-    let actor_id = extract_actor_id(&state.db, &headers, &state.jwt_secret).await;
+    let actor_id = match extract_actor_id(&state.db, &headers, &state.jwt_secret).await {
+        Ok(actor_id) => actor_id,
+        Err(e) => {
+            return (
+                git_db_status(&e),
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(git_failure_body("resolve git credential", &e)),
+            );
+        }
+    };
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, true).await {
         return (resp.0, resp.1, Body::from(resp.2));
     }

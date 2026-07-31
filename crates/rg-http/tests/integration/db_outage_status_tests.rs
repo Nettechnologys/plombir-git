@@ -12,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-use crate::common::{build_test_app_state, setup_test_db};
+use crate::common::{build_test_app_state, register_user, setup_test_db, spawn_test_app_with_db};
 
 /// A connection-level `DbErr` raised inside `runners::download_workspace`
 /// (the handler named in the card) must surface as 503, not 500.
@@ -452,5 +452,149 @@ async fn failed_read_permission_check_is_not_reported_as_forbidden() {
         response.status(),
         StatusCode::INTERNAL_SERVER_ERROR,
         "the failed permission check must surface as a server-side failure"
+    );
+}
+
+const PAT_OUTAGE_OWNER: &str = "pat-outage-owner";
+const PAT_OUTAGE_REPO: &str = "private";
+const PAT_OUTAGE_INFO_REFS: &str = "info/refs?service=git-upload-pack";
+
+/// Build a real PAT fixture through the public API so both the REST middleware
+/// and git smart-HTTP exercise the same production credential path.
+async fn seed_pat_outage_fixture() -> (String, rg_db::DatabaseConnection, String) {
+    let (base, db) = spawn_test_app_with_db().await;
+    let jwt = register_user(
+        &base,
+        PAT_OUTAGE_OWNER,
+        "pat-outage-owner@example.test",
+        "Qz7$wRtm",
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let repo = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "name": PAT_OUTAGE_REPO,
+            "is_private": true,
+        }))
+        .send()
+        .await
+        .expect("create private PAT fixture repo");
+    assert_eq!(repo.status(), StatusCode::CREATED);
+
+    let token = client
+        .post(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "name": "outage-regression",
+            "scopes": "user, repo",
+        }))
+        .send()
+        .await
+        .expect("create PAT fixture");
+    assert_eq!(token.status(), StatusCode::CREATED);
+    let pat = token
+        .json::<serde_json::Value>()
+        .await
+        .expect("PAT response is JSON")["token"]
+        .as_str()
+        .expect("PAT response carries plaintext token")
+        .to_string();
+
+    (base, db, pat)
+}
+
+async fn get_with_pat(base: &str, path: &str, pat: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base}{path}"))
+        .bearer_auth(pat)
+        .send()
+        .await
+        .expect("PAT-authenticated request")
+}
+
+/// Acceptance for card_eb7e2c05ba1a: a valid PAT whose lookup hits a closed
+/// pool is a retryable server outage on both transports, never an instruction
+/// to replace the credential.
+#[tokio::test]
+async fn closed_pool_during_pat_resolution_returns_503_on_rest_and_git() {
+    let (base, db, pat) = seed_pat_outage_fixture().await;
+    let git_path = format!("/git/{PAT_OUTAGE_OWNER}/{PAT_OUTAGE_REPO}/{PAT_OUTAGE_INFO_REFS}");
+
+    // Prove the fixture reaches both authenticated paths before faulting it.
+    for path in ["/api/v1/users/me", git_path.as_str()] {
+        let response = get_with_pat(&base, path, &pat).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "healthy PAT baseline failed for {path}"
+        );
+    }
+
+    db.close().await.expect("close PAT fixture pool");
+
+    let rest = get_with_pat(&base, "/api/v1/users/me", &pat).await;
+    assert_eq!(
+        rest.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "REST PAT lookup outage must be 503, not missing authentication"
+    );
+
+    let git = get_with_pat(&base, &git_path, &pat).await;
+    assert_eq!(
+        git.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "git PAT lookup outage must be 503, not missing authentication"
+    );
+    assert_eq!(
+        git.text().await.expect("git outage body"),
+        "database temporarily unavailable",
+        "git transport must log the detailed cause and expose only the fixed safe body"
+    );
+}
+
+/// A closed pool also breaks the repository access query, so 503 alone cannot
+/// prove the PAT resolver propagated its own error. Dropping only the PAT table
+/// leaves the private repository and its access gate healthy: the old resolver
+/// swallowed this failure, treated the caller as anonymous, and returned 401.
+#[tokio::test]
+async fn failed_pat_query_is_not_reported_as_a_missing_credential() {
+    use sea_orm::ConnectionTrait;
+
+    let (base, db, pat) = seed_pat_outage_fixture().await;
+    db.execute_unprepared("DROP TABLE access_tokens")
+        .await
+        .expect("drop only the PAT table");
+
+    let rest = get_with_pat(&base, "/api/v1/users/me", &pat).await;
+    assert!(
+        rest.status().is_server_error(),
+        "failed REST PAT lookup must be a server error, got {}",
+        rest.status()
+    );
+    assert_ne!(
+        rest.status(),
+        StatusCode::UNAUTHORIZED,
+        "failed REST PAT lookup must not masquerade as an invalid credential"
+    );
+
+    let git_path = format!("/git/{PAT_OUTAGE_OWNER}/{PAT_OUTAGE_REPO}/{PAT_OUTAGE_INFO_REFS}");
+    let git = get_with_pat(&base, &git_path, &pat).await;
+    assert!(
+        git.status().is_server_error(),
+        "failed git PAT lookup must be a server error, got {}",
+        git.status()
+    );
+    assert_ne!(
+        git.status(),
+        StatusCode::UNAUTHORIZED,
+        "failed git PAT lookup must not masquerade as anonymous access"
+    );
+    assert_eq!(
+        git.text().await.expect("git failure body"),
+        "internal server error",
+        "git transport must not expose the database error"
     );
 }
