@@ -538,7 +538,7 @@ pub async fn store_object(
     let compressed_size = compressed.len() as i64;
 
     let key = lfs_object_key(owner, repo, oid, true)?;
-    storage.put(&key, &compressed).await?;
+    let publication = publish_blob(storage, &key, &compressed).await?;
 
     tracing::info!(
         oid = %oid,
@@ -548,16 +548,60 @@ pub async fn store_object(
         "LFS object compressed and stored"
     );
 
-    mark_uploaded(db, storage, repo_id, oid, &key, compressed_size).await
+    mark_uploaded(
+        db,
+        storage,
+        repo_id,
+        oid,
+        &key,
+        compressed_size,
+        publication,
+    )
+    .await
 }
 
-/// Mark a stored LFS object uploaded, taking the blob with every failure.
+/// Whether this call put new bytes under the content-addressed key.
+///
+/// The distinction cannot be reconstructed after `put`: a retry and the first
+/// publication use the same key, but only the latter owns bytes a failed DB
+/// update may roll back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobPublication {
+    Published,
+    Reused,
+}
+
+async fn publish_blob(
+    storage: &dyn BlobStorage,
+    key: &BlobKey,
+    compressed: &[u8],
+) -> Result<BlobPublication> {
+    if storage.exists(key).await? {
+        return Ok(BlobPublication::Reused);
+    }
+    storage.put(key, compressed).await?;
+    Ok(BlobPublication::Published)
+}
+
+async fn publish_blob_from_file(
+    storage: &dyn BlobStorage,
+    key: &BlobKey,
+    compressed_path: &std::path::Path,
+) -> Result<BlobPublication> {
+    if storage.exists(key).await? {
+        return Ok(BlobPublication::Reused);
+    }
+    storage.put_file(key, compressed_path).await?;
+    Ok(BlobPublication::Published)
+}
+
+/// Mark a stored LFS object uploaded, rolling back only bytes this call owns.
 ///
 /// Between the `put` and this update the blob is in storage while its row still
 /// reads `uploaded = false`: downloads refuse it and retention — which walks
-/// rows — never comes back for it. The row going missing orphans the blob just
-/// as thoroughly as the update failing, so the compensation belongs to *every*
-/// exit here, not only to the last one.
+/// rows — never comes back for it. That makes compensation necessary for every
+/// failure after a new publication, but destructive for a retry that reused a
+/// blob already claimed by an earlier successful upload.
 async fn mark_uploaded(
     db: &DatabaseConnection,
     storage: &dyn BlobStorage,
@@ -565,25 +609,31 @@ async fn mark_uploaded(
     oid: &str,
     key: &BlobKey,
     compressed_size: i64,
+    publication: BlobPublication,
 ) -> Result<()> {
     let obj = match lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await {
         Ok(Some(obj)) => obj,
         Ok(None) => {
-            discard_stored_blob(storage, key, repo_id, oid).await;
+            discard_stored_blob(storage, key, repo_id, oid, publication).await;
             anyhow::bail!("LFS object {} not found after create", oid);
         }
         Err(error) => {
-            discard_stored_blob(storage, key, repo_id, oid).await;
+            discard_stored_blob(storage, key, repo_id, oid, publication).await;
             return Err(error).context("db: reload LFS object after store");
         }
     };
 
+    let already_uploaded = obj.uploaded;
     let mut model: lfs_object::ActiveModel = obj.into();
     model.uploaded = sea_orm::Set(true);
-    model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
-    model.compressed_size = sea_orm::Set(Some(compressed_size));
+    // A reused blob keeps the metadata of the publication that owns its bytes.
+    // A not-yet-uploaded row may still reuse bytes won by a concurrent publisher.
+    if publication == BlobPublication::Published || !already_uploaded {
+        model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
+        model.compressed_size = sea_orm::Set(Some(compressed_size));
+    }
     if let Err(error) = model.update(db).await {
-        discard_stored_blob(storage, key, repo_id, oid).await;
+        discard_stored_blob(storage, key, repo_id, oid, publication).await;
         return Err(error).context("db: update LFS object after store");
     }
 
@@ -595,7 +645,16 @@ async fn mark_uploaded(
 /// The caller must still report the failure that got us here, so a failed
 /// rollback can only be logged, never returned: if the delete does not land,
 /// the bytes stay in storage with nothing pointing at them.
-async fn discard_stored_blob(storage: &dyn BlobStorage, key: &BlobKey, repo_id: i64, oid: &str) {
+async fn discard_stored_blob(
+    storage: &dyn BlobStorage,
+    key: &BlobKey,
+    repo_id: i64,
+    oid: &str,
+    publication: BlobPublication,
+) {
+    if publication == BlobPublication::Reused {
+        return;
+    }
     if let Err(cleanup_error) = storage.delete(key).await {
         tracing::warn!(
             oid = %oid,
@@ -696,7 +755,7 @@ async fn stream_compress_and_store(
     let compressed_size = finished.metadata().map(|m| m.len() as i64).unwrap_or(0);
 
     let key = lfs_object_key(owner, repo, oid, true)?;
-    storage.put_file(&key, compressed_path).await?;
+    let publication = publish_blob_from_file(storage, &key, compressed_path).await?;
 
     tracing::info!(
         oid = %oid,
@@ -706,7 +765,16 @@ async fn stream_compress_and_store(
         "LFS object stream-compressed and stored"
     );
 
-    mark_uploaded(db, storage, repo_id, oid, &key, compressed_size).await
+    mark_uploaded(
+        db,
+        storage,
+        repo_id,
+        oid,
+        &key,
+        compressed_size,
+        publication,
+    )
+    .await
 }
 
 /// Read an LFS object from disk.
@@ -975,6 +1043,243 @@ pub async fn delete_object_from_storage(
         lfs_object_ops::delete_by_id(db, obj.id).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod blob_publication_tests {
+    use super::{
+        compress_data, lfs_object_key, store_object, store_object_from_file, COMPRESSION_ALGO,
+    };
+    use crate::blob_storage::{
+        BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage, Result as BlobResult,
+    };
+    use futures::future::BoxFuture;
+    use rg_db::entities::lfs_object;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, NotSet, Set};
+
+    /// Backend-shaped proxy with no `local_path` shortcut. The production tree
+    /// currently ships a local backend, but LFS ownership must use only the
+    /// portable object-store contract so an S3-like backend gets the same
+    /// compensation semantics.
+    struct RemoteBlobStorage {
+        inner: LocalBlobStorage,
+    }
+
+    impl RemoteBlobStorage {
+        fn new(root: &std::path::Path) -> Self {
+            Self {
+                inner: LocalBlobStorage::new(root),
+            }
+        }
+    }
+
+    impl BlobStorage for RemoteBlobStorage {
+        fn backend_name(&self) -> &'static str {
+            "remote-test"
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.put(key, data)
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a std::path::Path,
+        ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.put_file(key, source)
+        }
+
+        fn get<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<Vec<u8>>> {
+            self.inner.get(key)
+        }
+
+        fn metadata<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.metadata(key)
+        }
+
+        fn exists<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<bool>> {
+            self.inner.exists(key)
+        }
+
+        fn delete<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<bool>> {
+            self.inner.delete(key)
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, BlobResult<Vec<BlobMetadata>>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    async fn setup_db() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        db
+    }
+
+    async fn fail_lfs_updates(db: &DatabaseConnection) {
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_lfs_updates \
+             BEFORE UPDATE ON lfs_objects \
+             BEGIN SELECT RAISE(FAIL, 'injected lfs update failure'); END",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn oid(payload: &[u8]) -> String {
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
+    }
+
+    async fn insert_uploaded_object(
+        db: &DatabaseConnection,
+        repo_id: i64,
+        oid: &str,
+        payload: &[u8],
+        compressed_size: usize,
+    ) {
+        rg_db::ops::lfs_object_ops::create(
+            db,
+            lfs_object::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo_id),
+                oid: Set(oid.to_string()),
+                size: Set(payload.len() as i64),
+                uploaded: Set(true),
+                compression: Set(Some(COMPRESSION_ALGO.to_string())),
+                compressed_size: Set(Some(compressed_size as i64)),
+                created_at: Set(chrono::Utc::now()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Both public store implementations must carry the publication outcome to
+    /// `mark_uploaded`: the buffered helper is currently not routed from HTTP,
+    /// but returning its old unconditional rollback would reintroduce the same
+    /// data loss for its callers.
+    #[tokio::test]
+    async fn failed_retries_keep_reused_blobs_for_buffered_and_file_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db().await;
+        let storage = RemoteBlobStorage::new(&dir.path().join("remote"));
+
+        let buffered_payload = b"buffered LFS retry";
+        let buffered_oid = oid(buffered_payload);
+        let buffered_key = lfs_object_key("owner", "repo", &buffered_oid, true).unwrap();
+        let buffered_compressed = compress_data(buffered_payload).unwrap();
+        storage
+            .put(&buffered_key, &buffered_compressed)
+            .await
+            .unwrap();
+        insert_uploaded_object(
+            &db,
+            1,
+            &buffered_oid,
+            buffered_payload,
+            buffered_compressed.len(),
+        )
+        .await;
+
+        let file_payload = b"file-backed LFS retry";
+        let file_oid = oid(file_payload);
+        let file_key = lfs_object_key("owner", "repo", &file_oid, true).unwrap();
+        let file_compressed = compress_data(file_payload).unwrap();
+        storage.put(&file_key, &file_compressed).await.unwrap();
+        insert_uploaded_object(&db, 1, &file_oid, file_payload, file_compressed.len()).await;
+
+        fail_lfs_updates(&db).await;
+
+        let buffered_error = store_object(
+            &db,
+            1,
+            &storage,
+            "owner",
+            "repo",
+            &buffered_oid,
+            buffered_payload,
+        )
+        .await
+        .expect_err("the injected buffered metadata failure must land");
+        assert!(buffered_error.to_string().contains("update LFS object"));
+
+        let source = dir.path().join("file-retry.upload");
+        std::fs::write(&source, file_payload).unwrap();
+        let file_error = store_object_from_file(
+            &db,
+            1,
+            &storage,
+            "owner",
+            "repo",
+            &file_oid,
+            &source,
+            file_payload.len() as i64,
+        )
+        .await
+        .expect_err("the injected file metadata failure must land");
+        assert!(file_error.to_string().contains("update LFS object"));
+
+        assert_eq!(
+            storage.get(&buffered_key).await.unwrap(),
+            buffered_compressed
+        );
+        assert_eq!(storage.get(&file_key).await.unwrap(), file_compressed);
+    }
+
+    /// The ownership guard must not turn into a blanket "never clean up": a
+    /// request that actually published a new blob still owns its rollback.
+    #[tokio::test]
+    async fn failed_first_publications_remove_blobs_for_buffered_and_file_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db().await;
+        let storage = RemoteBlobStorage::new(&dir.path().join("remote"));
+        fail_lfs_updates(&db).await;
+
+        let buffered_payload = b"new buffered LFS object";
+        let buffered_oid = oid(buffered_payload);
+        let buffered_key = lfs_object_key("owner", "repo", &buffered_oid, true).unwrap();
+        store_object(
+            &db,
+            1,
+            &storage,
+            "owner",
+            "repo",
+            &buffered_oid,
+            buffered_payload,
+        )
+        .await
+        .expect_err("the injected buffered metadata failure must land");
+        assert!(!storage.exists(&buffered_key).await.unwrap());
+
+        let file_payload = b"new file-backed LFS object";
+        let file_oid = oid(file_payload);
+        let file_key = lfs_object_key("owner", "repo", &file_oid, true).unwrap();
+        let source = dir.path().join("new-file.upload");
+        std::fs::write(&source, file_payload).unwrap();
+        store_object_from_file(
+            &db,
+            1,
+            &storage,
+            "owner",
+            "repo",
+            &file_oid,
+            &source,
+            file_payload.len() as i64,
+        )
+        .await
+        .expect_err("the injected file metadata failure must land");
+        assert!(!storage.exists(&file_key).await.unwrap());
+    }
 }
 
 #[cfg(test)]

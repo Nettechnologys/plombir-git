@@ -1490,6 +1490,58 @@ async fn an_lfs_object_that_was_never_marked_uploaded_leaves_no_blob() {
     );
 }
 
+/// A retry does not own the blob an earlier successful upload published.
+///
+/// The object route accepts a repeated `PUT` (a signed LFS action URL can be
+/// retried for six hours). If the metadata update then fails, its compensation
+/// must not delete the stable content-addressed key that the first request
+/// already made live.
+#[tokio::test]
+async fn a_failed_lfs_retry_keeps_the_object_an_earlier_upload_published() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&app.base, "lfs_retry_owner", "lfs_retry_owner@example.com").await;
+    create_repo(&app.base, &token, "retry-lfs").await;
+
+    let payload = b"forgekeep-lfs-retry-keeps-live-bytes";
+    let (first_status, oid) =
+        upload_lfs_object(&app.base, &token, "lfs_retry_owner", "retry-lfs", payload).await;
+    assert_eq!(first_status, 200, "baseline upload must publish the object");
+
+    let blob = lfs_blob_path(&app.repo_root, "lfs_retry_owner", "retry-lfs", &oid);
+    let bytes_before_retry = std::fs::read(&blob).unwrap();
+
+    let fault = fail_db_writes(&app.db, "lfs_objects", DbWrite::Update).await;
+    let (retry_status, retry_oid) =
+        upload_lfs_object(&app.base, &token, "lfs_retry_owner", "retry-lfs", payload).await;
+    assert_eq!(retry_oid, oid);
+    assert_eq!(retry_status, 500, "the injected metadata failure must land");
+    fault.clear().await;
+
+    assert_eq!(
+        std::fs::read(&blob).unwrap(),
+        bytes_before_retry,
+        "the failed retry changed or deleted bytes owned by the first upload"
+    );
+
+    let downloaded = client
+        .get(format!(
+            "{}/api/v1/repos/lfs_retry_owner/retry-lfs/lfs/objects/{oid}",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        downloaded.status(),
+        200,
+        "the first upload must remain downloadable after the failed retry"
+    );
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), payload);
+}
+
 // ── Release assets ───────────────────────────────────────────
 
 /// Create a release and return its id.
