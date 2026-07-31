@@ -193,29 +193,7 @@ const NO_FIXTURE: &[(&str, &str)] = &[
 /// owner would panic on anyone the gate admits. Each entry is a filed defect;
 /// the list is checked both ways, so a route that stops falling over has to be
 /// removed from it.
-const FALLS_OVER: &[(&str, &str)] = &[
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
-        "'package type not enabled for this repo' is a bare `anyhow!`, so a repository \
-         without that registry answers 500 instead of 404 — see card_6db8f22d6b61",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/npm/list",
-        "same bare `anyhow!` as .../packages/{pkg_type}/list",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/nuget/query",
-        "same bare `anyhow!` as .../packages/{pkg_type}/list",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/helm/index.yaml",
-        "same bare `anyhow!` as .../packages/{pkg_type}/list",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}",
-        "same bare `anyhow!` as .../packages/{pkg_type}/list",
-    ),
-];
+const FALLS_OVER: &[(&str, &str)] = &[];
 
 /// Routes whose successful effect breaks the fixture for everything after them.
 ///

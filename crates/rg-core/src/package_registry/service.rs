@@ -5,6 +5,7 @@
 
 use sea_orm::DatabaseConnection;
 
+use crate::error::not_found;
 use crate::package_registry::storage::{PackageStorage, StoredFile};
 
 /// Package type constants for known package managers.
@@ -145,7 +146,7 @@ pub async fn publish(
     // 1. Find or create the package registry for this repo+type
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", info.owner, info.repo))?;
+        .ok_or_else(|| not_found("repository"))?;
 
     let registry =
         rg_db::ops::package_registry_ops::find_or_create(db, repo.id, &info.package_type).await?;
@@ -512,14 +513,12 @@ pub async fn list_packages(
 ) -> Result<Vec<PackageSummary>> {
     let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+        .ok_or_else(|| not_found("repository"))?;
 
     let registry =
         rg_db::ops::package_registry_ops::find_by_repo_and_type(db, repo_model.id, package_type)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("package type '{}' not enabled for this repo", package_type)
-            })?;
+            .ok_or_else(|| not_found("package registry"))?;
 
     let packages = rg_db::ops::package_ops::list_by_registry(db, registry.id).await?;
     let mut summaries = Vec::new();
@@ -557,16 +556,16 @@ pub async fn get_package(
 ) -> Result<crate::package_registry::PackageDetail> {
     let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+        .ok_or_else(|| not_found("repository"))?;
 
     let registry =
         rg_db::ops::package_registry_ops::find_by_repo_and_type(db, repo_model.id, package_type)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("package type not enabled"))?;
+            .ok_or_else(|| not_found("package registry"))?;
 
     let pkg = rg_db::ops::package_ops::find_by_registry_and_name(db, registry.id, name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("package not found"))?;
+        .ok_or_else(|| not_found("package"))?;
 
     let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
     let version_details: Vec<VersionDetail> = futures_for_versions(db, versions).await?;
@@ -592,16 +591,16 @@ pub async fn list_versions(
 ) -> Result<Vec<VersionDetail>> {
     let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+        .ok_or_else(|| not_found("repository"))?;
 
     let registry =
         rg_db::ops::package_registry_ops::find_by_repo_and_type(db, repo_model.id, package_type)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("package type not enabled"))?;
+            .ok_or_else(|| not_found("package registry"))?;
 
     let pkg = rg_db::ops::package_ops::find_by_registry_and_name(db, registry.id, name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("package not found"))?;
+        .ok_or_else(|| not_found("package"))?;
 
     let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
     futures_for_versions(db, versions).await
@@ -618,20 +617,20 @@ pub async fn get_version(
 ) -> Result<VersionDetail> {
     let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+        .ok_or_else(|| not_found("repository"))?;
 
     let registry =
         rg_db::ops::package_registry_ops::find_by_repo_and_type(db, repo_model.id, package_type)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("package type not enabled"))?;
+            .ok_or_else(|| not_found("package registry"))?;
 
     let pkg = rg_db::ops::package_ops::find_by_registry_and_name(db, registry.id, name)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("package not found"))?;
+        .ok_or_else(|| not_found("package"))?;
 
     let v = rg_db::ops::package_version_ops::find_by_package_and_version(db, pkg.id, version_str)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("version not found"))?;
+        .ok_or_else(|| not_found("package version"))?;
 
     let files = rg_db::ops::package_file_ops::list_by_version(db, v.id).await?;
     let file_details: Vec<FileDetail> = files
@@ -679,13 +678,11 @@ pub async fn download_file(
         .files
         .iter()
         .find(|f| f.filename == filename)
-        .ok_or_else(|| {
-            anyhow::anyhow!("file '{}' not found in version {}", filename, version_str)
-        })?;
+        .ok_or_else(|| not_found("package file"))?;
 
     let file_model = rg_db::ops::package_file_ops::find_by_id(db, file.id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("file record not found"))?;
+        .ok_or_else(|| not_found("package file"))?;
 
     let data = storage.read_file(&file_model.storage_path).await?;
 
