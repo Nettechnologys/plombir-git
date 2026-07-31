@@ -70,7 +70,7 @@ use rg_http::route_table::RouteFact;
 use crate::common::fault::{
     drop_every_table_except, spawn_test_app_for_fault_sweep, AUTH_TABLES, GATE_TABLES,
 };
-use crate::common::register_user;
+use crate::common::{register_user, spawn_test_app_with_routes};
 
 const PW: &str = "Qz7$wRtm";
 const OWNER: &str = "faultowner";
@@ -183,6 +183,26 @@ fn gap_parts(key: &str) -> (String, String) {
     let words: Vec<&str> = key.split_whitespace().collect();
     let split = words.len().saturating_sub(2);
     (words[..split].join(" "), words[split..].join(" "))
+}
+
+fn assert_not_driven_exceptions_are_live(facts: &[RouteFact]) {
+    for (entry, reason) in NOT_DRIVEN {
+        assert!(
+            !reason.trim().is_empty(),
+            "NOT_DRIVEN names '{entry}' without saying why driving it breaks the rest of the pass"
+        );
+
+        let Some(fact) = facts.iter().find(|fact| fact.label() == *entry) else {
+            panic!(
+                "NOT_DRIVEN names '{entry}' ({reason}), which is not a route any more — drop it"
+            );
+        };
+        assert!(
+            matches!(fact.method, "POST" | "PUT" | "PATCH" | "DELETE"),
+            "NOT_DRIVEN names '{entry}' ({reason}), but a read-only route cannot invalidate the \
+             rest of the pass — drive it instead"
+        );
+    }
 }
 
 // ── Fixture ────────────────────────────────────────────────────────────────
@@ -474,13 +494,8 @@ async fn sweep(fault: Fault) {
     // lists are checked against the table before anything is driven. A
     // `KNOWN_GAPS` key is `<fault label> METHOD /path`; the route it names is
     // the last two words.
+    assert_not_driven_exceptions_are_live(&healthy_app.facts);
     let labels: BTreeSet<String> = healthy_app.facts.iter().map(RouteFact::label).collect();
-    for (entry, reason) in NOT_DRIVEN {
-        assert!(
-            labels.contains(*entry),
-            "NOT_DRIVEN names '{entry}' ({reason}), which is not a route any more — drop it"
-        );
-    }
     for (key, reason) in KNOWN_GAPS {
         let (_, route) = gap_parts(key);
         assert!(
@@ -633,6 +648,14 @@ async fn sweep(fault: Fault) {
         fault.label(),
         healed.join("\n"),
     );
+}
+
+/// Every `NOT_DRIVEN` entry must remain a live, mutating route with an explicit
+/// reason for invalidating later probes in both halves of the differential.
+#[tokio::test]
+async fn not_driven_exceptions_are_live_and_mutating() {
+    let (_base, facts) = spawn_test_app_with_routes().await;
+    assert_not_driven_exceptions_are_live(&facts);
 }
 
 /// A dead database must not read as a malformed request.
