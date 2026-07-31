@@ -351,6 +351,22 @@ pub async fn publish(
         v
     };
 
+    // Package metadata describes the latest release, not the package's first
+    // release forever. A newly created version is the latest by the registry's
+    // creation-time ordering, so refresh only the fields its manifest carries.
+    // Additional files uploaded into an older existing version must not roll
+    // newer metadata back, and absent fields must not erase prior values.
+    if !existing_version {
+        rg_db::ops::package_ops::update_metadata(
+            db,
+            pkg.id,
+            info.description.as_deref(),
+            info.homepage.as_deref(),
+            info.repository_url.as_deref(),
+        )
+        .await?;
+    }
+
     Ok(PublishResult {
         package_id: pkg.id,
         version_id: version.id,

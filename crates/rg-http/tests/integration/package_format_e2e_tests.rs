@@ -301,6 +301,109 @@ async fn nine_native_package_formats_publish_index_and_download() {
 }
 
 #[tokio::test]
+async fn new_versions_refresh_present_package_metadata_without_rolling_it_back() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let publish = |version: &'static str, suffix: &'static str, manifest: &'static [u8]| {
+        let base = base.clone();
+        let client = client.clone();
+        let token = token.clone();
+        async move {
+            let archive_path = format!("matrix-metadata-{version}/Cargo.toml");
+            client
+                .post(package_url(&base, &["cargo", "publish"]))
+                .bearer_auth(token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"matrix-metadata-{version}-{suffix}.crate\""),
+                )
+                .body(tar_gz(&[(&archive_path, manifest)]))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = br#"[package]
+name = "matrix-metadata"
+version = "1.0.0"
+description = "first description"
+homepage = "https://example.test/first"
+repository = "https://git.example.test/first"
+"#;
+    let second = br#"[package]
+name = "matrix-metadata"
+version = "2.0.0"
+description = "second description"
+homepage = "https://example.test/second"
+repository = "https://git.example.test/second"
+"#;
+    let without_optional_metadata = br#"[package]
+name = "matrix-metadata"
+version = "3.0.0"
+"#;
+
+    assert_eq!(
+        publish("1.0.0", "main", first).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        publish("2.0.0", "main", second).await.status(),
+        StatusCode::CREATED
+    );
+
+    let current = client
+        .get(package_url(&base, &["cargo", "matrix-metadata"]))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(current["description"], "second description");
+    assert_eq!(current["homepage"], "https://example.test/second");
+    assert_eq!(current["repository_url"], "https://git.example.test/second");
+
+    // A later file for an older version can carry that version's old manifest,
+    // but it must not roll package-level metadata back.
+    assert_eq!(
+        publish("1.0.0", "extra", first).await.status(),
+        StatusCode::OK
+    );
+    // A genuinely new version without optional fields must not erase them.
+    assert_eq!(
+        publish("3.0.0", "main", without_optional_metadata)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    let after_sparse_and_old_publishes = client
+        .get(package_url(&base, &["cargo", "matrix-metadata"]))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_sparse_and_old_publishes["description"],
+        "second description"
+    );
+    assert_eq!(
+        after_sparse_and_old_publishes["homepage"],
+        "https://example.test/second"
+    );
+    assert_eq!(
+        after_sparse_and_old_publishes["repository_url"],
+        "https://git.example.test/second"
+    );
+}
+
+#[tokio::test]
 async fn yanked_only_packages_do_not_advertise_a_fake_latest_version() {
     let (base, _db) = spawn_test_app_with_db().await;
     let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;

@@ -49,6 +49,41 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<packa
     Package::find_by_id(id).one(db).await
 }
 
+/// Refresh the package-level metadata carried by a newly published version.
+///
+/// Missing fields deliberately stay untouched: package manifests commonly omit
+/// optional metadata, and publishing one of those versions must not erase the
+/// last value the package did provide.
+pub async fn update_metadata(
+    db: &DatabaseConnection,
+    id: i64,
+    description: Option<&str>,
+    homepage: Option<&str>,
+    repository_url: Option<&str>,
+) -> Result<(), DbErr> {
+    if description.is_none() && homepage.is_none() && repository_url.is_none() {
+        return Ok(());
+    }
+
+    let mut package = package::ActiveModel {
+        id: Unchanged(id),
+        updated_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+    if let Some(description) = description {
+        package.description = Set(Some(description.to_string()));
+    }
+    if let Some(homepage) = homepage {
+        package.homepage = Set(Some(homepage.to_string()));
+    }
+    if let Some(repository_url) = repository_url {
+        package.repository_url = Set(Some(repository_url.to_string()));
+    }
+
+    package.update(db).await?;
+    Ok(())
+}
+
 /// List all packages in a registry.
 pub async fn list_by_registry(
     db: &DatabaseConnection,
