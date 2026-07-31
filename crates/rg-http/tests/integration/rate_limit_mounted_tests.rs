@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 
 use crate::common::{build_test_app_state, setup_test_db, wait_for_listener};
+use crate::security_headers_tests::assert_security_headers;
 
 const PASSWORD: &str = "Qz7$wRtm";
 
@@ -90,6 +91,7 @@ async fn the_router_carries_the_global_rate_limiter() {
         "the third request is over budget — the global rate limiter is not mounted in the \
          production router"
     );
+    assert_security_headers(resp.headers(), "global rate-limit 429");
 }
 
 /// The stricter limiter is layered onto `/users/register` and `/users/login`

@@ -248,18 +248,15 @@ fn apply_middleware(
     rate_limiter: Option<&rate_limit::RateLimiter>,
 ) -> Router<AppState> {
     let router = router
-        // Innermost, so a rejected session is still counted, traced and given
-        // the security headers — and so rate limiting and maintenance mode both
-        // get to answer before it spends a database read.
+        // Innermost, so a rejected session is still counted and traced — and so
+        // rate limiting and maintenance mode both get to answer before it spends
+        // a database read.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::auth::session_standing_middleware,
         ))
         .layer(axum::middleware::from_fn(
             middleware::http_metrics_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            security::security_headers_middleware,
         ))
         .layer(axum::middleware::from_fn(middleware::request_id_middleware))
         .layer(TraceLayer::new_for_http().make_span_with(
@@ -300,12 +297,19 @@ fn apply_middleware(
         None => router,
     };
 
-    // Outermost: maintenance mode decides whether a request is served at all,
-    // so it answers before anything else — including the request-id layer,
-    // which is why the rejection body carries no `request_id`.
-    router.layer(axum::middleware::from_fn_with_state(
+    // Maintenance remains the outermost behaviour gate, so it answers before
+    // the request-id layer and its rejection body carries no `request_id`.
+    let router = router.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         middleware::maintenance_middleware,
+    ));
+
+    // The last layer runs first and therefore sees every response, including a
+    // 503 or 429 produced by the gates above. It also inserts the CSP nonce into
+    // request extensions before forwarding, so the deeper SPA fallback still
+    // receives exactly the nonce later written into the response header.
+    router.layer(axum::middleware::from_fn(
+        security::security_headers_middleware,
     ))
 }
 

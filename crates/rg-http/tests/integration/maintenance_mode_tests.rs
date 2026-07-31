@@ -12,6 +12,7 @@ use std::path::Path;
 use crate::common::{
     build_test_app_state, register_full, setup_test_db, spawn_test_app_with_db, wait_for_listener,
 };
+use crate::security_headers_tests::assert_security_headers;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
@@ -99,6 +100,7 @@ async fn maintenance_mode_rejects_a_mutating_request_with_503() {
         resp.headers().contains_key("retry-after"),
         "a 503 from a transient, self-clearing condition should tell the client when to come back"
     );
+    assert_security_headers(resp.headers(), "maintenance-mode 503");
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "MAINTENANCE_MODE");

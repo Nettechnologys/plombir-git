@@ -21,7 +21,7 @@ use crate::common::{build_test_app_state, setup_test_db, spawn_test_app, wait_fo
 
 /// Every header `security_headers_middleware` promises, checked on a live
 /// response from the real router.
-fn assert_security_headers(headers: &reqwest::header::HeaderMap, what: &str) {
+pub(crate) fn assert_security_headers(headers: &reqwest::header::HeaderMap, what: &str) {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
 
     assert_eq!(
