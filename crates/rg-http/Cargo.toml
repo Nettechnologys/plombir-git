@@ -59,6 +59,9 @@ sha1 = { workspace = true }
 # Helm's `index.yaml` is asserted on as a parsed document, not as text: a
 # `contains` check passes on a key that landed under the wrong chart.
 serde_yaml = { workspace = true }
+# The archive-stream regression test asserts on the warning an operator sees
+# when `git archive` stdout fails after the 200 response has started.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

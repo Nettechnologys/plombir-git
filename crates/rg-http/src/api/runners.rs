@@ -601,7 +601,7 @@ pub async fn download_workspace(
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
-        stream_git_archive_with_idle(child, state.git_idle_timeout_secs),
+        stream_git_archive_with_idle(child, state.git_idle_timeout_secs, job_id, repo_path),
     )
         .into_response()
 }
@@ -626,10 +626,13 @@ const ARCHIVE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 /// On either trip (or the runner disconnecting) the producer returns, dropping
 /// the child → `kill_on_drop` reaps git and frees the pipe. `idle_secs == 0`
 /// disables the bound. git's stderr is drained concurrently so a chatty error
-/// can't fill its pipe and stall the archive.
+/// can't fill its pipe and stall the archive. A stdout read failure is logged
+/// with the job and repository before the already-started response is cut short.
 fn stream_git_archive_with_idle(
     mut child: tokio::process::Child,
     idle_secs: u64,
+    job_id: i64,
+    repo_path: std::path::PathBuf,
 ) -> axum::body::Body {
     use tokio::io::AsyncReadExt;
 
@@ -655,61 +658,28 @@ fn stream_git_archive_with_idle(
 
         let mut stdout = match child.stdout.take() {
             Some(stdout) => stdout,
-            None => return,
+            None => {
+                tracing::warn!(
+                    job_id,
+                    repo = %repo_path.display(),
+                    "git archive stdout unavailable — workspace tar cannot be streamed"
+                );
+                return;
+            }
         };
 
-        let mut buf = vec![0u8; ARCHIVE_STREAM_CHUNK_BYTES];
-        let mut clean_eof = false;
-        loop {
-            // Read a chunk, bounded by the idle window (catches a hung git).
-            let n = match idle {
-                Some(dur) => match tokio::time::timeout(dur, stdout.read(&mut buf)).await {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(_)) => break,
-                    Err(_elapsed) => {
-                        tracing::warn!(idle_secs, "git archive read idle timeout — killing git");
-                        break;
-                    }
-                },
-                None => match stdout.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                },
-            };
-            if n == 0 {
-                clean_eof = true;
-                break;
-            }
-            let chunk = Bytes::copy_from_slice(&buf[..n]);
-            // Send, bounded by the idle window (catches a stalled runner: hyper
-            // stops draining the stream → the channel fills → `send` blocks).
-            let send = tx.send(Ok(chunk));
-            let sent = match idle {
-                Some(dur) => match tokio::time::timeout(dur, send).await {
-                    Ok(res) => res,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            idle_secs,
-                            "git archive response idle timeout — slow runner stopped reading, killing git"
-                        );
-                        break;
-                    }
-                },
-                None => send.await,
-            };
-            if sent.is_err() {
-                break; // receiver gone (runner disconnected)
-            }
-        }
+        pump_git_archive_stdout(&mut stdout, &tx, idle, job_id, &repo_path).await;
 
         // Reap git. On a trip we kill it; on clean EOF it has already exited.
         if let Err(error) = child.start_kill() {
             tracing::debug!(%error, "git archive process already exited before kill");
         }
         if let Ok(status) = child.wait().await {
-            if clean_eof && !status.success() {
+            if !status.success() {
                 let err = stderr_task.await.unwrap_or_default();
                 tracing::warn!(
+                    job_id,
+                    repo = %repo_path.display(),
                     stderr = %String::from_utf8_lossy(&err).trim(),
                     "git archive exited non-zero after streaming workspace tar (truncated archive)"
                 );
@@ -720,6 +690,75 @@ fn stream_git_archive_with_idle(
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
     axum::body::Body::new(http_body_util::StreamBody::new(frame_stream))
+}
+
+async fn pump_git_archive_stdout<R>(
+    stdout: &mut R,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
+    idle: Option<std::time::Duration>,
+    job_id: i64,
+    repo_path: &std::path::Path,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; ARCHIVE_STREAM_CHUNK_BYTES];
+    loop {
+        // Read a chunk, bounded by the idle window (catches a hung git).
+        let read = match idle {
+            Some(dur) => match tokio::time::timeout(dur, stdout.read(&mut buf)).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        job_id,
+                        repo = %repo_path.display(),
+                        idle_secs = dur.as_secs(),
+                        "git archive read idle timeout — killing git"
+                    );
+                    break;
+                }
+            },
+            None => stdout.read(&mut buf).await,
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::warn!(
+                    job_id,
+                    repo = %repo_path.display(),
+                    %error,
+                    "git archive stdout read failed — workspace tar truncated"
+                );
+                break;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let chunk = Bytes::copy_from_slice(&buf[..n]);
+        // Send, bounded by the idle window (catches a stalled runner: hyper
+        // stops draining the stream → the channel fills → `send` blocks).
+        let send = tx.send(Ok(chunk));
+        let sent = match idle {
+            Some(dur) => match tokio::time::timeout(dur, send).await {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        job_id,
+                        repo = %repo_path.display(),
+                        idle_secs = dur.as_secs(),
+                        "git archive response idle timeout — slow runner stopped reading, killing git"
+                    );
+                    break;
+                }
+            },
+            None => send.await,
+        };
+        if sent.is_err() {
+            break; // receiver gone (runner disconnected)
+        }
+    }
 }
 
 /// Download the CI cache archive stored under the `x-cache-key` of an assigned job.
@@ -1410,6 +1449,59 @@ mod cache_path_error_tests {
 mod archive_stream_tests {
     use super::*;
     use http_body_util::BodyExt;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    struct FailsAfterPartialChunk {
+        yielded: bool,
+    }
+
+    impl AsyncRead for FailsAfterPartialChunk {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.yielded {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "injected archive stdout failure",
+                )));
+            }
+            self.yielded = true;
+            buf.put_slice(b"partial tar");
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn gw() -> &'static rg_git::cli_gateway::GitCommandGateway {
         rg_git::cli_gateway::global_gateway().as_ref().unwrap()
@@ -1465,7 +1557,7 @@ mod archive_stream_tests {
             .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
             .await
             .unwrap();
-        let streamed = stream_git_archive_with_idle(child, 30)
+        let streamed = stream_git_archive_with_idle(child, 30, 1, repo.to_path_buf())
             .collect()
             .await
             .unwrap()
@@ -1498,11 +1590,55 @@ mod archive_stream_tests {
             .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
             .await
             .unwrap();
-        let streamed = stream_git_archive_with_idle(child, 0)
+        let streamed = stream_git_archive_with_idle(child, 0, 1, repo.to_path_buf())
             .collect()
             .await
             .unwrap()
             .to_bytes();
         assert_eq!(&streamed[..], &buffered[..]);
+    }
+
+    /// Once response headers are on the wire, a read failure cannot become a
+    /// different status. The server log is therefore the operator's only copy
+    /// of the underlying errno and the job/repository it corrupted.
+    #[tokio::test]
+    async fn stdout_read_failure_logs_cause_and_context_with_or_without_idle_guard() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let repo_path = std::path::Path::new("/repos/acme/widgets.git");
+
+        for idle in [None, Some(std::time::Duration::from_secs(30))] {
+            let mut stdout = FailsAfterPartialChunk { yielded: false };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+            pump_git_archive_stdout(&mut stdout, &tx, idle, 42, repo_path).await;
+            drop(tx);
+
+            assert_eq!(
+                rx.recv().await.unwrap().unwrap(),
+                Bytes::from_static(b"partial tar")
+            );
+            assert!(rx.recv().await.is_none(), "the failed reader must stop");
+        }
+
+        let rendered = logs.text();
+        assert_eq!(
+            rendered
+                .matches("git archive stdout read failed — workspace tar truncated")
+                .count(),
+            2,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("injected archive stdout failure"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("job_id=42"), "{rendered}");
+        assert!(rendered.contains("/repos/acme/widgets.git"), "{rendered}");
     }
 }
