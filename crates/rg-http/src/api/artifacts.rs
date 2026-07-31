@@ -46,24 +46,24 @@ impl RepoAnchor for Artifact {
     ) -> Result<(Self::Row, rg_db::entities::repository::Model), AppError> {
         let artifact = rg_db::ops::artifact_ops::get_by_id(&state.db, artifact_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(Self::masked)?;
         let job = rg_db::ops::pipeline_ops::get_job(&state.db, artifact.job_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| broken_chain(artifact_id, "job", artifact.job_id))?;
         let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| broken_chain(artifact_id, "stage", job.stage_id))?;
         let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| broken_chain(artifact_id, "pipeline", stage.pipeline_id))?;
         let repo = rg_db::entities::repository::Entity::find_by_id(pipeline.repo_id)
             .one(&state.db)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| broken_chain(artifact_id, "repository", pipeline.repo_id))?;
         Ok((artifact, repo))
     }
@@ -711,11 +711,11 @@ async fn repo_id_for_job(
 ) -> Result<i64, AppError> {
     let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("stage not found"))?;
     let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("pipeline not found"))?;
     Ok(pipeline.repo_id)
 }

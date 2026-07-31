@@ -185,7 +185,7 @@ async fn require_suggestion_source(
     let source_repo = rg_db::entities::repository::Entity::find_by_id(source_repo_id)
         .one(&state.db)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("source repository not found"))?;
     let can_write = match repo_access::may_write(state, &source_repo, Some(actor_id)).await {
         Ok(allowed) => allowed,
@@ -198,18 +198,18 @@ async fn require_suggestion_source(
     }
     let actor = rg_db::ops::user_ops::find_by_id(&state.db, actor_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::unauthorized("user not found"))?;
     let source_namespace = if let Some(org_id) = source_repo.org_id {
         rg_db::ops::org_ops::get_org(&state.db, org_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| AppError::not_found("source repository organization not found"))?
             .name
     } else {
         rg_db::ops::user_ops::find_by_id(&state.db, source_repo.owner_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| AppError::not_found("source repository owner not found"))?
             .username
     };

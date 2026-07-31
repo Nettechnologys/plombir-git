@@ -18,6 +18,35 @@ async fn instance_admin_probe(_admin: rg_http::api::admin::InstanceAdmin) -> Sta
     StatusCode::NO_CONTENT
 }
 
+async fn artifact_anchor_probe(_artifact: rg_http::api::artifacts::ArtifactRead) -> StatusCode {
+    StatusCode::OK
+}
+
+/// Drive the production artifact anchor without unrelated global middleware.
+/// Otherwise a closed pool can fail in session handling before `Artifact::resolve`
+/// runs, making this regression vacuously green.
+async fn artifact_anchor_probe_response(
+    state: rg_http::AppState,
+    artifact_id: i64,
+) -> axum::response::Response {
+    use tower::ServiceExt as _;
+
+    let request = axum::http::Request::builder()
+        .uri(format!("/artifact-anchor-probe/{artifact_id}"))
+        .body(axum::body::Body::empty())
+        .expect("build artifact anchor probe request");
+
+    axum::Router::new()
+        .route(
+            "/artifact-anchor-probe/{id}",
+            axum::routing::get(artifact_anchor_probe),
+        )
+        .with_state(state)
+        .oneshot(request)
+        .await
+        .expect("artifact anchor probe response")
+}
+
 /// Drive the public `InstanceAdmin` extractor without the global session
 /// middleware. The production router correctly has both layers, but on a closed
 /// pool the session layer also returns 503; letting it answer first would make a
@@ -293,7 +322,13 @@ async fn db_outage_in_oci_handler_returns_503_with_oci_envelope() {
 async fn seed_repo_with_outsider(
     db: &rg_db::DatabaseConnection,
     is_private: bool,
-) -> (&'static str, &'static str, i64, &'static str) {
+) -> (
+    &'static str,
+    &'static str,
+    rg_db::entities::repository::Model,
+    i64,
+    &'static str,
+) {
     use sea_orm::ActiveModelTrait;
     use sea_orm::ActiveValue::Set;
 
@@ -322,7 +357,7 @@ async fn seed_repo_with_outsider(
         .expect("insert user");
     }
 
-    rg_db::entities::repository::ActiveModel {
+    let repo = rg_db::entities::repository::ActiveModel {
         id: Set(REPO_ID),
         owner_id: Set(OWNER_ID),
         name: Set("perm-repo".to_string()),
@@ -338,7 +373,124 @@ async fn seed_repo_with_outsider(
     .await
     .expect("insert repository");
 
-    ("perm-owner", "perm-repo", OUTSIDER_ID, "perm-outsider")
+    (
+        "perm-owner",
+        "perm-repo",
+        repo,
+        OUTSIDER_ID,
+        "perm-outsider",
+    )
+}
+
+/// The card's two densest paths must classify the failure at their own DB
+/// boundary. The attachment call receives a pre-resolved `RepoRead`, while the
+/// artifact probe mounts the production `ArtifactRead` extractor without the
+/// global session middleware; neither assertion can be satisfied by an earlier
+/// repository/session lookup returning 503.
+#[tokio::test]
+async fn artifact_and_attachment_db_outages_return_503_after_healthy_baselines() {
+    use sea_orm::ActiveValue::Set;
+
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let (owner, repo_name, repo, _outsider_id, _outsider) =
+        seed_repo_with_outsider(&db, false).await;
+
+    const ISSUE_NUMBER: i64 = 900_104;
+    rg_db::ops::issue_ops::create(
+        &db,
+        rg_db::entities::issue::ActiveModel {
+            id: sea_orm::NotSet,
+            repo_id: Set(repo.id),
+            number: Set(ISSUE_NUMBER),
+            title: Set("DB outage attachment target".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            author_id: Set(repo.owner_id),
+            assignee_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            closed_at: Set(None),
+            deleted_at: Set(None),
+        },
+    )
+    .await
+    .expect("create attachment target issue");
+
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "1234567890123456789012345678901234567890",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .expect("create artifact pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+        .await
+        .expect("create artifact stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("create artifact job");
+    let artifact = rg_db::ops::artifact_ops::create_artifact(
+        &db,
+        job.id,
+        "report.txt",
+        "artifacts/jobs/report.txt",
+        1,
+        None,
+        None,
+    )
+    .await
+    .expect("create artifact row");
+
+    let state = build_test_app_state(db.clone(), repo_root);
+
+    let healthy_attachments = rg_http::api::attachments::list_issue_attachments(
+        State(state.clone()),
+        Path((owner.to_string(), repo_name.to_string(), ISSUE_NUMBER)),
+        rg_http::api::repo_access::RepoRead { repo: repo.clone() },
+    )
+    .await;
+    assert_eq!(
+        healthy_attachments.status(),
+        StatusCode::OK,
+        "healthy attachment baseline must reach the local target resolver"
+    );
+
+    let healthy_artifact = artifact_anchor_probe_response(state.clone(), artifact.id).await;
+    assert_eq!(
+        healthy_artifact.status(),
+        StatusCode::OK,
+        "healthy artifact baseline must pass the production anchor"
+    );
+
+    db.close().await.expect("close artifact/attachment pool");
+
+    let broken_attachments = rg_http::api::attachments::list_issue_attachments(
+        State(state.clone()),
+        Path((owner.to_string(), repo_name.to_string(), ISSUE_NUMBER)),
+        rg_http::api::repo_access::RepoRead { repo },
+    )
+    .await;
+    assert_eq!(
+        broken_attachments.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "attachment target lookup outage must map to 503, not 500"
+    );
+
+    let broken_artifact = artifact_anchor_probe_response(state, artifact.id).await;
+    assert_eq!(
+        broken_artifact.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "artifact anchor lookup outage must map to 503, not 500"
+    );
 }
 
 /// Break the one query a permission check makes for a non-owner, leaving the
@@ -412,7 +564,8 @@ async fn failed_write_permission_check_is_not_reported_as_forbidden() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).ok();
-    let (owner, repo, outsider_id, outsider) = seed_repo_with_outsider(&db, false).await;
+    let (owner, repo, _repo_model, outsider_id, outsider) =
+        seed_repo_with_outsider(&db, false).await;
     let state = build_test_app_state(db.clone(), repo_root);
     break_permission_lookup(&db).await;
 
@@ -540,7 +693,8 @@ async fn failed_read_permission_check_is_not_reported_as_forbidden() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).ok();
-    let (owner, repo, outsider_id, outsider) = seed_repo_with_outsider(&db, true).await;
+    let (owner, repo, _repo_model, outsider_id, outsider) =
+        seed_repo_with_outsider(&db, true).await;
     let state = build_test_app_state(db.clone(), repo_root);
     break_permission_lookup(&db).await;
 

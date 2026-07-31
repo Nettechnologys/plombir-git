@@ -79,7 +79,7 @@ async fn validate_request(state: &AppState, body: &EnvironmentRequest) -> Result
     for user_id in unique {
         if rg_db::ops::user_ops::find_by_id(&state.db, user_id)
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .is_none()
         {
             return Err(AppError::bad_request(format!(

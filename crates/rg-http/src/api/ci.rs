@@ -698,7 +698,7 @@ async fn resolve_repo_storage_owner(
 
     rg_db::ops::user_ops::find_by_id(&state.db, repo.owner_id)
         .await
-        .map_err(AppError::internal)?
+        .map_err(AppError::from)?
         .map(|user| user.username)
         .ok_or_else(|| AppError::internal("repository owner not found"))
 }

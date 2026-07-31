@@ -725,7 +725,7 @@ async fn resolve(
             let issue =
                 rg_db::ops::issue_ops::find_by_repo_and_number(&state.db, repo.id, target_id)
                     .await
-                    .map_err(AppError::internal)?
+                    .map_err(AppError::from)?
                     .ok_or_else(|| AppError::not_found("issue not found"))?;
             ResolvedTarget {
                 target: AttachmentTarget::Issue(issue.id),
@@ -737,7 +737,7 @@ async fn resolve(
                 &state.db, repo.id, target_id,
             )
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::from)?
             .ok_or_else(|| AppError::not_found("pull request not found"))?;
             ResolvedTarget {
                 target: AttachmentTarget::PullRequest(pull.id),
@@ -747,11 +747,11 @@ async fn resolve(
         TargetKind::IssueComment => {
             let comment = rg_db::ops::issue_comment_ops::find_by_id(&state.db, target_id)
                 .await
-                .map_err(AppError::internal)?
+                .map_err(AppError::from)?
                 .ok_or_else(|| AppError::not_found("comment not found"))?;
             let issue = rg_db::ops::issue_ops::find_by_id(&state.db, comment.issue_id)
                 .await
-                .map_err(AppError::internal)?
+                .map_err(AppError::from)?
                 .ok_or_else(|| AppError::not_found("comment not found"))?;
             if issue.repo_id != repo.id {
                 return Err(AppError::not_found("comment not found"));
@@ -764,11 +764,11 @@ async fn resolve(
         TargetKind::ReviewComment => {
             let comment = rg_db::ops::review_comment_ops::find_by_id(&state.db, target_id)
                 .await
-                .map_err(AppError::internal)?
+                .map_err(AppError::from)?
                 .ok_or_else(|| AppError::not_found("comment not found"))?;
             let pull = rg_db::ops::pull_request_ops::find_by_id(&state.db, comment.pr_id)
                 .await
-                .map_err(AppError::internal)?
+                .map_err(AppError::from)?
                 .ok_or_else(|| AppError::not_found("comment not found"))?;
             if pull.repo_id != repo.id {
                 return Err(AppError::not_found("comment not found"));
