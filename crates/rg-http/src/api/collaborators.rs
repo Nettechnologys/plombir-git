@@ -204,30 +204,34 @@ pub async fn update_permission(
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
-        ("id" = i64, Path, description = "collaborator user id"),
+        ("id" = i64, Path, description = "user id of the collaborator to remove (users.id — \
+          unlike PATCH on this path, which takes the repo_collaborators row id)"),
     ),
     responses(
         (status = 204, description = "Removed"),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Repository admin access required", body = serde_json::Value),
-        (status = 404, description = "Repository not found", body = serde_json::Value),
+        (status = 404, description = "Collaborator not found", body = serde_json::Value),
     ),
 )]
 pub async fn remove_collaborator(
     State(state): State<AppState>,
-    Path((owner, repo, user_id)): Path<(String, String, i64)>,
+    Path((_, _, user_id)): Path<(String, String, i64)>,
     // Revoking access is the same admin operation as granting it — without this
     // any account could strip the collaborators off someone else's repository.
-    RepoAdmin { .. }: RepoAdmin,
+    // The repo the check was about is also what scopes the delete, exactly as in
+    // `update_permission`; re-resolving it from the path would be a second
+    // lookup that could disagree with the one the authorization used.
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
-    match rg_core::collaborator::service::remove_collaborator(&state.db, &owner, &repo, user_id)
-        .await
-    {
+    match rg_core::collaborator::service::remove_collaborator(&state.db, repo.id, user_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        // Nothing here is the caller's to get wrong: the repo was resolved and
-        // authorized above, and the delete is idempotent. What used to answer 400
-        // was the repository lookup and the delete — both ours.
+        // A delete that matched nothing is a 404, not a 204: this path takes a
+        // `users.id` while `PATCH` on the identical URL takes the row id, and
+        // passing the wrong one has to be visible. Everything else here is
+        // ours — the repo was resolved and authorized above — so a failed
+        // delete stays a 5xx rather than an accusation aimed at the client.
         Err(e) => AppError::from(e).into_response(),
     }
 }

@@ -102,15 +102,28 @@ pub async fn update_permission(
 }
 
 /// Remove a collaborator from a repo.
+///
+/// `repo_id` is the repository the caller was authorized against — the same
+/// scoping [`update_permission`] gets, and it comes from the same extractor, so
+/// the route no longer resolves the repository a second time.
+///
+/// `user_id` is a `users.id`, *not* the `repo_collaborators.id` that `PATCH` on
+/// the very same path expects. That divergence is forced (axum refuses to mount
+/// two verbs with differently named segments in one position), so it has to be
+/// survivable: a delete that matched no row reports
+/// [`crate::error::NotFound`] instead of a silent success. Answering `204` to
+/// it made "removed" and "there was nothing to remove — you passed the wrong
+/// key, or the row id happened to collide with someone else's `users.id`" the
+/// same response.
 pub async fn remove_collaborator(
     db: &DatabaseConnection,
-    owner: &str,
-    repo_name: &str,
+    repo_id: i64,
     user_id: i64,
 ) -> Result<()> {
-    let repo = resolve_repo(db, owner, repo_name).await?;
-    repo_collaborator_ops::delete_by_repo_and_user(db, repo.id, user_id).await?;
-    crate::repo::service::invalidate_perm_cache_user(db, repo.id, user_id);
+    if !repo_collaborator_ops::delete_by_repo_and_user(db, repo_id, user_id).await? {
+        return Err(crate::error::not_found("collaborator"));
+    }
+    crate::repo::service::invalidate_perm_cache_user(db, repo_id, user_id);
     Ok(())
 }
 

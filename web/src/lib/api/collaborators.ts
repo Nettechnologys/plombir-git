@@ -27,6 +27,9 @@ export const collaborators = {
   // different keys. axum refuses to mount the two verbs with different segment
   // names, so the URL cannot carry the distinction and callers must: pass
   // `collaborator.user_id`, not `collaborator.id`.
+  //
+  // Passing the wrong one is at least no longer silent: a delete that matches
+  // no row answers 404 instead of 204, so this rejects rather than pretending.
   remove: (owner: string, repo: string, id: number) =>
     request<void>(`/repos/${owner}/${repo}/collaborators/${id}`, { method: 'DELETE' }),
 };

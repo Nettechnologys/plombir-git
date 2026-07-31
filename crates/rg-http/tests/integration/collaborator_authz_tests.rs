@@ -400,3 +400,133 @@ async fn invalid_permission_is_a_bad_request() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+// ── 4. a delete that removed nothing is not a success ────────────────────────
+//
+// `DELETE .../collaborators/{id}` keys off `users.id`, while `PATCH` on the
+// identical URL keys off the `repo_collaborators` row id — axum will not mount
+// two verbs with differently named segments in one position, so the spec cannot
+// spell the difference out. That makes the mistake easy and, while the delete
+// discarded `rows_affected`, invisible: passing the row id answered `204` for a
+// delete that removed nothing, or removed whoever happened to own that number
+// as a `users.id`.
+
+/// A user id that belongs to nobody must not read as "removed".
+#[tokio::test]
+async fn removing_an_unknown_collaborator_is_not_found() {
+    let base = spawn_test_app().await;
+    let (owner_token, _owner_id) = register_full(&base, "cdel_owner", "cdel_o@example.com").await;
+    create_repo(&base, &owner_token, "proj").await;
+
+    let resp = reqwest::Client::new()
+        .delete(format!(
+            "{base}/api/v1/repos/cdel_owner/proj/collaborators/424242"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "removing a collaborator that does not exist reported success"
+    );
+    // A fixed description with no `db: ...` chain behind it (H-05).
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "collaborator not found");
+}
+
+/// The second removal of the same user has nothing left to remove.
+#[tokio::test]
+async fn removing_the_same_collaborator_twice_is_not_found() {
+    let base = spawn_test_app().await;
+    let (owner_token, _owner_id) = register_full(&base, "cdup_owner", "cdup_o@example.com").await;
+    let (_alice_token, alice_id) = register_full(&base, "cdup_alice", "cdup_a@example.com").await;
+    create_repo(&base, &owner_token, "proj").await;
+    add_collaborator(
+        &base,
+        &owner_token,
+        "cdup_owner",
+        "proj",
+        "cdup_alice",
+        "write",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/cdup_owner/proj/collaborators/{alice_id}");
+
+    let first = client
+        .delete(&url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 204, "the removal itself stopped working");
+
+    let second = client
+        .delete(&url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        404,
+        "removing an already-removed collaborator reported success"
+    );
+}
+
+/// The `PATCH` key passed to `DELETE`: a row id that matches no `users.id` in
+/// this repository. The answer is `404`, and no other collaborator is touched.
+#[tokio::test]
+async fn removing_a_collaborator_by_row_id_is_not_found() {
+    let base = spawn_test_app().await;
+    let (owner_token, _owner_id) = register_full(&base, "crow_owner", "crow_o@example.com").await;
+    let (_alice_token, alice_id) = register_full(&base, "crow_alice", "crow_a@example.com").await;
+    let (_bob_token, bob_id) = register_full(&base, "crow_bob", "crow_bob@example.com").await;
+    create_repo(&base, &owner_token, "proj").await;
+    let alice_row = add_collaborator(
+        &base,
+        &owner_token,
+        "crow_owner",
+        "proj",
+        "crow_alice",
+        "write",
+    )
+    .await;
+    add_collaborator(&base, &owner_token, "crow_owner", "proj", "crow_bob", "read").await;
+
+    // The point of the test is a row id that is nobody's user id here; if the
+    // fixture ever produces a collision the delete below would legitimately
+    // remove someone, so fail loudly instead of asserting the wrong thing.
+    assert!(
+        alice_row != alice_id && alice_row != bob_id,
+        "fixture: row id {alice_row} collides with a collaborator user id"
+    );
+
+    let resp = reqwest::Client::new()
+        .delete(format!(
+            "{base}/api/v1/repos/crow_owner/proj/collaborators/{alice_row}"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "a delete keyed by the row id removed nothing and reported success"
+    );
+
+    // Both collaborators are still there — including the one whose row id was
+    // in the path.
+    assert_eq!(
+        permission_of(&base, &owner_token, "crow_owner", "proj", alice_id).await,
+        "write"
+    );
+    assert_eq!(
+        permission_of(&base, &owner_token, "crow_owner", "proj", bob_id).await,
+        "read"
+    );
+}

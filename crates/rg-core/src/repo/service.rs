@@ -2565,9 +2565,12 @@ mod permission_matrix_tests {
         assert!(can_write_repo(&db, &repo, Some(collab)).await.unwrap());
 
         // Revoke in the DB. The cache (30s TTL) still answers "yes".
-        repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, collab)
-            .await
-            .unwrap();
+        assert!(
+            repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, collab)
+                .await
+                .unwrap(),
+            "the revocation matched no row, so the rest of the test proves nothing"
+        );
         assert!(
             can_read_repo(&db, &repo, Some(collab)).await.unwrap(),
             "stale cache should still serve the revoked read decision"

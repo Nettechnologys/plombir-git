@@ -68,18 +68,30 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Remove a collaborator by repo and user.
+/// Remove a collaborator by repo and user. Returns whether a row was removed.
+///
+/// The discarded `rows_affected` here is what let a delete that matched nothing
+/// answer `204`: the caller could not tell "the user is no longer a
+/// collaborator" from "no such collaborator, nothing happened" — and the path
+/// invites exactly that mistake, since `PATCH` on the same URL keys off the
+/// `repo_collaborators` row id while this keys off `users.id`.
+///
+/// "There is no such row" travels in the value rather than as an error for the
+/// same reason as [`crate::ops::org_ops::delete_team`]: this crate cannot depend
+/// on `rg-core`, so an untyped `anyhow!("…not found")` would be
+/// indistinguishable at the HTTP layer from the `.context("db: …")` failure
+/// below it. An `Err` from here always means the database itself failed.
 pub async fn delete_by_repo_and_user(
     db: &DatabaseConnection,
     repo_id: i64,
     user_id: i64,
-) -> Result<()> {
+) -> Result<bool> {
     use sea_orm::QueryFilter;
-    CollabEntity::delete_many()
+    let result = CollabEntity::delete_many()
         .filter(repo_collaborator::Column::RepoId.eq(repo_id))
         .filter(repo_collaborator::Column::UserId.eq(user_id))
         .exec(db)
         .await
         .context("db: delete collaborator by repo and user")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
