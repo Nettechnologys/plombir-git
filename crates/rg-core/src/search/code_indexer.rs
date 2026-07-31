@@ -204,21 +204,31 @@ impl CodeIndexer {
             .find_tree(tree_oid)
             .with_context(|| format!("Failed to find tree: {}", tree_oid))?;
 
-        self.clear_index_for_repo(repo_id).await?;
-
         let mut entries: Vec<IndexEntry> = Vec::new();
         let mut visited = HashSet::new();
         self.collect_tree_entries(
             &repo,
             &tree,
+            tree_oid,
             repo_id,
             PathBuf::new(),
             &mut entries,
             &mut visited,
         )
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to traverse repository {} at ref '{}'",
+                repo_path.display(),
+                ref_name
+            )
+        })?;
 
         let count = entries.len();
+        // Do not discard a previously healthy index until the complete tree has
+        // been read. A corrupt object must fail this refresh, not turn search
+        // results into an empty or partial snapshot.
+        self.clear_index_for_repo(repo_id).await?;
         self.batch_insert_fts(&entries).await?;
 
         Ok(count)
@@ -238,25 +248,40 @@ impl CodeIndexer {
     }
 
     /// Collect indexable file entries by traversing the Git tree iteratively.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the traversal keeps repository, tree identity, output, and cycle state explicit"
+    )]
     async fn collect_tree_entries(
         &self,
         repo: &gix::Repository,
         tree: &gix::Tree<'_>,
+        tree_oid: gix::ObjectId,
         repo_id: i64,
         base_path: PathBuf,
         entries: &mut Vec<IndexEntry>,
         visited: &mut HashSet<gix::ObjectId>,
     ) -> Result<()> {
         let mut stack: Vec<(gix::ObjectId, PathBuf)> = Vec::new();
-        self.collect_tree(repo, tree, repo_id, base_path, entries, visited, &mut stack)
-            .await?;
+        self.collect_tree(
+            repo, tree, tree_oid, repo_id, base_path, entries, visited, &mut stack,
+        )
+        .await?;
         while let Some((tree_oid, path)) = stack.pop() {
-            if let Ok(object) = repo.find_object(tree_oid) {
-                if let Ok(tree) = object.try_into_tree() {
-                    self.collect_tree(repo, &tree, repo_id, path, entries, visited, &mut stack)
-                        .await?;
-                }
-            }
+            let object = repo.find_object(tree_oid).with_context(|| {
+                format!(
+                    "Failed to read tree object {} at '{}'",
+                    tree_oid,
+                    path.display()
+                )
+            })?;
+            let tree = object.try_into_tree().map_err(|_| {
+                anyhow::anyhow!("Object {} at '{}' is not a tree", tree_oid, path.display())
+            })?;
+            self.collect_tree(
+                repo, &tree, tree_oid, repo_id, path, entries, visited, &mut stack,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -268,17 +293,25 @@ impl CodeIndexer {
         &self,
         repo: &gix::Repository,
         tree: &gix::Tree<'_>,
+        tree_oid: gix::ObjectId,
         repo_id: i64,
         base_path: PathBuf,
         entries: &mut Vec<IndexEntry>,
         visited: &mut HashSet<gix::ObjectId>,
         stack: &mut Vec<(gix::ObjectId, PathBuf)>,
     ) -> Result<()> {
+        let tree_path = if base_path.as_os_str().is_empty() {
+            "<root>".to_string()
+        } else {
+            base_path.display().to_string()
+        };
         for item in tree.iter() {
-            let item = match item {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
+            let item = item.with_context(|| {
+                format!(
+                    "Failed to read tree entry from object {} at '{}'",
+                    tree_oid, tree_path
+                )
+            })?;
 
             let name = String::from_utf8_lossy(item.filename());
             let path = base_path.join(name.as_ref());
@@ -292,28 +325,30 @@ impl CodeIndexer {
                 }
             } else if mode.is_blob() || mode.is_executable() {
                 let oid = item.oid().to_owned();
-                if let Ok(object) = repo.find_object(oid) {
-                    if let Ok(blob) = object.try_into_blob() {
-                        let content = &blob.data;
-                        if should_index(&path, content) {
-                            let file_path = path.to_string_lossy().to_string();
-                            let file_name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let language = infer_language(&path);
-                            let content_str = String::from_utf8_lossy(content).to_string();
+                let object = repo.find_object(oid).with_context(|| {
+                    format!("Failed to read blob object {} at '{}'", oid, path.display())
+                })?;
+                let blob = object.try_into_blob().map_err(|_| {
+                    anyhow::anyhow!("Object {} at '{}' is not a blob", oid, path.display())
+                })?;
+                let content = &blob.data;
+                if should_index(&path, content) {
+                    let file_path = path.to_string_lossy().to_string();
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let language = infer_language(&path);
+                    let content_str = String::from_utf8_lossy(content).to_string();
 
-                            entries.push(IndexEntry {
-                                repo_id,
-                                file_path,
-                                file_name,
-                                content: content_str,
-                                language,
-                            });
-                        }
-                    }
+                    entries.push(IndexEntry {
+                        repo_id,
+                        file_path,
+                        file_name,
+                        content: content_str,
+                        language,
+                    });
                 }
             }
         }
@@ -459,6 +494,188 @@ impl CodeIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectOptions, Database};
+    use std::io::Write as _;
+
+    const TEST_REPO_ID: i64 = 41;
+
+    async fn test_indexer() -> CodeIndexer {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).sqlx_logging(false);
+        let db = Database::connect(options)
+            .await
+            .expect("test database must connect");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("test database migrations must run");
+        CodeIndexer::new(db)
+    }
+
+    fn committed_repository(files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temporary directory must be created");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree directory must be created");
+        run_git(&worktree, &["init", "-q", "-b", "main"]);
+        run_git(&worktree, &["config", "user.name", "ForgeKeep Index Test"]);
+        run_git(&worktree, &["config", "user.email", "indexer@example.test"]);
+        for (path, content) in files {
+            let file = worktree.join(path);
+            std::fs::create_dir_all(file.parent().expect("fixture file must have a parent"))
+                .expect("fixture parent directory must be created");
+            std::fs::write(file, content).expect("fixture file must be written");
+        }
+        run_git(&worktree, &["add", "."]);
+        run_git(&worktree, &["commit", "-q", "-m", "index fixture"]);
+        (dir, worktree)
+    }
+
+    fn run_git(worktree: &Path, args: &[&str]) -> String {
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize")
+            .run(args, Some(worktree))
+            .expect("git must run");
+        assert!(
+            output.success(),
+            "git {args:?} failed: {}",
+            output.stderr_str()
+        );
+        output.stdout_str().trim().to_string()
+    }
+
+    fn loose_object_path(repo_path: &Path, oid: &str) -> PathBuf {
+        repo_path.join("objects").join(&oid[..2]).join(&oid[2..])
+    }
+
+    fn overwrite_loose_object(repo_path: &Path, oid: &str, kind: &str, data: &[u8]) {
+        let object_path = loose_object_path(repo_path, oid);
+        std::fs::remove_file(&object_path).expect("existing loose object must be removable");
+        let file = std::fs::File::create(object_path).expect("loose object must be writable");
+        let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+        write!(encoder, "{kind} {}\0", data.len()).expect("object header must compress");
+        encoder
+            .write_all(data)
+            .expect("object payload must compress");
+        encoder.finish().expect("object must finish compressing");
+    }
+
+    #[tokio::test]
+    async fn healthy_repository_indexes_the_complete_file_set() {
+        let (_dir, worktree) = committed_repository(&[
+            ("README.md", b"searchable readme\n"),
+            ("src/main.rs", b"fn main() {}\n"),
+            ("assets/image.png", b"binary\0payload"),
+        ]);
+        let indexer = test_indexer().await;
+
+        let count = indexer
+            .index_repository(TEST_REPO_ID, &worktree, "HEAD")
+            .await
+            .expect("healthy repository must index");
+        assert_eq!(count, 2, "binary files are the only excluded fixture entry");
+
+        let (results, total) = indexer
+            .search_code("", Some(TEST_REPO_ID), 10, 0)
+            .await
+            .expect("indexed files must be searchable");
+        let mut paths = results
+            .into_iter()
+            .map(|result| result.file_path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(total, 2);
+        assert_eq!(paths, ["README.md", "src/main.rs"]);
+    }
+
+    #[tokio::test]
+    async fn unreadable_tree_entry_fails_the_index_job_with_context() {
+        let (_dir, worktree) = committed_repository(&[("src/main.rs", b"fn main() {}\n")]);
+        let repo_path = worktree.join(".git");
+        let tree_oid = run_git(&worktree, &["rev-parse", "HEAD^{tree}"]);
+        overwrite_loose_object(&repo_path, &tree_oid, "tree", b"x");
+
+        let error = test_indexer()
+            .await
+            .index_repository(TEST_REPO_ID, &worktree, "HEAD")
+            .await
+            .expect_err("a malformed tree entry must fail the complete index job");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&worktree.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("HEAD"), "{rendered}");
+        assert!(rendered.contains(&tree_oid), "{rendered}");
+        assert!(rendered.contains("Failed to read tree entry"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_subtree_fails_the_index_job_with_context() {
+        let (_dir, worktree) = committed_repository(&[("src/main.rs", b"fn main() {}\n")]);
+        let repo_path = worktree.join(".git");
+        let tree_oid = run_git(&worktree, &["rev-parse", "HEAD:src"]);
+        std::fs::remove_file(loose_object_path(&repo_path, &tree_oid))
+            .expect("fixture subtree must be removable");
+
+        let error = test_indexer()
+            .await
+            .index_repository(TEST_REPO_ID, &worktree, "HEAD")
+            .await
+            .expect_err("a missing subtree must fail the complete index job");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&worktree.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("HEAD"), "{rendered}");
+        assert!(rendered.contains("src"), "{rendered}");
+        assert!(rendered.contains(&tree_oid), "{rendered}");
+        assert!(
+            rendered.contains("Failed to read tree object"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_blob_fails_refresh_and_preserves_the_previous_index() {
+        let (_dir, worktree) = committed_repository(&[("src/main.rs", b"fn main() {}\n")]);
+        let repo_path = worktree.join(".git");
+        let blob_oid = run_git(&worktree, &["rev-parse", "HEAD:src/main.rs"]);
+        let indexer = test_indexer().await;
+        assert_eq!(
+            indexer
+                .index_repository(TEST_REPO_ID, &worktree, "HEAD")
+                .await
+                .expect("initial healthy index must succeed"),
+            1
+        );
+        std::fs::remove_file(loose_object_path(&repo_path, &blob_oid))
+            .expect("fixture blob must be removable");
+
+        let error = indexer
+            .index_repository(TEST_REPO_ID, &worktree, "HEAD")
+            .await
+            .expect_err("a missing blob must fail the complete index job");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&worktree.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("HEAD"), "{rendered}");
+        assert!(rendered.contains("src/main.rs"), "{rendered}");
+        assert!(rendered.contains(&blob_oid), "{rendered}");
+        assert!(
+            rendered.contains("Failed to read blob object"),
+            "{rendered}"
+        );
+
+        let (results, total) = indexer
+            .search_code("", Some(TEST_REPO_ID), 10, 0)
+            .await
+            .expect("the previous index must remain readable");
+        assert_eq!(total, 1);
+        assert_eq!(results[0].file_path, "src/main.rs");
+    }
 
     #[test]
     fn test_infer_language() {
