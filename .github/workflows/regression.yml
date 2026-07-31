@@ -573,8 +573,8 @@ jobs:
   # Cost is why this one is path-gated instead of unconditional — it is the most
   # expensive job in the file by a wide margin, since `[profile.release]` is
   # `lto = true` with `codegen-units = 1`. Measured cold on 24 cores: 103s for
-  # the dependency layer, 967s for the workspace build and the fat-LTO link of
-  # the three binaries, ~18 minutes end to end for a 243 MB image. A two-core
+  # the dependency layer, 967s for the workspace build and the fat-LTO links,
+  # ~18 minutes end to end for a 243 MB image. A two-core
   # hosted runner is well short of that, which is what the 120-minute ceiling
   # leaves room for; adjust it against a real run rather than downwards on
   # principle.
@@ -659,21 +659,30 @@ jobs:
       # start — on the server, in a restart loop, with the failure a line in
       # `docker logs` nobody reads until the deploy is already broken.
       #
-      # `--help` rather than `--version`: none of the three declare a version
-      # flag, and clap answers `--version` with exit 2. The point is not the
-      # output anyway — `forgekeep-mcp` prints nothing at all here, since it
-      # ignores argv and serves MCP over stdin, which is at EOF. The point is
-      # that the binary loads its libraries and runs as the image's own
+      # `--help` rather than `--version`: the current binaries do not all
+      # declare a version flag, and clap answers `--version` with exit 2. The
+      # point is not the output anyway — an executable may ignore argv and exit
+      # on stdin EOF. The point is that every binary copied into the image loads
+      # its libraries and runs as the image's own
       # unprivileged user. `timeout` is there so a binary that ever starts
       # blocking fails this step instead of sitting until the job ceiling — set
-      # far above the ~1s these actually take, because the bound exists to catch
+      # far above the ~1s they currently take, because the bound exists to catch
       # a hang, and a bound tight enough to also catch a busy runner would make
       # this gate flaky, which is worse than not having it.
       - name: Run the binaries in the built image
         if: steps.scope.outputs.build == 'true'
         run: |
           set -euo pipefail
-          for binary in forgekeep forgekeep-runner forgekeep-mcp; do
+          mapfile -t binaries < <(
+            docker run --rm --entrypoint find forgekeep:ci \
+              /usr/local/bin -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+              | sort
+          )
+          if [ "${#binaries[@]}" -eq 0 ]; then
+            echo "The image contains no files in /usr/local/bin." >&2
+            exit 1
+          fi
+          for binary in "${binaries[@]}"; do
             echo "Running ${binary}"
             timeout 300 docker run --rm forgekeep:ci "${binary}" --help >/dev/null
           done

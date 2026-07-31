@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-dev \
     libssl-dev \
     pkg-config \
+    jq \
     # curl + ca-certificates are needed at build time: utoipa-swagger-ui's
     # build script downloads the Swagger UI assets via the curl CLI.
     curl \
@@ -91,12 +92,26 @@ RUN cargo build --release
 RUN find crates -name '*.rs' -delete
 COPY crates/ crates/
 RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --bin forgekeep --bin forgekeep-runner --bin forgekeep-mcp
+    && cargo build --release --workspace --bins
 
-# Strip symbols to reduce binary size
-RUN strip target/release/forgekeep \
-    target/release/forgekeep-runner \
-    target/release/forgekeep-mcp
+# Derive the runtime payload from Cargo's target graph. Keeping this as a
+# separate directory prevents `*.d`, `deps/` and other release-build outputs
+# from leaking into the image while making every new workspace binary opt-out
+# rather than opt-in.
+RUN set -eu; \
+    mkdir -p /out; \
+    cargo metadata --format-version 1 --no-deps \
+      | jq -r '[.packages[].targets[] | select(.kind | index("bin")) | .name] | unique[]' \
+      | while IFS= read -r binary; do \
+          artifact="target/release/${binary}"; \
+          if [ ! -x "${artifact}" ]; then \
+            echo "Cargo binary target has no executable release artifact: ${binary}" >&2; \
+            exit 1; \
+          fi; \
+          strip "${artifact}"; \
+          cp "${artifact}" "/out/${binary}"; \
+        done; \
+    test -n "$(find /out -maxdepth 1 -type f -print -quit)"
 
 # ── Stage 3: Runtime ────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -122,10 +137,8 @@ RUN groupadd --gid ${FORGEKEEP_GID} forgekeep \
     && useradd --uid ${FORGEKEEP_UID} --gid ${FORGEKEEP_GID} \
        --create-home --shell /bin/bash forgekeep
 
-# Copy binaries
-COPY --from=builder /build/target/release/forgekeep /usr/local/bin/forgekeep
-COPY --from=builder /build/target/release/forgekeep-runner /usr/local/bin/forgekeep-runner
-COPY --from=builder /build/target/release/forgekeep-mcp /usr/local/bin/forgekeep-mcp
+# Copy the complete Cargo-derived runtime payload.
+COPY --from=builder /out/ /usr/local/bin/
 
 # Copy frontend static assets (served at web/build relative to WORKDIR)
 COPY --from=frontend-builder /build/web/build /app/web/build
