@@ -926,20 +926,26 @@ fn is_pypi_distribution(filename: &str) -> bool {
 /// `pip install Matrix_PyPI` asks for `matrix-pypi/`, while the registry stores
 /// whatever `Name:` the wheel metadata carried. Only reached after a lookup on
 /// the literal spelling missed, so the common case still costs one query.
+///
+/// `Ok(None)` is the answer "the scan ran and no published project normalizes to
+/// this name" — the only outcome that may become a `404`. A failed scan is an
+/// `Err` and stays one: swallowing it (`.ok()?`) told pip the project does not
+/// exist, which is precisely the answer it will not retry.
 async fn resolve_pypi_project(
     db: &sea_orm::DatabaseConnection,
     owner: &str,
     repo: &str,
     requested: &str,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     let wanted = rg_core::package_registry::normalize_project_name(requested);
 
-    rg_core::package_registry::service::list_packages(db, owner, repo, "pypi")
-        .await
-        .ok()?
-        .into_iter()
-        .find(|pkg| rg_core::package_registry::normalize_project_name(&pkg.name) == wanted)
-        .map(|pkg| pkg.name)
+    Ok(
+        rg_core::package_registry::service::list_packages(db, owner, repo, "pypi")
+            .await?
+            .into_iter()
+            .find(|pkg| rg_core::package_registry::normalize_project_name(&pkg.name) == wanted)
+            .map(|pkg| pkg.name),
+    )
 }
 
 /// GET /api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/
@@ -965,17 +971,30 @@ pub async fn pypi_simple_index(
     .await
     {
         Ok(versions) => (pkg_name.clone(), versions),
-        Err(miss) => match resolve_pypi_project(&state.db, &owner, &name, &pkg_name).await {
-            Some(stored) => match rg_core::package_registry::service::list_versions(
-                &state.db, &owner, &name, "pypi", &stored,
-            )
-            .await
-            {
-                Ok(versions) => (stored, versions),
-                Err(e) => return err(StatusCode::NOT_FOUND, &format!("{e:#}")),
-            },
-            None => return err(StatusCode::NOT_FOUND, &format!("{miss:#}")),
-        },
+        // Only a genuine absence earns the second, more expensive lookup. Any
+        // other failure — the database being down, above all — is ours, and
+        // retrying it under a different spelling would just fail again and then
+        // be reported as "no such project": an answer `pip`/`uv` cache and never
+        // retry. `AppError::from` keeps the outage a 5xx and the detail in the
+        // operator log rather than in the response body (H-05).
+        Err(miss) if miss.downcast_ref::<rg_core::error::NotFound>().is_some() => {
+            match resolve_pypi_project(&state.db, &owner, &name, &pkg_name).await {
+                Ok(Some(stored)) => match rg_core::package_registry::service::list_versions(
+                    &state.db, &owner, &name, "pypi", &stored,
+                )
+                .await
+                {
+                    Ok(versions) => (stored, versions),
+                    Err(e) => return AppError::from(e).into_response(),
+                },
+                // The scan ran and nothing normalizes to this name: the client's
+                // original miss was the truth, and it is a `NotFound`, so it
+                // renders as the fixed "… not found" with no `db: …` chain.
+                Ok(None) => return AppError::from(miss).into_response(),
+                Err(e) => return AppError::from(e).into_response(),
+            }
+        }
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     let base_url = build_base_url(&headers);

@@ -11,6 +11,7 @@ use std::io::{Cursor, Write};
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 use reqwest::StatusCode;
+use sea_orm::ConnectionTrait;
 
 /// A wheel is a ZIP holding `{name}-{version}.dist-info/METADATA`.
 fn wheel(dist_info: &str, metadata: &str) -> Vec<u8> {
@@ -31,7 +32,10 @@ fn wheel(dist_info: &str, metadata: &str) -> Vec<u8> {
 struct Fixture {
     base: String,
     client: reqwest::Client,
-    _db: rg_db::DatabaseConnection,
+    /// Held for the lifetime of the test: the temporary database lives as long
+    /// as this handle. The failure-status test also drives it directly, to break
+    /// exactly the table the handler queries.
+    db: rg_db::DatabaseConnection,
 }
 
 impl Fixture {
@@ -83,11 +87,7 @@ async fn fixture_with_package(published_name: &str, version: &str) -> Fixture {
         published.text().await.unwrap()
     );
 
-    Fixture {
-        base,
-        client,
-        _db: db,
-    }
+    Fixture { base, client, db }
 }
 
 /// The project page pip actually requests: `.../simple/<name>/`.
@@ -167,10 +167,70 @@ async fn an_empty_registry_is_an_empty_index_rather_than_a_fallback_page() {
     let fx = Fixture {
         base,
         client: reqwest::Client::new(),
-        _db: db,
+        db,
     };
 
     let (status, body) = fx.get(&fx.simple("/")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("<title>Simple index</title>"), "{body}");
+}
+
+/// Acceptance for card_287a67fe4f81: the normalized-name fallback must not turn
+/// a failed lookup into "no such project".
+///
+/// The project page looks the literal spelling up first and, on a miss, scans
+/// the published names for one that normalizes to the requested form. Both
+/// queries hit the `packages` table, so a database failure failed *both* — and
+/// the scan swallowed its own failure (`.ok()?`), leaving the handler to report
+/// the first miss as a `404`. For `pip`/`uv` a `404` means "this project does
+/// not exist here", which is cached and not retried, so an outage looked like a
+/// deleted package; the body also carried the `db: …` context (H-05).
+///
+/// The outage is simulated by dropping `packages` rather than by closing the
+/// pool: the repository resolution and the read gate run first and must keep
+/// working, or the request would never reach the code under test and the
+/// assertion would pass against the unfixed handler.
+#[tokio::test]
+async fn a_failed_project_scan_is_not_reported_as_an_absent_project() {
+    let fx = fixture_with_package("Matrix_PyPI", "3.0.0").await;
+
+    // Baselines on a healthy database — without them this test cannot tell "the
+    // status was fixed" from "the route 5xx's on everything".
+    let (status, body) = fx.get(&fx.simple("/matrix-pypi/")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the published project is still found by its normalized name: {body}"
+    );
+    let (status, body) = fx.get(&fx.simple("/definitely-absent/")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a project that really is not published stays a 404: {body}"
+    );
+    let absent: serde_json::Value = serde_json::from_str(&body).expect("404 body is JSON");
+    let absent = absent["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !absent.contains("db:") && !absent.contains("packages"),
+        "the 404 body must be the fixed message, got: {absent}"
+    );
+
+    // Break exactly the table both lookups read.
+    fx.db
+        .execute_unprepared("DROP TABLE packages")
+        .await
+        .expect("drop packages");
+
+    let (status, body) = fx.get(&fx.simple("/matrix-pypi/")).await;
+    assert!(
+        status.is_server_error(),
+        "a failed project scan must be a 5xx, not {status} — a 404 tells pip the \
+         project does not exist and it will not retry (body: {body})"
+    );
+    let failed: serde_json::Value = serde_json::from_str(&body).expect("5xx body is JSON");
+    let message = failed["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("db:") && !message.contains("packages"),
+        "the response body must not carry internal error detail, got: {message}"
+    );
 }
