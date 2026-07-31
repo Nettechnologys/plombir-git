@@ -192,6 +192,21 @@ pub async fn batch(
     headers: HeaderMap,
     Json(req): Json<rg_core::lfs::service::LfsBatchRequest>,
 ) -> impl IntoResponse {
+    // The outer maintenance layer cannot inspect this operation without
+    // buffering an untrusted body before the normal body limits and access
+    // gates. It therefore admits this shared POST endpoint; once Axum has
+    // parsed the small JSON request, reject the write half here while allowing
+    // the download half to continue.
+    if req.operation == "upload"
+        && state
+            .instance_settings
+            .get(&state.db)
+            .await
+            .maintenance_mode
+    {
+        return crate::middleware::maintenance_response();
+    }
+
     // LFS client sends Accept: application/vnd.git-lfs+json
     let repo_model =
         match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
