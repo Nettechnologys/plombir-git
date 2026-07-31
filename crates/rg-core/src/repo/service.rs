@@ -234,6 +234,30 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
     )))
 }
 
+/// Resolve the directory name that owns a repository row on disk.
+///
+/// `owner_id` alone is not enough: organization repositories retain the
+/// organization's owner there, while their directory lives under the
+/// organization name. Keeping this resolution next to create/delete prevents
+/// the two lifecycle ends from deriving different paths.
+async fn repository_namespace_name(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    org_id: Option<i64>,
+) -> Result<String> {
+    if let Some(org_id) = org_id {
+        return rg_db::ops::org_ops::get_org(db, org_id)
+            .await?
+            .map(|org| org.name)
+            .context("repository organization not found");
+    }
+
+    user_ops::find_by_id(db, owner_id)
+        .await?
+        .map(|user| user.username)
+        .context("repository owner not found")
+}
+
 /// Find a repository by owner name (user or org) and repo name.
 ///
 /// The two branches are two namespaces, not two ways of spelling one. A
@@ -526,39 +550,55 @@ pub async fn create_repo_with_opts(
     )
     .await?;
 
-    // Determine path prefix: org name or user name
-    let path_prefix = if let Some(oid) = opts.org_id {
-        let org = rg_db::ops::org_ops::get_org(db, oid)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("organization not found"))?;
-        org.name
-    } else {
-        let owner_user = rg_db::ops::user_ops::find_by_id(db, owner_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("owner not found"))?;
-        owner_user.username
-    };
+    // Determine path prefix: org name or user name.
+    let path_prefix = repository_namespace_name(db, owner_id, opts.org_id).await?;
 
     // Create bare git repo on disk using gix
     let git_path = repo_root.join(format!("{}/{}.git", path_prefix, name));
-    // The path was already named here; what was missing on the deployment that
-    // hits this first — a bind-mounted `repo_root` owned by another uid — is
-    // which knob points elsewhere and which side of the mismatch is wrong.
-    std::fs::create_dir_all(&git_path).map_err(|error| {
+    let namespace_dir = git_path
+        .parent()
+        .context("repository path has no namespace directory")?;
+    // Create the parent first, then claim the final path with one non-recursive
+    // create. `create_dir_all(git_path)` accepted an occupied directory and
+    // left gix to turn the ordinary state conflict into an anonymous 500.
+    std::fs::create_dir_all(namespace_dir).map_err(|error| {
         crate::platform::fs::path_error(
-            "repository directory",
-            &git_path,
+            "repository namespace directory",
+            namespace_dir,
             &error,
             crate::platform::fs::REPO_ROOT_HINT,
         )
     })?;
+    match std::fs::create_dir(&git_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(crate::error::conflict(format!(
+                "repository storage for '{path_prefix}/{name}' is already occupied"
+            )));
+        }
+        Err(error) => {
+            return Err(crate::platform::fs::path_error(
+                "repository directory",
+                &git_path,
+                &error,
+                crate::platform::fs::REPO_ROOT_HINT,
+            ));
+        }
+    }
 
-    gix::create::into(
+    let init_result = gix::create::into(
         &git_path,
         gix::create::Kind::Bare,
         gix::create::Options::default(),
     )
-    .with_context(|| format!("gix init --bare failed for {:?}", git_path))?;
+    .with_context(|| format!("gix init --bare failed for {:?}", git_path));
+    if let Err(error) = init_result {
+        // This call atomically claimed the directory above, so unlike a
+        // preflight `exists()` check it is safe to remove a partial gix init:
+        // no concurrent creator could have owned these bytes first.
+        discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+        return Err(error);
+    }
 
     // Auto-initialize with template files if requested
     if opts.auto_init {
@@ -1014,9 +1054,81 @@ pub async fn get_watch(
     rg_db::ops::repo_watch_ops::get_watch_state(db, user_id, repo_id).await
 }
 
-/// Soft-delete a repository.
-pub async fn delete_repo(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
-    rg_db::ops::repo_ops::soft_delete(db, repo_id).await?;
+/// Delete a repository's Git data and soft-delete its metadata row.
+///
+/// The filesystem and database cannot share a transaction. Rename the live
+/// tree out of the canonical namespace first (an atomic operation on the same
+/// filesystem), then mutate the row. If the database step fails, move the tree
+/// back so an active row never knowingly points at missing data. Once the row
+/// is deleted, the staged tree is unreachable and can be removed without
+/// keeping the repository name occupied.
+pub async fn delete_repo(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    repo: &rg_db::entities::repository::Model,
+) -> Result<()> {
+    let namespace = repository_namespace_name(db, repo.owner_id, repo.org_id).await?;
+    let repo_path = repo_root.join(format!("{namespace}/{}.git", repo.name));
+    let staged_path = repo_path.with_file_name(format!(
+        "{}.deleted-{}-{}",
+        repo_path
+            .file_name()
+            .context("repository path has no final component")?
+            .to_string_lossy(),
+        repo.id,
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let staged = match repo_path.try_exists() {
+        Ok(true) => {
+            std::fs::rename(&repo_path, &staged_path)
+                .map_err(|error| {
+                    crate::platform::fs::path_error(
+                        "repository directory",
+                        &repo_path,
+                        &error,
+                        crate::platform::fs::REPO_ROOT_HINT,
+                    )
+                })
+                .with_context(|| {
+                    format!(
+                        "failed to stage repository deletion at {}",
+                        staged_path.display()
+                    )
+                })?;
+            true
+        }
+        // The requested end state is already true on disk. Still soft-delete
+        // the row so metadata and storage converge instead of making an
+        // idempotent delete impossible to finish.
+        Ok(false) => false,
+        Err(error) => {
+            return Err(crate::platform::fs::path_error(
+                "repository directory",
+                &repo_path,
+                &error,
+                crate::platform::fs::REPO_ROOT_HINT,
+            ));
+        }
+    };
+
+    if let Err(error) = rg_db::ops::repo_ops::soft_delete(db, repo.id).await {
+        if staged {
+            // The row is still active. Put its tree back; a failed compensation
+            // is the one fact an operator needs to repair the split state.
+            if let Err(rollback_error) = std::fs::rename(&staged_path, &repo_path) {
+                tracing::warn!(
+                    repo_id = repo.id,
+                    staged_at = %staged_path.display(),
+                    belongs_at = %repo_path.display(),
+                    error = %rollback_error,
+                    "failed to restore a repository directory after its soft-delete failed — the \
+                     active row is now unreachable until the directory is moved back by hand"
+                );
+            }
+        }
+        return Err(error);
+    }
 
     // Manually remove from the metadata FTS table as a defensive fallback.
     let backend = db.get_database_backend();
@@ -1024,14 +1136,29 @@ pub async fn delete_repo(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
         .execute(sea_orm::Statement::from_sql_and_values(
             backend,
             rg_db::prepare_sql(backend, "DELETE FROM repos_fts WHERE rowid = ?"),
-            [repo_id.into()],
+            [repo.id.into()],
         ))
         .await
     {
-        tracing::warn!(repo_id = repo_id, error = %format!("{e:#}"), "failed to remove repo from repos_fts index");
+        tracing::warn!(repo_id = repo.id, error = %format!("{e:#}"), "failed to remove repo from repos_fts index");
     }
 
-    invalidate_perm_cache_repo(db, repo_id);
+    invalidate_perm_cache_repo(db, repo.id);
+
+    if staged {
+        match std::fs::remove_dir_all(&staged_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                repo_id = repo.id,
+                path = %staged_path.display(),
+                error = %error,
+                "repository is deleted and its canonical name is free, but its old Git data \
+                 remains on disk and must be removed by hand"
+            ),
+        }
+    }
+
     Ok(())
 }
 
@@ -2046,6 +2173,85 @@ mod path_diagnostic_tests {
         discard_unreferenced_repo_dir(
             &sandbox.path().join("never-existed.git"),
             &recreate_blocked_by("never-existed"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod repository_deletion_tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, Database};
+
+    async fn setup_db() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect in-memory database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    /// The filesystem move necessarily happens before the database mutation.
+    /// If that mutation fails, returning the error without compensation would
+    /// leave a live row whose Git data has vanished under a staging name.
+    #[tokio::test]
+    async fn a_failed_soft_delete_restores_the_repository_directory() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "delete-rollback-owner",
+            "delete-rollback@example.invalid",
+            "unused",
+            "Delete Rollback",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let repo = create_repo(&db, owner.id, "keep-me", None, false, &repo_root, None)
+            .await
+            .expect("create repository");
+        let bare = repo_root.join("delete-rollback-owner/keep-me.git");
+        let marker = bare.join("rollback-marker");
+        std::fs::write(&marker, b"must survive").expect("write marker");
+
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER reject_repo_soft_delete \
+             BEFORE UPDATE OF deleted_at ON repositories \
+             WHEN NEW.id = {} \
+             BEGIN SELECT RAISE(ABORT, 'forced soft-delete failure'); END",
+            repo.id
+        ))
+        .await
+        .expect("install failure trigger");
+
+        let error = delete_repo(&db, &repo_root, &repo)
+            .await
+            .expect_err("soft-delete trigger must reject the update");
+        assert!(
+            format!("{error:#}").contains("forced soft-delete failure"),
+            "unexpected failure: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("repository directory must be restored"),
+            b"must survive"
+        );
+        assert!(
+            find_repo_by_owner_name(&db, "delete-rollback-owner", "keep-me")
+                .await
+                .expect("read repository after rollback")
+                .is_some(),
+            "the failed soft-delete still hid the database row"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(bare.parent().unwrap())
+            .expect("read namespace directory")
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with("keep-me.git.deleted-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the rollback restored the live path but left staging directories: {leftovers:?}"
         );
     }
 }

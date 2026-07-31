@@ -22,7 +22,7 @@
 //! test: a `404` proves a namespace boundary only if the path that is supposed
 //! to work still answers `200` next to it.
 
-use crate::common::{register_full, spawn_test_app};
+use crate::common::{register_full, spawn_test_app, spawn_test_app_with_repo_root};
 
 async fn create_repo_in(base: &str, token: &str, name: &str, org: Option<&str>) -> (u16, String) {
     let mut body = serde_json::json!({ "name": name });
@@ -268,5 +268,111 @@ async fn a_foreign_organizations_repository_does_not_block_the_same_name() {
         get_repo_status(&base, &mine, "ni4-me", "common").await,
         200,
         "the repository was reported created but does not answer"
+    );
+}
+
+/// card_9b6fa1a621a0: deleting only the row left the bare repository at its
+/// canonical path. The schema then allowed the same name again, but gix found
+/// the old non-empty directory and creation ended as an anonymous 500.
+#[tokio::test]
+async fn a_deleted_repository_name_can_be_recreated_without_inheriting_history() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "ni6-owner", "ni6-owner@example.com").await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "recycled",
+            "auto_init": true,
+            "readme": "default"
+        }))
+        .send()
+        .await
+        .expect("create first repository");
+    assert_eq!(
+        first.status(),
+        201,
+        "baseline: first repository creation failed: {}",
+        first.text().await.unwrap_or_default()
+    );
+
+    let bare = repo_root.join("ni6-owner/recycled.git");
+    let first_head = gix::open(&bare)
+        .expect("open first repository")
+        .head_id()
+        .expect("auto-init must create a commit")
+        .detach();
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/repos/ni6-owner/recycled"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete repository");
+    assert_eq!(
+        deleted.status(),
+        200,
+        "delete failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+    assert!(
+        !bare.exists(),
+        "DELETE succeeded but left the canonical bare repository behind"
+    );
+    let deleted_trees: Vec<_> = std::fs::read_dir(bare.parent().unwrap())
+        .expect("read repository namespace")
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("recycled.git.deleted-"))
+        .collect();
+    assert!(
+        deleted_trees.is_empty(),
+        "DELETE moved the old repository aside but did not remove it: {deleted_trees:?}"
+    );
+
+    let (status, body) = create_repo_in(&base, &token, "recycled", None).await;
+    assert_eq!(
+        status, 201,
+        "the deleted repository still blocks its name ({body})"
+    );
+
+    let recreated = gix::open(&bare).expect("open recreated repository");
+    assert!(
+        recreated.head_id().is_err(),
+        "the empty recreation inherited commit {first_head} from the deleted repository"
+    );
+}
+
+/// A path can be occupied without a live database row (manual copy, failed old
+/// create, stale pre-fix deletion). That is a state conflict, not an internal
+/// error, and the server must not overwrite or remove the foreign bytes.
+#[tokio::test]
+async fn an_occupied_repository_directory_is_a_safe_conflict() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "ni7-owner", "ni7-owner@example.com").await;
+    let occupied = repo_root.join("ni7-owner/occupied.git");
+    std::fs::create_dir_all(&occupied).expect("create occupied repository path");
+    let marker = occupied.join("do-not-overwrite");
+    std::fs::write(&marker, b"foreign data").expect("write marker");
+
+    let (status, body) = create_repo_in(&base, &token, "occupied", None).await;
+    assert_eq!(status, 409, "occupied storage was not a conflict ({body})");
+    assert!(
+        body.contains("repository storage for 'ni7-owner/occupied' is already occupied"),
+        "the conflict does not explain the occupied storage: {body}"
+    );
+    assert!(
+        !body.contains(&repo_root.display().to_string()),
+        "the client-visible conflict leaked the server's repository root: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&marker).expect("occupied path must survive"),
+        b"foreign data"
+    );
+    assert_eq!(
+        get_repo_status(&base, &token, "ni7-owner", "occupied").await,
+        404,
+        "a failed create still inserted a repository row"
     );
 }
