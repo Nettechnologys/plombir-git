@@ -686,6 +686,81 @@ async fn failed_org_membership_check_is_not_reported_as_forbidden() {
     );
 }
 
+/// Acceptance for card_7425666e2f33: `GET /repos/{owner}` must distinguish a
+/// real missing owner from a user lookup that could not run. The healthy
+/// baselines go through the production router; the outage assertion invokes the
+/// public handler directly so a 503 cannot come from session middleware before
+/// `list_repos` executes. Before the fix both closed-pool errors were swallowed
+/// and this exact invocation answered 404.
+#[tokio::test]
+async fn repo_owner_lookup_distinguishes_absence_from_database_failure() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let (owner, repo_name, _repo, _outsider_id, _outsider) =
+        seed_repo_with_outsider(&db, false).await;
+    let state = build_test_app_state(db.clone(), repo_root);
+
+    let existing = get_through_router(
+        state.clone(),
+        &format!("/api/v1/repos/{owner}"),
+        axum::http::HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(
+        existing.status(),
+        StatusCode::OK,
+        "healthy baseline: an existing owner must be listable"
+    );
+    let body = axum::body::to_bytes(existing.into_body(), usize::MAX)
+        .await
+        .expect("read owner listing body");
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("owner listing body is JSON");
+    assert_eq!(
+        json["data"][0]["name"], repo_name,
+        "healthy baseline must include the owner's repository"
+    );
+
+    let missing = get_through_router(
+        state.clone(),
+        "/api/v1/repos/definitely-missing-owner",
+        axum::http::HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(
+        missing.status(),
+        StatusCode::NOT_FOUND,
+        "an owner absent from both users and organizations must stay 404"
+    );
+
+    db.close().await.expect("close owner-listing pool");
+
+    let outage = rg_http::api::repos::list_repos(
+        State(state),
+        axum::http::HeaderMap::new(),
+        Path(owner.to_string()),
+        axum::extract::Query(rg_http::api::repos::ListReposQuery {
+            pagination: rg_http::pagination::PaginationParams {
+                page: 1,
+                per_page: 20,
+            },
+        }),
+    )
+    .await;
+    let outage = outage.into_response();
+    assert_ne!(
+        outage.status(),
+        StatusCode::NOT_FOUND,
+        "a failed owner lookup must not be reported as an absent owner"
+    );
+    assert!(
+        outage.status().is_server_error(),
+        "a failed owner lookup must surface as a server error, got {}",
+        outage.status()
+    );
+}
+
 /// Read side: same contract, and here the pre-fix answer for an anonymous
 /// caller was a `401` — an instruction to authenticate that no token satisfies.
 #[tokio::test]

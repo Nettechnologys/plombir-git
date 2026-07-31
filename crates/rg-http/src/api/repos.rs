@@ -309,12 +309,13 @@ pub async fn list_repos(
     // querying public repos.
     let viewer_id = extract_user_id(&headers, &state.jwt_secret);
 
-    // Try user first
-    if let Some(user) = rg_db::ops::user_ops::find_by_username(&state.db, &owner)
-        .await
-        .ok()
-        .flatten()
-    {
+    // Try user first. A failed lookup is not evidence that the owner is absent:
+    // preserve the DB error so connection outages stay retryable server errors.
+    let user = match rg_db::ops::user_ops::find_by_username(&state.db, &owner).await {
+        Ok(user) => user,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    if let Some(user) = user {
         match rg_db::ops::repo_ops::list_personal_by_owner_visible_to(
             &state.db, user.id, viewer_id, offset, limit,
         )
@@ -331,12 +332,12 @@ pub async fn list_repos(
         }
     }
 
-    // Try organization
-    if let Some(org) = rg_db::ops::org_ops::get_org_by_name(&state.db, &owner)
-        .await
-        .ok()
-        .flatten()
-    {
+    // Try organization only after a successful user lookup that found no row.
+    let org = match rg_db::ops::org_ops::get_org_by_name(&state.db, &owner).await {
+        Ok(org) => org,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    if let Some(org) = org {
         match rg_db::ops::repo_ops::list_by_org_visible_to(
             &state.db, org.id, viewer_id, offset, limit,
         )
