@@ -136,6 +136,80 @@ async fn a_blob_row_that_was_not_written_fails_the_push() {
     assert_eq!(head.status(), 200, "the successful push must be readable");
 }
 
+/// A mount owns only the destination bytes it actually copied.
+///
+/// Losing the first target row must roll its new copy back. Losing a later
+/// idempotent insert must not delete the already-recorded layer the first
+/// successful mount owns.
+#[tokio::test]
+async fn a_mount_row_failure_rolls_back_only_its_own_copy() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&app.base, "mount_rollback", "mount_rollback@example.com").await;
+    create_repo(&app.base, &token, "source-image").await;
+    create_repo(&app.base, &token, "target-image").await;
+
+    let payload = b"forgekeep-mounted-layer";
+    let digest = push_blob(&app.base, &token, "mount_rollback", "source-image", payload).await;
+    let target = oci_blob_path(&app.repo_root, "mount_rollback", "target-image", &digest);
+    let mount = || {
+        client
+            .post(format!(
+                "{}/v2/mount_rollback/target-image/blobs/uploads/",
+                app.base
+            ))
+            .query(&[
+                ("mount", digest.as_str()),
+                ("from", "mount_rollback/source-image"),
+            ])
+            .bearer_auth(&token)
+            .send()
+    };
+
+    let fault = fail_db_writes(&app.db, "oci_blob", DbWrite::Insert).await;
+    let failed = mount().await.unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a mount whose target row was lost must not answer 201"
+    );
+    assert!(
+        !target.exists(),
+        "the first failed mount left unowned bytes at {}",
+        target.display()
+    );
+
+    fault.clear().await;
+    let healthy = mount().await.unwrap();
+    assert_eq!(healthy.status(), 201, "the healthy mount must succeed");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        payload,
+        "the successful mount stored different bytes"
+    );
+
+    let fault = fail_db_writes(&app.db, "oci_blob", DbWrite::Insert).await;
+    let failed_retry = mount().await.unwrap();
+    assert_eq!(
+        failed_retry.status(),
+        500,
+        "the injected database failure must still reach the retrying client"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        payload,
+        "a failed repeated mount deleted the layer an earlier mount recorded"
+    );
+
+    fault.clear().await;
+    assert_eq!(
+        mount().await.unwrap().status(),
+        201,
+        "the repeated mount must be idempotent once the database is healthy"
+    );
+}
+
 /// Where a finalized OCI layer lands once the blob store accepts it.
 fn oci_blob_path(
     repo_root: &std::path::Path,

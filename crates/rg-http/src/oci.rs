@@ -1182,19 +1182,52 @@ async fn handle_mount(
         }
     }
 
+    // The row that owns the mounted blob must exist before bytes are copied.
+    // Otherwise a repository-row failure leaves an object behind that no OCI
+    // read or reclamation path can discover.
+    let oci_repo = match find_or_create_oci_repo(&state.db, owner, repo).await {
+        Ok(repo) => repo,
+        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    };
+
     // Copy blob file via hardlink (or fallback to streaming copy) — avoids memory copy
     match state
         .oci_storage
         .copy_blob_file(from_owner, from_repo, owner, repo, mount_digest)
         .await
     {
-        Ok(_) => {
-            let location = format!("/v2/{owner}/{repo}/blobs/{mount_digest}");
+        Ok(blob) => {
+            let FinalizedBlob {
+                digest,
+                size,
+                storage_path,
+                published,
+            } = blob;
+            if let Err(error) = rg_db::ops::oci_ops::insert_blob(
+                &state.db,
+                oci_repo.id,
+                &digest,
+                "application/octet-stream",
+                size,
+                &storage_path,
+            )
+            .await
+            {
+                rollback_unrecorded_blob(state, owner, repo, &digest, &storage_path, published)
+                    .await;
+                return oci_err(
+                    oci_status_for(&error),
+                    "UNKNOWN",
+                    &format!("failed to record mounted blob {digest}: {error}"),
+                );
+            }
+
+            let location = format!("/v2/{owner}/{repo}/blobs/{digest}");
             (
                 StatusCode::CREATED,
                 [
                     (header::LOCATION, location.as_str()),
-                    (DOCKER_CONTENT_DIGEST, mount_digest),
+                    (DOCKER_CONTENT_DIGEST, digest.as_str()),
                 ],
                 String::new(),
             )
@@ -1205,6 +1238,43 @@ async fn handle_mount(
             "UNKNOWN",
             &format!("{e:#}"),
         ),
+    }
+}
+
+/// Remove bytes published by a request whose database row was not recorded.
+///
+/// A deduplicated publish must never be rolled back: those bytes predate this
+/// request and may already be referenced by a successful push or mount.
+async fn rollback_unrecorded_blob(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    digest: &str,
+    storage_path: &str,
+    published: bool,
+) {
+    if !published {
+        return;
+    }
+
+    let cleanup = match rg_core::blob_storage::BlobKey::new(storage_path) {
+        Ok(key) => state
+            .blob_storage
+            .delete(&key)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(reason) = cleanup {
+        tracing::warn!(
+            %owner,
+            %repo,
+            %digest,
+            %storage_path,
+            error = %reason,
+            "orphaned OCI blob: the oci_blobs row was not created and the rollback delete failed too"
+        );
     }
 }
 
@@ -1423,27 +1493,8 @@ pub async fn complete_upload(
                 // Duplicate digests never enter this branch. A real database
                 // failure must still reach the client, so a failed rollback
                 // can only be reported here.
-                if published {
-                    let cleanup = match rg_core::blob_storage::BlobKey::new(&storage_path) {
-                        Ok(key) => state
-                            .blob_storage
-                            .delete(&key)
-                            .await
-                            .err()
-                            .map(|error| error.to_string()),
-                        Err(error) => Some(error.to_string()),
-                    };
-                    if let Some(reason) = cleanup {
-                        tracing::warn!(
-                            %owner,
-                            %repo,
-                            %digest,
-                            storage_path = %storage_path,
-                            error = %reason,
-                            "orphaned OCI blob: the oci_blobs row was not created and the rollback delete failed too — the blob stays in storage with no row pointing at it, and OCI GC walks rows"
-                        );
-                    }
-                }
+                rollback_unrecorded_blob(&state, &owner, &repo, &digest, &storage_path, published)
+                    .await;
                 return oci_err(
                     oci_status_for(&e),
                     "UNKNOWN",

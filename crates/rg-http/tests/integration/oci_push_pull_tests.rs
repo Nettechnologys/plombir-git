@@ -63,6 +63,133 @@ async fn push_blob(base: &str, token: &str, owner: &str, repo: &str, payload: &[
     digest
 }
 
+async fn mount_blob(
+    base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    digest: &str,
+    from: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v2/{owner}/{repo}/blobs/uploads/"))
+        .query(&[("mount", digest), ("from", from)])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A cross-repository mount is a complete publish, not just a storage copy.
+///
+/// The row is what supplies HEAD's size and what `put_manifest` increments. A
+/// 201 with only the bytes present makes the layer look healthy while silently
+/// dropping its reference accounting.
+#[tokio::test]
+async fn a_cross_repository_mount_records_the_blob_and_its_manifest_reference() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_mount", "oci_mount@example.com").await;
+    create_repo(&base, &token, "source-image").await;
+    create_repo(&base, &token, "target-image").await;
+
+    let payload = b"forgekeep-cross-repository-layer";
+    let digest = push_blob(&base, &token, "oci_mount", "source-image", payload).await;
+
+    for attempt in 0..2 {
+        let mounted = mount_blob(
+            &base,
+            &token,
+            "oci_mount",
+            "target-image",
+            &digest,
+            "oci_mount/source-image",
+        )
+        .await;
+        let status = mounted.status();
+        let returned_digest = mounted
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = mounted.text().await.unwrap();
+        assert_eq!(
+            status, 201,
+            "mount attempt {attempt} failed instead of being idempotent: {body}"
+        );
+        assert_eq!(returned_digest.as_deref(), Some(digest.as_str()));
+    }
+
+    let head = client
+        .head(format!("{base}/v2/oci_mount/target-image/blobs/{digest}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    let expected_size = payload.len().to_string();
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_size.as_str()),
+        "HEAD must report the mounted blob's stored size, not zero"
+    );
+
+    let forgekeep_repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "oci_mount", "target-image")
+            .await
+            .unwrap()
+            .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+        .await
+        .unwrap()
+        .expect("the mount must create the target OCI repository row");
+    let mounted_blob = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &digest)
+        .await
+        .unwrap()
+        .expect("the 201 mount must create the target blob row");
+    assert_eq!(mounted_blob.size, payload.len() as i64);
+    assert_eq!(mounted_blob.ref_count, 0);
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": DOCKER_MANIFEST_V2,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": payload.len(),
+            "digest": digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let pushed = client
+        .put(format!(
+            "{base}/v2/oci_mount/target-image/manifests/mounted"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+        .body(manifest)
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let body = pushed.text().await.unwrap();
+    assert_eq!(
+        status, 201,
+        "manifest push over mounted blob failed: {body}"
+    );
+
+    let referenced = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        referenced.ref_count, 1,
+        "put_manifest must find and count the mounted blob row"
+    );
+}
+
 /// A `docker push` of an image manifest must be accepted, and pull back byte
 /// for byte.
 #[tokio::test]

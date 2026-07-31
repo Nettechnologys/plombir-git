@@ -24,8 +24,8 @@ const UPLOAD_DIR_HINT: &str =
 /// A blob that has reached its content-addressed key, and how it got there.
 ///
 /// `published` is the part the caller cannot work out for itself, and it decides
-/// whether a failure further along may roll the bytes back. Finalizing is
-/// deduplicating: a key that already holds these bytes is accepted as-is and
+/// whether a failure further along may roll the bytes back. Finalizing and
+/// cross-repository copying are deduplicating: a key that already holds these bytes is accepted as-is and
 /// nothing is written. Rolling *that* back would delete the object an earlier,
 /// successful push already recorded a row for — turning a leaked blob into an
 /// unpullable image. Only the caller that actually published may compensate.
@@ -240,29 +240,40 @@ impl OciStorage {
         dst_owner: &str,
         dst_repo: &str,
         digest: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<FinalizedBlob> {
         let source = self.blob_key(src_owner, src_repo, digest)?;
         let destination = self.blob_key(dst_owner, dst_repo, digest)?;
         if self.backend.exists(&destination).await? {
-            return Ok(destination.to_string());
+            let size = self.backend.metadata(&destination).await?.size as i64;
+            return Ok(FinalizedBlob {
+                digest: digest.to_string(),
+                size,
+                storage_path: destination.to_string(),
+                published: false,
+            });
         }
 
-        if self.backend.exists(&source).await? {
+        let metadata = if self.backend.exists(&source).await? {
             if let Some(path) = self.backend.local_path(&source) {
-                self.backend.put_file(&destination, &path).await?;
+                self.backend.put_file(&destination, &path).await?
             } else {
                 let data = self.backend.get(&source).await?;
-                self.backend.put(&destination, &data).await?;
+                self.backend.put(&destination, &data).await?
             }
         } else if let Some(path) = self
             .legacy_blob_path(src_owner, src_repo, digest)
             .filter(|path| path.is_file())
         {
-            self.backend.put_file(&destination, &path).await?;
+            self.backend.put_file(&destination, &path).await?
         } else {
             anyhow::bail!("source blob not found: {digest}");
-        }
-        Ok(destination.to_string())
+        };
+        Ok(FinalizedBlob {
+            digest: digest.to_string(),
+            size: metadata.size as i64,
+            storage_path: destination.to_string(),
+            published: true,
+        })
     }
 
     pub async fn store_manifest(
