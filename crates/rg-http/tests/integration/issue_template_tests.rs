@@ -1,4 +1,4 @@
-use crate::common::{create_repo, register_user, spawn_test_app};
+use crate::common::{create_repo, register_user, spawn_test_app, spawn_test_app_with_repo_root};
 use serde_json::{json, Value};
 
 const PASSWORD: &str = "Qz7$wRtm";
@@ -224,4 +224,105 @@ async fn private_repository_templates_require_read_access() {
         .await
         .unwrap();
     assert_eq!(owner_response.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn invalid_issue_config_is_a_sanitized_client_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let client = reqwest::Client::new();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("invalidcfg{}", &suffix[..8]);
+    let repo = format!("templates{}", &suffix[..8]);
+    let token = register_user(&base, &owner, &format!("{owner}@example.com"), PASSWORD).await;
+    create_repo(&base, &token, &repo).await;
+
+    put_file(
+        &client,
+        &base,
+        &token,
+        &owner,
+        &repo,
+        ".gitea/ISSUE_TEMPLATE/config.yml",
+        "contact_links:\n  - name: missing fields\n    url: [not valid YAML\n",
+    )
+    .await;
+
+    let response = client
+        .get(format!("{base}/api/v1/repos/{owner}/{repo}/issue_config"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "invalid issue template config");
+    assert!(
+        !body.to_string().contains(&repo_root.display().to_string()),
+        "the client error must not expose the repository root: {body}"
+    );
+
+    let validation = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issue_config/validate"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(validation.status(), reqwest::StatusCode::OK);
+    let validation: Value = validation.json().await.unwrap();
+    assert_eq!(validation["valid"], false);
+    assert!(
+        validation["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid issue template config YAML"),
+        "the validation endpoint should retain the user-actionable parse error: {validation}"
+    );
+    assert!(
+        !validation
+            .to_string()
+            .contains(&repo_root.display().to_string()),
+        "the validation response must not expose the repository root: {validation}"
+    );
+}
+
+#[tokio::test]
+async fn missing_repository_storage_is_a_server_error_for_all_template_reads() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let client = reqwest::Client::new();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("missinggit{}", &suffix[..8]);
+    let repo = format!("templates{}", &suffix[..8]);
+    let token = register_user(&base, &owner, &format!("{owner}@example.com"), PASSWORD).await;
+    create_repo(&base, &token, &repo).await;
+
+    let bare_repo = repo_root.join(&owner).join(format!("{repo}.git"));
+    assert!(
+        bare_repo.is_dir(),
+        "precondition: repository storage should exist at {}",
+        bare_repo.display()
+    );
+    std::fs::remove_dir_all(&bare_repo).unwrap();
+
+    for endpoint in [
+        "issue_templates",
+        "issue_config",
+        "issue_config/validate",
+        "pull_request_template",
+    ] {
+        let response = client
+            .get(format!("{base}/api/v1/repos/{owner}/{repo}/{endpoint}"))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(
+            status.is_server_error(),
+            "{endpoint} must report missing repository storage as 5xx, got {status}: {body}"
+        );
+        assert!(
+            !body.contains(&repo_root.display().to_string()),
+            "{endpoint} must not expose the repository root: {body}"
+        );
+    }
 }

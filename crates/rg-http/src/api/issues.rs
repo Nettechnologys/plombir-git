@@ -117,7 +117,7 @@ pub async fn get_issue_config(
     .await
     {
         Ok(Ok(config)) => (StatusCode::OK, Json(config)).into_response(),
-        Ok(Err(error)) => AppError::bad_request(error).into_response(),
+        Ok(Err(error)) => AppError::from(error).into_response(),
         Err(error) => AppError::internal(error).into_response(),
     }
 }
@@ -153,11 +153,20 @@ pub async fn validate_issue_config(
         .into_response(),
         // Telling the caller *why* the config is invalid is this endpoint's
         // entire job, so it must not drop the inner cause (card_a997f30c142c).
-        Ok(Err(error)) => Json(IssueConfigValidation {
-            valid: false,
-            message: format!("{error:#}"),
-        })
-        .into_response(),
+        // Storage failures carry no InvalidRequest marker and must stay 5xx
+        // rather than masquerading as a bad repository-owned config.
+        Ok(Err(error))
+            if error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some() =>
+        {
+            Json(IssueConfigValidation {
+                valid: false,
+                message: format!("{error:#}"),
+            })
+            .into_response()
+        }
+        Ok(Err(error)) => AppError::from(error).into_response(),
         Err(error) => AppError::internal(error).into_response(),
     }
 }

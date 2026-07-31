@@ -136,9 +136,16 @@ pub fn read_issue_config(repository_path: &Path, default_branch: &str) -> Result
         else {
             continue;
         };
-        let config: IssueConfig =
-            serde_yaml::from_str(&content).context("invalid issue template config YAML")?;
-        validate_config(&config)?;
+        let config: IssueConfig = serde_yaml::from_str(&content)
+            .context(crate::error::InvalidRequest::new(
+                "invalid issue template config",
+            ))
+            .context("invalid issue template config YAML")?;
+        validate_config(&config)
+            .context(crate::error::InvalidRequest::new(
+                "invalid issue template config",
+            ))
+            .context("invalid issue template config contents")?;
         return Ok(config);
     }
     Ok(IssueConfig::default())
@@ -169,16 +176,24 @@ fn verified_branch_ref(
     default_branch: &str,
 ) -> Result<Option<String>> {
     let branch_ref = format!("refs/heads/{default_branch}");
-    let commit_spec = format!("{branch_ref}^{{commit}}");
     let output = git.run(
-        &["rev-parse", "--verify", &commit_spec],
+        &["show-ref", "--verify", "--quiet", &branch_ref],
         Some(repository_path),
     )?;
-    if output.success() {
-        Ok(Some(branch_ref))
-    } else {
-        Ok(None)
+    if !output.success() {
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        output.ensure_success()?;
     }
+
+    let commit_spec = format!("{branch_ref}^{{commit}}");
+    let output = git.run(
+        &["rev-parse", "--verify", "--quiet", &commit_spec],
+        Some(repository_path),
+    )?;
+    output.ensure_success()?;
+    Ok(Some(branch_ref))
 }
 
 fn list_directory(
@@ -187,19 +202,19 @@ fn list_directory(
     git_ref: &str,
     directory: &str,
 ) -> Result<Vec<String>> {
-    let treeish = format!("{git_ref}:{directory}");
+    let pathspec = format!("{directory}/");
     let output = git.run(
-        &["ls-tree", "-z", "--name-only", &treeish],
+        &["ls-tree", "-rz", "--name-only", git_ref, "--", &pathspec],
         Some(repository_path),
     )?;
-    if !output.success() {
-        return Ok(Vec::new());
-    }
+    output.ensure_success()?;
+    let prefix = format!("{directory}/");
     let mut names: Vec<String> = output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
         .filter_map(|name| std::str::from_utf8(name).ok().map(str::to_string))
+        .filter_map(|name| name.strip_prefix(&prefix).map(str::to_string))
         .filter(|name| !name.contains('/'))
         .collect();
     names.sort();
@@ -212,11 +227,22 @@ fn try_read_text_blob(
     git_ref: &str,
     path: &str,
 ) -> Result<Option<String>> {
-    let object = format!("{git_ref}:{path}");
-    let output = git.run(&["cat-file", "blob", &object], Some(repository_path))?;
-    if !output.success() {
+    let listing = git.run(
+        &["ls-tree", "-z", "--name-only", git_ref, "--", path],
+        Some(repository_path),
+    )?;
+    listing.ensure_success()?;
+    if !listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .any(|name| name == path.as_bytes())
+    {
         return Ok(None);
     }
+
+    let object = format!("{git_ref}:{path}");
+    let output = git.run(&["cat-file", "blob", &object], Some(repository_path))?;
+    output.ensure_success()?;
     decode_template_content(path, output.stdout).map(Some)
 }
 
