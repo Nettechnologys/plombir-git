@@ -15,6 +15,10 @@ import path from 'node:path';
 const root = process.cwd();
 const wsPath = path.join(root, 'web/src/lib/api/websockets.ts');
 const source = readFileSync(wsPath, 'utf8');
+const notificationsPage = readFileSync(
+  path.join(root, 'web/src/routes/notifications/+page.svelte'),
+  'utf8',
+);
 
 const failures = [];
 
@@ -70,6 +74,27 @@ reject(
   /new\s+WebSocket\s*\([^)]*window\.location\.host/,
   'Notification WebSocket must not use the frontend host directly',
 );
+
+// A rejected handshake fires `error` + `close`, but never `open`; browsers do
+// not expose its HTTP status. Do not turn that observable shape into a retry
+// loop, and re-check the live auth store before retrying a previously-open socket.
+expect(
+  /ws\.onopen\s*=\s*\(\)\s*=>\s*\{[\s\S]*?opened\s*=\s*true/,
+  'Notification WebSocket must remember whether the handshake reached open',
+);
+expect(
+  /ws\.onclose\s*=\s*\(\)\s*=>\s*\{[\s\S]*?if\s*\(\s*!opened\s*\)\s*return[\s\S]*?if\s*\(\s*!shouldReconnect\s*\(\s*\)\s*\)\s*return/,
+  'Notification WebSocket must not retry a failed handshake and must re-check auth before reconnecting',
+);
+expect(
+  /connectNotificationWebSocket\s*\(\s*onMessage\s*,\s*onError\s*,\s*shouldReconnect\s*\)/,
+  'Notification WebSocket recursion must preserve the auth predicate',
+);
+if (
+  !/connectNotificationWebSocket\s*\([\s\S]*?isLoggedIn\s*,\s*\)/.test(notificationsPage)
+) {
+  failures.push('Notifications page must gate reconnects on the live auth store');
+}
 
 if (failures.length > 0) {
   for (const failure of failures) {

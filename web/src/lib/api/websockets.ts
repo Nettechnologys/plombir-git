@@ -10,10 +10,16 @@ function withWebSocketApiBase(path: string): string {
 export function connectNotificationWebSocket(
   onMessage: (event: { event_type: string; data: any }) => void,
   onError?: (err: Event) => void,
+  shouldReconnect: () => boolean = () => true,
 ): WebSocket | null {
   // WebSocket auth uses the HttpOnly cookie sent by the browser for same-origin
   // upgrades. The backend validates the cookie before accepting the connection.
   const ws = new WebSocket(withWebSocketApiBase('/ws/notifications'));
+  let opened = false;
+
+  ws.onopen = () => {
+    opened = true;
+  };
 
   ws.onmessage = (event) => {
     try {
@@ -29,8 +35,13 @@ export function connectNotificationWebSocket(
   };
 
   ws.onclose = () => {
+    // A failed handshake (including 401) never reaches `open`. Retrying that
+    // shape forever only repeats an answer that JavaScript cannot inspect.
+    if (!opened) return;
+
     setTimeout(() => {
-      connectNotificationWebSocket(onMessage, onError);
+      if (!shouldReconnect()) return;
+      connectNotificationWebSocket(onMessage, onError, shouldReconnect);
     }, 5000);
   };
 

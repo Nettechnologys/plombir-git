@@ -261,7 +261,7 @@ pub async fn ws_notifications_handler(
     Query(query): Query<WsQuery>,
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     // M-4/M-5: the cookie is the browser's only shape here, so the reading of
     // it belongs with the constant that names it — see `api::auth::ws_session`.
     let WsSession {
@@ -269,57 +269,37 @@ pub async fn ws_notifications_handler(
         user_id,
     } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
 
+    let Some(user_id) = user_id else {
+        return crate::error::AppError::unauthorized("authentication required").into_response();
+    };
+
     let upgrade = if let Some(proto) = protocol_echo {
         ws.protocols([proto])
     } else {
         ws
     };
 
-    upgrade.on_upgrade(move |socket| handle_ws_connection(socket, state, user_id))
+    upgrade
+        .on_upgrade(move |socket| handle_ws_connection(socket, state, user_id))
+        .into_response()
 }
 
 /// Handle an individual WebSocket connection.
-async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: Option<i64>) {
+async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: i64) {
     let hub = state.notification_hub.clone();
     let (mut sender, mut receiver) = socket.split();
 
-    if user_id.is_none() {
-        if sender
-            .send(Message::Text(
-                serde_json::json!({"error": "authentication required"})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .is_err()
-        {
-            // Client disconnected before the authentication error was sent.
-        }
-        if sender.close().await.is_err() {
-            // Client already disconnected.
-        }
-        return;
-    }
-
-    // user_id is guaranteed Some at this point due to the guard above.
-    let Some(uid) = user_id else {
-        tracing::error!("user_id became None after guard check — this is a logic bug");
-        return;
-    };
-    tracing::info!(
-        user_id = uid,
-        "WebSocket client connected for notifications"
-    );
+    tracing::info!(user_id, "WebSocket client connected for notifications");
     let _ws_guard = WsConnGuard::new();
 
     // General notifications never receive job logs. Those are isolated on
     // the dedicated /ws/job/:job_id endpoint.
-    let mut user_rx = hub.subscribe_user(uid).await;
+    let mut user_rx = hub.subscribe_user(user_id).await;
 
     // Send initial connection confirmation
     let welcome = serde_json::json!({
         "type": "connected",
-        "user_id": uid,
+        "user_id": user_id,
     });
     if sender
         .send(Message::Text(welcome.to_string().into()))
@@ -327,7 +307,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: Optio
         .is_err()
     {
         drop(user_rx);
-        hub.cleanup_user_channel(uid).await;
+        hub.cleanup_user_channel(user_id).await;
         return;
     }
 
@@ -336,9 +316,9 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: Optio
     loop {
         tokio::select! {
             _ = recheck.tick() => {
-                if !account_still_stands(&state.db, uid).await {
+                if !account_still_stands(&state.db, user_id).await {
                     tracing::warn!(
-                        user_id = uid,
+                        user_id,
                         "closing a notification WebSocket: its account no longer stands"
                     );
                     if sender
@@ -366,7 +346,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: Optio
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(user_id = uid, skipped, "notification WebSocket lagged");
+                    tracing::warn!(user_id, skipped, "notification WebSocket lagged");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -383,8 +363,8 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: Optio
     }
 
     drop(user_rx);
-    hub.cleanup_user_channel(uid).await;
-    tracing::info!(user_id = uid, "WebSocket client disconnected");
+    hub.cleanup_user_channel(user_id).await;
+    tracing::info!(user_id, "WebSocket client disconnected");
 }
 
 /// Push a notification to the WebSocket hub for real-time delivery.

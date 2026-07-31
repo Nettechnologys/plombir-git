@@ -15,19 +15,18 @@
 
 use crate::common::{register_full, spawn_test_app};
 use futures::StreamExt;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error, Message};
 
 /// Open `/ws/notifications` the way a browser does — a `Cookie` header, no
 /// `Authorization`, no subprotocol — and read the first frame back.
 ///
 /// Returns the handshake status, whichever subprotocol the server selected, and
-/// the first frame's text. The socket is opened even for a caller with no
-/// session: this endpoint reports the refusal in a frame rather than failing the
-/// upgrade, so the frame is where both answers live.
+/// the first frame's text. A refused handshake stays an `Error::Http`, so callers
+/// can prove that authentication failed before the protocol switched.
 async fn open_notification_socket(
     base: &str,
     cookie: Option<&str>,
-) -> (u16, Option<String>, String) {
+) -> Result<(u16, Option<String>, String), Error> {
     let url = format!(
         "{}/api/v1/ws/notifications",
         base.replacen("http://", "ws://", 1)
@@ -39,9 +38,7 @@ async fn open_notification_socket(
             .insert("cookie", cookie.parse().expect("cookie header value"));
     }
 
-    let (mut socket, response) = tokio_tungstenite::connect_async(request)
-        .await
-        .expect("the notification socket accepts the upgrade");
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await?;
     let status = response.status().as_u16();
     let selected_protocol = response
         .headers()
@@ -66,7 +63,7 @@ async fn open_notification_socket(
     if socket.close(None).await.is_err() {
         // The server may have closed first — the frame above is the assertion.
     }
-    (status, selected_protocol, frame)
+    Ok((status, selected_protocol, frame))
 }
 
 /// A browser holding only the session cookie must be greeted as the account that
@@ -82,7 +79,9 @@ async fn a_cookie_session_may_open_the_notification_socket_and_an_anonymous_call
     let (jwt, user_id) = register_full(&base, "wscookie", "wscookie@example.com").await;
 
     let (status, selected_protocol, welcome) =
-        open_notification_socket(&base, Some(&format!("forgekeep_token={jwt}"))).await;
+        open_notification_socket(&base, Some(&format!("forgekeep_token={jwt}")))
+            .await
+            .expect("a valid cookie must open the notification socket");
     assert_eq!(status, 101, "the cookie handshake was not upgraded");
     assert_eq!(
         selected_protocol, None,
@@ -97,13 +96,11 @@ async fn a_cookie_session_may_open_the_notification_socket_and_an_anonymous_call
         "the greeting must name the account that owns the cookie, got {welcome}"
     );
 
-    let (status, _, refusal) = open_notification_socket(&base, None).await;
-    assert_eq!(status, 101);
-    assert!(
-        refusal.contains("authentication required"),
-        "a handshake with no session must be refused — the greeting above proves \
-         the fixture works, got {refusal}"
-    );
+    let refusal = open_notification_socket(&base, None).await;
+    match refusal {
+        Err(Error::Http(response)) => assert_eq!(response.status(), 401),
+        other => panic!("expected an unauthorized WebSocket handshake, got {other:?}"),
+    }
 }
 
 /// A cookie under any other name is not a session.
@@ -117,10 +114,9 @@ async fn a_cookie_under_another_name_does_not_authenticate_the_notification_sock
     let base = spawn_test_app().await;
     let (jwt, _) = register_full(&base, "wsothername", "wsothername@example.com").await;
 
-    let (_, _, refusal) =
-        open_notification_socket(&base, Some(&format!("forgekeep_session={jwt}"))).await;
-    assert!(
-        refusal.contains("authentication required"),
-        "a valid JWT under the wrong cookie name was accepted as a session, got {refusal}"
-    );
+    let refusal = open_notification_socket(&base, Some(&format!("forgekeep_session={jwt}"))).await;
+    match refusal {
+        Err(Error::Http(response)) => assert_eq!(response.status(), 401),
+        other => panic!("a valid JWT under the wrong cookie name was accepted: {other:?}"),
+    }
 }

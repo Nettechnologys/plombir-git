@@ -68,9 +68,9 @@
       () => {
         wsConnected = false;
       },
+      isLoggedIn,
     );
     if (ws) {
-      wsConnected = true;
       ws.addEventListener('open', () => { wsConnected = true; });
       ws.addEventListener('close', () => { wsConnected = false; });
     }
