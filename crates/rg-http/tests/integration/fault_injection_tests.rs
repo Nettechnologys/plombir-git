@@ -154,6 +154,116 @@ fn oci_blob_path(
         .join(hash)
 }
 
+/// Re-uploading content the repository already owns is a successful no-op.
+///
+/// Docker may skip the preliminary HEAD, and retries routinely send the same
+/// layer again. The distribution contract is 201 plus a retrievable, unchanged
+/// blob — never a database constraint diagnostic.
+#[tokio::test]
+async fn a_second_push_of_the_same_blob_is_idempotent() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&app.base, "oci_retry", "oci_retry@example.com").await;
+    create_repo(&app.base, &token, "same-layer").await;
+
+    let payload = b"forgekeep-idempotent-layer";
+    let digest = push_blob(&app.base, &token, "oci_retry", "same-layer", payload).await;
+    let blob = oci_blob_path(&app.repo_root, "oci_retry", "same-layer", &digest);
+    let original = std::fs::read(&blob).expect("the first push must store the layer");
+
+    let location = start_upload(&app.base, &token, "oci_retry", "same-layer", payload).await;
+    let finish = client
+        .put(format!("{app_base}{location}", app_base = app.base))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let status = finish.status();
+    let returned_digest = finish
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = finish.text().await.unwrap();
+
+    assert_eq!(status, 201, "the repeated push failed: {body}");
+    assert_eq!(returned_digest.as_deref(), Some(digest.as_str()));
+    assert!(
+        !body.contains("UNIQUE constraint"),
+        "a database constraint escaped through the OCI response: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&blob).expect("the repeated push must keep the layer"),
+        original,
+        "the no-op push changed the bytes already stored under the digest"
+    );
+
+    let head = client
+        .head(format!(
+            "{app_base}/v2/oci_retry/same-layer/blobs/{digest}",
+            app_base = app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.status(),
+        200,
+        "the repeated layer must remain readable"
+    );
+}
+
+/// Two clients can both miss the preliminary HEAD and finalize the same layer.
+/// The unique index is the serialization point; neither winner is an error.
+#[tokio::test]
+async fn concurrent_pushes_of_the_same_blob_both_succeed() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&app.base, "oci_race", "oci_race@example.com").await;
+    create_repo(&app.base, &token, "same-layer").await;
+
+    let payload = b"forgekeep-concurrent-layer";
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
+    );
+    let first = start_upload(&app.base, &token, "oci_race", "same-layer", payload).await;
+    let second = start_upload(&app.base, &token, "oci_race", "same-layer", payload).await;
+
+    let finish = |location: String| {
+        client
+            .put(format!("{app_base}{location}", app_base = app.base))
+            .query(&[("digest", digest.as_str())])
+            .bearer_auth(&token)
+            .send()
+    };
+    let (first, second) = tokio::join!(finish(first), finish(second));
+
+    for response in [first.unwrap(), second.unwrap()] {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 201, "one concurrent finalize lost the race: {body}");
+        assert!(
+            !body.contains("UNIQUE constraint"),
+            "a database constraint escaped through the OCI response: {body}"
+        );
+    }
+
+    let fetched = client
+        .get(format!(
+            "{app_base}/v2/oci_race/same-layer/blobs/{digest}",
+            app_base = app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), 200);
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
+}
+
 /// A push whose blob row was never written must not keep the bytes.
 ///
 /// Every route to an OCI blob — reclamation included — goes through its
@@ -226,10 +336,11 @@ async fn a_failed_repush_does_not_delete_the_layer_an_earlier_push_stored() {
     let blob = oci_blob_path(&app.repo_root, "oci_dedup", "shared-layer", &digest);
     assert!(blob.exists(), "the first push must store the layer");
 
-    // A second push of the identical layer takes the dedup branch and then
-    // fails to record a row (here because the row already exists — the same
-    // shape a concurrent push produces).
+    // A second push of the identical layer takes the storage dedup branch. The
+    // row write then fails for a real database reason, not because the row is a
+    // harmless duplicate; that conflict is now an idempotent success.
     let location = start_upload(&app.base, &token, "oci_dedup", "shared-layer", payload).await;
+    let fault = fail_db_writes(&app.db, "oci_blob", DbWrite::Insert).await;
     let finish = client
         .put(format!("{app_base}{location}", app_base = app.base))
         .query(&[("digest", digest.as_str())])
@@ -237,10 +348,12 @@ async fn a_failed_repush_does_not_delete_the_layer_an_earlier_push_stored() {
         .send()
         .await
         .unwrap();
-    assert!(
-        finish.status().is_client_error() || finish.status().is_server_error(),
-        "this scenario is only meaningful while the duplicate row is refused (card_eff9561d6171)"
+    assert_eq!(
+        finish.status(),
+        500,
+        "a real INSERT failure must not be mistaken for an idempotent duplicate"
     );
+    fault.clear().await;
 
     assert!(
         blob.exists(),

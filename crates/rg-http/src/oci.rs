@@ -1387,7 +1387,9 @@ pub async fn complete_upload(
                 storage_path,
                 published,
             } = blob;
-            // Record blob in DB.
+            // Record blob in DB. `insert_blob` treats the content-addressed
+            // `(repository, digest)` conflict as an idempotent success, so a
+            // retry and two concurrent finalizers both reach the 201 below.
             //
             // The bytes are already in blob storage; without this row nothing
             // can find them. Answering `201 Created` anyway is how a push
@@ -1418,8 +1420,9 @@ pub async fn complete_upload(
                 // failed push by making somebody else's image unpullable, which
                 // is strictly worse than the leak this compensates.
                 //
-                // The client must still get the DB failure either way, so a
-                // failed rollback can only be reported here.
+                // Duplicate digests never enter this branch. A real database
+                // failure must still reach the client, so a failed rollback
+                // can only be reported here.
                 if published {
                     let cleanup = match rg_core::blob_storage::BlobKey::new(&storage_path) {
                         Ok(key) => state

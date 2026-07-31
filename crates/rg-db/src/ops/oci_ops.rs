@@ -4,7 +4,7 @@
 
 use crate::entities::{oci_blob, oci_manifest, oci_repository, oci_upload};
 use chrono::Utc;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::*;
 
 // ── OCI Repository ─────────────────────────────────────────
@@ -177,7 +177,12 @@ pub async fn find_blob(
         .await
 }
 
-/// Insert a new blob record.
+/// Insert a blob record unless this repository already owns the digest.
+///
+/// OCI blob uploads are content-addressed and idempotent: a client retry or two
+/// concurrent finalizers can legitimately reach this write for the same
+/// `(repository, digest)`. Keep that conflict inside the statement so both
+/// requests succeed atomically; every other database failure still propagates.
 pub async fn insert_blob(
     db: &DatabaseConnection,
     oci_repo_id: i64,
@@ -185,7 +190,7 @@ pub async fn insert_blob(
     media_type: &str,
     size: i64,
     storage_path: &str,
-) -> Result<oci_blob::Model, DbErr> {
+) -> Result<(), DbErr> {
     let now = Utc::now();
     let m = oci_blob::ActiveModel {
         id: NotSet,
@@ -197,7 +202,18 @@ pub async fn insert_blob(
         ref_count: Set(0),
         created_at: Set(now),
     };
-    m.insert(db).await
+    oci_blob::Entity::insert(m)
+        .on_conflict(
+            OnConflict::columns([oci_blob::Column::OciRepositoryId, oci_blob::Column::Digest])
+                // MySQL has no conflict target and needs a harmless assignment as
+                // its DO NOTHING polyfill. PostgreSQL and SQLite emit DO NOTHING
+                // for the two columns above.
+                .do_nothing_on([oci_blob::Column::Id])
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
+    Ok(())
 }
 
 /// Increment blob reference count.
