@@ -1491,26 +1491,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("broken-history");
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&worktree)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "ForgeKeep Test")
-                .env("GIT_AUTHOR_EMAIL", "forgekeep@example.test")
-                .env("GIT_COMMITTER_NAME", "ForgeKeep Test")
-                .env("GIT_COMMITTER_EMAIL", "forgekeep@example.test")
-                .output()
+            let output = rg_git::cli_gateway::global_gateway()
+                .as_ref()
+                .expect("git gateway must initialize")
+                .run(args, Some(&worktree))
                 .expect("git must run");
             assert!(
-                output.status.success(),
+                output.success(),
                 "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                output.stderr_str()
             );
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            output.stdout_str().trim().to_string()
         };
 
         std::fs::create_dir_all(&worktree).unwrap();
         git(&["init", "-q"]);
+        git(&["config", "user.name", "ForgeKeep Test"]);
+        git(&["config", "user.email", "forgekeep@example.test"]);
         std::fs::write(worktree.join("history.txt"), "first\n").unwrap();
         git(&["add", "history.txt"]);
         git(&["commit", "-q", "-m", "first"]);
