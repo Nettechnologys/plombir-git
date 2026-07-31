@@ -116,35 +116,116 @@ async fn finish_entry(
         serde_json::json!({"entry_id": entry.id, "strategy": entry.strategy}),
     )
     .await?;
-    if let Ok(Some(repository)) = repository::Entity::find_by_id(entry.repo_id).one(db).await {
-        cleanup_merge_group_ref(db, repo_root, &repository, entry.pr_id).await;
+    match repository::Entity::find_by_id(entry.repo_id).one(db).await {
+        Ok(Some(repository)) => {
+            cleanup_merge_group_ref(db, repo_root, &repository, entry.pr_id).await;
+        }
+        Ok(None) => tracing::warn!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            repo_id = entry.repo_id,
+            "{STALE_REF}: the queue entry's repository row is gone"
+        ),
+        Err(error) => tracing::warn!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            repo_id = entry.repo_id,
+            error = %format!("{error:#}"),
+            "{STALE_REF}: the queue entry's repository could not be read"
+        ),
     }
     Ok(finished)
 }
 
+/// Opening of every log line the cleanup below emits, so an operator can grep
+/// one phrase for the whole family instead of four different wordings.
+const STALE_REF: &str = "merge-group ref left behind";
+
+/// Delete the merge-group ref the entry created, best-effort.
+///
+/// Best-effort is the right contract: `cancel` and `finish_entry` have already
+/// committed the state change the caller was told about, and a ref that will not
+/// go away must not unwind it. Best-effort is *not* the same as silent, though —
+/// every failure below leaves a live `refs/merge-queue/{entry.id}` on disk, and
+/// with nothing logged that accumulation is indistinguishable from a clean run
+/// (card_75646d7b017b). Each failure therefore names the entry, the PR, the
+/// repository and the full cause chain.
 async fn cleanup_merge_group_ref(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
     pr_id: i64,
 ) {
-    let Some(entry) = merge_queue_ops::find_by_pr(db, pr_id).await.ok().flatten() else {
-        return;
+    let entry = match merge_queue_ops::find_by_pr(db, pr_id).await {
+        Ok(Some(entry)) => entry,
+        // No entry at all: there is no ref that could have been created.
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                pr_id,
+                repo_id = repository.id,
+                repo = %repository.name,
+                error = %format!("{error:#}"),
+                "{STALE_REF}: the queue entry that owns it could not be read"
+            );
+            return;
+        }
     };
     if entry.merge_group_sha.is_none() {
         return;
     }
-    let Ok(namespace) = service::repository_namespace(db, repository).await else {
-        return;
+    let namespace = match service::repository_namespace(db, repository).await {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            tracing::warn!(
+                entry_id = entry.id,
+                pr_id,
+                repo_id = repository.id,
+                repo = %repository.name,
+                error = %format!("{error:#}"),
+                "{STALE_REF}: the repository namespace could not be resolved"
+            );
+            return;
+        }
     };
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
     let group_ref = format!("refs/merge-queue/{}", entry.id);
-    if let Ok(git) = rg_git::cli_gateway::global_gateway().as_ref() {
-        if let Ok(output) = git.run(&["update-ref", "-d", &group_ref], Some(&repo_path)) {
-            if !output.success() {
-                tracing::warn!(entry_id = entry.id, "failed to delete merge-group ref");
-            }
+    let git = match rg_git::cli_gateway::global_gateway().as_ref() {
+        Ok(git) => git,
+        Err(error) => {
+            tracing::warn!(
+                entry_id = entry.id,
+                pr_id,
+                repo_id = repository.id,
+                repo = %repository.name,
+                git_ref = %group_ref,
+                error = %format!("{error:#}"),
+                "{STALE_REF}: the git gateway is unavailable"
+            );
+            return;
         }
+    };
+    match git.run(&["update-ref", "-d", &group_ref], Some(&repo_path)) {
+        Ok(output) if output.success() => {}
+        Ok(output) => tracing::warn!(
+            entry_id = entry.id,
+            pr_id,
+            repo_id = repository.id,
+            repo = %repository.name,
+            git_ref = %group_ref,
+            exit_code = ?output.status.code(),
+            stderr = %output.stderr_str().trim(),
+            "{STALE_REF}: git update-ref refused to delete it"
+        ),
+        Err(error) => tracing::warn!(
+            entry_id = entry.id,
+            pr_id,
+            repo_id = repository.id,
+            repo = %repository.name,
+            git_ref = %group_ref,
+            error = %format!("{error:#}"),
+            "{STALE_REF}: git update-ref could not be run"
+        ),
     }
 }
 
@@ -633,4 +714,363 @@ async fn process_for_head_commit_inner(
         });
     }
     Ok(results)
+}
+
+/// Deleting the merge-group ref is best-effort, so its failures never reach a
+/// caller — the log line is the only channel an operator has, and these tests
+/// hold every failure branch to producing one (card_75646d7b017b).
+#[cfg(test)]
+mod merge_group_ref_cleanup_tests {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, NotSet};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// `set_default` is thread-local and `#[tokio::test]` runs on the current
+    /// thread, so the guard covers the awaits too.
+    fn capture_warnings() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    async fn setup_db() -> DatabaseConnection {
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = sea_orm::Database::connect(options)
+            .await
+            .expect("connect in-memory database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    struct Fixture {
+        db: DatabaseConnection,
+        sandbox: tempfile::TempDir,
+        repo_root: std::path::PathBuf,
+        owner: rg_db::entities::user::Model,
+        repository: repository::Model,
+        pr: pull_request::Model,
+        entry: merge_queue_entry::Model,
+    }
+
+    /// A repository with a real bare git repo on disk, a PR, and a queued entry
+    /// that already owns a merge group — the state in which the cleanup has
+    /// something to delete.
+    async fn fixture(name: &str) -> Fixture {
+        let db = setup_db().await;
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            &format!("{name}-owner"),
+            &format!("{name}@example.invalid"),
+            "unused",
+            "Queue Owner",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create sandbox");
+        let repo_root = sandbox.path().join("repos");
+        let repository =
+            crate::repo::service::create_repo(&db, owner.id, name, None, false, &repo_root, None)
+                .await
+                .expect("create repository");
+        let now = Utc::now();
+        let pr = pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repository.id),
+            number: Set(1),
+            title: Set("queued".into()),
+            body: Set(None),
+            state: Set("open".into()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(owner.id),
+            reviewer_id: Set(None),
+            head_branch: Set("feature".into()),
+            base_branch: Set("main".into()),
+            head_sha: Set(None),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("create pull request");
+        let entry = merge_queue_ops::enqueue(&db, repository.id, pr.id, owner.id, "merge")
+            .await
+            .expect("enqueue");
+        // The cleanup is a no-op for an entry that never built a group, so the
+        // fixture has to claim one.
+        let entry = merge_queue_ops::set_merge_group(
+            &db,
+            entry.id,
+            "0000000000000000000000000000000000000000",
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            1,
+        )
+        .await
+        .expect("set merge group");
+        Fixture {
+            db,
+            sandbox,
+            repo_root,
+            owner,
+            repository,
+            pr,
+            entry,
+        }
+    }
+
+    fn git() -> &'static rg_git::cli_gateway::GitCommandGateway {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+    }
+
+    /// Point the entry's group ref at a real commit, so a successful delete is
+    /// distinguishable from a delete that had nothing to do.
+    fn create_group_ref(fixture: &Fixture) -> String {
+        let repo_path = fixture.repo_root.join(format!(
+            "{}/{}.git",
+            fixture.owner.username, fixture.repository.name
+        ));
+        // `hash-object` over an empty file yields the empty tree without needing
+        // a working copy or stdin; `commit-tree` then gives a real commit.
+        let empty = fixture.sandbox.path().join("empty");
+        std::fs::write(&empty, b"").expect("write empty file");
+        let tree = git()
+            .run(
+                &["hash-object", "-w", "-t", "tree", &empty.to_string_lossy()],
+                Some(&repo_path),
+            )
+            .expect("hash empty tree");
+        tree.ensure_success().expect("hash empty tree");
+        let tree = tree.stdout_str().trim().to_string();
+        let commit = git()
+            .run_with_env(
+                &["commit-tree", &tree, "-m", "group"],
+                Some(&repo_path),
+                &[
+                    ("GIT_AUTHOR_NAME", "Queue"),
+                    ("GIT_AUTHOR_EMAIL", "queue@example.invalid"),
+                    ("GIT_COMMITTER_NAME", "Queue"),
+                    ("GIT_COMMITTER_EMAIL", "queue@example.invalid"),
+                ],
+            )
+            .expect("commit-tree");
+        commit.ensure_success().expect("commit-tree");
+        let commit = commit.stdout_str().trim().to_string();
+        let group_ref = format!("refs/merge-queue/{}", fixture.entry.id);
+        git()
+            .run(&["update-ref", &group_ref, &commit], Some(&repo_path))
+            .expect("create group ref")
+            .ensure_success()
+            .expect("create group ref");
+        group_ref
+    }
+
+    fn ref_exists(fixture: &Fixture, group_ref: &str) -> bool {
+        let repo_path = fixture.repo_root.join(format!(
+            "{}/{}.git",
+            fixture.owner.username, fixture.repository.name
+        ));
+        git()
+            .run(&["rev-parse", "--verify", group_ref], Some(&repo_path))
+            .expect("rev-parse")
+            .success()
+    }
+
+    #[tokio::test]
+    async fn the_happy_path_deletes_the_ref_and_says_nothing() {
+        let fixture = fixture("clean-delete").await;
+        let group_ref = create_group_ref(&fixture);
+        assert!(ref_exists(&fixture, &group_ref), "fixture ref was created");
+
+        let (logs, _guard) = capture_warnings();
+        cleanup_merge_group_ref(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            fixture.pr.id,
+        )
+        .await;
+
+        assert!(!ref_exists(&fixture, &group_ref), "the ref is gone");
+        assert!(logs.rendered().is_empty(), "{}", logs.rendered());
+    }
+
+    #[tokio::test]
+    async fn a_broken_queue_lookup_is_not_mistaken_for_an_absent_entry() {
+        let fixture = fixture("broken-lookup").await;
+        let group_ref = create_group_ref(&fixture);
+        fixture
+            .db
+            .execute_unprepared("DROP TABLE merge_queue_entries")
+            .await
+            .expect("drop the queue table");
+
+        let (logs, _guard) = capture_warnings();
+        cleanup_merge_group_ref(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            fixture.pr.id,
+        )
+        .await;
+
+        let rendered = logs.rendered();
+        assert!(rendered.contains(STALE_REF), "{rendered}");
+        assert!(
+            rendered.contains(&format!("pr_id={}", fixture.pr.id)),
+            "{rendered}"
+        );
+        // The cause chain, not just the outer context.
+        assert!(rendered.contains("no such table"), "{rendered}");
+        assert!(
+            ref_exists(&fixture, &group_ref),
+            "the ref really is the one left behind"
+        );
+    }
+
+    /// The namespace failure is reached through the public entry point, because
+    /// the point of best-effort cleanup is that the caller still hears success.
+    #[tokio::test]
+    async fn an_unresolvable_namespace_is_logged_without_failing_the_cancel() {
+        let fixture = fixture("broken-namespace").await;
+        // The namespace is derived from the owner account; an owner that cannot
+        // be read is the failure, and pointing the model at a missing id gives
+        // it without deleting rows the queue entry itself hangs off.
+        let orphaned = repository::Model {
+            owner_id: i64::MAX,
+            ..fixture.repository.clone()
+        };
+
+        let (logs, _guard) = capture_warnings();
+        let canceled = cancel(
+            &fixture.db,
+            &fixture.repo_root,
+            &orphaned,
+            &fixture.pr,
+            fixture.owner.id,
+        )
+        .await
+        .expect("cancel still succeeds");
+
+        assert!(canceled, "the queue entry was canceled");
+        let rendered = logs.rendered();
+        assert!(rendered.contains(STALE_REF), "{rendered}");
+        assert!(
+            rendered.contains(&format!("entry_id={}", fixture.entry.id)),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("repository owner not found"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_git_delete_that_fails_is_logged_with_its_stderr() {
+        let fixture = fixture("broken-git").await;
+        // A repo root that holds no repository: `git -C` cannot even enter it,
+        // which is the shape of a storage mount that went away.
+        let missing_root = fixture.sandbox.path().join("vanished");
+
+        let (logs, _guard) = capture_warnings();
+        cleanup_merge_group_ref(
+            &fixture.db,
+            &missing_root,
+            &fixture.repository,
+            fixture.pr.id,
+        )
+        .await;
+
+        let rendered = logs.rendered();
+        assert!(rendered.contains(STALE_REF), "{rendered}");
+        assert!(
+            rendered.contains(&format!("refs/merge-queue/{}", fixture.entry.id)),
+            "{rendered}"
+        );
+        assert!(rendered.contains("stderr="), "{rendered}");
+    }
+
+    /// `finish_entry` reads the repository itself, and that read used to be
+    /// swallowed by the same `if let Ok(Some(..))` shape.
+    #[tokio::test]
+    async fn a_finish_whose_repository_row_vanished_still_reports_the_stale_ref() {
+        let fixture = fixture("vanished-repo").await;
+        // The row has to go without taking the queue entry and the event rows
+        // with it, so the deletion is done with the constraint lifted — what is
+        // being tested is the reader's reaction to a missing row, not sqlite's.
+        // The pool holds a single connection, so the pragma covers the test.
+        fixture
+            .db
+            .execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("lift the foreign keys");
+        rg_db::entities::repository::Entity::delete_by_id(fixture.repository.id)
+            .exec(&fixture.db)
+            .await
+            .expect("delete the repository row");
+
+        let (logs, _guard) = capture_warnings();
+        finish_entry(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.entry,
+            "failed",
+            Some("test".into()),
+        )
+        .await
+        .expect("finish still succeeds");
+
+        let rendered = logs.rendered();
+        assert!(rendered.contains(STALE_REF), "{rendered}");
+        assert!(
+            rendered.contains(&format!("entry_id={}", fixture.entry.id)),
+            "{rendered}"
+        );
+    }
 }
