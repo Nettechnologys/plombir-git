@@ -7,6 +7,8 @@
 //! - `on: push`, `on: pull_request` triggers with branch filtering
 //! - `jobs.<id>.runs-on` → runner tags
 //! - `jobs.<id>.steps[].run` → script commands
+//! - workflow/job `defaults.run.working-directory` and per-step
+//!   `working-directory` → isolated step directories
 //! - `jobs.<id>.steps[].uses` → `actions/checkout` is implicit; other actions are rejected
 //! - `jobs.<id>.container.image` → Docker image
 //! - `jobs.<id>.env` → environment variables
@@ -38,6 +40,10 @@ pub struct GiteaWorkflow {
     /// Workflow-level environment variables.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Defaults inherited by every `run:` step unless a job or step overrides
+    /// them.
+    pub defaults: Option<GiteaDefaults>,
 }
 
 /// Workflow trigger definitions.
@@ -106,6 +112,9 @@ pub struct GiteaJob {
     #[serde(default)]
     pub steps: Vec<GiteaStep>,
 
+    /// Defaults applied to `run:` steps.
+    pub defaults: Option<GiteaDefaults>,
+
     /// Container specification.
     pub container: Option<GiteaContainer>,
 
@@ -141,8 +150,23 @@ pub struct GiteaStrategy {
     pub matrix: std::collections::BTreeMap<String, Vec<serde_yaml::Value>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GiteaDefaults {
+    pub run: Option<GiteaRunDefaults>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GiteaRunDefaults {
+    #[serde(rename = "working-directory")]
+    pub working_directory: Option<String>,
+    pub shell: Option<String>,
+}
+
 /// A step within a Gitea Actions job.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaStep {
     /// Step name (optional).
     pub name: Option<String>,
@@ -156,6 +180,18 @@ pub struct GiteaStep {
 
     /// Shell to use (default: bash).
     pub shell: Option<String>,
+
+    /// Directory for this `run:` step, relative to the workspace.
+    #[serde(rename = "working-directory")]
+    pub working_directory: Option<String>,
+
+    /// Step identifiers and execution policies are parsed so unsupported
+    /// semantics fail loudly in `validate_supported_actions`.
+    pub id: Option<String>,
+    #[serde(rename = "continue-on-error")]
+    pub continue_on_error: Option<serde_yaml::Value>,
+    #[serde(rename = "timeout-minutes")]
+    pub timeout_minutes: Option<serde_yaml::Value>,
 
     /// Step-level environment variables.
     #[serde(default)]
@@ -246,6 +282,15 @@ impl GiteaWorkflow {
                 })
             })
             .collect::<Vec<_>>();
+        if self
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.shell.as_ref())
+            .is_some()
+        {
+            unsupported.push("defaults.run.shell".into());
+        }
         unsupported.extend(self.jobs.iter().filter_map(|(job_name, job)| {
             job.uses
                 .as_ref()
@@ -265,11 +310,37 @@ impl GiteaWorkflow {
             });
             job_condition.into_iter().chain(step_conditions)
         }));
+        unsupported.extend(self.jobs.iter().flat_map(|(job_name, job)| {
+            let default_shell = job
+                .defaults
+                .as_ref()
+                .and_then(|defaults| defaults.run.as_ref())
+                .and_then(|run| run.shell.as_ref())
+                .map(|_| format!("{job_name}: defaults.run.shell"));
+            let step_features = job.steps.iter().enumerate().flat_map(move |(index, step)| {
+                let prefix = format!("{job_name}: step {}", index + 1);
+                [
+                    step.shell.as_ref().map(|_| format!("{prefix} shell")),
+                    step.id.as_ref().map(|_| format!("{prefix} id")),
+                    step.continue_on_error
+                        .as_ref()
+                        .map(|_| format!("{prefix} continue-on-error")),
+                    step.timeout_minutes
+                        .as_ref()
+                        .map(|_| format!("{prefix} timeout-minutes")),
+                    (step.working_directory.is_some() && step.run.is_none())
+                        .then(|| format!("{prefix} working-directory without run")),
+                ]
+                .into_iter()
+                .flatten()
+            });
+            default_shell.into_iter().chain(step_features)
+        }));
         if unsupported.is_empty() {
             Ok(())
         } else {
             anyhow::bail!(
-                "unsupported action step(s): {}. Convert them to run: commands or use .forgekeep-ci.yml",
+                "unsupported workflow feature(s): {}. Convert them to run: commands or use .forgekeep-ci.yml",
                 unsupported.join(", ")
             )
         }
@@ -477,6 +548,17 @@ impl GiteaWorkflow {
 
         // Process steps
         let mut has_checkout = false;
+        let default_working_directory = job
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_deref())
+            .or_else(|| {
+                self.defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.run.as_ref())
+                    .and_then(|run| run.working_directory.as_deref())
+            });
         for step in &job.steps {
             if let Some(condition) = step.condition.as_deref() {
                 let mut condition_variables = job_vars.clone();
@@ -536,7 +618,15 @@ impl GiteaWorkflow {
 
                 // Substitute expressions in the command
                 let expanded_cmd = substitute_expr(run_cmd, job_name, &self.env, &job_vars);
-                script.push(expanded_cmd);
+                let working_directory = step
+                    .working_directory
+                    .as_deref()
+                    .or(default_working_directory)
+                    .map(|directory| substitute_expr(directory, job_name, &self.env, &job_vars));
+                script.push(match working_directory {
+                    Some(directory) => command_in_working_directory(&expanded_cmd, &directory),
+                    None => expanded_cmd,
+                });
             }
         }
 
@@ -550,6 +640,68 @@ impl GiteaWorkflow {
 
         (script, job_vars, cache)
     }
+}
+
+/// Run one Actions step in a subshell so its directory cannot leak into the
+/// following step. Expected runtime placeholders such as `${MATRIX_OS}` remain
+/// expandable while shell metacharacters in the configured path stay quoted.
+fn command_in_working_directory(command: &str, directory: &str) -> String {
+    format!("(\ncd -- {}\n{}\n)", shell_double_quote(directory), command)
+}
+
+fn shell_double_quote(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '$' if index + 3 < chars.len() && chars[index + 1] == '{' => {
+                let Some(relative_end) = chars[index + 2..].iter().position(|c| *c == '}') else {
+                    quoted.push_str("\\$");
+                    index += 1;
+                    continue;
+                };
+                let end = index + 2 + relative_end;
+                let name = &chars[index + 2..end];
+                let valid_name = name
+                    .first()
+                    .is_some_and(|c| c.is_ascii_uppercase() || *c == '_')
+                    && name
+                        .iter()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_');
+                if valid_name {
+                    quoted.extend(&chars[index..=end]);
+                    index = end + 1;
+                } else {
+                    quoted.push_str("\\$");
+                    index += 1;
+                }
+            }
+            '\\' => {
+                quoted.push_str("\\\\");
+                index += 1;
+            }
+            '"' => {
+                quoted.push_str("\\\"");
+                index += 1;
+            }
+            '`' => {
+                quoted.push_str("\\`");
+                index += 1;
+            }
+            '$' => {
+                quoted.push_str("\\$");
+                index += 1;
+            }
+            character => {
+                quoted.push(character);
+                index += 1;
+            }
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Map a job's `runs-on` value to ForgeKeep runner tags: a scalar becomes a
@@ -898,6 +1050,16 @@ fn replace_context_expression(
 mod tests {
     use super::*;
 
+    fn test_context() -> WorkflowContext {
+        WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc123".into(),
+            event: "push".into(),
+            repo_owner: "owner".into(),
+            repo_name: "repo".into(),
+        }
+    }
+
     #[test]
     fn test_parse_simple_workflow() {
         let yml = r#"
@@ -956,6 +1118,167 @@ jobs:
         let error = workflow.validate_supported_actions().unwrap_err();
         assert!(error.to_string().contains("actions/setup-node@v4"));
         assert!(error.to_string().contains(".forgekeep-ci.yml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_directories_execute_in_isolated_step_subshells() {
+        let workspace = tempfile::tempdir().unwrap();
+        for directory in ["step dir", "default dir", "override dir"] {
+            std::fs::create_dir(workspace.path().join(directory)).unwrap();
+        }
+        std::fs::write(workspace.path().join("workspace-marker"), "ok").unwrap();
+        std::fs::write(workspace.path().join("step dir/local-marker"), "ok").unwrap();
+        std::fs::write(workspace.path().join("default dir/default-marker"), "ok").unwrap();
+        std::fs::write(workspace.path().join("override dir/override-marker"), "ok").unwrap();
+
+        let workflow = GiteaWorkflow::parse(
+            r#"
+on: push
+jobs:
+  isolated:
+    steps:
+      - run: test -f local-marker
+        working-directory: step dir
+      - run: test -f workspace-marker
+  defaults:
+    defaults:
+      run:
+        working-directory: default dir
+    steps:
+      - run: test -f default-marker
+      - run: test -f override-marker
+        working-directory: override dir
+"#,
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+
+        for job_name in ["isolated", "defaults"] {
+            let script = config.jobs[job_name].script.join("\n");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{job_name} script failed:\n{script}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_directory_precedence_is_step_then_job_then_workflow() {
+        let workspace = tempfile::tempdir().unwrap();
+        for directory in ["workflow dir", "job dir", "step dir"] {
+            std::fs::create_dir(workspace.path().join(directory)).unwrap();
+            std::fs::write(workspace.path().join(directory).join("marker"), "ok").unwrap();
+        }
+
+        let workflow = GiteaWorkflow::parse(
+            r#"
+on: push
+defaults:
+  run:
+    working-directory: workflow dir
+jobs:
+  inherited:
+    steps:
+      - run: test -f marker
+  overridden:
+    defaults:
+      run:
+        working-directory: job dir
+    steps:
+      - run: test -f marker
+      - run: test -f marker
+        working-directory: step dir
+"#,
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+
+        for job_name in ["inherited", "overridden"] {
+            let script = config.jobs[job_name].script.join("\n");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{job_name} script failed:\n{script}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_step_semantics_are_rejected_instead_of_ignored() {
+        for (key, value) in [
+            ("shell", "python"),
+            ("id", "compile"),
+            ("continue-on-error", "true"),
+            ("timeout-minutes", "5"),
+        ] {
+            let yaml = format!(
+                "on: push\njobs:\n  build:\n    steps:\n      - run: echo ok\n        {key}: {value}\n"
+            );
+            let workflow = GiteaWorkflow::parse(&yaml).unwrap();
+            let error = workflow
+                .validate_supported_actions()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "error must name {key}: {error}");
+        }
+
+        let workflow = GiteaWorkflow::parse(
+            "on: push\njobs:\n  build:\n    defaults:\n      run:\n        shell: bash\n    steps:\n      - run: echo ok\n",
+        )
+        .unwrap();
+        let error = workflow
+            .validate_supported_actions()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("defaults.run.shell"));
+
+        let workflow = GiteaWorkflow::parse(
+            "on: push\ndefaults:\n  run:\n    shell: bash\njobs:\n  build:\n    steps:\n      - run: echo ok\n",
+        )
+        .unwrap();
+        let error = workflow
+            .validate_supported_actions()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("defaults.run.shell"));
+    }
+
+    #[test]
+    fn unknown_step_keys_fail_parsing_instead_of_becoming_noops() {
+        let error = GiteaWorkflow::parse(
+            "on: push\njobs:\n  build:\n    steps:\n      - run: echo ok\n        typo-key: ignored-before\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("typo-key"),
+            "parse error must name the key: {error}"
+        );
+    }
+
+    #[test]
+    fn working_directory_quoting_preserves_runtime_vars_and_blocks_substitution() {
+        assert_eq!(
+            shell_double_quote("build/${MATRIX_OS}/$(touch escaped)"),
+            r#""build/${MATRIX_OS}/\$(touch escaped)""#
+        );
     }
 
     #[test]
