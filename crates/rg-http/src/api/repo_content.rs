@@ -479,11 +479,21 @@ fn list_tree_entries(
     // Traverse into sub_path if specified
     if !sub_path.is_empty() {
         for component in sub_path.split('/') {
-            let entry = tree
-                .iter()
-                .filter_map(|e| e.ok())
-                .find(|e| e.filename() == component);
-            let entry = entry.ok_or_else(|| {
+            let mut matching_entry = None;
+            for entry in tree.iter() {
+                let entry = entry.with_context(|| {
+                    format!(
+                        "failed to inspect tree while resolving sub-path '{}' at component '{}' in {:?} at '{}'",
+                        sub_path, component, repo_path, git_ref
+                    )
+                })?;
+                if entry.filename() == component {
+                    matching_entry = Some(entry);
+                    break;
+                }
+            }
+
+            let entry = matching_entry.ok_or_else(|| {
                 anyhow::Error::new(rg_core::error::NotFound::new("path")).context(format!(
                     "sub-path '{}' has no component '{}' in {:?} at '{}'",
                     sub_path, component, repo_path, git_ref
@@ -498,8 +508,9 @@ fn list_tree_entries(
                 // once they are both `anyhow!("failed to find sub-tree")`.
                 return Err(rg_core::error::invalid_request("path is not a directory"));
             }
+            let subtree_oid = entry.oid().to_owned();
             tree = repo
-                .find_tree(entry.oid())
+                .find_tree(subtree_oid)
                 .map_err(|e| anyhow::anyhow!("failed to find sub-tree: {}", e))?;
         }
     }
@@ -1391,9 +1402,17 @@ fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::Write as _,
+        sync::{Arc, Mutex},
+    };
 
-    use super::{get_commit_log, is_empty_repo, list_branch_names, list_tag_names};
+    use axum::response::IntoResponse;
+
+    use super::{
+        get_commit_log, is_empty_repo, list_branch_names, list_tag_names, list_tree_entries,
+        AppError,
+    };
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -1432,6 +1451,18 @@ mod tests {
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
         (logs, guard)
+    }
+
+    fn overwrite_loose_object(repo_path: &std::path::Path, oid: &str, kind: &str, data: &[u8]) {
+        let object_path = repo_path.join("objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::remove_file(&object_path).expect("existing loose object must be removable");
+        let file = std::fs::File::create(object_path).expect("loose object must be writable");
+        let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+        write!(encoder, "{kind} {}\0", data.len()).expect("object header must compress");
+        encoder
+            .write_all(data)
+            .expect("object payload must compress");
+        encoder.finish().expect("object must finish compressing");
     }
 
     /// The ordinary positive case the empty-tree response exists for: a repo
@@ -1481,6 +1512,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         assert!(!is_empty_repo(&dir.path().join("nothing-here.git")));
+    }
+
+    /// card_c9c2a0d88340: a malformed entry encountered while resolving
+    /// `?path=` must remain a repository failure. Dropping the iterator error
+    /// turns this into the typed `path not found` 404 even though the client
+    /// cannot fix a corrupt tree object.
+    #[test]
+    fn an_unreadable_entry_during_sub_path_lookup_is_a_server_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("broken-tree");
+        let git = |args: &[&str]| {
+            let output = rg_git::cli_gateway::global_gateway()
+                .as_ref()
+                .expect("git gateway must initialize")
+                .run(args, Some(&worktree))
+                .expect("git must run");
+            assert!(
+                output.success(),
+                "git {args:?} failed: {}",
+                output.stderr_str()
+            );
+            output.stdout_str().trim().to_string()
+        };
+
+        std::fs::create_dir_all(worktree.join("requested-dir")).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "ForgeKeep Test"]);
+        git(&["config", "user.email", "forgekeep@example.test"]);
+        std::fs::write(worktree.join("requested-dir/file.txt"), "content\n").unwrap();
+        git(&["add", "requested-dir/file.txt"]);
+        git(&["commit", "-q", "-m", "tree fixture"]);
+
+        let tree_oid = git(&["rev-parse", "HEAD^{tree}"]);
+        let repo_path = worktree.join(".git");
+        overwrite_loose_object(&repo_path, &tree_oid, "tree", b"x");
+
+        let repo = gix::open(&repo_path).expect("repository must still open");
+        let commit_id = repo
+            .rev_parse_single("HEAD")
+            .expect("HEAD must still resolve");
+        let commit = repo
+            .find_commit(commit_id)
+            .expect("commit must remain readable");
+        let tree_oid = commit.decode().expect("commit must decode").tree();
+        let tree = repo
+            .find_tree(tree_oid)
+            .expect("tree object header must remain readable");
+        assert!(
+            tree.iter()
+                .next()
+                .expect("malformed tree must expose one iterator result")
+                .is_err(),
+            "fixture must fail while decoding a tree entry"
+        );
+
+        let error = match list_tree_entries(&repo_path, "HEAD", "requested-dir") {
+            Ok(_) => panic!("tree corruption must not become a successful listing"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("requested-dir"),
+            "error needs path context: {rendered}"
+        );
+        assert!(
+            rendered.contains("HEAD"),
+            "error needs ref context: {rendered}"
+        );
+        assert!(
+            rendered.contains(&repo_path.display().to_string()),
+            "error needs repository context: {rendered}"
+        );
+
+        let response = AppError::from(error).into_response();
+        assert!(
+            response.status().is_server_error(),
+            "an unreadable tree entry must stay 5xx, got {}",
+            response.status()
+        );
     }
 
     /// The rev-walk policy is deliberately best-effort: one missing object does
