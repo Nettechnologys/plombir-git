@@ -69,9 +69,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let refs = list_refs(repo_path)?;
-    let head_sha = crate::resolve_head_sha(repo_path);
-    let ref_list = build_ref_advertisement_vec(refs, head_sha);
+    let advertisement = crate::ref_advertisement::collect(repo_path)?;
+    let ref_list = build_ref_advertisement_vec(advertisement.refs, advertisement.head_oid);
 
     // Send ref advertisement
     let ad = build_ref_advertisement(&ref_list, "git-upload-pack");
@@ -102,9 +101,8 @@ async fn upload_pack_stream_impl<S>(repo_path: &Path, stream: &mut S) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let refs = list_refs(repo_path)?;
-    let head_sha = crate::resolve_head_sha(repo_path);
-    let ref_list = build_ref_advertisement_vec(refs, head_sha);
+    let advertisement = crate::ref_advertisement::collect(repo_path)?;
+    let ref_list = build_ref_advertisement_vec(advertisement.refs, advertisement.head_oid);
 
     // Send ref advertisement
     let ad = build_ref_advertisement(&ref_list, "git-upload-pack");
@@ -257,40 +255,6 @@ async fn read_want_have_impl<R: AsyncRead + Unpin>(
     Ok((wants, haves, capabilities))
 }
 
-/// List refs in a bare git repository using gix API.
-fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let repo = gix::open(repo_path).context("failed to open repository")?;
-    let mut refs = Vec::new();
-
-    let references = repo.references().context("failed to list references")?;
-    let all_refs = references.all()?;
-
-    for reference in all_refs {
-        let reference = match reference {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let refname = reference.name().as_bstr().to_string();
-        let target = reference.target();
-
-        match target {
-            gix::refs::TargetRef::Object(id) => {
-                refs.push((id.to_string(), refname));
-            }
-            gix::refs::TargetRef::Symbolic(_) => {
-                // For symbolic refs like HEAD, try to resolve to the actual object
-                if refname == "HEAD" {
-                    if let Ok(head_id) = repo.head_id() {
-                        refs.push((head_id.to_string(), refname));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(refs)
-}
-
 /// Build ref advertisement from ref list.
 fn build_ref_advertisement_vec(
     refs: Vec<(String, String)>,
@@ -416,4 +380,46 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
     tracing::info!(pack_size, objects = wants.len(), "Upload-pack complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ref_advertisement_tests {
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn upload_pack_advertises_an_unborn_repository_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("unborn.git");
+        gix::init_bare(&repo_path).unwrap();
+        let mut output = Vec::new();
+
+        super::handle_upload_pack(&repo_path, Cursor::new(Vec::<u8>::new()), &mut output)
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output
+            .contains("0000000000000000000000000000000000000000 capabilities^git-upload-pack"));
+    }
+
+    #[tokio::test]
+    async fn upload_pack_rejects_an_unreadable_ref_before_advertising() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("broken-ref.git");
+        gix::init_bare(&repo_path).unwrap();
+        std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
+        std::fs::write(repo_path.join("refs/heads/broken"), "not-an-object-id\n").unwrap();
+        let mut output = Vec::new();
+
+        let error =
+            super::handle_upload_pack(&repo_path, Cursor::new(Vec::<u8>::new()), &mut output)
+                .await
+                .unwrap_err();
+
+        assert!(output.is_empty(), "no partial advertisement may be written");
+        assert!(
+            format!("{error:#}").contains("failed to read a reference"),
+            "{error:#}"
+        );
+    }
 }

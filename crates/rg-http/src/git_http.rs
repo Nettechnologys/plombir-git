@@ -2,7 +2,7 @@
 //! `git-receive-pack`) plus post-push hooks (CI, webhooks, notifications) and
 //! branch/tag protection enforcement.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -435,31 +435,12 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     buf.push_str(&svc_line);
     buf.push_str("0000");
 
-    let repo = gix::open(repo_path)
-        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
+    let advertisement = rg_git::ref_advertisement::collect(repo_path)
+        .context("failed to collect repository refs")?;
+    let mut ref_list = advertisement.refs;
 
-    // Get all references (like git for-each-ref)
-    let references = repo.references()?;
-    let mut ref_list: Vec<(String, String)> = references
-        .all()?
-        .filter_map(|r| r.ok())
-        .filter_map(|r| {
-            let oid = r.target().try_id()?.to_owned();
-            let name = String::from_utf8_lossy(r.name().as_bstr()).to_string();
-            Some((oid.to_string(), name))
-        })
-        .collect();
-
-    // Get HEAD SHA
-    let head_sha = if let Ok(head) = repo.head() {
-        head.try_into_referent() // Returns Option<Reference>
-            .and_then(|r| r.target().try_id().map(|id| id.to_string()))
-    } else {
-        None
-    };
-
-    if let Some(sha) = &head_sha {
-        ref_list.insert(0, (sha.clone(), "HEAD".to_string()));
+    if let Some(head_oid) = advertisement.head_oid {
+        ref_list.insert(0, (head_oid, "HEAD".to_string()));
     }
 
     let caps = if service == "git-upload-pack" {
@@ -994,13 +975,40 @@ async fn find_repo_by_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_git_body, git_failure_body, with_git_timeout};
+    use super::{buffer_git_body, build_info_refs, git_failure_body, with_git_timeout};
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     // NOTE: a second `use axum::http::StatusCode` further down in this module
     // (pre-existing) was removed in favor of this single top-level import.
+
+    #[test]
+    fn legacy_info_refs_keeps_the_protocol_null_head_for_an_unborn_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("unborn.git");
+        gix::init_bare(&repo_path).unwrap();
+
+        let advertisement = build_info_refs(&repo_path, "git-upload-pack").unwrap();
+
+        assert!(advertisement.contains("0000000000000000000000000000000000000000 HEAD\0"));
+    }
+
+    #[test]
+    fn legacy_info_refs_rejects_an_unreadable_ref_instead_of_omitting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("broken-ref.git");
+        gix::init_bare(&repo_path).unwrap();
+        std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
+        std::fs::write(repo_path.join("refs/heads/broken"), "not-an-object-id\n").unwrap();
+
+        let error = build_info_refs(&repo_path, "git-upload-pack").unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to read a reference"),
+            "{error:#}"
+        );
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);

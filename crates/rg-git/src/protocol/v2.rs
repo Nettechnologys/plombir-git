@@ -678,67 +678,29 @@ async fn handle_ls_refs<W: AsyncWrite + Unpin>(
     }
 
     let ref_data: RefData = {
-        let repo = gix::open(repo_path).context("failed to open repository for ls-refs")?;
+        let advertisement = crate::ref_advertisement::collect(repo_path)
+            .context("failed to collect references for ls-refs")?;
 
         let mut ref_entries: Vec<(String, String, Option<String>)> = Vec::new();
-        let mut unborn_line: Option<String> = None;
-
-        // HEAD first — resolve symref target if client requested symrefs
-        let head_ref = repo.head().ok();
-        let head_target: Option<String> = if symrefs {
-            head_ref.as_ref().and_then(|h| match &h.kind {
-                gix::head::Kind::Symbolic(r) => Some(r.name.as_bstr().to_string()),
-                gix::head::Kind::Unborn(name) => Some(name.as_bstr().to_string()),
-                gix::head::Kind::Detached { .. } => None,
-            })
+        let head_target = if symrefs {
+            advertisement.head_target.clone()
         } else {
             None
         };
 
-        match repo.head_id() {
-            Ok(head_id) => {
-                ref_entries.push((head_id.to_string(), "HEAD".to_string(), head_target.clone()));
+        let unborn_line = match advertisement.head_oid {
+            Some(head_oid) => {
+                ref_entries.push((head_oid, "HEAD".to_string(), head_target.clone()));
+                None
             }
-            Err(_) => {
-                // HEAD points to unborn branch
-                if unborn {
-                    if let Some(target) = &head_target {
-                        unborn_line = Some(format!("unborn HEAD symref-target:{}", target));
-                    }
-                }
-            }
-        }
+            None if unborn => head_target
+                .as_ref()
+                .map(|target| format!("unborn HEAD symref-target:{target}")),
+            None => None,
+        };
 
-        // All non-symbolic refs
-        let references = repo.references().context("failed to list references")?;
-        let all_refs = references.all()?;
-
-        for reference in all_refs {
-            let reference = match reference {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let refname = reference.name().as_bstr().to_string();
-
-            // Skip HEAD — already handled above
-            if refname == "HEAD" {
-                continue;
-            }
-
-            let target = reference.target();
-            match target {
-                gix::refs::TargetRef::Object(id) => {
-                    ref_entries.push((id.to_string(), refname, None));
-                }
-                gix::refs::TargetRef::Symbolic(_) => {
-                    // Other symbolic refs (rare) — resolve to object
-                    if let Ok(mut r) = repo.find_reference(&refname) {
-                        if let Ok(id) = r.peel_to_id() {
-                            ref_entries.push((id.to_string(), refname, None));
-                        }
-                    }
-                }
-            }
+        for (oid, refname) in advertisement.refs {
+            ref_entries.push((oid, refname, None));
         }
 
         // repo is dropped here — no longer held across .await
@@ -782,12 +744,12 @@ async fn handle_ls_refs<W: AsyncWrite + Unpin>(
 
         // Append peeled SHA for annotated tags if client requested
         if peel && refname.starts_with("refs/tags/") {
-            if let Some(peeled) = get_tag_peel(repo_path, sha) {
-                // Only append if the peeled SHA differs from the tag object SHA
-                // (i.e., it's actually an annotated tag pointing to a commit)
-                if peeled != sha.as_str() {
-                    line.push_str(&format!(" peeled:{}", peeled));
-                }
+            let peeled = get_tag_peel(repo_path, sha)
+                .with_context(|| format!("failed to peel advertised tag `{refname}`"))?;
+            // Only append if the peeled SHA differs from the tag object SHA
+            // (i.e., it's actually an annotated tag pointing to a commit)
+            if peeled != sha.as_str() {
+                line.push_str(&format!(" peeled:{}", peeled));
             }
         }
 
@@ -1150,22 +1112,30 @@ async fn handle_object_info<W: AsyncWrite + Unpin>(
 // ─── Git Operations ───────────────────────────────────────────────────────────
 
 /// Get the peel (dereferenced) SHA of a tag using gix API.
-fn get_tag_peel(repo_path: &Path, sha: &str) -> Option<String> {
-    let repo = gix::open(repo_path).ok()?;
-    let object_id = gix::ObjectId::from_hex(sha.as_bytes()).ok()?;
+fn get_tag_peel(repo_path: &Path, sha: &str) -> Result<String> {
+    let repo = gix::open(repo_path).context("failed to open repository while peeling a tag")?;
+    let object_id = gix::ObjectId::from_hex(sha.as_bytes())
+        .context("advertised tag has an invalid object id")?;
 
     // Find the object
-    let object = repo.find_object(object_id).ok()?;
+    let object = repo
+        .find_object(object_id)
+        .context("failed to read advertised tag object")?;
 
     // Check if it's a tag and get the peeled object
-    if let Ok(tag) = object.try_into_tag() {
+    if object.kind == gix::object::Kind::Tag {
+        let tag = object
+            .try_into_tag()
+            .context("advertised tag object could not be decoded")?;
         // The tag points to another object - that's the peeled SHA
-        let target_id = tag.target_id().ok()?;
-        return Some(target_id.to_string());
+        let target_id = tag
+            .target_id()
+            .context("advertised tag target could not be read")?;
+        return Ok(target_id.to_string());
     }
 
-    // Not a tag or can't peel, return the original SHA
-    Some(sha.to_string())
+    // A lightweight tag already points straight at its target.
+    Ok(sha.to_string())
 }
 
 /// Get the size of a git object using gix API.
@@ -1293,6 +1263,52 @@ async fn generate_packfile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ls_refs_advertises_only_an_explicitly_unborn_head_as_unborn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("unborn.git");
+        gix::init_bare(&repo_path).unwrap();
+        let mut output = Vec::new();
+
+        handle_ls_refs(&repo_path, &mut output, &[], false, true, true, &[])
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("unborn HEAD symref-target:refs/heads/"));
+    }
+
+    #[tokio::test]
+    async fn ls_refs_rejects_a_malformed_head_instead_of_calling_it_unborn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("broken-head.git");
+        gix::init_bare(&repo_path).unwrap();
+        std::fs::write(repo_path.join("HEAD"), "not a ref at all\n").unwrap();
+        let mut output = Vec::new();
+
+        let error = handle_ls_refs(&repo_path, &mut output, &[], false, true, true, &[])
+            .await
+            .unwrap_err();
+
+        assert!(
+            output.is_empty(),
+            "no partial ls-refs response may be written"
+        );
+        assert!(format!("{error:#}").contains("failed to read HEAD"));
+    }
+
+    #[test]
+    fn requested_tag_peel_propagates_a_missing_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("unborn.git");
+        gix::init_bare(&repo_path).unwrap();
+
+        let error =
+            get_tag_peel(&repo_path, "0000000000000000000000000000000000000000").unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed to read advertised tag object"));
+    }
 
     #[test]
     fn test_capability_advertisement_format() {

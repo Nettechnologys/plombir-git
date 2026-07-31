@@ -37,7 +37,7 @@ where
     let mut writer = writer;
 
     // Send ref advertisement
-    let ref_list = build_ref_list(repo_path);
+    let ref_list = build_ref_list(repo_path)?;
     let ad = build_ref_advertisement(&ref_list, "git-receive-pack");
     for pkt in &ad {
         write_pkt_line(&mut writer, pkt).await?;
@@ -127,7 +127,7 @@ async fn do_receive_pack_stream<S>(repo_path: &Path, stream: &mut S) -> Result<V
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let ref_list = build_ref_list(repo_path);
+    let ref_list = build_ref_list(repo_path)?;
     let ad = build_ref_advertisement(&ref_list, "git-receive-pack");
     for pkt in &ad {
         write_pkt_line(stream, pkt).await?;
@@ -154,7 +154,7 @@ async fn do_receive_pack_stream_with_rejections<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let ref_list = build_ref_list(repo_path);
+    let ref_list = build_ref_list(repo_path)?;
     let ad = build_ref_advertisement(&ref_list, "git-receive-pack");
     for pkt in &ad {
         write_pkt_line(stream, pkt).await?;
@@ -172,45 +172,12 @@ where
 }
 
 /// Build the list of refs with their SHAs for advertisement.
-fn build_ref_list(repo_path: &Path) -> Vec<(String, String)> {
-    let mut refs = Vec::new();
+fn build_ref_list(repo_path: &Path) -> Result<Vec<(String, String)>> {
+    let advertisement = crate::ref_advertisement::collect(repo_path)?;
+    let mut refs = advertisement.refs;
 
-    // Get all refs using gix API
-    if let Ok(repo) = gix::open(repo_path) {
-        if let Ok(references) = repo.references() {
-            if let Ok(all_refs) = references.all() {
-                for reference in all_refs {
-                    let reference = match reference {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    let refname = reference.name().as_bstr().to_string();
-                    let target = reference.target();
-
-                    match target {
-                        gix::refs::TargetRef::Object(id) => {
-                            refs.push((id.to_string(), refname));
-                        }
-                        gix::refs::TargetRef::Symbolic(_) => {
-                            // For symbolic refs like HEAD, try to resolve to the actual object
-                            if refname == "HEAD" {
-                                if let Ok(head_id) = repo.head_id() {
-                                    refs.push((head_id.to_string(), refname));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also add HEAD if we have it
-        if let Ok(head_id) = repo.head_id() {
-            let head_entry = refs.iter().find(|(_, name)| name == "HEAD");
-            if head_entry.is_none() {
-                refs.push((head_id.to_string(), "HEAD".to_string()));
-            }
-        }
+    if let Some(head_oid) = advertisement.head_oid {
+        refs.insert(0, (head_oid, "HEAD".to_string()));
     }
 
     if refs.is_empty() {
@@ -221,7 +188,7 @@ fn build_ref_list(repo_path: &Path) -> Vec<(String, String)> {
         ));
     }
 
-    refs
+    Ok(refs)
 }
 
 /// Build ref advertisement pkt-lines for receive-pack.
@@ -717,6 +684,47 @@ async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, results: &[RefUpda
 
     tracing::info!("Receive-pack response sent");
     Ok(())
+}
+
+#[cfg(test)]
+mod ref_advertisement_tests {
+    use super::build_ref_list;
+
+    #[test]
+    fn receive_pack_keeps_the_protocol_null_ref_for_an_unborn_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("unborn.git");
+        gix::init_bare(&repo_path).unwrap();
+
+        let refs = build_ref_list(&repo_path).unwrap();
+
+        assert_eq!(
+            refs,
+            vec![(
+                "0000000000000000000000000000000000000000".to_string(),
+                "capabilities^{}".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_pack_stream_rejects_an_unreadable_ref_before_advertising() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("broken-ref.git");
+        gix::init_bare(&repo_path).unwrap();
+        std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
+        std::fs::write(repo_path.join("refs/heads/broken"), "not-an-object-id\n").unwrap();
+        let (mut server, _client) = tokio::io::duplex(256);
+
+        let error = super::handle_receive_pack_stream(&repo_path, &mut server)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to read a reference"),
+            "{error:#}"
+        );
+    }
 }
 
 #[cfg(test)]
