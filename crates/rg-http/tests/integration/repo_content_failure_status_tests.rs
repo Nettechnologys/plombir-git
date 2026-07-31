@@ -298,6 +298,135 @@ async fn a_file_as_the_tree_sub_path_is_not_a_server_error() {
     assert_no_internal_detail(&body, &repo_root);
 }
 
+/// card_511b208e49df: the log helper used to flatten every rev-parse error into
+/// `Ok(vec![])`. A missing ref on a repository that demonstrably has history is
+/// absence, not an empty history.
+#[tokio::test]
+async fn a_missing_ref_on_the_log_endpoint_is_not_an_empty_history() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "logref-owner", "logref@example.com").await;
+    create_repo(&base, &token, "logref-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "logref-owner", "logref-repo").await;
+
+    let url = format!("{base}/api/v1/repos/logref-owner/logref-repo/log");
+
+    // Non-vacuous baseline: this exact repository has one readable commit.
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "the default ref must still be readable");
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        body["commits"].as_array().map(Vec::len),
+        Some(1),
+        "fixture must expose one commit, got: {body}"
+    );
+
+    let resp = client
+        .get(&url)
+        .query(&[("ref", "no-such-branch")])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 404,
+        "a missing ref must not look like a healthy empty history (body: {body})"
+    );
+    assert_eq!(
+        body["error"]["message"], "ref not found",
+        "the 404 body must be the fixed message, got: {body}"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+}
+
+/// The legitimate empty result must survive the split above: a newly-created
+/// bare repository has an unborn HEAD, not a server failure.
+#[tokio::test]
+async fn an_unborn_repository_still_has_an_empty_commit_log() {
+    let (base, _) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "logempty-owner", "logempty@example.com").await;
+    create_repo(&base, &token, "logempty-repo").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/logempty-owner/logempty-repo/log");
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 200,
+        "an unborn HEAD is a healthy empty history (body: {body})"
+    );
+    assert_eq!(
+        body["commits"],
+        serde_json::json!([]),
+        "an unborn repository must return the documented empty list"
+    );
+
+    let resp = client
+        .get(&url)
+        .query(&[("ref", "no-such-branch")])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 404,
+        "only unborn HEAD is empty; an explicitly missing ref is still absent (body: {body})"
+    );
+    assert_eq!(body["error"]["message"], "ref not found");
+}
+
+/// A malformed HEAD is deliberately different from an unborn one. Merely
+/// changing the old `Ok([])` into typed NotFound would still lie here — as a
+/// 404 instead of a 200 — so this test pins the storage-failure side too.
+#[tokio::test]
+async fn an_unreadable_head_on_the_log_endpoint_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "loghead-owner", "loghead@example.com").await;
+    create_repo(&base, &token, "loghead-repo").await;
+    let bare = repo_root.join("loghead-owner/loghead-repo.git");
+    std::fs::write(bare.join("HEAD"), "not a ref at all\n").expect("corrupt HEAD fixture");
+
+    // Prove this reaches the helper's HEAD-read arm rather than failing the
+    // repository-open guard added by card_b013d630a280.
+    let repo = gix::open(&bare).expect("a malformed HEAD must still open the repository");
+    assert!(
+        repo.head().is_err(),
+        "fixture must make HEAD unreadable without making the repository unopenable"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{base}/api/v1/repos/loghead-owner/loghead-repo/log"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        status.is_server_error(),
+        "an unreadable HEAD is a storage failure, not empty history or a missing ref: \
+         {status} (body: {body})"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+}
+
 /// H-05: whatever the status, the body must not carry the storage path or the
 /// git library's own wording. This is the half of the bug a status-only fix
 /// would have left in place.
