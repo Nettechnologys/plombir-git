@@ -252,7 +252,10 @@ pub async fn list_issues(
             .await
             {
                 Ok((data, total)) => {
-                    let data = issues_with_authors(&state.db, data).await;
+                    let data = match issues_with_authors(&state.db, data).await {
+                        Ok(data) => data,
+                        Err(error) => return error.into_response(),
+                    };
                     (
                         StatusCode::OK,
                         Json(PaginatedResponse::new(data, &pagination, total as u64)),
@@ -275,7 +278,10 @@ pub async fn list_issues(
     .await
     {
         Ok((data, total)) => {
-            let data = issues_with_authors(&state.db, data).await;
+            let data = match issues_with_authors(&state.db, data).await {
+                Ok(data) => data,
+                Err(error) => return error.into_response(),
+            };
             (
                 StatusCode::OK,
                 Json(PaginatedResponse::new(data, &pagination, total as u64)),
@@ -307,7 +313,10 @@ pub async fn get_issue(
 ) -> impl IntoResponse {
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => {
-            let issue = issue_with_author(&state.db, issue).await;
+            let issue = match issue_with_author(&state.db, issue).await {
+                Ok(issue) => issue,
+                Err(error) => return error.into_response(),
+            };
             (StatusCode::OK, Json(issue)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -432,7 +441,10 @@ pub async fn create_issue(
     {
         Ok(issue) => {
             crate::metrics::recorder::issue_opened();
-            let issue = issue_with_author(&state.db, issue).await;
+            let issue = match issue_with_author(&state.db, issue).await {
+                Ok(issue) => issue,
+                Err(error) => return error.into_response(),
+            };
             (StatusCode::CREATED, Json(issue)).into_response()
         }
         // The service marks its one client-side outcome (an empty title) with
@@ -531,7 +543,10 @@ pub async fn update_issue(
             if closing {
                 crate::metrics::recorder::issue_closed();
             }
-            let issue = issue_with_author(&state.db, issue).await;
+            let issue = match issue_with_author(&state.db, issue).await {
+                Ok(issue) => issue,
+                Err(error) => return error.into_response(),
+            };
             (StatusCode::OK, Json(issue)).into_response()
         }
         // An unknown issue is now the 404 the service reports, a rejected title
@@ -563,7 +578,10 @@ pub async fn list_comments(
 ) -> impl IntoResponse {
     match rg_core::issue::list_comments(&state.db, &owner, &repo, number).await {
         Ok(comments) => {
-            let comments = comments_with_authors(&state.db, comments).await;
+            let comments = match comments_with_authors(&state.db, comments).await {
+                Ok(comments) => comments,
+                Err(error) => return error.into_response(),
+            };
             (StatusCode::OK, Json(comments)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -596,7 +614,10 @@ pub async fn add_comment(
 ) -> impl IntoResponse {
     match rg_core::issue::add_comment(&state.db, &owner, &repo, number, user_id, req.body).await {
         Ok(comment) => {
-            let comment = comment_with_author(&state.db, comment).await;
+            let comment = match comment_with_author(&state.db, comment).await {
+                Ok(comment) => comment,
+                Err(error) => return error.into_response(),
+            };
             (StatusCode::CREATED, Json(comment)).into_response()
         }
         // Empty body → 400 (typed in the service), unknown issue → 404, failed
@@ -611,62 +632,61 @@ async fn author_name(
     db: &sea_orm::DatabaseConnection,
     cache: &mut HashMap<i64, Option<String>>,
     user_id: i64,
-) -> Option<String> {
+) -> Result<Option<String>, AppError> {
     if let Some(cached) = cache.get(&user_id) {
-        return cached.clone();
+        return Ok(cached.clone());
     }
 
     let name = rg_db::ops::user_ops::find_by_id(db, user_id)
         .await
-        .ok()
-        .flatten()
+        .map_err(AppError::from)?
         .map(|user| user.username);
     cache.insert(user_id, name.clone());
-    name
+    Ok(name)
 }
 
 async fn issue_with_author(
     db: &sea_orm::DatabaseConnection,
     issue: rg_db::entities::issue::Model,
-) -> IssueResponse {
+) -> Result<IssueResponse, AppError> {
     let mut cache = HashMap::new();
-    let author = author_name(db, &mut cache, issue.author_id).await;
-    IssueResponse { issue, author }
+    let author = author_name(db, &mut cache, issue.author_id).await?;
+    Ok(IssueResponse { issue, author })
 }
 
 async fn issues_with_authors(
     db: &sea_orm::DatabaseConnection,
     issues: Vec<rg_db::entities::issue::Model>,
-) -> Vec<IssueResponse> {
+) -> Result<Vec<IssueResponse>, AppError> {
     let mut cache = HashMap::new();
     let mut responses = Vec::with_capacity(issues.len());
     for issue in issues {
-        let author = author_name(db, &mut cache, issue.author_id).await;
+        let author = author_name(db, &mut cache, issue.author_id).await?;
         responses.push(IssueResponse { issue, author });
     }
-    responses
+    Ok(responses)
 }
 
 async fn comment_with_author(
     db: &sea_orm::DatabaseConnection,
     comment: rg_db::entities::issue_comment::Model,
-) -> CommentResponse {
+) -> Result<CommentResponse, AppError> {
     let mut cache = HashMap::new();
-    let author = author_name(db, &mut cache, comment.author_id).await;
-    CommentResponse { comment, author }
+    let author = author_name(db, &mut cache, comment.author_id).await?;
+    Ok(CommentResponse { comment, author })
 }
 
 async fn comments_with_authors(
     db: &sea_orm::DatabaseConnection,
     comments: Vec<rg_db::entities::issue_comment::Model>,
-) -> Vec<CommentResponse> {
+) -> Result<Vec<CommentResponse>, AppError> {
     let mut cache = HashMap::new();
     let mut responses = Vec::with_capacity(comments.len());
     for comment in comments {
-        let author = author_name(db, &mut cache, comment.author_id).await;
+        let author = author_name(db, &mut cache, comment.author_id).await?;
         responses.push(CommentResponse { comment, author });
     }
-    responses
+    Ok(responses)
 }
 
 // ── Milestone handlers ──────────────────────────────────────────────────
@@ -916,5 +936,101 @@ pub async fn get_issue_labels(
             Err(e) => AppError::from(e).into_response(),
         },
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod author_enrichment_tests {
+    use super::*;
+    use chrono::Utc;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+
+    async fn test_db() -> sea_orm::DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.expect("connect test DB");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("run test migrations");
+        db
+    }
+
+    fn issue(author_id: i64) -> rg_db::entities::issue::Model {
+        let now = Utc::now();
+        rg_db::entities::issue::Model {
+            id: 1,
+            repo_id: 1,
+            number: 1,
+            title: "enrichment boundary".to_string(),
+            body: None,
+            state: "open".to_string(),
+            author_id,
+            assignee_id: None,
+            milestone_id: None,
+            labels: None,
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            deleted_at: None,
+        }
+    }
+
+    fn comment(id: i64, author_id: i64) -> rg_db::entities::issue_comment::Model {
+        let now = Utc::now();
+        rg_db::entities::issue_comment::Model {
+            id,
+            issue_id: 1,
+            author_id,
+            body: format!("comment {id}"),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn author_enrichment_keeps_existing_and_genuinely_missing_users_distinct() {
+        let db = test_db().await;
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "enrichment-author",
+            "enrichment-author@example.com",
+            "irrelevant-in-this-test",
+            "",
+        )
+        .await
+        .expect("create author");
+
+        let enriched = issue_with_author(&db, issue(user.id))
+            .await
+            .expect("existing author lookup");
+        assert_eq!(enriched.author.as_deref(), Some("enrichment-author"));
+
+        let enriched = comment_with_author(&db, comment(1, i64::MAX))
+            .await
+            .expect("missing author is a valid result");
+        assert_eq!(enriched.author, None);
+    }
+
+    #[tokio::test]
+    async fn author_enrichment_propagates_a_broken_users_table_for_single_and_list_paths() {
+        let db = test_db().await;
+        db.execute_unprepared("DROP TABLE users")
+            .await
+            .expect("break author lookup after loading the primary models");
+
+        let single = issue_with_author(&db, issue(1)).await;
+        assert!(
+            single
+                .err()
+                .is_some_and(|error| error.status().is_server_error()),
+            "single-item enrichment must fail with 5xx when the user lookup fails"
+        );
+
+        let list = comments_with_authors(&db, vec![comment(1, 1), comment(2, 1)]).await;
+        assert!(
+            list.err()
+                .is_some_and(|error| error.status().is_server_error()),
+            "list enrichment must fail with 5xx when the user lookup fails"
+        );
     }
 }

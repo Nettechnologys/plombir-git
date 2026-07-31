@@ -30,6 +30,7 @@ async fn setup(suffix: &str) -> (String, String, String, String) {
 async fn test_create_and_list_issues() {
     let (base, token, owner, repo) = setup("1").await;
     let client = reqwest::Client::new();
+    let mut first_number = None;
 
     for title in &[
         "Bug: crash on startup",
@@ -44,6 +45,9 @@ async fn test_create_and_list_issues() {
             .await
             .unwrap();
         assert_eq!(resp.status(), 201, "create issue '{}' failed", title);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(created["author"], owner);
+        first_number.get_or_insert_with(|| created["number"].as_i64().unwrap());
     }
 
     let resp = client
@@ -55,6 +59,22 @@ async fn test_create_and_list_issues() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let issues = body["data"].as_array().unwrap();
     assert_eq!(issues.len(), 3);
+    assert!(issues.iter().all(|issue| issue["author"] == owner));
+
+    let resp = client
+        .get(format!(
+            "{}/api/v1/repos/{}/{}/issues/{}",
+            base,
+            owner,
+            repo,
+            first_number.unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(issue["author"], owner);
 }
 
 #[tokio::test]
