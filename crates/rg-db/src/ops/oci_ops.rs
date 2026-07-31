@@ -47,6 +47,40 @@ pub async fn find_or_create_repo(
 
 // ── OCI Manifest ────────────────────────────────────────────
 
+/// Whether a content-addressed manifest row was created by this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestInsertOutcome {
+    Inserted,
+    Existing,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn manifest_model(
+    oci_repo_id: i64,
+    digest: &str,
+    tag: Option<&str>,
+    media_type: &str,
+    size: i64,
+    manifest_json: &str,
+    schema_version: i32,
+    push_by: Option<i64>,
+) -> oci_manifest::ActiveModel {
+    let now = Utc::now();
+    oci_manifest::ActiveModel {
+        id: NotSet,
+        oci_repository_id: Set(oci_repo_id),
+        digest: Set(digest.to_string()),
+        tag: Set(tag.map(str::to_owned)),
+        media_type: Set(media_type.to_string()),
+        size: Set(size),
+        manifest_json: Set(manifest_json.to_string()),
+        schema_version: Set(schema_version),
+        push_by: Set(push_by),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+}
+
 /// Find a manifest by digest.
 pub async fn find_manifest_by_digest(
     db: &DatabaseConnection,
@@ -99,21 +133,90 @@ pub async fn insert_manifest(
     schema_version: i32,
     push_by: Option<i64>,
 ) -> Result<oci_manifest::Model, DbErr> {
-    let now = Utc::now();
-    let m = oci_manifest::ActiveModel {
-        id: NotSet,
-        oci_repository_id: Set(oci_repo_id),
-        digest: Set(digest.to_string()),
-        tag: Set(tag.map(|s| s.to_string())),
-        media_type: Set(media_type.to_string()),
-        size: Set(size),
-        manifest_json: Set(manifest_json.to_string()),
-        schema_version: Set(schema_version),
-        push_by: Set(push_by),
-        created_at: Set(now),
-        updated_at: Set(now),
+    manifest_model(
+        oci_repo_id,
+        digest,
+        tag,
+        media_type,
+        size,
+        manifest_json,
+        schema_version,
+        push_by,
+    )
+    .insert(db)
+    .await
+}
+
+/// Insert a digest-addressed manifest and claim its blob references exactly once.
+///
+/// A client retry or two concurrent PUTs can legitimately reach the unique
+/// `(repository, digest)` key. The conflict is a successful no-op; only the
+/// request that inserts the row increments reference counts. Keeping both
+/// writes in one transaction also prevents a failed ref-count update from
+/// leaving a manifest row that every retry would mistake for fully recorded.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_digest_manifest(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    digest: &str,
+    media_type: &str,
+    size: i64,
+    manifest_json: &str,
+    schema_version: i32,
+    push_by: Option<i64>,
+    referenced_blob_digests: &[String],
+) -> Result<ManifestInsertOutcome, DbErr> {
+    use oci_blob::Entity as Blob;
+    use oci_manifest::Entity as Manifest;
+
+    let transaction = db.begin().await?;
+    let inserted = Manifest::insert(manifest_model(
+        oci_repo_id,
+        digest,
+        None,
+        media_type,
+        size,
+        manifest_json,
+        schema_version,
+        push_by,
+    ))
+    .on_conflict(
+        OnConflict::columns([
+            oci_manifest::Column::OciRepositoryId,
+            oci_manifest::Column::Digest,
+        ])
+        .do_nothing_on([oci_manifest::Column::Id])
+        .to_owned(),
+    )
+    .do_nothing()
+    .exec(&transaction)
+    .await?;
+
+    let outcome = match inserted {
+        TryInsertResult::Inserted(_) => {
+            for blob_digest in referenced_blob_digests {
+                Blob::update_many()
+                    .col_expr(
+                        oci_blob::Column::RefCount,
+                        Expr::col(oci_blob::Column::RefCount).add(1),
+                    )
+                    .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+                    .filter(oci_blob::Column::Digest.eq(blob_digest))
+                    .exec(&transaction)
+                    .await?;
+            }
+            ManifestInsertOutcome::Inserted
+        }
+        TryInsertResult::Conflicted => ManifestInsertOutcome::Existing,
+        TryInsertResult::Empty => {
+            return Err(DbErr::Custom(
+                "digest manifest insert unexpectedly contained no values".to_string(),
+            ));
+        }
     };
-    m.insert(db).await
+
+    transaction.commit().await?;
+    Ok(outcome)
 }
 
 /// Update a manifest's tag (move a tag to a new digest).

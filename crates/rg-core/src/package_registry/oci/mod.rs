@@ -12,6 +12,7 @@ pub mod types;
 pub use manifest::{Manifest, ManifestDescriptor, ManifestLayer, ParsedManifest};
 pub use storage::{
     is_client_digest_fault, DigestMismatch, FinalizedBlob, InvalidDigest, OciStorage,
+    StoredManifest,
 };
 pub use types::{
     error_codes, media_types, ErrorDetail, ErrorResponse, Reference, TagListResponse, API_VERSION,

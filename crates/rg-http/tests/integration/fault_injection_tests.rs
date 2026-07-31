@@ -13,6 +13,7 @@ use crate::common::fault::{
 };
 use crate::common::{create_issue, create_repo, register_full, spawn_test_app_with_db};
 use reqwest::multipart::{Form, Part};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde_json::Value;
 
 // ── OCI registry ─────────────────────────────────────────────
@@ -230,6 +231,23 @@ fn oci_blob_path(
         .join(hash)
 }
 
+/// Where a content-addressed OCI manifest lands in the shared blob store.
+fn oci_manifest_path(
+    repo_root: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    digest: &str,
+) -> std::path::PathBuf {
+    let hash = digest.strip_prefix("sha256:").expect("sha256 digest");
+    repo_root
+        .join("oci")
+        .join(owner)
+        .join(repo)
+        .join("manifests")
+        .join("sha256")
+        .join(hash)
+}
+
 /// Re-uploading content the repository already owns is a successful no-op.
 ///
 /// Docker may skip the preliminary HEAD, and retries routinely send the same
@@ -338,6 +356,289 @@ async fn concurrent_pushes_of_the_same_blob_both_succeed() {
         .unwrap();
     assert_eq!(fetched.status(), 200);
     assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
+}
+
+/// Retrying a digest-addressed manifest PUT is a successful no-op.
+///
+/// Only the request that creates the manifest row owns its blob-reference
+/// increments. A retry must neither surface the unique index nor count the
+/// same manifest a second time.
+#[tokio::test]
+async fn a_second_put_of_the_same_manifest_digest_is_idempotent() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&app.base, "manifest_retry", "manifest_retry@example.com").await;
+    create_repo(&app.base, &token, "same-manifest").await;
+
+    let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let config_digest =
+        push_blob(&app.base, &token, "manifest_retry", "same-manifest", config).await;
+    let manifest = manifest_json(&config_digest, config.len());
+    let manifest_digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(manifest.as_bytes()))
+    );
+    let url = format!(
+        "{}/v2/manifest_retry/same-manifest/manifests/{manifest_digest}",
+        app.base
+    );
+
+    for attempt in 0..2 {
+        let response = client
+            .put(&url)
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .body(manifest.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status, 201,
+            "manifest PUT attempt {attempt} failed instead of being idempotent: {body}"
+        );
+        let lower = body.to_ascii_lowercase();
+        assert!(
+            !lower.contains("unique constraint") && !lower.contains("duplicate key"),
+            "a database constraint escaped through the OCI response: {body}"
+        );
+    }
+
+    let forgekeep_repo =
+        rg_core::repo::service::find_repo_by_owner_name(&app.db, "manifest_retry", "same-manifest")
+            .await
+            .unwrap()
+            .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&app.db, forgekeep_repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest_rows = rg_db::entities::oci_manifest::Entity::find()
+        .filter(rg_db::entities::oci_manifest::Column::OciRepositoryId.eq(oci_repo.id))
+        .filter(rg_db::entities::oci_manifest::Column::Digest.eq(&manifest_digest))
+        .count(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(manifest_rows, 1, "a retry created a second manifest row");
+
+    let blob = rg_db::ops::oci_ops::find_blob(&app.db, oci_repo.id, &config_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        blob.ref_count, 1,
+        "the same digest-addressed manifest incremented its blob twice"
+    );
+}
+
+/// Two manifest PUTs are forced through storage together before either reaches
+/// the unique database key. Both are valid publishes; the database serializes
+/// them without double-counting their blob references.
+#[tokio::test]
+async fn concurrent_puts_of_the_same_manifest_digest_both_succeed() {
+    let config = b"{\"architecture\":\"arm64\",\"os\":\"linux\"}";
+    let config_digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(config))
+    );
+    let manifest = manifest_json(&config_digest, config.len());
+    let manifest_digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(manifest.as_bytes()))
+    );
+    let hash = manifest_digest.strip_prefix("sha256:").unwrap();
+    let needle = format!("manifests/sha256/{hash}");
+    let (base, db, gate) = spawn_test_app_with_two_put_gate(&needle).await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&base, "manifest_race", "manifest_race@example.com").await;
+    create_repo(&base, &token, "same-manifest").await;
+    let pushed_digest = push_blob(&base, &token, "manifest_race", "same-manifest", config).await;
+    assert_eq!(pushed_digest, config_digest);
+
+    let url = format!("{base}/v2/manifest_race/same-manifest/manifests/{manifest_digest}");
+    let publish = || {
+        let client = client.clone();
+        let token = token.clone();
+        let url = url.clone();
+        let manifest = manifest.clone();
+        tokio::spawn(async move {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                )
+                .body(manifest)
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    let mut left = publish();
+    let mut right = publish();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            left_result = &mut left => {
+                let left_result = left_result.unwrap();
+                gate.release_second();
+                (left_result, right.await.unwrap())
+            }
+            right_result = &mut right => {
+                let right_result = right_result.unwrap();
+                gate.release_second();
+                (right_result, left.await.unwrap())
+            }
+        }
+    })
+    .await
+    .expect("both manifest PUTs reached the gated storage write and completed");
+
+    for response in [first, second] {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 201, "one concurrent manifest PUT failed: {body}");
+        let lower = body.to_ascii_lowercase();
+        assert!(
+            !lower.contains("unique constraint") && !lower.contains("duplicate key"),
+            "a database constraint escaped through the OCI response: {body}"
+        );
+    }
+
+    let forgekeep_repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "manifest_race", "same-manifest")
+            .await
+            .unwrap()
+            .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest_rows = rg_db::entities::oci_manifest::Entity::find()
+        .filter(rg_db::entities::oci_manifest::Column::OciRepositoryId.eq(oci_repo.id))
+        .filter(rg_db::entities::oci_manifest::Column::Digest.eq(&manifest_digest))
+        .count(&db)
+        .await
+        .unwrap();
+    assert_eq!(manifest_rows, 1);
+    let blob = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &config_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        blob.ref_count, 1,
+        "both concurrent requests claimed the same blob reference"
+    );
+}
+
+/// A manifest row failure rolls back only an object this request published.
+/// Existing content-addressed bytes belong to the earlier successful push and
+/// remain readable even when a later tag INSERT genuinely fails.
+#[tokio::test]
+async fn a_manifest_row_failure_rolls_back_only_its_own_object() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(
+        &app.base,
+        "manifest_rollback",
+        "manifest_rollback@example.com",
+    )
+    .await;
+    create_repo(&app.base, &token, "rollback-manifest").await;
+
+    let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let config_digest = push_blob(
+        &app.base,
+        &token,
+        "manifest_rollback",
+        "rollback-manifest",
+        config,
+    )
+    .await;
+    let manifest = manifest_json(&config_digest, config.len());
+    let manifest_digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(manifest.as_bytes()))
+    );
+    let digest_url = format!(
+        "{}/v2/manifest_rollback/rollback-manifest/manifests/{manifest_digest}",
+        app.base
+    );
+    let stored = oci_manifest_path(
+        &app.repo_root,
+        "manifest_rollback",
+        "rollback-manifest",
+        &manifest_digest,
+    );
+    let put = |url: &str| {
+        client
+            .put(url)
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .body(manifest.clone())
+            .send()
+    };
+
+    let fault = fail_db_writes(&app.db, "oci_manifest", DbWrite::Insert).await;
+    let failed = put(&digest_url).await.unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a real manifest INSERT failure must reach the client"
+    );
+    fault.clear().await;
+    assert!(
+        !stored.exists(),
+        "the failed first publish left an unowned manifest at {}",
+        stored.display()
+    );
+
+    let healthy = put(&digest_url).await.unwrap();
+    assert_eq!(
+        healthy.status(),
+        201,
+        "the healthy manifest PUT must succeed"
+    );
+    assert!(
+        stored.exists(),
+        "the successful manifest PUT stored no object"
+    );
+
+    let fault = fail_db_writes(&app.db, "oci_manifest", DbWrite::Insert).await;
+    let tag_url = format!(
+        "{}/v2/manifest_rollback/rollback-manifest/manifests/another-tag",
+        app.base
+    );
+    let failed_retry = put(&tag_url).await.unwrap();
+    assert_eq!(
+        failed_retry.status(),
+        500,
+        "the injected tag INSERT failure must not be mistaken for a retry"
+    );
+    fault.clear().await;
+
+    assert!(
+        stored.exists(),
+        "the failed tag PUT deleted a manifest an earlier push recorded"
+    );
+    let pulled = client
+        .get(&digest_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pulled.status(), 200);
+    assert_eq!(pulled.text().await.unwrap(), manifest);
 }
 
 /// A push whose blob row was never written must not keep the bytes.

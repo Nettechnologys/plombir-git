@@ -39,6 +39,20 @@ pub struct FinalizedBlob {
     pub published: bool,
 }
 
+/// A manifest stored at its content-addressed key, and whether this request
+/// created the object.
+///
+/// The distinction is what makes compensation safe. A failed database write
+/// may delete bytes this request published, but must not delete a manifest an
+/// earlier successful push already recorded.
+#[derive(Debug, Clone)]
+pub struct StoredManifest {
+    /// The backend key the bytes live under, as a string.
+    pub storage_path: String,
+    /// Whether this call wrote the bytes, as opposed to finding them already there.
+    pub published: bool,
+}
+
 /// One actionable error for a filesystem failure on an OCI upload path.
 fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
     crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
@@ -282,10 +296,16 @@ impl OciStorage {
         repo: &str,
         digest: &str,
         data: &[u8],
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<StoredManifest> {
         let key = self.manifest_key(owner, repo, digest)?;
-        self.backend.put(&key, data).await?;
-        Ok(key.to_string())
+        let published = !self.backend.exists(&key).await?;
+        if published {
+            self.backend.put(&key, data).await?;
+        }
+        Ok(StoredManifest {
+            storage_path: key.to_string(),
+            published,
+        })
     }
 
     pub async fn read_manifest(

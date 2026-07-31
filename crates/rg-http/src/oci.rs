@@ -20,7 +20,7 @@ use rg_core::auth::oci_token::{
 };
 use rg_core::package_registry::oci::{
     error_codes, is_client_digest_fault, media_types, ErrorDetail, ErrorResponse, FinalizedBlob,
-    ParsedManifest, Reference, TagListResponse, API_VERSION,
+    ParsedManifest, Reference, StoredManifest, TagListResponse, API_VERSION,
 };
 
 use crate::api::repo_access;
@@ -794,11 +794,13 @@ pub async fn put_manifest(
         }
     };
 
+    let referenced_blobs = parsed.referenced_blobs();
+
     // Verify all referenced blobs exist
-    for blob_digest in parsed.referenced_blobs() {
+    for blob_digest in &referenced_blobs {
         let exists = match state
             .oci_storage
-            .blob_exists(&owner, &repo, &blob_digest)
+            .blob_exists(&owner, &repo, blob_digest)
             .await
         {
             Ok(exists) => exists,
@@ -820,17 +822,20 @@ pub async fn put_manifest(
     }
 
     // Store manifest on disk
-    if let Err(e) = state
+    let stored_manifest = match state
         .oci_storage
         .store_manifest(&owner, &repo, &parsed.digest, body.as_bytes())
         .await
     {
-        return oci_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("{e:#}"),
-        );
-    }
+        Ok(stored) => stored,
+        Err(e) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{e:#}"),
+            );
+        }
+    };
 
     let rf = Reference::parse(&reference);
     let tag = if rf.is_tag() {
@@ -842,69 +847,81 @@ pub async fn put_manifest(
         None
     };
 
-    // Insert or update manifest in DB
-    let result = if let Some(tag) = tag {
+    // Insert or update manifest in DB. Digest references are content-addressed:
+    // the database helper serializes retries and increments blob refs only for
+    // the request that actually created the row.
+    let increment_tag_refs = if let Some(tag) = tag {
         // Check if tag already exists — update it
-        match rg_db::ops::oci_ops::find_manifest_by_tag(&state.db, oci_repo.id, tag).await {
-            Ok(Some(_)) => {
-                rg_db::ops::oci_ops::update_manifest_tag(
-                    &state.db,
-                    oci_repo.id,
-                    tag,
-                    &parsed.digest,
-                    content_type,
-                    parsed.size as i64,
-                    &body,
-                    parsed.manifest.schema_version as i32,
-                    user_id,
-                )
-                .await
-            }
-            _ => {
-                rg_db::ops::oci_ops::insert_manifest(
-                    &state.db,
-                    oci_repo.id,
-                    &parsed.digest,
-                    Some(tag),
-                    content_type,
-                    parsed.size as i64,
-                    &body,
-                    parsed.manifest.schema_version as i32,
-                    user_id,
-                )
-                .await
-            }
-        }
+        let result =
+            match rg_db::ops::oci_ops::find_manifest_by_tag(&state.db, oci_repo.id, tag).await {
+                Ok(Some(_)) => {
+                    rg_db::ops::oci_ops::update_manifest_tag(
+                        &state.db,
+                        oci_repo.id,
+                        tag,
+                        &parsed.digest,
+                        content_type,
+                        parsed.size as i64,
+                        &body,
+                        parsed.manifest.schema_version as i32,
+                        user_id,
+                    )
+                    .await
+                }
+                _ => {
+                    rg_db::ops::oci_ops::insert_manifest(
+                        &state.db,
+                        oci_repo.id,
+                        &parsed.digest,
+                        Some(tag),
+                        content_type,
+                        parsed.size as i64,
+                        &body,
+                        parsed.manifest.schema_version as i32,
+                        user_id,
+                    )
+                    .await
+                }
+            };
+        result.map(|_| true)
     } else {
-        rg_db::ops::oci_ops::insert_manifest(
+        rg_db::ops::oci_ops::insert_digest_manifest(
             &state.db,
             oci_repo.id,
             &parsed.digest,
-            None,
             content_type,
             parsed.size as i64,
             &body,
             parsed.manifest.schema_version as i32,
             user_id,
+            &referenced_blobs,
         )
         .await
+        .map(|_| false)
     };
 
-    let _manifest = match result {
-        Ok(m) => m,
-        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+    let increment_tag_refs = match increment_tag_refs {
+        Ok(increment) => increment,
+        Err(e) => {
+            rollback_unrecorded_manifest(&state, &owner, &repo, &parsed.digest, &stored_manifest)
+                .await;
+            return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"));
+        }
     };
 
     // Increment blob ref counts.
     //
-    // A blob whose ref count was not incremented is a blob the GC is free to
-    // delete while this manifest still points at it — a corrupted image
-    // discovered long after the push that caused it. Over-counting on a client
-    // retry is harmless, under-counting is not, so a failure here fails the
-    // push instead of being swallowed.
-    for blob_digest in parsed.referenced_blobs() {
-        let blob = match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &blob_digest).await
-        {
+    // Digest-addressed inserts claimed their references transactionally above.
+    // Tag writes still use the legacy update path here. A blob whose ref count
+    // was not incremented is a blob a future GC could delete while this
+    // manifest still points at it, so a failure fails the push instead of being
+    // swallowed.
+    for blob_digest in if increment_tag_refs {
+        referenced_blobs.as_slice()
+    } else {
+        &[]
+    } {
+        let blob = match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, blob_digest).await {
             Ok(Some(blob)) => blob,
             Ok(None) => continue,
             Err(e) => {
@@ -946,6 +963,77 @@ pub async fn put_manifest(
         String::new(),
     )
         .into_response()
+}
+
+/// Remove a manifest object published by a request whose database transaction failed.
+///
+/// A content-addressed retry may find bytes from an earlier successful push.
+/// Those are never ours to delete. A final database recheck also protects the
+/// narrow race where another request committed the same digest while this one
+/// was failing.
+async fn rollback_unrecorded_manifest(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    digest: &str,
+    stored: &StoredManifest,
+) {
+    if !stored.published {
+        return;
+    }
+
+    match find_oci_repo(&state.db, owner, repo).await {
+        Ok(Some(oci_repo)) => {
+            match rg_db::ops::oci_ops::find_manifest_by_digest(&state.db, oci_repo.id, digest).await
+            {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %owner,
+                        %repo,
+                        %digest,
+                        storage_path = %stored.storage_path,
+                        error = %error,
+                        "possibly orphaned OCI manifest: the database recheck failed, so rollback kept the object"
+                    );
+                    return;
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                %owner,
+                %repo,
+                %digest,
+                storage_path = %stored.storage_path,
+                error = %format!("{error:#}"),
+                "possibly orphaned OCI manifest: the repository recheck failed, so rollback kept the object"
+            );
+            return;
+        }
+    }
+
+    let cleanup = match rg_core::blob_storage::BlobKey::new(&stored.storage_path) {
+        Ok(key) => state
+            .blob_storage
+            .delete(&key)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(reason) = cleanup {
+        tracing::warn!(
+            %owner,
+            %repo,
+            %digest,
+            storage_path = %stored.storage_path,
+            error = %reason,
+            "orphaned OCI manifest: the oci_manifests row was not created and the rollback delete failed too"
+        );
+    }
 }
 
 // ── Blob ─────────────────────────────────────────────────────
