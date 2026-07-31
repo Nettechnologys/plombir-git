@@ -473,23 +473,15 @@ async fn parse_artifact_upload(
         // wrong problem when the file is there but unreadable.
         let size = tokio::fs::metadata(&file_path)
             .await
-            .map_err(|error| {
-                AppError::bad_request(format!(
-                    "artifact metadata file {} is unusable: {error}",
-                    file_path.display()
-                ))
-            })?
+            .map_err(|error| artifact_metadata_file_error(&file_path, &error))?
             .len() as i64;
         let name = sanitize_artifact_name(&req.name);
         // Stream the digest over the referenced file instead of buffering it in
         // memory — the metadata path exists precisely to avoid loading the whole
         // artifact into the request body.
-        let sha256 = hash_file(&file_path).await.map_err(|error| {
-            AppError::bad_request(format!(
-                "failed to hash artifact metadata file {}: {error}",
-                file_path.display()
-            ))
-        })?;
+        let sha256 = hash_file(&file_path)
+            .await
+            .map_err(|error| artifact_metadata_file_error(&file_path, &error))?;
         let key = artifact_key(job_id, &name).map_err(AppError::bad_request)?;
         state
             .blob_storage
@@ -541,6 +533,14 @@ async fn hash_file(path: &FsPath) -> std::io::Result<String> {
         hasher.update(&buf[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn artifact_metadata_file_error(path: &FsPath, error: &std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        AppError::bad_request("artifact metadata file does not exist in this job's storage")
+    } else {
+        AppError::internal(artifact_path_error("artifact metadata file", path, error))
+    }
 }
 
 fn artifact_key(job_id: i64, name: &str) -> Result<rg_core::blob_storage::BlobKey, String> {

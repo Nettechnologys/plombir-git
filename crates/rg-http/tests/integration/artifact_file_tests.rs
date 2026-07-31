@@ -1,4 +1,5 @@
 use crate::common::answer::Answer;
+use crate::common::fault::spawn_test_app_for_fault_sweep;
 use crate::common::{register_full, spawn_test_app_with_db};
 use sea_orm::{ActiveModelTrait, Set};
 use sha2::{Digest, Sha256};
@@ -207,6 +208,90 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// The runner's JSON upload points at a file the server already staged under
+/// `_artifacts/jobs/<job_id>`. A missing file is still bad runner metadata, but
+/// once that path exists an I/O failure belongs to the server and its absolute
+/// storage path must stay in the operator log.
+#[tokio::test]
+async fn artifact_metadata_upload_separates_missing_files_from_storage_failures() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _owner_id) = register_full(
+        &app.base,
+        "artifact_metadata_owner",
+        "artifact_metadata_owner@example.com",
+    )
+    .await;
+    let repo_id = create_private_repo(&app.base, &owner_token, "artifact-metadata-errors").await;
+    let runner = rg_db::ops::runner_ops::register_runner(
+        &app.db,
+        "artifact-metadata-runner",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (_pipeline_id, job_id) = create_assigned_job(&app.db, repo_id, runner.id).await;
+    let job_root = app
+        .repo_root
+        .join("_artifacts")
+        .join("jobs")
+        .join(job_id.to_string());
+    std::fs::create_dir_all(&job_root).unwrap();
+    let upload_url = format!(
+        "{}/api/v1/runners/{}/jobs/{}/artifacts",
+        app.base, runner.id, job_id
+    );
+
+    let missing = job_root.join("missing.bin");
+    let missing_response = client
+        .post(&upload_url)
+        .bearer_auth(&runner.token)
+        .json(&serde_json::json!({
+            "name": "missing",
+            "file_path": missing,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let missing_status = missing_response.status();
+    let missing_body = missing_response.text().await.unwrap();
+    assert_eq!(missing_status, 400, "{missing_body}");
+    assert!(
+        !missing_body.contains(&job_root.display().to_string()),
+        "the client saw the artifact storage path: {missing_body}"
+    );
+
+    // `metadata()` succeeds for a directory, but the streaming hash cannot read
+    // its bytes. This is deterministic under root too, unlike chmod-based tests.
+    let unreadable = job_root.join("directory-not-file");
+    std::fs::create_dir(&unreadable).unwrap();
+    assert!(tokio::fs::read(&unreadable).await.is_err());
+    let failed_response = client
+        .post(&upload_url)
+        .bearer_auth(&runner.token)
+        .json(&serde_json::json!({
+            "name": "unreadable",
+            "file_path": unreadable,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let failed_status = failed_response.status();
+    let failed_body = failed_response.text().await.unwrap();
+    assert_eq!(failed_status, 500, "{failed_body}");
+    assert!(
+        !failed_body.contains(&job_root.display().to_string()),
+        "the client saw the artifact storage path: {failed_body}"
+    );
+    assert!(
+        failed_body.contains("Internal server error"),
+        "the 5xx body was not sanitized: {failed_body}"
+    );
 }
 
 /// The four artifact routes take their access level as a *type* now —
