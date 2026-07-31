@@ -24,6 +24,25 @@ async fn batch(
     oid: &str,
     size: usize,
 ) -> reqwest::Response {
+    batch_objects(
+        base,
+        owner,
+        repo,
+        token,
+        operation,
+        serde_json::json!([{"oid": oid, "size": size}]),
+    )
+    .await
+}
+
+async fn batch_objects(
+    base: &str,
+    owner: &str,
+    repo: &str,
+    token: Option<&str>,
+    operation: &str,
+    objects: serde_json::Value,
+) -> reqwest::Response {
     let client = reqwest::Client::new();
     let mut request = client
         .post(format!(
@@ -31,13 +50,84 @@ async fn batch(
         ))
         .json(&serde_json::json!({
             "operation": operation,
-            "objects": [{"oid": oid, "size": size}],
+            "objects": objects,
             "transfers": ["basic"]
         }));
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     request.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn lfs_download_batch_reports_missing_objects_individually() {
+    let (base, _) = spawn_test_app_with_db().await;
+    let (owner_token, _) =
+        register_full(&base, "lfs_missing_owner", "lfs_missing_owner@example.com").await;
+    create_repo(&base, &owner_token, "missing-lfs", true).await;
+
+    let content = b"stored LFS content";
+    let stored_oid = hex::encode(Sha256::digest(content));
+    let missing_oid = hex::encode(Sha256::digest(b"missing LFS content"));
+
+    let upload = batch(
+        &base,
+        "lfs_missing_owner",
+        "missing-lfs",
+        Some(&owner_token),
+        "upload",
+        &stored_oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(upload.status(), 200);
+    let upload = upload.json::<serde_json::Value>().await.unwrap();
+    let upload_href = upload["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap();
+    let stored = reqwest::Client::new()
+        .put(upload_href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), 200);
+
+    let missing = batch(
+        &base,
+        "lfs_missing_owner",
+        "missing-lfs",
+        Some(&owner_token),
+        "download",
+        &missing_oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(missing.status(), 200);
+    let missing = missing.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(missing["objects"][0]["error"]["code"], 404);
+
+    let mixed = batch_objects(
+        &base,
+        "lfs_missing_owner",
+        "missing-lfs",
+        Some(&owner_token),
+        "download",
+        serde_json::json!([
+            {"oid": stored_oid, "size": content.len()},
+            {"oid": missing_oid, "size": content.len()}
+        ]),
+    )
+    .await;
+    assert_eq!(mixed.status(), 200);
+    let mixed = mixed.json::<serde_json::Value>().await.unwrap();
+    assert!(
+        mixed["objects"][0]["actions"]["download"]["href"]
+            .as_str()
+            .is_some(),
+        "stored object must retain its download action: {mixed}"
+    );
+    assert_eq!(mixed["objects"][1]["error"]["code"], 404);
 }
 
 #[tokio::test]

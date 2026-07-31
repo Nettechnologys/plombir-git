@@ -445,9 +445,17 @@ async fn handle_download(
     signing_secret: &[u8],
     actor_id: Option<i64>,
 ) -> Result<LfsObjectResponse> {
-    let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("LFS object {} not found", oid))?;
+    let Some(existing) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? else {
+        return Ok(LfsObjectResponse {
+            oid: oid.to_string(),
+            size,
+            actions: None,
+            error: Some(LfsError {
+                code: 404,
+                message: "object not found".to_string(),
+            }),
+        });
+    };
 
     if !existing.uploaded {
         return Ok(LfsObjectResponse {
