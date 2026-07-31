@@ -46,12 +46,14 @@ pub struct CreateCommentRequest {
     pub body: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     pub state: Option<String>,
     #[serde(default)]
     pub labels: Option<String>,
     #[serde(flatten)]
+    #[param(ignore)]
     pub pagination: PaginationParams,
 }
 
@@ -204,6 +206,8 @@ pub struct CommentResponse {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        ListQuery,
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
@@ -658,7 +662,8 @@ async fn comments_with_authors(
 
 // ── Milestone handlers ──────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListMilestonesQuery {
     pub state: Option<String>,
 }
@@ -670,6 +675,7 @@ pub struct ListMilestonesQuery {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        ListMilestonesQuery,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),

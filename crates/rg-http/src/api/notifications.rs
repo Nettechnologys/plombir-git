@@ -24,10 +24,12 @@ struct NotificationResponse {
     created_at: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListNotificationsQuery {
     unread_only: Option<bool>,
     #[serde(flatten)]
+    #[param(ignore)]
     pagination: PaginationParams,
 }
 
@@ -39,6 +41,7 @@ pub struct ListNotificationsQuery {
     get,
     path = "/notifications",
     tag = "Notifications",
+    params(ListNotificationsQuery, PaginationParams),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
@@ -111,7 +114,6 @@ pub async fn unread_count(
     params(
         ("id" = i64, Path, description = "id"),
     ),
-    request_body(content = serde_json::Value),
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),

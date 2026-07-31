@@ -14,7 +14,8 @@ use crate::AppState;
 
 // ── Request / Response types ──────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TreeQuery {
     /// Git ref (branch, tag, commit SHA). Default: HEAD
     #[serde(default)]
@@ -24,7 +25,8 @@ pub struct TreeQuery {
     pub path: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct BlobQuery {
     #[serde(default)]
     pub r#ref: Option<String>,
@@ -56,7 +58,8 @@ pub struct CreateOrUpdateFileRequest {
 }
 
 /// Query parameters for deleting a file.
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteFileQuery {
     /// Branch name (default: repo's default branch)
     #[serde(default)]
@@ -147,6 +150,7 @@ pub struct GpgSignature {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        TreeQuery,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
@@ -246,6 +250,7 @@ fn is_empty_repo(repo_path: &std::path::Path) -> bool {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        BlobQuery,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
@@ -1083,6 +1088,7 @@ pub async fn create_or_update_file(
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        DeleteFileQuery,
     ),
     responses(
         (status = 200, description = "Success", body = FileOperationResponse),

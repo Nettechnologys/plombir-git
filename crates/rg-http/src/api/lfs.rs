@@ -19,7 +19,8 @@ use crate::AppState;
 /// failure and a maintenance-pass failure name the same directory the same way.
 use rg_core::platform::fs::{discard_file_async, LFS_STORAGE_HINT};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LfsActionQuery {
     expires: Option<i64>,
     signature: Option<String>,
@@ -278,6 +279,7 @@ pub async fn batch(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
         ("oid" = String, Path, description = "oid"),
+        LfsActionQuery,
     ),
     request_body(content = serde_json::Value),
     responses(
@@ -376,6 +378,7 @@ pub async fn upload_object(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
         ("oid" = String, Path, description = "oid"),
+        LfsActionQuery,
     ),
     responses(
         (status = 200, description = "Success", content_type = "application/octet-stream"),

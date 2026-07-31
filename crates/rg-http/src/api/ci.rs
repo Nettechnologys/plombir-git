@@ -76,9 +76,11 @@ pub struct TriggerPipelineRequest {
     ref_name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListPipelinesQuery {
     #[serde(flatten)]
+    #[param(ignore)]
     pagination: PaginationParams,
 }
 
@@ -93,6 +95,8 @@ pub struct ListPipelinesQuery {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        ListPipelinesQuery,
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),

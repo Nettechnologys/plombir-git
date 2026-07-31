@@ -105,6 +105,7 @@ pub async fn add_time(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
         ("number" = i64, Path, description = "issue number"),
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),

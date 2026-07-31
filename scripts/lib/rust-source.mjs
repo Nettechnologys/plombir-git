@@ -107,15 +107,94 @@ export function rustFnBlock(source, name) {
   if (close < 0) return null;
   const block = rest.slice(0, close + 2);
 
-  const signature =
-    /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(([\s\S]*?)\n\)/.exec(block) ||
-    /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(([^)]*)\)/.exec(block);
-  if (!signature) return null;
+  const head = /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(/.exec(block);
+  if (!head) return null;
+  const open = head[0].lastIndexOf('(');
+  let depth = 0;
+  let end = open;
+  while (end < block.length) {
+    if (block[end] === '(') depth += 1;
+    else if (block[end] === ')') {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+    end += 1;
+  }
+  if (depth !== 0) return null;
 
-  const brace = block.indexOf('{', signature[0].length);
+  const brace = block.indexOf('{', end + 1);
   if (brace < 0) return null;
 
-  return { params: signature[1], body: block.slice(brace) };
+  return { params: block.slice(open + 1, end), body: block.slice(brace) };
+}
+
+/**
+ * Split a Rust function parameter list at top-level commas.
+ *
+ * This is deliberately separate from `splitCallArgs`: generic type arguments
+ * (`Query<HashMap<String, String>>`) add `<...>` nesting that a call expression
+ * does not. Treating that comma as a parameter boundary would make a handler
+ * appear to take a made-up, untyped parameter and weaken every signature-based
+ * contract check built on this helper.
+ */
+export function splitRustParams(params) {
+  const result = [];
+  let depth = 0;
+  let start = 0;
+  let i = 0;
+  while (i < params.length) {
+    const ch = params[i];
+    if (ch === '"') {
+      i += 1;
+      while (i < params.length) {
+        if (params[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (params[i] === '"') break;
+        i += 1;
+      }
+    } else if (ch === '(' || ch === '[' || ch === '{' || ch === '<') {
+      depth += 1;
+    } else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') {
+      depth -= 1;
+      if (depth < 0) return null;
+    } else if (ch === ',' && depth === 0) {
+      const param = params.slice(start, i).trim();
+      if (param) result.push(param);
+      start = i + 1;
+    }
+    i += 1;
+  }
+  if (depth !== 0) return null;
+  const tail = params.slice(start).trim();
+  if (tail) result.push(tail);
+  return result;
+}
+
+/**
+ * The declared type of one Rust parameter: the text after the top-level `:`.
+ *
+ * Patterns may contain their own colons (`RepoWrite { actor_id: id }`) and type
+ * paths contain `::`; neither is the separator between the pattern and type.
+ */
+export function rustParamType(param) {
+  let depth = 0;
+  let i = 0;
+  while (i < param.length) {
+    const ch = param[i];
+    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') depth -= 1;
+    else if (ch === ':' && depth === 0) {
+      if (param[i + 1] === ':') {
+        i += 2;
+        continue;
+      }
+      return param.slice(i + 1).trim();
+    }
+    i += 1;
+  }
+  return null;
 }
 
 // ── Route table ────────────────────────────────────────────────────────────
@@ -456,6 +535,96 @@ function attributeStringValue(body, key) {
   return null;
 }
 
+/** Whether a top-level attribute key is followed by one of `continuations`. */
+function hasAttributeDeclaration(body, key, continuations) {
+  let depth = 0;
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === '"') {
+      i += 1;
+      while (i < body.length) {
+        if (body[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (body[i] === '"') break;
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+    else if (
+      depth === 0 &&
+      body.startsWith(key, i) &&
+      (i === 0 || !/[\w:]/.test(body[i - 1])) &&
+      !/\w/.test(body[i + key.length] ?? '')
+    ) {
+      let next = i + key.length;
+      while (/\s/.test(body[next] ?? '')) next += 1;
+      if (continuations.includes(body[next])) return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+/** The body of a top-level `key(...)` declaration, or `null` when absent. */
+function attributeCallBody(body, key) {
+  let depth = 0;
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === '"') {
+      i += 1;
+      while (i < body.length) {
+        if (body[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (body[i] === '"') break;
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+    else if (
+      depth === 0 &&
+      body.startsWith(key, i) &&
+      (i === 0 || !/[\w:]/.test(body[i - 1])) &&
+      !/\w/.test(body[i + key.length] ?? '')
+    ) {
+      let open = i + key.length;
+      while (/\s/.test(body[open] ?? '')) open += 1;
+      if (body[open] !== '(') return null;
+      let callDepth = 1;
+      let end = open + 1;
+      while (end < body.length && callDepth > 0) {
+        if (body[end] === '"') {
+          end += 1;
+          while (end < body.length) {
+            if (body[end] === '\\') {
+              end += 2;
+              continue;
+            }
+            if (body[end] === '"') break;
+            end += 1;
+          }
+        } else if (body[end] === '(') callDepth += 1;
+        else if (body[end] === ')') callDepth -= 1;
+        end += 1;
+      }
+      return callDepth === 0 ? body.slice(open + 1, end - 1) : null;
+    }
+    i += 1;
+  }
+  return null;
+}
+
 /**
  * The `#[utoipa::path(...)]` annotations of one Rust source file.
  *
@@ -468,7 +637,9 @@ function attributeStringValue(body, key) {
  * it: a silently skipped annotation is a hole in the very comparison these rows
  * exist for.
  *
- * Returns `{ handler|null, method|null, path|null, file, line }` rows.
+ * Returns rows carrying the annotation declarations and the attributed
+ * handler's raw signature parameters. A caller can therefore compare the
+ * document's claims with the handler input without maintaining a handler list.
  */
 export function parseUtoipaPaths(source, modulePath, file) {
   const src = stripRustComments(source);
@@ -506,11 +677,16 @@ export function parseUtoipaPaths(source, modulePath, file) {
 
     const owner = /^\]\s*(?:#\[[^\]]*\]\s*)*pub(?:\(crate\))?\s+async\s+fn\s+(\w+)/.exec(src.slice(i));
     const method = new RegExp(`^\\s*(${UTOIPA_METHODS.join('|')})\\s*,`, 'i').exec(body);
+    const fnBlock = owner ? rustFnBlock(src, owner[1]) : null;
 
     rows.push({
       handler: owner ? `${modulePath}::${owner[1]}` : null,
       method: method ? method[1].toUpperCase() : null,
       path: attributeStringValue(body, 'path'),
+      signatureParams: fnBlock?.params ?? null,
+      declaresParams: hasAttributeDeclaration(body, 'params', ['(']),
+      paramsBody: attributeCallBody(body, 'params'),
+      declaresRequestBody: hasAttributeDeclaration(body, 'request_body', ['(', '=']),
       file,
       line: src.slice(0, start).split('\n').length,
     });

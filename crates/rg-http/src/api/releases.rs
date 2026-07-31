@@ -105,6 +105,7 @@ pub struct UpdateReleaseRequest {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
@@ -345,6 +346,7 @@ pub async fn list_assets(
         ("name" = String, Path, description = "name"),
         ("release_id" = i64, Path, description = "release_id"),
     ),
+    request_body(content_type = "application/octet-stream"),
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),

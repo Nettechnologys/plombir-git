@@ -468,6 +468,7 @@ pub async fn get_starred_status(
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
@@ -762,6 +763,7 @@ pub async fn fork_repo_handler(
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),

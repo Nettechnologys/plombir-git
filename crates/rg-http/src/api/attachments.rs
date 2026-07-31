@@ -14,7 +14,8 @@ use crate::AppState;
 use rg_core::attachment::AttachmentTarget;
 use rg_core::platform::fs::discard_file_async;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct UploadQuery {
     pub name: Option<String>,
 }
@@ -56,7 +57,14 @@ pub async fn list_issue_attachments(
     list(&state, repo_model, &owner, &repo, TargetKind::Issue, number).await
 }
 
-#[utoipa::path(post, path = "/repos/{owner}/{name}/issues/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/issues/{number}/assets",
+    tag = "Attachments",
+    params(UploadQuery),
+    request_body(content_type = "multipart/form-data"),
+    responses((status = 201, body = serde_json::Value))
+)]
 pub async fn create_issue_attachment(
     State(state): State<AppState>,
     RepoAuthRead {
@@ -138,7 +146,14 @@ pub async fn list_pull_request_attachments(
     .await
 }
 
-#[utoipa::path(post, path = "/repos/{owner}/{name}/pulls/{number}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/pulls/{number}/assets",
+    tag = "Attachments",
+    params(UploadQuery),
+    request_body(content_type = "multipart/form-data"),
+    responses((status = 201, body = serde_json::Value))
+)]
 pub async fn create_pull_request_attachment(
     State(state): State<AppState>,
     RepoAuthRead {
@@ -220,7 +235,14 @@ pub async fn list_issue_comment_attachments(
     .await
 }
 
-#[utoipa::path(post, path = "/repos/{owner}/{name}/issues/comments/{comment_id}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
+    tag = "Attachments",
+    params(UploadQuery),
+    request_body(content_type = "multipart/form-data"),
+    responses((status = 201, body = serde_json::Value))
+)]
 pub async fn create_issue_comment_attachment(
     State(state): State<AppState>,
     RepoAuthRead {
@@ -302,7 +324,14 @@ pub async fn list_review_comment_attachments(
     .await
 }
 
-#[utoipa::path(post, path = "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets", tag = "Attachments", responses((status = 201, body = serde_json::Value)))]
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+    tag = "Attachments",
+    params(UploadQuery),
+    request_body(content_type = "multipart/form-data"),
+    responses((status = 201, body = serde_json::Value))
+)]
 pub async fn create_review_comment_attachment(
     State(state): State<AppState>,
     RepoAuthRead {

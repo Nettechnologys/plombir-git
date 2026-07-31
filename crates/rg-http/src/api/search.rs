@@ -12,7 +12,8 @@ use crate::error::AppError;
 use crate::pagination::PaginationParams;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SearchQuery {
     pub q: String,
     #[serde(default = "default_search_type")]
@@ -43,6 +44,7 @@ fn normalize_search_type(raw: &str) -> Option<&'static str> {
     get,
     path = "/search",
     tag = "Search",
+    params(SearchQuery),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),

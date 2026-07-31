@@ -36,7 +36,13 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadMountedHandlers, loadUtoipaPaths, stripRustComments } from './lib/rust-source.mjs';
+import {
+  loadMountedHandlers,
+  loadUtoipaPaths,
+  rustParamType,
+  splitRustParams,
+  stripRustComments,
+} from './lib/rust-source.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ROUTER = join(root, 'crates/rg-http/src/routes.rs');
@@ -265,6 +271,58 @@ for (const handler of [...documented].sort()) {
 const annotations = loadUtoipaPaths(API_DIR);
 const uncomparable = [];
 let extraMounts = 0;
+let inputCompared = 0;
+
+/** The outer extractor/type name of one handler parameter. */
+function baseParamType(type) {
+  const withoutReference = type
+    .trim()
+    .replace(/^&(?:'\w+\s+)?/, '')
+    .replace(/^mut\s+/, '');
+  const head = withoutReference.split(/[<\s]/, 1)[0];
+  return head.split('::').at(-1);
+}
+
+/** The `T` in an outer `Query<T>` extractor type. */
+function queryParamType(type) {
+  const match = /(?:^|::)Query\s*<([\s\S]+)>$/.exec(type.trim());
+  return match?.[1].trim() ?? null;
+}
+
+/**
+ * What the handler signature says this operation consumes.
+ *
+ * These are transport inputs, not arbitrary values used by the handler:
+ * `NamespaceCreate`/`NamespaceWrite` are the two local `FromRequest` body
+ * extractors; the remaining names are axum's built-ins.
+ */
+function handlerInput(annotation) {
+  if (annotation.signatureParams === null) return null;
+  const params = splitRustParams(annotation.signatureParams);
+  if (params === null) return null;
+  const types = [];
+  let queryType = null;
+  for (const param of params) {
+    const type = rustParamType(param);
+    if (type === null) return null;
+    types.push(baseParamType(type));
+    queryType ??= queryParamType(type);
+  }
+  const bodyTypes = new Set([
+    'Body',
+    'Bytes',
+    'Json',
+    'Multipart',
+    'NamespaceCreate',
+    'NamespaceWrite',
+    'String',
+  ]);
+  return {
+    body: types.some((type) => bodyTypes.has(type)),
+    query: types.includes('Query'),
+    queryType,
+  };
+}
 
 // The other half of the single-prefix rule: every annotation is relative to the
 // `servers` entry asserted above. This is checked over every annotation found,
@@ -277,6 +335,48 @@ for (const [handler, annotation] of [...annotations].sort()) {
       `${handler} is annotated path = "${annotation.path}" (${annotation.file}:${annotation.line}) — the ` +
         `${API_PREFIX} prefix belongs to the document's servers(...) entry alone, so this publishes ` +
         `${API_PREFIX}${annotation.path}. Write the path relative to the router's nest prefix.`,
+    );
+  }
+}
+
+// ── The third declaration: operation input ────────────────────────────────
+//
+// `utoipa` does not infer these inputs in this crate. Without the declaration,
+// Swagger UI has no file picker/query field and generated clients do not expose
+// the value at all. The handler signature is the production source of truth;
+// the annotation is only accepted when it agrees in both directions.
+for (const [handler, annotation] of [...annotations].sort()) {
+  if (!documented.has(handler)) continue;
+  const input = handlerInput(annotation);
+  if (input === null) {
+    failures.push(
+      `${handler}: could not read the handler signature attributed to #[utoipa::path(...)] at ` +
+        `${annotation.file}:${annotation.line} — fix parseUtoipaPaths()/splitRustParams(), not the assertion.`,
+    );
+    continue;
+  }
+  inputCompared += 1;
+
+  if (input.body !== annotation.declaresRequestBody) {
+    failures.push(
+      `${handler} ${input.body ? 'takes a request body' : 'takes no request body'} but its annotation at ` +
+        `${annotation.file}:${annotation.line} ${annotation.declaresRequestBody ? 'declares' : 'does not declare'} ` +
+        '`request_body` — the published operation and handler signature disagree.',
+    );
+  }
+  const queryTypeName = input.queryType?.split('::').at(-1);
+  const queryDeclared =
+    annotation.paramsBody !== null &&
+    (/\bQuery\b/.test(annotation.paramsBody) ||
+      (queryTypeName !== undefined &&
+        new RegExp(`\\b${queryTypeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(
+          annotation.paramsBody,
+        )));
+  if (input.query && !queryDeclared) {
+    failures.push(
+      `${handler} takes Query<${input.queryType ?? '?'}> but params(...) at ` +
+        `${annotation.file}:${annotation.line} declares neither query tuples nor that IntoParams type — ` +
+        'generated clients and Swagger UI cannot supply the query input.',
     );
   }
 }
@@ -363,4 +463,5 @@ console.log(
   `   method+URL agreed for ${covered - uncomparable.length}/${covered} of them; ` +
     `${uncomparable.length} compared by method only, ${extraMounts} extra mount(s) no annotation can describe`,
 );
+console.log(`   request body/query declarations agreed with ${inputCompared} published handler signatures`);
 for (const entry of uncomparable) console.log(`   - URL not comparable: ${entry}`);

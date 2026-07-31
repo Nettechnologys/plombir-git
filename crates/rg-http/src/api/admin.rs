@@ -139,6 +139,7 @@ impl axum::extract::FromRequestParts<AppState> for InstanceAdmin {
     get,
     path = "/admin/users",
     tag = "Admin",
+    params(PaginationParams),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
@@ -354,6 +355,7 @@ pub async fn delete_user(
     get,
     path = "/admin/orgs",
     tag = "Admin",
+    params(PaginationParams),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),

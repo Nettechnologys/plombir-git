@@ -12,7 +12,8 @@ const DEFAULT_PER_PAGE: u64 = 20;
 const MAX_PER_PAGE: u64 = 100;
 
 /// Query parameters for pagination.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PaginationParams {
     /// Page number (1-based). Default: 1
     #[serde(

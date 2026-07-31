@@ -76,10 +76,12 @@ pub struct MergeQueueEntryResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     pub state: Option<String>,
     #[serde(flatten)]
+    #[param(ignore)]
     pub pagination: PaginationParams,
 }
 
@@ -92,6 +94,8 @@ pub struct ListQuery {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        ListQuery,
+        PaginationParams,
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),

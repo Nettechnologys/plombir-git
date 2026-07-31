@@ -36,7 +36,8 @@ use crate::AppState;
 
 // ── Request / Response types ─────────────────────────────
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PublishPackageQuery {
     /// Package name (can be auto-extracted by adapter if the file is a known format).
     #[serde(default)]
@@ -182,6 +183,7 @@ fn resolve_publish_info(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "repo name"),
         ("pkg_type" = String, Path, description = "package type"),
+        PublishPackageQuery,
     ),
     request_body(
         content = String,
@@ -286,6 +288,7 @@ pub async fn publish(
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "repo name"),
+        PublishPackageQuery,
     ),
     request_body(
         content = String,
