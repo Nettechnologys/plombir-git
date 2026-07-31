@@ -3,7 +3,7 @@
 //! Provides generic package publish/download/list/delete operations,
 //! coordinating the DB ops and the storage layer.
 
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 
 use crate::error::not_found;
 use crate::package_registry::storage::{PackageStorage, StoredFile};
@@ -191,7 +191,6 @@ pub async fn publish(
         // 4. Store files
         let total_size: i64 = info.files.iter().map(|(_, d)| d.len() as i64).sum();
         let mut stored_files: Vec<StoredFile> = Vec::new();
-        let mut combined_sha256: Option<String> = None;
 
         for (filename, data) in &info.files {
             let sf = match storage
@@ -216,26 +215,13 @@ pub async fn publish(
                     // and only `df` ever sees them again. The caller must still
                     // see the storage failure, so a failed rollback can only be
                     // reported here.
-                    if let Err(cleanup_error) = storage
-                        .delete_version(
-                            &info.owner,
-                            &info.repo,
-                            &info.package_type,
-                            &info.name,
-                            &info.version,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            package = %format!("{}/{}", info.owner, info.repo),
-                            package_type = %info.package_type,
-                            name = %info.name,
-                            version = %info.version,
-                            filename = %filename,
-                            error = %format!("{cleanup_error:#}"),
-                            "orphaned package files: storing a file failed part-way through a publish and the rollback delete failed too — the files uploaded before it stay in storage with no version row pointing at them"
-                        );
-                    }
+                    discard_stored_files(
+                        storage,
+                        &stored_files,
+                        &info,
+                        "storing a file failed part-way through a publish",
+                    )
+                    .await;
                     return Err(error);
                 }
             };
@@ -243,13 +229,30 @@ pub async fn publish(
         }
 
         // Use first file's sha256 or combine
-        if let Some(sf) = stored_files.first() {
-            combined_sha256 = Some(sf.digests.sha256.clone());
-        }
+        let combined_sha256 = stored_files
+            .first()
+            .map(|stored| stored.digests.sha256.clone());
+
+        // The version row and every file row are one visibility boundary. In
+        // particular, another publish must not observe the version between
+        // those writes and start adding files that our rollback could remove.
+        let transaction = match db.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                discard_stored_files(
+                    storage,
+                    &stored_files,
+                    &info,
+                    "starting the package publish transaction failed",
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
 
         // 5. Create version record
         let v = match rg_db::ops::package_version_ops::create(
-            db,
+            &transaction,
             pkg.id,
             &info.version,
             info.semver.as_deref(),
@@ -262,26 +265,26 @@ pub async fn publish(
         {
             Ok(version) => version,
             Err(error) => {
-                // Compensation on the error path: the caller must still see the
-                // DB failure, so a failed rollback can only be reported here.
-                if let Err(cleanup_error) = storage
-                    .delete_version(
-                        &info.owner,
-                        &info.repo,
-                        &info.package_type,
-                        &info.name,
-                        &info.version,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        package = %format!("{}/{}", info.owner, info.repo),
-                        package_type = %info.package_type,
-                        name = %info.name,
-                        version = %info.version,
-                        error = %format!("{cleanup_error:#}"),
-                        "orphaned package files: the version record was not created and the rollback delete failed too — the uploaded files stay in storage with no version row pointing at them"
-                    );
+                let concurrent_publish =
+                    matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
+                rollback_publish_transaction(
+                    transaction,
+                    &info,
+                    "creating the package version row failed",
+                )
+                .await;
+                discard_stored_files(
+                    storage,
+                    &stored_files,
+                    &info,
+                    "creating the package version row failed",
+                )
+                .await;
+                if concurrent_publish {
+                    return Err(crate::error::conflict(format!(
+                        "version {} of package '{}' was published concurrently",
+                        info.version, info.name
+                    )));
                 }
                 return Err(error.into());
             }
@@ -290,7 +293,7 @@ pub async fn publish(
         // 6. Create file records
         for sf in &stored_files {
             if let Err(error) = rg_db::ops::package_file_ops::create(
-                db,
+                &transaction,
                 v.id,
                 &sf.filename,
                 sf.size,
@@ -299,53 +302,38 @@ pub async fn publish(
             )
             .await
             {
-                // Three-part compensation; each part can fail on its own and
-                // leaves a different kind of residue behind. The caller only
-                // ever sees the original file-record error, so every failed
-                // step has to name what it left behind.
-                if let Err(cleanup_error) = storage
-                    .delete_version(
-                        &info.owner,
-                        &info.repo,
-                        &info.package_type,
-                        &info.name,
-                        &info.version,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        package = %format!("{}/{}", info.owner, info.repo),
-                        package_type = %info.package_type,
-                        name = %info.name,
-                        version = %info.version,
-                        error = %format!("{cleanup_error:#}"),
-                        "orphaned package files: publish failed and the rollback delete failed too — the uploaded files stay in storage"
-                    );
-                }
-                if let Err(cleanup_error) =
-                    rg_db::ops::package_file_ops::delete_by_version(db, v.id).await
-                {
-                    tracing::warn!(
-                        version_id = v.id,
-                        name = %info.name,
-                        version = %info.version,
-                        error = %format!("{cleanup_error:#}"),
-                        "orphaned package_file rows: publish failed and deleting the already-inserted file records failed too — they point at files the rollback is removing"
-                    );
-                }
-                if let Err(cleanup_error) =
-                    rg_db::ops::package_version_ops::delete_by_id(db, v.id).await
-                {
-                    tracing::warn!(
-                        version_id = v.id,
-                        name = %info.name,
-                        version = %info.version,
-                        error = %format!("{cleanup_error:#}"),
-                        "orphaned package_version row: publish failed and deleting the version record failed too — the version is listed but its files are gone"
-                    );
-                }
+                rollback_publish_transaction(
+                    transaction,
+                    &info,
+                    "creating a package file row failed",
+                )
+                .await;
+                discard_stored_files(
+                    storage,
+                    &stored_files,
+                    &info,
+                    "creating a package file row failed",
+                )
+                .await;
                 return Err(error.into());
             }
+        }
+
+        if let Err(error) = transaction.commit().await {
+            // A commit error has an ambiguous outcome when the connection dies:
+            // deleting these private objects could turn a commit that reached
+            // the database into live rows pointing at missing bytes. Prefer an
+            // observable orphan over data loss; the keys are request-private and
+            // can be reconciled later.
+            tracing::warn!(
+                package = %format!("{}/{}", info.owner, info.repo),
+                package_type = %info.package_type,
+                name = %info.name,
+                version = %info.version,
+                error = %format!("{error:#}"),
+                "package publish transaction commit failed with an ambiguous outcome — uploaded request-private files were left in storage rather than risk deleting files referenced by a commit that may have succeeded"
+            );
+            return Err(error.into());
         }
 
         v
@@ -384,6 +372,49 @@ fn file_digests(stored: &StoredFile) -> rg_db::ops::package_file_ops::FileDigest
         sha256: Some(&stored.digests.sha256),
         sha1: Some(&stored.digests.sha1),
         sha512: Some(&stored.digests.sha512),
+    }
+}
+
+/// Roll back DB work that has not crossed the transaction boundary yet.
+async fn rollback_publish_transaction(
+    transaction: DatabaseTransaction,
+    info: &PublishInfo,
+    reason: &'static str,
+) {
+    if let Err(cleanup_error) = transaction.rollback().await {
+        tracing::warn!(
+            package = %format!("{}/{}", info.owner, info.repo),
+            package_type = %info.package_type,
+            name = %info.name,
+            version = %info.version,
+            reason,
+            error = %format!("{cleanup_error:#}"),
+            "package publish DB transaction could not be rolled back"
+        );
+    }
+}
+
+/// Delete only the request-private objects returned by `store_file`.
+async fn discard_stored_files(
+    storage: &PackageStorage,
+    stored_files: &[StoredFile],
+    info: &PublishInfo,
+    reason: &'static str,
+) {
+    for file in stored_files {
+        if let Err(cleanup_error) = storage.delete_file(&file.storage_path).await {
+            tracing::warn!(
+                package = %format!("{}/{}", info.owner, info.repo),
+                package_type = %info.package_type,
+                name = %info.name,
+                version = %info.version,
+                filename = %file.filename,
+                storage_path = %file.storage_path,
+                reason,
+                error = %format!("{cleanup_error:#}"),
+                "orphaned package file: publish failed and deleting this request's stored object failed too"
+            );
+        }
     }
 }
 

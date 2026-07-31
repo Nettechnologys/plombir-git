@@ -4,7 +4,7 @@ use sea_orm::*;
 /// Create a new package version entry.
 #[allow(clippy::too_many_arguments)]
 pub async fn create(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     package_id: i64,
     version: &str,
     semver: Option<&str>,

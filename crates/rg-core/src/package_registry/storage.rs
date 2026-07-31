@@ -62,6 +62,13 @@ impl PackageStorage {
         version: &str,
         filename: &str,
     ) -> Result<BlobKey> {
+        // A publish request owns exactly the objects it wrote. A stable
+        // `{version}/{filename}` key cannot express that ownership: two
+        // concurrent publishes overwrite the same object, and the loser then
+        // cannot roll its write back without deleting the winner's bytes.
+        // Keep the version prefix for bulk deletion, but isolate every write
+        // below it so compensation can safely delete the returned key.
+        let object_id = uuid::Uuid::new_v4().simple().to_string();
         BlobKey::from_segments([
             "packages",
             owner,
@@ -69,6 +76,8 @@ impl PackageStorage {
             package_type,
             name,
             version,
+            "objects",
+            object_id.as_str(),
             filename,
         ])
         .map_err(Into::into)
@@ -252,9 +261,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            stored.storage_path,
-            "packages/alice/demo/npm/%40scope%2Fpkg/1.0.0/package.tgz"
+        assert!(
+            stored
+                .storage_path
+                .starts_with("packages/alice/demo/npm/%40scope%2Fpkg/1.0.0/objects/"),
+            "{}",
+            stored.storage_path
+        );
+        assert!(
+            stored.storage_path.ends_with("/package.tgz"),
+            "{}",
+            stored.storage_path
         );
         assert_eq!(
             storage.read_file(&stored.storage_path).await.unwrap(),

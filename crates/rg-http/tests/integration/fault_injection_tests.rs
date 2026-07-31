@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use crate::common::fault::{fail_db_writes, spawn_test_app_with_faults, DbWrite};
+use crate::common::fault::{
+    fail_db_writes, spawn_test_app_with_faults, spawn_test_app_with_two_put_gate, DbWrite,
+};
 use crate::common::{create_issue, create_repo, register_full, spawn_test_app_with_db};
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
@@ -515,26 +517,6 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
 
 // ── Package registry ─────────────────────────────────────────
 
-/// Where a published package file lands once the blob store accepts it.
-fn package_file_path(
-    repo_root: &std::path::Path,
-    owner: &str,
-    repo: &str,
-    package_type: &str,
-    name: &str,
-    version: &str,
-    filename: &str,
-) -> std::path::PathBuf {
-    repo_root
-        .join("packages")
-        .join(owner)
-        .join(repo)
-        .join(package_type)
-        .join(name)
-        .join(version)
-        .join(filename)
-}
-
 /// A publish that failed on its second file must not keep the first one.
 ///
 /// This one calls the service instead of driving the route, and deliberately:
@@ -581,33 +563,112 @@ async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
         "a file the blob store refused must fail the publish"
     );
 
-    let pom = package_file_path(
-        &app.repo_root,
-        "pkg_part",
-        "half-published",
-        "maven",
-        "widget",
-        "1.0.0",
-        "widget-1.0.0.pom",
-    );
+    let healthy = rg_core::package_registry::PackageStorage::from_backend(root);
     assert!(
-        !pom.exists(),
-        "the file stored before the failure outlived the publish that would have claimed it: {}",
-        pom.display()
+        !healthy
+            .has_files("pkg_part", "half-published", "maven", "widget", "1.0.0")
+            .await,
+        "the file stored before the failure outlived the publish that would have claimed it"
     );
 
     // Control: the same publish, with the store healthy, does write that file —
     // so the assertion above is about the rollback and not about a path that is
     // never written in the first place.
-    let healthy = rg_core::package_registry::PackageStorage::from_backend(root);
     rg_core::package_registry::service::publish(&app.db, &healthy, info())
         .await
         .expect("the publish must succeed once the blob store accepts every file");
     assert!(
-        pom.exists(),
-        "a successful publish must leave its files in storage: {}",
-        pom.display()
+        healthy
+            .has_files("pkg_part", "half-published", "maven", "widget", "1.0.0")
+            .await,
+        "a successful publish must leave its files in storage"
     );
+}
+
+/// Two retries can both observe an absent version, but only the request that
+/// wins the UNIQUE claim owns a published version. The loser must neither
+/// overwrite nor delete the winner's bytes while compensating its own work.
+#[tokio::test]
+async fn concurrent_new_version_publish_keeps_the_winners_file() {
+    let (base, _db, gate) = spawn_test_app_with_two_put_gate("race.bin").await;
+    let (token, _) = register_full(&base, "pkg_race", "pkg_race@example.com").await;
+    create_repo(&base, &token, "racing-publishes").await;
+    let client = reqwest::Client::new();
+
+    // Seed only the package/registry rows. Both requests below still create a
+    // brand-new version, so their version-existence reads are the race under
+    // test rather than the unrelated first-package get-or-create path.
+    let seeded = client
+        .post(format!(
+            "{base}/api/v1/repos/pkg_race/racing-publishes/packages/generic/publish?name=widget&version=0.9.0"
+        ))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"seed.bin\"",
+        )
+        .body("seed")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seeded.status(), reqwest::StatusCode::CREATED);
+
+    let publish = |body: &'static str| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            let response = client
+                .post(format!(
+                    "{base}/api/v1/repos/pkg_race/racing-publishes/packages/generic/publish?name=widget&version=1.0.0"
+                ))
+                .bearer_auth(token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"race.bin\"",
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            (response, body.as_bytes().to_vec())
+        })
+    };
+
+    let mut left = publish("left request bytes");
+    let mut right = publish("right request bytes");
+    let ((winner, winner_bytes), (loser, _loser_bytes)) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                left_result = &mut left => {
+                    let left_result = left_result.unwrap();
+                    gate.release_second();
+                    let right_result = right.await.unwrap();
+                    (left_result, right_result)
+                }
+                right_result = &mut right => {
+                    let right_result = right_result.unwrap();
+                    gate.release_second();
+                    let left_result = left.await.unwrap();
+                    (right_result, left_result)
+                }
+            }
+        })
+        .await
+        .expect("both publishes reached the gated storage write and completed");
+
+    assert_eq!(winner.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(loser.status(), reqwest::StatusCode::CONFLICT);
+
+    let downloaded = client
+        .get(format!(
+            "{base}/api/v1/repos/pkg_race/racing-publishes/packages/generic/widget/1.0.0/race.bin"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), reqwest::StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), winner_bytes);
 }
 
 // ── Attachments ──────────────────────────────────────────────

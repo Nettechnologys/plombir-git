@@ -15,7 +15,7 @@ pub struct FileDigests<'a> {
 
 /// Create a new package file entry.
 pub async fn create(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     version_id: i64,
     filename: &str,
     size: i64,
