@@ -65,12 +65,29 @@ pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Vec
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let branch_ref = format!("refs/heads/{base_branch}");
     for candidate in [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"] {
-        let object = format!("refs/heads/{base_branch}:{candidate}");
-        let output = git.run(&["show", &object], Some(repo_path))?;
-        if output.success() {
-            return Ok(Some(parse_codeowners(&output.stdout_str())));
+        let listing = git.run(
+            &["ls-tree", "-z", "--name-only", &branch_ref, "--", candidate],
+            Some(repo_path),
+        )?;
+        listing
+            .ensure_success()
+            .with_context(|| format!("look up CODEOWNERS candidate `{candidate}`"))?;
+        if !listing
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|name| name == candidate.as_bytes())
+        {
+            continue;
         }
+
+        let object = format!("{branch_ref}:{candidate}");
+        let output = git.run(&["cat-file", "blob", &object], Some(repo_path))?;
+        output
+            .ensure_success()
+            .with_context(|| format!("read CODEOWNERS candidate `{candidate}`"))?;
+        return Ok(Some(parse_codeowners(&output.stdout_str())));
     }
     Ok(None)
 }
@@ -265,6 +282,53 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn bare_repository(
+        codeowners: Option<(&str, &str)>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let bare = dir.path().join("repo.git");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        if let Some((path, contents)) = codeowners {
+            let file = work.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, contents).unwrap();
+            git.run_or_bail(&["add", "."], Some(&work)).unwrap();
+        }
+        git.run_or_bail(
+            &[
+                "-c",
+                "user.name=CODEOWNERS test",
+                "-c",
+                "user.email=codeowners@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+            Some(&work),
+        )
+        .unwrap();
+        git.run_or_bail(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        (dir, bare)
+    }
+
     #[test]
     fn parser_ignores_comments_and_preserves_owner_order() {
         let rules = parse_codeowners(
@@ -290,5 +354,34 @@ mod tests {
         assert!(!pattern_matches("src/*/test?.rs", "src/api/v1/test1.rs"));
         assert!(pattern_matches("/README.md", "README.md"));
         assert!(!pattern_matches("/README.md", "docs/README.md"));
+    }
+
+    #[test]
+    fn standard_location_is_loaded_from_a_bare_repository() {
+        let (_dir, bare) = bare_repository(Some((".github/CODEOWNERS", "*.rs @rust\n")));
+
+        assert_eq!(
+            load_codeowners(&bare, "main").unwrap(),
+            Some(vec![CodeownerRule {
+                pattern: "*.rs".into(),
+                owners: vec!["rust".into()],
+            }])
+        );
+    }
+
+    #[test]
+    fn missing_policy_is_none_but_missing_repository_is_an_error() {
+        let (dir, bare) = bare_repository(None);
+        assert_eq!(load_codeowners(&bare, "main").unwrap(), None);
+
+        let missing = dir.path().join("disappeared.git");
+        let error = load_codeowners(&missing, "main")
+            .expect_err("an unavailable repository is not an absent CODEOWNERS file");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("look up CODEOWNERS candidate"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("disappeared.git"), "{rendered}");
     }
 }
