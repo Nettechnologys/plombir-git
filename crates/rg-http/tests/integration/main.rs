@@ -79,6 +79,7 @@ mod org_repo_service_resolution_tests;
 mod org_scoped_id_scope_sweep_tests;
 mod org_team_authz_tests;
 mod org_tests;
+mod package_failure_status_tests;
 mod package_format_e2e_tests;
 mod package_permission_tests;
 mod password_hash_failure_status_tests;

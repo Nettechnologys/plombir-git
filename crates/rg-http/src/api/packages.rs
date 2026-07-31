@@ -113,6 +113,34 @@ fn err_text(status: StatusCode, msg: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Classify one package-service failure through the shared HTTP error funnel.
+///
+/// The service layer carries genuine absence as `rg_core::error::NotFound` and
+/// leaves database/blob failures as their original typed sources. Rebuilding a
+/// status locally loses that distinction and is how an outage became a 404 or
+/// an empty protocol index in the first place.
+fn package_error_response(error: anyhow::Error) -> axum::response::Response {
+    AppError::from(error).into_response()
+}
+
+/// Whether a failed lookup proved absence rather than failing to check it.
+fn package_is_absent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<rg_core::error::NotFound>().is_some()
+}
+
+/// Package rows can outlive their blob. That is still a missing downloadable
+/// file, while every other storage failure is an internal server error.
+fn package_file_error_response(error: anyhow::Error) -> axum::response::Response {
+    if matches!(
+        error.downcast_ref::<rg_core::blob_storage::BlobStorageError>(),
+        Some(rg_core::blob_storage::BlobStorageError::NotFound(_))
+    ) {
+        AppError::not_found("package file not found").into_response()
+    } else {
+        package_error_response(error)
+    }
+}
+
 /// What a publish request resolved to, once the adapter's reading of the file
 /// and the caller's query params have been merged.
 struct ResolvedPublishInfo {
@@ -436,7 +464,7 @@ pub async fn get_package(
     .await
     {
         Ok(detail) => Json(detail).into_response(),
-        Err(e) => err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => package_error_response(e),
     }
 }
 
@@ -468,7 +496,7 @@ pub async fn list_versions(
     .await
     {
         Ok(versions) => Json(VersionListResponse { versions }).into_response(),
-        Err(e) => err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => package_error_response(e),
     }
 }
 
@@ -507,7 +535,7 @@ pub async fn get_version(
     .await
     {
         Ok(detail) => Json(detail).into_response(),
-        Err(e) => err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => package_error_response(e),
     }
 }
 
@@ -683,7 +711,7 @@ async fn serve_package_file(
             )
                 .into_response()
         }
-        Err(e) => err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => package_file_error_response(e),
     }
 }
 
@@ -792,7 +820,7 @@ pub async fn cargo_sparse_index(
     .await
     {
         Ok(v) => v,
-        Err(e) => return err_text(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => return package_error_response(e),
     };
 
     let entries: Vec<rg_core::package_registry::CargoIndexVersion<'_>> = versions
@@ -837,7 +865,7 @@ pub async fn npm_registry_metadata(
     .await
     {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => return package_error_response(e),
     };
 
     // Determine base URL from request host header
@@ -1078,9 +1106,13 @@ pub async fn pypi_simple_root_index(
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
     let packages =
-        rg_core::package_registry::service::list_packages(&state.db, &owner, &name, "pypi")
+        match rg_core::package_registry::service::list_packages(&state.db, &owner, &name, "pypi")
             .await
-            .unwrap_or_default();
+        {
+            Ok(packages) => packages,
+            Err(error) if package_is_absent(&error) => Vec::new(),
+            Err(error) => return package_error_response(error),
+        };
 
     let base = pypi_simple_base(&build_base_url(&headers), &owner, &name);
 
@@ -1176,7 +1208,7 @@ pub async fn maven_metadata(
     .await
     {
         Ok(v) => v,
-        Err(_e) => {
+        Err(error) if package_is_absent(&error) => {
             // Return empty metadata rather than 404 — Maven/Gradle handle gracefully
             return (
                 StatusCode::OK,
@@ -1188,6 +1220,7 @@ pub async fn maven_metadata(
                 ),
             ).into_response();
         }
+        Err(error) => return package_error_response(error),
     };
 
     let entries: Vec<rg_core::package_registry::MavenVersionEntry> = versions
@@ -1287,7 +1320,7 @@ pub async fn nuget_registration_index(
     .await
     {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => return package_error_response(e),
     };
 
     let base_url = build_base_url(&headers);
@@ -1452,7 +1485,8 @@ pub async fn rubygems_dependencies(
         .await
         {
             Ok(v) => v,
-            Err(_e) => continue,
+            Err(error) if package_is_absent(&error) => continue,
+            Err(error) => return package_error_response(error),
         };
 
         for v in &versions {
@@ -1499,7 +1533,7 @@ pub async fn rubygems_gem_info(
     .await
     {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => return package_error_response(e),
     };
 
     let base_url = build_base_url(&headers);
@@ -1638,14 +1672,20 @@ pub async fn rubygems_compact_versions(
     let mut gems = Vec::new();
     let mut created_at = String::new();
 
-    for pkg in rubygems_packages(&state, &owner, &name).await {
+    let packages = match rubygems_packages(&state, &owner, &name).await {
+        Ok(packages) => packages,
+        Err(error) => return package_error_response(error),
+    };
+
+    for pkg in packages {
         let versions = match rg_core::package_registry::service::list_versions(
             &state.db, &owner, &name, "rubygems", &pkg.name,
         )
         .await
         {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(error) if package_is_absent(&error) => continue,
+            Err(error) => return package_error_response(error),
         };
 
         let entries = compact_index_entries(&pkg.name, &versions);
@@ -1692,7 +1732,7 @@ pub async fn rubygems_compact_info(
     .await
     {
         Ok(v) => v,
-        Err(e) => return err_text(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Err(e) => return package_error_response(e),
     };
 
     let entries = compact_index_entries(&gem_name, &versions);
@@ -1718,11 +1758,11 @@ pub async fn rubygems_compact_names(
     Path((owner, name)): Path<(String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    let mut names: Vec<String> = rubygems_packages(&state, &owner, &name)
-        .await
-        .into_iter()
-        .map(|pkg| pkg.name)
-        .collect();
+    let packages = match rubygems_packages(&state, &owner, &name).await {
+        Ok(packages) => packages,
+        Err(error) => return package_error_response(error),
+    };
+    let mut names: Vec<String> = packages.into_iter().map(|pkg| pkg.name).collect();
     names.sort();
 
     text_index(rg_core::package_registry::build_compact_index_names(&names))
@@ -1740,7 +1780,12 @@ pub async fn rubygems_gem_download(
     Path((owner, name, filename)): Path<(String, String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    for pkg in rubygems_packages(&state, &owner, &name).await {
+    let packages = match rubygems_packages(&state, &owner, &name).await {
+        Ok(packages) => packages,
+        Err(error) => return package_error_response(error),
+    };
+
+    for pkg in packages {
         // Every gem file starts with its gem's name, so most candidates are
         // ruled out without a query.
         if !filename.starts_with(&format!("{}-", pkg.name)) {
@@ -1753,7 +1798,8 @@ pub async fn rubygems_gem_download(
         .await
         {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(error) if package_is_absent(&error) => continue,
+            Err(error) => return package_error_response(error),
         };
 
         if let Some(version) = versions
@@ -1788,10 +1834,14 @@ async fn rubygems_packages(
     state: &AppState,
     owner: &str,
     repo: &str,
-) -> Vec<rg_core::package_registry::PackageSummary> {
-    rg_core::package_registry::service::list_packages(&state.db, owner, repo, "rubygems")
+) -> anyhow::Result<Vec<rg_core::package_registry::PackageSummary>> {
+    match rg_core::package_registry::service::list_packages(&state.db, owner, repo, "rubygems")
         .await
-        .unwrap_or_default()
+    {
+        Ok(packages) => Ok(packages),
+        Err(error) if package_is_absent(&error) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Answer one of the compact index files.
@@ -1848,7 +1898,8 @@ pub async fn helm_index(
         .await
         {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(error) if package_is_absent(&error) => continue,
+            Err(error) => return package_error_response(error),
         };
 
         for v in &versions {
@@ -1926,7 +1977,7 @@ pub async fn composer_packages_json(
     .await
     {
         Ok(p) => p,
-        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e) => return package_error_response(e),
     };
 
     let mut json_output = String::new();
@@ -1942,7 +1993,8 @@ pub async fn composer_packages_json(
         .await
         {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(error) if package_is_absent(&error) => continue,
+            Err(error) => return package_error_response(error),
         };
 
         let composer_versions: Vec<
