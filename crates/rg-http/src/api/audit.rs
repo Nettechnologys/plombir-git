@@ -131,10 +131,7 @@ pub async fn list_audit_logs(
         end_time,
     )
     .await
-    .map_err(|e| {
-        tracing::error!("audit list error: {}", e);
-        AppError::internal("database error")
-    })?;
+    .map_err(AppError::from)?;
 
     let logs = logs
         .into_iter()
@@ -236,10 +233,7 @@ pub async fn list_login_attempts(
         end_time,
     )
     .await
-    .map_err(|error| {
-        tracing::error!(error = %format!("{error:#}"), "login attempt list failed");
-        AppError::internal("database error")
-    })?;
+    .map_err(AppError::from)?;
     Ok(Json(LoginAttemptResponse {
         total,
         page,
@@ -283,10 +277,7 @@ pub async fn get_audit_log(
 ) -> Result<Json<AuditLogEntry>, AppError> {
     let log = rg_db::ops::audit_log_ops::find_by_id(&state.db, id)
         .await
-        .map_err(|e| {
-            tracing::error!("audit get error: {}", e);
-            AppError::internal("database error")
-        })?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("audit log not found"))?;
 
     Ok(Json(AuditLogEntry {

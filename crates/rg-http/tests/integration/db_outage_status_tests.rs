@@ -8,7 +8,7 @@
 //! the response is `503 SERVICE_UNAVAILABLE`, proving the handler now routes
 //! the error through `AppError::from`.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
@@ -178,7 +178,201 @@ async fn db_outage_in_handler_returns_503_not_500() {
     );
 }
 
-/// Peripheral of the same class (card_2e5ab5773b6f): the package-registry
+/// The public SSO route has no authentication gate whose own database lookup
+/// could make a closed-pool assertion pass before `list_providers` runs.
+#[tokio::test]
+async fn db_outage_in_public_sso_provider_list_returns_503_after_live_baseline() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/auth/sso/providers");
+
+    let healthy = client.get(&url).send().await.expect("healthy SSO request");
+    assert_eq!(healthy.status(), StatusCode::OK);
+    assert_eq!(
+        healthy
+            .json::<serde_json::Value>()
+            .await
+            .expect("healthy SSO response is JSON"),
+        serde_json::json!([]),
+        "healthy baseline must reach the public provider-list handler"
+    );
+
+    db.close().await.expect("close SSO fixture pool");
+
+    let outage = client.get(url).send().await.expect("outage SSO request");
+    assert_eq!(
+        outage.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a provider lookup outage must remain a typed 503, not a generic 500"
+    );
+}
+
+#[tokio::test]
+async fn db_outage_in_mfa_setup_returns_503_after_live_handler_probe() {
+    let (db, dir) = setup_test_db().await;
+    let user = rg_db::ops::user_ops::create_user(
+        &db,
+        "mfa-outage-user",
+        "mfa-outage@example.test",
+        "",
+        "MFA Outage",
+    )
+    .await
+    .expect("create MFA fixture user");
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let state = build_test_app_state(db.clone(), repo_root);
+
+    let healthy =
+        rg_http::api::mfa::setup_mfa(State(state.clone()), rg_http::api::auth::AuthUser(user.id))
+            .await
+            .into_response();
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let healthy_body = axum::body::to_bytes(healthy.into_body(), usize::MAX)
+        .await
+        .expect("read healthy MFA body");
+    let healthy_json: serde_json::Value =
+        serde_json::from_slice(&healthy_body).expect("healthy MFA response is JSON");
+    assert!(
+        healthy_json["secret"]
+            .as_str()
+            .is_some_and(|secret| !secret.is_empty()),
+        "healthy baseline must generate and persist a real MFA secret"
+    );
+
+    db.close().await.expect("close MFA fixture pool");
+
+    let outage = rg_http::api::mfa::setup_mfa(State(state), rg_http::api::auth::AuthUser(user.id))
+        .await
+        .into_response();
+    assert_eq!(
+        outage.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the MFA user lookup outage must remain a typed 503, not a generic 500"
+    );
+}
+
+#[tokio::test]
+async fn db_outage_in_audit_handlers_returns_503_after_live_probes() {
+    let (db, dir) = setup_test_db().await;
+    let user = rg_db::ops::user_ops::create_user(
+        &db,
+        "audit-outage-admin",
+        "audit-outage@example.test",
+        "",
+        "Audit Outage",
+    )
+    .await
+    .expect("create audit fixture user");
+    let inserted = rg_db::ops::audit_log_ops::insert(
+        &db,
+        rg_db::entities::audit_log::ActiveModel {
+            id: sea_orm::ActiveValue::NotSet,
+            user_id: sea_orm::ActiveValue::Set(Some(user.id)),
+            username: sea_orm::ActiveValue::Set(Some(user.username.clone())),
+            action: sea_orm::ActiveValue::Set("outage.probe".to_string()),
+            resource_type: sea_orm::ActiveValue::Set(Some("test".to_string())),
+            resource_id: sea_orm::ActiveValue::Set(Some(1)),
+            resource_name: sea_orm::ActiveValue::Set(Some("fixture".to_string())),
+            ip_address: sea_orm::ActiveValue::Set(Some("127.0.0.1".to_string())),
+            user_agent: sea_orm::ActiveValue::Set(Some("rg-http-tests".to_string())),
+            details: sea_orm::ActiveValue::Set(None),
+            created_at: sea_orm::ActiveValue::Set(chrono::Utc::now()),
+        },
+    )
+    .await
+    .expect("insert audit fixture row");
+    rg_db::ops::login_log_ops::log_attempt(
+        &db,
+        Some(user.id),
+        &user.username,
+        "password",
+        Some("127.0.0.1"),
+        Some("rg-http-tests"),
+        true,
+        None,
+    )
+    .await
+    .expect("insert login-attempt fixture row");
+
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let state = build_test_app_state(db.clone(), repo_root);
+    let admin = || rg_http::api::admin::InstanceAdmin(user.id);
+    let audit_query = || {
+        Query(
+            serde_json::from_value::<rg_http::api::audit::AuditLogQuery>(serde_json::json!({}))
+                .expect("build audit query"),
+        )
+    };
+    let login_query = || {
+        Query(
+            serde_json::from_value::<rg_http::api::audit::LoginAttemptQuery>(serde_json::json!({}))
+                .expect("build login-attempt query"),
+        )
+    };
+
+    let healthy_list =
+        rg_http::api::audit::list_audit_logs(State(state.clone()), admin(), audit_query())
+            .await
+            .into_response();
+    assert_eq!(healthy_list.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(healthy_list.into_body(), usize::MAX)
+        .await
+        .expect("read healthy audit-list body");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("healthy audit-list response is JSON");
+    assert!(
+        body["logs"].as_array().is_some_and(|logs| logs
+            .iter()
+            .any(|log| log["id"].as_i64() == Some(inserted.id))),
+        "healthy audit-list baseline must return the seeded row"
+    );
+
+    let healthy_attempts =
+        rg_http::api::audit::list_login_attempts(State(state.clone()), admin(), login_query())
+            .await
+            .into_response();
+    assert_eq!(healthy_attempts.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(healthy_attempts.into_body(), usize::MAX)
+        .await
+        .expect("read healthy login-attempt body");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("healthy login-attempt response is JSON");
+    assert!(
+        body["attempts"].as_array().is_some_and(|attempts| attempts
+            .iter()
+            .any(|attempt| attempt["username"] == user.username)),
+        "healthy login-attempt baseline must return the seeded row"
+    );
+
+    let healthy_get =
+        rg_http::api::audit::get_audit_log(State(state.clone()), admin(), Path(inserted.id))
+            .await
+            .into_response();
+    assert_eq!(healthy_get.status(), StatusCode::OK);
+
+    db.close().await.expect("close audit fixture pool");
+
+    let outage_list =
+        rg_http::api::audit::list_audit_logs(State(state.clone()), admin(), audit_query())
+            .await
+            .into_response();
+    assert_eq!(outage_list.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let outage_attempts =
+        rg_http::api::audit::list_login_attempts(State(state.clone()), admin(), login_query())
+            .await
+            .into_response();
+    assert_eq!(outage_attempts.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let outage_get = rg_http::api::audit::get_audit_log(State(state), admin(), Path(inserted.id))
+        .await
+        .into_response();
+    assert_eq!(outage_get.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Peripheral of the same class (card_2e5ab577daf5): the package-registry
 /// handlers converted DB errors through a local `err()` helper (which stringifies
 /// into `AppError::internal` → 500) instead of `AppError::from`, and their shared
 /// `resolve_repo` gateway used `.map_err(AppError::internal)`. A DB outage on a

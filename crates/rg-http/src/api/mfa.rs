@@ -133,10 +133,7 @@ pub async fn setup_mfa(
     // Get username to include in TOTP label
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
-        .map_err(|e| {
-            tracing::error!("DB error: {}", e);
-            AppError::internal("database error")
-        })?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
     let (secret, otpauth_url, _qr_text) =
@@ -156,10 +153,7 @@ pub async fn setup_mfa(
 
     rg_db::ops::user_ops::update_totp_secret(&state.db, user_id, &enc_secret)
         .await
-        .map_err(|e| {
-            tracing::error!("DB error: {}", e);
-            AppError::internal("database error")
-        })?;
+        .map_err(AppError::from)?;
 
     Ok(Json(SetupMfaResponse {
         secret,

@@ -231,10 +231,7 @@ pub async fn list_providers(
 ) -> Result<Json<Vec<SsoProviderInfo>>, AppError> {
     let providers = rg_db::ops::sso_provider_ops::list_enabled(&state.db)
         .await
-        .map_err(|e| {
-            tracing::error!("DB error: {}", e);
-            AppError::internal("database error")
-        })?;
+        .map_err(AppError::from)?;
 
     let infos: Vec<SsoProviderInfo> = providers
         .into_iter()
@@ -272,10 +269,7 @@ pub async fn authorize(
 ) -> Result<impl IntoResponse, AppError> {
     let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &slug)
         .await
-        .map_err(|e| {
-            tracing::error!("DB error: {}", e);
-            AppError::internal("database error")
-        })?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found(format!("SSO provider '{}' not found", slug)))?;
 
     if !provider.enabled {
@@ -397,10 +391,7 @@ pub async fn callback(
     // ── Get provider config ──────────────────────────────────────
     let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &slug)
         .await
-        .map_err(|e| {
-            tracing::error!("DB error: {}", e);
-            AppError::internal("database error")
-        })?
+        .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found(format!("SSO provider '{}' not found", slug)))?;
 
     if !provider.enabled {
@@ -688,7 +679,7 @@ async fn store_refreshed_oauth_tokens(
         expires_at,
     )
     .await
-    .map_err(|_| AppError::internal("failed to store the OAuth account tokens"))?;
+    .map_err(AppError::from)?;
 
     Ok(())
 }
@@ -748,7 +739,7 @@ async fn find_or_create_sso_user(
         &user_info.provider_user_id,
     )
     .await
-    .map_err(|_| AppError::internal("database error"))?
+    .map_err(AppError::from)?
     {
         // Update stored tokens
         let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
@@ -779,7 +770,7 @@ async fn find_or_create_sso_user(
             expires_at,
         )
         .await
-        .map_err(|_| AppError::internal("failed to store the OAuth account tokens"))?;
+        .map_err(AppError::from)?;
 
         return Ok(oauth.user_id);
     }
@@ -787,17 +778,14 @@ async fn find_or_create_sso_user(
     // Check if user with this email already exists
     let user_id = if let Some(existing) = rg_db::ops::user_ops::find_by_email(db, &user_info.email)
         .await
-        .map_err(|_| AppError::internal("database error"))?
+        .map_err(AppError::from)?
     {
         existing.id
     } else {
         // Create new user
         let username = generate_unique_username(db, &user_info.provider_username)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to generate username: {}", e);
-                AppError::internal("failed to generate username")
-            })?;
+            .map_err(AppError::from)?;
 
         let created = rg_db::ops::user_ops::create_user(
             db,
@@ -807,10 +795,7 @@ async fn find_or_create_sso_user(
             user_info.display_name.as_deref().unwrap_or(&username),
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to create SSO user: {}", e);
-            AppError::internal("user creation failed")
-        })?;
+        .map_err(AppError::from)?;
         // SSO first-login provision is a new account: count it in the
         // `users_registered_total` funnel with `sso` provenance.
         crate::metrics::recorder::user_provisioned("sso");
@@ -842,7 +827,7 @@ async fn find_or_create_sso_user(
         expires_at,
     )
     .await
-    .map_err(|_| AppError::internal("failed to link OAuth account"))?;
+    .map_err(AppError::from)?;
 
     Ok(user_id)
 }
