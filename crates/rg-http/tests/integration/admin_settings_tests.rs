@@ -5,7 +5,8 @@ async fn admin_token(base: &str, db: &rg_db::DatabaseConnection, name: &str) -> 
     let (token, id) = register_full(base, name, &format!("{name}@example.com")).await;
     rg_db::ops::user_ops::update_by_id(db, id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
     token
 }
 
@@ -43,7 +44,8 @@ async fn admin_settings_requires_admin() {
 
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/settings", base))
@@ -70,7 +72,8 @@ async fn admin_settings_update_and_restore() {
     .await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let baseline_resp = client
         .get(format!("{}/api/v1/admin/settings", base))
@@ -296,7 +299,8 @@ async fn admin_settings_non_admin_post() {
 
     rg_db::ops::user_ops::update_by_id(&db, _admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let blocked_resp = client
         .patch(format!("{}/api/v1/admin/settings", base))

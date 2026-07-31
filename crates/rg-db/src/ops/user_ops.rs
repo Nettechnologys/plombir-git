@@ -82,18 +82,21 @@ pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<User>
 /// then convert it into an `ActiveModel`, modify fields, and call `update()`.
 ///
 /// CORRECT pattern (used here):
-///   let model = UserEntity::find_by_id(id)
-///       .one(db).await?
-///       .ok_or_else(|| anyhow::anyhow!("not found"))?;
+///   let Some(model) = UserEntity::find_by_id(id).one(db).await? else {
+///       return Ok(None);
+///   };
 ///   let mut active: ActiveModel = model.into();
 ///   active.field = Set(value);
-///   active.update(db).await
+///   active.update(db).await.map(Some)
 ///
 /// WRONG pattern for ordinary admin/profile field updates:
 ///   ActiveModel { id: Set(id), ... }.update(db)  // MAY skip optimistic lock
 ///
 /// `update_many().col_expr(...)` is still appropriate for atomic counters where
 /// a read-modify-write ActiveModel cycle would lose concurrent increments.
+///
+/// An absent row is returned as `Ok(None)` so the higher layer can give that
+/// outcome its domain meaning without confusing it with a database failure.
 pub async fn update_by_id(
     db: &DatabaseConnection,
     id: i64,
@@ -101,12 +104,14 @@ pub async fn update_by_id(
     bio: Option<Option<String>>,
     is_admin: Option<bool>,
     is_active: Option<bool>,
-) -> Result<User> {
-    let model = UserEntity::find_by_id(id)
+) -> Result<Option<User>> {
+    let Some(model) = UserEntity::find_by_id(id)
         .one(db)
         .await
         .context("db: find user for update")?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", id))?;
+    else {
+        return Ok(None);
+    };
 
     let mut active: ActiveModel = model.into();
 
@@ -123,7 +128,11 @@ pub async fn update_by_id(
         active.is_active = Set(active_flag);
     }
 
-    active.update(db).await.context("db: update user by admin")
+    active
+        .update(db)
+        .await
+        .context("db: update user by admin")
+        .map(Some)
 }
 
 /// Create a user with high-level parameters (used by SSO).

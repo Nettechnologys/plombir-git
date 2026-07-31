@@ -23,7 +23,8 @@ const PASSWORD: &str = "Qz7$wRtm";
 async fn deactivate(db: &rg_db::DatabaseConnection, user_id: i64) {
     rg_db::ops::user_ops::update_by_id(db, user_id, None, None, None, Some(false))
         .await
-        .expect("deactivate user");
+        .expect("deactivate user")
+        .expect("registered user must exist");
 }
 
 async fn create_pat(base: &str, jwt: &str) -> String {

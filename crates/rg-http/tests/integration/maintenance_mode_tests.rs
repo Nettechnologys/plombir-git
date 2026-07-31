@@ -38,7 +38,8 @@ async fn admin_token(base: &str, db: &rg_db::DatabaseConnection, name: &str) -> 
     let (token, id) = register_full(base, name, &format!("{name}@example.com")).await;
     rg_db::ops::user_ops::update_by_id(db, id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
     token
 }
 

@@ -3,7 +3,8 @@ use crate::common::{register_full, spawn_test_app_with_db};
 async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
     rg_db::ops::user_ops::update_by_id(db, user_id, None, None, Some(true), None)
         .await
-        .expect("promote user to admin");
+        .expect("promote user to admin")
+        .expect("registered user must exist");
 }
 
 /// A query string the caller was never going to be allowed to send must not be
@@ -160,6 +161,15 @@ async fn admin_users_get_and_update() {
     assert_eq!(updated["display_name"], "Target User");
     assert_eq!(updated["is_admin"], true);
     assert_eq!(updated["is_active"], false);
+
+    let missing = client
+        .patch(format!("{}/api/v1/admin/users/999999", base))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({ "display_name": "Missing" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
 }
 
 #[tokio::test]

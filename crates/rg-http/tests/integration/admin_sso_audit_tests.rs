@@ -34,7 +34,8 @@ async fn admin_sso_requires_admin() {
 
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/sso/providers", base))
@@ -56,7 +57,8 @@ async fn admin_sso_accepts_httponly_cookie_without_bearer() {
 
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let resp = client
         .get(format!("{}/api/v1/admin/sso/providers", base))
@@ -79,7 +81,8 @@ async fn admin_sso_create_get_update_delete() {
     let (admin_token, admin_id) = register_full(&base, "sso_crud", "sso_crud@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let create_resp = client
         .post(format!("{}/api/v1/admin/sso/providers", base))
@@ -225,7 +228,8 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         register_full(&base, "ldap_admin", "ldap_admin@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let incomplete = client
         .post(format!("{}/api/v1/admin/sso/providers", base))
@@ -365,7 +369,8 @@ async fn admin_audit_list_and_get_log() {
     let (admin_token, admin_id) = register_full(&base, "auditor", "auditor@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let inserted = rg_db::ops::audit_log_ops::insert(
         &db,
@@ -422,7 +427,8 @@ async fn admin_audit_get_not_found() {
         register_full(&base, "auditor_nf", "auditor_nf@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let resp = client
         .get(format!("{}/api/v1/admin/audit/logs/987654", base))
@@ -450,7 +456,8 @@ async fn admin_login_attempts_are_protected_paginated_and_filterable() {
         register_full(&base, "login_auditor", "login_auditor@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
     rg_db::ops::login_log_ops::log_attempt(
         &db,
         Some(admin_id),

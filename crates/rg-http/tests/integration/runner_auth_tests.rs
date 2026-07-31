@@ -28,7 +28,8 @@ async fn runner_register_requires_admin() {
         register_full(&base, "runner_admin", "runner_admin@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let admin_resp = client
         .post(format!("{}/api/v1/runners/register", base))
@@ -53,7 +54,8 @@ async fn runner_register_accepts_admin_httponly_cookie() {
 
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let resp = client
         .post(format!("{}/api/v1/runners/register", base))

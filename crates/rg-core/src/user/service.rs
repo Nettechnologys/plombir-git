@@ -590,16 +590,13 @@ pub async fn update_user_admin(
     is_admin: Option<bool>,
     is_active: Option<bool>,
 ) -> Result<UserInfo> {
-    // `user_ops::update_by_id` reports an absent row as an untyped
-    // `anyhow!("user {id} not found")`, which one layer up is indistinguishable
-    // from the lookup itself failing — and `rg-db` sits *below* `rg-core`, so it
-    // cannot build the marker. Resolve the row here so "no such user" is a typed
-    // 404 (without the id in the body) and a broken query stays a 5xx.
-    if user_ops::find_by_id(db, target_user_id).await?.is_none() {
+    // Absence crosses the rg-db boundary as a value; this layer can give it the
+    // typed domain meaning that the HTTP error classifier maps to a safe 404.
+    let Some(updated) =
+        user_ops::update_by_id(db, target_user_id, display_name, bio, is_admin, is_active).await?
+    else {
         return Err(crate::error::not_found("user"));
-    }
-    let updated =
-        user_ops::update_by_id(db, target_user_id, display_name, bio, is_admin, is_active).await?;
+    };
     Ok(updated.into())
 }
 

@@ -633,7 +633,8 @@ async fn deactivating_an_account_revokes_its_unexpired_oci_token() {
 
     rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, None, Some(false))
         .await
-        .expect("deactivate user");
+        .expect("deactivate user")
+        .expect("registered user must exist");
 
     let after = start_upload_with(&base, "ocigoneowner", "gone-oci", &token).await;
     assert_eq!(

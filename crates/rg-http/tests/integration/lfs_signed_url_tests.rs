@@ -313,7 +313,8 @@ async fn deactivating_an_account_revokes_its_outstanding_lfs_urls() {
 
     rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, None, Some(false))
         .await
-        .expect("deactivate user");
+        .expect("deactivate user")
+        .expect("registered user must exist");
 
     let after = reqwest::Client::new()
         .put(&upload_href)

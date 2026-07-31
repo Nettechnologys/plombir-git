@@ -51,7 +51,8 @@ async fn admin_orgs_list_requires_admin() {
     // promote org_admin to admin in db for the authorization check
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/orgs", base))
@@ -83,7 +84,8 @@ async fn admin_orgs_get_not_found() {
         register_full(&base, "admin_org_get", "admin_org_get@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let get_resp = client
         .get(format!("{}/api/v1/admin/orgs/nope-org", base))
@@ -120,7 +122,8 @@ async fn admin_orgs_delete() {
 
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("registered user must exist");
 
     let del_resp = client
         .delete(format!("{}/api/v1/admin/orgs/victim-org", base))
