@@ -71,12 +71,11 @@ async fn connect(addr: &str) -> russh::client::Handle<AcceptAnyServer> {
 /// Ask the server to serve `git-upload-pack` on a fresh channel of an
 /// already-authenticated connection, and report whether it agreed.
 ///
-/// The two answers are unambiguous on the wire: an accepted exec is
-/// `channel_success` followed by the ref advertisement, a refused one is
-/// `channel_failure` — and because the handler returns an error after refusing,
-/// the connection is torn down, which reaches the client as the channel simply
-/// ending. Both of those read as `false` here; only an explicit acceptance
-/// reads as `true`, so a broken fixture cannot be mistaken for a revocation.
+/// `channel_success` means only that the exec request itself was accepted. A
+/// rejected git command also uses it so the server can send a useful stderr +
+/// exit-status instead of an opaque `channel_failure`. The ref advertisement
+/// (`Data`) is therefore the proof that upload-pack actually started; a
+/// non-zero exit status is a clean rejection.
 async fn upload_pack_allowed(
     session: &russh::client::Handle<AcceptAnyServer>,
     owner: &str,
@@ -94,7 +93,8 @@ async fn upload_pack_allowed(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match tokio::time::timeout_at(deadline, channel.wait()).await {
-            Ok(Some(ChannelMsg::Success | ChannelMsg::Data { .. })) => return true,
+            Ok(Some(ChannelMsg::Data { .. })) => return true,
+            Ok(Some(ChannelMsg::ExitStatus { exit_status })) if exit_status != 0 => return false,
             Ok(Some(ChannelMsg::Failure) | None) | Err(_) => return false,
             Ok(Some(_)) => {}
         }

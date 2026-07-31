@@ -73,6 +73,53 @@ impl From<anyhow::Error> for HandlerError {
     }
 }
 
+/// A failed SSH git gate, classified before anything is written to the client.
+///
+/// Git-over-SSH has no HTTP status code or `AppError` envelope, so the error
+/// class has to survive until `exec_request` can translate it into stderr +
+/// exit-status. In particular, a failed storage lookup is not an access
+/// decision and must never become "repository access denied".
+#[derive(Debug)]
+enum GitServiceError {
+    AuthenticationRequired,
+    RepositoryNotFound,
+    AccessDenied(&'static str),
+    ServerUnavailable(anyhow::Error),
+}
+
+impl GitServiceError {
+    fn client_message(&self) -> &'static str {
+        match self {
+            Self::AuthenticationRequired => "authentication required",
+            Self::RepositoryNotFound => "repository not found",
+            Self::AccessDenied(_) => "repository access denied",
+            Self::ServerUnavailable(_) => "server temporarily unavailable; try again later",
+        }
+    }
+
+    fn class(&self) -> &'static str {
+        match self {
+            Self::AuthenticationRequired => "authentication_required",
+            Self::RepositoryNotFound => "repository_not_found",
+            Self::AccessDenied(_) => "access_denied",
+            Self::ServerUnavailable(_) => "server_unavailable",
+        }
+    }
+
+    fn log_detail(&self) -> String {
+        match self {
+            Self::AuthenticationRequired => "no authenticated SSH identity".to_string(),
+            Self::RepositoryNotFound => "repository not found".to_string(),
+            Self::AccessDenied(reason) => (*reason).to_string(),
+            Self::ServerUnavailable(error) => format!("{error:#}"),
+        }
+    }
+
+    fn is_server_failure(&self) -> bool {
+        matches!(self, Self::ServerUnavailable(_))
+    }
+}
+
 /// SSH server configuration.
 pub struct SshServerConfig {
     /// Path to the SSH host key file (e.g., ed25519).
@@ -347,6 +394,50 @@ impl AuthenticatedIdentity {
     }
 }
 
+/// Reject an accepted SSH exec with a useful, sanitized git-facing failure.
+///
+/// `channel_failure` only says that the exec request itself was rejected; git
+/// gets no stderr and normally reports an opaque SSH failure. Accepting the
+/// exec and then sending stderr + exit-status 1 mirrors a short-lived command
+/// that failed normally, which is both observable by humans and retryable by
+/// automation. The internal error chain remains in the operator log only.
+fn reject_git_exec(
+    session: &mut Session,
+    channel_id: ChannelId,
+    error: &GitServiceError,
+    identity: Option<&AuthenticatedIdentity>,
+    service: &str,
+    repo_path: &str,
+) -> Result<(), HandlerError> {
+    let detail = error.log_detail();
+    let class = error.class();
+    if error.is_server_failure() {
+        tracing::error!(
+            error = %detail,
+            %class,
+            ?identity,
+            %service,
+            %repo_path,
+            "SSH git request failed before the git process could start"
+        );
+    } else {
+        tracing::warn!(
+            error = %detail,
+            %class,
+            ?identity,
+            %service,
+            %repo_path,
+            "SSH git request rejected"
+        );
+    }
+
+    session.channel_success(channel_id)?;
+    session.extended_data(channel_id, 1, format!("{}\n", error.client_message()))?;
+    session.exit_status_request(channel_id, 1)?;
+    session.close(channel_id)?;
+    Ok(())
+}
+
 impl Handler for SshHandler {
     type Error = HandlerError;
 
@@ -602,7 +693,7 @@ impl Handler for SshHandler {
             .with_context(|| format!("invalid repository path: {}", repo_path))?;
 
         if let Some(db) = &self.shared.db {
-            if let Err(e) = authorize_git_service(
+            if let Err(error) = authorize_git_service(
                 db,
                 &service,
                 &repo_path,
@@ -610,18 +701,15 @@ impl Handler for SshHandler {
             )
             .await
             {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    identity = ?self.authenticated_identity,
-                    %service,
-                    %repo_path,
-                    "SSH git repository access denied"
-                );
-                session.channel_failure(channel_id)?;
-                return Err(HandlerError(format!(
-                    "repository access denied: {}",
-                    repo_path
-                )));
+                reject_git_exec(
+                    session,
+                    channel_id,
+                    &error,
+                    self.authenticated_identity.as_ref(),
+                    &service,
+                    &repo_path,
+                )?;
+                return Ok(());
             }
         }
 
@@ -647,24 +735,28 @@ impl Handler for SshHandler {
 
         let receive_pack_context = if service == "git-receive-pack" {
             if let Some(db) = &self.shared.db {
-                let (owner, repo_name) = parse_repo_owner_name(&repo_path)?;
-                let repo = rg_core::repo::service::find_repo_by_owner_name(db, &owner, &repo_name)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-                let protection_rules =
-                    rg_db::ops::protected_branch_ops::list_by_repo(db, repo.id).await?;
-                let tag_protection_rules =
-                    rg_db::ops::protected_tag_ops::list_by_repo(db, repo.id).await?;
-                Some(ReceivePackContext {
-                    protection_rules,
-                    tag_protection_rules,
-                    actor_id: self
-                        .authenticated_identity
+                match load_receive_pack_context(
+                    db,
+                    &repo_path,
+                    self.authenticated_identity
                         .as_ref()
                         .and_then(AuthenticatedIdentity::user_id),
-                    owner,
-                    repo_name,
-                })
+                )
+                .await
+                {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        reject_git_exec(
+                            session,
+                            channel_id,
+                            &error,
+                            self.authenticated_identity.as_ref(),
+                            &service,
+                            &repo_path,
+                        )?;
+                        return Ok(());
+                    }
+                }
             } else {
                 None
             }
@@ -935,12 +1027,14 @@ async fn authorize_git_service(
     service: &str,
     repo_path: &str,
     identity: Option<&AuthenticatedIdentity>,
-) -> Result<()> {
-    let identity = identity.ok_or_else(|| anyhow::anyhow!("authentication required"))?;
-    let (owner, repo_name) = parse_repo_owner_name(repo_path)?;
+) -> std::result::Result<(), GitServiceError> {
+    let identity = identity.ok_or(GitServiceError::AuthenticationRequired)?;
+    let (owner, repo_name) =
+        parse_repo_owner_name(repo_path).map_err(|_| GitServiceError::RepositoryNotFound)?;
     let repo = rg_core::repo::service::find_repo_by_owner_name(db, &owner, &repo_name)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
+        .await
+        .map_err(GitServiceError::ServerUnavailable)?
+        .ok_or(GitServiceError::RepositoryNotFound)?;
 
     // "Who are you" is re-asked here, next to "what may you do", so the two
     // cannot drift apart: `can_read_repo` / `can_write_repo` re-read the
@@ -954,26 +1048,36 @@ async fn authorize_git_service(
             user_id,
             ssh_key_id,
         } => {
-            match rg_db::ops::user_ops::find_by_id(db, *user_id).await? {
+            match rg_db::ops::user_ops::find_by_id(db, *user_id)
+                .await
+                .map_err(GitServiceError::ServerUnavailable)?
+            {
                 Some(user) if user.is_usable() => {}
-                _ => anyhow::bail!("account is disabled or gone"),
+                _ => return Err(GitServiceError::AccessDenied("account is disabled or gone")),
             }
             // A password session has no key row to revoke; a key session does,
             // and deleting the key is the other half of offboarding.
             if let Some(key_id) = ssh_key_id {
                 if rg_db::ops::ssh_key_ops::find_by_id(db, *key_id)
-                    .await?
+                    .await
+                    .map_err(GitServiceError::ServerUnavailable)?
                     .is_none_or(|key| key.user_id != *user_id)
                 {
-                    anyhow::bail!("the SSH key this session authenticated with is gone");
+                    return Err(GitServiceError::AccessDenied(
+                        "the SSH key this session authenticated with is gone",
+                    ));
                 }
             }
             match service {
                 "git-upload-pack" => {
-                    rg_core::repo::service::can_read_repo(db, &repo, Some(*user_id)).await?
+                    rg_core::repo::service::can_read_repo(db, &repo, Some(*user_id))
+                        .await
+                        .map_err(GitServiceError::ServerUnavailable)?
                 }
                 "git-receive-pack" => {
-                    rg_core::repo::service::can_write_repo(db, &repo, Some(*user_id)).await?
+                    rg_core::repo::service::can_write_repo(db, &repo, Some(*user_id))
+                        .await
+                        .map_err(GitServiceError::ServerUnavailable)?
                 }
                 _ => false,
             }
@@ -983,19 +1087,51 @@ async fn authorize_git_service(
             // narrowed to read-only, or re-pointed, has to take effect on the
             // next exec and not on the next connection.
             let key = rg_db::ops::deploy_key_ops::find_by_id(db, *key_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("the deploy key this session authenticated with is gone")
-                })?;
+                .await
+                .map_err(GitServiceError::ServerUnavailable)?
+                .ok_or(GitServiceError::AccessDenied(
+                    "the deploy key this session authenticated with is gone",
+                ))?;
             deploy_key_allows(key.repo_id, key.read_only, repo.id, service)
         }
     };
 
     if !allowed {
-        anyhow::bail!("insufficient repository permission");
+        return Err(GitServiceError::AccessDenied(
+            "insufficient repository permission",
+        ));
     }
 
     Ok(())
+}
+
+/// Build the extra receive-pack policy context without letting a failed lookup
+/// tear down the SSH connection as an opaque handler error.
+async fn load_receive_pack_context(
+    db: &DatabaseConnection,
+    repo_path: &str,
+    actor_id: Option<i64>,
+) -> std::result::Result<ReceivePackContext, GitServiceError> {
+    let (owner, repo_name) =
+        parse_repo_owner_name(repo_path).map_err(|_| GitServiceError::RepositoryNotFound)?;
+    let repo = rg_core::repo::service::find_repo_by_owner_name(db, &owner, &repo_name)
+        .await
+        .map_err(GitServiceError::ServerUnavailable)?
+        .ok_or(GitServiceError::RepositoryNotFound)?;
+    let protection_rules = rg_db::ops::protected_branch_ops::list_by_repo(db, repo.id)
+        .await
+        .map_err(GitServiceError::ServerUnavailable)?;
+    let tag_protection_rules = rg_db::ops::protected_tag_ops::list_by_repo(db, repo.id)
+        .await
+        .map_err(GitServiceError::ServerUnavailable)?;
+
+    Ok(ReceivePackContext {
+        protection_rules,
+        tag_protection_rules,
+        actor_id,
+        owner,
+        repo_name,
+    })
 }
 
 fn deploy_key_allows(
