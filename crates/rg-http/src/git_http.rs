@@ -994,12 +994,41 @@ async fn find_repo_by_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_git_body, with_git_timeout};
+    use super::{buffer_git_body, git_failure_body, with_git_timeout};
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     // NOTE: a second `use axum::http::StatusCode` further down in this module
     // (pre-existing) was removed in favor of this single top-level import.
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log lock").clone()).expect("logs are UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// A slow-drip request body (a chunk, then a long stall) trips the idle
     /// buffer at ~the idle window and returns 504 — not after the whole stall.
@@ -1200,6 +1229,31 @@ mod tests {
     // here directly on the git predicate.
     use super::git_db_status;
     use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
+
+    #[test]
+    fn git_failure_logs_the_full_cause_and_returns_only_the_safe_body() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let error =
+            anyhow::Error::from(DbErr::Conn(RuntimeErr::Internal("connection reset".into())))
+                .context("lookup personal access token");
+
+        let body = git_failure_body("resolve git credential", &error);
+
+        assert_eq!(body, "database temporarily unavailable");
+        let rendered = logs.text();
+        assert!(rendered.contains("resolve git credential"), "{rendered}");
+        assert!(
+            rendered.contains("lookup personal access token"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("connection reset"), "{rendered}");
+    }
 
     #[test]
     fn git_db_status_connection_outage_is_503() {
