@@ -152,7 +152,10 @@ mod tests {
         assert_eq!(BACKUP_CODE_LEN, 14);
 
         let bits = BACKUP_CODE_LEN as f64 * (BACKUP_CODE_ALPHABET.len() as f64).log2();
-        assert!(bits >= 64.0, "{bits} bits per backup code is below the floor");
+        assert!(
+            bits >= 64.0,
+            "{bits} bits per backup code is below the floor"
+        );
     }
 
     /// The alphabet is part of the contract too: an entropy count is only true
@@ -173,7 +176,11 @@ mod tests {
         let codes = generate_codes(BACKUP_CODE_COUNT);
         assert_eq!(codes.len(), BACKUP_CODE_COUNT);
         for code in &codes {
-            assert_eq!(code.chars().count(), BACKUP_CODE_LEN, "wrong length: {code}");
+            assert_eq!(
+                code.chars().count(),
+                BACKUP_CODE_LEN,
+                "wrong length: {code}"
+            );
             assert!(
                 code.chars().all(|c| alphabet.contains(&c)),
                 "code left the declared alphabet: {code}"
