@@ -1,16 +1,16 @@
 //! REST API handlers for repository content browsing (tree, blob, history).
 
 use anyhow::Context;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use chrono;
 use serde::{Deserialize, Serialize};
 
+use crate::AppState;
 use crate::api::repo_access::{CiRead, RepoContents, RepoWrite};
 use crate::error::AppError;
-use crate::AppState;
 
 // ── Request / Response types ──────────────────────────────────────────
 
@@ -1063,21 +1063,7 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
     let repo = gix::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
-    // The same two-client-outcomes split as `get_blob_content`: the SHA does
-    // not resolve, or it resolves to something that is not a commit. A repo
-    // that would not open never reaches here, and must not be reported as a
-    // missing commit.
-    let commit_id = match repo.rev_parse_single(sha) {
-        Ok(id) => id,
-        Err(e) => {
-            return Err(
-                anyhow::Error::new(rg_core::error::NotFound::new("commit")).context(format!(
-                    "resolving commit '{}' in {:?}: {}",
-                    sha, repo_path, e
-                )),
-            )
-        }
-    };
+    let commit_id = resolve_signature_commit_id(&repo, sha, repo_path)?;
 
     let full_sha = commit_id.to_string();
 
@@ -1110,15 +1096,41 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
         &["log", "--format=%G?%n%GK%n%GN%n%GE", "-1", &full_sha],
         Some(repo_path),
     )?;
-    if !verify_output.success() {
-        return Ok(GpgSignature {
-            verified: false,
-            signer_key: None,
-            signer_name: None,
-            signer_email: None,
-            status: "verification_failed".to_string(),
-        });
+    gpg_signature_from_output(&verify_output)
+}
+
+/// Resolve an object-id prefix without asking `rev_parse_single` to encode both
+/// absence and a broken object store in one error value.
+fn resolve_signature_commit_id(
+    repo: &gix::Repository,
+    sha: &str,
+    repo_path: &std::path::Path,
+) -> anyhow::Result<gix::hash::ObjectId> {
+    let prefix = gix::hash::Prefix::from_hex(sha)
+        .map_err(|_| rg_core::error::invalid_request("invalid commit SHA format"))?;
+    let resolution = repo
+        .objects
+        .lookup_prefix(prefix, None)
+        .with_context(|| format!("looking up commit '{sha}' in {}", repo_path.display()))?;
+
+    match resolution {
+        None => Err(anyhow::Error::new(rg_core::error::NotFound::new("commit"))),
+        Some(Ok(commit_id)) => Ok(commit_id),
+        // An ambiguous SHA prefix is a malformed client request, not an absent
+        // commit and not a storage failure.
+        Some(Err(())) => Err(rg_core::error::invalid_request("commit SHA is ambiguous")),
     }
+}
+
+/// Interpret a *successful* `git log` signature report. A Git process failure
+/// is operational, not a legitimate `verified: false` result.
+fn gpg_signature_from_output(
+    verify_output: &rg_git::cli_gateway::GitOutput,
+) -> anyhow::Result<GpgSignature> {
+    verify_output
+        .ensure_success()
+        .context("git could not verify commit signature")?;
+
     let verify_text = verify_output.stdout_str();
     let lines: Vec<&str> = verify_text.lines().collect();
 
@@ -1472,14 +1484,16 @@ fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::R
 mod tests {
     use std::{
         io::Write as _,
+        process::Command,
         sync::{Arc, Mutex},
     };
 
     use axum::response::IntoResponse;
+    use rg_git::cli_gateway::GitOutput;
 
     use super::{
-        get_commit_log, is_empty_repo, list_branch_names, list_tag_names, list_tree_entries,
-        AppError,
+        AppError, get_commit_log, gpg_signature_from_output, is_empty_repo, list_branch_names,
+        list_tag_names, list_tree_entries,
     };
 
     #[derive(Clone, Default)]
@@ -1531,6 +1545,41 @@ mod tests {
             .write_all(data)
             .expect("object payload must compress");
         encoder.finish().expect("object must finish compressing");
+    }
+
+    #[test]
+    fn an_invalid_signature_is_a_negative_verification_result() {
+        let output = GitOutput {
+            stdout: b"B\nkey\nSigner\nsigner@example.com\n".to_vec(),
+            stderr: Vec::new(),
+            status: Command::new("true").status().expect("true must run"),
+            command: "git log --format=%G?".to_string(),
+        };
+
+        let signature =
+            gpg_signature_from_output(&output).expect("Git reported a signature result");
+        assert!(!signature.verified);
+        assert_eq!(signature.status, "bad_signature");
+    }
+
+    #[test]
+    fn a_failed_signature_verification_command_is_a_server_error() {
+        let output = GitOutput {
+            stdout: Vec::new(),
+            stderr: b"git operational failure".to_vec(),
+            status: Command::new("false").status().expect("false must run"),
+            command: "git log --format=%G?".to_string(),
+        };
+
+        let error = match gpg_signature_from_output(&output) {
+            Ok(_) => panic!("a failed Git process must not become verified=false"),
+            Err(error) => error,
+        };
+        let response = AppError::from(error).into_response();
+        assert!(
+            response.status().is_server_error(),
+            "a failed Git process must reach the HTTP layer as 5xx"
+        );
     }
 
     /// The ordinary positive case the empty-tree response exists for: a repo

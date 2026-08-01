@@ -55,6 +55,28 @@ fn remove_loose_object(bare: &Path, object_id: &str) {
     );
 }
 
+/// Keep a loose object's name but replace its payload with an invalid commit.
+/// This preserves index/prefix lookup while making the object-store read fail.
+fn corrupt_loose_commit_object(bare: &Path, object_id: &str) {
+    use std::io::Write as _;
+
+    let object_path = bare
+        .join("objects")
+        .join(&object_id[..2])
+        .join(&object_id[2..]);
+    assert!(
+        object_path.exists(),
+        "fixture must start with a loose commit"
+    );
+    std::fs::remove_file(&object_path).expect("remove original commit object");
+    let file = std::fs::File::create(&object_path).expect("overwrite commit object");
+    let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+    encoder
+        .write_all(b"commit 1\0x")
+        .expect("write corrupt commit object");
+    encoder.finish().expect("finish corrupt commit object");
+}
+
 /// `GET /repos/{owner}/{name}/blob/{path}`.
 #[tokio::test]
 async fn broken_repository_on_the_blob_endpoint_is_not_a_missing_file() {
@@ -140,6 +162,46 @@ async fn broken_repository_on_the_signature_endpoint_is_not_a_missing_commit() {
     assert!(
         status.is_server_error(),
         "a repository that cannot be opened must be a 5xx, not {status} (body: {body})"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+}
+
+/// The repository can remain open and the requested SHA can remain indexed
+/// while decoding its commit object fails. That is a storage fault, not a
+/// legitimate absent commit or an unsigned commit.
+#[tokio::test]
+async fn a_corrupt_signature_commit_object_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "sigobject-owner", "sigobject@example.com").await;
+    create_repo(&base, &token, "sigobject-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "sigobject-owner", "sigobject-repo").await;
+
+    let bare = repo_root.join("sigobject-owner/sigobject-repo.git");
+    let repo = gix::open(&bare).expect("fixture repository must open");
+    let commit_id = repo
+        .head()
+        .expect("HEAD must be readable")
+        .try_into_peeled_id()
+        .expect("HEAD must resolve")
+        .expect("fixture must have a commit")
+        .to_string();
+    drop(repo);
+    corrupt_loose_commit_object(&bare, &commit_id);
+
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/repos/sigobject-owner/sigobject-repo/commits/{commit_id}/signature"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        status.is_server_error(),
+        "a corrupt commit object must be a 5xx, not {status} (body: {body})"
     );
     assert_no_internal_detail(&body, &repo_root);
 }
