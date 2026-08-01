@@ -85,13 +85,12 @@
 //! `remove_team_member(team.id, user_id)`, which scope the delete by the
 //! container the gate already settled. There is no id space to walk.
 //!
-//! What that leaves is a different question — whether the reply distinguishes an
-//! account that *was* a member from one that was not, or from an id that names
-//! no account at all — and it is answered by
-//! [`removing_a_member_never_says_whether_there_was_one`] below rather than by
-//! this comment. Both removals are idempotent by construction (`org_ops` looks
-//! the row up and deletes it only `if let Some`), so the three answers are one
-//! answer; the test is what keeps that true.
+//! What that leaves is a different question — whether the reply distinguishes a
+//! real membership change from a no-op without turning the no-op into an account
+//! existence oracle. [`removing_a_member_reports_only_real_membership_changes`]
+//! below pins both halves: an existing membership is removed successfully, while
+//! a repeat, an existing non-member, and an id that names no account all receive
+//! the same `404`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -105,7 +104,9 @@ use crate::common::source_scan::{
     functions, handler_type_name, param_base_types, relative, rust_files, signature_params,
     src_root,
 };
-use crate::common::{register_full, spawn_test_app, spawn_test_app_with_routes};
+use crate::common::{
+    register_full, spawn_test_app_with_db, spawn_test_app_with_routes,
+};
 
 const VICTIM: &str = "orgscopevictim";
 const ATTACKER: &str = "orgscopeattacker";
@@ -157,9 +158,9 @@ const ID_ROLE: &[(&str, &str, Role)] = &[
             "names an account, not a row of the organization: `remove_org_member(org.id, \
              user_id)` and `remove_team_member(team.id, user_id)` are both scoped by the \
              container the gate already settled, so there is no id space to walk. Whether the \
-             reply tells a member from a non-member from an id that names nobody is a different \
-             question, and it is asserted in \
-             `removing_a_member_never_says_whether_there_was_one` rather than assumed here",
+             reply confirms only a real membership change while keeping every no-op \
+             indistinguishable is asserted in \
+             `removing_a_member_reports_only_real_membership_changes` rather than assumed here",
         ),
     ),
 ];
@@ -848,20 +849,17 @@ async fn no_org_scoped_route_reaches_another_organizations_row() {
 /// `remove_org_member(org.id, user_id)` / `remove_team_member(team.id, user_id)`,
 /// which scope the delete by the container the gate already settled. That
 /// disposes of the *IDOR* — there is no id space to walk — and leaves one thing
-/// it says nothing about: whether the reply distinguishes an account that was a
-/// member, one that exists and was not, and an integer that names no account at
-/// all.
+/// it says nothing about: whether the reply confirms a real membership change
+/// without revealing whether a no-op id belongs to an account.
 ///
-/// Today it does not, because `org_ops` looks the row up and deletes it only
-/// `if let Some(m)`, answering `{"removed": true}` either way. That is a
-/// property of two lines that could be "improved" into a `404` by anyone tidying
-/// up, which is exactly the shape of change this directory keeps having to
-/// undo — so it is pinned here, by the same whole-answer comparison the sweep
-/// above uses, rather than left to be rediscovered.
+/// A successful removal must answer `200 {"removed": true}`. A repeated removal,
+/// an existing account that never joined, and an integer no account carries must
+/// all answer the same `404`: the first rule prevents a silent no-op, and the
+/// second keeps the account-existence oracle closed.
 #[tokio::test]
-async fn removing_a_member_never_says_whether_there_was_one() {
+async fn removing_a_member_reports_only_real_membership_changes() {
     const ORG: &str = "orgscope-member-oracle-org";
-    let base = spawn_test_app().await;
+    let (base, db) = spawn_test_app_with_db().await;
     let (owner_token, _owner_id) = register_full(
         &base,
         "orgscopememberowner",
@@ -916,16 +914,31 @@ async fn removing_a_member_never_says_whether_there_was_one() {
         );
     }
 
-    // Three callers' worth of a difference, and the removal must not report any
-    // of it: a member, an account that exists and never joined, and an integer
-    // no account has ever carried.
     for (family, base_path) in [
         ("organization", format!("/api/v1/orgs/{ORG}/members")),
         ("team", format!("/api/v1/orgs/{ORG}/teams/{team}/members")),
     ] {
-        let mut answers = Vec::new();
+        let removed = fx
+            .client
+            .delete(format!("{}{base_path}/{member_id}", fx.base))
+            .bearer_auth(&fx.attacker_token)
+            .send()
+            .await
+            .expect("remove seeded member");
+        assert_eq!(
+            removed.status(),
+            StatusCode::OK,
+            "removing a seeded {family} member must succeed"
+        );
+        let body: serde_json::Value = removed.json().await.expect("removal response JSON");
+        assert_eq!(
+            body["removed"], true,
+            "a successful {family} removal must confirm the change"
+        );
+
+        let mut misses = Vec::new();
         for (who, id) in [
-            ("a member", member_id),
+            ("the same member a second time", member_id),
             ("an account that never joined", stranger_id),
             ("an id no account carries", ABSENT_ID),
         ] {
@@ -936,25 +949,24 @@ async fn removing_a_member_never_says_whether_there_was_one() {
                 .send()
                 .await
                 .expect("remove member");
-            answers.push((who, Answer::of(response).await));
+            let answer = Answer::of(response).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::NOT_FOUND,
+                "removing {who} from the {family} must report that no membership changed: {}",
+                answer.excerpt()
+            );
+            misses.push((who, answer));
         }
-        let (first_who, first) = &answers[0];
-        assert!(
-            first.status.is_success(),
-            "removing {first_who} from the {family} answered {} — the fixture is broken, and \
-             three matching failures would read as a passing test",
-            first.status
-        );
-        for (who, answer) in &answers[1..] {
+
+        let (first_who, first) = &misses[0];
+        for (who, answer) in &misses[1..] {
             assert_eq!(
                 first.shape(),
                 answer.shape(),
                 "removing {who} from the {family} is answered differently from removing \
-                 {first_who}, so the route reports whether the account was there — and, with \
-                 `{ABSENT_ID}` in the pair, whether the account exists at all. The removal is \
-                 idempotent by construction (`org_ops` deletes only `if let Some`); if that \
-                 changed deliberately, the id is no longer a mere argument and belongs in ID_ROLE \
-                 as a target with a probe of its own.\n      {first_who}: {} {}\n      {who}: {} {}",
+                 {first_who}, so a no-op reports whether the account exists or used to be a \
+                 member.\n      {first_who}: {} {}\n      {who}: {} {}",
                 first.status,
                 first.excerpt(),
                 answer.status,
@@ -962,4 +974,22 @@ async fn removing_a_member_never_says_whether_there_was_one() {
             );
         }
     }
+
+    let (_logs, total) = rg_db::ops::audit_log_ops::list_paginated(
+        &db,
+        0,
+        100,
+        None,
+        Some("org.remove_member"),
+        Some("org"),
+        None,
+        None,
+    )
+    .await
+    .expect("list organization member removal audit events");
+    assert_eq!(
+        total, 1,
+        "only the successful organization-member removal may emit org.remove_member; no-op \
+         removals must not create audit history"
+    );
 }

@@ -450,6 +450,7 @@ pub async fn add_org_member(
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Organization member not found", body = serde_json::Value),
     ),
 )]
 pub async fn remove_org_member(
@@ -741,6 +742,7 @@ pub async fn add_team_member(
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Team member not found", body = serde_json::Value),
     ),
 )]
 pub async fn remove_team_member(

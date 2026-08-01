@@ -104,7 +104,9 @@ pub async fn add_org_member(
 
 /// Remove a member from an organization.
 pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<()> {
-    org_ops::remove_org_member(db, org_id, user_id).await?;
+    if !org_ops::remove_org_member(db, org_id, user_id).await? {
+        return Err(crate::error::not_found("organization member"));
+    }
     crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())
 }
@@ -204,7 +206,9 @@ pub async fn add_team_member(
 
 /// Remove a member from a team.
 pub async fn remove_team_member(db: &DatabaseConnection, team_id: i64, user_id: i64) -> Result<()> {
-    org_ops::remove_team_member(db, team_id, user_id).await?;
+    if !org_ops::remove_team_member(db, team_id, user_id).await? {
+        return Err(crate::error::not_found("team member"));
+    }
     crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())
 }

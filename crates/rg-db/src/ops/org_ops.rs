@@ -158,19 +158,15 @@ pub async fn add_org_member(
     model.insert(db).await.context("db: add org member")
 }
 
-/// Remove a member from an organization.
-pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<()> {
-    let member = organization_member::Entity::find()
+/// Remove a member from an organization. Returns whether a row was removed.
+pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<bool> {
+    let result = organization_member::Entity::delete_many()
         .filter(organization_member::Column::OrgId.eq(org_id))
         .filter(organization_member::Column::UserId.eq(user_id))
-        .one(db)
+        .exec(db)
         .await
-        .context("db: find org member")?;
-
-    if let Some(m) = member {
-        m.delete(db).await.context("db: remove org member")?;
-    }
-    Ok(())
+        .context("db: remove org member")?;
+    Ok(result.rows_affected > 0)
 }
 
 /// List members of an organization.
@@ -306,19 +302,19 @@ pub async fn add_team_member(
     model.insert(db).await.context("db: add team member")
 }
 
-/// Remove a member from a team.
-pub async fn remove_team_member(db: &DatabaseConnection, team_id: i64, user_id: i64) -> Result<()> {
-    let member = team_member::Entity::find()
+/// Remove a member from a team. Returns whether a row was removed.
+pub async fn remove_team_member(
+    db: &DatabaseConnection,
+    team_id: i64,
+    user_id: i64,
+) -> Result<bool> {
+    let result = team_member::Entity::delete_many()
         .filter(team_member::Column::TeamId.eq(team_id))
         .filter(team_member::Column::UserId.eq(user_id))
-        .one(db)
+        .exec(db)
         .await
-        .context("db: find team member")?;
-
-    if let Some(m) = member {
-        m.delete(db).await.context("db: remove team member")?;
-    }
-    Ok(())
+        .context("db: remove team member")?;
+    Ok(result.rows_affected > 0)
 }
 
 /// List members of a team.
