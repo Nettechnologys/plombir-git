@@ -93,6 +93,40 @@ pub fn detect_backend(db_url: &str) -> Result<DbBackend> {
     }
 }
 
+/// True when this database error is the backend's UNIQUE-constraint violation.
+///
+/// Answered from the backend's own error code — SQLite 1555/2067, PostgreSQL
+/// 23505, MySQL 1062 — via [`sea_orm::DbErr::sql_err`], not by looking for the
+/// word "unique" in the message: the wording differs per backend and per
+/// version, and a substring match also claims an error that merely *mentions* a
+/// uniquely-named index.
+///
+/// Narrow on purpose. A caller uses this to turn one specific loss — someone
+/// else inserted the row I was about to insert — into a normal outcome, so
+/// every other failure (foreign key, check constraint, disk, outage) must stay
+/// an error rather than become a fabricated success.
+pub fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
+    matches!(
+        error.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    )
+}
+
+/// [`is_unique_violation`] for a `DbErr` a higher layer wrapped in `anyhow`
+/// context.
+///
+/// `rg_db::ops::user_ops` returns `anyhow::Result` and attaches a `db: ...`
+/// context to every call, so its callers never see the `DbErr` directly. The
+/// whole chain is walked rather than just the source: context can be added more
+/// than once on the way up.
+pub fn is_unique_violation_anyhow(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sea_orm::DbErr>()
+            .is_some_and(is_unique_violation)
+    })
+}
+
 /// Convert portable `?` bind markers in raw SQL to the backend's syntax.
 ///
 /// SeaORM does not rewrite placeholders in `Statement::from_sql_and_values`:

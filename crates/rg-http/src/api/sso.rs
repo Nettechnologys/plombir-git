@@ -776,36 +776,21 @@ async fn find_or_create_sso_user(
     }
 
     // Check if user with this email already exists
-    let user_id = if let Some(existing) = rg_db::ops::user_ops::find_by_email(db, &user_info.email)
+    let user_id = match rg_db::ops::user_ops::find_by_email(db, &user_info.email)
         .await
         .map_err(AppError::from)?
     {
-        existing.id
-    } else {
-        // Create new user
-        let username = generate_unique_username(db, &user_info.provider_username)
-            .await
-            .map_err(AppError::from)?;
-
-        let created = rg_db::ops::user_ops::create_user(
-            db,
-            &username,
-            &user_info.email,
-            "", // no password for SSO users
-            user_info.display_name.as_deref().unwrap_or(&username),
-        )
-        .await
-        .map_err(AppError::from)?;
-        // SSO first-login provision is a new account: count it in the
-        // `users_registered_total` funnel with `sso` provenance.
-        crate::metrics::recorder::user_provisioned("sso");
-        created.id
+        Some(existing) => existing.id,
+        None => provision_sso_user(db, provider_slug, user_info).await?,
     };
 
     // Encrypt and store tokens
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    // Same reason as the linked-account branch above: `unwrap_or_default()`
+    // stores an empty string in place of the access token, and the row then
+    // looks populated while authenticating nothing.
     let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
-        .unwrap_or_default();
+        .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
     let enc_refresh = token_response
         .refresh_token
         .as_ref()
@@ -830,6 +815,123 @@ async fn find_or_create_sso_user(
     .map_err(AppError::from)?;
 
     Ok(user_id)
+}
+
+/// How many times a first-login provision may lose the race for its generated
+/// username before giving up.
+///
+/// Each extra pass costs one `SELECT` plus one `INSERT`, and it only runs while
+/// another request is provisioning the *same* username at the same moment, so
+/// a small bound is enough to cover a real collision without turning a
+/// persistent constraint failure into a spin.
+const SSO_PROVISION_ATTEMPTS: usize = 3;
+
+/// Create the ForgeKeep account behind a first SSO login, tolerating a
+/// concurrent callback for the same identity.
+///
+/// `users.username` and `users.email` are both UNIQUE
+/// (`m20260424_000001_create_users`), and this path reaches the `INSERT` after
+/// two separate reads: no OAuth link for `(provider, provider_user_id)`, no
+/// account on that email. Two callbacks of the same first login both pass those
+/// reads, so one of them meets the constraint. Losing that race is neither the
+/// client's fault nor a failed login — the winner created exactly the account
+/// this call was about to — so the loser adopts it instead of answering 500 and
+/// leaving the user staring at a broken first sign-in.
+///
+/// Two things it deliberately does not do:
+///
+/// * **Adopt an account merely because it holds the username.** The username is
+///   derived from the provider's, and an unrelated local user may legitimately
+///   own it; treating that collision as "this is me" would hand the login
+///   someone else's account. Only the OAuth link and the email identify this
+///   person — a bare username collision is retried with a new candidate.
+/// * **Count the provision twice.** `user_provisioned("sso")` fires only on the
+///   branch that actually inserted the row, so a raced double callback adds one
+///   registration to the funnel, not two.
+async fn provision_sso_user(
+    db: &sea_orm::DatabaseConnection,
+    provider_slug: &str,
+    user_info: &rg_core::auth::sso::SsoUserInfo,
+) -> Result<i64, AppError> {
+    for attempt in 1..=SSO_PROVISION_ATTEMPTS {
+        let username = generate_unique_username(db, &user_info.provider_username)
+            .await
+            .map_err(AppError::from)?;
+
+        let error = match rg_db::ops::user_ops::create_user(
+            db,
+            &username,
+            &user_info.email,
+            "", // no password for SSO users
+            user_info.display_name.as_deref().unwrap_or(&username),
+        )
+        .await
+        {
+            Ok(created) => {
+                // SSO first-login provision is a new account: count it in the
+                // `users_registered_total` funnel with `sso` provenance.
+                crate::metrics::recorder::user_provisioned("sso");
+                return Ok(created.id);
+            }
+            Err(error) => error,
+        };
+
+        // Anything that is not a UNIQUE violation is a real write failure and
+        // keeps its classification — `AppError::from` still tells a connection
+        // outage (503) apart from a statement-level fault (500).
+        if !rg_db::is_unique_violation_anyhow(&error) {
+            return Err(AppError::from(error));
+        }
+
+        // A race was lost — but to whom? Re-read the two keys that identify
+        // *this* login. A hit means a concurrent callback already built the
+        // account, and reusing it is the correct answer.
+        if let Some(user_id) = resolve_raced_sso_user(db, provider_slug, user_info).await? {
+            return Ok(user_id);
+        }
+
+        // Neither key is taken, so the collision was on the generated username
+        // alone — someone else's account, not this one. A fresh candidate is a
+        // different row; try again.
+        tracing::debug!(
+            provider = provider_slug,
+            attempt,
+            username = %username,
+            "SSO first-login username was taken concurrently; regenerating"
+        );
+    }
+
+    Err(AppError::internal(
+        "could not allocate a username for the new SSO account",
+    ))
+}
+
+/// Find the account a concurrent SSO callback created for this same identity.
+///
+/// Both keys belong to the login itself: the OAuth link is `(provider,
+/// provider_user_id)` — precisely the row this callback was going to write —
+/// and the email is the key the non-racing path merges on. Nothing else
+/// (username, display name) identifies the person, so nothing else is consulted.
+async fn resolve_raced_sso_user(
+    db: &sea_orm::DatabaseConnection,
+    provider_slug: &str,
+    user_info: &rg_core::auth::sso::SsoUserInfo,
+) -> Result<Option<i64>, AppError> {
+    if let Some(oauth) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
+        db,
+        provider_slug,
+        &user_info.provider_user_id,
+    )
+    .await
+    .map_err(AppError::from)?
+    {
+        return Ok(Some(oauth.user_id));
+    }
+
+    Ok(rg_db::ops::user_ops::find_by_email(db, &user_info.email)
+        .await
+        .map_err(AppError::from)?
+        .map(|user| user.id))
 }
 
 /// Generate a unique username based on the provider username.
@@ -862,11 +964,197 @@ async fn generate_unique_username(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_auth_cookie, encode_query_component, set_state_cookie, store_refreshed_oauth_tokens,
-        verify_state_cookie, SSO_STATE_COOKIE, SSO_VERIFIER_COOKIE,
+        build_auth_cookie, encode_query_component, provision_sso_user, resolve_raced_sso_user,
+        set_state_cookie, store_refreshed_oauth_tokens, verify_state_cookie, SSO_STATE_COOKIE,
+        SSO_VERIFIER_COOKIE,
     };
     use axum::http::{header, HeaderMap};
     use axum::response::IntoResponse;
+
+    /// Serialises the two tests that assert a delta on the process-wide
+    /// `users_registered_total` counter. Under `cargo nextest` each test is its
+    /// own process and this is a no-op; under a threaded `cargo test` it keeps
+    /// one test's increment out of the other's reading.
+    /// Async-aware on purpose: the guard is held across the database awaits,
+    /// which `clippy::await_holding_lock` denies for a `std` mutex.
+    static PROVISION_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn sso_user_info(uid: &str, username: &str, email: &str) -> rg_core::auth::sso::SsoUserInfo {
+        rg_core::auth::sso::SsoUserInfo {
+            provider_user_id: uid.to_string(),
+            provider_username: username.to_string(),
+            email: email.to_string(),
+            display_name: Some("Alice".to_string()),
+            avatar_url: None,
+        }
+    }
+
+    async fn migrated_db() -> sea_orm::DatabaseConnection {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect test database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    /// Reads `forgekeep_users_registered_total`, initialising the registry the
+    /// first time so the counter exists to be read at all.
+    fn registered_total() -> u64 {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the registry is process-global; a second init is the expected no-op"
+        )]
+        let _ = crate::metrics::init_registry();
+        crate::metrics::business::USERS_REGISTERED
+            .get()
+            .expect("the counter exists once the registry is initialised")
+            .get()
+    }
+
+    #[tokio::test]
+    async fn a_lost_first_login_race_is_resolved_through_the_winner_s_oauth_link() {
+        let db = migrated_db().await;
+
+        // The winner already created the account and linked the identity. Its
+        // email deliberately differs from what this callback carries, so only
+        // the OAuth link can identify it.
+        let winner =
+            rg_db::ops::user_ops::create_user(&db, "winner", "winner@example.com", "", "Winner")
+                .await
+                .expect("create the winning account");
+        rg_db::ops::oauth_account_ops::upsert(
+            &db,
+            winner.id,
+            "gitea",
+            "provider-uid-1",
+            "alice",
+            "winner@example.com",
+            Some("access"),
+            None,
+            None,
+        )
+        .await
+        .expect("link the winning account");
+
+        let resolved = resolve_raced_sso_user(
+            &db,
+            "gitea",
+            &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+        )
+        .await
+        .expect("resolve");
+
+        assert_eq!(resolved, Some(winner.id));
+    }
+
+    #[tokio::test]
+    async fn a_lost_first_login_race_is_resolved_through_the_email_before_the_link_exists() {
+        let db = migrated_db().await;
+
+        // The winner is between its two writes: the user row is in, the OAuth
+        // link is not yet.
+        let winner =
+            rg_db::ops::user_ops::create_user(&db, "alice", "alice@example.com", "", "Alice")
+                .await
+                .expect("create the winning account");
+
+        let resolved = resolve_raced_sso_user(
+            &db,
+            "gitea",
+            &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+        )
+        .await
+        .expect("resolve");
+
+        assert_eq!(resolved, Some(winner.id));
+    }
+
+    #[tokio::test]
+    async fn holding_the_username_alone_does_not_make_an_account_this_sso_identity() {
+        let db = migrated_db().await;
+
+        // An unrelated local account that happens to be called `alice`. The
+        // generated username is derived from the provider's, so this collision
+        // is ordinary — and adopting this row would hand the login someone
+        // else's account.
+        rg_db::ops::user_ops::create_user(&db, "alice", "someone-else@example.com", "", "Someone")
+            .await
+            .expect("create the unrelated account");
+
+        let resolved = resolve_raced_sso_user(
+            &db,
+            "gitea",
+            &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+        )
+        .await
+        .expect("resolve");
+
+        assert_eq!(resolved, None, "a username is not an identity");
+    }
+
+    #[tokio::test]
+    async fn provisioning_a_first_login_creates_one_account_and_counts_one_registration() {
+        let guard = PROVISION_COUNTER_LOCK.lock().await;
+        let db = migrated_db().await;
+        let before = registered_total();
+
+        let user_id = provision_sso_user(
+            &db,
+            "gitea",
+            &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+        )
+        .await
+        .expect("provision");
+
+        let created = rg_db::ops::user_ops::find_by_id(&db, user_id)
+            .await
+            .expect("read back")
+            .expect("the account exists");
+        assert_eq!(created.email, "alice@example.com");
+        assert_eq!(created.username, "alice");
+        assert_eq!(
+            registered_total() - before,
+            1,
+            "a genuine first login is one registration",
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn losing_the_race_reuses_the_winner_s_account_without_counting_it_twice() {
+        let guard = PROVISION_COUNTER_LOCK.lock().await;
+        let db = migrated_db().await;
+
+        // The concurrent callback got there first: the account is in, under a
+        // different username, on the email this login carries. `users.email` is
+        // UNIQUE, so the INSERT below really does fail — no injection needed.
+        let winner = rg_db::ops::user_ops::create_user(
+            &db,
+            "alice_from_the_other_callback",
+            "alice@example.com",
+            "",
+            "Alice",
+        )
+        .await
+        .expect("create the winning account");
+
+        let before = registered_total();
+        let user_id = provision_sso_user(
+            &db,
+            "gitea",
+            &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+        )
+        .await
+        .expect("a lost race is not a failed login");
+
+        assert_eq!(user_id, winner.id, "both callbacks resolve to one identity");
+        assert_eq!(
+            registered_total() - before,
+            0,
+            "adopting an account someone else created is not a new registration",
+        );
+        drop(guard);
+    }
 
     #[test]
     fn sso_state_and_pkce_cookies_are_both_set() {
