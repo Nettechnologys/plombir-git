@@ -34,6 +34,12 @@ url = "sqlite:///data/forgekeep.db?mode=rwc"
 # FORGEKEEP_JWT_SECRET (the env var wins over this file), so a config file that
 # accidentally lands in git carries no credentials.
 # jwt_secret = "..."
+#
+# Same for the at-rest encryption key: set FORGEKEEP_ENCRYPTION_KEY in
+# deploy/.env. Unset, it falls back to the JWT secret — which means rotating
+# FORGEKEEP_JWT_SECRET makes every TOTP secret, CI secret, mirror/LDAP password
+# and SSO client secret unreadable. Pin it once, and rotation stays safe.
+# encryption_key = "..."
 
 [ci]
 # Run CI jobs in Docker containers. Requires mounting the host Docker socket

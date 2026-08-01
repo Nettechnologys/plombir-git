@@ -74,7 +74,18 @@ pub(crate) struct DatabaseConfig {
 #[derive(Debug, serde::Deserialize, Default)]
 #[allow(dead_code)]
 pub(crate) struct AuthConfig {
+    /// Secret that signs session JWTs, PAT-derived tokens and CI job tokens.
     pub(crate) jwt_secret: Option<String>,
+    /// Secret that encrypts data at rest — TOTP secrets, CI secrets, mirror and
+    /// LDAP passwords, SSO client secrets, OAuth tokens.
+    ///
+    /// Unset falls back to [`jwt_secret`](Self::jwt_secret), which is where
+    /// every existing deployment's data already lives. It is a separate knob so
+    /// that rotating the *signing* secret — the thing an operator is told to do
+    /// the moment a token leaks — stops silently re-keying the whole database
+    /// (card_d740512de0a8). Set it to the previous `jwt_secret` before rotating
+    /// and the stored data stays readable.
+    pub(crate) encryption_key: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]

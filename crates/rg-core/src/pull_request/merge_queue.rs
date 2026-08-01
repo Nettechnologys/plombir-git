@@ -570,6 +570,7 @@ async fn ensure_merge_group_ci(
                     external_runners: ci.external_runners,
                     allow_host_runner: ci.allow_host_runner,
                     jwt_secret: ci.jwt_secret,
+                    encryption_key: ci.encryption_key,
                     external_url: ci.external_url,
                 })
                 .await?;

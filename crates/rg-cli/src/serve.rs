@@ -174,6 +174,22 @@ fn validate_numeric_ranges(
     Ok(())
 }
 
+/// Read a secret-carrying environment variable, treating a blank value as unset.
+///
+/// `std::env::var` reports `FOO=` as `Ok("")`, and `deploy/.env.example` ships
+/// exactly that line for `FORGEKEEP_JWT_SECRET`. Taken literally, an operator
+/// who copied the file and forgot to fill it in got a server that started
+/// cleanly and signed every token with the empty string — and the same file
+/// promised them "startup validation will fail loudly". A blank line in an
+/// `.env` means "I have not set this", never "the secret is the empty string",
+/// so it falls through to the next source and, if there is none, to that
+/// source's own honest error.
+fn env_secret(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// Initialise and run the ForgeKeep server (HTTP + SSH).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_serve(
@@ -183,6 +199,7 @@ pub(crate) async fn run_serve(
     host_key: Option<String>,
     db_url: Option<String>,
     jwt_secret: Option<String>,
+    encryption_key: Option<String>,
     docker: bool,
     external_runners: bool,
     allow_host_runner: bool,
@@ -209,7 +226,7 @@ pub(crate) async fn run_serve(
     };
 
     // Resolve JWT secret: env var > CLI args > config file > error
-    let resolved_jwt_secret = if let Ok(env_secret) = std::env::var("FORGEKEEP_JWT_SECRET") {
+    let resolved_jwt_secret = if let Some(env_secret) = env_secret("FORGEKEEP_JWT_SECRET") {
         validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
         tracing::info!("Using JWT secret from environment variable FORGEKEEP_JWT_SECRET");
         env_secret
@@ -223,6 +240,38 @@ pub(crate) async fn run_serve(
         anyhow::bail!(
             "No JWT secret provided. Set FORGEKEEP_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
         );
+    };
+
+    // Resolve the at-rest encryption secret: env var > CLI arg > config file >
+    // the JWT secret.
+    //
+    // The fallback is not laziness, it is compatibility: until card_d740512de0a8
+    // the two were the same value by construction, so every existing database
+    // has its TOTP secrets, CI secrets, mirror/LDAP passwords, SSO client
+    // secrets and OAuth tokens encrypted under `jwt_secret`. Splitting them
+    // without the fallback would have made this release the exact silent
+    // data-loss event the card is about. Setting the key explicitly is what
+    // makes rotating the *signing* secret safe from then on — and the preflight
+    // below is what catches an operator who rotated without doing that.
+    let resolved_encryption_key = if let Some(env_key) = env_secret("FORGEKEEP_ENCRYPTION_KEY") {
+        validate_jwt_secret(&env_key, "environment variable FORGEKEEP_ENCRYPTION_KEY")?;
+        tracing::info!("Using at-rest encryption key from FORGEKEEP_ENCRYPTION_KEY");
+        env_key
+    } else if let Some(cli_key) = encryption_key {
+        validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
+        tracing::info!("Using at-rest encryption key from --encryption-key");
+        cli_key
+    } else if let Some(cfg_key) = cfg.as_ref().and_then(|c| c.auth.encryption_key.clone()) {
+        validate_jwt_secret(&cfg_key, "config file [auth].encryption_key")?;
+        tracing::info!("Using at-rest encryption key from config file [auth].encryption_key");
+        cfg_key
+    } else {
+        tracing::info!(
+            "No [auth].encryption_key set — encrypting data at rest with the JWT secret. \
+             Set it (to the current JWT secret) before you ever rotate jwt_secret, or the \
+             stored secrets become unreadable"
+        );
+        resolved_jwt_secret.clone()
     };
 
     // Resolve every dual-source knob in one place: CLI args > config file >
@@ -324,12 +373,12 @@ pub(crate) async fn run_serve(
 
     // Inbound-webhook HMAC secret: env var wins, fallback to config file.
     // Unset ⇒ signature verification stays off (endpoints are auth-gated).
-    let resolved_external_webhook_secret = std::env::var("FORGEKEEP_EXTERNAL_WEBHOOK_SECRET")
-        .ok()
+    let resolved_external_webhook_secret = env_secret("FORGEKEEP_EXTERNAL_WEBHOOK_SECRET")
         .or_else(|| {
             cfg.as_ref()
                 .and_then(|c| c.webhooks.external_secret.clone())
-        });
+        })
+        .filter(|secret| !secret.trim().is_empty());
     if resolved_external_webhook_secret.is_some() {
         tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
     }
@@ -473,6 +522,15 @@ pub(crate) async fn run_serve(
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
 
+    // ── At-rest encryption key preflight ──────────────────────────
+    // Refuse to serve with a key that cannot open what is already stored. The
+    // alternative — the behaviour before card_d740512de0a8 — is a server that
+    // starts fine and then fails MFA login, CI secret injection, mirror sync and
+    // LDAP bind one at a time, each with its own unrelated-looking 500, with
+    // nothing anywhere naming the changed secret as the cause. Runs after the
+    // migrations so the columns it samples are guaranteed to exist.
+    rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
+
     // ── Graceful shutdown signal ──────────────────────────────────
     // A single `watch` channel fans the SIGTERM/ctrl_c signal out to the HTTP
     // server and every background worker so they can drain and exit cleanly.
@@ -587,6 +645,7 @@ pub(crate) async fn run_serve(
         repo_root: repo_root.clone(),
         db: db.clone(),
         jwt_secret: resolved_jwt_secret.clone(),
+        encryption_key: resolved_encryption_key.clone(),
         external_webhook_secret: resolved_external_webhook_secret,
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,
@@ -629,6 +688,7 @@ pub(crate) async fn run_serve(
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,
         jwt_secret: Some(resolved_jwt_secret.clone()),
+        encryption_key: Some(resolved_encryption_key),
         smtp_config,
         ci_engine,
         external_url: resolved_external_url,
@@ -675,6 +735,44 @@ pub(crate) async fn run_serve(
 #[cfg(test)]
 mod serve_tests {
     use crate::config::{CliSettings, ConfigFile};
+
+    /// `[auth].encryption_key` must actually parse — the struct carries
+    /// `deny_unknown_fields`, so a key documented in `forgekeep.example.toml`
+    /// but missing from the model turns every config file that uses it into a
+    /// hard startup failure.
+    #[test]
+    fn the_encryption_key_is_a_real_config_key() {
+        let config: ConfigFile =
+            toml::from_str("[auth]\njwt_secret = \"signing\"\nencryption_key = \"at-rest\"\n")
+                .expect("[auth].encryption_key must be part of the config model");
+        assert_eq!(config.auth.jwt_secret.as_deref(), Some("signing"));
+        assert_eq!(config.auth.encryption_key.as_deref(), Some("at-rest"));
+    }
+
+    /// Omitting it is the supported (and most common) state: existing
+    /// deployments encrypted everything under `jwt_secret` and must keep
+    /// working untouched.
+    #[test]
+    fn omitting_the_encryption_key_is_allowed() {
+        let config: ConfigFile = toml::from_str("[auth]\njwt_secret = \"signing\"\n").unwrap();
+        assert!(config.auth.encryption_key.is_none());
+    }
+
+    /// `FOO=` in a `.env` is "not set", not "the empty secret" — see
+    /// [`super::env_secret`]. `deploy/.env.example` ships exactly that line.
+    #[test]
+    fn a_blank_environment_variable_counts_as_unset() {
+        let name = "FORGEKEEP_TEST_BLANK_SECRET";
+        // SAFETY: single-threaded test, variable is private to this test.
+        std::env::set_var(name, "");
+        assert_eq!(super::env_secret(name), None);
+        std::env::set_var(name, "   \n");
+        assert_eq!(super::env_secret(name), None);
+        std::env::set_var(name, "an-actual-secret");
+        assert_eq!(super::env_secret(name).as_deref(), Some("an-actual-secret"));
+        std::env::remove_var(name);
+        assert_eq!(super::env_secret(name), None);
+    }
 
     #[test]
     fn tls_paths_that_are_directories_are_rejected_before_boot() {

@@ -250,6 +250,7 @@ pub async fn login(
         &body.login,
         &body.password,
         &state.jwt_secret,
+        &state.encryption_key,
     )
     .await
     {

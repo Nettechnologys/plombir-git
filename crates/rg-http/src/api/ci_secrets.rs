@@ -78,7 +78,7 @@ pub async fn put(
     if body.value.len() < 4 || body.value.len() > 65_536 {
         return AppError::bad_request("secret value must contain 4-65536 bytes").into_response();
     }
-    let key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let encrypted = match rg_core::auth::encryption::encrypt(&body.value, &key) {
         Ok(v) => v,
         Err(e) => return AppError::from(e).into_response(),

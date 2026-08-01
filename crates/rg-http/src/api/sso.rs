@@ -279,7 +279,7 @@ pub async fn authorize(
     let base_url = get_api_base_url(&state, &headers);
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let client_secret = provider
         .client_secret_enc
         .as_ref()
@@ -401,7 +401,7 @@ pub async fn callback(
     let base_url = get_api_base_url(&state, &headers);
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let client_secret = provider
         .client_secret_enc
         .as_ref()
@@ -564,7 +564,7 @@ pub async fn refresh_token(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("SSO provider not found"))?;
 
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let client_secret = provider
         .client_secret_enc
         .as_ref()
@@ -623,7 +623,7 @@ pub async fn refresh_token(
 
     store_refreshed_oauth_tokens(
         &state.db,
-        &state.jwt_secret,
+        &state.encryption_key,
         user_id,
         &slug,
         &token_response,
@@ -639,7 +639,7 @@ pub async fn refresh_token(
 
 async fn store_refreshed_oauth_tokens(
     db: &sea_orm::DatabaseConnection,
-    jwt_secret: &str,
+    encryption_key: &str,
     user_id: i64,
     provider_slug: &str,
     token_response: &rg_core::auth::sso::OAuth2TokenResponse,
@@ -652,7 +652,7 @@ async fn store_refreshed_oauth_tokens(
         .find(|account| account.provider == provider_slug)
         .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
 
-    let enc_key = rg_core::auth::encryption::derive_key(jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(encryption_key);
     let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
         .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
     let enc_refresh = token_response
@@ -742,7 +742,7 @@ async fn find_or_create_sso_user(
     .map_err(AppError::from)?
     {
         // Update stored tokens
-        let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+        let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
         // `unwrap_or_default()` here would store an empty string in place of the
         // access token — a row that looks populated and authenticates nothing.
         let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
@@ -803,7 +803,7 @@ async fn find_or_create_sso_user(
     };
 
     // Encrypt and store tokens
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
         .unwrap_or_default();
     let enc_refresh = token_response
@@ -951,8 +951,8 @@ mod tests {
         .await
         .expect("create user");
 
-        let jwt_secret = "test-jwt-secret";
-        let enc_key = rg_core::auth::encryption::derive_key(jwt_secret);
+        let encryption_key = "test-encryption-key";
+        let enc_key = rg_core::auth::encryption::derive_key(encryption_key);
         let old_access = rg_core::auth::encryption::encrypt("old-access", &enc_key).unwrap();
         let old_refresh = rg_core::auth::encryption::encrypt("old-refresh", &enc_key).unwrap();
         rg_db::ops::oauth_account_ops::upsert(
@@ -975,7 +975,7 @@ mod tests {
             expires_in: Some(3600),
         };
 
-        store_refreshed_oauth_tokens(&db, jwt_secret, user.id, "oidc", &token_response)
+        store_refreshed_oauth_tokens(&db, encryption_key, user.id, "oidc", &token_response)
             .await
             .expect("store refreshed tokens");
 

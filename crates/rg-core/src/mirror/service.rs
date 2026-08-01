@@ -7,9 +7,9 @@
 //!
 //! `mirrors.password_encrypted` holds the password/token for the upstream
 //! remote. It is AES-256-GCM ciphertext, keyed the same way as every other
-//! secret at rest in ForgeKeep (`derive_key(jwt_secret)` — see
+//! secret at rest in ForgeKeep (`derive_key(encryption_key)` — see
 //! `crate::auth::encryption`), and it is decrypted for exactly the duration of
-//! one sync. That is why every entry point here takes `jwt_secret`.
+//! one sync. That is why every entry point here takes `encryption_key`.
 //!
 //! On the way to `git` the plaintext travels through the **environment**, never
 //! through argv and never through the remote URL: argv is world-readable on a
@@ -40,7 +40,7 @@ pub async fn create_mirror(
     username: Option<String>,
     password: Option<String>,
     sync_interval_seconds: i64,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<Mirror> {
     // Ensure the repository exists
     let repo = repository::Entity::find_by_id(repo_id)
@@ -72,7 +72,7 @@ pub async fn create_mirror(
         repo_id: Set(repo_id),
         url: Set(url),
         username: Set(username),
-        password_encrypted: Set(encrypt_password(password.as_deref(), jwt_secret)?),
+        password_encrypted: Set(encrypt_password(password.as_deref(), encryption_key)?),
         sync_interval_seconds: Set(sync_interval_seconds),
         next_sync_at: Set(Some(next_sync)),
         last_sync_at: Set(None),
@@ -107,7 +107,7 @@ pub async fn update_mirror(
     password: Option<String>,
     sync_interval_seconds: Option<i64>,
     status: Option<String>,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<Mirror> {
     let existing = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
@@ -123,7 +123,7 @@ pub async fn update_mirror(
         model.username = Set(Some(v));
     }
     if let Some(v) = password {
-        model.password_encrypted = Set(encrypt_password(Some(&v), jwt_secret)?);
+        model.password_encrypted = Set(encrypt_password(Some(&v), encryption_key)?);
     }
     if let Some(v) = sync_interval_seconds {
         model.sync_interval_seconds = Set(v);
@@ -151,7 +151,7 @@ pub async fn sync_mirror(
     db: &DatabaseConnection,
     mirror: &Mirror,
     repo_root: &Path,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<bool> {
     if mirror.status != "active" {
         return Ok(false);
@@ -162,7 +162,7 @@ pub async fn sync_mirror(
     // Decrypt before the guard so a credential that can no longer be read is
     // reported as such, rather than as a plain authentication failure from the
     // remote. Like every other failure here it lands in `last_sync_error`.
-    let credentials = load_credentials(mirror, jwt_secret);
+    let credentials = load_credentials(mirror, encryption_key);
 
     // SSRF guard (with DNS resolution) immediately before the git subprocess.
     // Re-checked here — not only at create/update — so a URL that resolved
@@ -231,12 +231,12 @@ pub async fn sync_due_mirrors(
     db: &DatabaseConnection,
     repo_root: &Path,
     limit: u64,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<usize> {
     let mirrors = rg_db::ops::mirror_ops::list_due_sync(db, limit).await?;
     let mut count = 0;
     for mirror in &mirrors {
-        match sync_mirror(db, mirror, repo_root, jwt_secret).await {
+        match sync_mirror(db, mirror, repo_root, encryption_key).await {
             Ok(true) => count += 1,
             Ok(false) => { /* inactive, skip */ }
             Err(e) => {
@@ -252,12 +252,12 @@ pub async fn trigger_sync(
     db: &DatabaseConnection,
     repo_id: i64,
     repo_root: &Path,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
-    sync_mirror(db, &mirror, repo_root, jwt_secret).await?;
+    sync_mirror(db, &mirror, repo_root, encryption_key).await?;
     Ok(())
 }
 
@@ -267,11 +267,11 @@ pub async fn trigger_sync(
 ///
 /// `None` and `Some("")` both mean "no credential" — the empty string is how
 /// the API clears one.
-fn encrypt_password(password: Option<&str>, jwt_secret: &str) -> Result<Option<String>> {
+fn encrypt_password(password: Option<&str>, encryption_key: &str) -> Result<Option<String>> {
     let Some(password) = password.filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
-    let key = crate::auth::encryption::derive_key(jwt_secret);
+    let key = crate::auth::encryption::derive_key(encryption_key);
     crate::auth::encryption::encrypt(password, &key)
         .context("failed to encrypt the mirror credential")
         .map(Some)
@@ -282,11 +282,11 @@ fn encrypt_password(password: Option<&str>, jwt_secret: &str) -> Result<Option<S
 /// A mirror with a username but no password is *not* a credential: git would
 /// be handed half an answer, be refused, and (with prompting disabled) fail
 /// with a confusing error instead of the honest anonymous-access one.
-fn load_credentials(mirror: &Mirror, jwt_secret: &str) -> Result<Option<GitCredentials>> {
+fn load_credentials(mirror: &Mirror, encryption_key: &str) -> Result<Option<GitCredentials>> {
     let Some(ciphertext) = mirror.password_encrypted.as_deref() else {
         return Ok(None);
     };
-    let key = crate::auth::encryption::derive_key(jwt_secret);
+    let key = crate::auth::encryption::derive_key(encryption_key);
     let password = crate::auth::encryption::decrypt(ciphertext, &key)
         .context("mirror credential could not be decrypted")?;
     Ok(Some(GitCredentials::new(mirror.username.clone(), password)))

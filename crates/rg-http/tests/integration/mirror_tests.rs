@@ -12,7 +12,9 @@
 //! These tests take the happy path all the way to the row, which is the one
 //! thing that was never exercised.
 
-use crate::common::{create_repo, register_full, spawn_test_app, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, spawn_test_app, spawn_test_app_with_db, TEST_ENCRYPTION_KEY,
+};
 
 const REMOTE: &str = "https://example.com/upstream.git";
 
@@ -270,7 +272,7 @@ async fn a_stored_mirror_password_is_encrypted_at_rest() {
     let created: serde_json::Value = resp.json().await.expect("json body");
     let repo_id = created["repo_id"].as_i64().expect("repo_id");
 
-    let key = rg_core::auth::encryption::derive_key("test-secret-key");
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
     let stored = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
         .await
         .expect("query")

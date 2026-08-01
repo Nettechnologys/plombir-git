@@ -145,7 +145,7 @@ pub async fn setup_mfa(
     let qr_svg = rg_core::auth::totp::generate_qr_svg(&otpauth_url);
 
     // Store the secret temporarily (encrypted) but don't enable MFA yet
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let enc_secret = rg_core::auth::encryption::encrypt(&secret, &enc_key).map_err(|e| {
         tracing::error!("Encryption error: {}", e);
         AppError::internal("encryption failed")
@@ -199,7 +199,7 @@ pub async fn enable_mfa(
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
     // Decrypt the TOTP secret
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let totp_secret = match &user.totp_secret {
         Some(s) => rg_core::auth::encryption::decrypt(s, &enc_key).map_err(|e| {
             tracing::error!("Decryption error: {}", e);
@@ -319,7 +319,7 @@ pub async fn verify_mfa(
         }
     } else {
         // Verify TOTP code
-        let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+        let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
         let totp_secret = user
             .totp_secret
             .as_ref()

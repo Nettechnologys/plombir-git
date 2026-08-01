@@ -57,6 +57,12 @@ pub struct PostPushParams<'a> {
     /// (a local CLI run); it is passed through as `None` rather than as an empty
     /// secret, which would mint tokens signed with "".
     pub jwt_secret: Option<&'a str>,
+    /// Secret the repository's CI secrets are encrypted with — a *different*
+    /// knob from [`jwt_secret`](Self::jwt_secret) since card_d740512de0a8, so
+    /// rotating the signing secret does not silently make every stored CI
+    /// secret undecryptable. `None` means the same thing it means for
+    /// `jwt_secret`: this caller has no key, so no secrets are injected.
+    pub encryption_key: Option<&'a str>,
     /// Real-time notification sink. `None` = no WebSocket hub in this process.
     pub notifier: Option<&'a dyn PushNotifier>,
     pub smtp_config: &'a Option<SmtpConfig>,
@@ -75,6 +81,7 @@ impl PostPushParams<'_> {
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,
             jwt_secret: self.jwt_secret,
+            encryption_key: self.encryption_key,
             external_url: self.external_url,
         }
     }
@@ -104,6 +111,8 @@ pub struct PostPushContext {
     pub allow_host_runner: bool,
     /// See [`PostPushParams::jwt_secret`].
     pub jwt_secret: Option<String>,
+    /// See [`PostPushParams::encryption_key`].
+    pub encryption_key: Option<String>,
     pub smtp_config: Option<SmtpConfig>,
     pub ci_engine: Arc<dyn CiTrigger + Send + Sync>,
     pub external_url: Option<String>,
@@ -141,6 +150,7 @@ impl PostPushContext {
                 external_runners: self.external_runners,
                 allow_host_runner: self.allow_host_runner,
                 jwt_secret: self.jwt_secret.as_deref(),
+                encryption_key: self.encryption_key.as_deref(),
                 notifier: self.notifier.as_deref(),
                 smtp_config: &self.smtp_config,
                 ci_engine: &*self.ci_engine,
@@ -161,6 +171,7 @@ impl PostPushContext {
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,
             jwt_secret: self.jwt_secret.as_deref(),
+            encryption_key: self.encryption_key.as_deref(),
             external_url: self.external_url.as_deref(),
         }
     }
@@ -680,6 +691,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             external_runners: params.external_runners,
             allow_host_runner: params.allow_host_runner,
             jwt_secret: params.jwt_secret,
+            encryption_key: params.encryption_key,
             external_url: params.external_url,
         })
         .await

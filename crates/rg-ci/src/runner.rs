@@ -46,7 +46,14 @@ pub struct PipelineRunner {
     repo_path: std::path::PathBuf,
     pipeline_id: i64,
     repo_id: i64,
+    /// Signs `CI_JOB_TOKEN`. Not the key the repository's CI secrets are
+    /// encrypted with — see [`PipelineRunner::set_encryption_key`].
     jwt_secret: Option<String>,
+    /// Opens `ci_secrets.encrypted_value`. Split from `jwt_secret` by
+    /// card_d740512de0a8: they were one value, so rotating the token-signing
+    /// secret made every stored CI secret undecryptable and each job failed on
+    /// its own with "failed to decrypt CI secret".
+    encryption_key: Option<String>,
     docker_enabled: bool,
     /// Whether a job without an `image:` may execute as a shell directly on the
     /// host. Defaults to `false` (secure): imageless jobs are refused so that
@@ -66,6 +73,7 @@ impl PipelineRunner {
             pipeline_id,
             repo_id: 0,
             jwt_secret: None,
+            encryption_key: None,
             docker_enabled: true,
             allow_host_runner: false,
             oidc_token_url: None,
@@ -85,6 +93,7 @@ impl PipelineRunner {
             pipeline_id,
             repo_id: 0,
             jwt_secret: None,
+            encryption_key: None,
             docker_enabled: false,
             allow_host_runner: false,
             oidc_token_url: None,
@@ -110,6 +119,12 @@ impl PipelineRunner {
     /// If not set, CI_JOB_TOKEN will not be provided.
     pub fn set_jwt_secret(&mut self, secret: String) {
         self.jwt_secret = Some(secret);
+    }
+
+    /// Set the at-rest encryption key (for decrypting the repository's CI
+    /// secrets). If not set, no repository secrets are injected into jobs.
+    pub fn set_encryption_key(&mut self, secret: String) {
+        self.encryption_key = Some(secret);
     }
 
     pub fn set_oidc_token_url(&mut self, url: String) {
@@ -407,6 +422,7 @@ impl PipelineRunner {
             false,
             self.allow_host_runner,
             self.jwt_secret.as_deref(),
+            self.encryption_key.as_deref(),
             self.oidc_token_url
                 .as_deref()
                 .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
@@ -771,8 +787,8 @@ impl PipelineRunner {
             }
         }
         if self.repo_id > 0 {
-            if let Some(jwt_secret) = &self.jwt_secret {
-                let key = rg_core::auth::encryption::derive_key(jwt_secret);
+            if let Some(encryption_key) = &self.encryption_key {
+                let key = rg_core::auth::encryption::derive_key(encryption_key);
                 for secret in
                     rg_db::ops::ci_secret_ops::list_by_repo(&self.db, self.repo_id).await?
                 {
@@ -1591,10 +1607,15 @@ mod tests {
         .await
         .unwrap();
 
-        let jwt_secret = "runner-encryption-key";
+        // Deliberately different strings: the CI secret is keyed with the
+        // *encryption* key, and a runner handed only a signing secret must not
+        // be able to open it. Keeping the two equal here would let the two
+        // fields silently collapse back into one (card_d740512de0a8).
+        let jwt_secret = "runner-token-signing-secret";
+        let encryption_key = "runner-at-rest-encryption-key";
         let encrypted = rg_core::auth::encryption::encrypt(
             "super-secret-value",
-            &rg_core::auth::encryption::derive_key(jwt_secret),
+            &rg_core::auth::encryption::derive_key(encryption_key),
         )
         .unwrap();
         rg_db::ops::ci_secret_ops::upsert(&db, repo.id, "DEPLOY_SECRET", &encrypted, user.id)
@@ -1604,6 +1625,7 @@ mod tests {
         let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
         runner.set_repo_id(repo.id);
         runner.set_jwt_secret(jwt_secret.into());
+        runner.set_encryption_key(encryption_key.into());
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
 

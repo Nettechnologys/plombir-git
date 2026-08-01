@@ -12,10 +12,13 @@ Two compose files, pick one:
 ```bash
 cd deploy
 
-# 1. Create runtime environment file
+# 1. Create runtime environment file. Two secrets: one signs tokens, one
+#    encrypts data at rest — see "Secrets and rotation" below for why they are
+#    separate and why you want both set from day one.
 cp .env.example .env
 secret="$(openssl rand -hex 32)"
 sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
+sed -i.bak "s/^FORGEKEEP_ENCRYPTION_KEY=.*/FORGEKEEP_ENCRYPTION_KEY=${secret}/" .env
 rm -f .env.bak
 
 # 2. Start ForgeKeep
@@ -42,10 +45,11 @@ your log driver work as usual; set `[logging].file` if you want them in
 ```bash
 cd deploy
 
-# 1. Environment: JWT secret + the uid the container should run as.
+# 1. Environment: the two secrets + the uid the container should run as.
 cp .env.example .env
 secret="$(openssl rand -hex 32)"
 sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
+sed -i.bak "s/^FORGEKEEP_ENCRYPTION_KEY=.*/FORGEKEEP_ENCRYPTION_KEY=${secret}/" .env
 rm -f .env.bak
 printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 
@@ -125,8 +129,30 @@ directory, or take a hot SQLite backup with the commands in the
 | Variable | Required | Default |
 |----------|----------|---------|
 | `FORGEKEEP_JWT_SECRET` | **Yes** | set in `deploy/.env` |
+| `FORGEKEEP_ENCRYPTION_KEY` | Strongly recommended | falls back to the JWT secret |
 | `FORGEKEEP_CORS_ORIGINS` | No | unset |
 | `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
+
+### Secrets and rotation
+
+`FORGEKEEP_JWT_SECRET` signs tokens. `FORGEKEEP_ENCRYPTION_KEY` encrypts data at
+rest — TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets,
+OAuth tokens. Left unset, the encryption key *is* the JWT secret, which means
+rotating the JWT secret (after a leak, say) makes all of that data unreadable
+and there is no way back without the old value.
+
+So: set both, to the same value, on the first deploy. From then on rotating
+`FORGEKEEP_JWT_SECRET` is safe — it only invalidates live sessions — as long as
+`FORGEKEEP_ENCRYPTION_KEY` keeps its original value.
+
+The server checks this at startup: if the configured key decrypts none of the
+data already in the database it **refuses to start** and prints the fix, rather
+than starting and failing MFA logins, CI jobs and mirror syncs one at a time
+later. A blank `FORGEKEEP_JWT_SECRET=` in `.env` counts as unset, not as "the
+empty secret", and is refused the same way.
+
+Re-encrypting under a new encryption key is not supported yet; treat that key
+as permanent for a given database.
 
 For a separately hosted frontend, set `FORGEKEEP_CORS_ORIGINS` to the browser
 origin. ForgeKeep also adds those origins, plus matching `ws://` or `wss://`

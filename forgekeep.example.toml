@@ -16,7 +16,21 @@ ssh_addr = "0.0.0.0:2222"
 url = "sqlite://./forgekeep.db?mode=rwc"
 
 [auth]
+# Signs session tokens, PAT-derived tokens and CI job tokens. Generate one with
+# `forgekeep gen-secret`. Also settable as FORGEKEEP_JWT_SECRET, which wins.
 jwt_secret = "change-me-in-production"
+
+# Encrypts data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords,
+# SSO client secrets, OAuth tokens. Unset = the same value as `jwt_secret`.
+#
+# ROTATION — read this before you ever change `jwt_secret`:
+#   Leaving `encryption_key` unset ties your encrypted data to the signing
+#   secret, so rotating the signing secret makes all of it unreadable. Set this
+#   to your CURRENT `jwt_secret` now, and rotating `jwt_secret` later becomes a
+#   safe, ordinary operation. The server refuses to start if the configured key
+#   cannot decrypt what is already stored, rather than failing at runtime.
+# Also settable as FORGEKEEP_ENCRYPTION_KEY / --encryption-key (env wins).
+# encryption_key = "the-secret-your-data-was-encrypted-with"
 
 [webhooks]
 # Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*

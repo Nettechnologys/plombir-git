@@ -122,6 +122,7 @@ async fn run_post_push_hooks(
             external_runners: false,
             allow_host_runner: false,
             jwt_secret: Some("test-secret"),
+            encryption_key: Some("test-encryption-key"),
             notifier: None,
             smtp_config: &None,
             ci_engine: &ci,

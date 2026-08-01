@@ -101,6 +101,7 @@ Common `serve` flags:
 | `--host-key` | SSH host key path | — |
 | `--db-url` | `sqlite://` / `postgres://` / `mysql://` URL | `sqlite://./forgekeep.db?mode=rwc` |
 | `--jwt-secret` | JWT signing key (use a long random value) | — |
+| `--encryption-key` | Key for data at rest — see [Secrets and rotation](#secrets-and-rotation) | the JWT secret |
 | `--config` | TOML config file; a flag you pass wins over its config key | — |
 | `--tls-cert` / `--tls-key` | PEM cert/key to enable HTTPS | — |
 | `--docker` | Run CI jobs with an `image` in Docker | `false` |
@@ -114,6 +115,45 @@ it, and pass `--config forgekeep.toml`. Every flag in the table above has a
 config-file equivalent (named in `forgekeep serve --help`), and values resolve
 as **CLI arg > config file > built-in default** — so a config-only deployment
 needs no flags at all.
+
+### Secrets and rotation
+
+ForgeKeep holds two independent secrets. They do different jobs, and telling
+them apart is what makes rotation safe.
+
+| Secret | Sources (first wins) | Protects |
+|--------|----------------------|----------|
+| **JWT secret** | `FORGEKEEP_JWT_SECRET` › `--jwt-secret` › `[auth].jwt_secret` | Signatures: session tokens, PAT-derived tokens, CI job tokens |
+| **Encryption key** | `FORGEKEEP_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › *the JWT secret* | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens |
+
+**Set the encryption key explicitly.** Left unset it falls back to the JWT
+secret, which ties every encrypted row in the database to the secret you are
+told to change the moment a token leaks. Pin it once — to the same value as
+your current JWT secret — and the two become independent:
+
+```toml
+[auth]
+jwt_secret     = "..."   # rotate this freely
+encryption_key = "..."   # this one keeps your data readable
+```
+
+**Rotating the JWT secret** (a leak, or routine hygiene): make sure
+`encryption_key` is set to the *old* secret first, then change `jwt_secret` and
+restart. Existing sessions are invalidated — everyone logs in again — and
+nothing else is affected.
+
+**Rotating the encryption key** is a different operation: the stored ciphertext
+must be re-encrypted, and there is no tool for that yet. Until there is, treat
+the encryption key as permanent for a given database.
+
+On startup the server samples the encrypted columns and checks the configured
+key opens them. If it opens none of them, it **refuses to start** and prints
+the recovery, instead of starting and then failing MFA logins, CI jobs, mirror
+syncs and LDAP binds one at a time with unrelated-looking 500s. A brand-new
+database has nothing to check, so a fresh install is never blocked.
+
+If the old secret is genuinely lost, no tool can recover the encrypted values:
+clear them and have MFA re-enrolled and the stored credentials re-entered.
 
 ### Create a test repository
 

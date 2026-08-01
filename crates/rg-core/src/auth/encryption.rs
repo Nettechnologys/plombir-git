@@ -8,6 +8,23 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+/// Bytes of framing every [`encrypt`] output carries: a 12-byte nonce prefix
+/// plus the 16-byte AES-GCM authentication tag. A value shorter than this
+/// cannot be one of ours, whatever else it looks like.
+const FRAMING_LEN: usize = 12 + 16;
+
+/// Derive the at-rest encryption key from the instance's encryption secret.
+///
+/// **The secret this takes is `[auth].encryption_key`, not `[auth].jwt_secret`.**
+/// The two were one value until card_d740512de0a8: rotating the JWT signing
+/// secret then silently re-keyed every encrypted column in the database — TOTP
+/// secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth
+/// tokens — and each one surfaced as its own 500 in its own handler, long after
+/// the restart that caused it. `encryption_key` still *defaults* to
+/// `jwt_secret` (existing deployments have their data under it), but it is a
+/// separate knob so signing-secret rotation stops being destructive, and
+/// [`crate::auth::key_check`] refuses to start when the configured key no
+/// longer opens what is already stored.
 pub fn derive_key(secret: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
@@ -15,6 +32,20 @@ pub fn derive_key(secret: &str) -> [u8; 32] {
     let mut key = [0u8; 32];
     key.copy_from_slice(&result);
     key
+}
+
+/// Whether `value` has the shape of an [`encrypt`] output.
+///
+/// Structural only — it says nothing about *which* key would open the value,
+/// and a `true` here is not a promise that [`decrypt`] succeeds. Its job is to
+/// keep [`crate::auth::key_check`] from reading a legacy plaintext column (a
+/// bare base32 TOTP secret, a password stored before that column was
+/// encrypted) as "ciphertext this key failed to open", which would turn a
+/// correctly-configured instance into a refused start.
+pub fn looks_like_ciphertext(value: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|bytes| bytes.len() > FRAMING_LEN)
 }
 
 pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<String, anyhow::Error> {

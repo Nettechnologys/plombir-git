@@ -96,6 +96,12 @@ pub struct StateOverrides {
     pub ws_session_recheck_secs: Option<u64>,
 }
 
+/// The at-rest encryption key every test AppState carries.
+///
+/// Distinct from the JWT secret on purpose — see the field comment in
+/// [`build_test_app_state_with`].
+pub const TEST_ENCRYPTION_KEY: &str = "test-encryption-key";
+
 pub fn build_test_app_state(
     db: rg_db::DatabaseConnection,
     repo_root: std::path::PathBuf,
@@ -127,6 +133,13 @@ pub fn build_test_app_state_with(
         spa_build_dir: Arc::new(std::path::PathBuf::from(rg_http::DEFAULT_SPA_BUILD_DIR)),
         db,
         jwt_secret: Arc::new("test-secret-key".to_string()),
+        // Deliberately NOT the same string as `jwt_secret`. The two were one
+        // value until card_d740512de0a8, and a fixture that keeps them equal
+        // cannot tell a handler that reaches for the signing secret to decrypt
+        // at-rest data from one that reaches for the right key — which is the
+        // whole defect. Any test that stores ciphertext must key it with
+        // `TEST_ENCRYPTION_KEY`.
+        encryption_key: Arc::new(TEST_ENCRYPTION_KEY.to_string()),
         external_webhook_secret: None,
         docker_enabled: false,
         external_runners: false,

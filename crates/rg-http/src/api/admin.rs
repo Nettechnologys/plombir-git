@@ -611,7 +611,7 @@ pub async fn create_sso_provider(
     }
 
     // Encrypt secrets before storing
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let client_secret_enc = match body
         .client_secret
         .as_ref()
@@ -715,7 +715,7 @@ pub async fn update_sso_provider(
         }
     }
 
-    let enc_key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let client_secret_enc = match body
         .client_secret
         .as_ref()
@@ -791,7 +791,8 @@ pub async fn test_sso_provider_connection(
         return AppError::bad_request("connection testing is only supported for LDAP providers")
             .into_response();
     }
-    match rg_core::user::service::test_ldap_provider_connection(&provider, &state.jwt_secret).await
+    match rg_core::user::service::test_ldap_provider_connection(&provider, &state.encryption_key)
+        .await
     {
         Ok(()) => Json(serde_json::json!({
             "ok": true,

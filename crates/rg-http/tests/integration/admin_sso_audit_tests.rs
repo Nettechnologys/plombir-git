@@ -1,4 +1,4 @@
-use crate::common::{register_full, spawn_test_app_with_db};
+use crate::common::{register_full, spawn_test_app_with_db, TEST_ENCRYPTION_KEY};
 use chrono::Utc;
 use sea_orm::{ActiveValue, Set};
 
@@ -292,7 +292,7 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         .unwrap();
     let encrypted = stored.ldap_bind_password_enc.unwrap();
     assert_ne!(encrypted, "bind-secret");
-    let key = rg_core::auth::encryption::derive_key("test-secret-key");
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
     assert_eq!(
         rg_core::auth::encryption::decrypt(&encrypted, &key).unwrap(),
         "bind-secret"

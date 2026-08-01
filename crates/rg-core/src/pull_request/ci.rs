@@ -26,6 +26,8 @@ pub struct PipelineCi<'a> {
     /// See [`crate::ci::TriggerPipelineParams::allow_host_runner`].
     pub allow_host_runner: bool,
     pub jwt_secret: Option<&'a str>,
+    /// See [`crate::ci::TriggerPipelineParams::encryption_key`].
+    pub encryption_key: Option<&'a str>,
     pub external_url: Option<&'a str>,
 }
 
@@ -122,6 +124,7 @@ pub async fn trigger_pull_request_ci(
             external_runners: ci.external_runners,
             allow_host_runner: ci.allow_host_runner,
             jwt_secret: ci.jwt_secret,
+            encryption_key: ci.encryption_key,
             external_url: ci.external_url,
         })
         .await?;

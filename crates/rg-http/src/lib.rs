@@ -58,7 +58,19 @@ pub struct AppState {
     /// mutating process-global cwd or env.
     pub spa_build_dir: Arc<PathBuf>,
     pub db: DatabaseConnection,
+    /// Secret that signs and verifies session JWTs, PAT-derived tokens, CI job
+    /// tokens and the short-lived sealed states (passkey ceremonies, SSO).
     pub jwt_secret: Arc<String>,
+    /// Secret that encrypts data at rest: TOTP secrets, CI secrets, mirror and
+    /// LDAP passwords, SSO client secrets, OAuth tokens.
+    ///
+    /// **Never reach for `jwt_secret` when you mean this one.** They were the
+    /// same value until card_d740512de0a8, and that is exactly the bug: an
+    /// operator told to rotate a leaked signing secret silently re-keyed the
+    /// whole database, and found out one 500 at a time. `encryption_key`
+    /// defaults to `jwt_secret` so existing data stays readable, but it is a
+    /// separate knob and rotating either one alone is now a safe operation.
+    pub encryption_key: Arc<String>,
     /// Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
     /// external webhooks (defense-in-depth on `/webhooks/external/*`). `None`
     /// (the default) disables signature checking; the endpoints then rely on
@@ -156,6 +168,7 @@ impl AppState {
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,
             jwt_secret: Some(self.jwt_secret.to_string()),
+            encryption_key: Some(self.encryption_key.to_string()),
             smtp_config: self.smtp_config.clone(),
             ci_engine: self.ci_engine.clone(),
             external_url: self.external_url.clone(),
@@ -225,6 +238,7 @@ impl AppState {
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,
             jwt_secret: Some(&self.jwt_secret),
+            encryption_key: Some(&self.encryption_key),
             external_url: self.external_url.as_deref(),
         }
     }
@@ -238,8 +252,11 @@ pub struct HttpServerConfig {
     pub repo_root: PathBuf,
     /// Database connection.
     pub db: DatabaseConnection,
-    /// JWT secret key.
+    /// JWT secret key. Signing only — see [`AppState::encryption_key`] for the
+    /// key that opens data at rest.
     pub jwt_secret: String,
+    /// At-rest encryption key. See [`AppState::encryption_key`].
+    pub encryption_key: String,
     /// Optional shared secret for verifying HMAC-SHA256 signatures on inbound
     /// external webhooks. `None` disables signature checking (auth-only).
     pub external_webhook_secret: Option<String>,
@@ -378,6 +395,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         spa_build_dir: Arc::new(PathBuf::from(DEFAULT_SPA_BUILD_DIR)),
         db: config.db,
         jwt_secret: Arc::new(config.jwt_secret),
+        encryption_key: Arc::new(config.encryption_key),
         external_webhook_secret: config.external_webhook_secret.map(Arc::new),
         docker_enabled: config.docker_enabled,
         external_runners: config.external_runners,

@@ -142,6 +142,21 @@ pub(crate) fn generate_jwt_secret() -> String {
 /// Validate JWT secret strength.
 /// Common function used for CLI arg, env var, and config file values.
 pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Result<()> {
+    // A blank secret is not a weak secret to warn about — it is no secret at
+    // all, and every token this instance ever signs would be forgeable by
+    // anyone. It reached this far because `deploy/.env.example` ships
+    // `FORGEKEEP_JWT_SECRET=` and `std::env::var` reports that as `Ok("")`, so
+    // an operator who followed the file and forgot step 2 got a server that
+    // started cleanly and signed everything with "" — while the same file
+    // promised "startup validation will fail loudly". Now it does.
+    if jwt_secret.trim().is_empty() {
+        tracing::error!(
+            "FATAL: the secret from {} is empty. Generate one with \
+             `forgekeep gen-secret`",
+            source
+        );
+        anyhow::bail!("refusing to start with an empty secret from {source}");
+    }
     if KNOWN_BAD_JWT_SECRETS.contains(&jwt_secret) {
         tracing::error!(
             "FATAL: jwt_secret from {} is a known default/compromised value. \
@@ -177,6 +192,17 @@ mod jwt_secret_tests {
         assert!(
             validate_jwt_secret("uYT7aF/+zA2Zh6P48xnsuY0IbcHH3WdWA4SAtP/Uv6s=", "test").is_err()
         );
+    }
+
+    /// `deploy/.env.example` ships `FORGEKEEP_JWT_SECRET=`, and `env::var`
+    /// hands that back as `Ok("")` — so this is not a hypothetical value, it is
+    /// the one an operator gets by forgetting a step. Signing tokens with it
+    /// makes every session forgeable.
+    #[test]
+    fn rejects_an_empty_or_blank_secret() {
+        assert!(validate_jwt_secret("", "test").is_err());
+        assert!(validate_jwt_secret("   ", "test").is_err());
+        assert!(validate_jwt_secret("\n", "test").is_err());
     }
 
     #[test]

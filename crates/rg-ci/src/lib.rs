@@ -117,6 +117,7 @@ pub async fn resume_pipeline(params: ResumePipelineParams<'_>) -> Result<()> {
         params.docker_enabled,
         params.allow_host_runner,
         params.jwt_secret,
+        params.encryption_key,
         params.external_url,
     );
     Ok(())
@@ -144,6 +145,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
         external_runners,
         allow_host_runner,
         jwt_secret,
+        encryption_key,
         external_url,
     } = params;
 
@@ -247,6 +249,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
             external_runners,
             allow_host_runner,
             jwt_secret,
+            encryption_key,
             external_url,
         )
         .await;
@@ -263,6 +266,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
             docker_enabled,
             allow_host_runner,
             jwt_secret,
+            encryption_key,
             external_url,
         );
     } else {
@@ -451,6 +455,7 @@ async fn evaluate_initial_success(
     external_runners: bool,
     allow_host_runner: bool,
     jwt_secret: Option<&str>,
+    encryption_key: Option<&str>,
     external_url: Option<&str>,
 ) {
     let Some(repo_root) = repo_path.parent().and_then(std::path::Path::parent) else {
@@ -462,6 +467,7 @@ async fn evaluate_initial_success(
         external_runners,
         allow_host_runner,
         jwt_secret,
+        encryption_key,
         external_url,
     )
     .evaluate_merges_and_spawn_hooks(db, repo_id, commit_sha, None)
@@ -487,6 +493,7 @@ fn post_push_context(
     external_runners: bool,
     allow_host_runner: bool,
     jwt_secret: Option<&str>,
+    encryption_key: Option<&str>,
     external_url: Option<&str>,
 ) -> rg_core::push_hooks::PostPushContext {
     rg_core::push_hooks::PostPushContext {
@@ -495,6 +502,7 @@ fn post_push_context(
         external_runners,
         allow_host_runner,
         jwt_secret: jwt_secret.map(str::to_string),
+        encryption_key: encryption_key.map(str::to_string),
         smtp_config: None,
         ci_engine: std::sync::Arc::new(CiEngine),
         external_url: external_url.map(str::to_string),
@@ -512,11 +520,13 @@ fn spawn_internal_runner(
     docker_enabled: bool,
     allow_host_runner: bool,
     jwt_secret: Option<&str>,
+    encryption_key: Option<&str>,
     external_url: Option<&str>,
 ) {
     let db_clone = db.clone();
     let repo_path_owned = repo_path.to_path_buf();
     let jwt_secret_owned = jwt_secret.map(str::to_string);
+    let encryption_key_owned = encryption_key.map(str::to_string);
     let oidc_token_url =
         external_url.map(|url| format!("{}/api/v1/ci/oidc/token", url.trim_end_matches('/')));
     tokio::spawn(async move {
@@ -529,6 +539,9 @@ fn spawn_internal_runner(
         runner.set_allow_host_runner(allow_host_runner);
         if let Some(secret) = jwt_secret_owned {
             runner.set_jwt_secret(secret);
+        }
+        if let Some(secret) = encryption_key_owned {
+            runner.set_encryption_key(secret);
         }
         if let Some(url) = oidc_token_url {
             runner.set_oidc_token_url(url);
@@ -1155,6 +1168,7 @@ mod matrix_tests {
             external_runners: true,
             allow_host_runner: false,
             jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
             external_url: None,
         })
         .await
@@ -1253,6 +1267,7 @@ mod matrix_tests {
             external_runners: true,
             allow_host_runner: false,
             jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
             external_url: None,
         })
         .await
@@ -1382,6 +1397,7 @@ mod matrix_tests {
             external_runners: true,
             allow_host_runner: false,
             jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
             external_url: None,
         })
         .await

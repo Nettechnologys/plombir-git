@@ -1,4 +1,4 @@
-use crate::common::{register_full, spawn_test_app_with_db};
+use crate::common::{register_full, spawn_test_app_with_db, TEST_ENCRYPTION_KEY};
 
 async fn create_repo(base: &str, token: &str, name: &str) {
     let response = reqwest::Client::new()
@@ -60,7 +60,7 @@ async fn ci_secrets_are_admin_only_encrypted_and_never_return_values() {
         .unwrap()
         .unwrap();
     assert_ne!(stored.encrypted_value, "plain-secret-value");
-    let key = rg_core::auth::encryption::derive_key("test-secret-key");
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
     assert_eq!(
         rg_core::auth::encryption::decrypt(&stored.encrypted_value, &key).unwrap(),
         "plain-secret-value"

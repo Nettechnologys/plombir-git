@@ -391,6 +391,7 @@ async fn release_if_ready(
                 external_runners: state.external_runners,
                 allow_host_runner: state.allow_host_runner,
                 jwt_secret: Some(&state.jwt_secret),
+                encryption_key: Some(&state.encryption_key),
                 external_url: state.external_url.as_deref(),
             })
             .await

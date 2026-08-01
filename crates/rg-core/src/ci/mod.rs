@@ -38,6 +38,14 @@ pub struct TriggerPipelineParams<'a> {
     /// Docker container or an external runner.
     pub allow_host_runner: bool,
     pub jwt_secret: Option<&'a str>,
+    /// Secret the repository's CI secrets are encrypted with.
+    ///
+    /// Separate from [`jwt_secret`](Self::jwt_secret) since card_d740512de0a8:
+    /// they used to be one value, so rotating the token-signing secret silently
+    /// made every stored CI secret undecryptable and each job failed on its own
+    /// with "failed to decrypt CI secret". `None` = no key, so no repository
+    /// secrets are injected into the job environment.
+    pub encryption_key: Option<&'a str>,
     pub external_url: Option<&'a str>,
 }
 
@@ -52,6 +60,8 @@ pub struct ResumePipelineParams<'a> {
     /// See [`TriggerPipelineParams::allow_host_runner`].
     pub allow_host_runner: bool,
     pub jwt_secret: Option<&'a str>,
+    /// See [`TriggerPipelineParams::encryption_key`].
+    pub encryption_key: Option<&'a str>,
     pub external_url: Option<&'a str>,
 }
 

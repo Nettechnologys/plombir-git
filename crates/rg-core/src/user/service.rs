@@ -229,6 +229,7 @@ pub async fn login_with_configured_auth(
     username_or_email: &str,
     plaintext_password: &str,
     jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<LoginOutcome> {
     let existing = find_login_user(db, username_or_email).await?;
     if existing.as_ref().is_some_and(|user| {
@@ -249,6 +250,7 @@ pub async fn login_with_configured_auth(
                 username_or_email,
                 plaintext_password,
                 jwt_secret,
+                encryption_key,
             )
             .await
         }
@@ -285,6 +287,7 @@ async fn login_via_ldap(
     username_or_email: &str,
     plaintext_password: &str,
     jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<LoginOutcome> {
     let mut attempted_bind = false;
     let outcome = login_via_ldap_inner(
@@ -293,6 +296,7 @@ async fn login_via_ldap(
         username_or_email,
         plaintext_password,
         jwt_secret,
+        encryption_key,
         &mut attempted_bind,
     )
     .await;
@@ -310,6 +314,7 @@ async fn login_via_ldap_inner(
     username_or_email: &str,
     plaintext_password: &str,
     jwt_secret: &str,
+    encryption_key: &str,
     attempted_bind: &mut bool,
 ) -> Result<LoginOutcome> {
     if plaintext_password.is_empty() {
@@ -334,7 +339,7 @@ async fn login_via_ldap_inner(
         bail!("invalid credentials");
     }
     for provider in providers {
-        let config = match ldap_config_from_provider(&provider, jwt_secret) {
+        let config = match ldap_config_from_provider(&provider, encryption_key) {
             Ok(config) => config,
             Err(error) => {
                 tracing::warn!(
@@ -395,9 +400,15 @@ async fn login_via_ldap_inner(
     bail!("invalid credentials")
 }
 
+/// Build a bindable LDAP config from a stored provider row.
+///
+/// Takes the *encryption* secret, not the JWT one: the bind password is
+/// AES-GCM at rest, and conflating the two is what made a rotated signing
+/// secret break every LDAP login with "bind password could not be decrypted"
+/// (card_d740512de0a8).
 fn ldap_config_from_provider(
     provider: &rg_db::entities::sso_provider::Model,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<crate::auth::ldap::LdapConfig> {
     let raw_host = provider
         .ldap_host
@@ -432,7 +443,7 @@ fn ldap_config_from_provider(
         .ldap_bind_password_enc
         .as_deref()
         .context("LDAP bind password is missing")?;
-    let key = crate::auth::encryption::derive_key(jwt_secret);
+    let key = crate::auth::encryption::derive_key(encryption_key);
     let bind_password = crate::auth::encryption::decrypt(bind_password_enc, &key)
         .context("LDAP bind password could not be decrypted")?;
     let required = |value: Option<&str>, name: &str| -> Result<String> {
@@ -465,12 +476,12 @@ fn ldap_config_from_provider(
 
 pub async fn test_ldap_provider_connection(
     provider: &rg_db::entities::sso_provider::Model,
-    jwt_secret: &str,
+    encryption_key: &str,
 ) -> Result<()> {
     if provider.provider_type != "ldap" {
         bail!("provider is not LDAP");
     }
-    let config = ldap_config_from_provider(provider, jwt_secret)?;
+    let config = ldap_config_from_provider(provider, encryption_key)?;
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::auth::ldap::test_connection(&config),
@@ -970,6 +981,7 @@ mod tests {
             "missing-user",
             "definitely-not-the-password",
             "jwt-secret",
+            "encryption-key",
         )
         .await
         {

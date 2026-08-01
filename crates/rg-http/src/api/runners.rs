@@ -1195,7 +1195,7 @@ async fn decrypted_repo_secrets(
     state: &AppState,
     repo_id: i64,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let key = rg_core::auth::encryption::derive_key(&state.jwt_secret);
+    let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let mut values = Vec::new();
     for secret in rg_db::ops::ci_secret_ops::list_by_repo(&state.db, repo_id).await? {
         values.push((
@@ -1307,32 +1307,32 @@ pub async fn finish_job(
         match rg_db::ops::pipeline_ops::try_update_pipeline(&state.db, stage.pipeline_id).await {
             Ok(Some(status)) => {
                 if status == "success" {
-                    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(
-                        &state.db,
-                        stage.pipeline_id,
-                    )
-                    .await
-                    {
-                        Ok(Some(pipeline)) => pipeline,
-                        Ok(None) => {
-                            tracing::error!(
+                    let pipeline =
+                        match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
+                            .await
+                        {
+                            Ok(Some(pipeline)) => pipeline,
+                            Ok(None) => {
+                                tracing::error!(
                                 job_id,
                                 pipeline_id = stage.pipeline_id,
                                 "finish_job: completed pipeline disappeared before post-push hooks"
                             );
-                            return AppError::internal("pipeline not found after job completion")
+                                return AppError::internal(
+                                    "pipeline not found after job completion",
+                                )
                                 .into_response();
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                job_id,
-                                pipeline_id = stage.pipeline_id,
-                                error = %format!("{error:#}"),
-                                "finish_job: failed to reload completed pipeline"
-                            );
-                            return AppError::from(error).into_response();
-                        }
-                    };
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id,
+                                    pipeline_id = stage.pipeline_id,
+                                    error = %format!("{error:#}"),
+                                    "finish_job: failed to reload completed pipeline"
+                                );
+                                return AppError::from(error).into_response();
+                            }
+                        };
                     // "CI went green, so the PR goes in" is what
                     // auto-merge is for — and the merge commit it lands
                     // on the base branch owes the same post-push

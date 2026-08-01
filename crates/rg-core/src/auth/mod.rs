@@ -3,6 +3,7 @@ pub mod ci_oidc;
 pub mod ci_token;
 pub mod encryption;
 pub mod jwt;
+pub mod key_check;
 pub mod ldap;
 pub mod lockout;
 pub mod oci_token;

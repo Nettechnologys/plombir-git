@@ -113,6 +113,15 @@ pub(crate) enum Commands {
         #[arg(long)]
         jwt_secret: Option<String>,
 
+        /// Secret encrypting data at rest — TOTP secrets, CI secrets, mirror
+        /// and LDAP passwords, SSO client secrets, OAuth tokens
+        /// [config: [auth].encryption_key] [default: the JWT secret]
+        ///
+        /// Set this to the *previous* JWT secret before rotating `--jwt-secret`,
+        /// or the already-encrypted data stops being readable.
+        #[arg(long)]
+        encryption_key: Option<String>,
+
         /// Enable Docker runner for CI jobs with `image` field
         #[arg(long, default_value_t = false)]
         docker: bool,

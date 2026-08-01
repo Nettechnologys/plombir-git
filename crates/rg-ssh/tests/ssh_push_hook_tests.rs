@@ -241,6 +241,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             external_runners: false,
             allow_host_runner: false,
             jwt_secret: Some("test-secret".to_string()),
+            encryption_key: Some("test-encryption-key".to_string()),
             smtp_config: None,
             ci_engine,
             external_url: None,
