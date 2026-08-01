@@ -21,6 +21,16 @@ const UPLOAD_DIR_HINT: &str =
     "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` directory; \
      that directory must be writable by the user running forgekeep";
 
+/// Where the registry's own directories live, for an error that names one.
+///
+/// Retiring a repository touches both the upload staging tree and — on an
+/// instance still carrying the pre-[`BlobStorage`] layout — the legacy
+/// per-repository directory, so the hint has to cover both settings.
+const REGISTRY_DIR_HINT: &str =
+    "the OCI registry's directories live under the `[server].repo_root` directory, or under \
+     `[server].oci_storage_path` when one is configured; that directory must be writable by the \
+     user running forgekeep";
+
 /// A blob that has reached its content-addressed key, and how it got there.
 ///
 /// `published` is the part the caller cannot work out for itself, and it decides
@@ -53,9 +63,62 @@ pub struct StoredManifest {
     pub published: bool,
 }
 
+/// Everything one repository owns in the registry, moved out of the live
+/// namespace but not yet removed.
+///
+/// The registry's storage and the database cannot share a transaction, so a
+/// repository deletion renames the registry's data aside first and discards it
+/// only once the metadata row is gone. Until that point every part is
+/// reversible — see [`OciStorage::restore_repository`].
+///
+/// A part is absent when there was nothing to move, which is the ordinary case:
+/// most repositories never receive a `docker push`, and the legacy layout only
+/// exists on instances that predate [`BlobStorage`].
+#[derive(Debug, Default)]
+pub struct StagedOciRepository {
+    /// Content-addressed blobs and manifests: `(live, staged)` backend keys.
+    blobs: Option<(BlobKey, BlobKey)>,
+    /// The chunked-upload tree: `(live, staged)` filesystem paths.
+    uploads: Option<(PathBuf, PathBuf)>,
+    /// The pre-[`BlobStorage`] on-disk layout: `(live, staged)` paths.
+    legacy: Option<(PathBuf, PathBuf)>,
+    /// The directory the two filesystem parts were staged under.
+    ///
+    /// Kept so that retiring the tombstone leaves nothing behind: removing the
+    /// staged leaves alone would accumulate one empty deletion-id directory per
+    /// repository that ever had an upload in flight.
+    directories: Option<PathBuf>,
+}
+
 /// One actionable error for a filesystem failure on an OCI upload path.
 fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
     crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
+}
+
+/// One actionable error for a filesystem failure on a registry directory.
+fn registry_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
+    crate::platform::fs::path_error(what, path, error, REGISTRY_DIR_HINT)
+}
+
+/// Rename `live` aside, answering `false` when there was nothing there.
+///
+/// The parent of `aside` is created first: the staging tree is keyed by a
+/// deletion id that has never existed before, so nothing else can have made it.
+async fn stage_directory(what: &str, live: &Path, aside: &Path) -> anyhow::Result<bool> {
+    match tokio::fs::try_exists(live).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) => return Err(registry_path_error(what, live, &error)),
+    }
+    if let Some(parent) = aside.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| registry_path_error(what, parent, &error))?;
+    }
+    tokio::fs::rename(live, aside)
+        .await
+        .map_err(|error| registry_path_error(what, live, &error))?;
+    Ok(true)
 }
 
 /// The bytes the client sent do not hash to the digest it named.
@@ -134,12 +197,31 @@ impl OciStorage {
             .map_err(Into::into)
     }
 
-    fn upload_dir(&self, owner: &str, repo: &str, uuid: &str) -> PathBuf {
-        let key = BlobKey::from_segments(["oci-uploads", owner, repo, uuid])
+    /// Turn logical segments into a path under [`Self::upload_root`].
+    ///
+    /// Every segment goes through [`BlobKey::from_segments`] first, so a
+    /// client-supplied upload UUID cannot contribute a separator or a
+    /// traversal component to the path that is about to be opened.
+    fn upload_path<'a>(&self, segments: impl IntoIterator<Item = &'a str>) -> PathBuf {
+        let key = BlobKey::from_segments(segments)
             .expect("validated OCI namespace and generated upload UUID");
         key.as_str()
             .split('/')
             .fold(self.upload_root.clone(), |path, segment| path.join(segment))
+    }
+
+    fn upload_dir(&self, owner: &str, repo: &str, uuid: &str) -> PathBuf {
+        self.upload_path(["oci-uploads", owner, repo, uuid])
+    }
+
+    /// The directory holding every unfinished upload of `owner/repo`.
+    ///
+    /// One level above [`Self::upload_dir`]. A repository being deleted has to
+    /// retire the chunks of pushes still in flight, and those are named by
+    /// UUIDs that live in `oci_upload` rows the deletion never reads — so the
+    /// only way to reach them all is the directory that contains them.
+    fn repository_upload_dir(&self, owner: &str, repo: &str) -> PathBuf {
+        self.upload_path(["oci-uploads", owner, repo])
     }
 
     fn upload_file_path(&self, owner: &str, repo: &str, uuid: &str) -> PathBuf {
@@ -171,6 +253,210 @@ impl OciStorage {
                 .join(algorithm)
                 .join(digest.replace(':', "_")),
         )
+    }
+
+    /// The prefix every completed blob and manifest of `owner/repo` lives
+    /// under, in whichever backend this registry was built on.
+    fn repository_blob_prefix(owner: &str, repo: &str) -> anyhow::Result<BlobKey> {
+        BlobKey::from_segments(["oci", owner, repo]).map_err(Into::into)
+    }
+
+    /// The legacy per-repository directory, on an instance still carrying one.
+    fn legacy_repository_dir(&self, owner: &str, repo: &str) -> Option<PathBuf> {
+        let root = self.legacy_root.as_ref()?;
+        Some(root.join(owner).join(repo).join("oci"))
+    }
+
+    /// Move everything `owner/repo` owns in the registry out of the live
+    /// namespace, reversibly.
+    ///
+    /// Registry keys are shaped `oci/<owner>/<repo>/...`, and the namespace is
+    /// released the moment the repository row is soft-deleted — so a
+    /// re-created `<owner>/<repo>` inherits the physical keys of its
+    /// predecessor. That is not merely a retention leak: `HEAD
+    /// /v2/{owner}/{repo}/blobs/{digest}` answers off storage and then looks
+    /// for the `oci_blob` row, so the first `docker push` into the re-created
+    /// namespace meets a `500` for a layer it never uploaded. Unfinished
+    /// uploads leak the same way, minus the collision — nothing ever collects
+    /// them, because the sessions that named them are gone with the repository.
+    ///
+    /// A failure part-way through puts back whatever had already moved and
+    /// returns the error: a deletion that cannot retire the registry is a
+    /// failed deletion, not one that quietly keeps the layers of a repository
+    /// nobody can reach any more.
+    pub async fn stage_repository_deletion(
+        &self,
+        owner: &str,
+        repo: &str,
+        repo_id: i64,
+        deletion_id: &str,
+    ) -> anyhow::Result<StagedOciRepository> {
+        let mut staged = StagedOciRepository::default();
+        let repo_id_segment = repo_id.to_string();
+
+        let live = Self::repository_blob_prefix(owner, repo)?;
+        let aside = BlobKey::from_segments([
+            "_deleted",
+            "repositories",
+            repo_id_segment.as_str(),
+            deletion_id,
+            "oci",
+        ])?;
+        match self.backend.move_prefix(&live, &aside).await {
+            Ok(true) => staged.blobs = Some((live, aside)),
+            Ok(false) => {}
+            Err(error) => {
+                let context = format!(
+                    "failed to stage the registry data of {owner}/{repo} at {aside} — the \
+                     repository cannot be deleted while its layers stay under a name it no \
+                     longer holds"
+                );
+                return Err(anyhow::Error::new(error).context(context));
+            }
+        }
+
+        let staging_root = self
+            .upload_root
+            .join("_deleted")
+            .join("repositories")
+            .join(&repo_id_segment)
+            .join(deletion_id);
+
+        let live = self.repository_upload_dir(owner, repo);
+        let aside = staging_root.join("oci-uploads");
+        match stage_directory("OCI upload directory", &live, &aside).await {
+            Ok(true) => {
+                staged.uploads = Some((live, aside));
+                staged.directories = Some(staging_root.clone());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.restore_repository(staged).await;
+                return Err(error);
+            }
+        }
+
+        if let Some(live) = self.legacy_repository_dir(owner, repo) {
+            let aside = staging_root.join("oci-legacy");
+            match stage_directory("legacy OCI repository directory", &live, &aside).await {
+                Ok(true) => {
+                    staged.legacy = Some((live, aside));
+                    staged.directories = Some(staging_root);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.restore_repository(staged).await;
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(staged)
+    }
+
+    /// Put a staged registry back where a live repository expects it.
+    ///
+    /// Best-effort by construction: the caller is already returning a failure,
+    /// and that failure is the one worth reading. What a botched restore must
+    /// not do is stay quiet — the repository is live again with part of its
+    /// registry parked under a name nothing else records.
+    pub async fn restore_repository(&self, staged: StagedOciRepository) {
+        if let Some((live, aside)) = staged.legacy {
+            if let Err(error) = tokio::fs::rename(&aside, &live).await {
+                tracing::warn!(
+                    staged_at = %aside.display(),
+                    belongs_at = %live.display(),
+                    %error,
+                    "failed to restore the legacy OCI directory after a repository deletion aborted — the active repository can no longer reach these blobs until the directory is moved back by hand"
+                );
+            }
+        }
+        if let Some((live, aside)) = staged.uploads {
+            if let Err(error) = tokio::fs::rename(&aside, &live).await {
+                tracing::warn!(
+                    staged_at = %aside.display(),
+                    belongs_at = %live.display(),
+                    %error,
+                    "failed to restore the OCI upload directory after a repository deletion aborted — uploads in flight will report a session the registry can no longer write to"
+                );
+            }
+        }
+        if let Some(root) = staged.directories {
+            // Both leaves are back where they belong, so this is an empty
+            // directory. `remove_dir` rather than `remove_dir_all` on purpose:
+            // if a rename above failed, whatever is left is the operator's to
+            // move by hand and the warning above already names it.
+            if let Err(error) = tokio::fs::remove_dir(&root).await {
+                tracing::debug!(
+                    path = %root.display(),
+                    %error,
+                    "left the OCI deletion staging directory in place after a rollback — it is empty unless a restore above failed, and that failure has its own warning naming what is still in it"
+                );
+            }
+        }
+        if let Some((live, aside)) = staged.blobs {
+            match self.backend.move_prefix(&aside, &live).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    staged_prefix = %aside,
+                    live_prefix = %live,
+                    "failed to restore the OCI blob namespace after a repository deletion aborted — the staged prefix disappeared and the active repository may now reference missing layers"
+                ),
+                Err(error) => tracing::warn!(
+                    staged_prefix = %aside,
+                    live_prefix = %live,
+                    %error,
+                    "failed to restore the OCI blob namespace after a repository deletion aborted — the active repository can no longer reach these layers until the prefix is moved back by hand"
+                ),
+            }
+        }
+    }
+
+    /// Remove a staged registry for good, once the metadata row is gone.
+    ///
+    /// Every part is attempted even after one fails, because each leftover
+    /// costs the operator a separate manual cleanup. The first error is
+    /// returned so the caller can report that the deletion finished with data
+    /// still on disk rather than claim a clean one.
+    pub async fn discard_repository(&self, staged: StagedOciRepository) -> anyhow::Result<()> {
+        let mut first_error = None;
+
+        if let Some((_, aside)) = staged.blobs {
+            if let Err(error) = self.backend.delete_prefix(&aside).await {
+                tracing::warn!(
+                    staged_prefix = %aside,
+                    %error,
+                    "the repository is deleted and its registry namespace is free, but its staged layers remain and must be removed by hand"
+                );
+                first_error = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("failed to retire the staged OCI layers at {aside}")),
+                );
+            }
+        }
+
+        // One `remove_dir_all` for both filesystem parts: they were staged as
+        // siblings under a directory named by this deletion, so removing that
+        // directory is what leaves nothing behind.
+        if let Some(path) = staged.directories {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "the repository is deleted, but its staged OCI directories remain on disk and must be removed by hand"
+                    );
+                    if first_error.is_none() {
+                        first_error =
+                            Some(registry_path_error("staged OCI directories", &path, &error));
+                    }
+                }
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn blob_exists(&self, owner: &str, repo: &str, digest: &str) -> anyhow::Result<bool> {

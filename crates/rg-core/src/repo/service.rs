@@ -1061,6 +1061,16 @@ struct StagedBlobPrefix {
     staged: BlobKey,
 }
 
+/// The repository-shaped blob prefixes owned by a repository, one per feature.
+///
+/// The OCI registry is deliberately not among them even though its keys are
+/// repository-shaped (`oci/<owner>/<repo>/...`): it may be configured onto a
+/// backend of its own (`[server].oci_storage_path`), so staging its prefix
+/// through *this* storage would move nothing on the instances that have one.
+/// It is retired by
+/// [`OciStorage::stage_repository_deletion`](crate::package_registry::oci::storage::OciStorage::stage_repository_deletion),
+/// which also reaches the two things no `BlobKey` names — the chunked-upload
+/// tree and the legacy on-disk layout.
 fn repository_blob_prefixes(
     namespace: &str,
     repo: &rg_db::entities::repository::Model,
@@ -1221,10 +1231,18 @@ fn restore_repository_directory(
 /// one finds its object already gone, which
 /// [`BlobStorage::delete`](crate::blob_storage::BlobStorage::delete) reports as
 /// `Ok(false)`, not as a failure.
+///
+/// The OCI registry joins the set through its own storage rather than through
+/// `blob_storage`, because it may be configured onto a different backend and
+/// because two of the three things it owns — the chunked-upload tree and the
+/// legacy on-disk layout — are directories no `BlobKey` names. It obeys the
+/// same rule: staged before the row is touched, restored if the row will not
+/// move, discarded only afterwards.
 pub async fn delete_repo(
     db: &DatabaseConnection,
     repo_root: &std::path::Path,
     blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
     repo: &rg_db::entities::repository::Model,
 ) -> Result<()> {
     let namespace = repository_namespace_name(db, repo.owner_id, repo.org_id).await?;
@@ -1299,7 +1317,22 @@ pub async fn delete_repo(
         }
     };
 
+    let staged_oci = match oci_storage
+        .stage_repository_deletion(&namespace, &repo.name, repo.id, &deletion_id)
+        .await
+    {
+        Ok(staged_oci) => staged_oci,
+        Err(error) => {
+            restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
+            if staged {
+                restore_repository_directory(&staged_path, &repo_path, repo.id);
+            }
+            return Err(error);
+        }
+    };
+
     if let Err(error) = rg_db::ops::repo_ops::soft_delete(db, repo.id).await {
+        oci_storage.restore_repository(staged_oci).await;
         restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
         if staged {
             restore_repository_directory(&staged_path, &repo_path, repo.id);
@@ -1363,6 +1396,13 @@ pub async fn delete_repo(
                     prefix.staged
                 )));
             }
+        }
+    }
+
+    if let Err(error) = oci_storage.discard_repository(staged_oci).await {
+        if cleanup_error.is_none() {
+            cleanup_error =
+                Some(error.context("failed to retire deleted repository registry data"));
         }
     }
 
@@ -2421,6 +2461,7 @@ mod repository_deletion_tests {
     use crate::blob_storage::{
         BlobMetadata, BlobStorageError, LocalBlobStorage, Result as BlobResult,
     };
+    use crate::package_registry::oci::storage::OciStorage;
     use futures::future::BoxFuture;
     use sea_orm::{ConnectOptions, Database};
     use std::sync::{Arc, Mutex};
@@ -2514,6 +2555,16 @@ mod repository_deletion_tests {
         }
     }
 
+    /// The registry the deletion path is handed, in its default shape: the
+    /// instance's own blob backend plus `_oci_uploads/` under `repo_root`,
+    /// exactly as `rg_http::run` builds it when no dedicated OCI path is set.
+    fn oci_storage_for(repo_root: &std::path::Path) -> OciStorage {
+        OciStorage::from_backend(
+            Arc::new(LocalBlobStorage::new(repo_root)),
+            repo_root.join("_oci_uploads"),
+        )
+    }
+
     async fn setup_db() -> DatabaseConnection {
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
@@ -2580,6 +2631,38 @@ mod repository_deletion_tests {
         key
     }
 
+    /// One pushed layer and the manifest that references it, stored the way a
+    /// `docker push` leaves them. Returns the layer's backend key.
+    ///
+    /// Both are content-addressed under `oci/<owner>/<repo>/`, which is what
+    /// makes them a deletion problem: the digest is the same for everyone, so
+    /// only the namespace in the key says whose bytes these are — and that
+    /// namespace is handed straight back when the repository is deleted.
+    async fn seed_oci_repository(
+        oci_storage: &OciStorage,
+        owner: &str,
+        name: &str,
+        payload: &[u8],
+    ) -> BlobKey {
+        use sha2::Digest;
+
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(payload)));
+        let stored = oci_storage
+            .store_blob(owner, name, &digest, payload)
+            .await
+            .expect("store an OCI layer");
+        let manifest = format!(r#"{{"layers":[{{"digest":"{digest}"}}]}}"#);
+        let manifest_digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(manifest.as_bytes()))
+        );
+        oci_storage
+            .store_manifest(owner, name, &manifest_digest, manifest.as_bytes())
+            .await
+            .expect("store an OCI manifest");
+        BlobKey::new(stored).expect("the registry returns a valid backend key")
+    }
+
     /// A repository's artifacts live under `artifacts/jobs/<job_id>`, which
     /// names no repository at all. Until the deletion path walked the job
     /// graph, `DELETE` reported a completed removal and left those bytes
@@ -2629,9 +2712,15 @@ mod repository_deletion_tests {
             b"job output"
         );
 
-        delete_repo(&db, &repo_root, &blob_storage, &doomed)
-            .await
-            .expect("delete repository");
+        delete_repo(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            &doomed,
+        )
+        .await
+        .expect("delete repository");
 
         assert!(
             matches!(
@@ -2657,6 +2746,116 @@ mod repository_deletion_tests {
                 .await
                 .expect("another repository's artifact must survive this deletion"),
             b"other output"
+        );
+    }
+
+    /// Registry keys are `oci/<owner>/<repo>/...` and a repository's name is
+    /// released the moment its row is soft-deleted, so a re-created
+    /// `<owner>/<repo>` lands on exactly its predecessor's physical keys.
+    /// `DELETE` reported a completed removal and left them there — not merely
+    /// bytes nobody collects, but a trap: `HEAD /v2/{owner}/{repo}/blobs/
+    /// {digest}` answers off storage and then demands the `oci_blob` row that
+    /// went with the old repository, so the first `docker push` into the
+    /// re-created namespace meets a `500` for a layer it never uploaded.
+    ///
+    /// Uploads in flight leak without any collision at all: the sessions that
+    /// name them belong to the deleted repository, so nothing ever comes back
+    /// for the directory.
+    ///
+    /// The second repository is what makes the assertions mean anything — a
+    /// deletion that swept the whole registry would pass a test that only
+    /// looks at the repository it deleted.
+    #[tokio::test]
+    async fn deleting_a_repository_retires_its_registry_data_and_uploads_in_flight() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "oci-delete-owner",
+            "oci-delete@example.invalid",
+            "unused",
+            "Oci Delete",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+        let doomed = create_repo(&db, owner.id, "published", None, false, &repo_root, None)
+            .await
+            .expect("create repository");
+        let neighbour = create_repo(&db, owner.id, "kept", None, false, &repo_root, None)
+            .await
+            .expect("create neighbouring repository");
+        assert_eq!(neighbour.name, "kept");
+
+        let doomed_layer = seed_oci_repository(
+            &oci_storage,
+            "oci-delete-owner",
+            "published",
+            b"doomed layer",
+        )
+        .await;
+        let kept_layer =
+            seed_oci_repository(&oci_storage, "oci-delete-owner", "kept", b"kept layer").await;
+        let (_, doomed_upload) = oci_storage
+            .create_upload("oci-delete-owner", "published")
+            .await
+            .expect("start a chunked upload");
+        let (_, kept_upload) = oci_storage
+            .create_upload("oci-delete-owner", "kept")
+            .await
+            .expect("start a neighbouring chunked upload");
+
+        delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &doomed)
+            .await
+            .expect("delete repository");
+
+        let doomed_namespace =
+            BlobKey::from_segments(["oci", "oci-delete-owner", "published"]).expect("valid prefix");
+        assert!(
+            blob_storage
+                .list(Some(&doomed_namespace))
+                .await
+                .expect("inventory the deleted registry namespace")
+                .is_empty(),
+            "the repository is gone but its layers and manifests still occupy {doomed_namespace}, \
+             which the next repository of that name will be handed"
+        );
+        assert!(
+            matches!(
+                blob_storage.get(&doomed_layer).await,
+                Err(BlobStorageError::NotFound(_))
+            ),
+            "the deleted repository's layer is still readable at {doomed_layer}"
+        );
+        assert!(
+            !std::path::Path::new(&doomed_upload).exists(),
+            "the deleted repository left an upload in flight behind at {doomed_upload}"
+        );
+        let tombstones =
+            BlobKey::from_segments(["_deleted", "repositories", doomed.id.to_string().as_str()])
+                .expect("valid tombstone prefix");
+        assert!(
+            blob_storage
+                .list(Some(&tombstones))
+                .await
+                .expect("inventory tombstones")
+                .is_empty(),
+            "the registry data was staged aside but never retired"
+        );
+
+        assert_eq!(
+            blob_storage
+                .get(&kept_layer)
+                .await
+                .expect("another repository's layer must survive this deletion"),
+            b"kept layer"
+        );
+        assert!(
+            std::path::Path::new(&kept_upload).is_file(),
+            "another repository's upload in flight was swept away with this deletion: \
+             {kept_upload}"
         );
     }
 
@@ -2696,6 +2895,21 @@ mod repository_deletion_tests {
         // the staged set, so a rollback that walked it in the wrong order — or
         // skipped the part the database had to name — shows up here.
         let artifact = seed_job_artifact(&db, &blob_storage, repo.id, b"and so must this").await;
+        // The registry is staged after every blob prefix, so it is restored
+        // first — and it is the only part whose staging touches both a backend
+        // key and a plain directory.
+        let oci_storage = oci_storage_for(&repo_root);
+        let layer = seed_oci_repository(
+            &oci_storage,
+            "delete-rollback-owner",
+            "keep-me",
+            b"and this layer",
+        )
+        .await;
+        let upload = oci_storage
+            .create_upload("delete-rollback-owner", "keep-me")
+            .await
+            .expect("start a chunked upload");
 
         db.execute_unprepared(&format!(
             "CREATE TRIGGER reject_repo_soft_delete \
@@ -2707,7 +2921,7 @@ mod repository_deletion_tests {
         .await
         .expect("install failure trigger");
 
-        let error = delete_repo(&db, &repo_root, &blob_storage, &repo)
+        let error = delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &repo)
             .await
             .expect_err("soft-delete trigger must reject the update");
         assert!(
@@ -2731,6 +2945,18 @@ mod repository_deletion_tests {
                 .await
                 .expect("the CI artifact prefix must be restored too"),
             b"and so must this"
+        );
+        assert_eq!(
+            blob_storage
+                .get(&layer)
+                .await
+                .expect("the OCI blob namespace must be restored too"),
+            b"and this layer"
+        );
+        assert!(
+            std::path::Path::new(&upload.1).is_file(),
+            "the rollback left an upload in flight without the file it is being written to: {}",
+            upload.1
         );
         assert!(
             find_repo_by_owner_name(&db, "delete-rollback-owner", "keep-me")

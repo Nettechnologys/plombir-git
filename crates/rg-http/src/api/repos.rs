@@ -642,6 +642,7 @@ pub async fn delete_repo_handler(
         &state.db,
         &state.repo_root,
         state.blob_storage.as_ref(),
+        state.oci_storage.as_ref(),
         &repo,
     )
     .await
