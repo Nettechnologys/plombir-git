@@ -361,6 +361,21 @@ pub async fn list_user_teams(db: &DatabaseConnection, user_id: i64) -> Result<Ve
         .context("db: list user teams")
 }
 
+/// Decode the single row a `COUNT(*)` aggregate is obliged to return.
+///
+/// An absent row and a `cnt` that will not decode are *failures of the check*,
+/// not a count of zero. The two membership predicates below sit under
+/// `can_write_repo` / `can_admin_repo` and serve HTTP, OCI, Git-HTTP and SSH
+/// alike, so folding either into `0` is how a schema drift or a backend type
+/// mismatch reaches the caller as "access denied" — the check never ran, and
+/// the answer says it ran and refused. `0` is a legitimate answer only once it
+/// has been decoded as one.
+fn decode_count(row: Option<QueryResult>, what: &str) -> Result<i64> {
+    let row = row.with_context(|| format!("db: {what}: aggregate returned no row"))?;
+    row.try_get::<i64>("", "cnt")
+        .with_context(|| format!("db: {what}: decode `cnt`"))
+}
+
 /// Check if a user is a member of any team with write/admin permission in an org.
 /// Single query replacement for the N+1 pattern (list teams + is_team_member per team).
 pub async fn is_member_of_write_team(
@@ -384,9 +399,7 @@ pub async fn is_member_of_write_team(
         .await
         .context("db: check write team membership")?;
 
-    let count: i64 = result
-        .and_then(|row| row.try_get::<i64>("", "cnt").ok())
-        .unwrap_or(0);
+    let count = decode_count(result, "check write team membership")?;
     Ok(count > 0)
 }
 
@@ -411,8 +424,86 @@ pub async fn is_member_of_admin_team(
         ))
         .await
         .context("db: check admin team membership")?;
-    let count: i64 = result
-        .and_then(|row| row.try_get::<i64>("", "cnt").ok())
-        .unwrap_or(0);
+
+    let count = decode_count(result, "check admin team membership")?;
     Ok(count > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `decode_count` is the whole fix, so test it where a caller cannot: with
+    /// an aggregate row that is missing, and with one whose `cnt` is not an
+    /// integer — the shapes a schema drift or a backend type mismatch produces.
+    async fn memory_db() -> DatabaseConnection {
+        Database::connect("sqlite::memory:")
+            .await
+            .expect("open an in-memory database")
+    }
+
+    async fn one_row(db: &DatabaseConnection, sql: &str) -> Option<QueryResult> {
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            sql.to_string(),
+        ))
+        .await
+        .expect("run the aggregate")
+    }
+
+    #[tokio::test]
+    async fn a_decoded_zero_is_still_an_answer() {
+        let db = memory_db().await;
+        let row = one_row(&db, "SELECT 0 AS cnt").await;
+        assert_eq!(
+            decode_count(row, "check write team membership").expect("zero decodes"),
+            0,
+            "an honest count of zero must stay a count, not become an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_positive_count_decodes() {
+        let db = memory_db().await;
+        let row = one_row(&db, "SELECT 3 AS cnt").await;
+        assert_eq!(
+            decode_count(row, "check write team membership").expect("three decodes"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_aggregate_row_is_an_error_not_a_denial() {
+        let error = decode_count(None, "check write team membership")
+            .expect_err("a COUNT(*) that returned no row did not answer the question");
+        assert!(
+            format!("{error:#}").contains("aggregate returned no row"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_count_is_an_error_not_a_denial() {
+        let db = memory_db().await;
+        let sql = "SELECT 'not a number' AS cnt";
+
+        // The row this test feeds in is exactly the one the old fold could not
+        // tell apart from an empty team: assert here that it *is* that row, so
+        // the regression is pinned to the input rather than to our wording.
+        let old_fold = one_row(&db, sql)
+            .await
+            .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+            .unwrap_or(0);
+        assert_eq!(
+            old_fold, 0,
+            "the pre-fix expression answered `0` here — that is the bug being guarded"
+        );
+
+        let error = decode_count(one_row(&db, sql).await, "check admin team membership")
+            .expect_err("a `cnt` that will not decode is a failed check, not a count of zero");
+        assert!(
+            format!("{error:#}").contains("decode `cnt`"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
 }
