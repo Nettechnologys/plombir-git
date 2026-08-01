@@ -12,42 +12,81 @@ use crate::entities::repo_watch::{self, ActiveModel, Entity as RepoWatchEntity, 
 /// `rg_core::repo::service::WatchState` — go through
 /// `rg_core::repo::service::set_watch` for anything carrying a client-supplied
 /// value.
+///
+/// `(user_id, repo_id)` is UNIQUE (`idx_repo_watches_user_repo_unique`), and
+/// the read below is a separate statement from the insert that follows it. A
+/// double-clicked watch button, or two tabs of the same account, both read "no
+/// row" and both insert; one meets the constraint. That loss says the watch row
+/// this call wanted now exists, so it is resolved by re-reading it and writing
+/// this call's state onto it — the last click wins, which is what the user who
+/// clicked it expects.
+///
+/// Only a UNIQUE violation is treated this way. A foreign key failure (the user
+/// or repository is gone) or a broken connection stays an error: the watch was
+/// not recorded, and returning the requested state anyway would leave the UI
+/// showing a subscription the database does not have.
 pub async fn set_watch_state(
     db: &DatabaseConnection,
     user_id: i64,
     repo_id: i64,
     state: &str,
 ) -> Result<String> {
-    // Check if watch record exists
-    let existing = RepoWatchEntity::find()
+    let now = chrono::Utc::now();
+
+    if let Some(existing) = find_watch(db, user_id, repo_id).await? {
+        apply_state(db, existing, state, now).await?;
+        return Ok(state.to_string());
+    }
+
+    let insert = ActiveModel {
+        user_id: Set(user_id),
+        repo_id: Set(repo_id),
+        watch_state: Set(state.to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db)
+    .await;
+
+    match insert {
+        Ok(_) => Ok(state.to_string()),
+        Err(error) if crate::is_unique_violation(&error) => {
+            match find_watch(db, user_id, repo_id).await? {
+                Some(existing) => {
+                    apply_state(db, existing, state, now).await?;
+                    Ok(state.to_string())
+                }
+                // Not there after all, so the collision was on some other
+                // constraint. Report the original failure.
+                None => Err(error).context("db: insert watch"),
+            }
+        }
+        Err(error) => Err(error).context("db: insert watch"),
+    }
+}
+
+/// Read the one watch row identified by the unique key.
+async fn find_watch(db: &DatabaseConnection, user_id: i64, repo_id: i64) -> Result<Option<Model>> {
+    RepoWatchEntity::find()
         .filter(repo_watch::Column::UserId.eq(user_id))
         .filter(repo_watch::Column::RepoId.eq(repo_id))
         .one(db)
         .await
-        .context("db: check existing watch")?;
+        .context("db: check existing watch")
+}
 
-    let now = chrono::Utc::now();
-
-    if let Some(existing) = existing {
-        // Update existing record
-        let mut model: ActiveModel = existing.into();
-        model.watch_state = Set(state.to_string());
-        model.updated_at = Set(now);
-        model.update(db).await.context("db: update watch")?;
-    } else {
-        // Insert new record
-        let model = ActiveModel {
-            user_id: Set(user_id),
-            repo_id: Set(repo_id),
-            watch_state: Set(state.to_string()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-        model.insert(db).await.context("db: insert watch")?;
-    }
-
-    Ok(state.to_string())
+/// Write this call's watch state onto an existing row.
+async fn apply_state(
+    db: &DatabaseConnection,
+    existing: Model,
+    state: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Model> {
+    let mut model: ActiveModel = existing.into();
+    model.watch_state = Set(state.to_string());
+    model.updated_at = Set(now);
+    model.update(db).await.context("db: update watch")
 }
 
 /// Get watch state for a user and repo.

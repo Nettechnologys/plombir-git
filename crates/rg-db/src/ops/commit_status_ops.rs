@@ -8,6 +8,20 @@ use crate::entities::commit_status::{
 };
 
 /// Create or update a commit status (upsert by repo_id + sha + context).
+///
+/// `(repo_id, sha, context)` is UNIQUE
+/// (`idx_commit_statuses_repo_sha_context_unique`), and the lookup below is a
+/// separate statement from the insert that follows it. Two CI reports of the
+/// same context on the same commit — the normal shape of a build matrix
+/// finishing, or a runner retrying — both read `None` and both insert; one
+/// meets the constraint. That loss says the row this call wanted now exists,
+/// which is the outcome the caller asked for, so it is resolved by re-reading
+/// the winner's row and writing this call's state onto it.
+///
+/// Last report wins, exactly as it would have if the two had arrived a
+/// millisecond apart. Only a UNIQUE violation is treated this way: a foreign
+/// key failure (the repo or creator does not exist) or a broken connection
+/// stays an error, because the row genuinely was not written.
 pub async fn create_or_update(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -15,26 +29,57 @@ pub async fn create_or_update(
     context: &str,
     model: ActiveModel,
 ) -> Result<CommitStatus> {
-    // Try to find existing by unique constraint (repo_id, sha, context)
-    let existing = CommitStatusEntity::find()
+    if let Some(existing) = find_by_key(db, repo_id, sha, context).await? {
+        return apply_status(db, existing, model).await;
+    }
+
+    match model.clone().insert(db).await {
+        Ok(inserted) => Ok(inserted),
+        Err(error) if crate::is_unique_violation(&error) => {
+            // Lost the race for the first row. Whoever won holds this exact
+            // (repo, sha, context), so update it the way the existing-row
+            // branch would.
+            match find_by_key(db, repo_id, sha, context).await? {
+                Some(existing) => apply_status(db, existing, model).await,
+                // The row is not there after all, so the collision was on some
+                // other constraint. Report the original failure rather than
+                // inventing a reason for it.
+                None => Err(error).context("db: create commit status"),
+            }
+        }
+        Err(error) => Err(error).context("db: create commit status"),
+    }
+}
+
+/// Read the one status row identified by the unique key.
+async fn find_by_key(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    sha: &str,
+    context: &str,
+) -> Result<Option<CommitStatus>> {
+    CommitStatusEntity::find()
         .filter(commit_status::Column::RepoId.eq(repo_id))
         .filter(commit_status::Column::Sha.eq(sha))
         .filter(commit_status::Column::Context.eq(context))
         .one(db)
         .await
-        .context("db: find existing commit status")?;
+        .context("db: find existing commit status")
+}
 
-    if let Some(existing) = existing {
-        let mut active: ActiveModel = existing.into();
-        active.state = model.state;
-        active.description = model.description;
-        active.target_url = model.target_url;
-        active.creator_id = model.creator_id;
-        active.updated_at = model.updated_at;
-        active.update(db).await.context("db: update commit status")
-    } else {
-        model.insert(db).await.context("db: create commit status")
-    }
+/// Write this call's report onto an existing status row.
+async fn apply_status(
+    db: &DatabaseConnection,
+    existing: CommitStatus,
+    model: ActiveModel,
+) -> Result<CommitStatus> {
+    let mut active: ActiveModel = existing.into();
+    active.state = model.state;
+    active.description = model.description;
+    active.target_url = model.target_url;
+    active.creator_id = model.creator_id;
+    active.updated_at = model.updated_at;
+    active.update(db).await.context("db: update commit status")
 }
 
 /// List all statuses for a commit SHA in a repo.

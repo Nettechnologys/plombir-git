@@ -1,0 +1,483 @@
+//! card_1a5dab9714b8: six `rg-db` primitives promise create-or-update but read
+//! and write in two statements. Concurrent *first* calls all see no row and all
+//! insert; the key is UNIQUE, so one of them used to come back with a
+//! constraint error on an operation that was never the caller's fault.
+//!
+//! The six, and the ordinary concurrency that reaches each:
+//!
+//! * `commit_status_ops::create_or_update` — a build matrix reporting the same
+//!   context on one commit.
+//! * `ci_secret_ops::upsert` — two admins saving the settings form.
+//! * `ci_retention_ops::upsert_policy` — the same, for retention.
+//! * `ci_retention_ops::upsert_cache_entry` — parallel jobs uploading one cache key.
+//! * `instance_settings_ops::save` — the singleton on a never-configured instance.
+//! * `repo_watch_ops::set_watch_state` — a double-clicked watch button.
+//!
+//! What the tests guard:
+//!
+//! * **The race resolves to one row**, and every caller gets a result rather
+//!   than a constraint error.
+//! * **The surviving row is coherent.** Fields that describe one submission —
+//!   a cache blob's path, size and digest; a banner's text and type — come
+//!   from a single call, not merged from two.
+//! * **A real write failure is still a failure.** The retry is armed only by a
+//!   UNIQUE violation; a foreign-key failure must not be re-read into a
+//!   fabricated success.
+
+use rg_db::entities::{commit_status, repository};
+use rg_db::sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, NotSet, Set, Statement,
+};
+
+/// A throwaway SQLite database file, removed with its WAL siblings on drop.
+struct TempDb {
+    path: std::path::PathBuf,
+}
+
+impl TempDb {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "forgekeep-upsert-race-{label}-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        Self { path }
+    }
+
+    fn url(&self) -> String {
+        format!("sqlite://{}?mode=rwc", self.path.display())
+    }
+}
+
+impl Drop for TempDb {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "cleanup must not mask the assertion that failed the test"
+    )]
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+        }
+    }
+}
+
+/// A migrated database with more than one pooled connection, so concurrent
+/// tasks really do run their statements against separate connections.
+async fn setup(label: &str) -> (DatabaseConnection, TempDb) {
+    let temp = TempDb::new(label);
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to throwaway database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+    (db, temp)
+}
+
+/// A user and a repository to hang the raced rows off.
+async fn fixture(db: &DatabaseConnection) -> (i64, i64) {
+    let user = rg_db::ops::user_ops::create_user(db, "dana", "dana@example.com", "", "Dana")
+        .await
+        .expect("create the account the rows hang off");
+    let now = chrono::Utc::now();
+    let repo = rg_db::ops::repo_ops::create(
+        db,
+        repository::ActiveModel {
+            id: NotSet,
+            owner_id: Set(user.id),
+            name: Set("forge".to_string()),
+            description: Set(None),
+            is_private: Set(false),
+            default_branch: Set("main".to_string()),
+            fork_id: Set(None),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            org_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            origin_repo_id: Set(None),
+        },
+    )
+    .await
+    .expect("create the repository the rows hang off");
+    (user.id, repo.id)
+}
+
+async fn scalar(db: &DatabaseConnection, sql: &str) -> i64 {
+    db.query_one(Statement::from_string(DatabaseBackend::Sqlite, sql))
+        .await
+        .expect("query")
+        .expect("one row")
+        .try_get::<i64>("", "n")
+        .expect("count column")
+}
+
+/// How many callers race each primitive. Enough that several of them read
+/// "no such row" before any of them has written one.
+const ATTEMPTS: usize = 8;
+
+fn assert_all_ok<T, E: std::fmt::Debug>(results: &[Result<T, E>], what: &str) {
+    for (i, result) in results.iter().enumerate() {
+        assert!(
+            result.is_ok(),
+            "caller {i} of a concurrent first {what} failed: {:?}",
+            result.as_ref().err()
+        );
+    }
+}
+
+// Every race test is multi-threaded on purpose: the window each guards sits
+// between a `SELECT` and an `INSERT` on two different pooled connections.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_commit_status_reports_all_succeed_and_leave_one_row() {
+    let (db, _temp) = setup("status").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            let now = chrono::Utc::now();
+            rg_db::ops::commit_status_ops::create_or_update(
+                &db,
+                repo_id,
+                "deadbeef",
+                "ci/build",
+                commit_status::ActiveModel {
+                    id: NotSet,
+                    repo_id: Set(repo_id),
+                    sha: Set("deadbeef".to_string()),
+                    state: Set(format!("state-{i}")),
+                    context: Set("ci/build".to_string()),
+                    description: Set(Some(format!("run {i}"))),
+                    target_url: Set(None),
+                    creator_id: Set(user_id),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                },
+            )
+            .await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "commit status report");
+
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) AS n FROM commit_statuses \
+             WHERE sha = 'deadbeef' AND context = 'ci/build'",
+        )
+        .await,
+        1,
+        "one context on one commit must occupy exactly one row",
+    );
+
+    // The row that survived carries one report, not a blend of two.
+    let statuses = rg_db::ops::commit_status_ops::list_by_sha(&db, repo_id, "deadbeef")
+        .await
+        .expect("read the status back");
+    let status = statuses.first().expect("the status exists");
+    let run = status
+        .state
+        .strip_prefix("state-")
+        .expect("the state came from one of the callers");
+    assert_eq!(
+        status.description.as_deref(),
+        Some(format!("run {run}").as_str()),
+        "state and description must come from the same report",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_ci_secret_saves_all_succeed_and_leave_one_row() {
+    let (db, _temp) = setup("secret").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::ci_secret_ops::upsert(
+                &db,
+                repo_id,
+                "DEPLOY_TOKEN",
+                &format!("ciphertext-{i}"),
+                user_id,
+            )
+            .await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "CI secret save");
+
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) AS n FROM ci_secrets WHERE name = 'DEPLOY_TOKEN'",
+        )
+        .await,
+        1,
+        "one secret name in one repository must occupy exactly one row",
+    );
+
+    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo_id, "DEPLOY_TOKEN")
+        .await
+        .expect("read the secret back")
+        .expect("the secret exists");
+    assert!(
+        secret.encrypted_value.starts_with("ciphertext-"),
+        "the stored value came from one of the callers, got {:?}",
+        secret.encrypted_value,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_retention_policy_saves_all_succeed_and_leave_one_coherent_row() {
+    let (db, _temp) = setup("policy").await;
+    let (_user_id, repo_id) = fixture(&db).await;
+
+    // Artifact and cache days are offset by a constant, so a row that mixed two
+    // submissions would break the relation rather than merely look odd.
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::ci_retention_ops::upsert_policy(&db, repo_id, i as i32, i as i32 + 100)
+                .await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "retention policy save");
+
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) AS n FROM ci_retention_policies").await,
+        1,
+        "a repository has exactly one retention policy",
+    );
+
+    let policy = rg_db::ops::ci_retention_ops::get_policy(&db, repo_id)
+        .await
+        .expect("read the policy back");
+    assert_eq!(
+        policy.cache_retention_days,
+        policy.artifact_retention_days + 100,
+        "both numbers must come from the same submission",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_cache_registrations_all_succeed_and_leave_one_coherent_row() {
+    let (db, _temp) = setup("cache").await;
+    let (_user_id, repo_id) = fixture(&db).await;
+
+    // Path, size and digest describe one uploaded blob. A row assembled from
+    // two uploads would point at one file and vouch for another.
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::ci_retention_ops::upsert_cache_entry(
+                &db,
+                repo_id,
+                "key-hash-1",
+                &format!("cache-{i}.tar"),
+                i as i64,
+                Some(&format!("sha-{i}")),
+                7,
+            )
+            .await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "cache registration");
+
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) AS n FROM ci_cache_entries WHERE key_hash = 'key-hash-1'",
+        )
+        .await,
+        1,
+        "one cache key in one repository must occupy exactly one row",
+    );
+
+    let entry = rg_db::ops::ci_retention_ops::find_cache_entry(&db, repo_id, "key-hash-1")
+        .await
+        .expect("read the cache entry back")
+        .expect("the entry exists");
+    assert_eq!(entry.file_path, format!("cache-{}.tar", entry.size));
+    assert_eq!(
+        entry.sha256.as_deref(),
+        Some(format!("sha-{}", entry.size).as_str()),
+        "the digest must belong to the file the row points at",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_instance_settings_saves_all_succeed_and_leave_one_coherent_row() {
+    let (db, _temp) = setup("settings").await;
+
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::instance_settings_ops::save(
+                &db,
+                true,
+                Some(&format!("banner-{i}")),
+                &format!("type-{i}"),
+            )
+            .await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "instance settings save");
+
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) AS n FROM instance_settings").await,
+        1,
+        "the settings singleton must stay a singleton",
+    );
+
+    let settings = rg_db::ops::instance_settings_ops::find(&db)
+        .await
+        .expect("read the settings back")
+        .expect("the row exists");
+    assert!(settings.maintenance_mode);
+    let admin = settings
+        .banner_type
+        .strip_prefix("type-")
+        .expect("the banner type came from one of the callers");
+    assert_eq!(
+        settings.banner_message.as_deref(),
+        Some(format!("banner-{admin}").as_str()),
+        "banner text and type must come from the same submission",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_watch_writes_all_succeed_and_leave_one_row() {
+    let (db, _temp) = setup("watch").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let attempts = (0..ATTEMPTS).map(|_| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::repo_watch_ops::set_watch_state(&db, user_id, repo_id, "watching").await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "watch write");
+
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) AS n FROM repo_watches").await,
+        1,
+        "one user watching one repository must occupy exactly one row",
+    );
+    assert_eq!(
+        rg_db::ops::repo_watch_ops::get_watch_state(&db, user_id, repo_id)
+            .await
+            .expect("read the watch state back"),
+        Some("watching".to_string()),
+    );
+}
+
+/// The re-read is armed by a UNIQUE violation and nothing else. Each primitive
+/// is given a write that fails on a foreign key instead — SQLite enforces them
+/// (`connect_sqlite` sets `foreign_keys = ON`) — and must still report failure
+/// rather than re-read its way to a fabricated success.
+#[tokio::test]
+async fn writes_that_fail_on_something_other_than_uniqueness_are_still_errors() {
+    let (db, _temp) = setup("fk").await;
+    let (user_id, _repo_id) = fixture(&db).await;
+
+    const ORPHAN: i64 = 9999;
+    let now = chrono::Utc::now();
+
+    let status = rg_db::ops::commit_status_ops::create_or_update(
+        &db,
+        ORPHAN,
+        "deadbeef",
+        "ci/build",
+        commit_status::ActiveModel {
+            id: NotSet,
+            repo_id: Set(ORPHAN),
+            sha: Set("deadbeef".to_string()),
+            state: Set("success".to_string()),
+            context: Set("ci/build".to_string()),
+            description: Set(None),
+            target_url: Set(None),
+            creator_id: Set(user_id),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await;
+    assert!(
+        status.is_err(),
+        "a status for a repository that does not exist must stay a failure",
+    );
+
+    assert!(
+        rg_db::ops::ci_secret_ops::upsert(&db, ORPHAN, "DEPLOY_TOKEN", "ciphertext", user_id)
+            .await
+            .is_err(),
+        "a secret for a repository that does not exist must stay a failure",
+    );
+    assert!(
+        rg_db::ops::ci_retention_ops::upsert_policy(&db, ORPHAN, 30, 7)
+            .await
+            .is_err(),
+        "a policy for a repository that does not exist must stay a failure",
+    );
+    assert!(
+        rg_db::ops::ci_retention_ops::upsert_cache_entry(
+            &db,
+            ORPHAN,
+            "key-hash-1",
+            "cache.tar",
+            1,
+            None,
+            7,
+        )
+        .await
+        .is_err(),
+        "a cache entry for a repository that does not exist must stay a failure",
+    );
+    assert!(
+        rg_db::ops::repo_watch_ops::set_watch_state(&db, ORPHAN, ORPHAN, "watching")
+            .await
+            .is_err(),
+        "a watch for a user and repository that do not exist must stay a failure",
+    );
+
+    for (table, what) in [
+        ("commit_statuses", "commit status"),
+        ("ci_secrets", "CI secret"),
+        ("ci_retention_policies", "retention policy"),
+        ("ci_cache_entries", "cache entry"),
+        ("repo_watches", "watch"),
+    ] {
+        assert_eq!(
+            scalar(&db, &format!("SELECT COUNT(*) AS n FROM {table}")).await,
+            0,
+            "nothing may be written when the {what} insert failed",
+        );
+    }
+}
+
+/// `futures::future::join_all` without taking a dependency on `futures` for one
+/// call: poll the futures together by handing them to the runtime as tasks.
+async fn futures_join_all<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handles: Vec<_> = futures.into_iter().map(tokio::spawn).collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for handle in handles {
+        out.push(handle.await.expect("task panicked"));
+    }
+    out
+}
