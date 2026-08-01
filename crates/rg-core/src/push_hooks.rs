@@ -485,11 +485,15 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
     // Resolved once, not per ref: the watch fan-out below needs the pusher's
     // username, and a tag push can carry dozens of updates.
     let pusher_name = match params.pusher_id {
-        Some(pusher_id) => rg_db::ops::user_ops::find_by_id(params.db, pusher_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|user| user.username),
+        Some(pusher_id) => crate::notification::best_effort_user_by_id(
+            params.db,
+            pusher_id,
+            seed.repo_id,
+            "push",
+            "actor",
+        )
+        .await
+        .map(|user| user.username),
         None => None,
     };
 
@@ -705,8 +709,14 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
 
     // Send email notification if SMTP is configured
     if let Some(smtp) = params.smtp_config {
-        if let Ok(Some(owner_user)) =
-            rg_db::ops::user_ops::find_by_id(params.db, target.owner_id).await
+        if let Some(owner_user) = crate::notification::best_effort_user_by_id(
+            params.db,
+            target.owner_id,
+            target.repo_id,
+            "ci_triggered",
+            "recipient",
+        )
+        .await
         {
             let subject = format!(
                 "[ForgeKeep] CI pipeline #{} triggered for {}/{}",

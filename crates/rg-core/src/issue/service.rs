@@ -389,29 +389,53 @@ async fn notify_milestone_closed(
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger milestone.closed webhook");
     }
 
-    // Notify watchers about milestone completion
-    if let Ok(Some(milestone)) = rg_db::ops::milestone_ops::find_by_id(db, milestone_id).await {
-        // Look up repo name for notification
-        if let Ok(Some(repo)) = rg_db::entities::repository::Entity::find_by_id(repo_id)
-            .one(db)
-            .await
-        {
-            // Detached: closing the last issue of a milestone answers an HTTP
-            // request, and the fan-out below is a read check plus an insert for
-            // every subscriber of the repository.
-            crate::notification::spawn_notify_watchers(
-                db,
-                delivery_tracker.unwrap_or_else(|| crate::task_tracker::delivery_tracker()),
-                crate::notification::WatchEvent {
-                    repo_id,
-                    author_name: String::new(),
-                    title: format!("Milestone {} in {}", "closed", repo.name),
-                    notification_type: "milestone".to_string(),
-                    body: Some(format!("Milestone '{}' {}", milestone.title, "closed")),
-                },
+    // Notify watchers about milestone completion. Missing rows mean that there
+    // is no longer context to announce; a failed read is a different outcome
+    // and must remain visible even though this best-effort side effect does not
+    // unwind the issue update that was already committed.
+    let milestone = match rg_db::ops::milestone_ops::find_by_id(db, milestone_id).await {
+        Ok(Some(milestone)) => milestone,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                milestone_id,
+                error = %format!("{error:#}"),
+                "milestone lookup failed while preparing notification"
             );
+            return Ok(());
         }
-    }
+    };
+    let repo = match rg_db::entities::repository::Entity::find_by_id(repo_id)
+        .one(db)
+        .await
+    {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                milestone_id,
+                error = %format!("{error:#}"),
+                "repository lookup failed while preparing milestone notification"
+            );
+            return Ok(());
+        }
+    };
+
+    // Detached: closing the last issue of a milestone answers an HTTP request,
+    // and the fan-out below is a read check plus an insert for every subscriber.
+    crate::notification::spawn_notify_watchers(
+        db,
+        delivery_tracker.unwrap_or_else(|| crate::task_tracker::delivery_tracker()),
+        crate::notification::WatchEvent {
+            repo_id,
+            author_name: String::new(),
+            title: format!("Milestone {} in {}", "closed", repo.name),
+            notification_type: "milestone".to_string(),
+            body: Some(format!("Milestone '{}' {}", milestone.title, "closed")),
+        },
+    );
 
     Ok(())
 }
@@ -424,4 +448,107 @@ async fn resolve_repo(
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+#[cfg(test)]
+mod notification_lookup_tests {
+    use super::notify_milestone_closed;
+    use crate::test_support::{migrated_memory_database, CapturedLogs};
+    use chrono::Utc;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, NotSet, Set};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn milestone_lookup_failure_is_logged_without_failing_issue_completion() {
+        let db = migrated_memory_database().await;
+        db.execute_unprepared("DROP TABLE milestones")
+            .await
+            .expect("drop milestones");
+        let (logs, _guard) = CapturedLogs::capture();
+
+        notify_milestone_closed(&db, 7, 11, None)
+            .await
+            .expect("notification lookup failure stays best-effort");
+
+        let rendered = logs.rendered();
+        for expected in [
+            "milestone lookup failed while preparing notification",
+            "repo_id=7",
+            "milestone_id=11",
+            "db: find milestone by id",
+            "no such table: milestones",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repository_lookup_failure_is_logged_without_failing_issue_completion() {
+        let db = migrated_memory_database().await;
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "milestone-owner",
+            "milestone-owner@example.invalid",
+            "",
+            "Milestone Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::entities::repository::ActiveModel {
+            id: NotSet,
+            owner_id: Set(owner.id),
+            name: Set("milestone-repo".to_string()),
+            description: Set(None),
+            is_private: Set(false),
+            default_branch: Set("main".to_string()),
+            fork_id: Set(None),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            org_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            origin_repo_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("create repository");
+        let milestone = rg_db::entities::milestone::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            title: Set("v1".to_string()),
+            description: Set(None),
+            state: Set("closed".to_string()),
+            due_date: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("create milestone");
+        db.execute_unprepared("PRAGMA foreign_keys = OFF; DROP TABLE repositories")
+            .await
+            .expect("break repository lookup without removing milestone");
+        let (logs, _guard) = CapturedLogs::capture();
+
+        notify_milestone_closed(&db, repo.id, milestone.id, None)
+            .await
+            .expect("notification lookup failure stays best-effort");
+
+        let rendered = logs.rendered();
+        for expected in [
+            "repository lookup failed while preparing milestone notification",
+            &format!("repo_id={}", repo.id),
+            &format!("milestone_id={}", milestone.id),
+            "no such table: repositories",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in {rendered}"
+            );
+        }
+    }
 }

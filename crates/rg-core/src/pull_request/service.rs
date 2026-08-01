@@ -263,13 +263,11 @@ async fn notify_watchers_pr(
 }
 
 /// Resolve a username for the watch fan-out, or `None` when the account is
-/// gone / unreadable. A failed lookup must not fail the PR operation that is
-/// merely being announced, so it degrades to an actor-less notification.
-async fn watch_actor_name(db: &DatabaseConnection, actor_id: i64) -> Option<String> {
-    user_ops::find_by_id(db, actor_id)
+/// gone. A failed lookup is logged by the shared notification policy before it
+/// degrades to an actor-less event.
+async fn watch_actor_name(db: &DatabaseConnection, repo_id: i64, actor_id: i64) -> Option<String> {
+    crate::notification::best_effort_user_by_id(db, actor_id, repo_id, "pull_request", "actor")
         .await
-        .ok()
-        .flatten()
         .map(|user| user.username)
 }
 
@@ -306,7 +304,7 @@ fn announce_pr_to_watchers(
     let action = action.to_string();
     tracker.spawn(async move {
         let actor_name = match actor_id {
-            Some(actor_id) => watch_actor_name(&db, actor_id).await,
+            Some(actor_id) => watch_actor_name(&db, repo_id, actor_id).await,
             None => None,
         };
         if let Err(e) = notify_watchers_pr(

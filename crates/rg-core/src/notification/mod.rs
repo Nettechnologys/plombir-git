@@ -116,6 +116,57 @@ pub struct WatchEvent {
     pub body: Option<String>,
 }
 
+/// Resolve a user needed only to enrich or route a notification.
+///
+/// A missing row is a legitimate absence: accounts can be deleted after an
+/// event was committed. A failed query is different. The primary operation is
+/// already complete, so it still must not be unwound, but the failure must be
+/// visible with enough identity to explain the degraded notification.
+pub(crate) async fn best_effort_user_by_id(
+    db: &DatabaseConnection,
+    user_id: i64,
+    repo_id: i64,
+    notification_type: &str,
+    lookup_role: &str,
+) -> Option<rg_db::entities::user::Model> {
+    match rg_db::ops::user_ops::find_by_id(db, user_id).await {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                user_id,
+                notification_type,
+                lookup_role,
+                error = %format!("{error:#}"),
+                "notification user lookup failed"
+            );
+            None
+        }
+    }
+}
+
+async fn best_effort_user_by_username(
+    db: &DatabaseConnection,
+    username: &str,
+    repo_id: i64,
+    notification_type: &str,
+) -> Option<rg_db::entities::user::Model> {
+    match rg_db::ops::user_ops::find_by_username(db, username).await {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                username,
+                notification_type,
+                lookup_role = "author",
+                error = %format!("{error:#}"),
+                "notification user lookup failed"
+            );
+            None
+        }
+    }
+}
+
 /// Fan `event` out to the repository's watchers on `tracker`, returning as soon
 /// as the task is queued.
 ///
@@ -178,10 +229,8 @@ pub async fn notify_watchers(db: &DatabaseConnection, event: &WatchEvent) -> Res
     let author_opt = if event.author_name.is_empty() {
         None
     } else {
-        rg_db::ops::user_ops::find_by_username(db, &event.author_name)
+        best_effort_user_by_username(db, &event.author_name, repo_id, &event.notification_type)
             .await
-            .ok()
-            .flatten()
     };
 
     let notification_type = event.notification_type.as_str();
@@ -284,4 +333,89 @@ async fn watch_page(
         WATCH_FANOUT_PAGE,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{best_effort_user_by_id, best_effort_user_by_username};
+    use crate::test_support::{migrated_memory_database, CapturedLogs};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_notification_user_lookups_warn_with_context_and_stay_best_effort() {
+        let db = migrated_memory_database().await;
+        db.clone().close().await.expect("close test database");
+        let (logs, _guard) = CapturedLogs::capture();
+
+        assert!(
+            best_effort_user_by_id(&db, 41, 7, "pull_request", "actor")
+                .await
+                .is_none(),
+            "a failed enrichment lookup must preserve best-effort None semantics"
+        );
+        assert!(
+            best_effort_user_by_id(&db, 42, 8, "push", "actor")
+                .await
+                .is_none(),
+            "a failed pusher lookup must preserve best-effort None semantics"
+        );
+        assert!(
+            best_effort_user_by_id(&db, 43, 9, "ci_triggered", "recipient")
+                .await
+                .is_none(),
+            "a failed recipient lookup must preserve best-effort None semantics"
+        );
+        assert!(
+            best_effort_user_by_username(&db, "push-author", 10, "push")
+                .await
+                .is_none(),
+            "a failed self-exclusion lookup must preserve best-effort None semantics"
+        );
+
+        let rendered = logs.rendered();
+        for expected in [
+            "notification user lookup failed",
+            "repo_id=7",
+            "repo_id=8",
+            "repo_id=9",
+            "repo_id=10",
+            "user_id=41",
+            "user_id=42",
+            "user_id=43",
+            "username=\"push-author\"",
+            "notification_type=\"pull_request\"",
+            "notification_type=\"push\"",
+            "notification_type=\"ci_triggered\"",
+            "lookup_role=\"actor\"",
+            "lookup_role=\"recipient\"",
+            "lookup_role=\"author\"",
+            "db: find user by id",
+            "db: find user by username",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn absent_notification_users_are_not_logged_as_backend_failures() {
+        let db = migrated_memory_database().await;
+        let (logs, _guard) = CapturedLogs::capture();
+
+        assert!(
+            best_effort_user_by_id(&db, i64::MAX, 7, "ci_triggered", "recipient")
+                .await
+                .is_none()
+        );
+        assert!(
+            best_effort_user_by_username(&db, "missing-author", 7, "push")
+                .await
+                .is_none()
+        );
+        assert!(
+            logs.rendered().is_empty(),
+            "a genuine missing row must not be reported as a database failure"
+        );
+    }
 }

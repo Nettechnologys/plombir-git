@@ -4,6 +4,59 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
+/// Sink that keeps formatted warning lines so best-effort paths can prove that
+/// an operator sees the failure they deliberately do not return to the caller.
+#[derive(Clone, Default)]
+pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLogs {
+    pub(crate) fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    pub(crate) fn rendered(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
+    }
+}
+
+/// A migrated, single-connection SQLite database for tests that break exactly
+/// one table. One connection keeps PRAGMA changes and in-memory state aligned.
+pub(crate) async fn migrated_memory_database() -> sea_orm::DatabaseConnection {
+    let db = rg_db::connect_with_pool("sqlite::memory:", rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+        .await
+        .expect("connect test database");
+    rg_db::run_migrations(&db)
+        .await
+        .expect("run test migrations");
+    db
+}
+
 /// A remote that speaks HTTP Basic: 401 until an `Authorization` header shows
 /// up, then 403 so `git` stops instead of retrying. Returns the bound address
 /// and the list of credentials the remote actually received.
