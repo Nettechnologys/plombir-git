@@ -307,10 +307,18 @@ pub async fn ai_search_code(
         ));
     }
 
+    // `search_code` is three database round-trips behind an `anyhow::Error`
+    // (the FTS count, the result page, the row decoding), so its failure is the
+    // database's failure. Formatting it into a message threw the type away and
+    // answered a connection-level outage with a flat 500 — "we broke, and it is
+    // permanent" — while `AppError::from` downcasts through the anyhow chain to
+    // the original `DbErr` and answers the retryable 503 the index-status probe
+    // above already answers. The client-facing body stays generic either way;
+    // only the operator log keeps the detail.
     let (results, _total) = indexer
         .search_code(&params.q, Some(repo.id), limit, offset)
         .await
-        .map_err(|e| AppError::internal(format!("Search error: {}", e)))?;
+        .map_err(AppError::from)?;
 
     let api_results = results
         .into_iter()
@@ -374,6 +382,11 @@ pub async fn ai_index_repository(
             }),
         )
             .into_response(),
-        Err(e) => AppError::internal(format!("Indexing error: {}", e)).into_response(),
+        // Same boundary, same rule as `ai_search_code`: `index_repository`
+        // writes every indexed file into `code_fts`, so a pool outage mid-index
+        // is a `DbErr` under the anyhow chain and has to stay retryable.
+        // (Whether this handler is reachable at all is a separate question —
+        // it is not mounted, tracked as dead wiring in card_928d72df493a.)
+        Err(e) => AppError::from(e).into_response(),
     }
 }
