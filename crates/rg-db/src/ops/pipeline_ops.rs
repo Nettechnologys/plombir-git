@@ -87,6 +87,53 @@ pub async fn list_pipelines_by_repo_paginated(
     Ok((pipelines, total))
 }
 
+/// Every job id owned by `repo_id`, walked repo → pipeline → stage → job.
+///
+/// Repository deletion needs this because CI artifacts are stored under
+/// `artifacts/jobs/<job_id>/…` — a key that carries the job, not the
+/// repository, so there is no single storage prefix to hand to the deletion
+/// path. Ownership has to be read out of the database instead of guessed from
+/// a string prefix.
+///
+/// Returns bare ids through three id-only statements rather than the
+/// per-stage walk [`crate::ops::artifact_ops::list_by_pipeline`] does: a
+/// repository with a long CI history would otherwise cost one query per
+/// stage, and the caller has no use for the rows themselves.
+pub async fn list_job_ids_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<i64>> {
+    let pipeline_ids: Vec<i64> = pipeline::Entity::find()
+        .select_only()
+        .column(pipeline::Column::Id)
+        .filter(pipeline::Column::RepoId.eq(repo_id))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list pipeline ids by repo")?;
+    if pipeline_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let stage_ids: Vec<i64> = pipeline_stage::Entity::find()
+        .select_only()
+        .column(pipeline_stage::Column::Id)
+        .filter(pipeline_stage::Column::PipelineId.is_in(pipeline_ids))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list stage ids by repo")?;
+    if stage_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    pipeline_job::Entity::find()
+        .select_only()
+        .column(pipeline_job::Column::Id)
+        .filter(pipeline_job::Column::StageId.is_in(stage_ids))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list job ids by repo")
+}
+
 /// Update pipeline status.
 pub async fn update_pipeline_status(
     db: &impl ConnectionTrait,

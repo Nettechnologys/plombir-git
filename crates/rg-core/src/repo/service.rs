@@ -1100,6 +1100,44 @@ fn repository_blob_prefixes(
         .collect()
 }
 
+/// The CI artifact prefixes owned by a repository, one per job.
+///
+/// Artifacts are keyed `artifacts/jobs/<job_id>/<object>`, so unlike packages,
+/// LFS, releases and attachments they have no repository-shaped prefix: the
+/// only way from a repository to its artifact bytes is through the job ids its
+/// pipelines own. `job_ids` therefore comes from the database, never from a
+/// string prefix over the storage keys — a repository named `demo` must not
+/// decide the fate of objects it merely shares a spelling with.
+///
+/// Job ids are unique instance-wide and never reissued, so a job that uploaded
+/// nothing simply has no directory: [`BlobStorage::move_prefix`] answers
+/// `Ok(false)` for it and the prefix never enters the staged set.
+fn artifact_blob_prefixes(
+    job_ids: &[i64],
+    repo_id: i64,
+    deletion_id: &str,
+) -> Result<Vec<StagedBlobPrefix>> {
+    let repo_id = repo_id.to_string();
+    job_ids
+        .iter()
+        .map(|job_id| {
+            let job_id = job_id.to_string();
+            Ok(StagedBlobPrefix {
+                live: BlobKey::from_segments(["artifacts", "jobs", job_id.as_str()])?,
+                staged: BlobKey::from_segments([
+                    "_deleted",
+                    "repositories",
+                    repo_id.as_str(),
+                    deletion_id,
+                    "artifacts",
+                    "jobs",
+                    job_id.as_str(),
+                ])?,
+            })
+        })
+        .collect()
+}
+
 async fn restore_blob_prefixes(
     storage: &dyn BlobStorage,
     prefixes: &[StagedBlobPrefix],
@@ -1172,6 +1210,17 @@ fn restore_repository_directory(
 /// the database step fails, move the prepared namespaces back. Once the row is
 /// deleted, the tombstones are unreachable and can be physically removed
 /// without keeping the repository name occupied.
+///
+/// CI artifacts join that set through their jobs rather than through a
+/// repository-shaped prefix (see [`artifact_blob_prefixes`]). The inventory
+/// query runs before anything is moved, so a database that cannot answer
+/// "which jobs are yours" aborts the deletion instead of reporting a success
+/// that leaves artifact bytes live with no owner and no collector. The
+/// artifact *rows* stay where every other child table stays — behind the
+/// repository's own soft-delete — and the retention sweep that later reaches
+/// one finds its object already gone, which
+/// [`BlobStorage::delete`](crate::blob_storage::BlobStorage::delete) reports as
+/// `Ok(false)`, not as a failure.
 pub async fn delete_repo(
     db: &DatabaseConnection,
     repo_root: &std::path::Path,
@@ -1183,7 +1232,20 @@ pub async fn delete_repo(
     let deletion_id = uuid::Uuid::new_v4().simple().to_string();
     // Validate every backend-neutral namespace before moving any live data. A
     // malformed historical name must fail without leaving Git staged aside.
-    let prefixes = repository_blob_prefixes(&namespace, repo, &deletion_id)?;
+    let mut prefixes = repository_blob_prefixes(&namespace, repo, &deletion_id)?;
+    // Same rule for the artifact namespaces, which additionally need the
+    // database to name them: a failed inventory is a failed deletion, not a
+    // deletion that quietly keeps the artifacts.
+    let job_ids = rg_db::ops::pipeline_ops::list_job_ids_by_repo(db, repo.id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inventory the CI jobs of repository {} — its artifact storage cannot \
+                 be retired without them",
+                repo.id
+            )
+        })?;
+    prefixes.extend(artifact_blob_prefixes(&job_ids, repo.id, &deletion_id)?);
     let staged_path = repo_path.with_file_name(format!(
         "{}.deleted-{}-{}",
         repo_path
@@ -2462,6 +2524,142 @@ mod repository_deletion_tests {
         db
     }
 
+    /// One CI job of `repo_id`, with an artifact of its own on the blob
+    /// backend. Returns the artifact's key.
+    ///
+    /// The walk pipeline → stage → job is the shortest one that makes a job id
+    /// belong to a repository, and that ownership is the whole subject here:
+    /// the artifact key carries the job, so nothing but this chain can say
+    /// whose bytes these are.
+    async fn seed_job_artifact(
+        db: &DatabaseConnection,
+        storage: &LocalBlobStorage,
+        repo_id: i64,
+        payload: &[u8],
+    ) -> BlobKey {
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            db,
+            repo_id,
+            "1234567890123456789012345678901234567890",
+            "refs/heads/main",
+            "manual",
+            None,
+        )
+        .await
+        .expect("create pipeline");
+        let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+            .await
+            .expect("create stage");
+        let job = rg_db::ops::pipeline_ops::create_job(
+            db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        )
+        .await
+        .expect("create job");
+        let key = BlobKey::from_segments([
+            "artifacts",
+            "jobs",
+            job.id.to_string().as_str(),
+            "0e6c-report.txt",
+        ])
+        .expect("valid artifact key");
+        storage
+            .put(&key, payload)
+            .await
+            .expect("seed artifact blob");
+        rg_db::ops::artifact_ops::create_artifact(
+            db,
+            job.id,
+            "report.txt",
+            key.as_str(),
+            payload.len() as i64,
+            None,
+            None,
+        )
+        .await
+        .expect("create artifact row");
+        key
+    }
+
+    /// A repository's artifacts live under `artifacts/jobs/<job_id>`, which
+    /// names no repository at all. Until the deletion path walked the job
+    /// graph, `DELETE` reported a completed removal and left those bytes
+    /// behind with no owner and no collector.
+    ///
+    /// The second repository is what makes the first assertion mean anything:
+    /// a deletion that took every artifact directory it could find would pass
+    /// a test that only looks at the deleted repository.
+    #[tokio::test]
+    async fn deleting_a_repository_retires_the_artifacts_of_its_ci_jobs() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "artifact-delete-owner",
+            "artifact-delete@example.invalid",
+            "unused",
+            "Artifact Delete",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let doomed = create_repo(
+            &db,
+            owner.id,
+            "with-artifacts",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create repository");
+        let neighbour = create_repo(&db, owner.id, "kept", None, false, &repo_root, None)
+            .await
+            .expect("create neighbouring repository");
+        let doomed_artifact = seed_job_artifact(&db, &blob_storage, doomed.id, b"job output").await;
+        let kept_artifact =
+            seed_job_artifact(&db, &blob_storage, neighbour.id, b"other output").await;
+
+        assert_eq!(
+            blob_storage
+                .get(&doomed_artifact)
+                .await
+                .expect("the artifact must exist before the deletion is asked to remove it"),
+            b"job output"
+        );
+
+        delete_repo(&db, &repo_root, &blob_storage, &doomed)
+            .await
+            .expect("delete repository");
+
+        assert!(
+            matches!(
+                blob_storage.get(&doomed_artifact).await,
+                Err(BlobStorageError::NotFound(_))
+            ),
+            "the repository is gone but its CI artifact bytes are still readable at {doomed_artifact}"
+        );
+        let tombstones =
+            BlobKey::from_segments(["_deleted", "repositories", doomed.id.to_string().as_str()])
+                .expect("valid tombstone prefix");
+        assert!(
+            blob_storage
+                .list(Some(&tombstones))
+                .await
+                .expect("inventory tombstones")
+                .is_empty(),
+            "the artifacts were staged aside but never retired"
+        );
+        assert_eq!(
+            blob_storage
+                .get(&kept_artifact)
+                .await
+                .expect("another repository's artifact must survive this deletion"),
+            b"other output"
+        );
+    }
+
     /// The filesystem move necessarily happens before the database mutation.
     /// If that mutation fails, returning the error without compensation would
     /// leave a live row whose Git data has vanished under a staging name.
@@ -2494,6 +2692,10 @@ mod repository_deletion_tests {
             .put(&blob, b"must survive too")
             .await
             .expect("seed package blob");
+        // Staged last, restored first: the artifact prefixes are the tail of
+        // the staged set, so a rollback that walked it in the wrong order — or
+        // skipped the part the database had to name — shows up here.
+        let artifact = seed_job_artifact(&db, &blob_storage, repo.id, b"and so must this").await;
 
         db.execute_unprepared(&format!(
             "CREATE TRIGGER reject_repo_soft_delete \
@@ -2522,6 +2724,13 @@ mod repository_deletion_tests {
                 .await
                 .expect("repository blob prefix must be restored"),
             b"must survive too"
+        );
+        assert_eq!(
+            blob_storage
+                .get(&artifact)
+                .await
+                .expect("the CI artifact prefix must be restored too"),
+            b"and so must this"
         );
         assert!(
             find_repo_by_owner_name(&db, "delete-rollback-owner", "keep-me")
