@@ -125,15 +125,19 @@ async fn apply_tokens(
     am.update(db).await
 }
 
-/// Delete an OAuth account by id (must belong to user).
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64, user_id: i64) -> Result<(), DbErr> {
-    let some = Entity::find()
+/// Delete an OAuth account by id, scoped to its owner. Returns true if a row
+/// was removed.
+///
+/// The scoping filter and the delete are one statement, so the row cannot go
+/// away between them: two concurrent unlinks of the same link produce one
+/// `true` and one `false`, and only the `true` may be reported as an unlink.
+/// A `user_id` that does not own `id` is likewise `false` — indistinguishable
+/// from "no such link", which is what the caller answers either way.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64, user_id: i64) -> Result<bool, DbErr> {
+    let res = Entity::delete_many()
         .filter(oauth_account::Column::Id.eq(id))
         .filter(oauth_account::Column::UserId.eq(user_id))
-        .one(db)
+        .exec(db)
         .await?;
-    if let Some(m) = some {
-        Entity::delete_by_id(m.id).exec(db).await?;
-    }
-    Ok(())
+    Ok(res.rows_affected > 0)
 }

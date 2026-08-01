@@ -715,9 +715,17 @@ pub async fn unlink_oauth_account(
         .find(|a| a.provider == slug)
         .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
 
-    rg_db::ops::oauth_account_ops::delete_by_id(&state.db, account.id, user_id)
+    // The lookup above and the delete below are separate statements. A second
+    // unlink of the same link can pass the lookup while the first one is still
+    // in flight, so only the request whose DELETE actually removed the row may
+    // report an unlink; the loser gets the same 404 as a request that never
+    // had the link. A failed DELETE stays an error — it is not "already gone".
+    let removed = rg_db::ops::oauth_account_ops::delete_by_id(&state.db, account.id, user_id)
         .await
         .map_err(AppError::from)?;
+    if !removed {
+        return Err(AppError::not_found("no OAuth account linked"));
+    }
 
     Ok(Json(serde_json::json!({"unlinked": true})))
 }

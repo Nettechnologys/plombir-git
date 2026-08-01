@@ -189,9 +189,12 @@ async fn admin_sso_create_get_update_delete() {
         .await
         .unwrap();
     assert_eq!(linked_delete.status(), 400);
-    rg_db::ops::oauth_account_ops::delete_by_id(&db, linked_account.id, admin_id)
-        .await
-        .unwrap();
+    assert!(
+        rg_db::ops::oauth_account_ops::delete_by_id(&db, linked_account.id, admin_id)
+            .await
+            .unwrap(),
+        "the link this test just created must be the row that got deleted"
+    );
 
     let del_resp = client
         .delete(format!(
