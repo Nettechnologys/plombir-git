@@ -35,6 +35,7 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySe
 
 use rg_db::entities::{ci_secret, instance_signing_key, mirror, oauth_account, sso_provider, user};
 
+use crate::auth::encrypted_columns::with_encrypted_columns;
 use crate::auth::encryption;
 
 /// Rows read per column. Enough that one corrupt or hand-edited value cannot
@@ -160,83 +161,49 @@ fn wrong_key_message(probe: &KeyProbe) -> String {
 
 /// Sample every column that stores [`encryption::encrypt`] output.
 ///
+/// The columns come from [`encrypted_columns`], which is also what
+/// [`crate::auth::rekey`] rewrites — so a column added to one is sampled by the
+/// other, and a rotation can never quietly skip what this check watches.
+///
 /// Each entry is `(column label, stored value)`. The label is what the operator
 /// reads in the refusal, so it names the table and column, not the Rust field.
 async fn collect_samples(db: &DatabaseConnection) -> Result<Vec<(&'static str, String)>> {
-    let mut samples = Vec::new();
+    let mut samples: Vec<(&'static str, String)> = Vec::new();
 
-    for row in user::Entity::find()
-        .filter(user::Column::TotpSecret.is_not_null())
-        .limit(SAMPLE_LIMIT)
-        .all(db)
-        .await
-        .context("sampling users.totp_secret")?
-    {
-        samples.extend(row.totp_secret.map(|v| ("users.totp_secret", v)));
+    // The nullable columns are filtered to non-null rows before the limit:
+    // without it, `LIMIT 5` over a million users returns five rows with no MFA
+    // and the check silently probes nothing.
+    macro_rules! sample_one {
+        ($entity:ident, $col:ident, $field:ident, $label:literal, optional) => {{
+            for row in $entity::Entity::find()
+                .filter($entity::Column::$col.is_not_null())
+                .limit(SAMPLE_LIMIT)
+                .all(db)
+                .await
+                .context(concat!("sampling ", $label))?
+            {
+                samples.extend(row.$field.map(|value| ($label, value)));
+            }
+        }};
+        ($entity:ident, $col:ident, $field:ident, $label:literal, required) => {{
+            for row in $entity::Entity::find()
+                .limit(SAMPLE_LIMIT)
+                .all(db)
+                .await
+                .context(concat!("sampling ", $label))?
+            {
+                samples.push(($label, row.$field));
+            }
+        }};
     }
 
-    for row in ci_secret::Entity::find()
-        .limit(SAMPLE_LIMIT)
-        .all(db)
-        .await
-        .context("sampling ci_secrets.encrypted_value")?
-    {
-        samples.push(("ci_secrets.encrypted_value", row.encrypted_value));
+    macro_rules! sample_all {
+        ($($entity:ident, $col:ident, $field:ident, $label:literal, $opt:tt;)*) => {
+            $( sample_one!($entity, $col, $field, $label, $opt); )*
+        };
     }
 
-    for row in sso_provider::Entity::find()
-        .limit(SAMPLE_LIMIT)
-        .all(db)
-        .await
-        .context("sampling sso_providers")?
-    {
-        samples.extend(
-            row.client_secret_enc
-                .map(|v| ("sso_providers.client_secret_enc", v)),
-        );
-        samples.extend(
-            row.ldap_bind_password_enc
-                .map(|v| ("sso_providers.ldap_bind_password_enc", v)),
-        );
-    }
-
-    for row in oauth_account::Entity::find()
-        .limit(SAMPLE_LIMIT)
-        .all(db)
-        .await
-        .context("sampling oauth_accounts")?
-    {
-        samples.extend(row.access_token.map(|v| ("oauth_accounts.access_token", v)));
-        samples.extend(
-            row.refresh_token
-                .map(|v| ("oauth_accounts.refresh_token", v)),
-        );
-    }
-
-    // The instance's provenance signing key. Unlike the columns above it exists
-    // on every instance that has started once, so it is what makes this check
-    // bite on a deployment that stores nothing else encrypted.
-    for row in instance_signing_key::Entity::find()
-        .limit(SAMPLE_LIMIT)
-        .all(db)
-        .await
-        .context("sampling instance_signing_key.seed_encrypted")?
-    {
-        samples.push(("instance_signing_key.seed_encrypted", row.seed_encrypted));
-    }
-
-    for row in mirror::Entity::find()
-        .filter(mirror::Column::PasswordEncrypted.is_not_null())
-        .limit(SAMPLE_LIMIT)
-        .all(db)
-        .await
-        .context("sampling mirrors.password_encrypted")?
-    {
-        samples.extend(
-            row.password_encrypted
-                .map(|v| ("mirrors.password_encrypted", v)),
-        );
-    }
+    with_encrypted_columns!(sample_all);
 
     Ok(samples)
 }

@@ -151,8 +151,21 @@ than starting and failing MFA logins, CI jobs and mirror syncs one at a time
 later. A blank `FORGEKEEP_JWT_SECRET=` in `.env` counts as unset, not as "the
 empty secret", and is refused the same way.
 
-Re-encrypting under a new encryption key is not supported yet; treat that key
-as permanent for a given database.
+If the encryption key itself leaks, move the database onto a new one with the
+server stopped:
+
+```bash
+docker compose stop forgekeep
+docker compose run --rm forgekeep rotate-encryption-key \
+    --old "$OLD_KEY" --new "$NEW_KEY" --dry-run   # reports, changes nothing
+docker compose run --rm forgekeep rotate-encryption-key \
+    --old "$OLD_KEY" --new "$NEW_KEY" --yes
+# then set FORGEKEEP_ENCRYPTION_KEY to the new value in .env
+docker compose up -d forgekeep
+```
+
+Keep the old key until the server has come up under the new one — it is what
+opens anything the pass reported as unreadable.
 
 For a separately hosted frontend, set `FORGEKEEP_CORS_ORIGINS` to the browser
 origin. ForgeKeep also adds those origins, plus matching `ws://` or `wss://`

@@ -128,6 +128,112 @@ pub(crate) async fn cmd_rotate_instance_key(
     Ok(())
 }
 
+/// `forgekeep rotate-encryption-key` — move every at-rest secret onto a new
+/// at-rest encryption key.
+///
+/// The missing half of card_d740512de0a8. Splitting `encryption_key` out of
+/// `jwt_secret` made rotating the *signing* secret safe, and the startup
+/// preflight made a wrong encryption key loud — but the encryption key itself
+/// still had no way out: the README told operators to treat it as permanent for
+/// the life of the database, which for a leaked key means wiping every
+/// encrypted value and re-enrolling MFA for everyone by hand.
+pub(crate) async fn cmd_rotate_encryption_key(
+    db_url: Option<String>,
+    config: Option<String>,
+    jwt_secret: Option<String>,
+    old: Option<String>,
+    new: String,
+    dry_run: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    let db_url = config::resolve_db_url(db_url, cfg.as_ref());
+
+    // Without --old, "the key this database is encrypted with" is whatever this
+    // deployment resolves today — the same chain `serve` uses, so the default is
+    // right on every instance that has not already changed its config.
+    let old_key = match old {
+        Some(explicit) => explicit,
+        None => crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, None)?.1,
+    };
+    admin::validate_jwt_secret(&new, "--new")?;
+
+    if !dry_run && !yes {
+        anyhow::bail!(
+            "refusing to re-encrypt the database without --yes.\n\
+             \n\
+             Run it with --dry-run first: that reports, per column, how many stored values \
+             the old key opens and how many it does not, and writes nothing. Then re-run \
+             with --yes — and keep the old key until the server has started under the new \
+             one, because it is what opens any value this pass could not."
+        );
+    }
+
+    let db = dbconn::connect(&db_url).await?;
+    let report = rg_core::auth::rekey::rekey(&db, &old_key, &new, dry_run).await?;
+
+    println!(
+        "{:<38} {:>12} {:>12} {:>10} {:>11}",
+        "column", "re-encrypted", "already new", "plaintext", "unreadable"
+    );
+    for column in &report.columns {
+        println!(
+            "{:<38} {:>12} {:>12} {:>10} {:>11}",
+            column.column,
+            column.rewritten,
+            column.already_new,
+            column.plaintext,
+            column.unreadable
+        );
+    }
+
+    if report.plaintext() > 0 {
+        println!(
+            "\n{} value(s) are not encrypted at all (columns that predate encryption) and were \
+             left as they are.",
+            report.plaintext()
+        );
+    }
+    if report.unreadable() > 0 {
+        println!(
+            "\n{} value(s) in {} open with neither key. They were left untouched — re-enter \
+             them by hand once the rotation is done.",
+            report.unreadable(),
+            report.unreadable_columns().join(", ")
+        );
+    }
+
+    if dry_run {
+        // The apply path refuses this outright; on a dry run it is the whole
+        // point of the exercise, so report it and exit non-zero.
+        if report.old_key_is_wrong() {
+            anyhow::bail!(
+                "the old key opens none of the {} encrypted value(s) in this database. \
+                 Re-encrypting would seal them away for good, so this is what --dry-run is \
+                 for: check --old before running for real. On an instance that rotated \
+                 jwt_secret without setting [auth].encryption_key, the key that opens the \
+                 data is the *previous* signing secret.",
+                report.unreadable()
+            );
+        }
+        println!(
+            "\nDry run: nothing was changed. {} value(s) would be re-encrypted.",
+            report.rewritten()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n{} value(s) re-encrypted. Now set the new key — [auth].encryption_key, \
+         FORGEKEEP_ENCRYPTION_KEY or --encryption-key — before starting the server; \
+         starting it under the old one is refused by the startup key check.",
+        report.rewritten()
+    );
+    Ok(())
+}
+
 /// `forgekeep rebuild-fts` — rebuild full-text search indexes.
 pub(crate) async fn cmd_rebuild_fts(
     db_url: Option<String>,

@@ -30,6 +30,9 @@ jwt_secret = "change-me-in-production"
 #   to your CURRENT `jwt_secret` now, and rotating `jwt_secret` later becomes a
 #   safe, ordinary operation. The server refuses to start if the configured key
 #   cannot decrypt what is already stored, rather than failing at runtime.
+#   If this key itself leaks, move the database onto a new one with the server
+#   stopped: `forgekeep rotate-encryption-key --old <current> --new <fresh>
+#   --dry-run` reports what it would do, and `--yes` applies it.
 # Also settable as FORGEKEEP_ENCRYPTION_KEY / --encryption-key (env wins).
 # encryption_key = "the-secret-your-data-was-encrypted-with"
 #

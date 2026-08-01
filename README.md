@@ -159,9 +159,30 @@ attestation signed with it stops verifying for good:
 forgekeep rotate-instance-key --config forgekeep.toml --yes
 ```
 
-**Rotating the encryption key** is a different operation: the stored ciphertext
-must be re-encrypted, and there is no tool for that yet. Until there is, treat
-the encryption key as permanent for a given database.
+**Rotating the encryption key** is a different operation — the stored
+ciphertext has to be re-encrypted — so it has its own command. Stop the server
+first (a handler that writes an encrypted column mid-pass would leave a value
+under the old key), and look before you leap:
+
+```bash
+forgekeep rotate-encryption-key --config forgekeep.toml \
+    --old "<the current key>" --new "$(forgekeep gen-secret)" --dry-run
+```
+
+The dry run reports, per column, how many stored values the old key opens and
+how many it does not, and writes nothing. Re-run it with `--yes` instead of
+`--dry-run` to apply: every value is re-sealed in one transaction, and then
+`[auth].encryption_key` has to be set to the new secret before the server is
+started again.
+
+`--old` defaults to the key this deployment already resolves, so you only need
+it when the current key is not what the config says — on an instance that
+rotated `jwt_secret` without ever setting `encryption_key`, the key that opens
+the data is the *previous* signing secret. If the old key opens nothing at all,
+the command refuses and changes nothing rather than sealing the database away.
+Values it cannot open — legacy plaintext, or rows damaged earlier — are counted
+and reported, never rewritten and never deleted. Keep the old secret until the
+server has started under the new one.
 
 On startup the server samples the encrypted columns and checks the configured
 key opens them. If it opens none of them, it **refuses to start** and prints
@@ -266,6 +287,8 @@ Beyond `serve`, the `forgekeep` binary offers:
 | `migrate` | Run database migrations and exit |
 | `rebuild-fts` | Rebuild full-text search indexes |
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup |
+| `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key |
+| `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
 | `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab |

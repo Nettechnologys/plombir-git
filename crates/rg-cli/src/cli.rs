@@ -255,6 +255,50 @@ pub(crate) enum Commands {
         yes: bool,
     },
 
+    /// Re-encrypt every at-rest secret under a new encryption key.
+    ///
+    /// Run it with the server stopped: TOTP secrets, CI secrets, mirror and
+    /// LDAP passwords, SSO client secrets, OAuth tokens and the instance
+    /// signing key are opened with the old key and sealed with the new one, in
+    /// a single transaction. Start `--dry-run` first — it reports what every
+    /// column would do and changes nothing. Afterwards, set
+    /// `[auth].encryption_key` to the new secret.
+    RotateEncryptionKey {
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+
+        /// JWT signing secret, used only to work out the current encryption key
+        /// when `--old` is omitted [config: [auth].jwt_secret]
+        /// [env: FORGEKEEP_JWT_SECRET]
+        #[arg(long)]
+        jwt_secret: Option<String>,
+
+        /// The key the database is encrypted with today. Defaults to the key
+        /// this deployment resolves normally (FORGEKEEP_ENCRYPTION_KEY ›
+        /// [auth].encryption_key › the JWT secret)
+        #[arg(long)]
+        old: Option<String>,
+
+        /// The key to re-encrypt onto. Generate one with `forgekeep gen-secret`
+        #[arg(long)]
+        new: String,
+
+        /// Report what each column would do and change nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm the rewrite. Not needed with --dry-run
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Rebuild or refresh full-text search indexes from main tables
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)

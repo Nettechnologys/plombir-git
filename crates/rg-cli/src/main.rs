@@ -100,6 +100,19 @@ async fn main() -> anyhow::Result<()> {
                 .await?
         }
 
+        Commands::RotateEncryptionKey {
+            db_url,
+            config,
+            jwt_secret,
+            old,
+            new,
+            dry_run,
+            yes,
+        } => {
+            commands::cmd_rotate_encryption_key(db_url, config, jwt_secret, old, new, dry_run, yes)
+                .await?
+        }
+
         Commands::RebuildFts { db_url, config } => {
             commands::cmd_rebuild_fts(db_url, config).await?
         }

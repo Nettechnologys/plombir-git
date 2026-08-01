@@ -14,7 +14,7 @@ pub struct Model {
     pub slug: String,
     /// "oauth2" | "oidc" | "ldap"
     pub provider_type: String,
-    /// OAuth2 client ID (encrypted at rest)
+    /// OAuth2 client ID (stored in the clear — only `client_secret_enc` below is encrypted)
     pub client_id: Option<String>,
     /// OAuth2 client secret (AES-GCM encrypted)
     pub client_secret_enc: Option<String>,
