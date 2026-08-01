@@ -36,6 +36,25 @@ fn break_repository(bare: &Path) {
     );
 }
 
+/// Remove one object while retaining a repository gix can open and whose ref
+/// still resolves. This separates an object-store failure from both a missing
+/// ref and the broader "repository will not open" failure fixture above.
+fn remove_loose_object(bare: &Path, object_id: &str) {
+    let object_path = bare
+        .join("objects")
+        .join(&object_id[..2])
+        .join(&object_id[2..]);
+    assert!(
+        object_path.exists(),
+        "fixture must keep {object_id} as a loose object"
+    );
+    std::fs::remove_file(&object_path).expect("remove commit object");
+    assert!(
+        gix::open(bare).is_ok(),
+        "fixture must leave repository opening intact so the log reaches its target-object read"
+    );
+}
+
 /// `GET /repos/{owner}/{name}/blob/{path}`.
 #[tokio::test]
 async fn broken_repository_on_the_blob_endpoint_is_not_a_missing_file() {
@@ -422,6 +441,72 @@ async fn an_unreadable_head_on_the_log_endpoint_is_a_server_error() {
     assert!(
         status.is_server_error(),
         "an unreadable HEAD is a storage failure, not empty history or a missing ref: \
+         {status} (body: {body})"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+}
+
+/// A ref can still resolve after its target commit disappears from the object
+/// store. `rev_parse_single` alone cannot tell that from a healthy ref, and
+/// the old helper therefore reached its best-effort walker and replied `200`
+/// with an empty history. The target object must be read before that boundary.
+#[tokio::test]
+async fn a_log_ref_with_a_missing_target_commit_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "logobject-owner", "logobject@example.com").await;
+    create_repo(&base, &token, "logobject-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "logobject-owner", "logobject-repo").await;
+
+    let bare = repo_root.join("logobject-owner/logobject-repo.git");
+    let repo = gix::open(&bare).expect("fixture repository must open");
+    let head = repo.head().expect("HEAD must be readable");
+    let target_ref = head
+        .referent_name()
+        .expect("fixture HEAD must point to a branch")
+        .as_bstr()
+        .to_string();
+    let target_id = head
+        .try_into_peeled_id()
+        .expect("HEAD must resolve")
+        .expect("fixture repository must have a commit")
+        .to_string();
+    remove_loose_object(&bare, &target_id);
+
+    let repo = gix::open(&bare).expect("repository must still open after object removal");
+    let reference = repo
+        .try_find_reference(target_ref.as_str())
+        .expect("the ref store must stay readable after target removal")
+        .expect("the branch ref must still exist after target removal");
+    assert_eq!(
+        reference
+            .try_id()
+            .expect("fixture branch must carry a direct object id")
+            .to_string(),
+        target_id
+    );
+    assert!(
+        repo.find_object(
+            gix::ObjectId::from_hex(target_id.as_bytes())
+                .expect("fixture commit must have a full object id"),
+        )
+        .is_err(),
+        "fixture must fail only when gix reads the resolved commit object"
+    );
+
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/repos/logobject-owner/logobject-repo/log"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        status.is_server_error(),
+        "a missing target object is a server failure, not missing ref or empty history: \
          {status} (body: {body})"
     );
     assert_no_internal_detail(&body, &repo_root);

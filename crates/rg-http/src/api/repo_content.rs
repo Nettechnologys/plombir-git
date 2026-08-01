@@ -708,6 +708,84 @@ fn get_blob_size(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<i64> 
     Ok(blob.data.len() as i64)
 }
 
+/// Resolve the documented ref forms for the commit-log endpoint without asking
+/// `rev_parse_single` to encode both absence and a broken ref/object store in
+/// its one error value.
+fn resolve_commit_log_ref<'repo>(
+    repo: &'repo gix::Repository,
+    git_ref: &str,
+    repo_path: &std::path::Path,
+) -> anyhow::Result<gix::Id<'repo>> {
+    if git_ref == "HEAD" {
+        let head = repo.head().with_context(|| {
+            format!(
+                "reading HEAD before resolving commit-log ref in {}",
+                repo_path.display()
+            )
+        })?;
+
+        return head
+            .try_into_peeled_id()
+            .with_context(|| {
+                format!(
+                    "resolving HEAD before walking commit log in {}",
+                    repo_path.display()
+                )
+            })?
+            .ok_or_else(|| anyhow::Error::new(rg_core::error::NotFound::new("ref")));
+    }
+
+    // The API documents branch, tag, and fully qualified ref names. The
+    // `Option` from this lookup is the one honest "the client named no such
+    // ref" outcome; malformed ref data and I/O errors remain server failures.
+    let ref_names = if git_ref.starts_with("refs/") {
+        vec![git_ref.to_owned()]
+    } else {
+        vec![
+            format!("refs/heads/{git_ref}"),
+            format!("refs/tags/{git_ref}"),
+        ]
+    };
+    for ref_name in ref_names {
+        let Some(mut reference) =
+            repo.try_find_reference(ref_name.as_str())
+                .with_context(|| {
+                    format!(
+                        "looking up commit-log ref '{}' in {}",
+                        ref_name,
+                        repo_path.display()
+                    )
+                })?
+        else {
+            continue;
+        };
+
+        return reference.peel_to_id().with_context(|| {
+            format!(
+                "resolving commit-log ref '{}' in {}",
+                ref_name,
+                repo_path.display()
+            )
+        });
+    }
+
+    // A full object id is also a documented ref form. It has no reference
+    // namespace to look up, so retain gix's resolver only after the named-ref
+    // branch above has ruled out a real reference.
+    if gix::ObjectId::from_hex(git_ref.as_bytes()).is_ok() {
+        return repo.rev_parse_single(git_ref).map_err(|e| {
+            anyhow::Error::new(rg_core::error::NotFound::new("ref")).context(format!(
+                "resolving commit-log object id '{}' in {}: {}",
+                git_ref,
+                repo_path.display(),
+                e
+            ))
+        });
+    }
+
+    Err(anyhow::Error::new(rg_core::error::NotFound::new("ref")))
+}
+
 fn get_commit_log(
     repo_path: &std::path::Path,
     git_ref: &str,
@@ -719,28 +797,18 @@ fn get_commit_log(
 
     let mut entries = Vec::new();
 
-    // `rev_parse_single("HEAD")` gives the same outer error for an unborn HEAD
-    // and an unreadable HEAD. Read HEAD first so corruption stays a server
-    // failure; the caller alone turns the answerable unborn case into `200 []`.
-    if git_ref == "HEAD" {
-        repo.head().with_context(|| {
-            format!(
-                "reading HEAD before walking commit log in {}",
-                repo_path.display()
-            )
-        })?;
-    }
+    let head_id = resolve_commit_log_ref(&repo, git_ref, repo_path)?;
 
-    // A ref the client named and that does not resolve is a genuine 404. The
-    // gix detail stays in the context chain for operator logs, while the typed
-    // marker gives the client the fixed, path-free `ref not found` body.
-    let head_id = repo.rev_parse_single(git_ref).map_err(|e| {
-        anyhow::Error::new(rg_core::error::NotFound::new("ref")).context(format!(
-            "resolving commit-log ref '{}' in {}: {}",
+    // Resolving a ref only proves that its name carries an object id; it does
+    // not prove that the object store can supply that commit. Read it before
+    // starting the best-effort walk so a missing HEAD/branch target is a 5xx,
+    // never a plausible `404 ref not found` or an empty successful history.
+    head_id.object().with_context(|| {
+        format!(
+            "reading commit-log target object for ref '{}' in {}",
             git_ref,
-            repo_path.display(),
-            e
-        ))
+            repo_path.display()
+        )
     })?;
 
     // Use rev_walk to traverse commit history.
