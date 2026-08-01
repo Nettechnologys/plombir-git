@@ -271,6 +271,62 @@ fn git_failure_body(operation: &'static str, e: &anyhow::Error) -> String {
     }
 }
 
+/// Drain a finished Git protocol response without turning a failed reader into
+/// a valid, empty protocol response.
+fn spawn_git_response_reader<R>(reader: R) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = reader;
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await?;
+        Ok(output)
+    })
+}
+
+/// A join failure is a server failure too: the Git subprocess may have
+/// completed, but we cannot honestly tell the client that its response was
+/// delivered if the task that copied it failed or was cancelled.
+async fn collect_git_response(
+    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    operation: &'static str,
+) -> std::result::Result<Vec<u8>, Response> {
+    reader_task
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result.map_err(anyhow::Error::from))
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(git_failure_body(operation, &error)),
+            )
+                .into_response()
+        })
+}
+
+async fn git_upload_pack_response(
+    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    operation: &'static str,
+    idle_timeout_secs: u64,
+) -> Response {
+    let output = match collect_git_response(reader_task, operation).await {
+        Ok(output) => output,
+        Err(response) => return response,
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+        // Stream the buffered pack with an idle guard so a slow-drip
+        // downloader can't pin the clone-sized buffer indefinitely
+        // (card_751408c41e0c). git already finished, so 200 is final.
+        crate::http_stream::buffered_body_with_idle(output, idle_timeout_secs),
+    )
+        .into_response()
+}
+
 /// Classify a DB-touching error into an HTTP status while preserving the git
 /// smart-HTTP response envelope.
 ///
@@ -597,14 +653,7 @@ pub(crate) async fn handle_git_upload_pack(
 
         let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
         // Spawn concurrent reader to prevent duplex deadlock when pack > 64KB
-        let reader_task = tokio::spawn(async move {
-            let mut buf_reader = buf_reader;
-            let mut output = Vec::new();
-            if buf_reader.read_to_end(&mut output).await.is_err() {
-                output.clear();
-            }
-            output
-        });
+        let reader_task = spawn_git_response_reader(buf_reader);
 
         match with_git_timeout(
             state.git_stream_timeout_secs,
@@ -624,19 +673,12 @@ pub(crate) async fn handle_git_upload_pack(
                         .into_response();
                 }
                 drop(buf_writer);
-                let output = reader_task.await.unwrap_or_default();
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
-                    // Stream the buffered pack with an idle guard so a slow-drip
-                    // downloader can't pin the clone-sized buffer indefinitely
-                    // (card_751408c41e0c). git already finished, so 200 is final.
-                    crate::http_stream::buffered_body_with_idle(
-                        output,
-                        state.git_idle_timeout_secs,
-                    ),
+                git_upload_pack_response(
+                    reader_task,
+                    "read upload-pack (v2) response",
+                    state.git_idle_timeout_secs,
                 )
-                    .into_response()
+                .await
             }
             Ok(Err(e)) => {
                 drop(buf_writer);
@@ -674,14 +716,7 @@ pub(crate) async fn handle_git_upload_pack(
 
         let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
         // Spawn concurrent reader to prevent duplex deadlock when pack > 64KB
-        let reader_task = tokio::spawn(async move {
-            let mut buf_reader = buf_reader;
-            let mut output = Vec::new();
-            if buf_reader.read_to_end(&mut output).await.is_err() {
-                output.clear();
-            }
-            output
-        });
+        let reader_task = spawn_git_response_reader(buf_reader);
 
         match with_git_timeout(
             state.git_stream_timeout_secs,
@@ -705,19 +740,12 @@ pub(crate) async fn handle_git_upload_pack(
                         .into_response();
                 }
                 drop(buf_writer);
-                let output = reader_task.await.unwrap_or_default();
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
-                    // Stream the buffered pack with an idle guard so a slow-drip
-                    // downloader can't pin the clone-sized buffer indefinitely
-                    // (card_751408c41e0c). git already finished, so 200 is final.
-                    crate::http_stream::buffered_body_with_idle(
-                        output,
-                        state.git_idle_timeout_secs,
-                    ),
+                git_upload_pack_response(
+                    reader_task,
+                    "read upload-pack response",
+                    state.git_idle_timeout_secs,
                 )
-                    .into_response()
+                .await
             }
             Ok(Err(e)) => {
                 drop(buf_writer);
@@ -975,9 +1003,13 @@ async fn find_repo_by_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_git_body, build_info_refs, git_failure_body, with_git_timeout};
+    use super::{
+        buffer_git_body, build_info_refs, git_failure_body, git_upload_pack_response,
+        spawn_git_response_reader, with_git_timeout,
+    };
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
+    use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     // NOTE: a second `use axum::http::StatusCode` further down in this module
@@ -1296,5 +1328,77 @@ mod tests {
         // building the pack) must not be misclassified as a DB outage.
         let e = anyhow::anyhow!("failed to open repository");
         assert_eq!(git_db_status(&e), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[derive(Default)]
+    struct PartialThenFailReader {
+        sent_partial: bool,
+    }
+
+    impl tokio::io::AsyncRead for PartialThenFailReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.sent_partial {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected reader failure",
+                )));
+            }
+
+            self.sent_partial = true;
+            buf.put_slice(b"partial git protocol response");
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn assert_upload_pack_reader_failure(
+        reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+        operation: &'static str,
+    ) {
+        let response = git_upload_pack_response(reader_task, operation, 30).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{operation}"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("reader failure body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"internal server error", "{operation}");
+    }
+
+    /// `handle_git_upload_pack` uses the same completed-response path for v1
+    /// and v2. A reader that could not finish its copy, or a task that did not
+    /// finish at all, must never turn the already-produced partial bytes into a
+    /// successful empty protocol response.
+    #[tokio::test]
+    async fn upload_pack_reader_failures_are_sanitized_5xx_for_both_protocols() {
+        for operation in [
+            "read upload-pack response",
+            "read upload-pack (v2) response",
+        ] {
+            assert_upload_pack_reader_failure(
+                spawn_git_response_reader(PartialThenFailReader::default()),
+                operation,
+            )
+            .await;
+
+            let panic_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>> =
+                tokio::spawn(async { panic!("injected reader task panic") });
+            assert_upload_pack_reader_failure(panic_task, operation).await;
+
+            let cancelled_task = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<Vec<u8>, std::io::Error>(Vec::new())
+            });
+            cancelled_task.abort();
+            assert_upload_pack_reader_failure(cancelled_task, operation).await;
+        }
     }
 }
