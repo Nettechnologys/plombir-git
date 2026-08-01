@@ -369,10 +369,13 @@ async fn concurrent_first_enqueues_of_one_pr_all_succeed_and_leave_one_entry() {
     let (user_id, repo_id) = fixture(&db).await;
     let pr_id = open_pr(&db, repo_id, user_id, 1).await;
 
-    let attempts = (0..8).map(|_| {
-        let db = db.clone();
-        async move { rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "squash").await }
-    });
+    let attempts =
+        (0..8).map(|_| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "squash").await
+            }
+        });
     let results = join_all(attempts).await;
 
     for (i, result) in results.iter().enumerate() {

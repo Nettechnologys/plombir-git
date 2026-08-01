@@ -127,9 +127,7 @@ pub async fn enqueue(
             // Lost the race for the first row. Whoever won holds this PR's
             // entry, so adopt it the way the existing-row branch would.
             match find_by_pr(db, pr_id).await? {
-                Some(existing) => {
-                    adopt_existing(db, existing, enqueued_by_id, strategy, now).await
-                }
+                Some(existing) => adopt_existing(db, existing, enqueued_by_id, strategy, now).await,
                 // Not there after all, so the collision was on some other
                 // constraint. Report the original failure rather than inventing
                 // a reason for it.
