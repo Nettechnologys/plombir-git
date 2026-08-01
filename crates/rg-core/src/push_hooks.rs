@@ -487,8 +487,27 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
             name: params.repo_name.to_string(),
             path: params.repo_path.to_path_buf(),
         },
-        _ => {
-            tracing::warn!(owner = %params.owner, repo = %params.repo_name, "Post-push: repo not found in DB, skipping hooks");
+        Ok(None) => {
+            tracing::warn!(
+                owner = %params.owner,
+                repo = %params.repo_name,
+                "Post-push: repo not found in DB, skipping hooks"
+            );
+            return;
+        }
+        // A lookup that could not run is not a missing repository. The push is
+        // already accepted, so the only way an operator learns that CI, the
+        // webhooks, PR maintenance and the watch fan-out were all skipped is
+        // this line — and "repo not found" would send them looking for a
+        // deleted repository instead of at the database. `resolve_hook_target`
+        // above splits the same two outcomes.
+        Err(error) => {
+            tracing::warn!(
+                owner = %params.owner,
+                repo = %params.repo_name,
+                error = %format!("{error:#}"),
+                "Post-push: repo lookup failed, skipping hooks"
+            );
             return;
         }
     };
@@ -1036,6 +1055,140 @@ mod tests {
             processed, 50,
             "every ref of a wide push must be processed — the depth limit bounds \
              chains of merges, not the size of one push"
+        );
+    }
+}
+
+/// The seed lookup decides whether *any* hook runs at all, and it runs after the
+/// client already has its "push accepted". When it cannot reach the database,
+/// the only record that CI, webhooks, PR maintenance and the watch fan-out were
+/// skipped is one warning line — so that line must not blame a missing
+/// repository (card_39515539e787).
+#[cfg(test)]
+mod seed_lookup_tests {
+    use super::*;
+    use crate::test_support::{migrated_memory_database, CapturedLogs};
+    use sea_orm::ConnectionTrait;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// A CI engine that is never reached: both tests return before the cascade
+    /// starts, and a double that panics would prove that as loudly as one that
+    /// answers.
+    struct UnreachableCi;
+
+    impl CiTrigger for UnreachableCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            unreachable!("the seed lookup returns before any hook runs")
+        }
+
+        fn has_workflow_for_event(
+            &self,
+            _repo_path: &Path,
+            _commit_sha: &str,
+            _event: &str,
+            _ref_name: &str,
+            _base_branch: Option<&str>,
+        ) -> bool {
+            unreachable!("the seed lookup returns before any hook runs")
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>> {
+            unreachable!("the seed lookup returns before any hook runs")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            unreachable!("the seed lookup returns before any hook runs")
+        }
+    }
+
+    /// Run the hooks against `db` for one branch move, exactly as a transport
+    /// would once the pack is stored.
+    async fn run_hooks(db: &DatabaseConnection) {
+        let ci = UnreachableCi;
+        let delivery_tracker = crate::task_tracker::TaskTracker::new();
+        let repo_root = PathBuf::from("/repos");
+        post_push_hooks(
+            &PostPushParams {
+                db,
+                repo_path: &repo_root.join("owner/repo.git"),
+                repo_root: &repo_root,
+                owner: "owner",
+                repo_name: "repo",
+                pusher_id: None,
+                docker_enabled: false,
+                external_runners: false,
+                allow_host_runner: false,
+                jwt_secret: None,
+                encryption_key: None,
+                notifier: None,
+                smtp_config: &None,
+                ci_engine: &ci,
+                external_url: None,
+                delivery_tracker: &delivery_tracker,
+            },
+            &[RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: "a".repeat(40),
+                refname: "refs/heads/main".to_string(),
+                status: "ok".to_string(),
+                message: String::new(),
+            }],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_seed_lookup_that_could_not_run_names_the_database_failure() {
+        let db = migrated_memory_database().await;
+        db.execute_unprepared("PRAGMA foreign_keys = OFF;\nDROP TABLE users;")
+            .await
+            .expect("break the owner lookup the seed starts from");
+        let (logs, _guard) = CapturedLogs::capture();
+
+        // The push itself already succeeded; the hooks must not take the
+        // process down with them.
+        run_hooks(&db).await;
+
+        let rendered = logs.rendered();
+        for expected in [
+            "Post-push: repo lookup failed, skipping hooks",
+            "owner=owner",
+            "repo=repo",
+            "no such table: users",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("repo not found in DB"),
+            "a database outage must not be reported as a missing repository: {rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_genuinely_absent_repository_still_reads_as_not_found() {
+        let db = migrated_memory_database().await;
+        let (logs, _guard) = CapturedLogs::capture();
+
+        run_hooks(&db).await;
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("Post-push: repo not found in DB, skipping hooks"),
+            "an owner/repo that is simply absent must keep its own message: {rendered}"
+        );
+        assert!(
+            !rendered.contains("repo lookup failed"),
+            "nothing failed here — the lookup ran and answered `no such repository`: {rendered}"
         );
     }
 }
