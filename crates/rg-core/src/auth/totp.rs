@@ -5,23 +5,32 @@ use qrcode::QrCode;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Generate a new TOTP secret. Returns (secret_string, otpauth_url, qr_text).
+///
+/// The returned secret is **base32** (RFC 4648, unpadded) — the same encoding
+/// the `secret=` parameter of the otpauth URL carries, so it can be typed into
+/// an authenticator app by hand and fed straight back to [`verify_code`].
+/// `Secret::Raw` renders as *hex* through `Display`, which is neither what the
+/// app expects nor what `verify_code` parses — hence the explicit `to_encoded`.
 pub fn generate_secret(username: &str, issuer: &str) -> Result<(String, String, String)> {
     // Secret::generate_secret() returns Secret directly in totp-rs v5
     let secret = Secret::generate_secret();
+    let secret_bytes = secret
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!("TOTP secret encoding error: {}", e))?;
 
     let totp = TOTP::new(
         Algorithm::SHA1,
         6,
         1,
         30,
-        secret.to_bytes().unwrap_or_default(),
+        secret_bytes,
         Some(issuer.to_string()),
         username.to_string(),
     )
     .map_err(|e| anyhow::anyhow!("TOTP config error: {}", e))?;
 
     let url = totp.get_url();
-    let secret_str = secret.to_string();
+    let secret_str = secret.to_encoded().to_string();
 
     let qr = QrCode::new(&url).context("QR code generation failed")?;
     let qr_text = qr
@@ -33,16 +42,23 @@ pub fn generate_secret(username: &str, issuer: &str) -> Result<(String, String, 
     Ok((secret_str, url, qr_text))
 }
 
-/// Verify a TOTP code for a given secret.
+/// Verify a TOTP code against a secret produced by [`generate_secret`].
+///
+/// `secret_str` is base32 (RFC 4648, unpadded). An unparseable secret is an
+/// error, not a `false`: decoding it to an empty key would silently verify
+/// every code against the wrong HMAC key and report "invalid code" for a
+/// storage problem the operator needs to see.
 pub fn verify_code(secret_str: &str, code: &str) -> Result<bool> {
-    let secret = Secret::Raw(secret_str.to_string().into_bytes());
+    let secret_bytes = Secret::Encoded(secret_str.to_string())
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!("TOTP secret is not valid base32: {}", e))?;
 
     let totp = TOTP::new(
         Algorithm::SHA1,
         6,
         1,
         30,
-        secret.to_bytes().unwrap_or_default(),
+        secret_bytes,
         None,
         "".to_string(),
     )
@@ -105,5 +121,40 @@ mod tests {
     fn test_generate_secret() {
         let (secret, _url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
         assert!(!secret.is_empty());
+    }
+
+    /// The whole point of enrollment: a code produced from the secret we handed
+    /// to the authenticator app must verify against the secret we stored.
+    #[test]
+    fn code_from_enrollment_url_verifies_against_stored_secret() {
+        let (stored_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+
+        // What the authenticator app does: parse the otpauth:// URL it scanned
+        // and generate the current code from it.
+        let app_totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
+        let code = app_totp.generate_current().expect("code generation");
+
+        assert!(
+            verify_code(&stored_secret, &code).unwrap(),
+            "stored secret must accept the code the enrolled app generates"
+        );
+    }
+
+    /// The secret we show for manual entry must be the one in the QR code.
+    #[test]
+    fn returned_secret_matches_the_otpauth_url_parameter() {
+        let (stored_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let url_secret = url
+            .split("secret=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("otpauth URL carries a secret parameter");
+        assert_eq!(stored_secret, url_secret);
+    }
+
+    /// A secret that cannot be decoded is a storage fault, not a wrong code.
+    #[test]
+    fn unparseable_secret_is_an_error_not_a_silent_false() {
+        assert!(verify_code("not base32 at all!!", "123456").is_err());
     }
 }
