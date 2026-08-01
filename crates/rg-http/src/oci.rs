@@ -847,43 +847,25 @@ pub async fn put_manifest(
         None
     };
 
-    // Insert or update manifest in DB. Digest references are content-addressed:
-    // the database helper serializes retries and increments blob refs only for
-    // the request that actually created the row.
-    let increment_tag_refs = if let Some(tag) = tag {
-        // Check if tag already exists — update it
-        let result =
-            match rg_db::ops::oci_ops::find_manifest_by_tag(&state.db, oci_repo.id, tag).await {
-                Ok(Some(_)) => {
-                    rg_db::ops::oci_ops::update_manifest_tag(
-                        &state.db,
-                        oci_repo.id,
-                        tag,
-                        &parsed.digest,
-                        content_type,
-                        parsed.size as i64,
-                        &body,
-                        parsed.manifest.schema_version as i32,
-                        user_id,
-                    )
-                    .await
-                }
-                _ => {
-                    rg_db::ops::oci_ops::insert_manifest(
-                        &state.db,
-                        oci_repo.id,
-                        &parsed.digest,
-                        Some(tag),
-                        content_type,
-                        parsed.size as i64,
-                        &body,
-                        parsed.manifest.schema_version as i32,
-                        user_id,
-                    )
-                    .await
-                }
-            };
-        result.map(|_| true)
+    // Insert or update manifest in DB. Digest references are content-addressed;
+    // tag writes keep lookup, replacement and blob-reference claims in the same
+    // transaction, so no database failure can turn into an INSERT or leave a
+    // tag deleted after a failed move.
+    let manifest_write = if let Some(tag) = tag {
+        rg_db::ops::oci_ops::upsert_tag_manifest(
+            &state.db,
+            oci_repo.id,
+            tag,
+            &parsed.digest,
+            content_type,
+            parsed.size as i64,
+            &body,
+            parsed.manifest.schema_version as i32,
+            user_id,
+            &referenced_blobs,
+        )
+        .await
+        .map(|_| ())
     } else {
         rg_db::ops::oci_ops::insert_digest_manifest(
             &state.db,
@@ -897,47 +879,23 @@ pub async fn put_manifest(
             &referenced_blobs,
         )
         .await
-        .map(|_| false)
+        .map(|_| ())
     };
 
-    let increment_tag_refs = match increment_tag_refs {
-        Ok(increment) => increment,
+    match manifest_write {
+        Ok(_) => {}
         Err(e) => {
+            tracing::error!(
+                owner,
+                repo,
+                reference,
+                digest = %parsed.digest,
+                error = %format!("{e:#}"),
+                "failed to record OCI manifest"
+            );
             rollback_unrecorded_manifest(&state, &owner, &repo, &parsed.digest, &stored_manifest)
                 .await;
-            return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"));
-        }
-    };
-
-    // Increment blob ref counts.
-    //
-    // Digest-addressed inserts claimed their references transactionally above.
-    // Tag writes still use the legacy update path here. A blob whose ref count
-    // was not incremented is a blob a future GC could delete while this
-    // manifest still points at it, so a failure fails the push instead of being
-    // swallowed.
-    for blob_digest in if increment_tag_refs {
-        referenced_blobs.as_slice()
-    } else {
-        &[]
-    } {
-        let blob = match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, blob_digest).await {
-            Ok(Some(blob)) => blob,
-            Ok(None) => continue,
-            Err(e) => {
-                return oci_err(
-                    oci_status_for(&e),
-                    "UNKNOWN",
-                    &format!("failed to look up referenced blob {blob_digest}: {e}"),
-                )
-            }
-        };
-        if let Err(e) = rg_db::ops::oci_ops::increment_blob_ref(&state.db, blob.id).await {
-            return oci_err(
-                oci_status_for(&e),
-                "UNKNOWN",
-                &format!("failed to increment the ref count of blob {blob_digest}: {e}"),
-            );
+            return oci_err(oci_status_for(&e), "UNKNOWN", "failed to record manifest");
         }
     }
 

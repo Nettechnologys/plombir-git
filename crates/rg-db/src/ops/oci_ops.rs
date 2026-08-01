@@ -246,9 +246,14 @@ pub async fn insert_digest_manifest(
     Ok(outcome)
 }
 
-/// Update a manifest's tag (move a tag to a new digest).
+/// Insert a tagged manifest or atomically move an existing tag to it.
+///
+/// The tag lookup, replacement and blob-reference claims are one database
+/// transaction. A failed lookup must not be treated as an absent tag, and a
+/// failed replacement must leave the old tag live rather than deleting it
+/// before the new row can be written.
 #[allow(clippy::too_many_arguments)]
-pub async fn update_manifest_tag(
+pub async fn upsert_tag_manifest(
     db: &DatabaseConnection,
     oci_repo_id: i64,
     tag: &str,
@@ -258,12 +263,27 @@ pub async fn update_manifest_tag(
     new_manifest_json: &str,
     new_schema_version: i32,
     push_by: Option<i64>,
+    referenced_blob_digests: &[String],
 ) -> Result<oci_manifest::Model, DbErr> {
-    // Delete existing manifest with this tag
-    delete_manifest_by_tag(db, oci_repo_id, tag).await?;
-    // Insert new manifest
-    insert_manifest(
-        db,
+    use oci_blob::Entity as Blob;
+    use oci_manifest::Entity as Manifest;
+
+    let transaction = db.begin().await?;
+    let existing = Manifest::find()
+        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_manifest::Column::Tag.eq(tag))
+        .one(&transaction)
+        .await?;
+
+    if existing.is_some() {
+        Manifest::delete_many()
+            .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
+            .filter(oci_manifest::Column::Tag.eq(tag))
+            .exec(&transaction)
+            .await?;
+    }
+
+    let manifest = manifest_model(
         oci_repo_id,
         new_digest,
         Some(tag),
@@ -273,22 +293,28 @@ pub async fn update_manifest_tag(
         new_schema_version,
         push_by,
     )
-    .await
-}
+    .insert(&transaction)
+    .await?;
 
-/// Delete a manifest by tag.
-pub async fn delete_manifest_by_tag(
-    db: &DatabaseConnection,
-    oci_repo_id: i64,
-    tag: &str,
-) -> Result<u64, DbErr> {
-    use oci_manifest::Entity as Manifest;
-    let result = Manifest::delete_many()
-        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
-        .filter(oci_manifest::Column::Tag.eq(tag))
-        .exec(db)
-        .await?;
-    Ok(result.rows_affected)
+    for blob_digest in referenced_blob_digests {
+        let result = Blob::update_many()
+            .col_expr(
+                oci_blob::Column::RefCount,
+                Expr::col(oci_blob::Column::RefCount).add(1),
+            )
+            .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+            .filter(oci_blob::Column::Digest.eq(blob_digest))
+            .exec(&transaction)
+            .await?;
+        if result.rows_affected != 1 {
+            return Err(DbErr::Custom(format!(
+                "referenced OCI blob {blob_digest} is missing from repository {oci_repo_id}"
+            )));
+        }
+    }
+
+    transaction.commit().await?;
+    Ok(manifest)
 }
 
 // ── OCI Blob ────────────────────────────────────────────────

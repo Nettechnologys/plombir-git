@@ -13,7 +13,9 @@ use crate::common::fault::{
 };
 use crate::common::{create_issue, create_repo, register_full, spawn_test_app_with_db};
 use reqwest::multipart::{Form, Part};
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, Statement,
+};
 use serde_json::Value;
 
 // ── OCI registry ─────────────────────────────────────────────
@@ -731,6 +733,178 @@ async fn a_manifest_row_failure_rolls_back_only_its_own_object() {
     assert_eq!(pulled.text().await.unwrap(), manifest);
 }
 
+/// A failed tag lookup is a server failure, not evidence that the tag is free.
+///
+/// The view fails only reads of `tag`; its INSERT trigger leaves a durable probe
+/// row if the handler ever reaches the old "lookup Err -> INSERT" fallback.
+/// This keeps the failure at the actual branch instead of merely breaking the
+/// table, where both the lookup and a later INSERT would naturally fail.
+#[tokio::test]
+async fn a_failed_manifest_tag_lookup_never_falls_through_to_insert() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "tag_lookup", "tag_lookup@example.com").await;
+    create_repo(&base, &token, "lookup-failure").await;
+
+    let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let config_digest = push_blob(&base, &token, "tag_lookup", "lookup-failure", config).await;
+    let manifest = manifest_json(&config_digest, config.len());
+
+    // SQLite has no SELECT trigger. Swap only the table name the SeaORM entity
+    // uses for a view whose `tag` expression errors, then use an INSTEAD OF
+    // INSERT trigger as the proof that no write followed that failed lookup.
+    db.execute_unprepared("ALTER TABLE oci_manifest RENAME TO oci_manifest_backing")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "CREATE VIEW oci_manifest AS \
+         SELECT id, oci_repository_id, digest, json_extract('not JSON', '$') AS tag, \
+                media_type, size, manifest_json, schema_version, push_by, created_at, updated_at \
+         FROM oci_manifest_backing",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared("CREATE TABLE manifest_tag_lookup_probe (hit INTEGER NOT NULL)")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "CREATE TRIGGER manifest_tag_lookup_probe_insert \
+         INSTEAD OF INSERT ON oci_manifest \
+         BEGIN \
+           INSERT INTO manifest_tag_lookup_probe (hit) VALUES (1); \
+           SELECT RAISE(FAIL, 'unexpected insert after failed tag lookup'); \
+         END",
+    )
+    .await
+    .unwrap();
+
+    let failed = client
+        .put(format!(
+            "{base}/v2/tag_lookup/lookup-failure/manifests/latest"
+        ))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .body(manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a failed tag lookup must not be reported as a successful manifest PUT"
+    );
+    let body = failed.text().await.unwrap();
+    assert!(
+        !body.contains("not JSON") && !body.contains("unexpected insert after failed tag lookup"),
+        "database internals escaped through the OCI response: {body}"
+    );
+
+    let probe = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS count FROM manifest_tag_lookup_probe".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .expect("probe query must return its aggregate row")
+        .try_get::<i64>("", "count")
+        .unwrap();
+    assert_eq!(
+        probe, 0,
+        "a failed tag lookup reached INSERT instead of stopping before the write"
+    );
+}
+
+/// Moving a tag is all-or-nothing: an INSERT failure must retain the old row.
+#[tokio::test]
+async fn a_failed_manifest_tag_move_keeps_the_old_tag_live() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "tag_move", "tag_move@example.com").await;
+    create_repo(&base, &token, "atomic-move").await;
+
+    let old_config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let old_config_digest = push_blob(&base, &token, "tag_move", "atomic-move", old_config).await;
+    let old_manifest = manifest_json(&old_config_digest, old_config.len());
+    let new_config = b"{\"architecture\":\"arm64\",\"os\":\"linux\"}";
+    let new_config_digest = push_blob(&base, &token, "tag_move", "atomic-move", new_config).await;
+    let new_manifest = manifest_json(&new_config_digest, new_config.len());
+    let tag_url = format!("{base}/v2/tag_move/atomic-move/manifests/latest");
+    let put_tag = |body: String| {
+        client
+            .put(&tag_url)
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .body(body)
+            .send()
+    };
+
+    let initial = put_tag(old_manifest.clone()).await.unwrap();
+    assert_eq!(
+        initial.status(),
+        201,
+        "baseline tag push failed: {}",
+        initial.text().await.unwrap()
+    );
+
+    let fault = fail_db_writes(&db, "oci_manifest", DbWrite::Insert).await;
+    let failed = put_tag(new_manifest.clone()).await.unwrap();
+    assert_eq!(
+        failed.status(),
+        500,
+        "a failed tag replacement must be visible to the client"
+    );
+    let failed_body = failed.text().await.unwrap();
+    assert!(
+        !failed_body.contains("injected failure"),
+        "the OCI response leaked backend-specific database text: {failed_body}"
+    );
+    fault.clear().await;
+
+    let forgekeep_repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "tag_move", "atomic-move")
+            .await
+            .unwrap()
+            .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let retained = rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "latest")
+        .await
+        .unwrap()
+        .expect("the failed move must retain the old tag row");
+    assert_eq!(retained.manifest_json, old_manifest);
+
+    let pulled = client
+        .get(&tag_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pulled.status(), 200);
+    assert_eq!(pulled.text().await.unwrap(), old_manifest);
+
+    let healthy = put_tag(new_manifest.clone()).await.unwrap();
+    assert_eq!(
+        healthy.status(),
+        201,
+        "the tag must still be movable after the injected failure: {}",
+        healthy.text().await.unwrap()
+    );
+    let moved = rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "latest")
+        .await
+        .unwrap()
+        .expect("the healthy move must retain a tag row");
+    assert_eq!(moved.manifest_json, new_manifest);
+}
+
 /// A push whose blob row was never written must not keep the bytes.
 ///
 /// Every route to an OCI blob — reclamation included — goes through its
@@ -879,8 +1053,9 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
         ok.text().await.unwrap()
     );
 
-    // Re-pushing the tag takes the update path, and increments the ref counts
-    // again — which is the write this fault rejects.
+    // Re-pushing the tag takes the transactional replacement path and attempts
+    // to claim its blob references again — which is the write this fault
+    // rejects.
     let _fault = fail_db_writes(&db, "oci_blob", DbWrite::Update).await;
     let broken = client
         .put(&url)
@@ -900,9 +1075,9 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
         "a lost ref-count increment must fail the manifest push: {body}"
     );
     let message = body["errors"][0]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(&digest),
-        "the 500 must name the blob whose ref count it could not increment: {message}"
+    assert_eq!(
+        message, "failed to record manifest",
+        "the OCI response must be useful without disclosing backend internals: {message}"
     );
 }
 
