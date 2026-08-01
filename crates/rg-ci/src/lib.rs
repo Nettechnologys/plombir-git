@@ -167,11 +167,27 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
                     "Cancelling {} in-progress pipeline(s) for concurrency group",
                     active.len()
                 );
+                // `cancel_in_progress` is a promise that the group holds one
+                // pipeline at a time. A cancellation the database refused has
+                // not made room for the replacement: starting one anyway leaves
+                // the old chain running *and* adds a new one — the exact state
+                // the setting exists to prevent, and the shape the `else` branch
+                // below refuses outright. So the failure stops the trigger and
+                // reaches the caller instead of a warning line nobody reads.
+                //
+                // `Ok(false)` is not a failure: it means the pipeline finished
+                // or was canceled between the lookup and the write, which is the
+                // room we were asking for.
                 for p in &active {
-                    if let Err(e) = rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, p.id).await
-                    {
-                        tracing::warn!(pipeline_id = p.id, "Failed to cancel pipeline: {:#}", e);
-                    }
+                    rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, p.id)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "ci: cancel in-progress pipeline {} of concurrency group '{}' — \
+                                 the replacement pipeline was not started",
+                                p.id, group
+                            )
+                        })?;
                 }
             } else {
                 return Err(anyhow::anyhow!(
@@ -1501,6 +1517,138 @@ mod matrix_tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    /// `cancel_in_progress: true` promises the concurrency group runs one
+    /// pipeline at a time. A cancellation write the database refuses has to
+    /// stop the trigger — otherwise the promise buys the opposite of what it
+    /// says: the old chain keeps running and a second one joins it.
+    #[tokio::test]
+    async fn a_refused_concurrency_cancellation_does_not_start_a_replacement_pipeline() {
+        use sea_orm::ConnectionTrait;
+
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"concurrency:\n  group: ${{ ref }}\n  cancel_in_progress: true\nbuild:\n  script: [echo one]\n"
+                as &[u8],
+        )]);
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("concurrency.db").display()
+        ))
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "concurrency-owner",
+            "concurrency@example.com",
+            "unused",
+            "Concurrency Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("concurrency".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The in-progress pipeline the next push is supposed to replace.
+        let in_progress = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &sha,
+            "refs/heads/main",
+            "push",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+
+        // Scalpel fault injection: ONLY the cancellation write is refused.
+        // Inserting a pipeline with its stages and jobs still works, so nothing
+        // but the fix itself stands between this trigger and a second active
+        // chain — dropping a table would have failed the creation too and the
+        // test would pass for the wrong reason.
+        db.execute_unprepared(
+            "CREATE TRIGGER refuse_cancellation BEFORE UPDATE ON pipelines \
+             FOR EACH ROW WHEN NEW.status = 'canceled' \
+             BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END;",
+        )
+        .await
+        .expect("install the cancellation fault");
+
+        let error = trigger_pipeline(TriggerPipelineParams {
+            db: &db,
+            repo_path: temp.path(),
+            repo_id: repo.id,
+            commit_sha: &sha,
+            ref_name: "refs/heads/main",
+            trigger_type: "push",
+            base_branch: None,
+            triggered_by: Some(user.id),
+            docker_enabled: false,
+            external_runners: true,
+            allow_host_runner: false,
+            jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
+            external_url: None,
+        })
+        .await
+        .unwrap_err();
+
+        // The caller learns both what was refused and what did not happen
+        // because of it — the reason no longer lives only in the log.
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("the replacement pipeline was not started"),
+            "the caller must learn the trigger stopped on the cancellation: {reported}"
+        );
+        assert!(
+            reported.contains("injected cancellation failure"),
+            "the database reason must survive to the caller: {reported}"
+        );
+
+        // The count is the whole point: a failed cancellation must not grow the
+        // number of active pipelines on the ref.
+        let pipelines = rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            pipelines.len(),
+            1,
+            "a refused cancellation must not be followed by a replacement pipeline"
+        );
+        assert_eq!(pipelines[0].id, in_progress.id);
+        assert_eq!(
+            pipelines[0].status, "pending",
+            "the pipeline that could not be canceled stays exactly as it was"
+        );
+        assert_eq!(
+            rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(&db, repo.id, "refs/heads/main")
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
