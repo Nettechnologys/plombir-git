@@ -1107,27 +1107,41 @@ pub async fn explore(
 
     match rg_db::ops::repo_ops::list_public_paginated(&state.db, offset, limit).await {
         Ok((data, total)) => {
-            // Enrich with owner names
-            let enriched: Vec<serde_json::Value> =
-                futures::future::join_all(data.iter().map(|repo| async {
-                    let owner_name = rg_db::ops::user_ops::find_by_id(&state.db, repo.owner_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|u| u.username)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    serde_json::json!({
-                        "id": repo.id,
-                        "owner_id": repo.owner_id,
-                        "owner_name": owner_name,
-                        "name": repo.name,
-                        "description": repo.description,
-                        "stars_count": repo.stars_count,
-                        "forks_count": repo.forks_count,
-                        "updated_at": repo.updated_at,
-                    })
-                }))
-                .await;
+            // Enrich with owner names. The owner is not decoration here: the
+            // client links to `/{owner_name}/{name}`, so this listing is only
+            // usable if the name is the account's own.
+            //
+            // The two ways the lookup can end are therefore kept apart. A row
+            // that is genuinely absent — the account was deleted after the
+            // repository was published — answers `null`, which says "there is
+            // no owner to name" and lets the client render it as such. A lookup
+            // that could not run says nothing about the owner at all, so it
+            // fails the response instead of inventing one: a placeholder here
+            // ships a `200` the client trusts, never retries, and turns a live
+            // account into an unknown one (card_f15f12e055d0).
+            let lookups = futures::future::join_all(
+                data.iter()
+                    .map(|repo| rg_db::ops::user_ops::find_by_id(&state.db, repo.owner_id)),
+            )
+            .await;
+
+            let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(data.len());
+            for (repo, lookup) in data.iter().zip(lookups) {
+                let owner_name = match lookup {
+                    Ok(owner) => owner.map(|user| user.username),
+                    Err(error) => return AppError::from(error).into_response(),
+                };
+                enriched.push(serde_json::json!({
+                    "id": repo.id,
+                    "owner_id": repo.owner_id,
+                    "owner_name": owner_name,
+                    "name": repo.name,
+                    "description": repo.description,
+                    "stars_count": repo.stars_count,
+                    "forks_count": repo.forks_count,
+                    "updated_at": repo.updated_at,
+                }));
+            }
 
             (
                 StatusCode::OK,

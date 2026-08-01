@@ -56,10 +56,13 @@
   {:else}
     <div class="repo-grid">
       {#each repoList as repo}
-        <a href={`/${repo.owner_name}/${repo.name}`} class="repo-card">
+        <!-- `owner_name` is null when the owning account is gone; the API no
+             longer fabricates a name for it, so the placeholder is the client's
+             own, exactly as on the landing page. -->
+        <a href={`/${repo.owner_name || 'unknown'}/${repo.name}`} class="repo-card">
           <div class="rc-icon">📂</div>
           <div class="rc-body">
-            <div class="rc-name">{repo.owner_name}/{repo.name}</div>
+            <div class="rc-name">{repo.owner_name || 'unknown'}/{repo.name}</div>
             <div class="rc-desc">{repo.description || t('common.no_description')}</div>
             <div class="rc-meta">
               {repo.stars_count || 0} ⭐ · {t('common.updated', { date: formatDate(repo.updated_at) })}
