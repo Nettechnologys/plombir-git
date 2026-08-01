@@ -221,6 +221,40 @@ pub(crate) enum Commands {
     ///     FORGEKEEP_JWT_SECRET="$(forgekeep gen-secret)"
     GenSecret,
 
+    /// Replace this instance's Ed25519 provenance signing key.
+    ///
+    /// The key signs release attestations and backs `/api/v1/ci/oidc/jwks`. It
+    /// is stored, not derived from `jwt_secret`, so rotating the signing secret
+    /// leaves it alone — use this only when the key itself is compromised.
+    /// Every attestation signed with the previous key stops verifying.
+    RotateInstanceKey {
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+
+        /// JWT signing secret [config: [auth].jwt_secret]
+        /// [env: FORGEKEEP_JWT_SECRET]
+        #[arg(long)]
+        jwt_secret: Option<String>,
+
+        /// At-rest encryption key, which is what the stored key material is
+        /// sealed with [config: [auth].encryption_key]
+        /// [env: FORGEKEEP_ENCRYPTION_KEY]
+        #[arg(long)]
+        encryption_key: Option<String>,
+
+        /// Confirm the rotation. Without it the command refuses and explains
+        /// what would be invalidated.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Rebuild or refresh full-text search indexes from main tables
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)

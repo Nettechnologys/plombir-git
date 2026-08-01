@@ -3,10 +3,11 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Duration, Utc};
-use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+use crate::auth::instance_key::InstanceKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CiOidcClaims {
@@ -36,42 +37,29 @@ pub struct CiOidcJwk {
     pub x: String,
 }
 
-/// Derive the instance's Ed25519 key from the server secret.
+/// The JWKS entry published for the instance key.
 ///
-/// `pub(crate)` so sibling subsystems (e.g. release-asset attestation) can sign
-/// and verify with the *same* key that backs the CI OIDC JWKS — the public half
-/// is already published at `/api/v1/ci/oidc/jwks`, so any external verifier can
-/// check those signatures without a second key to distribute.
-pub(crate) fn signing_key(secret: &str) -> SigningKey {
-    let mut hash = Sha256::new();
-    hash.update(b"forgekeep-ci-oidc-ed25519-v1\0");
-    hash.update(secret.as_bytes());
-    SigningKey::from_bytes(&hash.finalize().into())
-}
-
-/// Public verifying key matching [`signing_key`], plus its JWK `kid`.
-pub(crate) fn verifying_key(secret: &str) -> ed25519_dalek::VerifyingKey {
-    signing_key(secret).verifying_key()
-}
-
-pub fn jwk(secret: &str) -> CiOidcJwk {
-    let verifying = signing_key(secret).verifying_key();
-    let x = URL_SAFE_NO_PAD.encode(verifying.as_bytes());
-    let kid = hex::encode(&Sha256::digest(verifying.as_bytes())[..8]);
+/// Sibling subsystems (release-asset attestation) sign and verify with the
+/// *same* [`InstanceKey`] that backs this document — its public half is already
+/// served at `/api/v1/ci/oidc/jwks`, so any external verifier can check those
+/// signatures without a second key to distribute. That sharing is also why the
+/// key must outlive `jwt_secret`: see [`crate::auth::instance_key`].
+pub fn jwk(key: &InstanceKey) -> CiOidcJwk {
+    let verifying = key.verifying_key();
     CiOidcJwk {
         kty: "OKP",
         crv: "Ed25519",
         key_use: "sig",
         alg: "EdDSA",
-        kid,
-        x,
+        kid: key.kid().to_string(),
+        x: URL_SAFE_NO_PAD.encode(verifying.as_bytes()),
     }
 }
 
 // Wide by design: assembles the full OIDC claim set for a CI job token.
 #[allow(clippy::too_many_arguments)]
 pub fn issue(
-    secret: &str,
+    key: &InstanceKey,
     issuer: &str,
     audience: &str,
     repo_id: i64,
@@ -82,13 +70,12 @@ pub fn issue(
 ) -> Result<(String, i64)> {
     let now = Utc::now();
     let expires = now + Duration::minutes(5);
-    let key = signing_key(secret);
     let pem = key
+        .signing_key()
         .to_pkcs8_pem(Default::default())
         .context("encode CI OIDC signing key")?;
-    let jwk = jwk(secret);
     let mut header = Header::new(Algorithm::EdDSA);
-    header.kid = Some(jwk.kid);
+    header.kid = Some(key.kid().to_string());
     header.typ = Some("JWT".into());
     let claims = CiOidcClaims {
         iss: issuer.trim_end_matches('/').to_string(),
@@ -116,8 +103,9 @@ mod tests {
     use jsonwebtoken::{decode, DecodingKey, Validation};
     #[test]
     fn tokens_are_asymmetric_audience_bound_and_publicly_verifiable() {
+        let instance_key = InstanceKey::derived_from_secret("secret");
         let (token, _) = issue(
-            "secret",
+            &instance_key,
             "https://forge.example/oidc",
             "sts.example",
             1,
@@ -127,8 +115,10 @@ mod tests {
             "abc",
         )
         .unwrap();
-        let key = signing_key("secret").verifying_key();
-        let pem = key.to_public_key_pem(Default::default()).unwrap();
+        let pem = instance_key
+            .verifying_key()
+            .to_public_key_pem(Default::default())
+            .unwrap();
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_audience(&["sts.example"]);
         validation.set_issuer(&["https://forge.example/oidc"]);

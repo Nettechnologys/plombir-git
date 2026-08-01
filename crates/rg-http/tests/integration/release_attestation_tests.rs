@@ -7,6 +7,7 @@
 
 use crate::common::{
     build_test_app_state, create_repo, register_user, setup_test_db, spawn_test_app,
+    spawn_test_app_over_db_with, StateOverrides, TEST_ENCRYPTION_KEY,
 };
 
 const PW: &str = "Qz7$wRtm";
@@ -103,6 +104,117 @@ async fn sign_get_verify_round_trip() {
         report["asset_sha256"],
         "e6abe9df7db8513616674b02b5edb26c37bf3b2f81daeec1e3c6fc8c9a802850"
     );
+}
+
+/// The card's acceptance, end to end: rotate `jwt_secret`, restart, and the
+/// envelope this instance issued before the rotation still verifies.
+///
+/// Before card_3aecf3708ebe the provenance key was derived from `jwt_secret`,
+/// so a rotation the security guide tells operators to perform silently
+/// replaced the instance's identity — and `POST .../attestation/verify` then
+/// answered "invalid" about a signature this very server had produced. What
+/// changes across the restart here is exactly that input — the secret the key
+/// used to be derived from. The identity, and every signature under it, must
+/// not.
+#[tokio::test]
+async fn a_rotated_jwt_secret_leaves_earlier_attestations_verifiable() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+
+    // First boot: the instance adopts and stores its identity, derived from the
+    // signing secret in force at the time.
+    let key_before = rg_core::auth::instance_key::load_or_adopt(
+        &db,
+        "the-original-jwt-secret",
+        TEST_ENCRYPTION_KEY,
+    )
+    .await
+    .expect("adopt instance key");
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        repo_root.clone(),
+        StateOverrides {
+            instance_key: Some(std::sync::Arc::new(key_before.clone())),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let owner = "rotuser".to_string();
+    let token = register_user(&base, &owner, "rotuser@example.com", PW).await;
+    let repo = "rotrepo".to_string();
+    create_repo(&base, &token, &repo).await;
+    let release_id = create_release(&base, &token, &owner, &repo).await;
+    let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
+
+    let client = reqwest::Client::new();
+    let signed = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed.status(), 201);
+    let envelope: serde_json::Value = signed.json().await.unwrap();
+
+    // The operator rotates the signing secret and restarts. Same database, same
+    // repo root, cold state — only the secret the key would have been derived
+    // from differs.
+    let key_after = rg_core::auth::instance_key::load_or_adopt(
+        &db,
+        "the-rotated-jwt-secret",
+        TEST_ENCRYPTION_KEY,
+    )
+    .await
+    .expect("load instance key after rotation");
+    assert_eq!(
+        key_after.kid(),
+        key_before.kid(),
+        "the published kid must survive a rotated signing secret"
+    );
+
+    let base_after = spawn_test_app_over_db_with(
+        db.clone(),
+        repo_root,
+        StateOverrides {
+            instance_key: Some(std::sync::Arc::new(key_after)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let fetched: serde_json::Value = client
+        .get(format!(
+            "{base_after}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched, envelope, "the stored envelope must be untouched");
+
+    let report: serde_json::Value = client
+        .post(format!(
+            "{base_after}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation/verify"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        report["verified"], true,
+        "an envelope this instance signed must not be called invalid after a jwt_secret \
+         rotation: {report}"
+    );
+    drop(dir);
 }
 
 #[tokio::test]

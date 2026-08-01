@@ -21,7 +21,8 @@ url = "sqlite://./forgekeep.db?mode=rwc"
 jwt_secret = "change-me-in-production"
 
 # Encrypts data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords,
-# SSO client secrets, OAuth tokens. Unset = the same value as `jwt_secret`.
+# SSO client secrets, OAuth tokens, and this instance's provenance signing key.
+# Unset = the same value as `jwt_secret`.
 #
 # ROTATION — read this before you ever change `jwt_secret`:
 #   Leaving `encryption_key` unset ties your encrypted data to the signing
@@ -31,6 +32,13 @@ jwt_secret = "change-me-in-production"
 #   cannot decrypt what is already stored, rather than failing at runtime.
 # Also settable as FORGEKEEP_ENCRYPTION_KEY / --encryption-key (env wins).
 # encryption_key = "the-secret-your-data-was-encrypted-with"
+#
+# There is no third key to configure here: the Ed25519 key that signs release
+# attestations and backs /api/v1/ci/oidc/jwks is established on first start and
+# kept in the database, precisely so that rotating `jwt_secret` cannot change
+# this instance's public identity. Replace it only with
+# `forgekeep rotate-instance-key --yes`, which permanently invalidates every
+# attestation signed with the previous key.
 
 [webhooks]
 # Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*

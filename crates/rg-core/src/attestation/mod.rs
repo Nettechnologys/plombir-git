@@ -10,9 +10,11 @@
 //!   bytes are reproducible across languages (deterministic provenance).
 //! - **Signature**: Ed25519 over the [DSSE] Pre-Authentication Encoding (PAE),
 //!   which domain-separates the payload with its `payloadType` and length
-//!   prefixes. The signing key is the instance key from [`crate::auth::ci_oidc`]
-//!   — its public half is already served at `/api/v1/ci/oidc/jwks`, so no new
-//!   key has to be distributed to verifiers.
+//!   prefixes. The signing key is the [instance
+//!   key](crate::auth::instance_key) — its public half is already served at
+//!   `/api/v1/ci/oidc/jwks`, so no new key has to be distributed to verifiers,
+//!   and it is stored rather than derived from `jwt_secret` so that rotating
+//!   the signing secret does not invalidate every envelope ever issued.
 //! - **Wrapper**: a [DSSE envelope](types::Envelope) stored detached from the
 //!   asset bytes.
 //! - **Verification**: signature + digest binding first, then a pluggable
@@ -27,10 +29,10 @@ pub mod types;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::{Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Verifier};
 use serde_json::Value;
 
-use crate::auth::ci_oidc;
+use crate::auth::instance_key::InstanceKey;
 pub use predicate::{PredicateVerifier, VerifierRegistry, FORGEKEEP_PROVENANCE_TYPE};
 pub use types::{Envelope, Signature as EnvelopeSignature, Statement, Subject, DSSE_PAYLOAD_TYPE};
 
@@ -55,20 +57,18 @@ fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 ///
 /// The payload is JCS-canonicalized so the bytes are deterministic; the
 /// signature is Ed25519 over the DSSE PAE of those bytes with the instance key.
-pub fn sign_statement(secret: &str, statement: &Statement) -> Result<Envelope> {
+pub fn sign_statement(key: &InstanceKey, statement: &Statement) -> Result<Envelope> {
     let value = serde_json::to_value(statement).context("serialize attestation statement")?;
     let payload = jcs::to_canonical_bytes(&value).context("canonicalize attestation payload")?;
     let msg = pae(DSSE_PAYLOAD_TYPE, &payload);
 
-    let key = ci_oidc::signing_key(secret);
     let signature = key.sign(&msg);
-    let keyid = ci_oidc::jwk(secret).kid;
 
     Ok(Envelope {
         payload_type: DSSE_PAYLOAD_TYPE.to_string(),
         payload: STANDARD.encode(&payload),
         signatures: vec![EnvelopeSignature {
-            keyid,
+            keyid: key.kid().to_string(),
             sig: STANDARD.encode(signature.to_bytes()),
         }],
     })
@@ -80,7 +80,7 @@ pub fn sign_statement(secret: &str, statement: &Statement) -> Result<Envelope> {
 /// URL); `predicate_extra` is merged into the predicate for extra context
 /// (release id, uploader, timestamp — all deterministic, no floats).
 pub fn sign_asset_provenance(
-    secret: &str,
+    key: &InstanceKey,
     filename: &str,
     sha256_hex: &str,
     builder_id: &str,
@@ -100,7 +100,7 @@ pub fn sign_asset_provenance(
         FORGEKEEP_PROVENANCE_TYPE.to_string(),
         predicate,
     );
-    sign_statement(secret, &statement)
+    sign_statement(key, &statement)
 }
 
 /// A successfully verified attestation.
@@ -122,7 +122,7 @@ pub struct Verified {
 ///   was tampered with, or the attestation belongs to different bytes),
 /// - the predicate type has no registered verifier or fails its checks.
 pub fn verify_envelope(
-    secret: &str,
+    key: &InstanceKey,
     envelope: &Envelope,
     expected_sha256: &str,
     registry: &VerifierRegistry,
@@ -140,8 +140,8 @@ pub fn verify_envelope(
         .context("decode attestation payload")?;
     let msg = pae(DSSE_PAYLOAD_TYPE, &payload);
 
-    let verifying = ci_oidc::verifying_key(secret);
-    let expected_kid = ci_oidc::jwk(secret).kid;
+    let verifying = key.verifying_key();
+    let expected_kid = key.kid();
 
     // A signature verifies only when both the bytes AND the advertised kid match
     // the instance key — so a valid signature carrying someone else's kid is
@@ -164,7 +164,32 @@ pub fn verify_envelope(
             break;
         }
     }
-    let keyid = verified_kid.context("no signature verified under the instance key")?;
+    let keyid = match verified_kid {
+        Some(keyid) => keyid,
+        // Naming the mismatch is the difference between "your asset is
+        // suspect" and "this instance no longer holds the key that signed it".
+        // The second is what an operator sees after deliberately rotating the
+        // provenance key, and it used to be indistinguishable from tampering
+        // (card_3aecf3708ebe).
+        None if envelope.signatures.iter().all(|s| s.keyid != expected_kid) => {
+            let offered: Vec<&str> = envelope
+                .signatures
+                .iter()
+                .map(|s| s.keyid.as_str())
+                .collect();
+            bail!(
+                "attestation was signed by a different instance key (kid {}) than this instance \
+                 now holds (kid {expected_kid}) — it predates a rotation of the provenance \
+                 signing key",
+                if offered.is_empty() {
+                    "none".to_string()
+                } else {
+                    offered.join(", ")
+                }
+            )
+        }
+        None => bail!("no signature verified under the instance key"),
+    };
 
     let statement: Statement =
         serde_json::from_slice(&payload).context("parse attestation statement")?;
@@ -189,7 +214,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const SECRET: &str = "instance-secret";
+    fn instance_key() -> InstanceKey {
+        InstanceKey::derived_from_secret("instance-secret")
+    }
+
     // SHA-256 of the empty string — a convenient fixed digest for vectors.
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -222,52 +250,62 @@ mod tests {
 
     #[test]
     fn sign_is_deterministic() {
-        let a = sign_statement(SECRET, &sample_statement()).unwrap();
-        let b = sign_statement(SECRET, &sample_statement()).unwrap();
+        let a = sign_statement(&instance_key(), &sample_statement()).unwrap();
+        let b = sign_statement(&instance_key(), &sample_statement()).unwrap();
         assert_eq!(a, b, "Ed25519 signing must be deterministic (RFC 8032)");
     }
 
     #[test]
     fn sign_then_verify_roundtrips() {
-        let env = sign_statement(SECRET, &sample_statement()).unwrap();
+        let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
-        let verified = verify_envelope(SECRET, &env, EMPTY_SHA256, &reg).unwrap();
+        let verified = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).unwrap();
         assert_eq!(verified.statement.subject_sha256(), Some(EMPTY_SHA256));
-        assert_eq!(verified.keyid, ci_oidc::jwk(SECRET).kid);
+        assert_eq!(verified.keyid, instance_key().kid());
     }
 
     #[test]
     fn tampered_asset_digest_fails() {
-        let env = sign_statement(SECRET, &sample_statement()).unwrap();
+        let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
         let other = "0".repeat(64);
-        assert!(verify_envelope(SECRET, &env, &other, &reg).is_err());
+        assert!(verify_envelope(&instance_key(), &env, &other, &reg).is_err());
     }
 
+    /// A different instance key must not verify — and the refusal must say so
+    /// in those words. "Invalid signature" about an envelope this instance
+    /// signed before its key was rotated reads as tampering; naming both `kid`s
+    /// is what tells the operator it is a key change (card_3aecf3708ebe).
     #[test]
-    fn wrong_key_fails() {
-        let env = sign_statement(SECRET, &sample_statement()).unwrap();
+    fn a_different_instance_key_fails_and_names_the_mismatch() {
+        let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
-        assert!(verify_envelope("different-secret", &env, EMPTY_SHA256, &reg).is_err());
+        let other = InstanceKey::derived_from_secret("a-rotated-instance");
+        let error = verify_envelope(&other, &env, EMPTY_SHA256, &reg)
+            .expect_err("an envelope signed by another key must not verify");
+        let message = format!("{error:#}");
+        assert!(message.contains(instance_key().kid()), "{message}");
+        assert!(message.contains(other.kid()), "{message}");
+        assert!(message.contains("rotation"), "{message}");
     }
 
     #[test]
     fn flipped_signature_bit_fails() {
-        let mut env = sign_statement(SECRET, &sample_statement()).unwrap();
+        let mut env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         // Corrupt one signature byte.
         let mut raw = STANDARD.decode(env.signatures[0].sig.as_bytes()).unwrap();
         raw[0] ^= 0x01;
         env.signatures[0].sig = STANDARD.encode(&raw);
         let reg = VerifierRegistry::with_defaults();
-        assert!(verify_envelope(SECRET, &env, EMPTY_SHA256, &reg).is_err());
+        assert!(verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).is_err());
     }
 
     #[test]
     fn valid_signature_with_foreign_kid_is_rejected() {
-        let mut env = sign_statement(SECRET, &sample_statement()).unwrap();
+        let mut env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         env.signatures[0].keyid = "deadbeef".to_string();
         let reg = VerifierRegistry::with_defaults();
-        assert!(verify_envelope(SECRET, &env, EMPTY_SHA256, &reg).is_err());
+        assert!(verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).is_err());
     }
 
     #[test]
@@ -281,7 +319,7 @@ mod tests {
     #[test]
     fn provenance_helper_merges_extra_and_verifies() {
         let env = sign_asset_provenance(
-            SECRET,
+            &instance_key(),
             "app.tar.gz",
             EMPTY_SHA256,
             "https://forge.example",
@@ -289,7 +327,7 @@ mod tests {
         )
         .unwrap();
         let reg = VerifierRegistry::with_defaults();
-        let v = verify_envelope(SECRET, &env, EMPTY_SHA256, &reg).unwrap();
+        let v = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).unwrap();
         assert_eq!(v.statement.predicate["release_id"], json!(7));
         assert_eq!(
             v.statement.predicate["builder"]["id"],

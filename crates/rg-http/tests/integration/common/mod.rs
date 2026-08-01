@@ -94,6 +94,14 @@ pub struct StateOverrides {
     /// still be open. Production samples every 30s; a test that has to observe
     /// the socket close cannot sit through that.
     pub ws_session_recheck_secs: Option<u64>,
+    /// Replaces this state's provenance signing identity.
+    ///
+    /// The default is derived from [`TEST_INSTANCE_KEY_SECRET`] rather than
+    /// loaded from the database, so a state can be built synchronously. A test
+    /// about the key's *lifetime* — that it survives a rotated `jwt_secret` —
+    /// must load it through `rg_core::auth::instance_key::load_or_adopt` and
+    /// inject it here, which is the production path.
+    pub instance_key: Option<Arc<rg_core::auth::instance_key::InstanceKey>>,
 }
 
 /// The at-rest encryption key every test AppState carries.
@@ -101,6 +109,13 @@ pub struct StateOverrides {
 /// Distinct from the JWT secret on purpose — see the field comment in
 /// [`build_test_app_state_with`].
 pub const TEST_ENCRYPTION_KEY: &str = "test-encryption-key";
+
+/// The secret every test AppState derives its provenance identity from.
+///
+/// A third distinct string, for the same reason `TEST_ENCRYPTION_KEY` is a
+/// second one: a fixture where the keys collide cannot tell a handler that
+/// reached for the right key from one that reached for `jwt_secret`.
+pub const TEST_INSTANCE_KEY_SECRET: &str = "test-instance-key";
 
 pub fn build_test_app_state(
     db: rg_db::DatabaseConnection,
@@ -140,6 +155,13 @@ pub fn build_test_app_state_with(
         // whole defect. Any test that stores ciphertext must key it with
         // `TEST_ENCRYPTION_KEY`.
         encryption_key: Arc::new(TEST_ENCRYPTION_KEY.to_string()),
+        instance_key: overrides.instance_key.unwrap_or_else(|| {
+            Arc::new(
+                rg_core::auth::instance_key::InstanceKey::derived_from_secret(
+                    TEST_INSTANCE_KEY_SECRET,
+                ),
+            )
+        }),
         external_webhook_secret: None,
         docker_enabled: false,
         external_runners: false,
@@ -333,6 +355,32 @@ pub async fn spawn_test_app_over_db(db: rg_db::DatabaseConnection) -> String {
     let base_url = format!("http://{}", addr);
     tokio::spawn(async move {
         let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    base_url
+}
+
+/// Spawn a server over an existing database **and** repo root, with explicit
+/// state overrides — a restart that keeps both halves of the instance.
+///
+/// [`spawn_test_app_over_db`] gives the new server a fresh repo root, which is
+/// right for a test about a database-backed setting and wrong for one that has
+/// to read bytes the previous server wrote (release assets, LFS objects). Use
+/// this when durability spans both stores.
+#[allow(dead_code)]
+pub async fn spawn_test_app_over_db_with(
+    db: rg_db::DatabaseConnection,
+    repo_root: std::path::PathBuf,
+    overrides: StateOverrides,
+) -> String {
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let state = build_test_app_state_with(db, repo_root, overrides);
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     wait_for_listener(&addr.to_string()).await;

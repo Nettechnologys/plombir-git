@@ -641,7 +641,7 @@ pub async fn sign_asset_attestation(
     match rg_core::release::service::sign_asset_attestation(
         &state.db,
         asset.id,
-        &state.jwt_secret,
+        &state.instance_key,
         &builder_id,
     )
     .await
@@ -738,7 +738,7 @@ pub async fn verify_asset_attestation(
         &state.repo_root,
         &owner,
         &name,
-        &state.jwt_secret,
+        &state.instance_key,
     )
     .await
     {

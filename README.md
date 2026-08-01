@@ -118,13 +118,14 @@ needs no flags at all.
 
 ### Secrets and rotation
 
-ForgeKeep holds two independent secrets. They do different jobs, and telling
-them apart is what makes rotation safe.
+ForgeKeep holds two configured secrets and one stored key. They do different
+jobs, and telling them apart is what makes rotation safe.
 
 | Secret | Sources (first wins) | Protects |
 |--------|----------------------|----------|
 | **JWT secret** | `FORGEKEEP_JWT_SECRET` › `--jwt-secret` › `[auth].jwt_secret` | Signatures: session tokens, PAT-derived tokens, CI job tokens |
-| **Encryption key** | `FORGEKEEP_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › *the JWT secret* | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens |
+| **Encryption key** | `FORGEKEEP_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › *the JWT secret* | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens, the instance signing key below |
+| **Instance signing key** | Stored in the database, established on first start | This instance's public identity: release-asset provenance attestations and the CI OIDC JWKS |
 
 **Set the encryption key explicitly.** Left unset it falls back to the JWT
 secret, which ties every encrypted row in the database to the secret you are
@@ -142,6 +143,22 @@ encryption_key = "..."   # this one keeps your data readable
 restart. Existing sessions are invalidated — everyone logs in again — and
 nothing else is affected.
 
+**The instance signing key is not a config value.** It signs release-asset
+attestations and backs the public keys at `/api/v1/ci/oidc/jwks`, so it has to
+outlive the secrets you rotate: a key that changed with `jwt_secret` would make
+every attestation this server ever issued fail verification — against the very
+server that signed it — and change the `kid` under external verifiers that
+already fetched it. The server establishes the key on first start (adopting the
+one the old derivation produced, so nothing signed earlier is invalidated by
+upgrading), seals it with the encryption key, and keeps it in the database.
+
+Replace it only if the key itself is compromised, and knowing that every
+attestation signed with it stops verifying for good:
+
+```bash
+forgekeep rotate-instance-key --config forgekeep.toml --yes
+```
+
 **Rotating the encryption key** is a different operation: the stored ciphertext
 must be re-encrypted, and there is no tool for that yet. Until there is, treat
 the encryption key as permanent for a given database.
@@ -153,7 +170,9 @@ syncs and LDAP binds one at a time with unrelated-looking 500s. A brand-new
 database has nothing to check, so a fresh install is never blocked.
 
 If the old secret is genuinely lost, no tool can recover the encrypted values:
-clear them and have MFA re-enrolled and the stored credentials re-entered.
+clear them and have MFA re-enrolled and the stored credentials re-entered. That
+includes the instance signing key — `rotate-instance-key` mints a new identity,
+and attestations signed under the old one stay unverifiable.
 
 ### Create a test repository
 

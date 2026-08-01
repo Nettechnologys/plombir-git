@@ -33,7 +33,7 @@
 use anyhow::{bail, Context, Result};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 
-use rg_db::entities::{ci_secret, mirror, oauth_account, sso_provider, user};
+use rg_db::entities::{ci_secret, instance_signing_key, mirror, oauth_account, sso_provider, user};
 
 use crate::auth::encryption;
 
@@ -134,7 +134,8 @@ fn wrong_key_message(probe: &KeyProbe) -> String {
          \n\
          Nothing has been changed. This is what a changed secret looks like: data at rest \
          (TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth \
-         tokens) is encrypted with [auth].encryption_key, which defaults to [auth].jwt_secret \
+         tokens, this instance's provenance signing key) is encrypted with \
+         [auth].encryption_key, which defaults to [auth].jwt_secret \
          when it is not set. Starting anyway would fail every one of those operations \
          separately, at runtime, with no indication why.\n\
          \n\
@@ -149,7 +150,9 @@ fn wrong_key_message(probe: &KeyProbe) -> String {
          \n\
          If the previous secret is genuinely lost, the encrypted values cannot be recovered \
          by anyone: clear them and have MFA re-enrolled, CI secrets, mirror and LDAP \
-         passwords and SSO client secrets re-entered.",
+         passwords and SSO client secrets re-entered. The instance's provenance signing key \
+         is in that set — losing it means release attestations signed so far can no longer \
+         be verified, and `forgekeep rotate-instance-key` is what mints a new identity.",
         probed = probe.probed,
         columns = probe.unopened_columns.join(", "),
     )
@@ -208,6 +211,18 @@ async fn collect_samples(db: &DatabaseConnection) -> Result<Vec<(&'static str, S
             row.refresh_token
                 .map(|v| ("oauth_accounts.refresh_token", v)),
         );
+    }
+
+    // The instance's provenance signing key. Unlike the columns above it exists
+    // on every instance that has started once, so it is what makes this check
+    // bite on a deployment that stores nothing else encrypted.
+    for row in instance_signing_key::Entity::find()
+        .limit(SAMPLE_LIMIT)
+        .all(db)
+        .await
+        .context("sampling instance_signing_key.seed_encrypted")?
+    {
+        samples.push(("instance_signing_key.seed_encrypted", row.seed_encrypted));
     }
 
     for row in mirror::Entity::find()

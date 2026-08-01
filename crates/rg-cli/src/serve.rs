@@ -190,6 +190,67 @@ fn env_secret(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Resolve the pair of secrets every server-side path needs: the one that
+/// *signs* and the one that *encrypts*. Shared with the one-shot subcommands
+/// that also have to open at-rest data, so "which key opens this database" has
+/// one answer and not one per entry point.
+pub(crate) fn resolve_auth_secrets(
+    cfg: Option<&crate::config::ConfigFile>,
+    jwt_secret: Option<String>,
+    encryption_key: Option<String>,
+) -> anyhow::Result<(String, String)> {
+    // Resolve JWT secret: env var > CLI args > config file > error
+    let resolved_jwt_secret = if let Some(env_secret) = env_secret("FORGEKEEP_JWT_SECRET") {
+        validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
+        tracing::info!("Using JWT secret from environment variable FORGEKEEP_JWT_SECRET");
+        env_secret
+    } else if let Some(cli_secret) = jwt_secret {
+        validate_jwt_secret(&cli_secret, "--jwt-secret CLI argument")?;
+        cli_secret
+    } else if let Some(cfg_secret) = cfg.and_then(|c| c.auth.jwt_secret.clone()) {
+        validate_jwt_secret(&cfg_secret, "config file [auth].jwt_secret")?;
+        cfg_secret
+    } else {
+        anyhow::bail!(
+            "No JWT secret provided. Set FORGEKEEP_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
+        );
+    };
+
+    // Resolve the at-rest encryption secret: env var > CLI arg > config file >
+    // the JWT secret.
+    //
+    // The fallback is not laziness, it is compatibility: until card_d740512de0a8
+    // the two were the same value by construction, so every existing database
+    // has its TOTP secrets, CI secrets, mirror/LDAP passwords, SSO client
+    // secrets and OAuth tokens encrypted under `jwt_secret`. Splitting them
+    // without the fallback would have made this release the exact silent
+    // data-loss event the card is about. Setting the key explicitly is what
+    // makes rotating the *signing* secret safe from then on — and the startup
+    // preflight is what catches an operator who rotated without doing that.
+    let resolved_encryption_key = if let Some(env_key) = env_secret("FORGEKEEP_ENCRYPTION_KEY") {
+        validate_jwt_secret(&env_key, "environment variable FORGEKEEP_ENCRYPTION_KEY")?;
+        tracing::info!("Using at-rest encryption key from FORGEKEEP_ENCRYPTION_KEY");
+        env_key
+    } else if let Some(cli_key) = encryption_key {
+        validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
+        tracing::info!("Using at-rest encryption key from --encryption-key");
+        cli_key
+    } else if let Some(cfg_key) = cfg.and_then(|c| c.auth.encryption_key.clone()) {
+        validate_jwt_secret(&cfg_key, "config file [auth].encryption_key")?;
+        tracing::info!("Using at-rest encryption key from config file [auth].encryption_key");
+        cfg_key
+    } else {
+        tracing::info!(
+            "No [auth].encryption_key set — encrypting data at rest with the JWT secret. \
+             Set it (to the current JWT secret) before you ever rotate jwt_secret, or the \
+             stored secrets become unreadable"
+        );
+        resolved_jwt_secret.clone()
+    };
+
+    Ok((resolved_jwt_secret, resolved_encryption_key))
+}
+
 /// Initialise and run the ForgeKeep server (HTTP + SSH).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_serve(
@@ -225,54 +286,8 @@ pub(crate) async fn run_serve(
         None
     };
 
-    // Resolve JWT secret: env var > CLI args > config file > error
-    let resolved_jwt_secret = if let Some(env_secret) = env_secret("FORGEKEEP_JWT_SECRET") {
-        validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
-        tracing::info!("Using JWT secret from environment variable FORGEKEEP_JWT_SECRET");
-        env_secret
-    } else if let Some(cli_secret) = jwt_secret {
-        validate_jwt_secret(&cli_secret, "--jwt-secret CLI argument")?;
-        cli_secret
-    } else if let Some(cfg_secret) = cfg.as_ref().and_then(|c| c.auth.jwt_secret.clone()) {
-        validate_jwt_secret(&cfg_secret, "config file [auth].jwt_secret")?;
-        cfg_secret
-    } else {
-        anyhow::bail!(
-            "No JWT secret provided. Set FORGEKEEP_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
-        );
-    };
-
-    // Resolve the at-rest encryption secret: env var > CLI arg > config file >
-    // the JWT secret.
-    //
-    // The fallback is not laziness, it is compatibility: until card_d740512de0a8
-    // the two were the same value by construction, so every existing database
-    // has its TOTP secrets, CI secrets, mirror/LDAP passwords, SSO client
-    // secrets and OAuth tokens encrypted under `jwt_secret`. Splitting them
-    // without the fallback would have made this release the exact silent
-    // data-loss event the card is about. Setting the key explicitly is what
-    // makes rotating the *signing* secret safe from then on — and the preflight
-    // below is what catches an operator who rotated without doing that.
-    let resolved_encryption_key = if let Some(env_key) = env_secret("FORGEKEEP_ENCRYPTION_KEY") {
-        validate_jwt_secret(&env_key, "environment variable FORGEKEEP_ENCRYPTION_KEY")?;
-        tracing::info!("Using at-rest encryption key from FORGEKEEP_ENCRYPTION_KEY");
-        env_key
-    } else if let Some(cli_key) = encryption_key {
-        validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
-        tracing::info!("Using at-rest encryption key from --encryption-key");
-        cli_key
-    } else if let Some(cfg_key) = cfg.as_ref().and_then(|c| c.auth.encryption_key.clone()) {
-        validate_jwt_secret(&cfg_key, "config file [auth].encryption_key")?;
-        tracing::info!("Using at-rest encryption key from config file [auth].encryption_key");
-        cfg_key
-    } else {
-        tracing::info!(
-            "No [auth].encryption_key set — encrypting data at rest with the JWT secret. \
-             Set it (to the current JWT secret) before you ever rotate jwt_secret, or the \
-             stored secrets become unreadable"
-        );
-        resolved_jwt_secret.clone()
-    };
+    let (resolved_jwt_secret, resolved_encryption_key) =
+        resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key)?;
 
     // Resolve every dual-source knob in one place: CLI args > config file >
     // built-in default.
@@ -531,6 +546,22 @@ pub(crate) async fn run_serve(
     // migrations so the columns it samples are guaranteed to exist.
     rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
 
+    // ── Instance provenance identity ──────────────────────────────
+    // The Ed25519 key that signs release attestations and backs the CI OIDC
+    // JWKS. Loaded from the database — on the first start it adopts exactly the
+    // key the old `jwt_secret` derivation produced, so nothing that was already
+    // signed stops verifying, and from then on the identity outlives every
+    // rotation of either secret (card_3aecf3708ebe).
+    let instance_key = std::sync::Arc::new(
+        rg_core::auth::instance_key::load_or_adopt(
+            &db,
+            &resolved_jwt_secret,
+            &resolved_encryption_key,
+        )
+        .await?,
+    );
+    tracing::info!(kid = %instance_key.kid(), "instance provenance signing key ready");
+
     // ── Graceful shutdown signal ──────────────────────────────────
     // A single `watch` channel fans the SIGTERM/ctrl_c signal out to the HTTP
     // server and every background worker so they can drain and exit cleanly.
@@ -646,6 +677,7 @@ pub(crate) async fn run_serve(
         db: db.clone(),
         jwt_secret: resolved_jwt_secret.clone(),
         encryption_key: resolved_encryption_key.clone(),
+        instance_key,
         external_webhook_secret: resolved_external_webhook_secret,
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,

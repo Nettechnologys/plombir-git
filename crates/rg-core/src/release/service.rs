@@ -573,7 +573,7 @@ pub struct AttestationReport {
 pub async fn sign_asset_attestation(
     db: &DatabaseConnection,
     asset_id: i64,
-    secret: &str,
+    key: &crate::auth::instance_key::InstanceKey,
     builder_id: &str,
 ) -> Result<(Asset, crate::attestation::Envelope)> {
     let asset = get_asset(db, asset_id).await?;
@@ -589,7 +589,7 @@ pub async fn sign_asset_attestation(
         "created_at": asset.created_at.to_rfc3339(),
     });
     let envelope = crate::attestation::sign_asset_provenance(
-        secret,
+        key,
         &asset.filename,
         sha256,
         builder_id,
@@ -627,7 +627,7 @@ pub async fn verify_asset_attestation(
     repo_root: &Path,
     owner: &str,
     repo_name: &str,
-    secret: &str,
+    key: &crate::auth::instance_key::InstanceKey,
 ) -> Result<AttestationReport> {
     let asset = get_asset(db, asset_id).await?;
     let json = asset
@@ -641,7 +641,7 @@ pub async fn verify_asset_attestation(
     let actual_sha = hex::encode(Sha256::digest(&data));
 
     let registry = crate::attestation::VerifierRegistry::with_defaults();
-    match crate::attestation::verify_envelope(secret, &envelope, &actual_sha, &registry) {
+    match crate::attestation::verify_envelope(key, &envelope, &actual_sha, &registry) {
         Ok(v) => Ok(AttestationReport {
             verified: true,
             reason: None,

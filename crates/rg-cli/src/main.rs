@@ -89,6 +89,17 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::GenSecret => commands::cmd_gen_secret(),
 
+        Commands::RotateInstanceKey {
+            db_url,
+            config,
+            jwt_secret,
+            encryption_key,
+            yes,
+        } => {
+            commands::cmd_rotate_instance_key(db_url, config, jwt_secret, encryption_key, yes)
+                .await?
+        }
+
         Commands::RebuildFts { db_url, config } => {
             commands::cmd_rebuild_fts(db_url, config).await?
         }

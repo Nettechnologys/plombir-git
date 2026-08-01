@@ -9,6 +9,7 @@ pub mod commit_status_ops;
 pub mod deploy_key_ops;
 pub mod import_task_ops;
 pub mod instance_settings_ops;
+pub mod instance_signing_key_ops;
 pub mod issue_comment_ops;
 pub mod issue_label_ops;
 pub mod issue_ops;

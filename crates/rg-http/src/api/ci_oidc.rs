@@ -68,7 +68,7 @@ pub async fn discovery(State(state): State<AppState>, headers: HeaderMap) -> imp
 
 #[utoipa::path(get, path = "/ci/oidc/jwks", tag = "CI/CD", responses((status = 200, description = "Public Ed25519 signing keys")))]
 pub async fn jwks(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({ "keys": [rg_core::auth::ci_oidc::jwk(&state.jwt_secret)] }))
+    Json(serde_json::json!({ "keys": [rg_core::auth::ci_oidc::jwk(&state.instance_key)] }))
 }
 
 #[derive(Serialize)]
@@ -107,7 +107,7 @@ pub async fn token(
         Err(error) => return error.into_response(),
     };
     let (value, expires_at) = match rg_core::auth::ci_oidc::issue(
-        &state.jwt_secret,
+        &state.instance_key,
         &issuer,
         &query.audience,
         pipeline.repo_id,

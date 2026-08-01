@@ -105,8 +105,15 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
         .expect("connect to throwaway database");
 
     // ── The schema as it was, one step before the rebuild ────────────────────
-    let all = rg_db::migrations::Migrator::migrations().len();
-    let before_rebuild = u32::try_from(all - 1).expect("migration count fits in u32");
+    // Located by name, not by "one before the end": the rebuild stopped being
+    // the newest migration the moment another one landed, and a count-based
+    // index silently starts testing a different step instead of failing.
+    const REBUILD: &str = "m20260730_000001_repositories_namespace_unique";
+    let before_rebuild = rg_db::migrations::Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == REBUILD)
+        .unwrap_or_else(|| panic!("{REBUILD} must still be part of the migration list"));
+    let before_rebuild = u32::try_from(before_rebuild).expect("migration index fits in u32");
     rg_db::migrations::Migrator::up(&db, Some(before_rebuild))
         .await
         .expect("migrate up to the step before the rebuild");

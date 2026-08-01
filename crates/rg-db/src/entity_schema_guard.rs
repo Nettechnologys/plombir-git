@@ -74,6 +74,7 @@ probed_entities!(
     deploy_key,
     import_task,
     instance_settings,
+    instance_signing_key,
     issue,
     issue_comment,
     issue_label,

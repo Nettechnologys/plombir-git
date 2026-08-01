@@ -79,6 +79,7 @@ pub mod m20260727_000002_clear_import_task_auth_tokens;
 pub mod m20260728_000001_create_instance_settings;
 pub mod m20260728_000002_add_package_file_digests;
 pub mod m20260730_000001_repositories_namespace_unique;
+pub mod m20260801_000001_create_instance_signing_key;
 
 use sea_orm_migration::prelude::*;
 
@@ -171,6 +172,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260728_000001_create_instance_settings::Migration),
             Box::new(m20260728_000002_add_package_file_digests::Migration),
             Box::new(m20260730_000001_repositories_namespace_unique::Migration),
+            Box::new(m20260801_000001_create_instance_signing_key::Migration),
         ]
     }
 }

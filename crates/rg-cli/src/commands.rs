@@ -74,6 +74,60 @@ pub(crate) fn cmd_gen_secret() {
     println!("{}", admin::generate_jwt_secret());
 }
 
+/// `forgekeep rotate-instance-key` — replace this instance's provenance
+/// signing key.
+///
+/// The deliberate, destructive counterpart to the key's whole point. Since
+/// card_3aecf3708ebe the Ed25519 identity that signs release attestations and
+/// backs the CI OIDC JWKS is stored rather than derived from `jwt_secret`, so
+/// rotating the signing secret no longer touches it — which also means a
+/// *leaked* instance key has no other way out. This is that way out, and it is
+/// explicit because everything the old key signed stops verifying.
+pub(crate) async fn cmd_rotate_instance_key(
+    db_url: Option<String>,
+    config: Option<String>,
+    jwt_secret: Option<String>,
+    encryption_key: Option<String>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    let db_url = config::resolve_db_url(db_url, cfg.as_ref());
+    let (_, resolved_encryption_key) =
+        crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key)?;
+
+    let db = dbconn::connect(&db_url).await?;
+    let current = rg_db::ops::instance_signing_key_ops::find(&db)
+        .await
+        .context("read the current instance signing key")?;
+
+    if !yes {
+        let established = match current.as_ref() {
+            Some(row) => format!("established {}", row.created_at.to_rfc3339()),
+            None => "not established yet".to_string(),
+        };
+        anyhow::bail!(
+            "refusing to rotate the instance signing key without --yes ({established}).\n\
+             \n\
+             Rotating mints a new Ed25519 identity for this instance. Every release \
+             attestation signed with the current key stops verifying — permanently, for \
+             everyone — and every external verifier that fetched /api/v1/ci/oidc/jwks has to \
+             refetch it. Do this when the key itself is compromised, not to recover from a \
+             rotated jwt_secret: the signing secret and this key have been independent since \
+             card_3aecf3708ebe."
+        );
+    }
+
+    let rotated = rg_core::auth::instance_key::rotate(&db, &resolved_encryption_key).await?;
+    println!("{}", rotated.kid());
+    tracing::warn!(
+        kid = %rotated.kid(),
+        "instance signing key rotated; previously signed attestations no longer verify"
+    );
+    Ok(())
+}
+
 /// `forgekeep rebuild-fts` — rebuild full-text search indexes.
 pub(crate) async fn cmd_rebuild_fts(
     db_url: Option<String>,

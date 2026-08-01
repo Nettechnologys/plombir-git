@@ -93,8 +93,11 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
         .as_str()
         .unwrap()
         .to_string();
-    let public = rg_core::auth::ci_oidc::jwk("test-secret-key");
-    let key = jsonwebtoken::DecodingKey::from_ed_components(&public.x).unwrap();
+    // Verify through the published JWKS, the way an external relying party
+    // would — and never by re-deriving the key from a secret, which is the
+    // coupling card_3aecf3708ebe removed.
+    let public_x = jwks["keys"][0]["x"].as_str().unwrap();
+    let key = jsonwebtoken::DecodingKey::from_ed_components(public_x).unwrap();
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
     validation.set_audience(&["sts.example"]);
     validation.set_issuer(&[format!("{base}/api/v1/ci/oidc")]);
