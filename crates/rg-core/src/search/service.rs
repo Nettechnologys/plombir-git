@@ -14,7 +14,7 @@
 //! [`crate::search::dialect`]; this module stays dialect-agnostic.
 
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{ConnectionTrait, DatabaseConnection, QueryResult, Statement, TryGetable, Value};
 use serde::Serialize;
 
 use crate::search::dialect::{fts_match, ISSUES_FTS_COLS, REPOS_FTS_COLS, WIKI_FTS_COLS};
@@ -291,6 +291,53 @@ fn search_params(
         .collect()
 }
 
+/// Decode a column the search projection is obliged to produce.
+///
+/// `id` and `title` are `NOT NULL` in all three projections, so a value that
+/// will not decode is a schema drift or a backend type mismatch — not a row
+/// that happens to be blank. Reading it as `unwrap_or(0)` / `unwrap_or_default`
+/// is how such a row leaves the server as a result pointing at entity `0` with
+/// an empty title: a coherent-looking answer with nothing to trace it back to.
+/// A decoded value is the only thing allowed out.
+fn decode_required<T: TryGetable>(
+    row: &QueryResult,
+    index: usize,
+    what: &str,
+    column: &str,
+) -> Result<T> {
+    row.try_get_by_index::<T>(index)
+        .with_context(|| format!("fts: {what}: decode `{column}`"))
+}
+
+/// Decode a nullable column, keeping `NULL` and "would not decode" apart.
+///
+/// Reading these as `try_get_by_index(..).ok()` collapses both into `None`, so
+/// an owner or excerpt that failed to decode is served as the absence of an
+/// owner or excerpt. Only SQL `NULL` may answer `None`.
+fn decode_optional<T: TryGetable>(
+    row: &QueryResult,
+    index: usize,
+    what: &str,
+    column: &str,
+) -> Result<Option<T>> {
+    row.try_get_by_index::<Option<T>>(index)
+        .with_context(|| format!("fts: {what}: decode `{column}`"))
+}
+
+/// Decode the single row a `COUNT(...)` aggregate is obliged to return.
+///
+/// Mirrors `rg_db::ops::org_ops::decode_count`: a missing row and an
+/// undecodable count are failures of the count, not a total of zero. The total
+/// travels next to the results, so folding it into `0` publishes a page that
+/// contradicts itself — rows in hand, and a `total` telling the client there
+/// were none to page through.
+fn decode_total(rows: &[QueryResult], what: &str) -> Result<i64> {
+    let row = rows
+        .first()
+        .with_context(|| format!("fts: {what}: aggregate returned no row"))?;
+    decode_required(row, 0, what, "count")
+}
+
 /// Search repositories by name and description, with optional filters.
 async fn search_repos(
     db: &DatabaseConnection,
@@ -344,10 +391,10 @@ async fn search_repos(
 
     let mut results = Vec::new();
     for row in rows {
-        let id: i64 = row.try_get_by_index(0).unwrap_or(0);
-        let title: String = row.try_get_by_index(1).unwrap_or_default();
-        let excerpt: Option<String> = row.try_get_by_index(2).ok();
-        let owner: Option<String> = row.try_get_by_index(3).ok();
+        let id: i64 = decode_required(&row, 0, "search repos", "id")?;
+        let title: String = decode_required(&row, 1, "search repos", "title")?;
+        let excerpt: Option<String> = decode_optional(&row, 2, "search repos", "excerpt")?;
+        let owner: Option<String> = decode_optional(&row, 3, "search repos", "owner_name")?;
         results.push(SearchResult {
             result_type: "repo".to_string(),
             id,
@@ -381,10 +428,7 @@ async fn search_repos(
         ))
         .await
         .context("fts: count repos")?;
-    let total: i64 = count_rows
-        .first()
-        .and_then(|r| r.try_get_by_index::<i64>(0).ok())
-        .unwrap_or(0);
+    let total = decode_total(&count_rows, "count repos")?;
 
     Ok((results, total))
 }
@@ -444,14 +488,16 @@ async fn search_issues(
 
     let mut results = Vec::new();
     for row in rows {
-        let id: i64 = row.try_get_by_index(0).unwrap_or(0);
-        let title: String = row.try_get_by_index(1).unwrap_or_default();
-        let excerpt: Option<String> = row.try_get_by_index(2).ok();
-        let _repo_id: i64 = row.try_get_by_index(3).unwrap_or(0);
-        let repo_name: Option<String> = row.try_get_by_index(4).ok();
-        let owner: Option<String> = row.try_get_by_index(5).ok();
-        let state: Option<String> = row.try_get_by_index(6).ok();
-        let number: Option<i64> = row.try_get_by_index(7).ok();
+        // `i.repo_id` (index 3) is selected but never published, so it is left
+        // undecoded: a column no answer is built from must not be able to fail
+        // the search.
+        let id: i64 = decode_required(&row, 0, "search issues", "id")?;
+        let title: String = decode_required(&row, 1, "search issues", "title")?;
+        let excerpt: Option<String> = decode_optional(&row, 2, "search issues", "excerpt")?;
+        let repo_name: Option<String> = decode_optional(&row, 4, "search issues", "repo_name")?;
+        let owner: Option<String> = decode_optional(&row, 5, "search issues", "owner_name")?;
+        let state: Option<String> = decode_optional(&row, 6, "search issues", "state")?;
+        let number: Option<i64> = decode_optional(&row, 7, "search issues", "number")?;
         results.push(SearchResult {
             result_type: "issue".to_string(),
             id,
@@ -485,10 +531,7 @@ async fn search_issues(
         ))
         .await
         .context("fts: count issues")?;
-    let total: i64 = count_rows
-        .first()
-        .and_then(|r| r.try_get_by_index::<i64>(0).ok())
-        .unwrap_or(0);
+    let total = decode_total(&count_rows, "count issues")?;
 
     Ok((results, total))
 }
@@ -546,12 +589,13 @@ async fn search_wiki(
 
     let mut results = Vec::new();
     for row in rows {
-        let id: i64 = row.try_get_by_index(0).unwrap_or(0);
-        let title: String = row.try_get_by_index(1).unwrap_or_default();
-        let excerpt: Option<String> = row.try_get_by_index(2).ok();
-        let _repo_id: i64 = row.try_get_by_index(3).unwrap_or(0);
-        let repo_name: Option<String> = row.try_get_by_index(4).ok();
-        let owner: Option<String> = row.try_get_by_index(5).ok();
+        // `w.repo_id` (index 3) is selected but never published — see the same
+        // note in `search_issues`.
+        let id: i64 = decode_required(&row, 0, "search wiki", "id")?;
+        let title: String = decode_required(&row, 1, "search wiki", "title")?;
+        let excerpt: Option<String> = decode_optional(&row, 2, "search wiki", "excerpt")?;
+        let repo_name: Option<String> = decode_optional(&row, 4, "search wiki", "repo_name")?;
+        let owner: Option<String> = decode_optional(&row, 5, "search wiki", "owner_name")?;
         results.push(SearchResult {
             result_type: "wiki".to_string(),
             id,
@@ -592,10 +636,155 @@ async fn search_wiki(
         ))
         .await
         .context("fts: count wiki")?;
-    let total: i64 = count_rows
-        .first()
-        .and_then(|r| r.try_get_by_index::<i64>(0).ok())
-        .unwrap_or(0);
+    let total = decode_total(&count_rows, "count wiki")?;
 
     Ok((results, total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::Database;
+
+    /// The decoders are the whole fix, and no caller can reach the branch they
+    /// replace: on a healthy schema every one of these columns decodes. So they
+    /// are tested here, on the rows a schema drift or a backend type mismatch
+    /// actually produces — a column of the wrong type, and an aggregate that
+    /// returned nothing.
+    async fn memory_db() -> DatabaseConnection {
+        Database::connect("sqlite::memory:")
+            .await
+            .expect("open an in-memory database")
+    }
+
+    async fn one_row(db: &DatabaseConnection, sql: &str) -> QueryResult {
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            sql.to_string(),
+        ))
+        .await
+        .expect("run the query")
+        .expect("the query returned a row")
+    }
+
+    async fn all_rows(db: &DatabaseConnection, sql: &str) -> Vec<QueryResult> {
+        db.query_all(Statement::from_string(
+            db.get_database_backend(),
+            sql.to_string(),
+        ))
+        .await
+        .expect("run the aggregate")
+    }
+
+    #[tokio::test]
+    async fn a_decoded_zero_total_is_still_a_total() {
+        let db = memory_db().await;
+        assert_eq!(
+            decode_total(&all_rows(&db, "SELECT 0").await, "count repos").expect("zero decodes"),
+            0,
+            "an honest total of zero must stay a total, not become an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_aggregate_row_is_an_error_not_a_zero_total() {
+        let error = decode_total(&[], "count repos")
+            .expect_err("a COUNT(...) that returned no row did not answer the question");
+        assert!(
+            format!("{error:#}").contains("aggregate returned no row"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_total_is_an_error_not_a_zero_total() {
+        let db = memory_db().await;
+        let rows = all_rows(&db, "SELECT 'not a number'").await;
+
+        // Pin the regression to the input rather than to our wording: this is
+        // exactly the row the pre-fix fold could not tell apart from an empty
+        // result set.
+        let old_fold = rows
+            .first()
+            .and_then(|r| r.try_get_by_index::<i64>(0).ok())
+            .unwrap_or(0);
+        assert_eq!(
+            old_fold, 0,
+            "the pre-fix expression answered `total = 0` here — that is the bug being guarded"
+        );
+
+        let error = decode_total(&rows, "count issues")
+            .expect_err("a count that will not decode is a failed count, not a total of zero");
+        assert!(
+            format!("{error:#}").contains("decode `count`"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_id_is_an_error_not_a_result_pointing_at_entity_zero() {
+        let db = memory_db().await;
+        let row = one_row(&db, "SELECT 'not a number' AS id").await;
+
+        let old_fold: i64 = row.try_get_by_index(0).unwrap_or(0);
+        assert_eq!(
+            old_fold, 0,
+            "the pre-fix expression published this row as a link to entity 0"
+        );
+
+        let error = decode_required::<i64>(&row, 0, "search repos", "id")
+            .expect_err("a row whose `id` will not decode is not a result about entity 0");
+        assert!(
+            format!("{error:#}").contains("decode `id`"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_title_is_an_error_not_an_empty_title() {
+        let db = memory_db().await;
+        let row = one_row(&db, "SELECT 7 AS title").await;
+
+        let old_fold: String = row.try_get_by_index(0).unwrap_or_default();
+        assert_eq!(
+            old_fold, "",
+            "the pre-fix expression published this row with no title at all"
+        );
+
+        let error = decode_required::<String>(&row, 0, "search wiki", "title")
+            .expect_err("a row whose `title` will not decode is not a row with an empty title");
+        assert!(
+            format!("{error:#}").contains("decode `title`"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_optional_column_is_absent_and_an_undecodable_one_is_an_error() {
+        let db = memory_db().await;
+
+        let null_row = one_row(&db, "SELECT NULL AS owner_name").await;
+        assert_eq!(
+            decode_optional::<String>(&null_row, 0, "search repos", "owner_name")
+                .expect("a NULL column decodes"),
+            None,
+            "a repository with no owner row is still an answer, not a failure"
+        );
+
+        // The two inputs the old `.ok()` could not tell apart: the NULL above,
+        // and this one.
+        let bad_row = one_row(&db, "SELECT 7 AS owner_name").await;
+        let old_fold: Option<String> = bad_row.try_get_by_index(0).ok();
+        assert_eq!(
+            old_fold, None,
+            "the pre-fix expression served an undecodable owner as no owner"
+        );
+
+        let error = decode_optional::<String>(&bad_row, 0, "search repos", "owner_name")
+            .expect_err("a column that will not decode is not an absent column");
+        assert!(
+            format!("{error:#}").contains("decode `owner_name`"),
+            "the failure must name itself, got: {error:#}"
+        );
+    }
 }
