@@ -1342,8 +1342,7 @@ mod tests {
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             if self.sent_partial {
-                return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return std::task::Poll::Ready(Err(std::io::Error::other(
                     "injected reader failure",
                 )));
             }

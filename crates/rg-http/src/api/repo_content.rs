@@ -517,21 +517,17 @@ fn list_tree_entries(
 
     let mut entries = Vec::new();
     for entry in tree.iter() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                // Skipping silently would drop the entry from the listing and
-                // make a corrupt tree look like a short directory.
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    path = %sub_path,
-                    error = %format!("{e:#}"),
-                    "skipping unreadable tree entry"
-                );
-                continue;
-            }
-        };
+        let entry = entry.with_context(|| {
+            let listed_path = if sub_path.is_empty() {
+                "<root>"
+            } else {
+                sub_path
+            };
+            format!(
+                "failed to inspect tree entry while listing '{}' in {:?} at '{}'",
+                listed_path, repo_path, git_ref
+            )
+        })?;
         let oid = entry.oid();
         let name = entry.filename().to_string();
         let kind = if entry.mode().is_tree() {
@@ -1631,12 +1627,13 @@ mod tests {
         assert!(!is_empty_repo(&dir.path().join("nothing-here.git")));
     }
 
-    /// card_c9c2a0d88340: a malformed entry encountered while resolving
-    /// `?path=` must remain a repository failure. Dropping the iterator error
-    /// turns this into the typed `path not found` 404 even though the client
-    /// cannot fix a corrupt tree object.
+    /// card_c9c2a0d88340 / card_58d30e3cb060: a malformed entry encountered
+    /// while resolving `?path=` or listing the root tree must remain a
+    /// repository failure. Dropping the iterator error turns the sub-path case
+    /// into a typed `path not found` 404, and the root case into a partial 200,
+    /// even though the client cannot fix a corrupt tree object.
     #[test]
-    fn an_unreadable_entry_during_sub_path_lookup_is_a_server_error() {
+    fn unreadable_tree_entries_are_server_errors_during_sub_path_lookup_and_root_listing() {
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("broken-tree");
         let git = |args: &[&str]| {
@@ -1706,6 +1703,31 @@ mod tests {
         assert!(
             response.status().is_server_error(),
             "an unreadable tree entry must stay 5xx, got {}",
+            response.status()
+        );
+
+        let root_error = match list_tree_entries(&repo_path, "HEAD", "") {
+            Ok(_) => panic!("root-tree corruption must not become a partial successful listing"),
+            Err(error) => error,
+        };
+        let rendered = format!("{root_error:#}");
+        assert!(
+            rendered.contains("<root>"),
+            "root-listing error needs root-path context: {rendered}"
+        );
+        assert!(
+            rendered.contains("HEAD"),
+            "root-listing error needs ref context: {rendered}"
+        );
+        assert!(
+            rendered.contains(&repo_path.display().to_string()),
+            "root-listing error needs repository context: {rendered}"
+        );
+
+        let response = AppError::from(root_error).into_response();
+        assert!(
+            response.status().is_server_error(),
+            "an unreadable root-tree entry must stay 5xx, got {}",
             response.status()
         );
     }
