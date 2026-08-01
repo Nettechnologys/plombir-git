@@ -582,82 +582,15 @@ pub async fn cancel_pipeline(
     Path((_, _, id)): Path<(String, String, i64)>,
     RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    let pipeline = match pipeline_in_repo(&state, &repo, id).await {
-        Ok(pipeline) => pipeline,
-        Err(error) => return error.into_response(),
-    };
-
-    if pipeline.status != "running"
-        && pipeline.status != "pending"
-        && pipeline.status != "manual"
-        && pipeline.status != "waiting_approval"
-    {
-        return AppError::bad_request("pipeline is not active").into_response();
+    if let Err(error) = pipeline_in_repo(&state, &repo, id).await {
+        return error.into_response();
     }
 
-    let now = chrono::Utc::now().naive_utc();
-
-    // Mark pipeline as canceled
-    if let Err(e) =
-        rg_db::ops::pipeline_ops::update_pipeline_status(&state.db, id, "canceled", None, Some(now))
-            .await
-    {
-        return AppError::from(e).into_response();
+    match rg_db::ops::pipeline_ops::cancel_pipeline_chain(&state.db, id).await {
+        Ok(true) => Json(serde_json::json!({"id": id, "status": "canceled"})).into_response(),
+        Ok(false) => AppError::bad_request("pipeline is not active").into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
-
-    // Mark all running stages/jobs as canceled
-    let stages = match rg_db::ops::pipeline_ops::list_stages_by_pipeline(&state.db, id).await {
-        Ok(s) => s,
-        Err(e) => return AppError::from(e).into_response(),
-    };
-
-    for stage in stages {
-        if matches!(
-            stage.status.as_str(),
-            "running" | "pending" | "manual" | "waiting_approval"
-        ) {
-            if let Err(e) = rg_db::ops::pipeline_ops::update_stage_status(
-                &state.db,
-                stage.id,
-                "canceled",
-                None,
-                Some(now),
-            )
-            .await
-            {
-                tracing::error!(stage_id = stage.id, error = %format!("{e:#}"), "Failed to cancel stage");
-            }
-
-            let jobs = match rg_db::ops::pipeline_ops::list_jobs_by_stage(&state.db, stage.id).await
-            {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-
-            for job in jobs {
-                if matches!(
-                    job.status.as_str(),
-                    "running" | "pending" | "manual" | "waiting_approval"
-                ) {
-                    if let Err(e) = rg_db::ops::pipeline_ops::update_job_result(
-                        &state.db,
-                        job.id,
-                        "canceled",
-                        None,
-                        None,
-                        None,
-                        Some(now),
-                    )
-                    .await
-                    {
-                        tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to cancel job");
-                    }
-                }
-            }
-        }
-    }
-
-    Json(serde_json::json!({"id": id, "status": "canceled"})).into_response()
 }
 
 // ── Helpers ──────────────────────────────────────────────────────

@@ -41,7 +41,7 @@ pub async fn create_pipeline(
 }
 
 /// Get a pipeline by ID.
-pub async fn get_pipeline(db: &DatabaseConnection, id: i64) -> Result<Option<pipeline::Model>> {
+pub async fn get_pipeline(db: &impl ConnectionTrait, id: i64) -> Result<Option<pipeline::Model>> {
     pipeline::Entity::find_by_id(id)
         .one(db)
         .await
@@ -89,7 +89,7 @@ pub async fn list_pipelines_by_repo_paginated(
 
 /// Update pipeline status.
 pub async fn update_pipeline_status(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     id: i64,
     status: &str,
     started_at: Option<chrono::NaiveDateTime>,
@@ -142,7 +142,7 @@ pub async fn create_stage(
 
 /// Get stages for a pipeline.
 pub async fn list_stages_by_pipeline(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     pipeline_id: i64,
 ) -> Result<Vec<pipeline_stage::Model>> {
     pipeline_stage::Entity::find()
@@ -155,7 +155,7 @@ pub async fn list_stages_by_pipeline(
 
 /// Update stage status.
 pub async fn update_stage_status(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     id: i64,
     status: &str,
     started_at: Option<chrono::NaiveDateTime>,
@@ -334,7 +334,7 @@ pub async fn update_job_log(db: &DatabaseConnection, id: i64, log: &str) -> Resu
 
 /// List jobs for a stage.
 pub async fn list_jobs_by_stage(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     stage_id: i64,
 ) -> Result<Vec<pipeline_job::Model>> {
     pipeline_job::Entity::find()
@@ -844,45 +844,77 @@ pub async fn find_active_pipelines_by_ref(
         .context("db: find active pipelines by ref")
 }
 
-/// Cancel a pipeline and all its stages/jobs that are still pending or running.
+/// Cancel a pipeline and its active stages/jobs atomically.
+///
+/// A cancellation acknowledgement is a claim about the entire execution graph,
+/// not just its root row. Keep every write in one transaction so a failed child
+/// read or update cannot leave an active job beneath a canceled pipeline.
 /// Returns whether the pipeline was actually transitioned to "canceled".
 pub async fn cancel_pipeline_chain(db: &DatabaseConnection, pipeline_id: i64) -> Result<bool> {
+    let tx = db
+        .begin()
+        .await
+        .context("db: begin pipeline cancellation transaction")?;
+
+    match cancel_pipeline_chain_in_transaction(&tx, pipeline_id).await {
+        Ok(canceled) => {
+            tx.commit()
+                .await
+                .context("db: commit pipeline cancellation transaction")?;
+            Ok(canceled)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(
+                    pipeline_id,
+                    error = %format!("{rollback_error:#}"),
+                    "pipeline cancellation failed and its transaction could not be rolled back"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn cancel_pipeline_chain_in_transaction(
+    db: &impl ConnectionTrait,
+    pipeline_id: i64,
+) -> Result<bool> {
     let pipeline_model = match get_pipeline(db, pipeline_id).await? {
         Some(p) => p,
         None => return Ok(false),
     };
 
-    // Only cancel if still pending or running
-    if pipeline_model.status != "pending"
-        && pipeline_model.status != "running"
-        && pipeline_model.status != "manual"
-        && pipeline_model.status != "waiting_approval"
-    {
+    if !is_active_pipeline_work(&pipeline_model.status) {
         return Ok(false);
     }
 
     let now = Some(chrono::Utc::now().naive_utc());
 
-    // Cancel the pipeline
     update_pipeline_status(db, pipeline_id, "canceled", None, now).await?;
 
-    // Cancel all stages that are not yet finished
     let stages = list_stages_by_pipeline(db, pipeline_id).await?;
     for stage in &stages {
-        if stage.status != "success" && stage.status != "failed" && stage.status != "skipped" {
+        if is_active_pipeline_work(&stage.status) {
             update_stage_status(db, stage.id, "canceled", None, now).await?;
         }
 
-        // Cancel all jobs in this stage
         let jobs = list_jobs_by_stage(db, stage.id).await?;
         for job in &jobs {
-            if job.status != "success" && job.status != "failed" && job.status != "skipped" {
+            if is_active_pipeline_work(&job.status) {
                 update_job_result(db, job.id, "canceled", None, None, None, now).await?;
             }
         }
     }
 
     Ok(true)
+}
+
+fn is_active_pipeline_work(status: &str) -> bool {
+    matches!(
+        status,
+        "pending" | "running" | "manual" | "waiting_approval"
+    )
 }
 
 /// Resolve concurrency group template variables.
