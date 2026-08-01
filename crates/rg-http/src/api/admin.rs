@@ -318,8 +318,10 @@ pub async fn unlock_user(
     ),
     responses(
         (status = 200, description = "Deleted", body = serde_json::Value),
-        (status = 204, description = "No content"),
+        (status = 400, description = "Cannot delete the current account", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 404, description = "User not found", body = serde_json::Value),
     ),
 )]
 pub async fn delete_user(

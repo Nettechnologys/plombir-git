@@ -602,7 +602,12 @@ pub async fn update_user_admin(
 
 /// Delete a user (admin only).
 pub async fn delete_user(db: &DatabaseConnection, user_id: i64) -> Result<()> {
-    user_ops::delete_by_id(db, user_id).await
+    // `rg-db` cannot depend on this crate's domain error types, so absence
+    // crosses that boundary as a value and becomes a typed 404 here.
+    if !user_ops::delete_by_id(db, user_id).await? {
+        return Err(crate::error::not_found("user"));
+    }
+    Ok(())
 }
 
 /// Get a single user by ID (admin view).

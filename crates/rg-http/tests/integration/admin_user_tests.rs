@@ -209,6 +209,20 @@ async fn admin_users_delete_target() {
     let del_body: serde_json::Value = del_resp.json().await.unwrap();
     assert_eq!(del_body["deleted"], true);
 
+    let missing = client
+        .delete(format!("{}/api/v1/admin/users/{}", base, target_id))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        404,
+        "deleting a user that no longer exists must not look like a database failure"
+    );
+    let missing_body: serde_json::Value = missing.json().await.unwrap();
+    assert_eq!(missing_body["error"]["message"], "user not found");
+
     let get_after = client
         .get(format!("{}/api/v1/admin/users/{}", base, target_id))
         .bearer_auth(&admin_token)

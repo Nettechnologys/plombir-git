@@ -375,14 +375,16 @@ pub async fn record_failed_login(
         .is_some_and(|locked_until| locked_until > now))
 }
 
-/// Delete a user by ID.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let model = UserEntity::find_by_id(id)
+/// Delete a user by ID, returning whether a row existed.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let Some(model) = UserEntity::find_by_id(id)
         .one(db)
         .await
         .context("db: find user for delete")?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", id))?;
+    else {
+        return Ok(false);
+    };
 
     model.delete(db).await.context("db: delete user")?;
-    Ok(())
+    Ok(true)
 }
