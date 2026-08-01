@@ -122,7 +122,8 @@
             type="text"
             bind:value={mfaCode}
             required
-            inputmode="numeric"
+            inputmode={useBackupCode ? 'text' : 'numeric'}
+            autocapitalize={useBackupCode ? 'characters' : 'off'}
             autocomplete="one-time-code"
           />
         </label>

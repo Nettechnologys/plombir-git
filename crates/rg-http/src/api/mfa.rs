@@ -5,8 +5,11 @@
 //!   POST   /users/mfa/enable   — Verify TOTP code and enable MFA
 //!   POST   /users/mfa/disable  — Disable MFA (requires password)
 //!   POST   /users/mfa/verify   — Verify TOTP code (during login)
-//!   GET    /users/mfa/backup   — Get backup codes
-//!   POST   /users/mfa/backup   — Verify and use a backup code
+//!   GET    /users/mfa/backup   — Backup code status (never the codes themselves)
+//!
+//! A backup code is redeemed through `POST /users/mfa/verify` with `backup:
+//! true`; the `POST /users/mfa/backup` this header used to advertise has never
+//! been routed.
 
 use anyhow::Context as _;
 use axum::{
@@ -222,7 +225,9 @@ pub async fn enable_mfa(
         .map_err(AppError::from)?;
 
     // Generate backup codes
-    let backup_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(8);
+    let backup_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
+        rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
+    );
     rg_db::ops::mfa_backup_code_ops::set_codes(&state.db, user_id, &backup_codes)
         .await
         .map_err(AppError::from)?;
