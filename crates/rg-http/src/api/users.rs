@@ -789,7 +789,9 @@ pub struct ResetPasswordRequest {
     tag = "Users",
     request_body = ResetPasswordRequest,
     responses(
-        (status = 200, description = "Password reset successfully", body = serde_json::Value),
+        (status = 200, description = "Password reset successfully. An `mfa_enabled` account is \
+            answered with `mfa_required: true`, an empty token and an MFA challenge cookie \
+            instead of a session — exactly as `POST /users/login` answers it.", body = serde_json::Value),
         (status = 400, description = "Invalid or expired token, or invalid password"),
     ),
 )]
@@ -798,6 +800,8 @@ pub async fn reset_password(
     headers: HeaderMap,
     Json(body): Json<ResetPasswordRequest>,
 ) -> impl IntoResponse {
+    use rg_core::user::service::PasswordResetOutcome;
+
     match rg_core::user::service::reset_password(
         &state.db,
         &body.token,
@@ -806,7 +810,7 @@ pub async fn reset_password(
     )
     .await
     {
-        Ok(resp) => {
+        Ok(PasswordResetOutcome::Session(resp)) => {
             tracing::info!(user_id = resp.user_id, "password reset successful");
             // M-4: Set HttpOnly cookie so the user stays logged in after reset
             let is_https = is_https_request(&headers);
@@ -817,6 +821,51 @@ pub async fn reset_password(
                 Json(serde_json::json!(resp)),
             )
                 .into_response()
+        }
+        // The reset succeeded and the session does not follow from it. Answered
+        // in the shape `POST /users/login` already uses for the same account —
+        // an empty token, `mfa_required`, and the five-minute challenge cookie
+        // that `POST /users/mfa/verify` trades for the real session — so the
+        // browser lands on the same second-factor form by the same path.
+        Ok(PasswordResetOutcome::SecondFactorRequired { user_id, username }) => {
+            tracing::info!(
+                user_id,
+                "password reset successful; issuing an MFA challenge instead of a session"
+            );
+            let challenge = match rg_core::auth::jwt::generate_mfa_challenge(
+                user_id,
+                &username,
+                "password_reset",
+                &state.jwt_secret,
+            ) {
+                Ok(challenge) => challenge,
+                Err(error) => return AppError::from(error).into_response(),
+            };
+            let is_https = is_https_request(&headers);
+            let mut response = (
+                StatusCode::OK,
+                [(
+                    axum::http::header::SET_COOKIE,
+                    crate::api::mfa::build_mfa_challenge_cookie(&challenge, is_https),
+                )],
+                Json(serde_json::json!({
+                    "token": "",
+                    "user_id": user_id,
+                    "username": username,
+                    "mfa_required": true,
+                })),
+            )
+                .into_response();
+            // Clear whatever session the browser arrived carrying: the password
+            // it was minted against no longer exists, and a reset that leaves
+            // an older session standing hands back with one hand what it just
+            // refused with the other.
+            if let Ok(value) = axum::http::HeaderValue::from_str(&build_clear_cookie(is_https)) {
+                response
+                    .headers_mut()
+                    .append(axum::http::header::SET_COOKIE, value);
+            }
+            response
         }
         // A spent/expired token and a rejected password are typed
         // `InvalidRequest` and stay 400; the password hash, the row update and

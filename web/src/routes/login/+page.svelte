@@ -33,7 +33,9 @@
 
   $effect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get('sso_mfa_required') === '1') {
+    // Two doors hand off here holding a challenge cookie and no session: the
+    // SSO callback, and the password reset of an account with a second factor.
+    if (params.get('sso_mfa_required') === '1' || params.get('mfa_required') === '1') {
       const usernameParam = params.get('username');
       if (usernameParam) {
         beginMfa(usernameParam);

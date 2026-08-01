@@ -52,6 +52,29 @@ pub struct AuthResponse {
     pub username: String,
 }
 
+/// What a completed password reset entitles its holder to.
+///
+/// An enum, and not an [`AuthResponse`] with a flag next to it, for the reason
+/// [`PasswordAttempt::SecondFactorRequired`](crate::auth::lockout::PasswordAttempt)
+/// is one: whether the account still owes a second factor is a *policy*, and a
+/// caller that cannot compile without answering it is a gate. A caller that
+/// merely ought to remember to ask is a convention — which is exactly what let
+/// this door mint a seven-day session for an `mfa_enabled` account while every
+/// other door was busy refusing one.
+#[derive(Debug)]
+pub enum PasswordResetOutcome {
+    /// No second factor is enrolled, so the new password is the whole
+    /// credential and the reset ends logged in, as it always has.
+    Session(AuthResponse),
+    /// The password was changed and does not open a session on its own.
+    ///
+    /// MFA is bought for precisely this situation — a mailbox in someone
+    /// else's hands — so the holder of the reset link is left where
+    /// `POST /users/login` would leave them: first factor proved, second one
+    /// still owed.
+    SecondFactorRequired { user_id: i64, username: String },
+}
+
 /// Validate a username according to ForgeKeep rules.
 ///
 /// Rules:
@@ -760,12 +783,14 @@ async fn forgot_password_inner(
 }
 
 /// Reset a password using a valid reset token.
+///
+/// Ends the reset, not necessarily the login: see [`PasswordResetOutcome`].
 pub async fn reset_password(
     db: &DatabaseConnection,
     raw_token: &str,
     new_password: &str,
     jwt_secret: &str,
-) -> Result<AuthResponse> {
+) -> Result<PasswordResetOutcome> {
     use sha2::Digest;
     let token_hash = hex::encode(sha2::Sha256::digest(raw_token.as_bytes()));
 
@@ -816,14 +841,28 @@ pub async fn reset_password(
     // Invalidate any other unused tokens for this user
     rg_db::ops::password_reset_token_ops::invalidate_user_tokens(db, user.id).await?;
 
+    // The password is written either way — a refused session must not become a
+    // refused reset, or an MFA account could never recover a lost password at
+    // all. Only what the reset *hands back* is at stake below.
+    if user.mfa_enabled {
+        tracing::info!(
+            user_id = user.id,
+            "password reset completed; the account owes its second factor before a session exists"
+        );
+        return Ok(PasswordResetOutcome::SecondFactorRequired {
+            user_id: user.id,
+            username: user.username,
+        });
+    }
+
     // Generate new JWT
     let jwt_token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
 
-    Ok(AuthResponse {
+    Ok(PasswordResetOutcome::Session(AuthResponse {
         token: jwt_token,
         user_id: user.id,
         username: user.username,
-    })
+    }))
 }
 
 #[cfg(test)]

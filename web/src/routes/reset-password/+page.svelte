@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import { auth } from '$lib/api/client.svelte';
   import { setToken } from '$lib/api/client.svelte';
   import { fetchUser } from '$lib/stores/auth.svelte';
@@ -39,6 +40,14 @@
     loading = true;
     try {
       const res = await auth.resetPassword(token, password);
+      if (res.mfa_required) {
+        // The password changed; the session did not follow. The server has set
+        // the same five-minute challenge cookie the login door sets, so the
+        // second-factor form on /login finishes the job — the same hand-off SSO
+        // makes.
+        goto(`/login?mfa_required=1&username=${encodeURIComponent(res.username)}`);
+        return;
+      }
       setToken(res.token);
       await fetchUser();
       success = true;

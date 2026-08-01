@@ -37,8 +37,11 @@ export const auth = {
       method: 'POST',
       body: JSON.stringify({ email }),
     }),
+  // Answers with `mfa_required` and an empty token for an account that has a
+  // second factor: the reset changes the password, the session comes from
+  // `verifyMfa`. Same shape as `login`, so the same handling applies.
   resetPassword: (token: string, newPassword: string) =>
-    request<{ token: string; user_id: number; username: string }>('/users/reset-password', {
+    request<AuthLoginResponse>('/users/reset-password', {
       method: 'POST',
       body: JSON.stringify({ token, new_password: newPassword }),
     }),

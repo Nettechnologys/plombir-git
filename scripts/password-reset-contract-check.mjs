@@ -28,6 +28,30 @@ expect(
   'Backend reset_password must keep using the standard password validator',
 );
 
+// The reset door is reachable precisely when a mailbox or a password is
+// already compromised, which is the case MFA is bought for. Both halves of the
+// hand-off are asserted here so neither can quietly drift back to "log them in".
+expect(
+  userService,
+  /fn reset_password[\s\S]*if user\.mfa_enabled[\s\S]*PasswordResetOutcome::SecondFactorRequired/,
+  'Backend reset_password must refuse the session for an account that owes a second factor',
+);
+expect(
+  resetPage,
+  /if\s*\(res\.mfa_required\)/,
+  'Reset page must honour the mfa_required answer instead of storing an empty token',
+);
+expect(
+  resetPage,
+  /mfa_required=1&username=/,
+  'Reset page must hand the MFA case off to the login second-factor form',
+);
+expect(
+  loginPage,
+  /params\.get\('mfa_required'\)\s*===\s*'1'/,
+  'Login page must accept the password-reset MFA hand-off, not only the SSO one',
+);
+
 expect(passwordValidator, /min_length:\s*8/, 'Backend standard password validator must require at least 8 characters');
 expect(passwordValidator, /max_length:\s*128/, 'Backend standard password validator must cap passwords at 128 characters');
 expect(passwordValidator, /require_uppercase:\s*true/, 'Backend standard password validator must require uppercase letters');
