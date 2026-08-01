@@ -17,8 +17,8 @@ use crate::AppState;
 /// to remember to look the owner up: a PAT is a standing delegation of that
 /// account's rights, and deactivating the account has to revoke it. Resolving
 /// the owner here rather than at each call site is what makes that true for
-/// both the REST middleware and git-over-HTTP at once.
-async fn resolve_pat(
+/// the REST middleware, git-over-HTTP and the registry's Basic auth at once.
+pub(crate) async fn resolve_pat(
     db: &DatabaseConnection,
     token: &str,
 ) -> anyhow::Result<

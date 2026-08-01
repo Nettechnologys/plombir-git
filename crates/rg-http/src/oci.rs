@@ -393,12 +393,36 @@ pub async fn api_version_check(State(_state): State<AppState>, headers: HeaderMa
 //   - Anonymous: returns token with limited scope (public pull)
 //   - Basic Auth: validates username/password, returns full scope token
 //
+/// Who the registry decided is behind a `/v2/auth/token` request.
+enum BasicIdentity {
+    /// The request carries no usable credentials — missing header, malformed
+    /// value, unknown user, wrong password. Every one of those answers the same
+    /// way on purpose: a client that could tell them apart could enumerate
+    /// accounts against the registry.
+    Anonymous,
+    Authenticated {
+        username: String,
+        user_id: i64,
+    },
+    /// The password was right and the account carries a second factor. Kept
+    /// apart from `Anonymous` because it is the one refusal that may be
+    /// explained: reaching it takes the correct password, so the answer tells a
+    /// guesser nothing, while an owner who just switched MFA on would otherwise
+    /// watch `docker login` degrade into anonymous pulls with no reason given.
+    SecondFactorRequired,
+}
+
 /// Resolve Basic-auth credentials from the request headers.
 ///
-/// Returns the authenticated `(username, user_id)` when valid Docker-login
-/// credentials are present, or the anonymous default (`"anonymous"`, `None`)
-/// when the request carries no usable credentials (missing header, malformed
-/// value, unknown user, bad password).
+/// Returns the authenticated account when valid Docker-login credentials are
+/// present, or [`BasicIdentity::Anonymous`] when the request carries none that
+/// are usable.
+///
+/// Two credentials are accepted, in this order: a personal access token in
+/// either Basic field, then the account's password. The token goes first
+/// because it is the credential an account with MFA has left here — and because
+/// running it through the password path would file a valid token as a failed
+/// password, so five `docker pull`s would lock the account out of the forge.
 ///
 /// A credential check that *failed* is `Err`, never the anonymous default: an
 /// unreachable database or a stored hash the verifier cannot parse says nothing
@@ -409,8 +433,8 @@ pub async fn api_version_check(State(_state): State<AppState>, headers: HeaderMa
 async fn authenticate_basic(
     db: &DatabaseConnection,
     headers: &HeaderMap,
-) -> anyhow::Result<(String, Option<i64>)> {
-    let anonymous = || Ok((ANONYMOUS_SUBJECT.to_string(), None));
+) -> anyhow::Result<BasicIdentity> {
+    let anonymous = || Ok(BasicIdentity::Anonymous);
 
     let Some(auth_header) = headers.get(header::AUTHORIZATION) else {
         return anonymous();
@@ -432,6 +456,36 @@ async fn authenticate_basic(
     let [user, pass] = parts[..] else {
         return anonymous();
     };
+
+    // A personal access token may arrive in either field: `docker login -u me
+    // -p <token>` puts it in the password, and some clients carry it as the
+    // username. Same two candidates, same order, as git-over-HTTP.
+    for candidate in [pass, user] {
+        if candidate.is_empty() {
+            continue;
+        }
+        let Some((token, owner)) = crate::pat_auth::resolve_pat(db, candidate)
+            .await
+            .with_context(|| format!("registry basic auth: resolving a token for '{user}'"))?
+        else {
+            continue;
+        };
+        // A token that resolves is the answer either way. Falling through to
+        // the password path on a scope refusal would hash the token, fail, and
+        // record the failure as a brute-force strike against its owner.
+        if !rg_core::auth::pat_scope::has_scope(&token.scopes, "repo") {
+            tracing::warn!(
+                user_id = owner.id,
+                token_id = token.id,
+                "registry basic auth: token lacks the 'repo' scope"
+            );
+            return anonymous();
+        }
+        return Ok(BasicIdentity::Authenticated {
+            username: owner.username,
+            user_id: owner.id,
+        });
+    }
 
     // Verify unconditionally — an unknown username must cost the same Argon2
     // work as a real one, or the response time enumerates accounts. (A failed
@@ -471,7 +525,13 @@ async fn authenticate_basic(
                 .as_ref()
                 .map(|found| found.id)
                 .expect("an accepted password attempt resolved to an account");
-            Ok((user.to_string(), Some(user_id)))
+            Ok(BasicIdentity::Authenticated {
+                username: user.to_string(),
+                user_id,
+            })
+        }
+        rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired => {
+            Ok(BasicIdentity::SecondFactorRequired)
         }
         rg_core::auth::lockout::PasswordAttempt::Rejected { .. } => anonymous(),
     }
@@ -570,7 +630,20 @@ pub async fn get_token(
     let scope = params.get("scope").cloned().unwrap_or_default();
 
     let (username, authenticated_user_id) = match authenticate_basic(&state.db, &headers).await {
-        Ok(identity) => identity,
+        Ok(BasicIdentity::Anonymous) => (ANONYMOUS_SUBJECT.to_string(), None),
+        Ok(BasicIdentity::Authenticated { username, user_id }) => (username, Some(user_id)),
+        Ok(BasicIdentity::SecondFactorRequired) => {
+            // The one refusal the registry states out loud, and the only place
+            // the owner can be told: `docker login` prints this message, and
+            // without it the password that still works in the browser would
+            // simply stop granting scope here with no explanation.
+            return oci_err(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "this account requires a second factor: authenticate with a personal \
+                 access token instead of your password",
+            );
+        }
         Err(e) => {
             // Nothing downstream logs this — `oci_err` only writes the client's
             // envelope — and the message is deliberately generic: the caller

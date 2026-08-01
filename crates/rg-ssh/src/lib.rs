@@ -630,6 +630,23 @@ impl Handler for SshHandler {
                 tracing::info!(username, "SSH password auth accepted");
                 Ok(Auth::Accept)
             }
+            rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired => {
+                // The password was right. SSH has no way to prompt for a TOTP
+                // code — `auth_password` may only accept or reject — so the
+                // account authenticates here with the credential that is a
+                // standing second factor already: its SSH key. The log line is
+                // the whole explanation the owner can be given, since the
+                // client is told nothing but "no".
+                tracing::warn!(
+                    username,
+                    "SSH password auth refused: the account requires a second factor, \
+                     which this door cannot ask for — authenticate with an SSH key"
+                );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
             rg_core::auth::lockout::PasswordAttempt::Rejected { locked } => {
                 tracing::warn!(username, locked, "SSH password auth rejected");
                 Ok(Auth::Reject {

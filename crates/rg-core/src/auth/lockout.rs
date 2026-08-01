@@ -1,4 +1,4 @@
-//! Brute-force lockout policy for the doors that take a password.
+//! Password-door policy: the brute-force lockout, and the second factor.
 //!
 //! `login_attempts` / `locked_until` on the user row are the forge's only brake
 //! on password guessing, and until this module existed that brake lived inline
@@ -21,6 +21,29 @@
 //! token endpoint is hit with Basic credentials on every `docker pull`, so
 //! logging its successes would bury the brute-force signal these rows exist to
 //! carry under a per-request access log.
+//!
+//! # The second factor lives here for the same reason
+//!
+//! `mfa_enabled` used to be read by the web login and by the SSO callback, and
+//! by nobody else. The two doors that end their attempt here read it nowhere:
+//! a correct password was a full session over SSH and a full-scope registry
+//! token, on an account whose owner had switched MFA on and whose browser was
+//! being asked for a TOTP code for the same password. The second factor was a
+//! convention of one door rather than a property of the credential.
+//!
+//! So the decision is taken in the same call that already applies the lock, and
+//! it is reported as [`PasswordAttempt::SecondFactorRequired`] — a variant, not
+//! a bool, so a future password door cannot compile without answering it. The
+//! policy is the one GitHub and Gitea settle on: a password is not enough on a
+//! non-interactive channel that has nowhere to prompt for a code, and the
+//! account authenticates there with a credential that is already a standing
+//! second factor — an SSH key, or a personal access token.
+//!
+//! Exemptions exist and must stay *explicit*, the way the passkey door
+//! (`rg-http/src/api/passkeys.rs::login_finish`) is exempt: a passkey assertion
+//! is itself phishing-resistant strong authentication, and its doc comment says
+//! so. What this module rules out is the silent exemption — the door that never
+//! asked.
 
 use chrono::Utc;
 use rg_db::entities::user::Model as User;
@@ -38,6 +61,16 @@ pub const MAX_FAILED_PASSWORD_ATTEMPTS: i32 = 5;
 pub enum PasswordAttempt {
     /// The password matched an account that is allowed to authenticate.
     Accepted,
+    /// The password was right, and it is not enough: the account carries a
+    /// second factor this door has no way to ask for.
+    ///
+    /// Kept apart from `Rejected` on purpose. It is only ever reached by a
+    /// caller who already presented the correct password, so naming the reason
+    /// out loud discloses nothing a guesser could use — the same reason
+    /// `POST /users/login` may answer "account is temporarily locked" in words
+    /// — and the account's owner otherwise has no way to learn why the password
+    /// that works in the browser stopped working here.
+    SecondFactorRequired,
     /// Refused. `locked` says the brute-force lock was the reason (or has just
     /// become one); it is for the server's log only — a client that could tell
     /// the two rejections apart would be told which usernames are real.
@@ -59,8 +92,8 @@ pub struct AttemptOrigin<'a> {
     pub user_agent: Option<&'a str>,
 }
 
-/// Settle one password attempt: apply the lockout, advance the brute-force
-/// counter, and file the attempt in the login log.
+/// Settle one password attempt: apply the lockout, require the second factor,
+/// advance the brute-force counter, and file the attempt in the login log.
 ///
 /// Call it *after* the Argon2 verification, with `user` set to the row the
 /// login resolved to (`None` when there is no such account) and `password_ok`
@@ -81,6 +114,7 @@ pub async fn settle_password_attempt(
         user.locked_until
             .is_some_and(|locked_until| locked_until > now)
     });
+    let mut second_factor_required = false;
 
     // A locked account is refused even when the password is right — that is the
     // entire point of the lock — and a deactivated one is refused for the
@@ -102,7 +136,15 @@ pub async fn settle_password_attempt(
                     );
                 }
             }
-            return PasswordAttempt::Accepted;
+            if !user.mfa_enabled {
+                return PasswordAttempt::Accepted;
+            }
+            // The strikes are cleared above before this branch is taken, and
+            // deliberately so: they count *wrong* passwords, and this one was
+            // right. Leaving them would make the second factor a slow lockout
+            // of its own — the owner's git remote retries the password it has
+            // always used, and five of those would close the web login too.
+            second_factor_required = true;
         }
 
         // Only a wrong password advances the counter, exactly as on
@@ -137,7 +179,9 @@ pub async fn settle_password_attempt(
         origin.ip_address,
         origin.user_agent,
         false,
-        Some(if locked {
+        Some(if second_factor_required {
+            "mfa_required"
+        } else if locked {
             "account_locked"
         } else {
             "invalid_credentials"
@@ -153,5 +197,9 @@ pub async fn settle_password_attempt(
         );
     }
 
-    PasswordAttempt::Rejected { locked }
+    if second_factor_required {
+        PasswordAttempt::SecondFactorRequired
+    } else {
+        PasswordAttempt::Rejected { locked }
+    }
 }
