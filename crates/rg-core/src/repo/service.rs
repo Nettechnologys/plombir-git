@@ -13,6 +13,7 @@ use rg_db::{
 };
 
 use super::templates;
+use crate::blob_storage::{BlobKey, BlobStorage};
 use crate::platform::fs::discard_dir;
 
 /// One actionable error for a failure to stage a temporary git working tree.
@@ -1054,21 +1055,135 @@ pub async fn get_watch(
     rg_db::ops::repo_watch_ops::get_watch_state(db, user_id, repo_id).await
 }
 
-/// Delete a repository's Git data and soft-delete its metadata row.
+#[derive(Debug)]
+struct StagedBlobPrefix {
+    live: BlobKey,
+    staged: BlobKey,
+}
+
+fn repository_blob_prefixes(
+    namespace: &str,
+    repo: &rg_db::entities::repository::Model,
+    deletion_id: &str,
+) -> Result<Vec<StagedBlobPrefix>> {
+    let repo_id = repo.id.to_string();
+    let live = [
+        (
+            "packages",
+            BlobKey::from_segments(["packages", namespace, repo.name.as_str()])?,
+        ),
+        (
+            "lfs",
+            BlobKey::from_segments(["lfs", namespace, repo.name.as_str()])?,
+        ),
+        (
+            "releases",
+            BlobKey::from_segments(["releases", namespace, repo.name.as_str()])?,
+        ),
+        (
+            "attachments",
+            BlobKey::from_segments(["attachments", repo_id.as_str()])?,
+        ),
+    ];
+
+    live.into_iter()
+        .map(|(kind, live)| {
+            let staged = BlobKey::from_segments([
+                "_deleted",
+                "repositories",
+                repo_id.as_str(),
+                deletion_id,
+                kind,
+            ])?;
+            Ok(StagedBlobPrefix { live, staged })
+        })
+        .collect()
+}
+
+async fn restore_blob_prefixes(
+    storage: &dyn BlobStorage,
+    prefixes: &[StagedBlobPrefix],
+    repo_id: i64,
+) {
+    for prefix in prefixes.iter().rev() {
+        match storage.move_prefix(&prefix.staged, &prefix.live).await {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                repo_id,
+                staged_prefix = %prefix.staged,
+                live_prefix = %prefix.live,
+                "failed to restore a repository blob prefix after deletion aborted — the staged prefix disappeared and the active repository may now reference missing blobs"
+            ),
+            Err(error) => tracing::warn!(
+                repo_id,
+                staged_prefix = %prefix.staged,
+                live_prefix = %prefix.live,
+                %error,
+                "failed to restore a repository blob prefix after deletion aborted — the active repository can no longer reach these blobs until the prefix is moved back by hand"
+            ),
+        }
+    }
+}
+
+async fn stage_blob_prefixes(
+    storage: &dyn BlobStorage,
+    prefixes: Vec<StagedBlobPrefix>,
+    repo_id: i64,
+) -> Result<Vec<StagedBlobPrefix>> {
+    let mut staged = Vec::new();
+    for prefix in prefixes {
+        match storage.move_prefix(&prefix.live, &prefix.staged).await {
+            Ok(true) => staged.push(prefix),
+            Ok(false) => {}
+            Err(error) => {
+                restore_blob_prefixes(storage, &staged, repo_id).await;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to stage repository blob prefix {} at {}",
+                        prefix.live, prefix.staged
+                    )
+                });
+            }
+        }
+    }
+    Ok(staged)
+}
+
+fn restore_repository_directory(
+    staged_path: &std::path::Path,
+    repo_path: &std::path::Path,
+    repo_id: i64,
+) {
+    if let Err(rollback_error) = std::fs::rename(staged_path, repo_path) {
+        tracing::warn!(
+            repo_id,
+            staged_at = %staged_path.display(),
+            belongs_at = %repo_path.display(),
+            error = %rollback_error,
+            "failed to restore a repository directory after deletion aborted — the active row is now unreachable until the directory is moved back by hand"
+        );
+    }
+}
+
+/// Delete a repository's Git/blob data and soft-delete its metadata row.
 ///
-/// The filesystem and database cannot share a transaction. Rename the live
-/// tree out of the canonical namespace first (an atomic operation on the same
-/// filesystem), then mutate the row. If the database step fails, move the tree
-/// back so an active row never knowingly points at missing data. Once the row
-/// is deleted, the staged tree is unreachable and can be removed without
-/// keeping the repository name occupied.
+/// The filesystems and database cannot share a transaction. Rename every live
+/// namespace out of the way first, then mutate the row. If any prepare step or
+/// the database step fails, move the prepared namespaces back. Once the row is
+/// deleted, the tombstones are unreachable and can be physically removed
+/// without keeping the repository name occupied.
 pub async fn delete_repo(
     db: &DatabaseConnection,
     repo_root: &std::path::Path,
+    blob_storage: &dyn BlobStorage,
     repo: &rg_db::entities::repository::Model,
 ) -> Result<()> {
     let namespace = repository_namespace_name(db, repo.owner_id, repo.org_id).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repo.name));
+    let deletion_id = uuid::Uuid::new_v4().simple().to_string();
+    // Validate every backend-neutral namespace before moving any live data. A
+    // malformed historical name must fail without leaving Git staged aside.
+    let prefixes = repository_blob_prefixes(&namespace, repo, &deletion_id)?;
     let staged_path = repo_path.with_file_name(format!(
         "{}.deleted-{}-{}",
         repo_path
@@ -1076,7 +1191,7 @@ pub async fn delete_repo(
             .context("repository path has no final component")?
             .to_string_lossy(),
         repo.id,
-        uuid::Uuid::new_v4().simple()
+        deletion_id
     ));
 
     let staged = match repo_path.try_exists() {
@@ -1112,20 +1227,20 @@ pub async fn delete_repo(
         }
     };
 
-    if let Err(error) = rg_db::ops::repo_ops::soft_delete(db, repo.id).await {
-        if staged {
-            // The row is still active. Put its tree back; a failed compensation
-            // is the one fact an operator needs to repair the split state.
-            if let Err(rollback_error) = std::fs::rename(&staged_path, &repo_path) {
-                tracing::warn!(
-                    repo_id = repo.id,
-                    staged_at = %staged_path.display(),
-                    belongs_at = %repo_path.display(),
-                    error = %rollback_error,
-                    "failed to restore a repository directory after its soft-delete failed — the \
-                     active row is now unreachable until the directory is moved back by hand"
-                );
+    let staged_blobs = match stage_blob_prefixes(blob_storage, prefixes, repo.id).await {
+        Ok(staged_blobs) => staged_blobs,
+        Err(error) => {
+            if staged {
+                restore_repository_directory(&staged_path, &repo_path, repo.id);
             }
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = rg_db::ops::repo_ops::soft_delete(db, repo.id).await {
+        restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
+        if staged {
+            restore_repository_directory(&staged_path, &repo_path, repo.id);
         }
         return Err(error);
     }
@@ -1145,21 +1260,51 @@ pub async fn delete_repo(
 
     invalidate_perm_cache_repo(db, repo.id);
 
+    let mut cleanup_error = None;
     if staged {
         match std::fs::remove_dir_all(&staged_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(
+            Err(error) => {
+                tracing::warn!(
                 repo_id = repo.id,
                 path = %staged_path.display(),
                 error = %error,
                 "repository is deleted and its canonical name is free, but its old Git data \
                  remains on disk and must be removed by hand"
-            ),
+                );
+                cleanup_error = Some(
+                    crate::platform::fs::path_error(
+                        "staged repository directory",
+                        &staged_path,
+                        &error,
+                        crate::platform::fs::REPO_ROOT_HINT,
+                    )
+                    .context("failed to retire deleted repository Git data"),
+                );
+            }
         }
     }
 
-    Ok(())
+    for prefix in staged_blobs {
+        if let Err(error) = blob_storage.delete_prefix(&prefix.staged).await {
+            tracing::warn!(
+                repo_id = repo.id,
+                staged_prefix = %prefix.staged,
+                live_prefix = %prefix.live,
+                %error,
+                "repository is deleted and its live blob namespace is free, but its staged blobs remain and must be removed by hand"
+            );
+            if cleanup_error.is_none() {
+                cleanup_error = Some(anyhow::Error::new(error).context(format!(
+                    "failed to retire staged repository blobs at {}",
+                    prefix.staged
+                )));
+            }
+        }
+    }
+
+    cleanup_error.map_or(Ok(()), Err)
 }
 
 /// Find repo by owner/name (skip soft-deleted).
@@ -2180,7 +2325,101 @@ mod path_diagnostic_tests {
 #[cfg(test)]
 mod repository_deletion_tests {
     use super::*;
+    use crate::blob_storage::{
+        BlobMetadata, BlobStorageError, LocalBlobStorage, Result as BlobResult,
+    };
+    use futures::future::BoxFuture;
     use sea_orm::{ConnectOptions, Database};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    struct RestoreFailingStorage {
+        inner: LocalBlobStorage,
+    }
+
+    impl BlobStorage for RestoreFailingStorage {
+        fn backend_name(&self) -> &'static str {
+            "restore-failing-test"
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.put(key, data)
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a std::path::Path,
+        ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.put_file(key, source)
+        }
+
+        fn get<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<Vec<u8>>> {
+            self.inner.get(key)
+        }
+
+        fn metadata<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.metadata(key)
+        }
+
+        fn exists<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<bool>> {
+            self.inner.exists(key)
+        }
+
+        fn delete<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<bool>> {
+            self.inner.delete(key)
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, BlobResult<Vec<BlobMetadata>>> {
+            self.inner.list(prefix)
+        }
+
+        fn move_prefix<'a>(
+            &'a self,
+            source: &'a BlobKey,
+            _destination: &'a BlobKey,
+        ) -> BoxFuture<'a, BlobResult<bool>> {
+            Box::pin(async move {
+                Err(BlobStorageError::io(
+                    "blob prefix restore",
+                    std::path::PathBuf::from(source.as_str()),
+                    std::io::Error::other("injected restore failure"),
+                ))
+            })
+        }
+
+        fn local_path(&self, key: &BlobKey) -> Option<std::path::PathBuf> {
+            self.inner.local_path(key)
+        }
+    }
 
     async fn setup_db() -> DatabaseConnection {
         let mut options = ConnectOptions::new("sqlite::memory:");
@@ -2215,6 +2454,15 @@ mod repository_deletion_tests {
         let bare = repo_root.join("delete-rollback-owner/keep-me.git");
         let marker = bare.join("rollback-marker");
         std::fs::write(&marker, b"must survive").expect("write marker");
+        let blob_storage = crate::blob_storage::LocalBlobStorage::new(&repo_root);
+        let blob = crate::blob_storage::BlobKey::new(
+            "packages/delete-rollback-owner/keep-me/generic/demo/1/objects/one/payload.bin",
+        )
+        .expect("valid package key");
+        blob_storage
+            .put(&blob, b"must survive too")
+            .await
+            .expect("seed package blob");
 
         db.execute_unprepared(&format!(
             "CREATE TRIGGER reject_repo_soft_delete \
@@ -2226,7 +2474,7 @@ mod repository_deletion_tests {
         .await
         .expect("install failure trigger");
 
-        let error = delete_repo(&db, &repo_root, &repo)
+        let error = delete_repo(&db, &repo_root, &blob_storage, &repo)
             .await
             .expect_err("soft-delete trigger must reject the update");
         assert!(
@@ -2236,6 +2484,13 @@ mod repository_deletion_tests {
         assert_eq!(
             std::fs::read(&marker).expect("repository directory must be restored"),
             b"must survive"
+        );
+        assert_eq!(
+            blob_storage
+                .get(&blob)
+                .await
+                .expect("repository blob prefix must be restored"),
+            b"must survive too"
         );
         assert!(
             find_repo_by_owner_name(&db, "delete-rollback-owner", "keep-me")
@@ -2252,6 +2507,58 @@ mod repository_deletion_tests {
         assert!(
             leftovers.is_empty(),
             "the rollback restored the live path but left staging directories: {leftovers:?}"
+        );
+        let tombstones = crate::blob_storage::BlobKey::from_segments([
+            "_deleted",
+            "repositories",
+            repo.id.to_string().as_str(),
+        ])
+        .expect("valid tombstone prefix");
+        assert!(
+            blob_storage
+                .list(Some(&tombstones))
+                .await
+                .expect("inventory tombstones")
+                .is_empty(),
+            "the rollback restored the live blob prefix but left staged objects"
+        );
+    }
+
+    /// A failed rollback cannot replace the original storage/DB error, so its
+    /// only durable evidence is the warning. It must contain both namespaces
+    /// and state the consequence, otherwise an operator cannot repair it.
+    #[tokio::test]
+    async fn failed_blob_compensation_logs_the_object_and_consequence() {
+        let sandbox = tempfile::tempdir().expect("create blob root");
+        let storage = RestoreFailingStorage {
+            inner: LocalBlobStorage::new(sandbox.path()),
+        };
+        let live = BlobKey::new("packages/owner/repo").unwrap();
+        let staged = BlobKey::new("_deleted/repositories/42/delete-id/packages").unwrap();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        restore_blob_prefixes(
+            &storage,
+            &[StagedBlobPrefix {
+                live: live.clone(),
+                staged: staged.clone(),
+            }],
+            42,
+        )
+        .await;
+
+        let rendered = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(rendered.contains(staged.as_str()), "{rendered}");
+        assert!(rendered.contains(live.as_str()), "{rendered}");
+        assert!(
+            rendered.contains("active repository can no longer reach these blobs"),
+            "{rendered}"
         );
     }
 }

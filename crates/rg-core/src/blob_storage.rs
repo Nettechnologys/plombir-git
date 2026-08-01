@@ -74,6 +74,11 @@ pub enum BlobStorageError {
     NotFound(BlobKey),
     #[error("blob path escaped storage root: {0}")]
     OutsideRoot(PathBuf),
+    #[error("blob storage backend {backend} does not support {operation}")]
+    UnsupportedOperation {
+        backend: &'static str,
+        operation: &'static str,
+    },
     /// A filesystem failure, carrying the path the bare `io::Error` dropped.
     ///
     /// There is deliberately no `#[from] std::io::Error`: automatic conversion
@@ -152,6 +157,38 @@ pub trait BlobStorage: Send + Sync {
     fn delete<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, Result<bool>>;
 
     fn list<'a>(&'a self, prefix: Option<&'a BlobKey>) -> BoxFuture<'a, Result<Vec<BlobMetadata>>>;
+
+    /// Atomically move every object below `source` to `destination` without
+    /// materialising object contents in the caller.
+    ///
+    /// Repository deletion uses this as its prepare/rollback primitive. A
+    /// backend that cannot provide an atomic namespace move must reject the
+    /// operation before changing either prefix; deleting objects one by one
+    /// could otherwise leave an active repository only partly readable.
+    fn move_prefix<'a>(
+        &'a self,
+        _source: &'a BlobKey,
+        _destination: &'a BlobKey,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Err(BlobStorageError::UnsupportedOperation {
+                backend: self.backend_name(),
+                operation: "atomic prefix move",
+            })
+        })
+    }
+
+    /// Delete every object below `prefix` after it has left the live namespace.
+    fn delete_prefix<'a>(&'a self, prefix: &'a BlobKey) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let objects = self.list(Some(prefix)).await?;
+            let found = !objects.is_empty();
+            for object in objects {
+                self.delete(&object.key).await?;
+            }
+            Ok(found)
+        })
+    }
 
     /// Local backends expose a path for zero-copy protocol handlers. Portable
     /// callers must use the other methods and handle `None` for S3-like stores.
@@ -306,6 +343,73 @@ impl LocalBlobStorage {
                 )
             })?
     }
+
+    async fn move_prefix_checked(&self, source: &BlobKey, destination: &BlobKey) -> Result<bool> {
+        let source_path = self.lexical_path(source);
+        let metadata = match tokio::fs::symlink_metadata(&source_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(BlobStorageError::io("blob prefix", &source_path, error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(BlobStorageError::io(
+                "blob prefix",
+                &source_path,
+                std::io::Error::other("refusing to move a symlinked blob prefix"),
+            ));
+        }
+        self.ensure_canonical_under_root(&source_path).await?;
+
+        let destination_path = self.lexical_path(destination);
+        self.prepare_parent(&destination_path).await?;
+        if tokio::fs::try_exists(&destination_path)
+            .await
+            .map_err(io_at("blob staging prefix", &destination_path))?
+        {
+            return Err(BlobStorageError::io(
+                "blob staging prefix",
+                &destination_path,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination prefix already exists",
+                ),
+            ));
+        }
+
+        tokio::fs::rename(&source_path, &destination_path)
+            .await
+            .map_err(io_at("blob prefix", &source_path))?;
+        Ok(true)
+    }
+
+    async fn delete_prefix_checked(&self, prefix: &BlobKey) -> Result<bool> {
+        let path = self.lexical_path(prefix);
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(BlobStorageError::io("blob prefix", &path, error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(BlobStorageError::io(
+                "blob prefix",
+                &path,
+                std::io::Error::other("refusing to delete a symlinked blob prefix"),
+            ));
+        }
+        self.ensure_canonical_under_root(&path).await?;
+        if metadata.is_dir() {
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .map_err(io_at("blob prefix", &path))?;
+        } else if metadata.is_file() {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(io_at("blob prefix", &path))?;
+        } else {
+            return Err(BlobStorageError::NotFound(prefix.clone()));
+        }
+        Ok(true)
+    }
 }
 
 impl BlobStorage for LocalBlobStorage {
@@ -391,6 +495,18 @@ impl BlobStorage for LocalBlobStorage {
 
     fn list<'a>(&'a self, prefix: Option<&'a BlobKey>) -> BoxFuture<'a, Result<Vec<BlobMetadata>>> {
         Box::pin(self.list_checked(prefix))
+    }
+
+    fn move_prefix<'a>(
+        &'a self,
+        source: &'a BlobKey,
+        destination: &'a BlobKey,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(self.move_prefix_checked(source, destination))
+    }
+
+    fn delete_prefix<'a>(&'a self, prefix: &'a BlobKey) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(self.delete_prefix_checked(prefix))
     }
 
     fn local_path(&self, key: &BlobKey) -> Option<PathBuf> {
@@ -557,9 +673,20 @@ mod tests {
         assert_eq!(prefixed[0].key, first);
         assert_eq!(storage.list(None).await.unwrap().len(), 2);
 
+        let staged = BlobKey::new("_deleted/artifacts/1").unwrap();
+        assert!(storage.move_prefix(&prefix, &staged).await.unwrap());
+        assert!(storage.list(Some(&prefix)).await.unwrap().is_empty());
+        assert_eq!(storage.list(Some(&staged)).await.unwrap().len(), 1);
+        assert!(storage.move_prefix(&staged, &prefix).await.unwrap());
+
         assert!(storage.delete(&first).await.unwrap());
         assert!(!storage.delete(&first).await.unwrap());
         assert!(!storage.exists(&first).await.unwrap());
+
+        let artifacts = BlobKey::new("artifacts").unwrap();
+        assert!(storage.delete_prefix(&artifacts).await.unwrap());
+        assert!(storage.list(None).await.unwrap().is_empty());
+        assert!(!storage.delete_prefix(&artifacts).await.unwrap());
     }
 
     /// The failing directory is derived from the storage root and the key, so

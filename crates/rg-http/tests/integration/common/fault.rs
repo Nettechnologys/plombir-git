@@ -106,6 +106,7 @@ pub struct BlobFaults {
     put_file: Arc<AtomicBool>,
     get: Arc<AtomicBool>,
     delete: Arc<AtomicBool>,
+    delete_prefix: Arc<AtomicBool>,
 }
 
 /// Not every switch has a test yet; the set is complete because a harness that
@@ -129,10 +130,23 @@ impl BlobFaults {
         self.delete.store(true, Ordering::SeqCst);
     }
 
+    /// Fail only the post-commit retirement of an already-staged prefix. The
+    /// prepare move still succeeds, so repository deletion reaches the branch
+    /// where returning `2xx` would lie about physical cleanup.
+    pub fn fail_delete_prefix(&self) {
+        self.delete_prefix.store(true, Ordering::SeqCst);
+    }
+
     /// Take the whole blob store away at once — what the sweep needs, where a
     /// per-endpoint test wants exactly one method to fail.
     pub fn fail_everything(&self) {
-        for flag in [&self.put, &self.put_file, &self.get, &self.delete] {
+        for flag in [
+            &self.put,
+            &self.put_file,
+            &self.get,
+            &self.delete,
+            &self.delete_prefix,
+        ] {
             flag.store(true, Ordering::SeqCst);
         }
     }
@@ -140,7 +154,13 @@ impl BlobFaults {
     /// Lift every fault, so the test can read back what the failed request left
     /// behind.
     pub fn heal(&self) {
-        for flag in [&self.put, &self.put_file, &self.get, &self.delete] {
+        for flag in [
+            &self.put,
+            &self.put_file,
+            &self.get,
+            &self.delete,
+            &self.delete_prefix,
+        ] {
             flag.store(false, Ordering::SeqCst);
         }
     }
@@ -252,6 +272,33 @@ impl BlobStorage for FaultyBlobStorage {
         prefix: Option<&'a BlobKey>,
     ) -> BoxFuture<'a, rg_core::blob_storage::Result<Vec<BlobMetadata>>> {
         self.inner.list(prefix)
+    }
+
+    fn move_prefix<'a>(
+        &'a self,
+        source: &'a BlobKey,
+        destination: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<bool>> {
+        Box::pin(async move {
+            if self.faults.delete.load(Ordering::SeqCst) {
+                return Err(injected("blob storage prefix move", source));
+            }
+            self.inner.move_prefix(source, destination).await
+        })
+    }
+
+    fn delete_prefix<'a>(
+        &'a self,
+        prefix: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<bool>> {
+        Box::pin(async move {
+            if self.faults.delete.load(Ordering::SeqCst)
+                || self.faults.delete_prefix.load(Ordering::SeqCst)
+            {
+                return Err(injected("blob storage prefix delete", prefix));
+            }
+            self.inner.delete_prefix(prefix).await
+        })
     }
 
     /// Answers "no local file" while reads are faulted.
