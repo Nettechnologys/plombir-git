@@ -97,6 +97,7 @@ mod pypi_simple_index_tests;
 mod rate_limit_mounted_tests;
 mod registry_lockout_tests;
 mod release_attestation_tests;
+mod release_deletion_storage_tests;
 mod release_tests;
 mod repo_content_failure_status_tests;
 mod repo_cookie_session_tests;

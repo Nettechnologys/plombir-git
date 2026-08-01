@@ -11,6 +11,8 @@ use rg_db::{
     entities::release_asset::{ActiveModel as AssetActiveModel, Model as Asset},
 };
 
+use crate::blob_storage::{BlobKey, BlobStorage};
+
 /// Create a new release.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_release(
@@ -131,15 +133,269 @@ pub async fn update_release(
     rg_db::ops::release_ops::update(db, model).await
 }
 
-/// Delete a release.
-pub async fn delete_release(db: &DatabaseConnection, id: i64) -> Result<()> {
+#[derive(Debug)]
+struct StagedReleaseBlob {
+    live: BlobKey,
+    staged: BlobKey,
+}
+
+#[derive(Debug)]
+struct StagedLegacyAsset {
+    asset_id: i64,
+    live: PathBuf,
+    staged: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct ReleaseDeletionStaging {
+    blob: Option<StagedReleaseBlob>,
+    legacy: Vec<StagedLegacyAsset>,
+}
+
+impl ReleaseDeletionStaging {
+    async fn prepare(
+        storage: &dyn BlobStorage,
+        blob: StagedReleaseBlob,
+        legacy: Vec<StagedLegacyAsset>,
+        deletion_kind: &'static str,
+        item_id: i64,
+    ) -> Result<Self> {
+        let mut staging = Self::default();
+        match storage.move_prefix(&blob.live, &blob.staged).await {
+            Ok(true) => staging.blob = Some(blob),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to stage {deletion_kind} blob prefix {} at {}",
+                        blob.live, blob.staged
+                    )
+                });
+            }
+        }
+
+        for path in legacy {
+            let exists = match tokio::fs::try_exists(&path.live).await {
+                Ok(exists) => exists,
+                Err(error) => {
+                    staging.restore(storage, deletion_kind, item_id).await;
+                    return Err(crate::platform::fs::path_error(
+                        "legacy release asset directory",
+                        &path.live,
+                        &error,
+                        crate::platform::fs::BLOB_STORAGE_HINT,
+                    ));
+                }
+            };
+            if !exists {
+                continue;
+            }
+            if let Err(error) = tokio::fs::rename(&path.live, &path.staged).await {
+                staging.restore(storage, deletion_kind, item_id).await;
+                return Err(crate::platform::fs::path_error(
+                    "legacy release asset directory",
+                    &path.live,
+                    &error,
+                    crate::platform::fs::BLOB_STORAGE_HINT,
+                ))
+                .with_context(|| {
+                    format!(
+                        "failed to stage legacy release asset {} at {}",
+                        path.asset_id,
+                        path.staged.display()
+                    )
+                });
+            }
+            staging.legacy.push(path);
+        }
+
+        Ok(staging)
+    }
+
+    async fn restore(&self, storage: &dyn BlobStorage, deletion_kind: &'static str, item_id: i64) {
+        for path in self.legacy.iter().rev() {
+            if let Err(error) = tokio::fs::rename(&path.staged, &path.live).await {
+                tracing::warn!(
+                    deletion_kind,
+                    item_id,
+                    asset_id = path.asset_id,
+                    staged_at = %path.staged.display(),
+                    belongs_at = %path.live.display(),
+                    %error,
+                    "failed to restore a legacy release asset after deletion aborted — live metadata may now point at missing bytes until the directory is moved back by hand"
+                );
+            }
+        }
+        if let Some(blob) = &self.blob {
+            match storage.move_prefix(&blob.staged, &blob.live).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    deletion_kind,
+                    item_id,
+                    staged_prefix = %blob.staged,
+                    live_prefix = %blob.live,
+                    "failed to restore release blobs after deletion aborted — the staged prefix disappeared and live metadata may now point at missing bytes"
+                ),
+                Err(error) => tracing::warn!(
+                    deletion_kind,
+                    item_id,
+                    staged_prefix = %blob.staged,
+                    live_prefix = %blob.live,
+                    %error,
+                    "failed to restore release blobs after deletion aborted — live metadata cannot reach them until the prefix is moved back by hand"
+                ),
+            }
+        }
+    }
+
+    async fn retire(
+        self,
+        storage: &dyn BlobStorage,
+        deletion_kind: &'static str,
+        item_id: i64,
+    ) -> Result<()> {
+        let mut cleanup_error = None;
+
+        for path in self.legacy {
+            match tokio::fs::remove_dir_all(&path.staged).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        deletion_kind,
+                        item_id,
+                        asset_id = path.asset_id,
+                        staged_at = %path.staged.display(),
+                        %error,
+                        "release metadata is deleted, but staged legacy asset bytes remain and must be removed by hand"
+                    );
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(
+                            crate::platform::fs::path_error(
+                                "staged legacy release asset directory",
+                                &path.staged,
+                                &error,
+                                crate::platform::fs::BLOB_STORAGE_HINT,
+                            )
+                            .context("failed to retire deleted legacy release asset"),
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(blob) = self.blob {
+            if let Err(error) = storage.delete_prefix(&blob.staged).await {
+                tracing::warn!(
+                    deletion_kind,
+                    item_id,
+                    staged_prefix = %blob.staged,
+                    live_prefix = %blob.live,
+                    %error,
+                    "release metadata is deleted and its live blob namespace is free, but staged blobs remain and must be removed by hand"
+                );
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(anyhow::Error::new(error).context(format!(
+                        "failed to retire staged release blobs at {}",
+                        blob.staged
+                    )));
+                }
+            }
+        }
+
+        cleanup_error.map_or(Ok(()), Err)
+    }
+}
+
+fn release_blob_prefix(owner: &str, repo_name: &str, release_id: i64) -> Result<BlobKey> {
+    let release_id = release_id.to_string();
+    BlobKey::from_segments(["releases", owner, repo_name, release_id.as_str()]).map_err(Into::into)
+}
+
+fn asset_blob_prefix(owner: &str, repo_name: &str, asset: &Asset) -> Result<BlobKey> {
+    let release_id = asset.release_id.to_string();
+    let asset_id = asset.id.to_string();
+    BlobKey::from_segments([
+        "releases",
+        owner,
+        repo_name,
+        release_id.as_str(),
+        asset_id.as_str(),
+    ])
+    .map_err(Into::into)
+}
+
+fn staged_release_blob_prefix(
+    deletion_kind: &str,
+    item_id: i64,
+    deletion_id: &str,
+) -> Result<BlobKey> {
+    let item_id = item_id.to_string();
+    BlobKey::from_segments([
+        "_deleted",
+        "release-deletions",
+        deletion_kind,
+        item_id.as_str(),
+        deletion_id,
+    ])
+    .map_err(Into::into)
+}
+
+fn legacy_asset_staging(
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    assets: &[Asset],
+    deletion_id: &str,
+) -> Vec<StagedLegacyAsset> {
+    assets
+        .iter()
+        .map(|asset| {
+            let live = asset_storage_dir(repo_root, owner, repo_name).join(asset.id.to_string());
+            let staged = live.with_file_name(format!("{}.deleted-{deletion_id}", asset.id));
+            StagedLegacyAsset {
+                asset_id: asset.id,
+                live,
+                staged,
+            }
+        })
+        .collect()
+}
+
+/// Delete a release and every asset representation it owns.
+#[allow(clippy::too_many_arguments)]
+pub async fn delete_release(
+    db: &DatabaseConnection,
+    id: i64,
+    storage: &dyn BlobStorage,
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+) -> Result<()> {
     // Get release info for webhook before deleting
     let release = rg_db::ops::release_ops::find_by_id(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("release"))?;
     let repo_id = release.repo_id;
 
-    rg_db::ops::release_ops::delete_by_id(db, id).await?;
+    let assets = rg_db::ops::release_ops::list_assets(db, release.id).await?;
+    let deletion_id = uuid::Uuid::new_v4().simple().to_string();
+    let staging = ReleaseDeletionStaging::prepare(
+        storage,
+        StagedReleaseBlob {
+            live: release_blob_prefix(owner, repo_name, release.id)?,
+            staged: staged_release_blob_prefix("release", release.id, &deletion_id)?,
+        },
+        legacy_asset_staging(repo_root, owner, repo_name, &assets, &deletion_id),
+        "release",
+        release.id,
+    )
+    .await?;
+
+    if let Err(error) = rg_db::ops::release_ops::delete_by_id(db, id).await {
+        staging.restore(storage, "release", release.id).await;
+        return Err(error).context("failed to delete release metadata");
+    }
 
     // Trigger release.deleted webhook
     let payload = serde_json::json!({
@@ -152,7 +408,7 @@ pub async fn delete_release(db: &DatabaseConnection, id: i64) -> Result<()> {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger release.deleted webhook");
     }
 
-    Ok(())
+    staging.retire(storage, "release", release.id).await
 }
 
 /// Roll back the metadata row inserted before the blob was written.
@@ -415,7 +671,7 @@ pub async fn list_assets(db: &DatabaseConnection, release_id: i64) -> Result<Vec
     rg_db::ops::release_ops::list_assets(db, release_id).await
 }
 
-/// Delete a release asset (removes DB record + file from disk).
+/// Delete a release asset from both backend-neutral/legacy storage and the DB.
 pub async fn delete_asset(
     db: &DatabaseConnection,
     asset_id: i64,
@@ -425,29 +681,31 @@ pub async fn delete_asset(
     repo_name: &str,
 ) -> Result<()> {
     let asset = get_asset(db, asset_id).await?;
+    let deletion_id = uuid::Uuid::new_v4().simple().to_string();
+    let staging = ReleaseDeletionStaging::prepare(
+        storage,
+        StagedReleaseBlob {
+            live: asset_blob_prefix(owner, repo_name, &asset)?,
+            staged: staged_release_blob_prefix("asset", asset.id, &deletion_id)?,
+        },
+        legacy_asset_staging(
+            repo_root,
+            owner,
+            repo_name,
+            std::slice::from_ref(&asset),
+            &deletion_id,
+        ),
+        "release asset",
+        asset.id,
+    )
+    .await?;
 
-    let key = asset_blob_key(owner, repo_name, &asset)?;
-    if let Err(error) = storage.delete(&key).await {
-        tracing::warn!(%key, %error, "failed to remove release asset blob");
+    if let Err(error) = rg_db::ops::release_ops::delete_asset_by_id(db, asset_id).await {
+        staging.restore(storage, "release asset", asset.id).await;
+        return Err(error).context("failed to delete release asset metadata");
     }
 
-    // Remove file from disk (ignore errors if file doesn't exist)
-    let file_path = asset_file_path(repo_root, owner, repo_name, &asset);
-    if let Err(e) = tokio::fs::remove_file(&file_path).await {
-        tracing::warn!("Failed to remove asset file {}: {e}", file_path.display());
-    }
-
-    // Remove parent directory if empty
-    if let Some(parent) = file_path.parent() {
-        if let Err(e) = tokio::fs::remove_dir(parent).await {
-            tracing::warn!("Failed to remove asset directory {}: {e}", parent.display());
-        }
-    }
-
-    // Delete DB record
-    rg_db::ops::release_ops::delete_asset_by_id(db, asset_id).await?;
-
-    Ok(())
+    staging.retire(storage, "release asset", asset.id).await
 }
 
 /// Get the storage directory for release assets.

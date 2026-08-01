@@ -31,13 +31,11 @@ use sea_orm::ConnectionTrait;
 
 /// The statement kind a [`DbFault`] rejects.
 ///
-/// `DELETE` is missing because nothing needs it yet: SQLite takes the same
-/// `BEFORE DELETE` trigger, so add the variant when a test wants it rather than
-/// carrying an `#[allow(dead_code)]` for it.
 #[derive(Clone, Copy, Debug)]
 pub enum DbWrite {
     Insert,
     Update,
+    Delete,
 }
 
 impl DbWrite {
@@ -45,6 +43,7 @@ impl DbWrite {
         match self {
             Self::Insert => "INSERT",
             Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
         }
     }
 }

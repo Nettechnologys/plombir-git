@@ -281,7 +281,7 @@ pub async fn update_release(
 )]
 pub async fn delete_release(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
+    Path((owner, name, id)): Path<(String, String, i64)>,
     RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
     let release = match release_in_repo(&state, &repo, id).await {
@@ -289,7 +289,16 @@ pub async fn delete_release(
         Err(e) => return e.into_response(),
     };
 
-    match rg_core::release::service::delete_release(&state.db, release.id).await {
+    match rg_core::release::service::delete_release(
+        &state.db,
+        release.id,
+        state.blob_storage.as_ref(),
+        &state.repo_root,
+        &owner,
+        &name,
+    )
+    .await
+    {
         Ok(()) => (
             StatusCode::NO_CONTENT,
             Json(serde_json::json!({ "deleted": true })),
