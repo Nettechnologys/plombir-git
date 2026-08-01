@@ -186,6 +186,46 @@ pub async fn register(
     }
 }
 
+/// Whether the account whose first factor was just accepted still owes a second
+/// one — as three outcomes, never as one boolean.
+///
+/// `Ok(None)` and `Err` used to collapse into `false` here, and `false` is the
+/// permissive answer on the one door where being wrong costs an account: the
+/// handler went on to mint the JWT and set the auth cookie for a user whose
+/// mandatory second factor had never been consulted. A degraded database was
+/// therefore an MFA bypass that lasted exactly as long as the degradation, and
+/// nothing in the log said so.
+///
+/// The split is the one `session_standing_middleware`, the passkey door and
+/// `verify_mfa` already make:
+///
+/// * `Err` — the requirement could not be *read*. Ours, and retryable: the
+///   funnel turns a connection-level failure into `503` and everything else
+///   into `500`, with the database text kept to the operator log.
+/// * `Ok(None)` — the account was deleted between the password check and this
+///   read. The credential no longer belongs to anyone, which is the same `401`
+///   the passkey door and `verify_mfa` give a vanished row.
+fn mfa_requirement(user_id: i64, lookup: anyhow::Result<Option<bool>>) -> Result<bool, AppError> {
+    match lookup {
+        Ok(Some(mfa_enabled)) => Ok(mfa_enabled),
+        Ok(None) => {
+            tracing::warn!(
+                user_id,
+                "login: the account disappeared between the password check and the MFA lookup"
+            );
+            Err(AppError::unauthorized("invalid credentials"))
+        }
+        Err(error) => {
+            tracing::error!(
+                user_id,
+                error = %format!("{error:#}"),
+                "login: could not read the MFA requirement; refusing to issue a session"
+            );
+            Err(AppError::from(error))
+        }
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/users/login",
@@ -194,6 +234,8 @@ pub async fn register(
     responses(
         (status = 200, description = "Login successful", body = AuthResponse),
         (status = 401, description = "Invalid credentials", body = serde_json::Value),
+        (status = 500, description = "The MFA requirement could not be read", body = serde_json::Value),
+        (status = 503, description = "The database is unreachable", body = serde_json::Value),
     )
 )]
 pub async fn login(
@@ -220,11 +262,15 @@ pub async fn login(
                 rg_core::user::service::LoginMethod::Password => "password",
                 rg_core::user::service::LoginMethod::Ldap => "ldap",
             };
-            // Check if MFA is enabled for this user
-            let mfa_required = match rg_db::ops::user_ops::find_by_id(&state.db, resp.user_id).await
-            {
-                Ok(Some(user)) => user.mfa_enabled,
-                _ => false,
+            // Check if MFA is enabled for this user. The three outcomes of that
+            // read are kept apart by `mfa_requirement`, which is where the
+            // reasoning for not folding them lives.
+            let lookup = rg_db::ops::user_ops::find_by_id(&state.db, resp.user_id)
+                .await
+                .map(|user| user.map(|user| user.mfa_enabled));
+            let mfa_required = match mfa_requirement(resp.user_id, lookup) {
+                Ok(required) => required,
+                Err(error) => return error.into_response(),
             };
 
             // Record audit log
@@ -319,17 +365,29 @@ pub async fn login(
         }
         Err(error) => {
             // Not every failure of `login_with_configured_auth` is a rejected
-            // credential. A stored hash the verifier cannot use never produced
-            // a verdict at all, and answering 401 tells the account holder they
-            // mistyped a password that was very possibly right — while the
-            // brute-force counter below racks up strikes against them for our
-            // broken column. Hand it to the error funnel instead: 500 for the
-            // client, the full chain (with the login it happened on) for the
-            // operator.
-            if error
-                .downcast_ref::<rg_core::auth::password::UnusablePasswordHash>()
-                .is_some()
-            {
+            // credential, and the two must not share an answer. A verdict is
+            // one of the three the service bails with, listed in
+            // `CREDENTIAL_VERDICTS`; anything else — an unreachable database on
+            // the account lookup, a stored hash the verifier cannot use, a
+            // token that would not sign — never produced a verdict at all.
+            //
+            // Answering 401 to those tells the account holder they mistyped a
+            // password that was very possibly right, keeps the outage out of
+            // the operator's 5xx rate entirely, and lets the brute-force
+            // counter below rack up strikes against them for our breakage.
+            //
+            // Enumerating the *verdicts* rather than the failures is what makes
+            // this fail-closed: a message this list does not know becomes a
+            // retryable 5xx with the full chain in the operator log, not a
+            // silent 401. The old form enumerated one failure
+            // (`UnusablePasswordHash`) and called everything else a rejection.
+            const CREDENTIAL_VERDICTS: [&str; 3] = [
+                "invalid credentials",
+                "account is disabled",
+                "account is temporarily locked",
+            ];
+            let verdict = error.to_string();
+            if !CREDENTIAL_VERDICTS.contains(&verdict.as_str()) {
                 crate::metrics::recorder::auth_event("login", "failure");
                 return AppError::from(error).into_response();
             }
@@ -354,8 +412,8 @@ pub async fn login(
                     None
                 }
             };
-            let mut locked = error.to_string() == "account is temporarily locked";
-            if !locked && error.to_string() == "invalid credentials" {
+            let mut locked = verdict == "account is temporarily locked";
+            if !locked && verdict == "invalid credentials" {
                 if let Some(user) = &user {
                     // `false` means "not locked" — which is also what a failed
                     // write would report, so a silent error here degrades the
@@ -764,6 +822,82 @@ pub async fn reset_password(
         // the token bookkeeping are ours and become a retryable 5xx instead of
         // telling the user their valid reset link is invalid.
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// The branch behind [`mfa_requirement`] cannot be reached over HTTP: both the
+/// password check and the MFA lookup read `users`, so any fault that breaks the
+/// second one has already rejected the first, and the handler never gets there.
+/// Only a database that fails *between* two queries of one request lands on it —
+/// which is exactly why it went unnoticed, and why it is proven here instead.
+#[cfg(test)]
+mod mfa_requirement_tests {
+    use super::mfa_requirement;
+    use axum::http::StatusCode;
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
+
+    #[test]
+    fn a_healthy_lookup_reports_the_stored_requirement() {
+        assert!(mfa_requirement(7, Ok(Some(true))).expect("healthy lookup"));
+        assert!(!mfa_requirement(7, Ok(Some(false))).expect("healthy lookup"));
+    }
+
+    #[test]
+    fn an_unreadable_requirement_is_a_retryable_server_error() {
+        let error = mfa_requirement(
+            7,
+            Err(
+                anyhow::Error::new(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout))
+                    .context("db: find user by id"),
+            ),
+        )
+        .expect_err("a failed lookup must not answer the MFA question");
+        assert_eq!(
+            error.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unreachable database on the MFA lookup must be retryable"
+        );
+
+        let error = mfa_requirement(
+            7,
+            Err(anyhow::Error::new(DbErr::Exec(RuntimeErr::Internal(
+                "no such table: users".into(),
+            )))
+            .context("db: find user by id")),
+        )
+        .expect_err("a failed lookup must not answer the MFA question");
+        assert_eq!(
+            error.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a statement-level failure on the MFA lookup is a 500, not a session"
+        );
+    }
+
+    #[test]
+    fn a_vanished_account_does_not_become_a_session() {
+        let error = mfa_requirement(7, Ok(None))
+            .expect_err("an account that is gone must not be handed a session");
+        assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The property all three cases exist for: nothing but a stored `false`
+    /// may ever answer "no second factor needed".
+    #[test]
+    fn only_a_stored_false_waives_the_second_factor() {
+        for lookup in [
+            Ok(None),
+            Err(anyhow::Error::new(DbErr::ConnectionAcquire(
+                ConnAcquireErr::Timeout,
+            ))),
+            Err(anyhow::Error::new(DbErr::Exec(RuntimeErr::Internal(
+                "broken".into(),
+            )))),
+        ] {
+            assert!(
+                !matches!(mfa_requirement(7, lookup), Ok(false)),
+                "an unanswered MFA lookup was folded back into 'MFA is off'"
+            );
+        }
     }
 }
 
