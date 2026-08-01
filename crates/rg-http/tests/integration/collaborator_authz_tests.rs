@@ -495,7 +495,15 @@ async fn removing_a_collaborator_by_row_id_is_not_found() {
         "write",
     )
     .await;
-    add_collaborator(&base, &owner_token, "crow_owner", "proj", "crow_bob", "read").await;
+    add_collaborator(
+        &base,
+        &owner_token,
+        "crow_owner",
+        "proj",
+        "crow_bob",
+        "read",
+    )
+    .await;
 
     // The point of the test is a row id that is nobody's user id here; if the
     // fixture ever produces a collision the delete below would legitimately

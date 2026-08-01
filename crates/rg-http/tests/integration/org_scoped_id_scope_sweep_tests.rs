@@ -104,9 +104,7 @@ use crate::common::source_scan::{
     functions, handler_type_name, param_base_types, relative, rust_files, signature_params,
     src_root,
 };
-use crate::common::{
-    register_full, spawn_test_app_with_db, spawn_test_app_with_routes,
-};
+use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_routes};
 
 const VICTIM: &str = "orgscopevictim";
 const ATTACKER: &str = "orgscopeattacker";

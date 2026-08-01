@@ -1,16 +1,16 @@
 //! REST API handlers for repository content browsing (tree, blob, history).
 
 use anyhow::Context;
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Json;
 use chrono;
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
 use crate::api::repo_access::{CiRead, RepoContents, RepoWrite};
 use crate::error::AppError;
+use crate::AppState;
 
 // ── Request / Response types ──────────────────────────────────────────
 
@@ -1488,8 +1488,8 @@ mod tests {
     use rg_git::cli_gateway::GitOutput;
 
     use super::{
-        AppError, get_commit_log, gpg_signature_from_output, is_empty_repo, list_branch_names,
-        list_tag_names, list_tree_entries,
+        get_commit_log, gpg_signature_from_output, is_empty_repo, list_branch_names,
+        list_tag_names, list_tree_entries, AppError,
     };
 
     #[derive(Clone, Default)]
