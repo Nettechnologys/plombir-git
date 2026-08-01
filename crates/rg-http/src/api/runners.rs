@@ -214,10 +214,10 @@ pub async fn heartbeat(
         Some(HeartbeatRefresh::Failed) => {
             AppError::internal("runner heartbeat was not recorded").into_response()
         }
-        None => AppError::internal(
-            "runner heartbeat route reached without the runner-auth middleware",
-        )
-        .into_response(),
+        None => {
+            AppError::internal("runner heartbeat route reached without the runner-auth middleware")
+                .into_response()
+        }
     }
 }
 
