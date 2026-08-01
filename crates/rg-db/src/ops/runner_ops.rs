@@ -111,6 +111,42 @@ pub async fn delete_runner(db: &DatabaseConnection, runner_id: i64) -> Result<bo
     Ok(result.rows_affected > 0)
 }
 
+/// Deregister a runner: hand its in-flight jobs back to the pool and delete the
+/// runner row, as one transaction.
+///
+/// The two writes are not independent. `pipeline_jobs.runner_id` points at the
+/// row being deleted, so committing the delete without the reset strands every
+/// `assigned`/`running` job on a runner that no longer exists — the scheduler
+/// hands those jobs to nobody, and only the watchdog's stuck-job sweep
+/// eventually notices. Committing the reset without the delete is the harmless
+/// half, but a caller that did the two separately had no way to tell which half
+/// it got. Inside one transaction there is no half: either the pool got the
+/// jobs back and the runner is gone, or nothing changed and the error says so.
+///
+/// Returns `false` when no runner row matched — the caller's 404 — and rolls
+/// the reset back rather than leaving jobs reset in the name of a runner that
+/// was not there to deregister.
+pub async fn deregister_runner(db: &DatabaseConnection, runner_id: i64) -> Result<bool> {
+    let txn = db.begin().await.context("db: begin transaction")?;
+
+    crate::ops::pipeline_ops::reset_runner_jobs(&txn, runner_id).await?;
+
+    let deleted = RunnerEntity::delete_by_id(runner_id)
+        .exec(&txn)
+        .await
+        .context("db: delete runner")?
+        .rows_affected
+        > 0;
+
+    if !deleted {
+        txn.rollback().await.context("db: rollback transaction")?;
+        return Ok(false);
+    }
+
+    txn.commit().await.context("db: commit transaction")?;
+    Ok(true)
+}
+
 /// Generate a unique token for runner authentication.
 fn generate_token() -> String {
     // Use UUID v4 to generate a unique token (36 chars with hyphens)

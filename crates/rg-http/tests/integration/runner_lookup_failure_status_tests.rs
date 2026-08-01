@@ -1,4 +1,10 @@
-//! Regression coverage for card_4791042b81e2.
+//! Regression coverage for card_4791042b81e2 and card_b2d69ce9baa6.
+//!
+//! The first card is about lookups a runner request reads; the second is about
+//! writes it performs — the heartbeat refresh, the `busy`/`online` transitions,
+//! and deregistration's job reset. Both families share this file's harness for
+//! the same reason: the fault has to be aimed at one table, after the request
+//! has already got past runner-token authentication.
 //!
 //! Runner requests do several database operations before the lookup whose
 //! failure matters here. A closed-pool test over the production router would
@@ -314,4 +320,331 @@ async fn finish_reports_every_post_write_rollup_and_context_failure() {
     ] {
         assert_finish_rollup_failure(target).await;
     }
+}
+
+// ── card_b2d69ce9baa6: writes the response speaks for ──────────────────────
+//
+// Every case below aborts exactly one write with a SQLite trigger and leaves the
+// rest of the database healthy, so the request reaches the handler through
+// normal runner-token authentication and fails at the named statement. A closed
+// pool would have answered at `find_by_token` instead and proved nothing.
+
+/// Refuse one column's write on the runner row. `UPDATE OF` fires only when that
+/// column is in the statement's SET list, which is what keeps the heartbeat
+/// refresh (`last_seen_at`) and the status transitions (`status`) separable.
+fn refuse_runner_write(name: &str, column: &str, when: &str) -> String {
+    format!(
+        "CREATE TRIGGER {name}\n\
+         BEFORE UPDATE OF {column} ON runners\n\
+         WHEN {when}\n\
+         BEGIN\n\
+           SELECT RAISE(ABORT, 'runner {column} write refused');\n\
+         END;"
+    )
+}
+
+async fn runner_row(
+    db: &rg_db::DatabaseConnection,
+    runner_id: i64,
+) -> Option<rg_db::entities::runner::Model> {
+    rg_db::ops::runner_ops::find_by_id(db, runner_id)
+        .await
+        .expect("reload runner row")
+}
+
+/// The `/heartbeat` response is a statement about one write. When that write is
+/// refused the endpoint must not answer `200 {"status":"ok"}` — and the same
+/// refused refresh must not fail an unrelated report that did land, which is why
+/// the finish below runs against the very same broken trigger.
+#[tokio::test]
+async fn heartbeat_answers_for_the_write_it_reports_without_failing_other_reports() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, "heartbeat").await;
+    let client = reqwest::Client::new();
+    let heartbeat_url = format!("{base}/api/v1/runners/{}/heartbeat", seeded.runner_id);
+
+    // Non-vacuity: the token, the route and the write all work before the fault.
+    let healthy = client
+        .post(&heartbeat_url)
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("healthy heartbeat");
+    assert_eq!(healthy.status(), StatusCode::OK);
+
+    install_trigger(
+        &db,
+        &refuse_runner_write(
+            "break_runner_heartbeat",
+            "last_seen_at",
+            &format!("NEW.id = {}", seeded.runner_id),
+        ),
+    )
+    .await;
+
+    let seen_before = runner_row(&db, seeded.runner_id)
+        .await
+        .expect("runner still registered")
+        .last_seen_at;
+
+    let response = client
+        .post(&heartbeat_url)
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("heartbeat against the refused write");
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the heartbeat write was refused but /heartbeat answered {}",
+        response.status()
+    );
+    assert_eq!(
+        runner_row(&db, seeded.runner_id)
+            .await
+            .expect("runner still registered")
+            .last_seen_at,
+        seen_before,
+        "the response claimed a heartbeat that never reached the row"
+    );
+
+    // The other half of the rule: the refresh is opportunistic everywhere else.
+    // A runner that finished a job has done work it cannot reproduce, so its
+    // report must land even while its liveness timestamp is unwritable.
+    rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
+        .await
+        .expect("assign job before finish");
+    let finish = client
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/finish",
+            seeded.runner_id, seeded.job_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .json(&serde_json::json!({"status": "success", "exit_code": 0}))
+        .send()
+        .await
+        .expect("finish job while the heartbeat write is refused");
+    assert_eq!(
+        finish.status(),
+        StatusCode::OK,
+        "a failed opportunistic heartbeat refresh must not fail an unrelated report"
+    );
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload finished job")
+        .expect("finished job still exists");
+    assert_eq!(persisted.status, "success");
+}
+
+/// `busy` is what stops the scheduler handing this runner a second job. A
+/// refused transition may not be reported as a started job — and the report the
+/// runner retries has to find the job exactly where it left it.
+#[tokio::test]
+async fn start_does_not_confirm_a_runner_that_could_not_be_marked_busy() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, "start-busy").await;
+    rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
+        .await
+        .expect("assign job before start");
+    install_trigger(
+        &db,
+        &refuse_runner_write(
+            "break_runner_busy_transition",
+            "status",
+            &format!("NEW.id = {} AND NEW.status = 'busy'", seeded.runner_id),
+        ),
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/start",
+            seeded.runner_id, seeded.job_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("start job through the production router");
+    assert!(
+        response.status().is_server_error(),
+        "the runner was never marked busy but start returned {}",
+        response.status()
+    );
+    assert_ne!(
+        runner_row(&db, seeded.runner_id)
+            .await
+            .expect("runner still registered")
+            .status,
+        "busy"
+    );
+
+    // The fault landed after the job-result write — proof it is not a vacuous
+    // failure at authentication — and the job is still this runner's, so the
+    // retry passes the same gate.
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload started job")
+        .expect("started job still exists");
+    assert_eq!(persisted.status, "running");
+    assert_eq!(persisted.runner_id, Some(seeded.runner_id));
+}
+
+/// The mirror at the other end: a runner left `busy` after finishing is one the
+/// scheduler skips until the watchdog notices, so the finish response cannot
+/// claim a transition that was refused.
+#[tokio::test]
+async fn finish_does_not_confirm_a_runner_that_could_not_be_marked_online() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, "finish-online").await;
+    rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
+        .await
+        .expect("assign job before finish");
+    rg_db::ops::runner_ops::update_status(&db, seeded.runner_id, "busy")
+        .await
+        .expect("mark runner busy before finish");
+    install_trigger(
+        &db,
+        &refuse_runner_write(
+            "break_runner_online_transition",
+            "status",
+            &format!("NEW.id = {} AND NEW.status = 'online'", seeded.runner_id),
+        ),
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/finish",
+            seeded.runner_id, seeded.job_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .json(&serde_json::json!({"status": "success", "exit_code": 0}))
+        .send()
+        .await
+        .expect("finish job through the production router");
+    assert!(
+        response.status().is_server_error(),
+        "the runner was never marked online but finish returned {}",
+        response.status()
+    );
+    assert_eq!(
+        runner_row(&db, seeded.runner_id)
+            .await
+            .expect("runner still registered")
+            .status,
+        "busy"
+    );
+
+    // The job result itself did land, so the runner's retry is a repeat of the
+    // same terminal write rather than a lost result.
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload finished job")
+        .expect("finished job still exists");
+    assert_eq!(persisted.status, "success");
+    assert_eq!(persisted.exit_code, Some(0));
+}
+
+/// Deregistration is two writes that are only correct together. Each half is
+/// refused in turn; neither may leave the other half committed.
+async fn assert_deregistration_is_atomic(target: &str) {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, &format!("deregister-{target}")).await;
+    rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
+        .await
+        .expect("assign job before deregistration");
+
+    let trigger = match target {
+        // The job reset fails: the runner must survive, or its jobs are stranded
+        // on a row that no longer exists.
+        "reset" => format!(
+            "CREATE TRIGGER break_runner_job_reset\n\
+             BEFORE UPDATE OF status ON pipeline_jobs\n\
+             WHEN NEW.id = {} AND NEW.status = 'pending'\n\
+             BEGIN\n\
+               SELECT RAISE(ABORT, 'job reset refused');\n\
+             END;",
+            seeded.job_id
+        ),
+        // The delete fails after the reset succeeded: the reset must roll back,
+        // or a live runner is left with the jobs it was executing taken away.
+        "delete" => format!(
+            "CREATE TRIGGER break_runner_delete\n\
+             BEFORE DELETE ON runners\n\
+             WHEN OLD.id = {}\n\
+             BEGIN\n\
+               SELECT RAISE(ABORT, 'runner delete refused');\n\
+             END;",
+            seeded.runner_id
+        ),
+        other => panic!("unknown deregistration fault target {other}"),
+    };
+    install_trigger(&db, &trigger).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/runners/{}/deregister",
+            seeded.runner_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("deregister through the production router");
+    assert!(
+        response.status().is_server_error(),
+        "the {target} half of deregistration failed but it returned {}",
+        response.status()
+    );
+
+    assert!(
+        runner_row(&db, seeded.runner_id).await.is_some(),
+        "the runner was deleted although the {target} half never committed"
+    );
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload assigned job")
+        .expect("assigned job still exists");
+    assert_eq!(
+        persisted.runner_id,
+        Some(seeded.runner_id),
+        "the {target} failure left the job reset half-applied"
+    );
+    assert_eq!(persisted.status, "assigned");
+}
+
+#[tokio::test]
+async fn deregistration_never_commits_one_half_of_its_two_writes() {
+    // Each case gets its own database: the triggers are deliberately
+    // irreversible for the rows they name.
+    assert_deregistration_is_atomic("reset").await;
+    assert_deregistration_is_atomic("delete").await;
+}
+
+/// The healthy path the fault-injection cases are measured against: the runner's
+/// job goes back to the pool and the runner row is gone, in one response.
+#[tokio::test]
+async fn deregistration_returns_the_jobs_and_deletes_the_runner() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, "deregister-healthy").await;
+    rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
+        .await
+        .expect("assign job before deregistration");
+
+    let client = reqwest::Client::new();
+    let deregister_url = format!("{base}/api/v1/runners/{}/deregister", seeded.runner_id);
+    let response = client
+        .post(&deregister_url)
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("deregister through the production router");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(runner_row(&db, seeded.runner_id).await.is_none());
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload released job")
+        .expect("released job still exists");
+    assert_eq!(persisted.status, "pending");
+    assert_eq!(persisted.runner_id, None);
 }

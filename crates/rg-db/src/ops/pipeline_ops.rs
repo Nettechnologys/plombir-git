@@ -770,7 +770,14 @@ pub async fn mark_job_timeout(db: &DatabaseConnection, job_id: i64) -> Result<()
 }
 
 /// Reset all jobs assigned to a runner back to pending (for deregistration).
-pub async fn reset_runner_jobs(db: &DatabaseConnection, runner_id: i64) -> Result<u64> {
+///
+/// Takes any [`ConnectionTrait`] — a pool *or* a transaction — because
+/// deregistration has to reset the runner's jobs and delete its row as one
+/// unit: a reset that lands without the delete leaves a live runner with no
+/// work, and a delete that lands without the reset leaves jobs pointing at a
+/// runner row that no longer exists, which nothing but the watchdog will ever
+/// pick up. See `runner_ops::deregister_runner`.
+pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Result<u64> {
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::RunnerId.eq(Some(runner_id)))

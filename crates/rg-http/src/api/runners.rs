@@ -1,7 +1,7 @@
 //! REST API handlers for CI/CD Runners.
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -172,22 +172,53 @@ pub async fn register(
         ("id" = i64, Path, description = "Runner ID"),
     ),
     responses(
-        (status = 200, description = "Success", body = HeartbeatResponse),
+        (status = 200, description = "Heartbeat recorded", body = HeartbeatResponse),
+        (status = 503, description = "The heartbeat was not recorded: the database is unreachable", body = serde_json::Value),
     ),
 )]
 pub async fn heartbeat(
     State(_state): State<AppState>,
+    // The id is deliberately not bound: this handler answers for a write it
+    // does not perform and does not act on the id, and the middleware already
+    // logs `runner_id` next to the error itself. Binding it here would enter
+    // this route into `global_id_anchor_guard`'s census — the denominator of a
+    // plan about handlers that *act* on an instance-wide id — for a log line.
     Path(_runner_id): Path<i64>,
+    refresh: Option<Extension<HeartbeatRefresh>>,
 ) -> impl IntoResponse {
-    // Heartbeat is already updated by the authenticate_runner middleware
-    (
-        StatusCode::OK,
-        Json(HeartbeatResponse {
-            status: "ok".to_string(),
-            server_time: chrono::Utc::now().to_rfc3339(),
-        }),
-    )
-        .into_response()
+    // The write itself is `authenticate_runner`'s — every authenticated runner
+    // request refreshes `last_seen_at`, so doing it again here would be a second
+    // write for the same fact. What this handler owns is the *answer*: this is
+    // the one route whose entire purpose is that write, and `{"status":"ok"}`
+    // is a statement about it. The middleware records the outcome instead of
+    // discarding it, so a refresh that never reached the database cannot be
+    // reported as a heartbeat that landed.
+    //
+    // A missing extension means the middleware did not run at all — the route
+    // is mounted behind it, so that is a wiring fault, and answering `200` to it
+    // would be the same lie by another route.
+    match refresh.map(|Extension(refresh)| refresh) {
+        Some(HeartbeatRefresh::Persisted) => (
+            StatusCode::OK,
+            Json(HeartbeatResponse {
+                status: "ok".to_string(),
+                server_time: chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+            .into_response(),
+        // Already logged with its full context by the middleware; the runner
+        // gets the classification, not the database's words.
+        Some(HeartbeatRefresh::Unavailable) => {
+            AppError::service_unavailable("runner heartbeat was not recorded").into_response()
+        }
+        Some(HeartbeatRefresh::Failed) => {
+            AppError::internal("runner heartbeat was not recorded").into_response()
+        }
+        None => AppError::internal(
+            "runner heartbeat route reached without the runner-auth middleware",
+        )
+        .into_response(),
+    }
 }
 
 /// POST /api/v1/runners/:id/deregister
@@ -209,12 +240,11 @@ pub async fn deregister(
     State(state): State<AppState>,
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
-    // Reset any jobs assigned to this runner so they can be picked up by others
-    if let Err(e) = rg_db::ops::pipeline_ops::reset_runner_jobs(&state.db, runner_id).await {
-        tracing::warn!(runner_id, error = %format!("{e:#}"), "Failed to reset runner jobs during deregistration");
-    }
-
-    match rg_db::ops::runner_ops::delete_runner(&state.db, runner_id).await {
+    // Handing the runner's in-flight jobs back to the pool and deleting the
+    // runner row is one transaction, not two writes with a log line between
+    // them: deleting a runner whose jobs were not reset strands those jobs on a
+    // row that no longer exists. See `runner_ops::deregister_runner`.
+    match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
         Ok(true) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "deregistered"})),
@@ -225,7 +255,10 @@ pub async fn deregister(
             Json(serde_json::json!({"error": "runner not found"})),
         )
             .into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => {
+            tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to deregister runner");
+            AppError::from(e).into_response()
+        }
     }
 }
 
@@ -534,13 +567,21 @@ pub async fn start_job(
         return AppError::from(e).into_response();
     }
 
-    // Metrics: a job is now executing on a runner.
-    crate::metrics::recorder::ci_job_started();
-
-    // Mark runner as busy
+    // Mark runner as busy. This is not decoration: `busy` is what keeps the
+    // scheduler from handing this runner a second job while it executes this
+    // one, so a swallowed failure oversubscribes the runner — and answering
+    // `200` tells it the whole transition landed. Reporting the failure is
+    // retry-safe: the job stays assigned to this runner, so a repeated `start`
+    // passes the same gate and rewrites the same `running` row.
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "busy").await {
         tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as busy");
+        return AppError::from(e).into_response();
     }
+
+    // Metrics: a job is now executing on a runner. After the transition above,
+    // for the same reason `finish_job` counts after its roll-up — a 5xx makes
+    // the runner retry `start`, and counting before it counts one job per retry.
+    crate::metrics::recorder::ci_job_started();
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
@@ -1263,9 +1304,16 @@ pub async fn finish_job(
         return AppError::from(e).into_response();
     }
 
-    // Mark runner as online (ready for next job)
+    // Mark runner as online (ready for next job). The mirror of `start_job`'s
+    // `busy`: a runner left `busy` after finishing is a runner the scheduler
+    // skips until the watchdog's 90-second sweep, so this transition is part of
+    // what `{"status":"ok"}` claims. It stays ahead of the roll-up below so a
+    // failure here returns before any completion metric is emitted, and the
+    // runner's retry (`finish` is the one report it retries) redoes the whole
+    // sequence against the same job row.
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "online").await {
         tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as online");
+        return AppError::from(e).into_response();
     }
 
     // Cascade: check if stage is done, then if pipeline is done
@@ -1429,9 +1477,30 @@ pub async fn list_runners_admin(
 /// Used as a route-layer middleware via `from_fn_with_state`.
 /// The runner_id is extracted from the path to verify token ownership.
 /// Also updates heartbeat on every authenticated request.
+/// What became of the `last_seen_at` refresh `authenticate_runner` performs on
+/// every authenticated runner request.
+///
+/// The refresh is opportunistic for every route but `/heartbeat`: a runner
+/// reporting a finished job has done the work whether or not its liveness
+/// timestamp could be rewritten, and failing that report would throw away a
+/// result the runner cannot reproduce. So the middleware carries the outcome
+/// forward in the request extensions rather than deciding for the handler, and
+/// only `heartbeat` — where the refresh *is* the request — turns a failure into
+/// a failed response.
+#[derive(Clone, Copy, Debug)]
+pub enum HeartbeatRefresh {
+    /// `last_seen_at` was written.
+    Persisted,
+    /// The write failed against an unreachable database — retryable, so the
+    /// runner's next heartbeat may well land (503).
+    Unavailable,
+    /// The write failed for a reason retrying will not fix (500).
+    Failed,
+}
+
 pub async fn authenticate_runner(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let runner_id = match extract_runner_id_from_path(request.uri().path()) {
@@ -1463,10 +1532,29 @@ pub async fn authenticate_runner(
 
     match rg_db::ops::runner_ops::find_by_token(&state.db, token).await {
         Ok(Some(runner)) if runner.id == runner_id => {
-            // Valid token — also update heartbeat
-            if let Err(e) = rg_db::ops::runner_ops::update_heartbeat(&state.db, runner_id).await {
-                tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to update runner heartbeat");
-            }
+            // Valid token — also update heartbeat. The outcome travels with the
+            // request instead of being dropped here: `heartbeat` answers for
+            // this write, every other handler is free to ignore it.
+            let refresh = match rg_db::ops::runner_ops::update_heartbeat(&state.db, runner_id).await
+            {
+                Ok(()) => HeartbeatRefresh::Persisted,
+                Err(error) => {
+                    tracing::error!(runner_id, error = %format!("{error:#}"), "Failed to update runner heartbeat");
+                    // Same outage predicate the `AppError` conversions use, so a
+                    // dead pool is a retryable 503 on `/heartbeat` exactly as it
+                    // is on every other route — classified here, where the
+                    // `DbErr` still exists.
+                    if error
+                        .downcast_ref::<sea_orm::DbErr>()
+                        .is_some_and(AppError::is_db_outage)
+                    {
+                        HeartbeatRefresh::Unavailable
+                    } else {
+                        HeartbeatRefresh::Failed
+                    }
+                }
+            };
+            request.extensions_mut().insert(refresh);
             next.run(request).await
         }
         Ok(Some(_)) => (
