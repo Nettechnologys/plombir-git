@@ -64,18 +64,22 @@ async fn blob_sha(base: &str, token: &str, owner: &str, repo: &str, path: &str) 
         .to_string()
 }
 
-/// Make the bare repository unopenable while leaving its directory in place —
-/// both handlers guard on `repo_path.exists()`, so a removed directory would
-/// exercise that arm instead of the git layer these tests are about. This is
-/// the in-process stand-in for the card's "unwritable `repo_root`": both are a
-/// storage failure that is ours, not the caller's, and both used to answer
-/// `400`. Permission bits are not usable here — the test process may be root.
-fn break_repository(bare: &Path) {
-    std::fs::remove_dir_all(bare.join("objects")).expect("bare repo must have an objects dir");
+/// Leave the bare repository openable while deleting the file object the client
+/// asks to update or delete. This is the storage fault that used to be collapsed
+/// into `None` by `get_file_sha`, and is more precise than removing `objects/`.
+fn remove_loose_object(bare: &Path, object_id: &str) {
+    let object_path = bare
+        .join("objects")
+        .join(&object_id[..2])
+        .join(&object_id[2..]);
     assert!(
-        gix::open(bare).is_err(),
-        "fixture must produce a repository that gix refuses to open, otherwise \
-         the test exercises a different arm"
+        object_path.exists(),
+        "fixture must keep {object_id} as a loose object"
+    );
+    std::fs::remove_file(&object_path).expect("remove blob object");
+    assert!(
+        gix::open(bare).is_ok(),
+        "fixture must leave repository opening intact so the file probe reads the missing object"
     );
 }
 
@@ -206,10 +210,9 @@ async fn deleting_an_absent_file_is_a_not_found() {
     assert_no_internal_detail(&body, &repo_root);
 }
 
-/// The half of the card the string match hid completely: a storage failure
-/// answered `400`, so the client never retried and nothing was alerted.
+/// A dangling blob entry is a server failure, not an absent client file.
 #[tokio::test]
-async fn a_broken_repository_on_the_write_endpoint_is_not_the_client_s_fault() {
+async fn a_missing_file_object_on_the_write_endpoint_is_not_the_client_s_fault() {
     let (base, repo_root) = spawn_test_app_with_repo_root().await;
     let (token, _) = register_full(&base, "writefail-owner", "writefail@example.com").await;
     create_repo(&base, &token, "writefail-repo").await;
@@ -231,7 +234,7 @@ async fn a_broken_repository_on_the_write_endpoint_is_not_the_client_s_fault() {
     )
     .await;
 
-    break_repository(&repo_root.join("writefail-owner/writefail-repo.git"));
+    remove_loose_object(&repo_root.join("writefail-owner/writefail-repo.git"), &sha);
 
     let resp = reqwest::Client::new()
         .post(contents_url(
@@ -253,16 +256,15 @@ async fn a_broken_repository_on_the_write_endpoint_is_not_the_client_s_fault() {
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert!(
         status.is_server_error(),
-        "a repository that cannot be opened must be a 5xx, not {status} — a 400 \
+        "a missing stored blob must be a 5xx, not {status} — a 400 \
          tells the client to fix a request that was never wrong (body: {body})"
     );
     assert_no_internal_detail(&body, &repo_root);
 }
 
-/// Same failure on the delete endpoint. It used to report a broken repository
-/// as an absent file *and* as a bad request at once.
+/// Same object-store failure on the delete endpoint.
 #[tokio::test]
-async fn a_broken_repository_on_the_delete_endpoint_is_not_the_client_s_fault() {
+async fn a_missing_file_object_on_the_delete_endpoint_is_not_the_client_s_fault() {
     let (base, repo_root) = spawn_test_app_with_repo_root().await;
     let (token, _) = register_full(&base, "delfail-owner", "delfail@example.com").await;
     create_repo(&base, &token, "delfail-repo").await;
@@ -277,7 +279,7 @@ async fn a_broken_repository_on_the_delete_endpoint_is_not_the_client_s_fault() 
     .await;
     let sha = blob_sha(&base, &token, "delfail-owner", "delfail-repo", "README.md").await;
 
-    break_repository(&repo_root.join("delfail-owner/delfail-repo.git"));
+    remove_loose_object(&repo_root.join("delfail-owner/delfail-repo.git"), &sha);
 
     let url = contents_url(&base, "delfail-owner", "delfail-repo", "README.md");
     let resp = reqwest::Client::new()
@@ -290,7 +292,7 @@ async fn a_broken_repository_on_the_delete_endpoint_is_not_the_client_s_fault() 
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert!(
         status.is_server_error(),
-        "a repository that cannot be opened must be a 5xx, not {status} (body: {body})"
+        "a missing stored blob must be a 5xx, not {status} (body: {body})"
     );
     assert_no_internal_detail(&body, &repo_root);
 }

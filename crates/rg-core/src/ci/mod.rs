@@ -149,17 +149,32 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {}", repo_path.display()))?;
 
-    // Check Gitea Actions format
-    let tree_revspec = format!("{}:.gitea/workflows", commit_sha);
-    if repo.rev_parse_single(tree_revspec.as_str()).is_ok() {
-        return Ok(true);
+    // An unborn HEAD is the one ordinary negative commit case: a freshly
+    // initialized repository has no tree in which a CI config could exist.
+    // Every other failure below is storage or object corruption and must remain
+    // observable to the fail-open wrapper.
+    if commit_sha == "HEAD" && repo.head()?.is_unborn() {
+        return Ok(false);
     }
 
-    // Check native format.
-    Ok([".forgekeep-ci.yml"].iter().any(|name| {
-        repo.rev_parse_single(format!("{}:{}", commit_sha, name).as_str())
-            .is_ok()
-    }))
+    let commit = repo
+        .rev_parse_single(commit_sha)
+        .with_context(|| format!("failed to resolve CI commit {commit_sha}"))?
+        .object()
+        .with_context(|| format!("failed to read CI commit {commit_sha}"))?
+        .peel_to_tree()
+        .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))?;
+
+    for path in [".gitea/workflows", ".forgekeep-ci.yml"] {
+        if commit
+            .lookup_entry_by_path(path)
+            .with_context(|| format!("failed to look up {path} at commit {commit_sha}"))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -216,15 +231,11 @@ mod tests {
         assert!(!has_ci_config(&repo_path, "HEAD"));
     }
 
-    /// The card's deploy-shaped scenario: a repository whose object database
-    /// became unreadable (wrong uid after a bind-mount, `chmod 000 objects`).
-    /// The commit exists, the CI config exists, but the server cannot read
-    /// either — and the gate must say so instead of answering a silent "no CI".
-    #[cfg(unix)]
+    /// The card's deploy-shaped scenario: the reference remains readable but
+    /// its commit object disappears from the store. The gate must preserve the
+    /// error for the fail-open wrapper instead of returning a confident no.
     #[test]
-    fn an_unreadable_object_database_does_not_pass_for_a_missing_ci_config() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn a_missing_commit_object_does_not_pass_for_a_missing_ci_config() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("work");
         let git = rg_git::cli_gateway::GitCommandGateway::new().expect("git must be installed");
@@ -252,37 +263,29 @@ mod tests {
             "the fixture itself must have a discoverable CI config"
         );
 
-        let objects = repo_path.join(".git").join("objects");
-        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // root ignores the permission bits entirely — probe instead of guessing
-        // the uid, as the runner-config tests do.
-        if std::fs::read_dir(&objects).is_ok() {
-            return;
-        }
+        let object_path = repo_path
+            .join(".git")
+            .join("objects")
+            .join(&sha[..2])
+            .join(&sha[2..]);
+        assert!(
+            object_path.exists(),
+            "fixture must keep HEAD as a loose object"
+        );
+        std::fs::remove_file(&object_path).unwrap();
 
         // Fail-open is preserved (a push is never blocked)...
         let gate = has_ci_config(&repo_path, &sha);
         // ...but the reason is now retrievable rather than dropped on the floor.
-        let checked = has_ci_config_checked(&repo_path, &sha).map_err(|error| format!("{error:#}"));
-
-        // Restore the bits before asserting, so a failure cannot leave an
-        // undeletable directory behind in the system temp dir.
-        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let checked = has_ci_config_checked(&repo_path, &sha)
+            .expect_err("a missing commit object must not become no CI config");
 
         assert!(!gate, "the gate must stay fail-open, not block the push");
-        match checked {
-            Err(rendered) => assert!(
-                rendered.contains(repo_path.to_str().unwrap()),
-                "error must name the repository path: {rendered}"
-            ),
-            // gix may still open the repository and only fail to resolve the
-            // commit inside it. Then the honest answer is "no config found",
-            // which is what the gate reports — but it must not claim `true`.
-            Ok(found) => assert!(
-                !found,
-                "an unreadable object database must not report a CI config as present"
-            ),
-        }
+        let rendered = format!("{checked:#}");
+        assert!(
+            rendered.contains("failed to resolve CI commit"),
+            "error must preserve the failed object-store lookup: {rendered}"
+        );
     }
 
     /// The manual trigger used to name only `.forgekeep-ci.yml`, so a repository

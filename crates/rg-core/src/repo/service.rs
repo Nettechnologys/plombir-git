@@ -2118,8 +2118,8 @@ fn validate_repo_file_path(file_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get the blob SHA of a file at a given ref, or `None` when the ref/path does
-/// not resolve.
+/// Get the blob SHA of a file at a given ref, or `None` when the path is not in
+/// that commit.
 ///
 /// The two outcomes have to stay apart at the type level: callers used to write
 /// `get_file_sha(..).ok()`, which turned "this repository cannot be opened"
@@ -2133,11 +2133,42 @@ fn get_file_sha(
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
-    let target = format!("{}:{}", git_ref, file_path);
-    Ok(repo
-        .rev_parse_single(target.as_str())
-        .ok()
-        .map(|object_id| object_id.to_string()))
+    let ref_name = if git_ref.starts_with("refs/") {
+        git_ref.to_string()
+    } else {
+        format!("refs/heads/{git_ref}")
+    };
+    let Some(mut reference) = repo
+        .try_find_reference(ref_name.as_str())
+        .with_context(|| format!("failed to look up ref {ref_name}"))?
+    else {
+        // Creating the first file on an unborn branch is a normal absence, not
+        // an object-store fault. This is the same explicit `Option` boundary as
+        // a missing path below.
+        return Ok(None);
+    };
+
+    let tree = reference
+        .peel_to_id()
+        .with_context(|| format!("failed to peel ref {ref_name}"))?
+        .object()
+        .with_context(|| format!("failed to read commit at ref {ref_name}"))?
+        .peel_to_tree()
+        .with_context(|| format!("failed to read tree at ref {ref_name}"))?;
+
+    let Some(entry) = tree
+        .lookup_entry_by_path(file_path)
+        .with_context(|| format!("failed to look up {file_path} at ref {ref_name}"))?
+    else {
+        return Ok(None);
+    };
+
+    // Return the tree's SHA, but first force the object lookup: a dangling
+    // entry is a storage fault, not a file the client may safely recreate.
+    entry
+        .object()
+        .with_context(|| format!("failed to read {file_path} at ref {ref_name}"))?;
+    Ok(Some(entry.object_id().to_string()))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! REST API handlers for CI/CD pipelines.
 
+use anyhow::Context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -683,26 +684,92 @@ fn resolve_commit_sha(
         }
     };
 
-    // Try to parse the ref directly
+    // A reference lookup has the required three-valued contract: `None` is a
+    // genuinely absent client ref, while I/O, malformed ref data and a missing
+    // target object stay `Err` and become a retryable server failure.
     let ref_name_normalized = if ref_name.starts_with("refs/") {
         ref_name.to_string()
     } else {
         format!("refs/heads/{}", ref_name)
     };
 
-    match repo.rev_parse_single(ref_name_normalized.as_str()) {
-        Ok(id) => Ok(Some(id.to_string())),
-        Err(_) => {
-            // Try without refs/heads/ prefix
-            let short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
-            Ok(repo.rev_parse_single(short).ok().map(|id| id.to_string()))
-        }
-    }
+    let mut reference = match repo
+        .try_find_reference(ref_name_normalized.as_str())
+        .with_context(|| format!("failed to look up ref {ref_name_normalized}"))?
+    {
+        Some(reference) => reference,
+        None => return Ok(None),
+    };
+    let id = reference
+        .peel_to_id()
+        .with_context(|| format!("failed to peel ref {ref_name_normalized}"))?;
+    id.object()
+        .with_context(|| format!("failed to read object for ref {ref_name_normalized}"))?;
+    Ok(Some(id.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn commit_repo() -> (tempfile::TempDir, String, String) {
+        let temp = tempfile::tempdir().expect("create repository tempdir");
+        let git = rg_git::cli_gateway::GitCommandGateway::new().expect("git must be installed");
+        git.run_or_bail(&["init", "-q", temp.path().to_str().unwrap()], None)
+            .expect("init repository");
+        for args in [
+            vec!["config", "user.email", "ci@example.com"],
+            vec!["config", "user.name", "CI"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            git.run_or_bail(&args, Some(temp.path()))
+                .expect("create fixture commit");
+        }
+        let sha = git
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .expect("resolve HEAD")
+            .stdout_str()
+            .trim()
+            .to_string();
+        let branch = git
+            .run(&["symbolic-ref", "--short", "HEAD"], Some(temp.path()))
+            .expect("resolve branch")
+            .stdout_str()
+            .trim()
+            .to_string();
+        (temp, sha, branch)
+    }
+
+    #[test]
+    fn an_absent_ref_stays_a_client_negative_answer() {
+        let (temp, _, _) = commit_repo();
+        assert_eq!(
+            resolve_commit_sha(temp.path(), "refs/heads/missing").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_ref_with_a_missing_commit_object_is_an_error() {
+        let (temp, sha, branch) = commit_repo();
+        let object_path = temp
+            .path()
+            .join(".git/objects")
+            .join(&sha[..2])
+            .join(&sha[2..]);
+        assert!(
+            object_path.exists(),
+            "fixture must keep HEAD as a loose object"
+        );
+        std::fs::remove_file(object_path).expect("remove commit object");
+
+        let error = resolve_commit_sha(temp.path(), &branch)
+            .expect_err("a dangling ref must not become an absent client ref");
+        assert!(
+            format!("{error:#}").contains("failed to peel ref"),
+            "error must retain the object-store failure: {error:#}"
+        );
+    }
 
     #[tokio::test]
     async fn job_pipeline_ownership_connection_outage_is_retryable() {

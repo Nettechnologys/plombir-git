@@ -684,6 +684,7 @@ fn read_ci_config(
 ) -> Result<CiConfig> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+    let tree = tree_at_commit(&repo, commit_sha)?;
 
     // Try Gitea Actions format first
     let gitea = try_read_gitea_workflows(&repo, commit_sha, ref_name, event, base_branch)?;
@@ -696,10 +697,13 @@ fn read_ci_config(
     // Fall back to the native CI config.
     let ci_filename = [".forgekeep-ci.yml"]
         .into_iter()
-        .find(|name| {
-            repo.rev_parse_single(format!("{}:{}", commit_sha, name).as_str())
-                .is_ok()
+        .find_map(|name| {
+            tree.lookup_entry_by_path(name)
+                .with_context(|| format!("failed to look up {name} at commit {commit_sha}"))
+                .transpose()
+                .map(|entry| entry.map(|_| name))
         })
+        .transpose()?
         .ok_or_else(|| {
             // Workflows that exist but sit out this event are not "no config":
             // saying so is the difference between fixing an `on:` filter and
@@ -720,13 +724,14 @@ fn read_ci_config(
             }
         })?;
 
-    let revspec = format!("{}:{}", commit_sha, ci_filename);
-    let object_id = repo
-        .rev_parse_single(revspec.as_str())
-        .context("failed to resolve CI config object")?;
-
-    let object_id = object_id.object().context("failed to resolve object")?;
-    let blob = object_id
+    let entry = tree
+        .lookup_entry_by_path(ci_filename)
+        .with_context(|| format!("failed to look up {ci_filename} at commit {commit_sha}"))?
+        .expect("the CI config was found above");
+    let object = entry
+        .object()
+        .with_context(|| format!("failed to read CI config object {ci_filename}"))?;
+    let blob = object
         .try_into_blob()
         .with_context(|| format!("expected a blob object for {}", ci_filename))?;
 
@@ -740,6 +745,21 @@ fn read_ci_config(
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", ci_filename, e))?;
 
     Ok(config)
+}
+
+/// Resolve a commit once, then use tree lookup APIs whose `Option` means only
+/// that a path is absent. `rev_parse_single("commit:path")` mixed a missing
+/// path with every ref/object-store error behind one `Err` value.
+fn tree_at_commit<'repo>(
+    repo: &'repo gix::Repository,
+    commit_sha: &str,
+) -> Result<gix::Tree<'repo>> {
+    repo.rev_parse_single(commit_sha)
+        .with_context(|| format!("failed to resolve CI commit {commit_sha}"))?
+        .object()
+        .with_context(|| format!("failed to read CI commit {commit_sha}"))?
+        .peel_to_tree()
+        .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))
 }
 
 /// Directory holding Gitea Actions workflow files, relative to the repo root.
@@ -867,12 +887,18 @@ fn load_workflow_sources(
     repo: &gix::Repository,
     commit_sha: &str,
 ) -> Result<Option<std::collections::HashMap<String, String>>> {
-    let tree_revspec = format!("{}:{}", commit_sha, WORKFLOW_DIR);
-    let Ok(object_id) = repo.rev_parse_single(tree_revspec.as_str()) else {
+    let tree = tree_at_commit(repo, commit_sha)?;
+    let Some(workflow_dir) = tree.lookup_entry_by_path(WORKFLOW_DIR).with_context(|| {
+        format!(
+            "failed to look up {} at commit {}",
+            WORKFLOW_DIR, commit_sha
+        )
+    })?
+    else {
         return Ok(None);
     };
 
-    let object = object_id
+    let object = workflow_dir
         .object()
         .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
     let tree = object.try_into_tree().map_err(|_| {
@@ -1524,6 +1550,18 @@ mod matrix_tests {
         (temp, sha)
     }
 
+    fn remove_loose_object(repo_path: &std::path::Path, object_id: &str) {
+        let object_path = repo_path
+            .join(".git/objects")
+            .join(&object_id[..2])
+            .join(&object_id[2..]);
+        assert!(
+            object_path.exists(),
+            "fixture must keep {object_id} as a loose object"
+        );
+        std::fs::remove_file(object_path).expect("remove fixture object");
+    }
+
     #[test]
     fn broken_workflow_yaml_reports_the_file_and_the_parse_error() {
         // Present-but-broken must never degrade into "no CI config found":
@@ -1658,6 +1696,64 @@ mod matrix_tests {
         assert!(
             error.to_string().contains("no CI config found"),
             "genuinely missing config keeps its own message: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_missing_native_config_object_is_not_no_config() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo native]\n" as &[u8],
+        )]);
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let object_id = git
+            .run(
+                &["rev-parse", &format!("{sha}:.forgekeep-ci.yml")],
+                Some(temp.path()),
+            )
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        remove_loose_object(temp.path(), &object_id);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+            .expect_err("a dangling config entry must not become absent config");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to read CI config object"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("no CI config found"), "{rendered}");
+    }
+
+    #[test]
+    fn a_missing_workflow_object_does_not_fall_back_to_native_config() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/ci.yml",
+                b"on: push\njobs:\n  build:\n    steps:\n      - run: echo workflow\n" as &[u8],
+            ),
+            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+        ]);
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let object_id = git
+            .run(
+                &["rev-parse", &format!("{sha}:.gitea/workflows/ci.yml")],
+                Some(temp.path()),
+            )
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        remove_loose_object(temp.path(), &object_id);
+
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+            .expect_err("a dangling workflow must not select the native fallback");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to read .gitea/workflows/ci.yml from the object database"),
+            "{rendered}"
         );
     }
 
