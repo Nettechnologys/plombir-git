@@ -139,7 +139,9 @@ pub async fn create_deploy_key(
     };
     match rg_db::ops::deploy_key_ops::create(&state.db, model).await {
         Ok(key) => (StatusCode::CREATED, Json(DeployKeyResponse::from(key))).into_response(),
-        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
+        // The fingerprint is unique; the checks above catch a key registered
+        // earlier, so reaching here means a concurrent insert won the race.
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("this SSH key is already registered").into_response()
         }
         Err(error) => AppError::from(error).into_response(),

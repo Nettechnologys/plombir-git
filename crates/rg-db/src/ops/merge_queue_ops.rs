@@ -1,7 +1,7 @@
 //! Database operations for repository merge queues.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::*;
 
 use crate::entities::merge_queue_entry::{self, Entity as QueueEntity, Model as QueueEntry};
@@ -38,6 +38,58 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<Q
         .context("db: list repository merge queue")
 }
 
+/// Bring the PR's existing queue entry into the state this `enqueue` call asked
+/// for.
+///
+/// An entry that is already `queued` or `running` *is* the requested outcome, so
+/// it is returned untouched: asking twice must not send a PR that is waiting its
+/// turn to the back of the queue, nor swap the strategy of a merge already in
+/// flight. A finished entry (`merged` / `failed` / `canceled`) is recycled
+/// instead — this call's actor and strategy take over and the merge-group
+/// columns are cleared, so the row describes this attempt rather than the last
+/// one.
+///
+/// Shared by the ordinary path and the raced one so the two cannot drift apart.
+async fn adopt_existing(
+    db: &DatabaseConnection,
+    existing: QueueEntry,
+    enqueued_by_id: i64,
+    strategy: &str,
+    now: DateTime<Utc>,
+) -> Result<QueueEntry> {
+    if matches!(existing.status.as_str(), "queued" | "running") {
+        return Ok(existing);
+    }
+    let mut active: merge_queue_entry::ActiveModel = existing.into();
+    active.enqueued_by_id = Set(enqueued_by_id);
+    active.strategy = Set(strategy.to_string());
+    active.status = Set("queued".to_string());
+    active.failure_reason = Set(None);
+    active.created_at = Set(now);
+    active.updated_at = Set(now);
+    active.started_at = Set(None);
+    active.finished_at = Set(None);
+    active.merge_group_sha = Set(None);
+    active.merge_group_base_sha = Set(None);
+    active.merge_group_head_sha = Set(None);
+    active.merge_group_pipeline_id = Set(None);
+    active.update(db).await.context("db: re-enqueue PR")
+}
+
+/// Put a PR on its repository's merge queue, or return the entry it already has.
+///
+/// `pr_id` is UNIQUE (`idx_merge_queue_pr_unique`), and the lookup above is a
+/// separate statement from the insert below it. Two clicks of "merge when ready"
+/// on the same PR both read `None` and both insert; one of them meets the
+/// constraint. That loss says the entry this call wanted now exists — the
+/// outcome the caller asked for — so it is resolved by re-reading the winner's
+/// row and treating it exactly as the existing-row branch would have.
+///
+/// Only a UNIQUE violation is resolved that way. Previously *any* insert failure
+/// re-read `pr_id` and reported success if a row was found, so a foreign-key
+/// failure or a broken connection became a successful enqueue as soon as the PR
+/// happened to have an old entry — a write that never happened, reported as
+/// done.
 pub async fn enqueue(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -47,23 +99,7 @@ pub async fn enqueue(
 ) -> Result<QueueEntry> {
     let now = Utc::now();
     if let Some(existing) = find_by_pr(db, pr_id).await? {
-        if matches!(existing.status.as_str(), "queued" | "running") {
-            return Ok(existing);
-        }
-        let mut active: merge_queue_entry::ActiveModel = existing.into();
-        active.enqueued_by_id = Set(enqueued_by_id);
-        active.strategy = Set(strategy.to_string());
-        active.status = Set("queued".to_string());
-        active.failure_reason = Set(None);
-        active.created_at = Set(now);
-        active.updated_at = Set(now);
-        active.started_at = Set(None);
-        active.finished_at = Set(None);
-        active.merge_group_sha = Set(None);
-        active.merge_group_base_sha = Set(None);
-        active.merge_group_head_sha = Set(None);
-        active.merge_group_pipeline_id = Set(None);
-        return active.update(db).await.context("db: re-enqueue PR");
+        return adopt_existing(db, existing, enqueued_by_id, strategy, now).await;
     }
 
     let insert = merge_queue_entry::ActiveModel {
@@ -87,14 +123,20 @@ pub async fn enqueue(
     .await;
     match insert {
         Ok(entry) => Ok(entry),
-        Err(error) => {
-            // A concurrent enqueue may win the unique(pr_id) race.
-            if let Some(entry) = find_by_pr(db, pr_id).await? {
-                Ok(entry)
-            } else {
-                Err(error).context("db: enqueue PR")
+        Err(error) if crate::is_unique_violation(&error) => {
+            // Lost the race for the first row. Whoever won holds this PR's
+            // entry, so adopt it the way the existing-row branch would.
+            match find_by_pr(db, pr_id).await? {
+                Some(existing) => {
+                    adopt_existing(db, existing, enqueued_by_id, strategy, now).await
+                }
+                // Not there after all, so the collision was on some other
+                // constraint. Report the original failure rather than inventing
+                // a reason for it.
+                None => Err(error).context("db: enqueue PR"),
             }
         }
+        Err(error) => Err(error).context("db: enqueue PR"),
     }
 }
 

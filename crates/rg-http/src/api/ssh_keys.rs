@@ -131,9 +131,11 @@ pub async fn create_ssh_key(
 
     match rg_db::ops::ssh_key_ops::create(&state.db, model).await {
         Ok(key) => (StatusCode::CREATED, Json(SshKeyResponse::from(key))).into_response(),
-        // The fingerprint has a unique constraint. Treat a concurrent insert
-        // as a conflict without exposing database internals.
-        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
+        // The fingerprint has a unique constraint. The lookup above already
+        // rejects a key that was registered earlier; this is the insert that
+        // loses a race with a concurrent one. Answer it as a conflict without
+        // exposing database internals.
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("this SSH key is already registered").into_response()
         }
         Err(error) => AppError::from(error).into_response(),

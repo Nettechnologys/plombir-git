@@ -103,7 +103,12 @@ pub async fn add_approval(
     };
     match model.insert(db).await {
         Ok(_) => Ok(true),
-        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => Ok(false),
+        // `(job_id, approved_by)` is UNIQUE: this approver has already signed
+        // off on this job, so there is nothing to add and `false` says so.
+        // Classified from the backend's error code — the message text this used
+        // to match on is worded differently per backend, and MySQL's duplicate
+        // -entry message does not contain the word "unique" at all.
+        Err(error) if crate::is_unique_violation(&error) => Ok(false),
         Err(error) => Err(error).context("db: add environment approval"),
     }
 }

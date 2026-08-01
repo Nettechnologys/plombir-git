@@ -127,7 +127,10 @@ pub async fn create(
     };
     match rg_db::ops::ci_environment_ops::create(&state.db, model).await {
         Ok(model) => (StatusCode::CREATED, Json(response(model))).into_response(),
-        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
+        // `(repo_id, name)` is UNIQUE (`uq_ci_environments_repo_name`), and
+        // there is no pre-check: a second environment of the same name lands
+        // here every time, not just on a race.
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("environment already exists").into_response()
         }
         Err(error) => AppError::from(error).into_response(),
@@ -158,7 +161,8 @@ pub async fn update(
     active.updated_at = Set(chrono::Utc::now());
     match rg_db::ops::ci_environment_ops::update(&state.db, active).await {
         Ok(model) => Json(response(model)).into_response(),
-        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
+        // Renaming onto a name a sibling environment already holds.
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("environment already exists").into_response()
         }
         Err(error) => AppError::from(error).into_response(),

@@ -1246,7 +1246,10 @@ pub async fn request_reviewer(
             )
                 .into_response()
         }
-        Err(error) if error.to_string().to_ascii_lowercase().contains("unique") => {
+        // `(pr_id, reviewer_id)` is unique; the lookup above catches a request
+        // that already existed, so this is the one that lost a race with a
+        // concurrent request for the same reviewer.
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("reviewer is already requested").into_response()
         }
         Err(error) => AppError::from(error).into_response(),

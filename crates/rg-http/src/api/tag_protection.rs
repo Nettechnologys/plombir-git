@@ -87,7 +87,9 @@ pub async fn create(
     };
     match rg_db::ops::protected_tag_ops::create(&state.db, model).await {
         Ok(v) => (StatusCode::CREATED, Json(response(v))).into_response(),
-        Err(e) if e.to_string().to_ascii_lowercase().contains("unique") => {
+        // `(repo_id, pattern)` is unique and nothing pre-checks it, so every
+        // repeat of an existing pattern arrives here.
+        Err(e) if rg_db::is_unique_violation_anyhow(&e) => {
             AppError::conflict("tag protection pattern already exists").into_response()
         }
         Err(e) => AppError::from(e).into_response(),
