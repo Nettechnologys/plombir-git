@@ -326,31 +326,35 @@ pub async fn poll_job(
             .await
             {
                 Ok(Some(job)) => {
-                    // Found a job — assign it to this runner
-                    if let Err(error) =
-                        rg_db::ops::pipeline_ops::assign_job(&state.db, job.id, runner_id).await
-                    {
-                        tracing::error!(
-                            job_id = job.id,
-                            runner_id,
-                            error = %format!("{error:#}"),
-                            "poll_job: failed to assign job"
-                        );
-                        return Err(AppError::from(error).into_response());
-                    }
-                    // Mark job as assigned
-                    let now = Some(chrono::Utc::now().naive_utc());
-                    if let Err(error) = rg_db::ops::pipeline_ops::update_job_result(
-                        &state.db, job.id, "assigned", None, None, now, None,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            job_id = job.id,
-                            error = %format!("{error:#}"),
-                            "Failed to update job result to assigned"
-                        );
-                        return Err(AppError::from(error).into_response());
+                    // Found a job — assign it to this runner. The candidate
+                    // came out of a snapshot, so a cancellation may have landed
+                    // since: the write refuses on a settled row, and the poll
+                    // simply looks for the next candidate rather than handing
+                    // out work the server has already disowned.
+                    //
+                    // The retry needs no backoff and cannot spin: the only way
+                    // to be refused is to have left `pending`, and the query
+                    // above selects on `pending`, so the same row cannot come
+                    // back as a candidate.
+                    match rg_db::ops::pipeline_ops::assign_job(&state.db, job.id, runner_id).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(
+                                job_id = job.id,
+                                runner_id,
+                                "poll_job: candidate settled before it could be assigned"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                job_id = job.id,
+                                runner_id,
+                                error = %format!("{error:#}"),
+                                "poll_job: failed to assign job"
+                            );
+                            return Err(AppError::from(error).into_response());
+                        }
                     }
 
                     // Fetch stage to get pipeline_id
@@ -558,13 +562,23 @@ pub async fn start_job(
     }
 
     let now = Some(chrono::Utc::now().naive_utc());
-    if let Err(e) = rg_db::ops::pipeline_ops::update_job_result(
-        &state.db, job_id, "running", None, None, now, None,
-    )
-    .await
-    {
-        tracing::error!(error = %format!("{e:#}"), "start_job: update_job_result failed");
-        return AppError::from(e).into_response();
+    match rg_db::ops::pipeline_ops::start_job_if_active(&state.db, job_id, now).await {
+        Ok(true) => {}
+        // The job settled while this runner was picking it up — a cancellation,
+        // or the watchdog. Saying `200` here would tell the runner to go
+        // execute work the server has already answered `canceled` for.
+        Ok(false) => {
+            tracing::info!(
+                runner_id,
+                job_id,
+                "start_job: refused — the job settled before the runner started it"
+            );
+            return AppError::conflict("job is no longer active").into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "start_job: update_job_result failed");
+            return AppError::from(e).into_response();
+        }
     }
 
     // Mark runner as busy. This is not decoration: `busy` is what keeps the
@@ -1289,20 +1303,27 @@ pub async fn finish_job(
 
     let now = Some(chrono::Utc::now().naive_utc());
     // log is managed via upload_log; not updated on finish
-    if let Err(e) = rg_db::ops::pipeline_ops::update_job_result(
+    //
+    // Conditional, and that is the whole point of this call: a cancellation is
+    // transactional at the moment it answers, but it cannot stop a runner that
+    // already holds the job. The report arriving now was computed from a
+    // snapshot older than the cascade, and writing it unconditionally walked
+    // job → stage → pipeline back out of `canceled` — the caller who got
+    // `200 {"status":"canceled"}` would watch the pipeline turn green, success
+    // hooks and auto-merge included.
+    //
+    // Rewriting the status the row already carries still counts as landing, so
+    // the runner's `finish` retry stays idempotent and keeps driving the
+    // roll-up below.
+    let job_settled = rg_db::ops::pipeline_ops::settle_job_if_active(
         &state.db,
         job_id,
         &req.status,
         Some(req.exit_code),
         None,
-        None,
         now,
     )
-    .await
-    {
-        tracing::error!(error = %format!("{e:#}"), "finish_job: update_job_result failed");
-        return AppError::from(e).into_response();
-    }
+    .await;
 
     // Mark runner as online (ready for next job). The mirror of `start_job`'s
     // `busy`: a runner left `busy` after finishing is a runner the scheduler
@@ -1311,9 +1332,36 @@ pub async fn finish_job(
     // failure here returns before any completion metric is emitted, and the
     // runner's retry (`finish` is the one report it retries) redoes the whole
     // sequence against the same job row.
+    //
+    // It also runs before the late-completion answer below: a runner whose job
+    // was canceled under it is still a free runner, and leaving it `busy` would
+    // park it until the watchdog sweep.
     if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "online").await {
         tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as online");
         return AppError::from(e).into_response();
+    }
+
+    match job_settled {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                runner_id,
+                job_id,
+                reported = %req.status,
+                "finish_job: late completion for a job that already settled — not applied"
+            );
+            // Answering `200 {"status":"ok"}` here would be a false receipt for
+            // a state change that did not happen. The runner has nothing to
+            // retry, so this is a conflict, not a server error.
+            return AppError::conflict(
+                "job already settled (canceled or completed) — completion not applied",
+            )
+            .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "finish_job: update_job_result failed");
+            return AppError::from(e).into_response();
+        }
     }
 
     // Cascade: check if stage is done, then if pipeline is done

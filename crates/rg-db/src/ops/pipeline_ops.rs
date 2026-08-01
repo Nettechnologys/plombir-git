@@ -567,13 +567,19 @@ pub async fn try_pause_stage_at_manual(db: &DatabaseConnection, stage_id: i64) -
     let stage = get_stage_by_id(db, stage_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("stage {} not found", stage_id))?;
-    update_stage_status(db, stage_id, gate_status, None, None).await?;
-    update_pipeline_status(db, stage.pipeline_id, gate_status, None, None).await?;
+    if !settle_stage_if_active(db, stage_id, gate_status, None, None).await? {
+        return Ok(false);
+    }
+    settle_pipeline_if_active(db, stage.pipeline_id, gate_status, None, None).await?;
     Ok(true)
 }
 
 /// After a job finishes, update stage status if all jobs in the stage are done.
 /// Returns the new stage status if updated, or None if not all done.
+///
+/// `None` also covers "the stage already settled as something else" — a
+/// cancellation that landed while this job was executing. The caller must not
+/// roll the pipeline up on it: see [`settle_stage_if_active`].
 pub async fn try_update_stage(db: &DatabaseConnection, stage_id: i64) -> Result<Option<String>> {
     if try_pause_stage_at_manual(db, stage_id).await? {
         return Ok(Some("manual".to_string()));
@@ -584,7 +590,9 @@ pub async fn try_update_stage(db: &DatabaseConnection, stage_id: i64) -> Result<
     }
     let new_status = if any_failure { "failed" } else { "success" };
     let now = Some(chrono::Utc::now().naive_utc());
-    update_stage_status(db, stage_id, new_status, None, now).await?;
+    if !settle_stage_if_active(db, stage_id, new_status, None, now).await? {
+        return Ok(None);
+    }
     if any_failure {
         skip_downstream_stages(db, stage_id).await?;
     }
@@ -649,6 +657,11 @@ pub async fn check_pipeline_stages(
 }
 
 /// After a stage finishes, update pipeline status if all stages are done.
+///
+/// A canceled pipeline stays canceled: `check_pipeline_stages` counts a
+/// `canceled` stage as done and not as a failure, so without the guard the
+/// last late job would roll the pipeline up to `success` and release the
+/// success hooks the cancellation was supposed to prevent.
 pub async fn try_update_pipeline(
     db: &DatabaseConnection,
     pipeline_id: i64,
@@ -659,7 +672,9 @@ pub async fn try_update_pipeline(
     }
     let new_status = if any_failure { "failed" } else { "success" };
     let now = Some(chrono::Utc::now().naive_utc());
-    update_pipeline_status(db, pipeline_id, new_status, None, now).await?;
+    if !settle_pipeline_if_active(db, pipeline_id, new_status, None, now).await? {
+        return Ok(None);
+    }
     Ok(Some(new_status.to_string()))
 }
 
@@ -802,18 +817,13 @@ pub async fn find_offline_runners(
 }
 
 /// Mark a job as timed out (error status).
-pub async fn mark_job_timeout(db: &DatabaseConnection, job_id: i64) -> Result<()> {
+///
+/// Conditional for the same reason a runner's `finish` is: the watchdog decides
+/// a job is stale from a snapshot, and a job canceled in the meantime must not
+/// come back as `error`. Returns whether the row was actually moved.
+pub async fn mark_job_timeout(db: &DatabaseConnection, job_id: i64) -> Result<bool> {
     let now = chrono::Utc::now().naive_utc();
-    pipeline_job::Entity::update_many()
-        .filter(pipeline_job::Column::Id.eq(job_id))
-        .col_expr(pipeline_job::Column::Status, Expr::value("error"))
-        .col_expr(pipeline_job::Column::ExitCode, Expr::value(-1))
-        .col_expr(pipeline_job::Column::FinishedAt, Expr::value(now))
-        .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
-        .exec(db)
-        .await
-        .context("db: mark job timeout")?;
-    Ok(())
+    settle_job_if_active(db, job_id, "error", Some(-1), None, Some(now)).await
 }
 
 /// Reset all jobs assigned to a runner back to pending (for deregistration).
@@ -842,20 +852,24 @@ pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Res
 }
 
 /// Assign a CI job to a specific runner.
-pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) -> Result<()> {
+///
+/// Conditional on the job still being active work: the scheduler picks its
+/// candidate from a snapshot, and a cancellation landing between the pick and
+/// this write would otherwise hand a runner a job the server has already
+/// answered `canceled` for — and put the row back to `assigned` while it was
+/// at it. Returns whether the assignment landed.
+pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) -> Result<bool> {
     let now = chrono::Utc::now().naive_utc();
-    let model = pipeline_job::Entity::find_by_id(job_id)
-        .one(db)
+    let result = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .filter(still_settleable(pipeline_job::Column::Status, "assigned"))
+        .col_expr(pipeline_job::Column::Status, Expr::value("assigned"))
+        .col_expr(pipeline_job::Column::RunnerId, Expr::value(runner_id))
+        .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
+        .exec(db)
         .await
-        .context("db: find job for assign")?
-        .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-
-    let mut active: pipeline_job::ActiveModel = model.into();
-    active.status = Set("assigned".to_string());
-    active.runner_id = Set(Some(runner_id));
-    active.updated_at = Set(Some(now));
-    active.update(db).await.context("db: assign job")?;
-    Ok(())
+        .context("db: assign job")?;
+    Ok(result.rows_affected > 0)
 }
 
 // ── Concurrency Control ──────────────────────────────────────────
@@ -964,11 +978,166 @@ async fn cancel_pipeline_chain_in_transaction(
     Ok(true)
 }
 
-fn is_active_pipeline_work(status: &str) -> bool {
-    matches!(
-        status,
-        "pending" | "running" | "manual" | "waiting_approval"
-    )
+/// The statuses a pipeline, stage or job can still leave under its own power.
+///
+/// Everything else — `success`, `failed`/`failure`/`error`, `skipped`,
+/// `canceled` — is terminal. `assigned` belongs here: a job handed to a runner
+/// but not yet started is work in flight, and a cancellation that walked past
+/// it left a runner about to report a result for a pipeline the server had
+/// already answered `canceled` for.
+pub const ACTIVE_WORK_STATUSES: [&str; 5] = [
+    "pending",
+    "assigned",
+    "running",
+    "manual",
+    "waiting_approval",
+];
+
+pub fn is_active_pipeline_work(status: &str) -> bool {
+    ACTIVE_WORK_STATUSES.contains(&status)
+}
+
+/// Whether the pipeline still owns its own execution.
+///
+/// A worker that started before a cancellation has no other way to notice it:
+/// its stage/job snapshot predates the cascade.
+pub async fn pipeline_is_active(db: &impl ConnectionTrait, pipeline_id: i64) -> Result<bool> {
+    Ok(get_pipeline(db, pipeline_id)
+        .await?
+        .is_some_and(|pipeline| is_active_pipeline_work(&pipeline.status)))
+}
+
+// ── Terminal-status guards ───────────────────────────────────────
+//
+// A cancellation is transactional at the moment it answers, but it does not
+// stop a worker that already holds the job. The worker comes back with
+// `success`/`failed` from a snapshot taken before the cascade, and an
+// unconditional write walks the whole chain back out of `canceled` — a false
+// acknowledgement that also releases success hooks and auto-merge.
+//
+// So the terminal write is a condition, not a command: it lands only while the
+// row is still active work, or when it would rewrite the status the row
+// already carries (which is what makes a runner's `finish` retry idempotent
+// rather than a conflict). One statement each — a read-then-write leaves
+// exactly the window the cancellation lands in.
+
+fn still_settleable<C: ColumnTrait>(status_column: C, status: &str) -> Condition {
+    Condition::any()
+        .add(status_column.is_in(ACTIVE_WORK_STATUSES))
+        .add(status_column.eq(status))
+}
+
+/// Record a job's result unless the job has already settled as something else.
+///
+/// Returns `false` when the row was left untouched — the caller is reporting on
+/// work the server has disowned and must not cascade it further.
+pub async fn settle_job_if_active(
+    db: &impl ConnectionTrait,
+    id: i64,
+    status: &str,
+    exit_code: Option<i32>,
+    log: Option<&str>,
+    finished_at: Option<chrono::NaiveDateTime>,
+) -> Result<bool> {
+    let now = chrono::Utc::now().naive_utc();
+    let mut update = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(id))
+        .filter(still_settleable(pipeline_job::Column::Status, status))
+        .col_expr(pipeline_job::Column::Status, Expr::value(status))
+        .col_expr(pipeline_job::Column::ExitCode, Expr::value(exit_code))
+        .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now));
+    if let Some(log) = log {
+        update = update.col_expr(pipeline_job::Column::Log, Expr::value(log));
+    }
+    if let Some(finished_at) = finished_at {
+        update = update.col_expr(pipeline_job::Column::FinishedAt, Expr::value(finished_at));
+    }
+    Ok(update
+        .exec(db)
+        .await
+        .context("db: settle job result")?
+        .rows_affected
+        > 0)
+}
+
+/// Move a job to `running` and stamp its start, but only while it is still
+/// active work.
+///
+/// Returns `false` when the job settled between assignment and start — telling
+/// the runner to go ahead would put it to work on a pipeline the server has
+/// already answered `canceled` for.
+pub async fn start_job_if_active(
+    db: &impl ConnectionTrait,
+    id: i64,
+    started_at: Option<chrono::NaiveDateTime>,
+) -> Result<bool> {
+    let now = chrono::Utc::now().naive_utc();
+    let mut update = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(id))
+        .filter(still_settleable(pipeline_job::Column::Status, "running"))
+        .col_expr(pipeline_job::Column::Status, Expr::value("running"))
+        .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now));
+    if let Some(started_at) = started_at {
+        update = update.col_expr(pipeline_job::Column::StartedAt, Expr::value(started_at));
+    }
+    Ok(update
+        .exec(db)
+        .await
+        .context("db: start job")?
+        .rows_affected
+        > 0)
+}
+
+/// Stage-level twin of [`settle_job_if_active`].
+pub async fn settle_stage_if_active(
+    db: &impl ConnectionTrait,
+    id: i64,
+    status: &str,
+    started_at: Option<chrono::NaiveDateTime>,
+    finished_at: Option<chrono::NaiveDateTime>,
+) -> Result<bool> {
+    let mut update = pipeline_stage::Entity::update_many()
+        .filter(pipeline_stage::Column::Id.eq(id))
+        .filter(still_settleable(pipeline_stage::Column::Status, status))
+        .col_expr(pipeline_stage::Column::Status, Expr::value(status));
+    if let Some(started_at) = started_at {
+        update = update.col_expr(pipeline_stage::Column::StartedAt, Expr::value(started_at));
+    }
+    if let Some(finished_at) = finished_at {
+        update = update.col_expr(pipeline_stage::Column::FinishedAt, Expr::value(finished_at));
+    }
+    Ok(update
+        .exec(db)
+        .await
+        .context("db: settle stage status")?
+        .rows_affected
+        > 0)
+}
+
+/// Pipeline-level twin of [`settle_job_if_active`].
+pub async fn settle_pipeline_if_active(
+    db: &impl ConnectionTrait,
+    id: i64,
+    status: &str,
+    started_at: Option<chrono::NaiveDateTime>,
+    finished_at: Option<chrono::NaiveDateTime>,
+) -> Result<bool> {
+    let mut update = pipeline::Entity::update_many()
+        .filter(pipeline::Column::Id.eq(id))
+        .filter(still_settleable(pipeline::Column::Status, status))
+        .col_expr(pipeline::Column::Status, Expr::value(status));
+    if let Some(started_at) = started_at {
+        update = update.col_expr(pipeline::Column::StartedAt, Expr::value(started_at));
+    }
+    if let Some(finished_at) = finished_at {
+        update = update.col_expr(pipeline::Column::FinishedAt, Expr::value(finished_at));
+    }
+    Ok(update
+        .exec(db)
+        .await
+        .context("db: settle pipeline status")?
+        .rows_affected
+        > 0)
 }
 
 /// Resolve concurrency group template variables.

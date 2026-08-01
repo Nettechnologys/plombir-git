@@ -88,6 +88,7 @@ mod package_permission_tests;
 mod password_hash_failure_status_tests;
 mod password_reset_mfa_tests;
 mod pat_api_tests;
+mod pipeline_cancellation_terminal_tests;
 mod pr_lookup_failure_status_tests;
 mod pr_merge_outcome_status_tests;
 mod pr_merge_push_hook_tests;

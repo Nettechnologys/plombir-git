@@ -38,6 +38,10 @@ enum StageOutcome {
     /// The pipeline was paused mid-stage — a `manual` job or a job awaiting
     /// environment approval — so no further stages should run.
     Paused,
+    /// The pipeline settled behind this runner's back — a cancellation landed
+    /// while the stage was executing. Nothing more may be written for it: the
+    /// server has already answered `canceled` to whoever asked.
+    Settled,
 }
 
 /// Pipeline runner that executes stages/jobs sequentially.
@@ -142,7 +146,7 @@ impl PipelineRunner {
     pub async fn run(&self) -> Result<()> {
         if let Err(error) = self.prepare_workspace().await {
             let now = chrono::Utc::now().naive_utc();
-            if let Err(update_error) = pipeline_ops::update_pipeline_status(
+            if let Err(update_error) = pipeline_ops::settle_pipeline_if_active(
                 &self.db,
                 self.pipeline_id,
                 "failed",
@@ -174,14 +178,21 @@ impl PipelineRunner {
             .await?
             .filter(|pipeline| pipeline.started_at.is_none())
             .map(|_| now);
-        pipeline_ops::update_pipeline_status(
+        if !pipeline_ops::settle_pipeline_if_active(
             &self.db,
             self.pipeline_id,
             "running",
             pipeline_started_at,
             None,
         )
-        .await?;
+        .await?
+        {
+            tracing::info!(
+                pipeline_id = self.pipeline_id,
+                "pipeline already settled before the runner started it — not running"
+            );
+            return Ok(());
+        }
 
         // Get stages in order
         let stages = pipeline_ops::list_stages_by_pipeline(&self.db, self.pipeline_id).await?;
@@ -205,7 +216,7 @@ impl PipelineRunner {
             }
 
             match self.run_stage(stage).await? {
-                StageOutcome::Paused => return Ok(()),
+                StageOutcome::Paused | StageOutcome::Settled => return Ok(()),
                 StageOutcome::Completed(stage_failed) => {
                     if stage_failed {
                         pipeline_failed = true;
@@ -214,17 +225,28 @@ impl PipelineRunner {
             }
         }
 
-        // Mark pipeline as completed
+        // Mark pipeline as completed. Conditional: a cancellation that landed
+        // while the last stage ran already answered `canceled`, and rewriting
+        // it here would both contradict that answer and release the success
+        // followups below.
         let pipeline_end = chrono::Utc::now().naive_utc();
         let pipeline_status = if pipeline_failed { "failed" } else { "success" };
-        pipeline_ops::update_pipeline_status(
+        if !pipeline_ops::settle_pipeline_if_active(
             &self.db,
             self.pipeline_id,
             pipeline_status,
             None,
             Some(pipeline_end),
         )
-        .await?;
+        .await?
+        {
+            tracing::info!(
+                pipeline_id = self.pipeline_id,
+                would_be = pipeline_status,
+                "pipeline settled while the runner was executing — keeping the recorded status"
+            );
+            return Ok(());
+        }
 
         if pipeline_status == "success" {
             self.run_success_followups().await?;
@@ -242,10 +264,10 @@ impl PipelineRunner {
     /// Mark a stage and all of its jobs as `skipped`. Used once an earlier
     /// stage has already failed the pipeline.
     async fn skip_stage(&self, stage: &rg_db::entities::pipeline_stage::Model) -> Result<()> {
-        pipeline_ops::update_stage_status(&self.db, stage.id, "skipped", None, None).await?;
+        pipeline_ops::settle_stage_if_active(&self.db, stage.id, "skipped", None, None).await?;
         let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
         for job in jobs {
-            pipeline_ops::update_job_result(&self.db, job.id, "skipped", None, None, None, None)
+            pipeline_ops::settle_job_if_active(&self.db, job.id, "skipped", None, None, None)
                 .await?;
         }
         Ok(())
@@ -255,6 +277,7 @@ impl PipelineRunner {
     ///
     /// Returns [`StageOutcome::Paused`] the moment a `manual` job or a job
     /// awaiting environment approval is reached (the pipeline stops there),
+    /// [`StageOutcome::Settled`] when the pipeline was canceled mid-stage,
     /// otherwise [`StageOutcome::Completed`] carrying whether the stage failed.
     async fn run_stage(
         &self,
@@ -262,19 +285,34 @@ impl PipelineRunner {
     ) -> Result<StageOutcome> {
         // Mark stage as running
         let stage_start = chrono::Utc::now().naive_utc();
-        pipeline_ops::update_stage_status(
+        if !pipeline_ops::settle_stage_if_active(
             &self.db,
             stage.id,
             "running",
             stage.started_at.is_none().then_some(stage_start),
             None,
         )
-        .await?;
+        .await?
+        {
+            return Ok(StageOutcome::Settled);
+        }
 
         let mut stage_failed = false;
         let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
 
         for job in &jobs {
+            // `jobs` is a snapshot taken before the first job ran. A
+            // cancellation that lands mid-stage is invisible in it, so the
+            // liveness of the pipeline is re-read per job rather than assumed
+            // for the whole loop.
+            if !pipeline_ops::pipeline_is_active(&self.db, self.pipeline_id).await? {
+                tracing::info!(
+                    pipeline_id = self.pipeline_id,
+                    stage_id = stage.id,
+                    "pipeline settled mid-stage — stopping before the next job"
+                );
+                return Ok(StageOutcome::Settled);
+            }
             if matches!(job.status.as_str(), "success" | "skipped" | "canceled") {
                 continue;
             }
@@ -285,8 +323,12 @@ impl PipelineRunner {
                 continue;
             }
             if job.status == "manual" {
-                pipeline_ops::update_stage_status(&self.db, stage.id, "manual", None, None).await?;
-                pipeline_ops::update_pipeline_status(
+                if !pipeline_ops::settle_stage_if_active(&self.db, stage.id, "manual", None, None)
+                    .await?
+                {
+                    return Ok(StageOutcome::Settled);
+                }
+                pipeline_ops::settle_pipeline_if_active(
                     &self.db,
                     self.pipeline_id,
                     "manual",
@@ -302,15 +344,18 @@ impl PipelineRunner {
                 return Ok(StageOutcome::Paused);
             }
             if job.status == "waiting_approval" {
-                pipeline_ops::update_stage_status(
+                if !pipeline_ops::settle_stage_if_active(
                     &self.db,
                     stage.id,
                     "waiting_approval",
                     None,
                     None,
                 )
-                .await?;
-                pipeline_ops::update_pipeline_status(
+                .await?
+                {
+                    return Ok(StageOutcome::Settled);
+                }
+                pipeline_ops::settle_pipeline_if_active(
                     &self.db,
                     self.pipeline_id,
                     "waiting_approval",
@@ -339,8 +384,17 @@ impl PipelineRunner {
 
         let stage_end = chrono::Utc::now().naive_utc();
         let stage_status = if stage_failed { "failed" } else { "success" };
-        pipeline_ops::update_stage_status(&self.db, stage.id, stage_status, None, Some(stage_end))
-            .await?;
+        if !pipeline_ops::settle_stage_if_active(
+            &self.db,
+            stage.id,
+            stage_status,
+            None,
+            Some(stage_end),
+        )
+        .await?
+        {
+            return Ok(StageOutcome::Settled);
+        }
 
         Ok(StageOutcome::Completed(stage_failed))
     }
@@ -349,6 +403,12 @@ impl PipelineRunner {
     /// when the job failed in a way that should fail the stage (a non-
     /// `allow_failure` non-zero exit or an execution error). Persisting the
     /// result is best-effort: DB errors are logged, not propagated.
+    ///
+    /// The write is conditional. `job` is a snapshot taken before execution
+    /// started, so a cancellation that landed during the run is not visible in
+    /// it; [`pipeline_ops::settle_job_if_active`] refuses to move a row that
+    /// already settled as something else, and the refusal is logged rather
+    /// than silently dropped.
     async fn run_and_record_job(&self, job: &rg_db::entities::pipeline_job::Model) -> bool {
         let job_result = self
             .run_job(
@@ -362,41 +422,47 @@ impl PipelineRunner {
             )
             .await;
 
-        match job_result {
-            Ok((exit_code, log)) => {
-                let status = if exit_code == 0 { "success" } else { "failed" };
-                let stage_failed = exit_code != 0 && !job.allow_failure;
-                if let Err(e) = pipeline_ops::update_job_result(
-                    &self.db,
-                    job.id,
-                    status,
-                    Some(exit_code),
-                    Some(&log),
-                    None,
-                    None,
-                )
-                .await
-                {
-                    tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to update job result");
-                }
-                stage_failed
-            }
+        let (status, exit_code, log, stage_failed) = match job_result {
+            Ok((exit_code, log)) => (
+                if exit_code == 0 { "success" } else { "failed" },
+                exit_code,
+                log,
+                exit_code != 0 && !job.allow_failure,
+            ),
             Err(e) => {
                 tracing::error!(job_id = job.id, "Job execution error: {:#}", e);
-                let stage_failed = !job.allow_failure;
-                if let Err(e) = pipeline_ops::update_job_result(
-                    &self.db,
-                    job.id,
+                (
                     "failed",
-                    Some(-1),
-                    Some(&format!("Runner error: {}", e)),
-                    None,
-                    None,
+                    -1,
+                    format!("Runner error: {}", e),
+                    !job.allow_failure,
                 )
-                .await
-                {
-                    tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to update job result");
-                }
+            }
+        };
+
+        match pipeline_ops::settle_job_if_active(
+            &self.db,
+            job.id,
+            status,
+            Some(exit_code),
+            Some(&log),
+            None,
+        )
+        .await
+        {
+            Ok(true) => stage_failed,
+            Ok(false) => {
+                tracing::info!(
+                    job_id = job.id,
+                    would_be = status,
+                    "job settled while the runner was executing it — result discarded"
+                );
+                // The stage's own status is settled too (the cascade is
+                // whole-graph), so this must not push the stage to `failed`.
+                false
+            }
+            Err(e) => {
+                tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to update job result");
                 stage_failed
             }
         }
@@ -454,17 +520,7 @@ impl PipelineRunner {
         let job_start = chrono::Utc::now().naive_utc();
 
         // Mark job as running
-        if let Err(e) = pipeline_ops::update_job_result(
-            &self.db,
-            job_id,
-            "running",
-            None,
-            None,
-            Some(job_start),
-            None,
-        )
-        .await
-        {
+        if let Err(e) = pipeline_ops::start_job_if_active(&self.db, job_id, Some(job_start)).await {
             tracing::error!(job_id, error = %format!("{e:#}"), "Failed to update job status to running");
         }
 
