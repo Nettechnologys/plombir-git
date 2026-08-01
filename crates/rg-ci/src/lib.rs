@@ -1017,15 +1017,41 @@ fn workflow_matches_event(
     Ok(false)
 }
 
+/// The branch a detached `HEAD` is matched against, for lack of a better name.
+const DETACHED_HEAD_BRANCH: &str = "main";
+
 /// Get the default branch name of the repository.
+///
+/// `HEAD` is the only source: a symbolic `HEAD` names the branch, and an unborn
+/// `HEAD` — a repository whose branch has no commit yet — still names the branch
+/// it is waiting for, which is what `git symbolic-ref HEAD` reports. A detached
+/// `HEAD` names no branch at all, and that single state is the documented
+/// fallback to [`DETACHED_HEAD_BRANCH`]; it is logged, because the name is a
+/// guess and the `on:`-filters are matched against it.
+///
+/// Everything else is an error. A `HEAD` that cannot be read, a target ref that
+/// is corrupt, or a branch name that is not UTF-8 used to land in the very same
+/// fallback as an honestly branch-less repository — so a workflow filtered on
+/// `main` would run, and one filtered on the real default branch would be
+/// silently skipped, with nothing in the log either way.
 fn get_default_branch(repo: &gix::Repository) -> Result<String> {
-    // Try to read HEAD reference
-    if let Ok(Some(head_ref)) = repo.head_ref() {
-        if let Ok(name) = head_ref.name().shorten().to_str() {
-            return Ok(name.to_string());
-        }
-    }
-    Ok("main".to_string())
+    let head = repo
+        .head()
+        .context("failed to read HEAD while resolving the default branch")?;
+
+    let Some(referent) = head.referent_name() else {
+        tracing::warn!(
+            "repository HEAD is detached; matching workflow branch filters against {}",
+            DETACHED_HEAD_BRANCH
+        );
+        return Ok(DETACHED_HEAD_BRANCH.to_string());
+    };
+
+    let short = referent.shorten();
+    short
+        .to_str()
+        .map(str::to_string)
+        .with_context(|| format!("default branch name is not valid UTF-8: {short:?}"))
 }
 
 // M-14: has_ci_config moved to rg_core::ci::has_ci_config and re-exported above.
@@ -1917,6 +1943,112 @@ mod matrix_tests {
             .unwrap(),
             "a native config declares no events — it must not answer for pull_request"
         );
+    }
+
+    /// Run a git command in `repo` and assert it succeeded.
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(
+            gateway.run(args, Some(repo)).unwrap().success(),
+            "git {args:?} must succeed"
+        );
+    }
+
+    /// A workflow whose `branches:` filter only accepts `branch`, so the config
+    /// is produced exactly when the matcher resolved that branch.
+    fn pull_request_workflow(branch: &str) -> Vec<u8> {
+        format!(
+            "on:\n  pull_request:\n    branches: [{branch}]\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n"
+        )
+        .into_bytes()
+    }
+
+    /// The fallback the matcher used when `base_branch` is absent read `HEAD`
+    /// and, on any failure, answered `main`. Here `HEAD` is readable and names
+    /// something else — the filter must follow it.
+    #[test]
+    fn the_default_branch_filter_follows_head_instead_of_assuming_main() {
+        let (temp, sha) =
+            commit_repo(&[(".gitea/workflows/pr.yml", &pull_request_workflow("release"))]);
+        git(temp.path(), &["branch", "-m", "release"]);
+
+        let config = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
+            .expect("the repository's own default branch must satisfy the filter");
+        assert!(config.jobs.contains_key("pr/verify"));
+    }
+
+    /// The defect: `if let Ok(Some(..))` folded a `HEAD` that cannot be resolved
+    /// into the very same `main` an honestly branch-less repository gets. The
+    /// filter then judged a broken repository as if its default branch were
+    /// `main` — right answer by luck here, wrong answer anywhere else, and
+    /// nothing in the log either way.
+    #[test]
+    fn an_unreadable_head_is_an_error_not_the_default_branch_main() {
+        let (temp, sha) =
+            commit_repo(&[(".gitea/workflows/pr.yml", &pull_request_workflow("main"))]);
+        git(temp.path(), &["branch", "-m", "main"]);
+
+        // Baseline: with a readable HEAD this repository does match.
+        read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
+            .expect("fixture must match while HEAD is intact");
+        assert!(workflow_matches_event(
+            temp.path(),
+            &sha,
+            "pull_request",
+            "refs/pull/3/head",
+            None
+        )
+        .unwrap());
+
+        // HEAD still says `ref: refs/heads/main`; the branch it points at is
+        // no longer a ref at all.
+        std::fs::write(temp.path().join(".git/refs/heads/main"), b"not a ref\n").unwrap();
+
+        let error = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
+            .expect_err("an unresolvable HEAD must not be matched as `main`");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("HEAD"),
+            "the error must name what could not be read: {rendered}"
+        );
+
+        let error =
+            workflow_matches_event(temp.path(), &sha, "pull_request", "refs/pull/3/head", None)
+                .expect_err("the event gate must not answer from a guessed default branch");
+        assert!(format!("{error:#}").contains("HEAD"), "{error:#}");
+    }
+
+    /// An unborn `HEAD` — the branch has no commit yet — still names the branch
+    /// it is waiting for, and that name is the default branch. The old fallback
+    /// discarded it and said `main`.
+    #[test]
+    fn an_unborn_head_still_names_its_branch() {
+        let (temp, sha) =
+            commit_repo(&[(".gitea/workflows/pr.yml", &pull_request_workflow("future"))]);
+        // Points HEAD at a branch that does not exist while keeping the objects.
+        git(temp.path(), &["checkout", "--orphan", "future"]);
+
+        let config = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
+            .expect("an unborn HEAD names the default branch just like a born one");
+        assert!(config.jobs.contains_key("pr/verify"));
+    }
+
+    /// The one documented fallback: a detached `HEAD` names no branch, so there
+    /// is nothing to match against and `main` is the agreed stand-in.
+    #[test]
+    fn a_detached_head_falls_back_to_the_documented_branch() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/pr.yml",
+            &pull_request_workflow(DETACHED_HEAD_BRANCH),
+        )]);
+        // The default branch is deliberately not the fallback name, so a match
+        // can only come from the fallback itself.
+        git(temp.path(), &["branch", "-m", "trunk"]);
+        git(temp.path(), &["checkout", "--detach"]);
+
+        let config = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
+            .expect("a detached HEAD keeps the documented fallback");
+        assert!(config.jobs.contains_key("pr/verify"));
     }
 
     #[test]
