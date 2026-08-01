@@ -831,8 +831,10 @@ fn parse_range_start(range: &str) -> Option<i64> {
 /// Replaces `git diff --numstat` with native gix tree-diff + per-blob line counting.
 /// Returns file-level additions/deletions/status + aggregated totals.
 ///
-/// On failure (e.g. missing refs), falls back with a generic error — the caller
-/// should handle gracefully.
+/// Every failure is propagated: a ref that does not resolve, a tree-diff that
+/// blows up, and a blob we cannot read or line-count all become an `Err`. The
+/// one case that legitimately has no line count — a binary blob — is reported
+/// as a zero numstat entry, the way `git diff --numstat` prints `-` for it.
 fn gix_diff_numstat(
     repo_path: &std::path::Path,
     old_ref: String,
@@ -897,12 +899,21 @@ fn gix_diff_numstat(
                 |change| -> Result<std::ops::ControlFlow<()>, anyhow::Error> {
                     let location = change.location().to_str_lossy().to_string();
 
-                    let (additions, deletions) = change
+                    // Only `Ok(None)` means "this file has no line count" — gix
+                    // answers that for a binary blob, and a zero numstat is the
+                    // right report for it. An `Err` from either step means we
+                    // could not read or diff the blob at all; swallowing it here
+                    // would publish an unreadable file as an unchanged one.
+                    let (additions, deletions) = match change
                         .diff(&mut resource_cache)
-                        .ok()
-                        .and_then(|mut p| p.line_counts().ok().flatten())
-                        .map(|c| (c.insertions as i64, c.removals as i64))
-                        .unwrap_or((0, 0));
+                        .with_context(|| format!("failed to diff changed blob: {location}"))?
+                        .line_counts()
+                        .with_context(|| {
+                            format!("failed to count changed lines of blob: {location}")
+                        })? {
+                        Some(counts) => (counts.insertions as i64, counts.removals as i64),
+                        None => (0, 0),
+                    };
 
                     let status = match &change {
                         gix::object::tree::diff::Change::Addition { .. } => "added",
@@ -926,7 +937,11 @@ fn gix_diff_numstat(
                     Ok(std::ops::ControlFlow::Continue(()))
                 },
             )
-            .map_err(|e| anyhow::anyhow!("tree-diff failed: {e}"))?;
+            // `Error::ForEach` renders as a bare "the user-provided callback
+            // failed" — keep it as a `source` instead of interpolating it, so
+            // the per-file context raised above survives into `{err:#}`.
+            .map_err(anyhow::Error::from)
+            .context("tree-diff failed")?;
 
         file_count = files.len() as i64;
     }
@@ -944,6 +959,109 @@ fn gix_diff_numstat(
 #[cfg(test)]
 mod diff_tests {
     use super::*;
+
+    /// `main` → `feature`, where the feature commit touches one text file and
+    /// one binary file. Returns the work tree, which is also the repo path we
+    /// hand to [`gix_diff_numstat`].
+    fn repo_with_a_text_and_a_binary_change() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "PR diff test"],
+            ["config", "user.email", "prdiff@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(&work)).unwrap();
+        }
+
+        std::fs::write(work.join("text.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(work.join("blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
+        git.run_or_bail(&["add", "."], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
+            .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
+            .unwrap();
+        std::fs::write(work.join("text.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(work.join("blob.bin"), [0u8, 9, 9, 0, 7, 7]).unwrap();
+        git.run_or_bail(&["add", "."], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "change"], Some(&work))
+            .unwrap();
+
+        (dir, work)
+    }
+
+    fn numstat(work: &std::path::Path) -> Result<(Vec<FileDiff>, DiffStats)> {
+        gix_diff_numstat(
+            work,
+            "refs/heads/main".to_string(),
+            "refs/heads/feature".to_string(),
+        )
+    }
+
+    /// The legitimate half of the old `.ok().flatten()`: gix answers `Ok(None)`
+    /// for a binary blob, and a zero numstat is the correct report for it —
+    /// exactly what `git diff --numstat` prints as `-`.
+    #[test]
+    fn a_binary_blob_stays_a_zero_numstat_entry() {
+        let (_dir, work) = repo_with_a_text_and_a_binary_change();
+
+        let (files, stats) = numstat(&work).expect("a readable repository must diff");
+
+        assert_eq!(stats.files_changed, 2, "both files changed: {files:?}");
+        let binary = files
+            .iter()
+            .find(|f| f.path == "blob.bin")
+            .expect("the binary file must still be listed as changed");
+        assert_eq!(
+            (binary.additions, binary.deletions),
+            (0, 0),
+            "a binary blob has no line count — that is a zero numstat, not an error"
+        );
+        let text = files.iter().find(|f| f.path == "text.txt").unwrap();
+        assert_eq!((text.additions, text.deletions), (1, 0));
+        assert_eq!((stats.total_additions, stats.total_deletions), (1, 0));
+    }
+
+    /// The defect half: with `.diff(..).ok()` / `.line_counts().ok().flatten()`
+    /// a blob we cannot read was indistinguishable from a binary one, so the PR
+    /// diff answered `200` with a plausible zero numstat for a file that had in
+    /// fact changed. Deleting the loose object of the new-side blob reproduces
+    /// it; the whole call must now fail, naming the file.
+    #[test]
+    fn an_unreadable_blob_fails_the_whole_numstat() {
+        let (_dir, work) = repo_with_a_text_and_a_binary_change();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        // Sanity: the same repository diffs cleanly while every object is readable.
+        numstat(&work).expect("the fixture must diff before we break it");
+
+        let oid = git
+            .run(&["rev-parse", "feature:text.txt"], Some(&work))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+        let object = work
+            .join(".git")
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        std::fs::remove_file(&object)
+            .unwrap_or_else(|e| panic!("loose object {object:?} must exist: {e}"));
+
+        let err =
+            numstat(&work).expect_err("an unreadable blob must not be reported as zero changes");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("text.txt"),
+            "the error must name the file it failed on, got: {rendered}"
+        );
+    }
 
     #[test]
     fn splits_patch_by_file_and_parses_line_numbers() {
