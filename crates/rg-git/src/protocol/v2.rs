@@ -866,6 +866,12 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
 /// A repository that cannot be opened cannot answer the common-object question.
 /// Keep the existing best-effort fetch behavior, but make that degraded answer
 /// visible to operators instead of silently treating every `have` as absent.
+///
+/// The same distinction holds per object: `try_find_object` separates "the odb
+/// says this object is not here" from "the odb could not be read". Only the
+/// first is an honest absence; the second stays unacknowledged *and* logged, so
+/// a corrupt pack degrades the fetch to a full transfer with an operator trail
+/// instead of masquerading as a client that shares nothing with us.
 fn acknowledged_haves(repo_path: &Path, haves: &[String]) -> Vec<String> {
     let repo = match gix::open(repo_path) {
         Ok(repo) => repo,
@@ -881,10 +887,18 @@ fn acknowledged_haves(repo_path: &Path, haves: &[String]) -> Vec<String> {
 
     let mut acked = Vec::new();
     for have in haves {
-        if let Ok(oid) = gix::ObjectId::from_hex(have.as_bytes()) {
-            if repo.find_object(oid).is_ok() {
-                acked.push(have.clone());
-            }
+        let Ok(oid) = gix::ObjectId::from_hex(have.as_bytes()) else {
+            continue;
+        };
+        match repo.try_find_object(oid) {
+            Ok(Some(_)) => acked.push(have.clone()),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                repo = %repo_path.display(),
+                object = %have,
+                error = %format!("{error:#}"),
+                "cannot read object while negotiating V2 fetch acknowledgments"
+            ),
         }
     }
     acked
@@ -1155,14 +1169,21 @@ fn get_tag_peel(repo_path: &Path, sha: &str) -> Result<String> {
 }
 
 /// Get the size of a git object using gix API.
+///
+/// The two ways this can fail are not the same answer, so they must not share a
+/// message: an object the repository does not carry is `object ... not found`,
+/// while an odb that refused to answer keeps its own cause chain. Collapsing
+/// both into "not found" told the operator a healthy-but-unreadable pack was a
+/// client asking for something that never existed.
 fn get_object_size(repo_path: &Path, oid: &str) -> Result<u64> {
     let repo = gix::open(repo_path).context("failed to open repository")?;
     let object_id = gix::ObjectId::from_hex(oid.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid object ID: {}", e))?;
 
     let object = repo
-        .find_object(object_id)
-        .map_err(|_| anyhow::anyhow!("object {} not found", oid))?;
+        .try_find_object(object_id)
+        .with_context(|| format!("failed to read object {oid}"))?
+        .ok_or_else(|| anyhow::anyhow!("object {} not found", oid))?;
 
     // Get the size of the object data
     let size = object.data.len() as u64;
@@ -1429,6 +1450,117 @@ mod tests {
         assert!(gix::open(&repo_path).is_err());
 
         assert!(acknowledged_haves(&repo_path, &["a".repeat(40)]).is_empty());
+    }
+
+    /// Sink that keeps formatted warning lines, so a best-effort path can prove
+    /// that the failure it deliberately does not surface still reaches an
+    /// operator.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            (logs, guard)
+        }
+
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
+        }
+    }
+
+    /// A `have` the server genuinely never had is the ordinary negotiation
+    /// outcome: it stays unacknowledged and must NOT look like a storage
+    /// incident in the log.
+    #[test]
+    fn acknowledged_haves_silently_skips_an_object_the_server_never_had() {
+        let (_dir, repo_path, _have) = repository_with_commit();
+        let (logs, _guard) = CapturedLogs::capture();
+        let absent = "b".repeat(40);
+
+        assert!(acknowledged_haves(&repo_path, std::slice::from_ref(&absent)).is_empty());
+        assert_eq!(logs.rendered(), "", "an absent object is not a failure");
+    }
+
+    /// The distinction the card is about: the odb refusing to read an object is
+    /// not the same answer as the object not being there. It stays
+    /// unacknowledged either way, but only the failure gets an operator trail.
+    #[test]
+    fn acknowledged_haves_reports_an_unreadable_object_instead_of_calling_it_absent() {
+        let (_dir, repo_path, have) = repository_with_commit();
+        let loose = repo_path
+            .join(".git/objects")
+            .join(&have[..2])
+            .join(&have[2..]);
+        assert!(loose.is_file(), "fixture must keep the commit loose");
+        // Not deleted — present but undecodable, which is exactly what a
+        // corrupt odb looks like and what `Ok(None)` would misreport. Loose
+        // objects land read-only, so replace the file rather than write over it.
+        std::fs::remove_file(&loose).unwrap();
+        std::fs::write(&loose, b"not a zlib stream").unwrap();
+
+        let (logs, _guard) = CapturedLogs::capture();
+        let acked = acknowledged_haves(&repo_path, std::slice::from_ref(&have));
+
+        assert!(acked.is_empty(), "an unreadable object must not be acked");
+        let rendered = logs.rendered();
+        assert!(rendered.contains(&have), "{rendered}");
+        assert!(
+            rendered.contains("cannot read object while negotiating"),
+            "{rendered}"
+        );
+    }
+
+    /// `object-info` returns an error either way, but the operator reads the
+    /// message: an absent object is the client's question, an unreadable one is
+    /// our storage. The old `map_err(|_| "not found")` printed the first for
+    /// both and dropped the real cause.
+    #[test]
+    fn object_size_separates_an_absent_object_from_an_unreadable_one() {
+        let (_dir, repo_path, have) = repository_with_commit();
+
+        let absent = get_object_size(&repo_path, &"b".repeat(40)).unwrap_err();
+        assert!(format!("{absent:#}").contains("not found"), "{absent:#}");
+
+        let loose = repo_path
+            .join(".git/objects")
+            .join(&have[..2])
+            .join(&have[2..]);
+        std::fs::remove_file(&loose).unwrap();
+        std::fs::write(&loose, b"not a zlib stream").unwrap();
+
+        let unreadable = get_object_size(&repo_path, &have).unwrap_err();
+        let rendered = format!("{unreadable:#}");
+        assert!(rendered.contains("failed to read object"), "{rendered}");
+        assert!(
+            !rendered.contains("not found"),
+            "a storage failure must not be reported as a missing object: {rendered}"
+        );
     }
 
     #[tokio::test]
