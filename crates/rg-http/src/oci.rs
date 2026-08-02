@@ -395,15 +395,18 @@ pub async fn api_version_check(State(_state): State<AppState>, headers: HeaderMa
 //
 /// Who the registry decided is behind a `/v2/auth/token` request.
 enum BasicIdentity {
-    /// The request carries no usable credentials — missing header, malformed
-    /// value, unknown user, wrong password. Every one of those answers the same
-    /// way on purpose: a client that could tell them apart could enumerate
-    /// accounts against the registry.
+    /// The request carries no usable credentials — a missing header or a
+    /// malformed Basic value. This is the public-pull path.
     Anonymous,
     Authenticated {
         username: String,
         user_id: i64,
     },
+    /// The request supplied a syntactically valid credential which was not
+    /// accepted. Unknown users, wrong passwords, and PATs without `repo` all
+    /// land here and receive the same OCI 401 response, so this state cannot
+    /// enumerate accounts while also never posing as anonymous access.
+    Rejected,
     /// The password was right and the account carries a second factor. Kept
     /// apart from `Anonymous` because it is the one refusal that may be
     /// explained: reaching it takes the correct password, so the answer tells a
@@ -479,7 +482,7 @@ async fn authenticate_basic(
                 token_id = token.id,
                 "registry basic auth: token lacks the 'repo' scope"
             );
-            return anonymous();
+            return Ok(BasicIdentity::Rejected);
         }
         return Ok(BasicIdentity::Authenticated {
             username: owner.username,
@@ -533,7 +536,7 @@ async fn authenticate_basic(
         rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired => {
             Ok(BasicIdentity::SecondFactorRequired)
         }
-        rg_core::auth::lockout::PasswordAttempt::Rejected { .. } => anonymous(),
+        rg_core::auth::lockout::PasswordAttempt::Rejected { .. } => Ok(BasicIdentity::Rejected),
     }
 }
 
@@ -632,6 +635,13 @@ pub async fn get_token(
     let (username, authenticated_user_id) = match authenticate_basic(&state.db, &headers).await {
         Ok(BasicIdentity::Anonymous) => (ANONYMOUS_SUBJECT.to_string(), None),
         Ok(BasicIdentity::Authenticated { username, user_id }) => (username, Some(user_id)),
+        Ok(BasicIdentity::Rejected) => {
+            return oci_err(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "invalid credentials",
+            );
+        }
         Ok(BasicIdentity::SecondFactorRequired) => {
             // The one refusal the registry states out loud, and the only place
             // the owner can be told: `docker login` prints this message, and

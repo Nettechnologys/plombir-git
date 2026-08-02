@@ -6,9 +6,9 @@
 //! nothing in `login_log`. A five-try threshold on the web form is worth
 //! nothing while `/v2/auth/token` next to it counts to infinity in silence.
 //!
-//! The registry's answer to bad credentials is an *anonymous* token, not a 401
-//! — that is the OCI flow, and it is why the guessing was invisible: from the
-//! outside every attempt looks like a successful anonymous handshake.
+//! A missing credential still gets an anonymous token for public pulls, but a
+//! supplied password that is wrong gets an OCI 401. Otherwise a `docker login`
+//! failure looks exactly like a successful anonymous handshake.
 //!
 //! The SSH half of the same class lives in `rg-ssh/tests/ssh_lockout_tests.rs`.
 
@@ -26,24 +26,41 @@ fn basic(username: &str, password: &str) -> String {
     )
 }
 
-/// One `docker login`-shaped token request; returns the subject the registry
-/// minted the token for (`"anonymous"` when the credentials were refused).
-async fn token_subject(base: &str, auth: &str) -> String {
-    let resp = reqwest::Client::new()
+/// One `docker login`-shaped token request.
+async fn token_request(base: &str, auth: Option<&str>) -> reqwest::Response {
+    let request = reqwest::Client::new()
         .get(format!("{}/v2/auth/token", base))
         .query(&[
             ("service", "forgekeep-registry"),
             ("scope", "repository:reg_lock/image:pull"),
-        ])
-        .header(reqwest::header::AUTHORIZATION, auth)
-        .send()
-        .await
-        .unwrap();
+        ]);
+    let request = match auth {
+        Some(auth) => request.header(reqwest::header::AUTHORIZATION, auth),
+        None => request,
+    };
+    request.send().await.unwrap()
+}
+
+/// The subject from a successful token response.
+async fn token_subject(base: &str, auth: Option<&str>) -> String {
+    let resp = token_request(base, auth).await;
     assert_eq!(resp.status(), 200, "token request failed");
     let body: serde_json::Value = resp.json().await.unwrap();
     rg_core::auth::oci_token::validate_oci_token(body["token"].as_str().unwrap(), "test-secret-key")
         .expect("valid OCI token")
         .sub
+}
+
+/// The byte-for-byte OCI response for a rejected credential. Keeping the raw
+/// bytes guards against adding a response-body account-enumeration oracle.
+async fn rejected_body(base: &str, auth: &str) -> Vec<u8> {
+    let resp = token_request(base, Some(auth)).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "credential rejection must not mint an anonymous token"
+    );
+    resp.bytes().await.unwrap().to_vec()
 }
 
 async fn user(db: &rg_db::DatabaseConnection, user_id: i64) -> rg_db::entities::user::Model {
@@ -72,18 +89,14 @@ async fn failed_registry_logins_lock_the_account() {
     let (_jwt, user_id) = register_full(&base, "reg_lock", "reg_lock@example.com").await;
 
     assert_eq!(
-        token_subject(&base, &basic("reg_lock", PASSWORD)).await,
+        token_subject(&base, Some(&basic("reg_lock", PASSWORD))).await,
         "reg_lock",
         "baseline: the real password authenticates before any strike"
     );
 
     let threshold = rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS;
-    for attempt in 1..=threshold {
-        assert_eq!(
-            token_subject(&base, &basic("reg_lock", "not-the-password")).await,
-            "anonymous",
-            "a wrong registry password was accepted on attempt {attempt}"
-        );
+    for _attempt in 1..=threshold {
+        rejected_body(&base, &basic("reg_lock", "not-the-password")).await;
     }
 
     let account = user(&db, user_id).await;
@@ -100,11 +113,7 @@ async fn failed_registry_logins_lock_the_account() {
 
     // The lock has to bite on the credentials that are actually correct,
     // otherwise it is bookkeeping the attacker can ignore.
-    assert_eq!(
-        token_subject(&base, &basic("reg_lock", PASSWORD)).await,
-        "anonymous",
-        "a locked account still authenticates against the registry"
-    );
+    rejected_body(&base, &basic("reg_lock", PASSWORD)).await;
 
     let rows = failed_log_rows(&db, "reg_lock").await;
     assert_eq!(
@@ -135,6 +144,23 @@ async fn failed_registry_logins_lock_the_account() {
     );
 }
 
+/// A wrong password and an unknown user both pay the dummy-hash cost and must
+/// return exactly the same OCI envelope. The 401 distinguishes a rejected
+/// login from a missing Authorization header; it must not distinguish accounts.
+#[tokio::test]
+async fn registry_rejects_unknown_and_known_accounts_with_the_same_answer() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (_jwt, _user_id) = register_full(&base, "reg_known", "reg_known@example.com").await;
+
+    let known = rejected_body(&base, &basic("reg_known", "not-the-password")).await;
+    let unknown = rejected_body(&base, &basic("reg_unknown", "not-the-password")).await;
+
+    assert_eq!(
+        known, unknown,
+        "the registry rejection body distinguishes a real account from a missing one"
+    );
+}
+
 /// An anonymous pull carries no credentials at all — it must not be counted,
 /// logged, or otherwise mistaken for a guess.
 #[tokio::test]
@@ -142,16 +168,11 @@ async fn anonymous_registry_requests_are_not_login_attempts() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_jwt, user_id) = register_full(&base, "reg_lock", "reg_lock@example.com").await;
 
-    let resp = reqwest::Client::new()
-        .get(format!("{}/v2/auth/token", base))
-        .query(&[
-            ("service", "forgekeep-registry"),
-            ("scope", "repository:reg_lock/image:pull"),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        token_subject(&base, None).await,
+        "anonymous",
+        "a request with no Authorization header must retain public-pull access"
+    );
 
     assert_eq!(user(&db, user_id).await.login_attempts, 0);
     assert!(

@@ -56,8 +56,7 @@ async fn token_request(base: &str, auth: &str) -> reqwest::Response {
         .unwrap()
 }
 
-/// The subject the registry minted a token for (`"anonymous"` when the
-/// credentials were refused the OCI way).
+/// The subject the registry minted for a successful token request.
 async fn token_subject(base: &str, auth: &str) -> String {
     let resp = token_request(base, auth).await;
     assert_eq!(resp.status(), 200, "token request failed");
@@ -104,11 +103,8 @@ async fn mfa_closes_the_registry_password_door() {
         .await
         .expect("enable MFA");
 
-    // Not the anonymous token a wrong password gets: that answer is uniform
-    // because telling wrong-password from unknown-user apart would enumerate
-    // accounts. This one is only reachable *with* the right password, so it can
-    // be explained — and has to be, or the owner watches `docker login` quietly
-    // degrade to anonymous pulls.
+    // This is only reachable *with* the right password, so it can be explained
+    // — and has to be, or the owner watches `docker login` quietly fail.
     let refused = token_request(&base, &basic("reg_mfa", PASSWORD)).await;
     assert_eq!(
         refused.status(),
@@ -183,14 +179,34 @@ async fn the_gate_changes_nothing_else_about_the_password_door() {
         .await
         .expect("enable MFA");
 
+    let refused = token_request(&base, &basic("reg_mfa", "not-the-password")).await;
     assert_eq!(
-        token_subject(&base, &basic("reg_mfa", "not-the-password")).await,
-        "anonymous",
-        "a wrong password on an MFA account was answered differently from any other"
+        refused.status(),
+        401,
+        "a wrong password on an MFA account must be rejected like any other"
     );
     assert_eq!(
         user(&db, user_id).await.login_attempts,
         1,
         "wrong passwords stopped advancing the brute-force counter once MFA was on"
     );
+}
+
+/// A PAT is still an explicit credential. If it lacks the registry scope,
+/// downgrading it to public access makes that refusal look like a success.
+#[tokio::test]
+async fn pat_without_repo_scope_is_rejected_instead_of_becoming_anonymous() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (jwt, _user_id) = register_full(&base, "reg_mfa", "reg_mfa@example.com").await;
+    let pat = create_pat(&base, &jwt, "user").await;
+
+    let response = token_request(&base, &basic("reg_mfa", &pat)).await;
+    assert_eq!(
+        response.status(),
+        401,
+        "a PAT without repo scope must not receive an anonymous token"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNAUTHORIZED");
+    assert_eq!(body["errors"][0]["message"], "invalid credentials");
 }

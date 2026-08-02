@@ -65,7 +65,8 @@ async fn registry_token_for_a_broken_hash_is_not_an_anonymous_token() {
     );
 
     // The other half of the split: a genuinely wrong password is the client's
-    // problem and must stay a quiet anonymous token, not become an error.
+    // problem and must be a client-visible OCI rejection, not an anonymous
+    // token that lets `docker login` look successful.
     let resp = client
         .get(&url)
         .header("Authorization", basic_auth("ocihash", "not-the-password"))
@@ -74,8 +75,8 @@ async fn registry_token_for_a_broken_hash_is_not_an_anonymous_token() {
         .expect("request");
     assert_eq!(
         resp.status(),
-        200,
-        "a wrong password is a rejection, not a failure"
+        401,
+        "a wrong password is a client rejection, not a server failure"
     );
 
     break_stored_hash(&db, "ocihash").await;

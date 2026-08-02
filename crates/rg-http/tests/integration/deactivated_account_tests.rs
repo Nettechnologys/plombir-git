@@ -387,24 +387,28 @@ async fn deactivating_an_account_blocks_docker_login() {
         let client = client.clone();
         let base = base.clone();
         async move {
-            let resp = client
+            client
                 .get(format!("{}/v2/auth/token", base))
                 .query(&[("service", "forgekeep-registry"), ("scope", scope)])
                 .header(reqwest::header::AUTHORIZATION, auth)
                 .send()
                 .await
-                .unwrap();
-            assert_eq!(resp.status(), 200, "token request failed");
-            let body: serde_json::Value = resp.json().await.unwrap();
-            rg_core::auth::oci_token::validate_oci_token(
-                body["token"].as_str().unwrap(),
-                "test-secret-key",
-            )
-            .expect("valid OCI token")
+                .unwrap()
         }
     };
 
-    let before = request_token(basic.clone()).await;
+    let before_response = request_token(basic.clone()).await;
+    assert_eq!(
+        before_response.status(),
+        200,
+        "baseline token request failed"
+    );
+    let before_body: serde_json::Value = before_response.json().await.unwrap();
+    let before = rg_core::auth::oci_token::validate_oci_token(
+        before_body["token"].as_str().unwrap(),
+        "test-secret-key",
+    )
+    .expect("baseline minted a valid OCI token");
     assert_eq!(
         before.sub, "deact_oci",
         "baseline: credentials are accepted"
@@ -419,13 +423,13 @@ async fn deactivating_an_account_blocks_docker_login() {
 
     let after = request_token(basic).await;
     assert_eq!(
-        after.sub, "anonymous",
-        "docker login with a deactivated account still authenticates"
+        after.status(),
+        401,
+        "docker login with a deactivated account must be rejected, not downgraded to anonymous"
     );
-    assert!(
-        after.scope.is_none(),
-        "deactivated account still granted a push scope on its private image"
-    );
+    let body: serde_json::Value = after.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNAUTHORIZED");
+    assert_eq!(body["errors"][0]["message"], "invalid credentials");
 }
 
 /// The reset flow is a way back in that needs no administrator: the mail lands
