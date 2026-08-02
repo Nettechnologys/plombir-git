@@ -124,24 +124,26 @@ jobs, and telling them apart is what makes rotation safe.
 | Secret | Sources (first wins) | Protects |
 |--------|----------------------|----------|
 | **JWT secret** | `FORGEKEEP_JWT_SECRET` › `--jwt-secret` › `[auth].jwt_secret` | Signatures: session tokens, PAT-derived tokens, CI job tokens |
-| **Encryption key** | `FORGEKEEP_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › *the JWT secret* | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens, the instance signing key below |
+| **Encryption key** | `FORGEKEEP_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › `[auth].key_file` | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens, the instance signing key below |
 | **Instance signing key** | Stored in the database, established on first start | This instance's public identity: release-asset provenance attestations and the CI OIDC JWKS |
 
-**Set the encryption key explicitly.** Left unset it falls back to the JWT
-secret, which ties every encrypted row in the database to the secret you are
-told to change the moment a token leaks. Pin it once — to the same value as
-your current JWT secret — and the two become independent:
+**The encryption key establishes itself.** With no explicit key source, first
+start generates `[auth].key_file` beside `[server].host_key` with mode `0600`
+(the container configuration therefore uses `/data/encryption_key`). The file
+belongs in the same backup as the database and is independent of the JWT
+signing secret. Set an explicit key only when a KMS or vault is the intended
+source:
 
 ```toml
 [auth]
 jwt_secret     = "..."   # rotate this freely
-encryption_key = "..."   # this one keeps your data readable
+# encryption_key = "..." # optional external key source
+# key_file = "/data/encryption_key"
 ```
 
-**Rotating the JWT secret** (a leak, or routine hygiene): make sure
-`encryption_key` is set to the *old* secret first, then change `jwt_secret` and
-restart. Existing sessions are invalidated — everyone logs in again — and
-nothing else is affected.
+**Rotating the JWT secret** (a leak, or routine hygiene): change `jwt_secret`
+and restart. Existing sessions are invalidated — everyone logs in again — while
+the durable at-rest key file remains unchanged.
 
 **The instance signing key is not a config value.** It signs release-asset
 attestations and backs the public keys at `/api/v1/ci/oidc/jwks`, so it has to
@@ -172,8 +174,9 @@ forgekeep rotate-encryption-key --config forgekeep.toml \
 The dry run reports, per column, how many stored values the old key opens and
 how many it does not, and writes nothing. Re-run it with `--yes` instead of
 `--dry-run` to apply: every value is re-sealed in one transaction, and then
-`[auth].encryption_key` has to be set to the new secret before the server is
-started again.
+the configured source has to carry the new secret before the server is started
+again: update `[auth].encryption_key` / `FORGEKEEP_ENCRYPTION_KEY`, or replace
+`[auth].key_file` with mode `0600`.
 
 `--old` defaults to the key this deployment already resolves, so you only need
 it when the current key is not what the config says — on an instance that

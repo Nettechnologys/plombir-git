@@ -14,6 +14,7 @@ pub mod ci_retention_policy;
 pub mod ci_secret;
 pub mod commit_status;
 pub mod deploy_key;
+pub mod encryption_key_check;
 pub mod import_task;
 pub mod instance_settings;
 pub mod instance_signing_key;

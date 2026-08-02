@@ -35,11 +35,12 @@ url = "sqlite:///data/forgekeep.db?mode=rwc"
 # accidentally lands in git carries no credentials.
 # jwt_secret = "..."
 #
-# Same for the at-rest encryption key: set FORGEKEEP_ENCRYPTION_KEY in
-# deploy/.env. Unset, it falls back to the JWT secret — which means rotating
-# FORGEKEEP_JWT_SECRET makes every TOTP secret, CI secret, mirror/LDAP password
-# and SSO client secret unreadable. Pin it once, and rotation stays safe.
+# The at-rest encryption key needs no .env value: on first start the server
+# creates /data/encryption_key (next to the SSH host key, mode 0600) and keeps
+# using it across rebuilds. FORGEKEEP_ENCRYPTION_KEY remains available for KMS
+# or vault-backed deployments and wins over the file.
 # encryption_key = "..."
+# key_file = "/data/encryption_key"
 
 [ci]
 # Run CI jobs in Docker containers. Requires mounting the host Docker socket

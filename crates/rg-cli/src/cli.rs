@@ -115,10 +115,10 @@ pub(crate) enum Commands {
 
         /// Secret encrypting data at rest — TOTP secrets, CI secrets, mirror
         /// and LDAP passwords, SSO client secrets, OAuth tokens
-        /// [config: [auth].encryption_key] [default: the JWT secret]
+        /// [config: [auth].encryption_key] [default: [auth].key_file]
         ///
-        /// Set this to the *previous* JWT secret before rotating `--jwt-secret`,
-        /// or the already-encrypted data stops being readable.
+        /// With no explicit source the server creates and reuses a durable key
+        /// file, independent of `--jwt-secret`.
         #[arg(long)]
         encryption_key: Option<String>,
 
@@ -261,8 +261,8 @@ pub(crate) enum Commands {
     /// LDAP passwords, SSO client secrets, OAuth tokens and the instance
     /// signing key are opened with the old key and sealed with the new one, in
     /// a single transaction. Start `--dry-run` first — it reports what every
-    /// column would do and changes nothing. Afterwards, set
-    /// `[auth].encryption_key` to the new secret.
+    /// column would do and changes nothing. Afterwards, replace the configured
+    /// key source or its `[auth].key_file` with the new secret.
     RotateEncryptionKey {
         /// Database URL (sqlite://, postgres://, or mysql://)
         /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
@@ -282,7 +282,7 @@ pub(crate) enum Commands {
 
         /// The key the database is encrypted with today. Defaults to the key
         /// this deployment resolves normally (FORGEKEEP_ENCRYPTION_KEY ›
-        /// [auth].encryption_key › the JWT secret)
+        /// [auth].encryption_key › [auth].key_file)
         #[arg(long)]
         old: Option<String>,
 

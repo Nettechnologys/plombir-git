@@ -10,6 +10,8 @@
 //! running `forgekeep migrate` on a Postgres deployment migrated a brand-new
 //! empty SQLite file and `forgekeep backup-db` happily "backed up" nothing.
 
+use std::path::PathBuf;
+
 use anyhow::Context;
 
 /// TOML configuration file structure.
@@ -79,13 +81,49 @@ pub(crate) struct AuthConfig {
     /// Secret that encrypts data at rest — TOTP secrets, CI secrets, mirror and
     /// LDAP passwords, SSO client secrets, OAuth tokens.
     ///
-    /// Unset falls back to [`jwt_secret`](Self::jwt_secret), which is where
-    /// every existing deployment's data already lives. It is a separate knob so
-    /// that rotating the *signing* secret — the thing an operator is told to do
-    /// the moment a token leaks — stops silently re-keying the whole database
-    /// (card_d740512de0a8). Set it to the previous `jwt_secret` before rotating
-    /// and the stored data stays readable.
+    /// Unset falls through to the durable [`key_file`](Self::key_file), which
+    /// the server creates on first start. This keeps at-rest data independent
+    /// from a JWT secret that operators are expected to rotate.
     pub(crate) encryption_key: Option<String>,
+    /// File that carries the generated at-rest key when no explicit secret is
+    /// supplied. Kept next to the SSH host key by default so the whole instance
+    /// state remains in one backupable directory.
+    pub(crate) key_file: Option<String>,
+}
+
+/// The SSH host-key location used by `serve` without a configured
+/// `[server].host_key`. Keeping it here lets the one-shot commands resolve the
+/// same default key file as the server.
+pub(crate) fn default_host_key_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ssh")
+        .join("id_ed25519")
+}
+
+/// Resolve the durable at-rest key file. The file location is a deployment
+/// setting, not a secret source: env/CLI/config values for the key itself still
+/// win over its contents.
+pub(crate) fn resolve_encryption_key_file(
+    cfg: Option<&ConfigFile>,
+    resolved_host_key: Option<&str>,
+) -> PathBuf {
+    if let Some(path) = cfg.and_then(|config| config.auth.key_file.as_ref()) {
+        return PathBuf::from(path);
+    }
+
+    let host_key = resolved_host_key
+        .map(PathBuf::from)
+        .unwrap_or_else(default_host_key_path);
+    if let Some(parent) = host_key
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        return parent.join("encryption_key");
+    }
+
+    PathBuf::from("./data/encryption_key")
 }
 
 #[derive(Debug, serde::Deserialize, Default)]

@@ -2,9 +2,9 @@
 //! this instance already wrote?
 //!
 //! Every at-rest secret in ForgeKeep is AES-GCM encrypted under
-//! [`encryption::derive_key`] of the instance's encryption secret, which
-//! defaults to `[auth].jwt_secret`. Change that secret and *nothing* announces
-//! it: the server starts, and then every path that touches an encrypted column
+//! [`encryption::derive_key`] of the instance's durable encryption secret.
+//! Before the durable key file and marker existed, changing the effective key
+//! announced nothing: the server started, and every path that touched an encrypted column
 //! fails on its own — MFA login says "decryption failed", the CI job says it
 //! cannot decrypt a secret, the mirror sync says the credential is unreadable,
 //! LDAP bind says the password is missing. Each is a separate 500 in a separate
@@ -17,11 +17,11 @@
 //!
 //! ## Why a sample, and why "none of them opened"
 //!
-//! There is no key-check marker row to consult — the defect predates any such
-//! column, and the deployments that need this check the most are the ones
-//! already carrying data. So the check asks the data itself: take a few values
-//! that structurally *are* our ciphertext ([`encryption::looks_like_ciphertext`]),
-//! and try to open them.
+//! Databases created before the marker migration do not have a key-check row,
+//! so they are checked from their own data: take a few values that structurally
+//! *are* our ciphertext ([`encryption::looks_like_ciphertext`]), and try to
+//! open them. Once that succeeds, startup writes the marker; later starts use
+//! the marker even before the instance has any user-provided secret to sample.
 //!
 //! The verdict is deliberately asymmetric. One value that opens proves the key
 //! is right, so any success passes. Only "there is ciphertext here and **not
@@ -31,7 +31,9 @@
 //! cannot fake the verdict while its neighbours still open.
 
 use anyhow::{bail, Context, Result};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
+};
 
 use rg_db::entities::{ci_secret, instance_signing_key, mirror, oauth_account, sso_provider, user};
 
@@ -42,6 +44,11 @@ use crate::auth::encryption;
 /// decide the verdict alone, small enough to stay a constant-time startup step
 /// on an instance with a million users.
 const SAMPLE_LIMIT: u64 = 5;
+
+/// Domain-separated plaintext of the singleton key-check marker. The value is
+/// not secret; AES-GCM authentication is what proves the configured key opened
+/// it. Keeping it fixed makes an unexpected plaintext a corruption signal.
+const MARKER_PLAINTEXT: &str = "forgekeep-encryption-key-check-v1";
 
 /// What the probe saw. `probed` counts only values that structurally look like
 /// our ciphertext; a column of legacy plaintext contributes nothing.
@@ -85,22 +92,32 @@ pub async fn probe_encryption_key(db: &DatabaseConnection, key: &[u8; 32]) -> Re
     Ok(probe)
 }
 
-/// Refuse to start when the configured encryption secret cannot open the
-/// encrypted data already in `db`.
+/// Refuse to start when the configured encryption secret cannot open this
+/// database. Newer databases carry an encrypted marker, while legacy databases
+/// are still checked by sampling their stored ciphertext.
 ///
-/// `Ok(())` on a fresh database (nothing encrypted yet) and whenever at least
-/// one sampled value opens. A partial failure — some values open, some do not —
-/// is a warning rather than a refusal: the key is demonstrably right, so what
-/// is left is per-row damage that stopping the server would not repair.
-pub async fn verify_encryption_key(db: &DatabaseConnection, encryption_secret: &str) -> Result<()> {
+/// The returned probe is meaningful only for the legacy sample path; marker
+/// verification returns an empty probe because it is the stronger proof.
+pub async fn verify_encryption_key(
+    db: &DatabaseConnection,
+    encryption_secret: &str,
+) -> Result<KeyProbe> {
     let key = encryption::derive_key(encryption_secret);
+    if let Some(marker) = rg_db::ops::encryption_key_check_ops::find(db)
+        .await
+        .context("could not read the encryption-key check marker")?
+    {
+        verify_marker(&marker.value_encrypted, &key)?;
+        return Ok(KeyProbe::default());
+    }
+
     let probe = probe_encryption_key(db, &key)
         .await
         .context("could not read the encrypted columns to verify the encryption key")?;
 
     if probe.is_empty() {
         tracing::debug!("encryption key check: no encrypted data stored yet");
-        return Ok(());
+        return Ok(probe);
     }
 
     if probe.key_is_wrong() {
@@ -115,13 +132,86 @@ pub async fn verify_encryption_key(db: &DatabaseConnection, encryption_secret: &
             "the encryption key is correct, but some stored values did not decrypt — \
              those individual rows are damaged and must be re-entered"
         );
-        return Ok(());
+        return Ok(probe);
     }
 
     tracing::info!(
         opened = probe.opened,
         "encryption key check passed: stored secrets decrypt with the configured key"
     );
+    Ok(probe)
+}
+
+/// Whether this database has moved past the legacy sample-only proof.
+pub async fn has_encryption_key_check(db: &DatabaseConnection) -> Result<bool> {
+    rg_db::ops::encryption_key_check_ops::find(db)
+        .await
+        .map(|marker| marker.is_some())
+        .context("could not read the encryption-key check marker")
+}
+
+/// Establish the marker after the caller has verified the effective key.
+///
+/// If a concurrent first start wins the insert, verify its marker rather than
+/// overwriting it: two server processes must converge on one key.
+pub async fn ensure_encryption_key_check<C>(db: &C, encryption_secret: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let key = encryption::derive_key(encryption_secret);
+    let sealed = encryption::encrypt(MARKER_PLAINTEXT, &key)
+        .context("could not encrypt the encryption-key check marker")?;
+
+    match rg_db::ops::encryption_key_check_ops::insert(db, &sealed).await {
+        Ok(_) => {
+            tracing::info!("created encryption-key check marker");
+            Ok(())
+        }
+        Err(error) if rg_db::is_unique_violation(&error) => {
+            let marker = rg_db::ops::encryption_key_check_ops::find(db)
+                .await
+                .context("re-read the encryption-key check marker after a concurrent insert")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "encryption-key check marker disappeared after a concurrent insert"
+                    )
+                })?;
+            verify_marker(&marker.value_encrypted, &key)
+        }
+        Err(error) => Err(error).context("could not create the encryption-key check marker"),
+    }
+}
+
+/// Replace the marker in the same transaction that re-encrypts every stored
+/// value, so a committed database never has two answers for its current key.
+pub async fn replace_encryption_key_check<C>(db: &C, encryption_secret: &str) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    let key = encryption::derive_key(encryption_secret);
+    let sealed = encryption::encrypt(MARKER_PLAINTEXT, &key)
+        .context("could not encrypt the replacement encryption-key check marker")?;
+    rg_db::ops::encryption_key_check_ops::replace(db, &sealed)
+        .await
+        .context("could not replace the encryption-key check marker")?;
+    Ok(())
+}
+
+fn verify_marker(value_encrypted: &str, key: &[u8; 32]) -> Result<()> {
+    let value = encryption::decrypt(value_encrypted, key).map_err(|_| {
+        anyhow::anyhow!(
+            "the configured encryption key does not open this database's encryption-key check marker. \\
+             Nothing has been changed. Restore the key from [auth].key_file, \\
+             FORGEKEEP_ENCRYPTION_KEY or --encryption-key that this instance used before; \\
+             a substituted key file cannot open the existing database."
+        )
+    })?;
+    if value != MARKER_PLAINTEXT {
+        bail!(
+            "the encryption-key check marker decrypted to an unexpected value; \\
+             the database marker is corrupt and the server refuses to guess"
+        );
+    }
     Ok(())
 }
 
@@ -133,21 +223,16 @@ fn wrong_key_message(probe: &KeyProbe) -> String {
         "the configured encryption key does not decrypt any of the {probed} encrypted \
          value(s) already stored in this database ({columns}).\n\
          \n\
-         Nothing has been changed. This is what a changed secret looks like: data at rest \
+         Nothing has been changed. Data at rest \
          (TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth \
-         tokens, this instance's provenance signing key) is encrypted with \
-         [auth].encryption_key, which defaults to [auth].jwt_secret \
-         when it is not set. Starting anyway would fail every one of those operations \
+         tokens, this instance's provenance signing key) is encrypted with the instance's \
+         durable at-rest key. Starting anyway would fail every one of those operations \
          separately, at runtime, with no indication why.\n\
          \n\
-         If you rotated jwt_secret: keep the new signing secret and pin the OLD one as the \
-         encryption key, which leaves the stored data readable:\n\
-         \n\
-         \x20   [auth]\n\
-         \x20   jwt_secret     = \"<the new secret>\"\n\
-         \x20   encryption_key = \"<the secret used before the rotation>\"\n\
-         \n\
-         (or set FORGEKEEP_ENCRYPTION_KEY / --encryption-key to the previous secret).\n\
+         Restore the key from [auth].key_file, [auth].encryption_key, FORGEKEEP_ENCRYPTION_KEY or \
+         --encryption-key that this instance used before. If the key file was deleted or \
+         substituted, restore its original contents from the instance backup; rotating \
+         jwt_secret alone must not change it.\n\
          \n\
          If the previous secret is genuinely lost, the encrypted values cannot be recovered \
          by anyone: clear them and have MFA re-enrolled, CI secrets, mirror and LDAP \

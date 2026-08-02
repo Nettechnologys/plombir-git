@@ -135,21 +135,19 @@ directory, or take a hot SQLite backup with the commands in the
 
 ### Secrets and rotation
 
-`FORGEKEEP_JWT_SECRET` signs tokens. `FORGEKEEP_ENCRYPTION_KEY` encrypts data at
-rest — TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets,
-OAuth tokens. Left unset, the encryption key *is* the JWT secret, which means
-rotating the JWT secret (after a leak, say) makes all of that data unreadable
-and there is no way back without the old value.
+`FORGEKEEP_JWT_SECRET` signs tokens. The at-rest key encrypts TOTP secrets, CI
+secrets, mirror and LDAP passwords, SSO client secrets, and OAuth tokens. On a
+normal first start the server generates `/data/encryption_key`, mode `0600`, and
+keeps reusing it from the bind-mounted data directory. It is deliberately not
+derived from the JWT secret, so rotating `FORGEKEEP_JWT_SECRET` only invalidates
+sessions and never needs a second manual `.env` step.
 
-So: set both, to the same value, on the first deploy. From then on rotating
-`FORGEKEEP_JWT_SECRET` is safe — it only invalidates live sessions — as long as
-`FORGEKEEP_ENCRYPTION_KEY` keeps its original value.
-
-The server checks this at startup: if the configured key decrypts none of the
-data already in the database it **refuses to start** and prints the fix, rather
-than starting and failing MFA logins, CI jobs and mirror syncs one at a time
-later. A blank `FORGEKEEP_JWT_SECRET=` in `.env` counts as unset, not as "the
-empty secret", and is refused the same way.
+`FORGEKEEP_ENCRYPTION_KEY` still wins over the file for an external KMS or
+vault. `[auth].key_file` changes its location; by default it is beside
+`[server].host_key`. The startup marker in the database makes a substituted or
+deleted key file fail immediately with the recovery source named, rather than
+letting MFA, CI and mirror operations fail later. A blank
+`FORGEKEEP_JWT_SECRET=` in `.env` counts as unset, not as "the empty secret".
 
 If the encryption key itself leaks, move the database onto a new one with the
 server stopped:
@@ -160,7 +158,8 @@ docker compose run --rm forgekeep rotate-encryption-key \
     --old "$OLD_KEY" --new "$NEW_KEY" --dry-run   # reports, changes nothing
 docker compose run --rm forgekeep rotate-encryption-key \
     --old "$OLD_KEY" --new "$NEW_KEY" --yes
-# then set FORGEKEEP_ENCRYPTION_KEY to the new value in .env
+# then replace /data/encryption_key with the new value (mode 0600),
+# or update FORGEKEEP_ENCRYPTION_KEY in .env for an external key source
 docker compose up -d forgekeep
 ```
 

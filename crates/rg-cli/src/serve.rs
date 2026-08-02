@@ -6,8 +6,9 @@
 //! were private to this module, `migrate` / `backup-db` / `import` and friends
 //! had no way to read `[database].url` or `[server].repo_root` at all.
 
+use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -15,7 +16,8 @@ use crate::admin::validate_jwt_secret;
 use crate::config::{
     default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
     default_git_stream_timeout, default_git_timeout, ensure_regular_file, load_config_file,
-    resolve_settings, CliSettings, ResolvedSettings, DEFAULT_LOG_MAX_SIZE_MB,
+    resolve_encryption_key_file, resolve_settings, CliSettings, ResolvedSettings,
+    DEFAULT_LOG_MAX_SIZE_MB,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -194,11 +196,18 @@ fn env_secret(name: &str) -> Option<String> {
 /// *signs* and the one that *encrypts*. Shared with the one-shot subcommands
 /// that also have to open at-rest data, so "which key opens this database" has
 /// one answer and not one per entry point.
+pub(crate) struct AuthSecrets {
+    pub(crate) jwt_secret: String,
+    pub(crate) encryption_key: String,
+    missing_key_file: Option<PathBuf>,
+}
+
 pub(crate) fn resolve_auth_secrets(
     cfg: Option<&crate::config::ConfigFile>,
     jwt_secret: Option<String>,
     encryption_key: Option<String>,
-) -> anyhow::Result<(String, String)> {
+    key_file: &Path,
+) -> anyhow::Result<AuthSecrets> {
     // Resolve JWT secret: env var > CLI args > config file > error
     let resolved_jwt_secret = if let Some(env_secret) = env_secret("FORGEKEEP_JWT_SECRET") {
         validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
@@ -217,38 +226,201 @@ pub(crate) fn resolve_auth_secrets(
     };
 
     // Resolve the at-rest encryption secret: env var > CLI arg > config file >
-    // the JWT secret.
-    //
-    // The fallback is not laziness, it is compatibility: until card_d740512de0a8
-    // the two were the same value by construction, so every existing database
-    // has its TOTP secrets, CI secrets, mirror/LDAP passwords, SSO client
-    // secrets and OAuth tokens encrypted under `jwt_secret`. Splitting them
-    // without the fallback would have made this release the exact silent
-    // data-loss event the card is about. Setting the key explicitly is what
-    // makes rotating the *signing* secret safe from then on — and the startup
-    // preflight is what catches an operator who rotated without doing that.
-    let resolved_encryption_key = if let Some(env_key) = env_secret("FORGEKEEP_ENCRYPTION_KEY") {
+    // durable key file. A missing file is handled only after migrations and
+    // preflight: legacy ciphertext first proves the effective JWT-era key,
+    // while an empty database receives a new random key.
+    let (resolved_encryption_key, missing_key_file) = if let Some(env_key) =
+        env_secret("FORGEKEEP_ENCRYPTION_KEY")
+    {
         validate_jwt_secret(&env_key, "environment variable FORGEKEEP_ENCRYPTION_KEY")?;
         tracing::info!("Using at-rest encryption key from FORGEKEEP_ENCRYPTION_KEY");
-        env_key
+        (env_key, None)
     } else if let Some(cli_key) = encryption_key {
         validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
         tracing::info!("Using at-rest encryption key from --encryption-key");
-        cli_key
+        (cli_key, None)
     } else if let Some(cfg_key) = cfg.and_then(|c| c.auth.encryption_key.clone()) {
         validate_jwt_secret(&cfg_key, "config file [auth].encryption_key")?;
         tracing::info!("Using at-rest encryption key from config file [auth].encryption_key");
-        cfg_key
+        (cfg_key, None)
     } else {
-        tracing::info!(
-            "No [auth].encryption_key set — encrypting data at rest with the JWT secret. \
-             Set it (to the current JWT secret) before you ever rotate jwt_secret, or the \
-             stored secrets become unreadable"
-        );
-        resolved_jwt_secret.clone()
+        match read_key_file(key_file)? {
+            Some(key) => {
+                validate_jwt_secret(&key, "[auth].key_file")?;
+                tracing::info!(path = %key_file.display(), "Using at-rest encryption key from key file");
+                (key, None)
+            }
+            None => {
+                tracing::info!(
+                    path = %key_file.display(),
+                    "No explicit at-rest encryption key or key file; startup will establish one"
+                );
+                (resolved_jwt_secret.clone(), Some(key_file.to_owned()))
+            }
+        }
     };
 
-    Ok((resolved_jwt_secret, resolved_encryption_key))
+    Ok(AuthSecrets {
+        jwt_secret: resolved_jwt_secret,
+        encryption_key: resolved_encryption_key,
+        missing_key_file,
+    })
+}
+
+fn read_key_file(path: &Path) -> anyhow::Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    ensure_regular_file(
+        path,
+        "at-rest encryption key file",
+        "point [auth].key_file at a regular file, or remove it and let the server create it",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| {
+                format!(
+                    "read at-rest encryption key permissions: {}",
+                    path.display()
+                )
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "at-rest encryption key file {} has mode {mode:04o}; run chmod 600 {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    let key = std::fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "at-rest encryption key file",
+            path,
+            &error,
+            "the server must be able to read [auth].key_file",
+        ))
+    })?;
+    let key = key.trim().to_owned();
+    if key.is_empty() {
+        anyhow::bail!(
+            "at-rest encryption key file {} is empty; restore its original contents or remove it only before the first start",
+            path.display()
+        );
+    }
+    Ok(Some(key))
+}
+
+/// Atomically persist `key` if the file is missing. A concurrent first start
+/// reuses the value it finds rather than replacing the other process's key.
+fn ensure_key_file(path: &Path, key: &str) -> anyhow::Result<String> {
+    if let Some(existing) = read_key_file(path)? {
+        return Ok(existing);
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+                "at-rest encryption key directory",
+                parent,
+                &error,
+                "point [auth].key_file at a directory the server can write to",
+            ))
+        })?;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(key.as_bytes())
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.sync_all())
+                .map_err(|error| {
+                    anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+                        "at-rest encryption key file",
+                        path,
+                        &error,
+                        "the server must be able to write and fsync [auth].key_file",
+                    ))
+                })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| {
+                        format!(
+                            "failed to set at-rest encryption key permissions: {}",
+                            path.display()
+                        )
+                    })?;
+            }
+            Ok(key.to_owned())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_key_file(path)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "at-rest encryption key file {} disappeared during creation",
+                    path.display()
+                )
+            }),
+        Err(error) => Err(anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "at-rest encryption key file",
+            path,
+            &error,
+            "the server generates this key on first start and needs write access to its directory",
+        ))),
+    }
+}
+
+fn generate_encryption_key() -> String {
+    use base64::Engine;
+    use rand::RngCore;
+
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Complete the part of key resolution that requires the migrated database.
+/// It runs before any durable value is written by this server start.
+async fn establish_encryption_key(
+    db: &rg_db::DatabaseConnection,
+    secrets: &mut AuthSecrets,
+) -> anyhow::Result<()> {
+    let had_marker = rg_core::auth::key_check::has_encryption_key_check(db).await?;
+    let legacy_probe =
+        rg_core::auth::key_check::verify_encryption_key(db, &secrets.encryption_key).await?;
+
+    if let Some(path) = secrets.missing_key_file.take() {
+        let key_to_persist = if had_marker || !legacy_probe.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                "materializing the legacy at-rest key into [auth].key_file; future JWT rotations will not change it"
+            );
+            secrets.encryption_key.clone()
+        } else {
+            generate_encryption_key()
+        };
+        secrets.encryption_key = ensure_key_file(&path, &key_to_persist)?;
+        // A concurrent first start may have supplied this file. Check the value
+        // that will actually be used rather than assuming it matches ours.
+        rg_core::auth::key_check::verify_encryption_key(db, &secrets.encryption_key).await?;
+        tracing::info!(path = %path.display(), "at-rest encryption key file ready");
+    }
+
+    rg_core::auth::key_check::ensure_encryption_key_check(db, &secrets.encryption_key).await
 }
 
 /// Initialise and run the ForgeKeep server (HTTP + SSH).
@@ -286,9 +458,6 @@ pub(crate) async fn run_serve(
         None
     };
 
-    let (resolved_jwt_secret, resolved_encryption_key) =
-        resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key)?;
-
     // Resolve every dual-source knob in one place: CLI args > config file >
     // built-in default.
     let ResolvedSettings {
@@ -317,6 +486,15 @@ pub(crate) async fn run_serve(
         },
         cfg.as_ref(),
     );
+
+    let encryption_key_file =
+        resolve_encryption_key_file(cfg.as_ref(), resolved_host_key.as_deref());
+    let mut resolved_auth_secrets = resolve_auth_secrets(
+        cfg.as_ref(),
+        jwt_secret,
+        encryption_key,
+        &encryption_key_file,
+    )?;
 
     let resolved_docker = docker || cfg.as_ref().and_then(|c| c.ci.docker).unwrap_or(false);
     let resolved_external_runners = external_runners
@@ -538,13 +716,10 @@ pub(crate) async fn run_serve(
     tracing::info!("Database ready");
 
     // ── At-rest encryption key preflight ──────────────────────────
-    // Refuse to serve with a key that cannot open what is already stored. The
-    // alternative — the behaviour before card_d740512de0a8 — is a server that
-    // starts fine and then fails MFA login, CI secret injection, mirror sync and
-    // LDAP bind one at a time, each with its own unrelated-looking 500, with
-    // nothing anywhere naming the changed secret as the cause. Runs after the
-    // migrations so the columns it samples are guaranteed to exist.
-    rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
+    // Refuse to serve with a key that cannot open what is already stored. On a
+    // first boot this also creates the durable key file and its database marker
+    // before any other startup path writes encrypted state.
+    establish_encryption_key(&db, &mut resolved_auth_secrets).await?;
 
     // ── Instance provenance identity ──────────────────────────────
     // The Ed25519 key that signs release attestations and backs the CI OIDC
@@ -555,8 +730,8 @@ pub(crate) async fn run_serve(
     let instance_key = std::sync::Arc::new(
         rg_core::auth::instance_key::load_or_adopt(
             &db,
-            &resolved_jwt_secret,
-            &resolved_encryption_key,
+            &resolved_auth_secrets.jwt_secret,
+            &resolved_auth_secrets.encryption_key,
         )
         .await?,
     );
@@ -660,7 +835,7 @@ pub(crate) async fn run_serve(
         _ => None,
     };
 
-    validate_config(&resolved_jwt_secret, &repo_root, &tls_config)?;
+    validate_config(&resolved_auth_secrets.jwt_secret, &repo_root, &tls_config)?;
 
     // One CI engine and one WebSocket hub for the whole process: the SSH
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
@@ -675,8 +850,8 @@ pub(crate) async fn run_serve(
         listen_addr: resolved_http_addr,
         repo_root: repo_root.clone(),
         db: db.clone(),
-        jwt_secret: resolved_jwt_secret.clone(),
-        encryption_key: resolved_encryption_key.clone(),
+        jwt_secret: resolved_auth_secrets.jwt_secret.clone(),
+        encryption_key: resolved_auth_secrets.encryption_key.clone(),
         instance_key,
         external_webhook_secret: resolved_external_webhook_secret,
         docker_enabled: resolved_docker,
@@ -719,8 +894,8 @@ pub(crate) async fn run_serve(
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,
-        jwt_secret: Some(resolved_jwt_secret.clone()),
-        encryption_key: Some(resolved_encryption_key),
+        jwt_secret: Some(resolved_auth_secrets.jwt_secret.clone()),
+        encryption_key: Some(resolved_auth_secrets.encryption_key),
         smtp_config,
         ci_engine,
         external_url: resolved_external_url,
@@ -766,6 +941,8 @@ pub(crate) async fn run_serve(
 
 #[cfg(test)]
 mod serve_tests {
+    use std::path::PathBuf;
+
     use crate::config::{CliSettings, ConfigFile};
 
     /// `[auth].encryption_key` must actually parse — the struct carries
@@ -775,10 +952,14 @@ mod serve_tests {
     #[test]
     fn the_encryption_key_is_a_real_config_key() {
         let config: ConfigFile =
-            toml::from_str("[auth]\njwt_secret = \"signing\"\nencryption_key = \"at-rest\"\n")
+            toml::from_str("[auth]\njwt_secret = \"signing\"\nencryption_key = \"at-rest\"\nkey_file = \"/srv/forgekeep/encryption_key\"\n")
                 .expect("[auth].encryption_key must be part of the config model");
         assert_eq!(config.auth.jwt_secret.as_deref(), Some("signing"));
         assert_eq!(config.auth.encryption_key.as_deref(), Some("at-rest"));
+        assert_eq!(
+            config.auth.key_file.as_deref(),
+            Some("/srv/forgekeep/encryption_key")
+        );
     }
 
     /// Omitting it is the supported (and most common) state: existing
@@ -788,6 +969,147 @@ mod serve_tests {
     fn omitting_the_encryption_key_is_allowed() {
         let config: ConfigFile = toml::from_str("[auth]\njwt_secret = \"signing\"\n").unwrap();
         assert!(config.auth.encryption_key.is_none());
+    }
+
+    #[test]
+    fn default_encryption_key_file_is_a_sibling_of_the_host_key() {
+        let config: ConfigFile =
+            toml::from_str("[auth]\nkey_file = \"/secrets/custom-key\"\n").unwrap();
+        assert_eq!(
+            crate::config::resolve_encryption_key_file(Some(&config), Some("/data/ssh_host_key")),
+            PathBuf::from("/secrets/custom-key")
+        );
+
+        let config: ConfigFile =
+            toml::from_str("[server]\nhost_key = \"/data/ssh_host_key\"\n").unwrap();
+        assert_eq!(
+            crate::config::resolve_encryption_key_file(
+                Some(&config),
+                config.server.host_key.as_deref()
+            ),
+            PathBuf::from("/data/encryption_key")
+        );
+    }
+
+    async fn fresh_db(path: &std::path::Path) -> rg_db::DatabaseConnection {
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            path.join("test.db").display()
+        ))
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    fn unresolved_secrets(jwt_secret: &str, key_file: PathBuf) -> super::AuthSecrets {
+        super::AuthSecrets {
+            jwt_secret: jwt_secret.to_owned(),
+            encryption_key: jwt_secret.to_owned(),
+            missing_key_file: Some(key_file),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_start_generates_a_stable_owner_only_key_file_and_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let key_file = dir.path().join("nested").join("encryption_key");
+        let jwt_secret = "the-jwt-secret-used-only-for-signing";
+        let mut first = unresolved_secrets(jwt_secret, key_file.clone());
+
+        super::establish_encryption_key(&db, &mut first)
+            .await
+            .expect("first start establishes the durable key");
+        assert_ne!(first.encryption_key, jwt_secret);
+        assert_eq!(
+            super::read_key_file(&key_file).unwrap().as_deref(),
+            Some(first.encryption_key.as_str())
+        );
+        assert!(rg_core::auth::key_check::has_encryption_key_check(&db)
+            .await
+            .unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&key_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let mut second = super::AuthSecrets {
+            jwt_secret: "a-rotated-jwt-secret".to_owned(),
+            encryption_key: super::read_key_file(&key_file).unwrap().unwrap(),
+            missing_key_file: None,
+        };
+        super::establish_encryption_key(&db, &mut second)
+            .await
+            .expect("second start reuses the generated key");
+        assert_eq!(second.encryption_key, first.encryption_key);
+    }
+
+    #[tokio::test]
+    async fn legacy_jwt_encryption_is_materialized_before_the_jwt_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let legacy_jwt = "the-jwt-secret-that-encrypted-this-database";
+        let user =
+            rg_db::ops::user_ops::create_user(&db, "alice", "alice@example.invalid", "", "Alice")
+                .await
+                .unwrap();
+        let cipher = rg_core::auth::encryption::encrypt(
+            "JBSWY3DPEHPK3PXP",
+            &rg_core::auth::encryption::derive_key(legacy_jwt),
+        )
+        .unwrap();
+        rg_db::ops::user_ops::update_totp_secret(&db, user.id, &cipher)
+            .await
+            .unwrap();
+
+        let key_file = dir.path().join("encryption_key");
+        let mut first = unresolved_secrets(legacy_jwt, key_file.clone());
+        super::establish_encryption_key(&db, &mut first)
+            .await
+            .expect("legacy key is proven before materializing it");
+        assert_eq!(first.encryption_key, legacy_jwt);
+
+        let mut after_jwt_rotation = super::AuthSecrets {
+            jwt_secret: "a-new-jwt-signing-secret".to_owned(),
+            encryption_key: super::read_key_file(&key_file).unwrap().unwrap(),
+            missing_key_file: None,
+        };
+        super::establish_encryption_key(&db, &mut after_jwt_rotation)
+            .await
+            .expect("the old at-rest data remains readable after JWT rotation");
+        assert_eq!(after_jwt_rotation.encryption_key, legacy_jwt);
+    }
+
+    #[tokio::test]
+    async fn a_substituted_key_file_refuses_startup_before_any_feature_uses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let key_file = dir.path().join("encryption_key");
+        let mut first = unresolved_secrets("the-original-jwt-secret", key_file.clone());
+        super::establish_encryption_key(&db, &mut first)
+            .await
+            .unwrap();
+
+        std::fs::write(&key_file, "a-substituted-key-file-value\n").unwrap();
+        let mut substituted = super::AuthSecrets {
+            jwt_secret: "a-new-jwt-secret".to_owned(),
+            encryption_key: super::read_key_file(&key_file).unwrap().unwrap(),
+            missing_key_file: None,
+        };
+        let error = super::establish_encryption_key(&db, &mut substituted)
+            .await
+            .expect_err("a marker must reject a substituted key file");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("key file") || message.contains("key_file"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing has been changed"), "{message}");
     }
 
     /// `FOO=` in a `.env` is "not set", not "the empty secret" — see

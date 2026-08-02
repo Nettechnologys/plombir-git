@@ -80,6 +80,7 @@ pub mod m20260728_000001_create_instance_settings;
 pub mod m20260728_000002_add_package_file_digests;
 pub mod m20260730_000001_repositories_namespace_unique;
 pub mod m20260801_000001_create_instance_signing_key;
+pub mod m20260802_000001_create_encryption_key_check;
 
 use sea_orm_migration::prelude::*;
 
@@ -173,6 +174,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260728_000002_add_package_file_digests::Migration),
             Box::new(m20260730_000001_repositories_namespace_unique::Migration),
             Box::new(m20260801_000001_create_instance_signing_key::Migration),
+            Box::new(m20260802_000001_create_encryption_key_check::Migration),
         ]
     }
 }

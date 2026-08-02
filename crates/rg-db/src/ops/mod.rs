@@ -7,6 +7,7 @@ pub mod ci_retention_ops;
 pub mod ci_secret_ops;
 pub mod commit_status_ops;
 pub mod deploy_key_ops;
+pub mod encryption_key_check_ops;
 pub mod import_task_ops;
 pub mod instance_settings_ops;
 pub mod instance_signing_key_ops;

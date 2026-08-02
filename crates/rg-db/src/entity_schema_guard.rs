@@ -72,6 +72,7 @@ probed_entities!(
     ci_secret,
     commit_status,
     deploy_key,
+    encryption_key_check,
     import_task,
     instance_settings,
     instance_signing_key,

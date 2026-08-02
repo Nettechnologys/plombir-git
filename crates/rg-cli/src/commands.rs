@@ -94,10 +94,17 @@ pub(crate) async fn cmd_rotate_instance_key(
 
     let cfg = config::load_optional_config_file(config.as_deref())?;
     let db_url = config::resolve_db_url(db_url, cfg.as_ref());
-    let (_, resolved_encryption_key) =
-        crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key)?;
+    let key_file = config::resolve_encryption_key_file(
+        cfg.as_ref(),
+        cfg.as_ref()
+            .and_then(|config| config.server.host_key.as_deref()),
+    );
+    let resolved_encryption_key =
+        crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key, &key_file)?
+            .encryption_key;
 
     let db = dbconn::connect(&db_url).await?;
+    rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
     let current = rg_db::ops::instance_signing_key_ops::find(&db)
         .await
         .context("read the current instance signing key")?;
@@ -156,7 +163,15 @@ pub(crate) async fn cmd_rotate_encryption_key(
     // right on every instance that has not already changed its config.
     let old_key = match old {
         Some(explicit) => explicit,
-        None => crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, None)?.1,
+        None => {
+            let key_file = config::resolve_encryption_key_file(
+                cfg.as_ref(),
+                cfg.as_ref()
+                    .and_then(|config| config.server.host_key.as_deref()),
+            );
+            crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, None, &key_file)?
+                .encryption_key
+        }
     };
     admin::validate_jwt_secret(&new, "--new")?;
 
@@ -695,4 +710,49 @@ pub(crate) async fn cmd_index_repo(
         "Repository indexing complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cmd_rotate_instance_key;
+
+    #[tokio::test]
+    async fn rotate_instance_key_refuses_a_key_that_does_not_open_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let db = rg_db::connect(&db_url).await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        rg_core::auth::key_check::ensure_encryption_key_check(&db, "the-real-at-rest-key")
+            .await
+            .unwrap();
+
+        let config_path = dir.path().join("forgekeep.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[database]\nurl = \"{db_url}\"\n\n[auth]\njwt_secret = \"a-sufficiently-long-jwt-secret\"\nencryption_key = \"a-wrong-at-rest-key\"\n"
+            ),
+        )
+        .unwrap();
+
+        let error = cmd_rotate_instance_key(
+            None,
+            Some(config_path.to_string_lossy().into_owned()),
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect_err("the command must preflight the configured encryption key");
+        let message = format!("{error:#}");
+        assert!(message.contains("check marker"), "{message}");
+        assert!(
+            rg_db::ops::instance_signing_key_ops::find(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the command must not write a new signing key after a failed preflight"
+        );
+    }
 }

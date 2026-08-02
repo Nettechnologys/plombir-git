@@ -168,6 +168,22 @@ pub async fn rekey(
         );
     }
 
+    // On databases booted since card_82df8d4bb730 the marker is the definitive
+    // proof of the old key, including on a database with no user secrets yet.
+    // A re-run after a completed rotation is intentionally different: the old
+    // key must fail while `new_secret` opens the marker, and the traversal below
+    // will report every row as `already_new`. Preserve the old-key error when
+    // neither key opens the database.
+    if let Err(old_key_error) = crate::auth::key_check::verify_encryption_key(db, old_secret).await
+    {
+        if crate::auth::key_check::verify_encryption_key(db, new_secret)
+            .await
+            .is_err()
+        {
+            return Err(old_key_error);
+        }
+    }
+
     let old_key = encryption::derive_key(old_secret);
     let new_key = encryption::derive_key(new_secret);
 
@@ -272,6 +288,8 @@ pub async fn rekey(
             .context("roll back after refusing to rotate")?;
         bail!("{}", wrong_old_key_message(&report));
     }
+
+    crate::auth::key_check::replace_encryption_key_check(&txn, new_secret).await?;
 
     txn.commit()
         .await
