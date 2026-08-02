@@ -23,8 +23,8 @@
 //!   and `merge_queue_ops::enqueue`.
 
 use rg_db::entities::{
-    ci_environment, deploy_key, pr_reviewer_request, protected_tag, pull_request, repository,
-    ssh_key,
+    ci_environment, deploy_key, mirror, pr_reviewer_request, protected_tag, pull_request,
+    repository, ssh_key,
 };
 use rg_db::sea_orm::{DatabaseConnection, NotSet, Set};
 
@@ -226,6 +226,38 @@ async fn a_duplicate_tag_protection_pattern_is_classifiable() {
         .await
         .expect_err("(repo_id, pattern) is UNIQUE");
     assert_conflict_is_classifiable(&error, "tag protection pattern");
+}
+
+/// `mirror::service::create_mirror` reads first and inserts second, so the
+/// loser of the `UNIQUE(mirrors.repo_id)` race reaches the insert. It answers
+/// the caller's own conflict only while this classification stays alive.
+#[tokio::test]
+async fn a_duplicate_mirror_for_one_repository_is_classifiable() {
+    let (db, _temp) = setup("mirrors").await;
+    let (_user_id, repo_id) = fixture(&db).await;
+
+    let mirror = || mirror::ActiveModel {
+        id: NotSet,
+        repo_id: Set(repo_id),
+        url: Set("https://example.com/upstream.git".to_string()),
+        username: Set(None),
+        password_encrypted: Set(None),
+        sync_interval_seconds: Set(3600),
+        next_sync_at: Set(None),
+        last_sync_at: Set(None),
+        last_sync_error: Set(None),
+        status: Set("active".to_string()),
+        created_at: Set(chrono::Utc::now()),
+        updated_at: Set(chrono::Utc::now()),
+    };
+
+    rg_db::ops::mirror_ops::create(&db, mirror())
+        .await
+        .expect("the first mirror registers");
+    let error = rg_db::ops::mirror_ops::create(&db, mirror())
+        .await
+        .expect_err("repo_id is UNIQUE");
+    assert_conflict_is_classifiable(&error, "mirror");
 }
 
 #[tokio::test]

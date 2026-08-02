@@ -55,14 +55,14 @@ pub async fn create_mirror(
     // for immediate operator feedback; sync re-checks with DNS resolution.
     crate::net::check_git_url_static(&url).context("invalid mirror URL")?;
 
-    // Check for existing mirror
+    // Check for existing mirror. This read is the fast path only — the row can
+    // still appear between here and the insert below, which is why the insert
+    // classifies its own failure rather than trusting this answer.
     if rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .is_some()
     {
-        return Err(crate::error::invalid_request(
-            "mirror already exists for this repository",
-        ));
+        return Err(mirror_already_exists());
     }
 
     let now = Utc::now();
@@ -83,8 +83,24 @@ pub async fn create_mirror(
         ..Default::default()
     };
 
-    let mirror = rg_db::ops::mirror_ops::create(db, model).await?;
-    Ok(mirror)
+    // Losing the `UNIQUE(mirrors.repo_id)` race is the same outcome the read
+    // above reports, reached a moment later: someone else registered the mirror
+    // first. That is the caller's answer, not a server fault. Only that one
+    // loss is folded — a foreign-key failure or a database outage stays an
+    // error, because telling a client to fix a request that was never the
+    // problem is exactly the misattribution this costs.
+    match rg_db::ops::mirror_ops::create(db, model).await {
+        Ok(mirror) => Ok(mirror),
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => Err(mirror_already_exists()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The one answer both the pre-read and the losing insert give, so a caller
+/// cannot tell which of the two noticed. Carries no constraint or `db:` text —
+/// this message reaches the client verbatim.
+fn mirror_already_exists() -> anyhow::Error {
+    crate::error::invalid_request("mirror already exists for this repository")
 }
 
 /// Get mirror for a repository.
