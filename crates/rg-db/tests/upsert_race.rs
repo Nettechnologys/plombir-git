@@ -2,8 +2,10 @@
 //! and write in two statements. Concurrent *first* calls all see no row and all
 //! insert; the key is UNIQUE, so one of them used to come back with a
 //! constraint error on an operation that was never the caller's fault.
+//! card_d9d5f4ff7809 adds the related toggle contract: concurrent requests that
+//! all mean "make this star exist" must not leak the losing UNIQUE error.
 //!
-//! The six, and the ordinary concurrency that reaches each:
+//! The operations, and the ordinary concurrency that reaches each:
 //!
 //! * `commit_status_ops::create_or_update` — a build matrix reporting the same
 //!   context on one commit.
@@ -12,6 +14,7 @@
 //! * `ci_retention_ops::upsert_cache_entry` — parallel jobs uploading one cache key.
 //! * `instance_settings_ops::save` — the singleton on a never-configured instance.
 //! * `repo_watch_ops::set_watch_state` — a double-clicked watch button.
+//! * `repo_star_ops::toggle_star` — a double-clicked star button.
 //!
 //! What the tests guard:
 //!
@@ -383,6 +386,46 @@ async fn concurrent_first_watch_writes_all_succeed_and_leave_one_row() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_star_toggles_all_succeed_and_leave_a_coherent_counter() {
+    let (db, _temp) = setup("star").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let attempts = (0..ATTEMPTS).map(|_| {
+        let db = db.clone();
+        async move {
+            let starred = rg_db::ops::repo_star_ops::toggle_star(&db, user_id, repo_id).await?;
+            // This is the same write sequence as `rg_core::repo::service::toggle_star`.
+            rg_db::ops::repo_ops::update_stars_count(&db, repo_id).await?;
+            Ok::<bool, anyhow::Error>(starred)
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "star toggle");
+
+    let actual = scalar(
+        &db,
+        &format!(
+            "SELECT COUNT(*) AS n FROM repo_stars WHERE user_id = {user_id} AND repo_id = {repo_id}"
+        ),
+    )
+    .await;
+    assert!(
+        (0..=1).contains(&actual),
+        "one user may hold at most one star for one repository"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT stars_count AS n FROM repositories WHERE id = {repo_id}"),
+        )
+        .await,
+        actual,
+        "the cached star count must match the rows after concurrent toggles",
+    );
+}
+
 /// The re-read is armed by a UNIQUE violation and nothing else. Each primitive
 /// is given a write that fails on a foreign key instead — SQLite enforces them
 /// (`connect_sqlite` sets `foreign_keys = ON`) — and must still report failure
@@ -451,6 +494,12 @@ async fn writes_that_fail_on_something_other_than_uniqueness_are_still_errors() 
             .is_err(),
         "a watch for a user and repository that do not exist must stay a failure",
     );
+    assert!(
+        rg_db::ops::repo_star_ops::toggle_star(&db, ORPHAN, ORPHAN)
+            .await
+            .is_err(),
+        "a star for a user and repository that do not exist must stay a failure",
+    );
 
     for (table, what) in [
         ("commit_statuses", "commit status"),
@@ -458,6 +507,7 @@ async fn writes_that_fail_on_something_other_than_uniqueness_are_still_errors() 
         ("ci_retention_policies", "retention policy"),
         ("ci_cache_entries", "cache entry"),
         ("repo_watches", "watch"),
+        ("repo_stars", "star"),
     ] {
         assert_eq!(
             scalar(&db, &format!("SELECT COUNT(*) AS n FROM {table}")).await,

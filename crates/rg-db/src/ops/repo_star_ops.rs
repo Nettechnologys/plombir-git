@@ -7,6 +7,12 @@ use crate::entities::repo_star::{self, ActiveModel, Entity as RepoStarEntity, Mo
 
 /// Toggle a star: if already starred, unstar (delete) and return false.
 /// If not starred, star (insert) and return true.
+///
+/// `(user_id, repo_id)` is UNIQUE. Two simultaneous requests can both observe
+/// no row and race to insert it. The loser does not undo the winner's star:
+/// its requested end state now exists, so it returns `true` too. A UNIQUE error
+/// is accepted only after re-reading this exact key; every other write failure,
+/// and a collision that did not leave this star row behind, remains an error.
 pub async fn toggle_star(db: &DatabaseConnection, user_id: i64, repo_id: i64) -> Result<bool> {
     // Check if already starred
     let existing = RepoStarEntity::find()
@@ -32,8 +38,17 @@ pub async fn toggle_star(db: &DatabaseConnection, user_id: i64, repo_id: i64) ->
             created_at: Set(now),
             ..Default::default()
         };
-        model.insert(db).await.context("db: insert star")?;
-        Ok(true)
+        match model.insert(db).await {
+            Ok(_) => Ok(true),
+            Err(error) if crate::is_unique_violation(&error) => {
+                if is_starred(db, user_id, repo_id).await? {
+                    Ok(true)
+                } else {
+                    Err(error).context("db: insert star")
+                }
+            }
+            Err(error) => Err(error).context("db: insert star"),
+        }
     }
 }
 
