@@ -434,15 +434,194 @@ async fn deactivating_an_account_revokes_its_outstanding_lfs_urls() {
     assert_eq!(forged.status(), 403);
 }
 
+/// Mint an upload URL for `owner/repo` as `token`, and hand back the href.
+///
+/// Six hours is the longest-lived capability this server issues, which is why
+/// the two tests below reach for the upload half rather than the download one.
+async fn upload_href(base: &str, owner: &str, repo: &str, token: &str, oid: &str, size: usize) -> String {
+    let response = batch(base, owner, repo, Some(token), "upload", oid, size).await;
+    assert_eq!(response.status(), 200);
+    let href = response.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
+        ["upload"]["href"]
+        .as_str()
+        .expect("an upload batch on a writable repository hands out an upload action")
+        .to_string();
+    assert!(
+        href.contains("actor=") && href.contains("session="),
+        "an authenticated issue must name the account *and* the session it was issued under: {href}"
+    );
+    href
+}
+
+/// Plant a reset token straight into the database — the raw value only ever
+/// leaves the server by email, which the test harness cannot read.
+async fn issue_reset_token(db: &rg_db::DatabaseConnection, user_id: i64, raw: &str) -> String {
+    let hash = hex::encode(Sha256::digest(raw.as_bytes()));
+    rg_db::ops::password_reset_token_ops::create(
+        db,
+        user_id,
+        &hash,
+        chrono::Utc::now() + chrono::Duration::minutes(15),
+    )
+    .await
+    .expect("create reset token");
+    raw.to_string()
+}
+
+/// Changing the password is what the owner of a stolen session does, and the
+/// capability that session already minted is the thing it has to reach.
+///
+/// The thief's JWT dies at the next request — `session_standing_middleware`
+/// compares its generation against the bumped column. The upload URL it minted
+/// presents no JWT at all, so before the generation was folded into the
+/// signature there was nothing to compare, and it stayed write access to the
+/// private repository for the rest of its six hours (card_c742da1794e4).
+#[tokio::test]
+async fn a_password_reset_revokes_the_lfs_urls_its_session_minted() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, user_id) = register_full(&base, "lfs_pw_reset", "lfs_pw_reset@example.com").await;
+    create_repo(&base, &token, "reset-lfs", true).await;
+    let content = b"written by a session that was stolen";
+    let oid = hex::encode(Sha256::digest(content));
+
+    let href = upload_href(&base, "lfs_pw_reset", "reset-lfs", &token, &oid, content.len()).await;
+
+    // Baseline in the same run and before the reset: a URL answering 401 proves
+    // nothing on its own, since a URL that never worked answers 401 too.
+    let before = reqwest::Client::new()
+        .put(&href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200);
+
+    let raw = issue_reset_token(&db, user_id, "raw-token-lfs-reset").await;
+    let reset = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/reset-password"))
+        .json(&serde_json::json!({ "token": raw, "new_password": "Nw9#pLqz" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200, "password reset failed");
+
+    let after = reqwest::Client::new()
+        .put(&href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "an upload URL minted before the password reset must stop working"
+    );
+}
+
+/// Logging out is the other act that ends a session while leaving the account
+/// entirely intact — the one performed on a machine the user is walking away
+/// from. The generation is a comparison and not a kill switch, so the session
+/// that logs in afterwards has to mint URLs that work.
+#[tokio::test]
+async fn a_logout_revokes_the_lfs_urls_its_session_minted_and_spares_the_next_one() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "lfs_logout", "lfs_logout@example.com").await;
+    create_repo(&base, &token, "logout-lfs", true).await;
+    let content = b"written by a session that was left behind";
+    let oid = hex::encode(Sha256::digest(content));
+
+    let href = upload_href(&base, "lfs_logout", "logout-lfs", &token, &oid, content.len()).await;
+    let before = reqwest::Client::new()
+        .put(&href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200);
+
+    let logout = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "logout failed");
+
+    let after = reqwest::Client::new()
+        .put(&href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "an upload URL minted before the logout must stop working"
+    );
+
+    // A fresh session on the same account: the bump must invalidate the
+    // generation it replaced, not the account's ability to mint. A second object
+    // is needed because the first one is already stored, and a batch for an
+    // object that is already there hands out no action at all.
+    let fresh = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/login"))
+        .json(&serde_json::json!({ "login": "lfs_logout", "password": "Qz7$wRtm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), 200, "login after logout failed");
+    let fresh = fresh.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .expect("a login without MFA returns its session token")
+        .to_string();
+
+    let next_content = b"written by the session that replaced it";
+    let next_oid = hex::encode(Sha256::digest(next_content));
+    let href = upload_href(
+        &base,
+        "lfs_logout",
+        "logout-lfs",
+        &fresh,
+        &next_oid,
+        next_content.len(),
+    )
+    .await;
+    let after_login = reqwest::Client::new()
+        .put(&href)
+        .body(next_content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_login.status(),
+        200,
+        "a URL minted by the session that replaced the logged-out one must work"
+    );
+}
+
 #[test]
 fn lfs_action_signature_rejects_tampering_and_expiry() {
     use rg_core::lfs::service::{
-        sign_action_url, verify_action_url, LfsActionKind, LfsActionSignatureError,
+        sign_action_url, verify_action_url, LfsActionKind, LfsActionSignatureError, LfsActor,
+    };
+
+    let actor = |user_id, session_version| {
+        Some(LfsActor {
+            user_id,
+            session_version,
+        })
     };
 
     let oid = "b".repeat(64);
     let expires = 2_000_000_000;
-    let signature = sign_action_url(b"secret", LfsActionKind::Upload, 7, &oid, expires, Some(42));
+    let signature = sign_action_url(
+        b"secret",
+        LfsActionKind::Upload,
+        7,
+        &oid,
+        expires,
+        actor(42, 3),
+    );
     assert_eq!(
         verify_action_url(
             b"secret",
@@ -450,7 +629,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
-            Some(42),
+            actor(42, 3),
             &signature,
             expires - 1,
         ),
@@ -463,7 +642,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
-            Some(42),
+            actor(42, 3),
             &signature,
             expires - 1,
         ),
@@ -476,7 +655,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             8,
             &oid,
             expires,
-            Some(42),
+            actor(42, 3),
             &signature,
             expires - 1,
         ),
@@ -492,7 +671,24 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
-            Some(43),
+            actor(43, 3),
+            &signature,
+            expires - 1,
+        ),
+        Err(LfsActionSignatureError::Invalid)
+    );
+    // Re-pointing it at another *generation* of the same account is the same
+    // forgery: the generation is what a redemption compares against, so a URL
+    // that could carry a fresher one than it was minted with would survive the
+    // logout it is supposed to die with.
+    assert_eq!(
+        verify_action_url(
+            b"secret",
+            LfsActionKind::Upload,
+            7,
+            &oid,
+            expires,
+            actor(42, 4),
             &signature,
             expires - 1,
         ),
@@ -520,7 +716,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
             7,
             &oid,
             expires,
-            Some(42),
+            actor(42, 3),
             &signature,
             expires,
         ),

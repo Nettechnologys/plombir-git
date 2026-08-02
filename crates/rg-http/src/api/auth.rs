@@ -83,13 +83,26 @@ fn extract_token_from_cookie(headers: &HeaderMap) -> Option<String> {
 /// CI job tokens are intentionally rejected — use `extract_ci_or_user_id` for
 /// repository-scoped operations during CI job execution.
 pub(crate) fn extract_user_id(headers: &HeaderMap, jwt_secret: &str) -> Option<i64> {
+    extract_user_session(headers, jwt_secret).map(|(user_id, _)| user_id)
+}
+
+/// The account this request's credentials name, *and* the session generation
+/// they were minted under.
+///
+/// [`extract_user_id`] is this reading with the generation thrown away, which is
+/// all most callers need: they are behind
+/// [`session_standing_middleware`], which has already refused any request
+/// carrying an older generation. The exception is a caller that mints something
+/// outliving the request — a presigned LFS action URL is redeemed hours later,
+/// by a request that presents no session at all, so the generation has to be
+/// carried into the capability for the redeeming side to have anything to
+/// compare (card_c742da1794e4).
+pub(crate) fn extract_user_session(headers: &HeaderMap, jwt_secret: &str) -> Option<(i64, i64)> {
     // M-4: Check HttpOnly cookie first, then fall back to Bearer header
-    if let Some(token) = extract_token_from_cookie(headers) {
-        if let Some(claims) = rg_core::auth::jwt::validate_token(&token, jwt_secret) {
-            return claims.sub.parse::<i64>().ok();
-        }
-    }
-    extract_bearer_claims(headers, jwt_secret).and_then(|c| c.sub.parse::<i64>().ok())
+    let claims = extract_token_from_cookie(headers)
+        .and_then(|token| rg_core::auth::jwt::validate_token(&token, jwt_secret))
+        .or_else(|| extract_bearer_claims(headers, jwt_secret))?;
+    Some((claims.sub.parse::<i64>().ok()?, claims.session_version))
 }
 
 /// Extract and validate the Bearer JWT Claims from the Authorization header.

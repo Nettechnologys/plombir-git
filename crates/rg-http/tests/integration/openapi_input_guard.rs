@@ -99,12 +99,12 @@ async fn handler_inputs_reach_the_published_openapi_document() {
         (
             "put",
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            &["actor", "expires", "signature"][..],
+            &["actor", "expires", "session", "signature"][..],
         ),
         (
             "get",
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            &["actor", "expires", "signature"][..],
+            &["actor", "expires", "session", "signature"][..],
         ),
         (
             "post",

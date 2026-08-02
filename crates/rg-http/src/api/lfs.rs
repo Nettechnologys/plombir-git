@@ -28,6 +28,12 @@ pub struct LfsActionQuery {
     /// recomputed over it. It is covered by the HMAC, so neither editing nor
     /// dropping it produces a URL that verifies.
     actor: Option<i64>,
+    /// The `users.session_version` the issuing session held. Covered by the
+    /// HMAC like `actor`, and echoed for the same reason — with the difference
+    /// that this one is also the thing [`signer_still_stands`] compares against
+    /// the account's current generation, which is how a revoked session stops
+    /// being able to redeem what it minted.
+    session: Option<i64>,
 }
 
 /// One actionable error for a filesystem failure on an LFS object path.
@@ -44,29 +50,46 @@ fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) ->
     ))
 }
 
-/// Does the account a signed URL was issued to still stand?
+/// Does the session a signed URL was issued under still stand?
 ///
-/// This is [`crate::api::auth::session_standing_middleware`]'s question, asked
-/// again here because the middleware cannot ask it: a presigned URL carries no
-/// session for it to read — that is the entire point of the shape, and the
-/// price is that the capability answers for itself for as long as it lives.
-/// Deactivating an account therefore left up to six hours of write access to a
-/// private repository standing, which is the same distance between "revoked"
-/// and "revoked, eventually" that the middleware was built to close.
+/// This is [`crate::api::auth::session_standing_middleware`]'s question — both
+/// halves of it — asked again here because the middleware cannot ask it: a
+/// presigned URL carries no session for it to read. That is the entire point of
+/// the shape, and the price is that the capability answers for itself for as
+/// long as it lives. Deactivating an account therefore left up to six hours of
+/// write access to a private repository standing, which is the same distance
+/// between "revoked" and "revoked, eventually" that the middleware was built to
+/// close.
+///
+/// Both halves, because the account outliving its session is the *normal* case
+/// for the two acts a user performs on purpose: a password reset and a
+/// `POST /users/logout` leave `is_usable()` true and bump
+/// `users.session_version` instead. A check reading only the first was blind to
+/// exactly the scenario the reset exists for — the owner changes their password
+/// *because* the session was stolen, the thief's JWT dies at once, and the
+/// upload URL that session already minted stayed write access to the private
+/// repository for the rest of its six hours (card_c742da1794e4).
 ///
 /// Fails closed and keeps the two answers apart: `401` for an account that is
-/// gone or disabled, `503` for a database that could not be asked — a client
-/// is right to retry the second and wrong to retry the first.
-async fn signer_still_stands(state: &AppState, user_id: i64) -> Result<(), AppError> {
+/// gone or disabled or a session that has been revoked, `503` for a database
+/// that could not be asked — a client is right to retry the second and wrong to
+/// retry the first.
+async fn signer_still_stands(
+    state: &AppState,
+    actor: rg_core::lfs::service::LfsActor,
+) -> Result<(), AppError> {
+    let user_id = actor.user_id;
     match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
-        Ok(Some(user)) if user.is_usable() => Ok(()),
+        Ok(Some(user)) if user.is_usable() && user.session_version == actor.session_version => {
+            Ok(())
+        }
         Ok(_) => {
             tracing::warn!(
                 user_id,
-                "rejecting signed LFS action URL: account is disabled or gone"
+                "rejecting signed LFS action URL: account is disabled or gone, or its session was revoked"
             );
             Err(AppError::unauthorized(
-                "LFS action URL belongs to a disabled account",
+                "LFS action URL belongs to a disabled account or a revoked session",
             ))
         }
         Err(error) => {
@@ -92,7 +115,8 @@ async fn signer_still_stands(state: &AppState, user_id: i64) -> Result<(), AppEr
 /// "Honoured" is three questions, not one, and the URL used to answer only the
 /// first two. A signature proves the server issued this capability and that it
 /// has not expired. [`signer_still_stands`] proves the account behind it is
-/// still an account. Neither says anything about *access to this repository*,
+/// still an account, and that the session it was minted under has not been
+/// ended. Neither says anything about *access to this repository*,
 /// and that is the thing a signed URL most obviously outlives: drop a
 /// collaborator and their download URLs keep working for the rest of the hour
 /// and their upload URLs for the rest of the six. The account is untouched
@@ -124,26 +148,28 @@ async fn authorize_signed_action(
     match (&query.expires, &query.signature) {
         (None, None) => Ok(false),
         (Some(expires), Some(signature)) => {
+            let signed_actor = signed_actor(query)?;
             match rg_core::lfs::service::verify_action_url(
                 state.jwt_secret.as_bytes(),
                 action,
                 repo_model.id,
                 oid,
                 *expires,
-                query.actor,
+                signed_actor,
                 signature,
                 chrono::Utc::now().timestamp(),
             ) {
                 Ok(()) => {
-                    if let Some(user_id) = query.actor {
-                        signer_still_stands(state, user_id).await?;
+                    if let Some(actor) = signed_actor {
+                        signer_still_stands(state, actor).await?;
                     }
+                    let actor_id = signed_actor.map(|actor| actor.user_id);
                     match action {
                         rg_core::lfs::service::LfsActionKind::Download => {
-                            repo_access::check_read_for(state, repo_model, query.actor).await?
+                            repo_access::check_read_for(state, repo_model, actor_id).await?
                         }
                         rg_core::lfs::service::LfsActionKind::Upload => {
-                            repo_access::check_write_for(state, repo_model, query.actor).await?
+                            repo_access::check_write_for(state, repo_model, actor_id).await?
                         }
                     }
                     Ok(true)
@@ -169,6 +195,44 @@ async fn authorize_signed_action(
 /// all, and only the gate knows that.
 fn actor_id(headers: &HeaderMap, state: &AppState) -> Option<i64> {
     crate::api::auth::extract_user_id(headers, &state.jwt_secret)
+}
+
+/// The caller a signed URL would be *issued* to: the account, plus the session
+/// generation the credentials it is asking with were minted under.
+///
+/// The generation is bound into the signature so that redeeming the URL can ask
+/// whether that session is still current. It is read from the presented JWT
+/// rather than from the database on purpose: the capability inherits the
+/// standing of the session that asked for it, and that session has already been
+/// through `session_standing_middleware` on this very request.
+fn issuing_actor(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<rg_core::lfs::service::LfsActor> {
+    crate::api::auth::extract_user_session(headers, &state.jwt_secret).map(
+        |(user_id, session_version)| rg_core::lfs::service::LfsActor {
+            user_id,
+            session_version,
+        },
+    )
+}
+
+/// The actor a presented URL claims to have been issued to.
+///
+/// `actor` and `session` are one value split across two query parameters, and
+/// both are covered by the HMAC — so a half-present pair is not a URL this
+/// server ever minted, and saying so plainly beats letting it fall through to a
+/// signature mismatch. A URL signed before the generation was folded in
+/// (`forgekeep-lfs-v2`) lands here too, which is the intended end for it.
+fn signed_actor(query: &LfsActionQuery) -> Result<Option<rg_core::lfs::service::LfsActor>, AppError> {
+    match (query.actor, query.session) {
+        (None, None) => Ok(None),
+        (Some(user_id), Some(session_version)) => Ok(Some(rg_core::lfs::service::LfsActor {
+            user_id,
+            session_version,
+        })),
+        _ => Err(AppError::forbidden("incomplete LFS action URL signature")),
+    }
 }
 
 /// LFS batch API: POST /repos/:owner/:name/lfs/objects/batch
@@ -222,7 +286,8 @@ pub async fn batch(
     // a private repository used to be turned away by the *credential* helper
     // rather than by the gate, which happened to produce the same 401 without
     // anything guaranteeing it would.
-    let actor_id = actor_id(&headers, &state);
+    let actor = issuing_actor(&headers, &state);
+    let actor_id = actor.map(|actor| actor.user_id);
     let decision = if req.operation == "upload" {
         repo_access::check_write_for(&state, &repo_model, actor_id).await
     } else {
@@ -259,7 +324,7 @@ pub async fn batch(
         &repo,
         &req,
         state.jwt_secret.as_bytes(),
-        actor_id,
+        actor,
     )
     .await
     {

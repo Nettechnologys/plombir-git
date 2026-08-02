@@ -71,43 +71,72 @@ pub enum LfsActionSignatureError {
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The account a signed URL is issued to, and the session generation it was
+/// issued under.
+///
+/// The two travel as one value because an id on its own can only ask half of the
+/// revocation question at redemption time. Re-reading the account catches a
+/// deactivation, but a password reset and a `POST /users/logout` leave
+/// `is_usable()` true and bump `users.session_version` instead — so a capability
+/// carrying only the id had nothing to compare against, and an upload URL minted
+/// by a stolen session stayed write access to a private repository for the rest
+/// of its six hours (card_c742da1794e4). Same shape, same fix as the WebSocket
+/// half of this class (`rg_http::api::auth::WsSessionUser`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LfsActor {
+    pub user_id: i64,
+    /// The `users.session_version` the issuing session was authenticated under.
+    pub session_version: i64,
+}
+
 /// How the actor a signed URL was issued to is rendered into the signed
-/// payload — and, for an authenticated one, into the URL itself as `actor=`.
+/// payload — and, for an authenticated one, into the URL itself as
+/// `actor=`/`session=`.
 ///
 /// An anonymous issue is a distinct value rather than an empty one, so
 /// dropping `actor=` from an authenticated URL changes the payload instead of
 /// reproducing it.
-fn actor_token(actor_id: Option<i64>) -> String {
-    match actor_id {
-        Some(id) => id.to_string(),
+fn actor_token(actor: Option<LfsActor>) -> String {
+    match actor {
+        Some(actor) => format!("{}@{}", actor.user_id, actor.session_version),
         None => "anon".to_string(),
     }
 }
 
+/// The signed payload. The `v3` generation is what folded the issuing session
+/// into the signature; URLs minted under `v2` carry no generation and therefore
+/// stop verifying, which for a revocation fix is the desired direction.
 fn action_signature_payload(
     action: LfsActionKind,
     repo_id: i64,
     oid: &str,
     expires_at: i64,
-    actor_id: Option<i64>,
+    actor: Option<LfsActor>,
 ) -> String {
     format!(
-        "forgekeep-lfs-v2:{}:{}:{}:{}:{}",
+        "forgekeep-lfs-v3:{}:{}:{}:{}:{}",
         action.as_str(),
         repo_id,
         oid,
         expires_at,
-        actor_token(actor_id)
+        actor_token(actor)
     )
 }
 
 /// Append the actor a signed URL was issued to, when there was one.
 ///
+/// Both halves are echoed, because both are covered by the HMAC and the
+/// redeeming side needs them to recompute it — and needs the generation on its
+/// own to answer "is this the session that is still allowed to act?".
+///
 /// Anonymous issues carry nothing: there is no account behind them to re-check,
 /// and `anon` is already what the signature covers.
-pub fn action_url_actor_param(actor_id: Option<i64>) -> String {
-    match actor_id {
-        Some(id) => format!("&actor={id}"),
+pub fn action_url_actor_param(actor: Option<LfsActor>) -> String {
+    match actor {
+        Some(actor) => format!(
+            "&actor={}&session={}",
+            actor.user_id, actor.session_version
+        ),
         None => String::new(),
     }
 }
@@ -122,11 +151,11 @@ pub fn sign_action_url(
     repo_id: i64,
     oid: &str,
     expires_at: i64,
-    actor_id: Option<i64>,
+    actor: Option<LfsActor>,
 ) -> String {
     let mut mac = HmacSha256::new_from_slice(secret)
         .expect("HMAC-SHA256 accepts keys of any non-negative length");
-    mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor_id).as_bytes());
+    mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor).as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -134,9 +163,10 @@ pub fn sign_action_url(
 /// Supplying `now` keeps expiry behavior deterministic in tests.
 ///
 /// Verifying the signature answers "this URL was issued by us, for this action,
-/// on this object, to this actor" — and nothing beyond that. Whether the actor
-/// may *still* act is the caller's question; see
-/// `rg_http::api::lfs::verify_signed_action`.
+/// on this object, to this actor, under this session" — and nothing beyond that.
+/// Whether the actor may *still* act, and whether that session is still the
+/// current one, is the caller's question; see
+/// `rg_http::api::lfs::authorize_signed_action`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_action_url(
     secret: &[u8],
@@ -144,7 +174,7 @@ pub fn verify_action_url(
     repo_id: i64,
     oid: &str,
     expires_at: i64,
-    actor_id: Option<i64>,
+    actor: Option<LfsActor>,
     signature: &str,
     now: i64,
 ) -> std::result::Result<(), LfsActionSignatureError> {
@@ -154,7 +184,7 @@ pub fn verify_action_url(
     let signature = hex::decode(signature).map_err(|_| LfsActionSignatureError::Invalid)?;
     let mut mac = HmacSha256::new_from_slice(secret)
         .expect("HMAC-SHA256 accepts keys of any non-negative length");
-    mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor_id).as_bytes());
+    mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor).as_bytes());
     mac.verify_slice(&signature)
         .map_err(|_| LfsActionSignatureError::Invalid)
 }
@@ -262,7 +292,7 @@ pub async fn batch(
     repo: &str,
     req: &LfsBatchRequest,
     signing_secret: &[u8],
-    actor_id: Option<i64>,
+    actor: Option<LfsActor>,
 ) -> Result<LfsBatchResponse> {
     let transfer = req
         .transfers
@@ -302,7 +332,7 @@ pub async fn batch(
                             oid,
                             size,
                             signing_secret,
-                            actor_id,
+                            actor,
                         )
                         .await
                     }
@@ -317,7 +347,7 @@ pub async fn batch(
                             oid,
                             size,
                             signing_secret,
-                            actor_id,
+                            actor,
                         )
                         .await
                     }
@@ -355,7 +385,7 @@ async fn handle_upload(
     oid: &str,
     size: i64,
     signing_secret: &[u8],
-    actor_id: Option<i64>,
+    actor: Option<LfsActor>,
 ) -> Result<LfsObjectResponse> {
     // Check if object already exists
     let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
@@ -404,7 +434,7 @@ async fn handle_upload(
         repo_id,
         oid,
         expires_at,
-        actor_id,
+        actor,
     );
     let upload_href = format!(
         "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
@@ -414,7 +444,7 @@ async fn handle_upload(
         oid,
         expires_at,
         signature,
-        action_url_actor_param(actor_id)
+        action_url_actor_param(actor)
     );
 
     Ok(LfsObjectResponse {
@@ -443,7 +473,7 @@ async fn handle_download(
     oid: &str,
     size: i64,
     signing_secret: &[u8],
-    actor_id: Option<i64>,
+    actor: Option<LfsActor>,
 ) -> Result<LfsObjectResponse> {
     let Some(existing) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? else {
         return Ok(LfsObjectResponse {
@@ -476,7 +506,7 @@ async fn handle_download(
         repo_id,
         oid,
         expires_at,
-        actor_id,
+        actor,
     );
     let download_href = format!(
         "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
@@ -486,7 +516,7 @@ async fn handle_download(
         oid,
         expires_at,
         signature,
-        action_url_actor_param(actor_id)
+        action_url_actor_param(actor)
     );
 
     Ok(LfsObjectResponse {
