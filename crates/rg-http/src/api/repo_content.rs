@@ -255,6 +255,8 @@ fn is_empty_repo(repo_path: &std::path::Path) -> bool {
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Repository or ref not found", body = serde_json::Value),
+        (status = 500, description = "Repository storage or commit history could not be read", body = serde_json::Value),
     ),
 )]
 pub async fn get_blob(
@@ -304,7 +306,10 @@ pub async fn get_blob(
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
+        (status = 400, description = "Invalid repository path or ambiguous ref", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Repository or ref not found", body = serde_json::Value),
+        (status = 500, description = "Repository storage or commit history could not be read", body = serde_json::Value),
     ),
 )]
 pub async fn get_log(
@@ -910,6 +915,10 @@ fn get_commit_log(
         )
     })?;
 
+    // A commit log is a snapshot: returning the readable prefix after any
+    // traversal or decoding failure is indistinguishable from healthy history.
+    // Keep the repository/ref/object context for the server log, but fail the
+    // whole request so the client receives a sanitized 5xx instead of a lie.
     // Use rev_walk to traverse commit history.
     let walk = repo.rev_walk([head_id]);
     let walk_iter = walk.all().with_context(|| {
@@ -919,122 +928,89 @@ fn get_commit_log(
             repo_path.display()
         )
     })?;
-    let mut count = 0;
-    for info in walk_iter {
+    let limit = usize::try_from(limit).unwrap_or_default();
+    for (count, info) in walk_iter.enumerate() {
         if count >= limit {
             break;
         }
 
-        let info = match info {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = "<unknown>",
-                    error = %format!("{e:#}"),
-                    "skipping unreadable commit-log entry"
-                );
-                continue;
-            }
-        };
+        let info = info.with_context(|| {
+            format!(
+                "reading commit-log entry for ref '{}' in {}",
+                git_ref,
+                repo_path.display()
+            )
+        })?;
 
         let commit_id = info.id;
-        let object = match repo.find_object(commit_id) {
-            Ok(object) => object,
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = %commit_id,
-                    error = %format!("{e:#}"),
-                    "skipping commit whose object cannot be read"
-                );
-                continue;
-            }
-        };
+        let object = repo.find_object(commit_id).with_context(|| {
+            format!(
+                "reading commit '{}' while walking ref '{}' in {}",
+                commit_id,
+                git_ref,
+                repo_path.display()
+            )
+        })?;
 
-        let commit = match object.try_into_commit() {
-            Ok(commit) => commit,
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = %commit_id,
-                    error = %format!("{e:#}"),
-                    "skipping non-commit object in commit history"
-                );
-                continue;
-            }
-        };
+        let commit = object.try_into_commit().with_context(|| {
+            format!(
+                "decoding commit '{}' while walking ref '{}' in {}",
+                commit_id,
+                git_ref,
+                repo_path.display()
+            )
+        })?;
 
-        // A malformed commit must not silently degrade into empty author,
-        // message, or timestamp fields. Keep the listing best-effort, but make
-        // every omitted commit observable with repository/ref/object context.
-        let message = match commit.message_raw() {
-            Ok(message) => message.to_string(),
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = %commit_id,
-                    error = %format!("{e:#}"),
-                    "skipping commit whose message cannot be decoded"
-                );
-                continue;
-            }
-        };
+        let message = commit
+            .message_raw()
+            .with_context(|| {
+                format!(
+                    "decoding message for commit '{}' while walking ref '{}' in {}",
+                    commit_id,
+                    git_ref,
+                    repo_path.display()
+                )
+            })?
+            .to_string();
         let first_line = message.lines().next().unwrap_or("").to_string();
 
-        let author = match commit.author() {
-            Ok(author) => author,
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = %commit_id,
-                    error = %format!("{e:#}"),
-                    "skipping commit whose author cannot be decoded"
-                );
-                continue;
-            }
-        };
+        let author = commit.author().with_context(|| {
+            format!(
+                "decoding author for commit '{}' while walking ref '{}' in {}",
+                commit_id,
+                git_ref,
+                repo_path.display()
+            )
+        })?;
         let author_name = String::from_utf8_lossy(author.name).to_string();
         let author_email = String::from_utf8_lossy(author.email).to_string();
         // Parse author time from the signature string (format: "timestamp offset")
         // e.g., "1700000000 +0000"
-        let timestamp = match author
+        let timestamp = author
             .time
             .split_whitespace()
             .next()
             .unwrap_or("")
             .parse::<i64>()
-        {
-            Ok(timestamp) => timestamp,
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = %commit_id,
-                    error = %e,
-                    "skipping commit whose author timestamp is invalid"
-                );
-                continue;
-            }
-        };
-        let author_date = match chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0) {
-            Some(author_date) => author_date.to_rfc3339(),
-            None => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = %git_ref,
-                    commit = %commit_id,
+            .with_context(|| {
+                format!(
+                    "parsing author timestamp for commit '{}' while walking ref '{}' in {}",
+                    commit_id,
+                    git_ref,
+                    repo_path.display()
+                )
+            })?;
+        let author_date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "author timestamp {} is out of range for commit '{}' while walking ref '{}' in {}",
                     timestamp,
-                    "skipping commit whose author timestamp is out of range"
-                );
-                continue;
-            }
-        };
+                    commit_id,
+                    git_ref,
+                    repo_path.display()
+                )
+            })?
+            .to_rfc3339();
 
         entries.push(CommitEntry {
             sha: commit_id.to_string(),
@@ -1044,8 +1020,6 @@ fn get_commit_log(
             message: first_line,
             gpg_signature: None,
         });
-
-        count += 1;
     }
 
     Ok(entries)
@@ -1573,11 +1547,7 @@ fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Write as _,
-        process::Command,
-        sync::{Arc, Mutex},
-    };
+    use std::{io::Write as _, process::Command};
 
     use axum::response::IntoResponse;
     use rg_git::cli_gateway::GitOutput;
@@ -1586,45 +1556,6 @@ mod tests {
         get_commit_log, gpg_signature_from_output, is_empty_repo, list_branch_names,
         list_tag_names, list_tree_entries, AppError,
     };
-
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
-        type Writer = CapturedLogs;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_warnings() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (logs, guard)
-    }
 
     fn overwrite_loose_object(repo_path: &std::path::Path, oid: &str, kind: &str, data: &[u8]) {
         let object_path = repo_path.join("objects").join(&oid[..2]).join(&oid[2..]);
@@ -1827,11 +1758,10 @@ mod tests {
         );
     }
 
-    /// The rev-walk policy is deliberately best-effort: one missing object does
-    /// not hide every readable commit. But an empty/partial list without a log
-    /// is indistinguishable from healthy history, which was the original bug.
+    /// A reachable parent that cannot be read makes the commit log incomplete.
+    /// It must fail rather than looking like a shorter healthy history.
     #[test]
-    fn an_unreadable_commit_is_skipped_with_repository_and_ref_context() {
+    fn an_unreadable_commit_fails_with_repository_ref_and_object_context() {
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("broken-history");
         let git = |args: &[&str]| {
@@ -1868,23 +1798,22 @@ mod tests {
         )
         .expect("the parent commit must be a loose object");
 
-        let (logs, _guard) = capture_warnings();
-        let commits = get_commit_log(&repo_path, "HEAD", "", 50)
-            .expect("per-commit corruption stays best-effort");
-        assert_eq!(commits.len(), 1, "the readable HEAD commit must survive");
-
-        let rendered = logs.text();
+        let error = match get_commit_log(&repo_path, "HEAD", "", 50) {
+            Ok(_) => panic!("a reachable unreadable commit must fail the complete history read"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
         assert!(
             rendered.contains(&repo_path.display().to_string()),
-            "warning must name the repository: {rendered}"
+            "error must name the repository: {rendered}"
         );
         assert!(
-            rendered.contains("git_ref") && rendered.contains("HEAD"),
-            "warning must name the requested ref: {rendered}"
+            rendered.contains("ref 'HEAD'"),
+            "error must name the requested ref: {rendered}"
         );
         assert!(
             rendered.contains(&missing_commit),
-            "warning must name the unreadable object: {rendered}"
+            "error must name the unreadable object: {rendered}"
         );
     }
 

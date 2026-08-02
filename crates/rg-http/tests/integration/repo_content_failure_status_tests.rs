@@ -213,15 +213,29 @@ async fn a_corrupt_signature_commit_object_is_a_server_error() {
 /// Put a file through the contents API so the repository has a commit — the
 /// tree endpoint answers `200 {entries: []}` on an unborn HEAD (the empty-repo
 /// path), so a freshly created repo would never reach the arms under test.
-async fn commit_a_file(client: &reqwest::Client, base: &str, token: &str, owner: &str, repo: &str) {
+struct CommitFile<'a> {
+    path: &'a str,
+    content: &'a str,
+    message: &'a str,
+}
+
+async fn commit_file(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    file: CommitFile<'_>,
+) {
     let resp = client
         .post(format!(
-            "{base}/api/v1/repos/{owner}/{repo}/contents/README.md"
+            "{base}/api/v1/repos/{owner}/{repo}/contents/{}",
+            file.path
         ))
         .bearer_auth(token)
         .json(&serde_json::json!({
-            "content": "# hello\n",
-            "message": "add README.md",
+            "content": file.content,
+            "message": file.message,
         }))
         .send()
         .await
@@ -232,6 +246,22 @@ async fn commit_a_file(client: &reqwest::Client, base: &str, token: &str, owner:
         "the fixture needs a commit: {}",
         resp.text().await.unwrap_or_default()
     );
+}
+
+async fn commit_a_file(client: &reqwest::Client, base: &str, token: &str, owner: &str, repo: &str) {
+    commit_file(
+        client,
+        base,
+        token,
+        owner,
+        repo,
+        CommitFile {
+            path: "README.md",
+            content: "# hello\n",
+            message: "add README.md",
+        },
+    )
+    .await;
 }
 
 /// card_784afeaf9603, the mirror of the bug above: on `GET .../tree` nothing
@@ -574,6 +604,83 @@ async fn a_log_ref_with_a_missing_target_commit_is_a_server_error() {
         status.is_server_error(),
         "a missing target object is a server failure, not missing ref or empty history: \
          {status} (body: {body})"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+}
+
+/// The target commit can be intact while a reachable parent disappears. A
+/// best-effort rev-walk used to return the target alone as a normal successful
+/// list, so clients had no way to tell a damaged history from a one-commit repo.
+#[tokio::test]
+async fn a_log_with_an_unreadable_reachable_parent_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "logparent-owner", "logparent@example.com").await;
+    create_repo(&base, &token, "logparent-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "logparent-owner", "logparent-repo").await;
+    commit_file(
+        &client,
+        &base,
+        &token,
+        "logparent-owner",
+        "logparent-repo",
+        CommitFile {
+            path: "SECOND.md",
+            content: "second\n",
+            message: "add SECOND.md",
+        },
+    )
+    .await;
+
+    let url = format!("{base}/api/v1/repos/logparent-owner/logparent-repo/log");
+    let healthy = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("healthy request");
+    assert_eq!(
+        healthy.status(),
+        200,
+        "the fixture must expose both commits before corruption"
+    );
+    let healthy: serde_json::Value = healthy.json().await.expect("healthy JSON");
+    let commits = healthy["commits"]
+        .as_array()
+        .expect("healthy log response must contain commits");
+    assert_eq!(
+        commits.len(),
+        2,
+        "fixture must create a reachable parent: {healthy}"
+    );
+    let parent_id = commits[1]["sha"]
+        .as_str()
+        .expect("second listed commit must have a SHA")
+        .to_string();
+
+    let bare = repo_root.join("logparent-owner/logparent-repo.git");
+    remove_loose_object(&bare, &parent_id);
+    let repo = gix::open(&bare).expect("repository must remain open after parent removal");
+    assert!(
+        repo.find_object(
+            gix::ObjectId::from_hex(parent_id.as_bytes())
+                .expect("fixture parent must have a full object id"),
+        )
+        .is_err(),
+        "fixture must fail only when gix reads the reachable parent"
+    );
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    assert!(
+        status.is_server_error(),
+        "an unreadable reachable parent must not produce a partial 200: {status} (body: {body})"
     );
     assert_no_internal_detail(&body, &repo_root);
 }

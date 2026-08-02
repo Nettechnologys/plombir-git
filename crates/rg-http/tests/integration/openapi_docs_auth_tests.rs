@@ -63,6 +63,34 @@ async fn api_docs_openapi_accepts_jwt_and_pat() {
         .starts_with("application/json"));
 }
 
+/// A complete commit history is either returned as a snapshot or rejected.
+/// Keep the documented client and storage failures alongside that live contract
+/// so a response annotation cannot accidentally land on a neighbouring handler.
+#[tokio::test]
+async fn commit_log_openapi_documents_client_and_storage_outcomes() {
+    let base = spawn_test_app().await;
+    let jwt = register_user(&base, "logdocs", "logdocs@example.com", "Qz7$wRtm").await;
+    let client = reqwest::Client::new();
+
+    let spec: serde_json::Value = client
+        .get(format!("{}/api-docs/openapi.json", base))
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let responses = &spec["paths"]["/repos/{owner}/{name}/log"]["get"]["responses"];
+
+    for status in ["400", "404", "500"] {
+        assert!(
+            responses[status].is_object(),
+            "the published commit-log contract must document HTTP {status}: {responses}"
+        );
+    }
+}
+
 /// card_fb094ba6d323: the docs gate used to read `Authorization: Bearer` and
 /// nothing else.
 ///
