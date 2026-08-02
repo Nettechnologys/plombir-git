@@ -31,17 +31,15 @@ async fn fresh_db(dir: &std::path::Path) -> sea_orm::DatabaseConnection {
 async fn wiki_fixture(
     dir: &std::path::Path,
     name: &str,
-) -> (sea_orm::DatabaseConnection, rg_db::entities::repository::Model) {
+) -> (
+    sea_orm::DatabaseConnection,
+    rg_db::entities::repository::Model,
+) {
     let db = fresh_db(dir).await;
-    let owner = rg_db::ops::user_ops::create_user(
-        &db,
-        name,
-        &format!("{name}@example.invalid"),
-        "",
-        name,
-    )
-    .await
-    .unwrap_or_else(|error| panic!("create user {name}: {error:#}"));
+    let owner =
+        rg_db::ops::user_ops::create_user(&db, name, &format!("{name}@example.invalid"), "", name)
+            .await
+            .unwrap_or_else(|error| panic!("create user {name}: {error:#}"));
 
     let repo = rg_core::repo::service::create_repo(
         &db,

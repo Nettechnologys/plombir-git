@@ -21,7 +21,9 @@
 //! * **The claim is not vacuous**: an ordinary first assignment still lands.
 
 use rg_db::entities::repository;
-use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, NotSet, Set, Statement};
+use rg_db::sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, NotSet, Set, Statement,
+};
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
 struct TempDb {
@@ -232,11 +234,16 @@ async fn a_first_claim_lands_and_a_canceled_job_is_never_claimed() {
 
     // A fresh pending job, canceled before anyone claims it.
     let (canceled_id, canceled_runners) = fixture(&db, "canceled", 1).await;
-    assert!(
-        rg_db::ops::pipeline_ops::settle_job_if_active(&db, canceled_id, "canceled", None, None, None)
-            .await
-            .expect("cancel the job"),
-    );
+    assert!(rg_db::ops::pipeline_ops::settle_job_if_active(
+        &db,
+        canceled_id,
+        "canceled",
+        None,
+        None,
+        None
+    )
+    .await
+    .expect("cancel the job"),);
     assert!(
         !rg_db::ops::pipeline_ops::assign_job(&db, canceled_id, canceled_runners[0])
             .await

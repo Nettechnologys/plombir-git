@@ -205,10 +205,7 @@ fn actor_id(headers: &HeaderMap, state: &AppState) -> Option<i64> {
 /// rather than from the database on purpose: the capability inherits the
 /// standing of the session that asked for it, and that session has already been
 /// through `session_standing_middleware` on this very request.
-fn issuing_actor(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Option<rg_core::lfs::service::LfsActor> {
+fn issuing_actor(headers: &HeaderMap, state: &AppState) -> Option<rg_core::lfs::service::LfsActor> {
     crate::api::auth::extract_user_session(headers, &state.jwt_secret).map(
         |(user_id, session_version)| rg_core::lfs::service::LfsActor {
             user_id,
@@ -224,7 +221,9 @@ fn issuing_actor(
 /// server ever minted, and saying so plainly beats letting it fall through to a
 /// signature mismatch. A URL signed before the generation was folded in
 /// (`forgekeep-lfs-v2`) lands here too, which is the intended end for it.
-fn signed_actor(query: &LfsActionQuery) -> Result<Option<rg_core::lfs::service::LfsActor>, AppError> {
+fn signed_actor(
+    query: &LfsActionQuery,
+) -> Result<Option<rg_core::lfs::service::LfsActor>, AppError> {
     match (query.actor, query.session) {
         (None, None) => Ok(None),
         (Some(user_id), Some(session_version)) => Ok(Some(rg_core::lfs::service::LfsActor {

@@ -133,10 +133,7 @@ fn action_signature_payload(
 /// and `anon` is already what the signature covers.
 pub fn action_url_actor_param(actor: Option<LfsActor>) -> String {
     match actor {
-        Some(actor) => format!(
-            "&actor={}&session={}",
-            actor.user_id, actor.session_version
-        ),
+        Some(actor) => format!("&actor={}&session={}", actor.user_id, actor.session_version),
         None => String::new(),
     }
 }

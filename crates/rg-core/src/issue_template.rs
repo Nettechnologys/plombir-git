@@ -494,10 +494,7 @@ mod tests {
         let undecodable = std::ffi::OsStr::from_bytes(b"br\xffken.md");
         std::fs::write(template_directory.join(undecodable), "# Broken name\n").unwrap();
 
-        for arguments in [
-            vec!["add", "-A"],
-            vec!["commit", "-qm", "templates"],
-        ] {
+        for arguments in [vec!["add", "-A"], vec!["commit", "-qm", "templates"]] {
             git.run_or_bail(&arguments, Some(&repository)).unwrap();
         }
 

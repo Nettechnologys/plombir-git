@@ -133,7 +133,10 @@ async fn concurrent_mirror_registrations_leave_one_row_and_one_caller_conflict()
     }
 
     assert_eq!(created, 1, "exactly one attempt may register the mirror");
-    assert_eq!(refused, 7, "every other attempt must be answered, not dropped");
+    assert_eq!(
+        refused, 7,
+        "every other attempt must be answered, not dropped"
+    );
     assert_eq!(
         mirror_rows(&db, repo_id).await,
         1,

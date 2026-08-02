@@ -128,5 +128,8 @@ async fn concurrent_ssh_key_revocations_confirm_exactly_one_deletion() {
         .unwrap();
     assert_eq!(listed.status(), 200);
     let listed: Vec<serde_json::Value> = listed.json().await.unwrap();
-    assert!(listed.is_empty(), "the SSH key survived the race: {listed:?}");
+    assert!(
+        listed.is_empty(),
+        "the SSH key survived the race: {listed:?}"
+    );
 }

@@ -438,7 +438,14 @@ async fn deactivating_an_account_revokes_its_outstanding_lfs_urls() {
 ///
 /// Six hours is the longest-lived capability this server issues, which is why
 /// the two tests below reach for the upload half rather than the download one.
-async fn upload_href(base: &str, owner: &str, repo: &str, token: &str, oid: &str, size: usize) -> String {
+async fn upload_href(
+    base: &str,
+    owner: &str,
+    repo: &str,
+    token: &str,
+    oid: &str,
+    size: usize,
+) -> String {
     let response = batch(base, owner, repo, Some(token), "upload", oid, size).await;
     assert_eq!(response.status(), 200);
     let href = response.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
@@ -484,7 +491,15 @@ async fn a_password_reset_revokes_the_lfs_urls_its_session_minted() {
     let content = b"written by a session that was stolen";
     let oid = hex::encode(Sha256::digest(content));
 
-    let href = upload_href(&base, "lfs_pw_reset", "reset-lfs", &token, &oid, content.len()).await;
+    let href = upload_href(
+        &base,
+        "lfs_pw_reset",
+        "reset-lfs",
+        &token,
+        &oid,
+        content.len(),
+    )
+    .await;
 
     // Baseline in the same run and before the reset: a URL answering 401 proves
     // nothing on its own, since a URL that never worked answers 401 too.
@@ -530,7 +545,15 @@ async fn a_logout_revokes_the_lfs_urls_its_session_minted_and_spares_the_next_on
     let content = b"written by a session that was left behind";
     let oid = hex::encode(Sha256::digest(content));
 
-    let href = upload_href(&base, "lfs_logout", "logout-lfs", &token, &oid, content.len()).await;
+    let href = upload_href(
+        &base,
+        "lfs_logout",
+        "logout-lfs",
+        &token,
+        &oid,
+        content.len(),
+    )
+    .await;
     let before = reqwest::Client::new()
         .put(&href)
         .body(content.to_vec())
