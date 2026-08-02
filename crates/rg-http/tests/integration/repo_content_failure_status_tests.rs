@@ -738,6 +738,69 @@ async fn a_blob_whose_object_is_missing_is_a_server_error() {
     assert_eq!(body["error"]["message"], "file not found");
 }
 
+/// Branches and tags are snapshots clients use to choose a ref. If gix cannot
+/// enumerate even one ref, a shortened 200 list falsely tells the client that
+/// the omitted branch or tag does not exist.
+#[tokio::test]
+async fn unreadable_branch_or_tag_ref_is_a_server_error_not_a_partial_list() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "reffail-owner", "reffail@example.com").await;
+    create_repo(&base, &token, "reffail-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "reffail-owner", "reffail-repo").await;
+
+    let bare = repo_root.join("reffail-owner/reffail-repo.git");
+    let repo = gix::open(&bare).expect("fixture repository must open");
+    let head = repo
+        .head()
+        .expect("HEAD must be readable")
+        .try_into_peeled_id()
+        .expect("HEAD must resolve")
+        .expect("fixture repository must have a commit")
+        .to_string();
+    drop(repo);
+    std::fs::create_dir_all(bare.join("refs/tags")).expect("tag directory");
+    std::fs::write(bare.join("refs/tags/release"), format!("{head}\n")).expect("healthy tag ref");
+
+    for endpoint in ["branches", "tags"] {
+        let resp = client
+            .get(format!(
+                "{base}/api/v1/repos/reffail-owner/reffail-repo/{endpoint}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            body.as_array().is_some_and(|names| !names.is_empty()),
+            "the healthy {endpoint} fixture must yield a non-empty list, got: {body}"
+        );
+    }
+
+    std::fs::write(bare.join("refs/heads/broken"), "not an object id\n")
+        .expect("broken branch ref");
+    std::fs::write(bare.join("refs/tags/broken"), "not an object id\n").expect("broken tag ref");
+
+    for endpoint in ["branches", "tags"] {
+        let resp = client
+            .get(format!(
+                "{base}/api/v1/repos/reffail-owner/reffail-repo/{endpoint}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            status.is_server_error(),
+            "an unreadable {endpoint} ref must not look like a complete 200 list: {status} (body: {body})"
+        );
+        assert_no_internal_detail(&body, &repo_root);
+    }
+}
+
 /// H-05: whatever the status, the body must not carry the storage path or the
 /// git library's own wording. This is the half of the bug a status-only fix
 /// would have left in place.

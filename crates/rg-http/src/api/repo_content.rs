@@ -362,6 +362,7 @@ pub async fn get_log(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 500, description = "Repository storage failure", body = serde_json::Value),
     ),
 )]
 pub async fn list_branches(
@@ -406,6 +407,7 @@ pub async fn list_branches(
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 500, description = "Repository storage failure", body = serde_json::Value),
     ),
 )]
 pub async fn list_tags(
@@ -1063,16 +1065,10 @@ fn list_branch_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>>
                 branches.push(String::from_utf8_lossy(stripped).to_string());
             }
             Err(e) => {
-                // The iterator error owns the exact failing ref path. Keep that
-                // full error and the namespace alongside the repository: an
-                // unreadable ref may be omitted from a best-effort picker, but
-                // never invisibly.
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = "refs/heads/*",
-                    error = %format!("{e:#}"),
-                    "skipping unreadable branch reference"
-                );
+                return Err(anyhow::Error::from_boxed(e).context(format!(
+                    "failed to read a branch reference in {}",
+                    repo_path.display()
+                )));
             }
         }
     }
@@ -1094,12 +1090,10 @@ fn list_tag_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
                 tags.push(String::from_utf8_lossy(stripped).to_string());
             }
             Err(e) => {
-                tracing::warn!(
-                    repo = %repo_path.display(),
-                    git_ref = "refs/tags/*",
-                    error = %format!("{e:#}"),
-                    "skipping unreadable tag reference"
-                );
+                return Err(anyhow::Error::from_boxed(e).context(format!(
+                    "failed to read a tag reference in {}",
+                    repo_path.display()
+                )));
             }
         }
     }
@@ -1894,10 +1888,10 @@ mod tests {
         );
     }
 
-    /// Branch/tag pickers remain best-effort, but corrupt ref files must leave
-    /// an operator-visible warning instead of merely shortening the list.
+    /// A ref picker is a snapshot, not a best-effort hint: one unreadable ref
+    /// must fail the whole read instead of pretending the omitted ref is absent.
     #[test]
-    fn unreadable_branch_and_tag_refs_are_skipped_with_context() {
+    fn unreadable_branch_and_tag_refs_fail_with_context() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("broken-refs.git");
         gix::init_bare(&repo_path).expect("a bare repo must initialise");
@@ -1906,22 +1900,27 @@ mod tests {
         std::fs::write(repo_path.join("refs/heads/broken"), "not an object id\n").unwrap();
         std::fs::write(repo_path.join("refs/tags/broken"), "not an object id\n").unwrap();
 
-        let (logs, _guard) = capture_warnings();
-        assert!(list_branch_names(&repo_path).unwrap().is_empty());
-        assert!(list_tag_names(&repo_path).unwrap().is_empty());
-
-        let rendered = logs.text();
+        let branch_error = list_branch_names(&repo_path).expect_err("broken branch ref must fail");
+        let tag_error = list_tag_names(&repo_path).expect_err("broken tag ref must fail");
         assert!(
-            rendered.contains(&repo_path.display().to_string()),
-            "warnings must name the repository: {rendered}"
+            branch_error
+                .to_string()
+                .contains(&repo_path.display().to_string()),
+            "branch error must name the repository: {branch_error:#}"
         );
         assert!(
-            rendered.contains("git_ref") && rendered.contains("refs/heads/*"),
-            "branch warning must name its ref namespace: {rendered}"
+            branch_error.to_string().contains("branch reference"),
+            "branch error must identify the failing namespace: {branch_error:#}"
         );
         assert!(
-            rendered.contains("git_ref") && rendered.contains("refs/tags/*"),
-            "tag warning must name its ref namespace: {rendered}"
+            tag_error
+                .to_string()
+                .contains(&repo_path.display().to_string()),
+            "tag error must name the repository: {tag_error:#}"
+        );
+        assert!(
+            tag_error.to_string().contains("tag reference"),
+            "tag error must identify the failing namespace: {tag_error:#}"
         );
     }
 }
