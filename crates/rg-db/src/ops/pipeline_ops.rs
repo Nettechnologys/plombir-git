@@ -857,18 +857,37 @@ pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Res
     Ok(result.rows_affected)
 }
 
-/// Assign a CI job to a specific runner.
+/// Claim a CI job for a specific runner. Returns whether the claim landed.
 ///
-/// Conditional on the job still being active work: the scheduler picks its
-/// candidate from a snapshot, and a cancellation landing between the pick and
-/// this write would otherwise hand a runner a job the server has already
-/// answered `canceled` for — and put the row back to `assigned` while it was
-/// at it. Returns whether the assignment landed.
+/// This is a compare-and-swap, not a write: the `WHERE` names the exact state
+/// the caller believed it was acting on — unclaimed work — and the database
+/// decides the winner in one statement.
+///
+/// `poll_job` picks its candidate with `find_pending_job_matching_labels`
+/// (`status = 'pending' AND runner_id IS NULL`) and writes afterwards, so
+/// everything that can change in between has to be re-asserted here. A filter on
+/// "still active work" covered only half of it: a *cancellation* landing in that
+/// window was refused, but a competing **runner** was not — `assigned` is itself
+/// an active status, so the second poller's write sailed through and overwrote
+/// `runner_id`. Both runners had already been answered `200` with the job body;
+/// the loser then found its own `/start` and `/finish` answered `404 job not
+/// found`, because `assigned_job` matches on the runner the row now names. The
+/// job it was told to run was never its own.
+///
+/// So the condition is the candidate query verbatim. `pending` alone would do in
+/// production (nothing leaves a row `pending` with a runner still attached —
+/// `reset_stuck_job` and `reset_runner_jobs` both null the column in the same
+/// statement), but the claim is a safety property and it states both halves
+/// rather than leaning on that invariant holding forever.
+///
+/// A refused claim is not an error: the row simply belongs to someone else now,
+/// or the pipeline was canceled. `poll_job` looks for the next candidate.
 pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) -> Result<bool> {
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
-        .filter(still_settleable(pipeline_job::Column::Status, "assigned"))
+        .filter(pipeline_job::Column::Status.eq("pending"))
+        .filter(pipeline_job::Column::RunnerId.is_null())
         .col_expr(pipeline_job::Column::Status, Expr::value("assigned"))
         .col_expr(pipeline_job::Column::RunnerId, Expr::value(runner_id))
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))

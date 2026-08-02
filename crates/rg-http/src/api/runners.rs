@@ -326,23 +326,28 @@ pub async fn poll_job(
             .await
             {
                 Ok(Some(job)) => {
-                    // Found a job — assign it to this runner. The candidate
-                    // came out of a snapshot, so a cancellation may have landed
-                    // since: the write refuses on a settled row, and the poll
-                    // simply looks for the next candidate rather than handing
-                    // out work the server has already disowned.
+                    // Found a candidate — now *claim* it. The candidate came out
+                    // of a snapshot, and two things can have happened since: the
+                    // pipeline was canceled, or another runner polling at the
+                    // same instant took this exact row. `assign_job` re-asserts
+                    // the whole candidate condition (`pending` and unassigned)
+                    // in its `WHERE`, so the database picks one winner and the
+                    // rest are refused here rather than silently overwriting
+                    // `runner_id` — which is what made two runners both receive
+                    // `200` with the same job body, and left the loser's
+                    // `/start` and `/finish` answered `404 job not found`.
                     //
-                    // The retry needs no backoff and cannot spin: the only way
-                    // to be refused is to have left `pending`, and the query
-                    // above selects on `pending`, so the same row cannot come
-                    // back as a candidate.
+                    // The retry needs no backoff and cannot spin: being refused
+                    // means the row is no longer pending-and-unassigned, and the
+                    // query above selects exactly that, so the same row cannot
+                    // come back as a candidate.
                     match rg_db::ops::pipeline_ops::assign_job(&state.db, job.id, runner_id).await {
                         Ok(true) => {}
                         Ok(false) => {
                             tracing::info!(
                                 job_id = job.id,
                                 runner_id,
-                                "poll_job: candidate settled before it could be assigned"
+                                "poll_job: candidate was claimed or settled before this runner could take it"
                             );
                             continue;
                         }
