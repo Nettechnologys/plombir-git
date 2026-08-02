@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use qrcode::QrCode;
+use std::time::SystemTime;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Generate a new TOTP secret. Returns (secret_string, otpauth_url, qr_text).
@@ -47,7 +48,8 @@ pub fn generate_secret(username: &str, issuer: &str) -> Result<(String, String, 
 /// `secret_str` is base32 (RFC 4648, unpadded). An unparseable secret is an
 /// error, not a `false`: decoding it to an empty key would silently verify
 /// every code against the wrong HMAC key and report "invalid code" for a
-/// storage problem the operator needs to see.
+/// storage problem the operator needs to see. A clock before the Unix epoch is
+/// likewise an error, not an invalid code.
 pub fn verify_code(secret_str: &str, code: &str) -> Result<bool> {
     let secret_bytes = Secret::Encoded(secret_str.to_string())
         .to_bytes()
@@ -64,7 +66,16 @@ pub fn verify_code(secret_str: &str, code: &str) -> Result<bool> {
     )
     .map_err(|e| anyhow::anyhow!("TOTP parse error: {}", e))?;
 
-    Ok(totp.check_current(code).unwrap_or(false))
+    check_code_at(&totp, code, SystemTime::now())
+}
+
+fn check_code_at(totp: &TOTP, code: &str, now: SystemTime) -> Result<bool> {
+    let seconds = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("totp: read the current time step")?
+        .as_secs();
+
+    Ok(totp.check(code, seconds))
 }
 
 /// Generate QR code as SVG for web display.
@@ -116,6 +127,7 @@ pub fn generate_qr_svg(otpauth_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_generate_secret() {
@@ -138,6 +150,16 @@ mod tests {
             verify_code(&stored_secret, &code).unwrap(),
             "stored secret must accept the code the enrolled app generates"
         );
+
+        let wrong_code = format!(
+            "{}{}",
+            &code[..code.len() - 1],
+            if code.ends_with('0') { '1' } else { '0' }
+        );
+        assert!(
+            !verify_code(&stored_secret, &wrong_code).unwrap(),
+            "a checked but incorrect code must stay a plain rejection"
+        );
     }
 
     /// The secret we show for manual entry must be the one in the QR code.
@@ -156,5 +178,19 @@ mod tests {
     #[test]
     fn unparseable_secret_is_an_error_not_a_silent_false() {
         assert!(verify_code("not base32 at all!!", "123456").is_err());
+    }
+
+    #[test]
+    fn a_clock_before_the_epoch_is_an_error_not_a_wrong_code() {
+        let (secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
+        let clock_before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+
+        let error = check_code_at(&totp, "123456", clock_before_epoch).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("totp: read the current time step"));
+        assert!(verify_code(&secret, "123456").is_ok());
     }
 }
