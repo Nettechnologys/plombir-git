@@ -567,16 +567,54 @@ fn enforce_signed_commit_policies(
                 continue;
             }
         };
-        if let Some(unsigned) = commits.lines().find(|sha| {
-            gateway
-                .run(&["verify-commit", sha], Some(repo_path))
-                .map(|output| !output.success())
-                .unwrap_or(true)
-        }) {
-            update.status = "error".into();
-            update.message =
-                format!("commit {unsigned} does not have a cryptographically valid signature");
+        for commit in commits.lines() {
+            let verification = gateway
+                .run(&["log", "--format=%G?", "-1", commit], Some(repo_path))
+                .and_then(|output| signature_is_cryptographically_valid(&output));
+
+            match verification {
+                Ok(true) => {}
+                Ok(false) => {
+                    update.status = "error".into();
+                    update.message = format!(
+                        "commit {commit} does not have a cryptographically valid signature"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        refname = %update.refname,
+                        commit,
+                        %error,
+                        "server-side commit signature verification failed"
+                    );
+                    update.status = "error".into();
+                    update.message =
+                        format!("server-side signature verification failure for commit {commit}");
+                    break;
+                }
+            }
         }
+    }
+}
+
+/// Interpret `git log --format=%G?` without turning an unavailable verifier
+/// into a claim that the client supplied a bad signature.
+fn signature_is_cryptographically_valid(
+    verify_output: &crate::cli_gateway::GitOutput,
+) -> Result<bool> {
+    verify_output
+        .ensure_success()
+        .context("git could not verify commit signature")?;
+
+    match verify_output.stdout_str().trim() {
+        "G" => Ok(true),
+        // Validity is stricter than merely having a signature: an expired,
+        // revoked, untrusted, bad, or absent signature cannot satisfy this
+        // branch-protection policy.
+        "B" | "N" | "U" | "X" | "Y" | "R" => Ok(false),
+        "E" => bail!("git could not check the commit signature (status E)"),
+        status => bail!("git returned an unexpected commit signature status {status:?}"),
     }
 }
 
@@ -729,7 +767,10 @@ mod ref_advertisement_tests {
 
 #[cfg(test)]
 mod rejection_pattern_tests {
-    use super::{enforce_signed_commit_policies, ref_matches_rejection_pattern, RefUpdate};
+    use super::{
+        enforce_signed_commit_policies, ref_matches_rejection_pattern,
+        signature_is_cryptographically_valid, RefUpdate,
+    };
     #[test]
     fn matches_exact_branches_and_wildcard_tags() {
         assert!(ref_matches_rejection_pattern(
@@ -801,6 +842,38 @@ mod rejection_pattern_tests {
         assert!(updates[0]
             .message
             .contains("cryptographically valid signature"));
+    }
+
+    #[test]
+    fn signature_verification_distinguishes_invalid_and_unavailable() {
+        let gateway = crate::cli_gateway::global_gateway().as_ref().unwrap();
+        let success_status = gateway.run(&["--version"], None).unwrap().status;
+        let output = |status: &str| crate::cli_gateway::GitOutput {
+            stdout: format!("{status}\n").into_bytes(),
+            stderr: Vec::new(),
+            status: success_status.clone(),
+            command: "git log --format=%G? -1 fixture".into(),
+        };
+
+        assert!(signature_is_cryptographically_valid(&output("G")).unwrap());
+        assert!(!signature_is_cryptographically_valid(&output("B")).unwrap());
+        assert!(!signature_is_cryptographically_valid(&output("N")).unwrap());
+        assert!(signature_is_cryptographically_valid(&output("E")).is_err());
+    }
+
+    #[test]
+    fn nonzero_signature_command_output_is_an_operational_error() {
+        let gateway = crate::cli_gateway::global_gateway().as_ref().unwrap();
+        let output = gateway
+            .run(&["rev-parse", "--verify", "not-a-real-commit"], None)
+            .unwrap();
+        assert!(!output.success());
+
+        let error = signature_is_cryptographically_valid(&output).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("git could not verify commit signature"),
+            "non-zero git exit must be an operational verification error: {error:#}"
+        );
     }
 }
 
