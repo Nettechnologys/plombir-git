@@ -56,7 +56,10 @@ pub async fn create_pr(
     let target_namespace = repository_namespace(db, &target_repo).await?;
     let target_path = repo_root.join(format!("{target_namespace}/{}.git", target_repo.name));
 
-    // Resolve head SHA (for same-repo PRs, look up branch; for fork PRs, use the head repo)
+    // Resolve head SHA (for same-repo PRs, look up branch; for fork PRs, use the head repo).
+    // A missing branch is a caller error, but an unreadable repository or ref store
+    // is ours: `try_get_ref_sha` preserves that distinction instead of turning both
+    // into a nullable `head_sha` on a newly-created PR.
     let head_sha = if let Some(head_repo_id) = head_repo_id {
         // For fork PRs, resolve from the fork repo's git data
         let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
@@ -65,15 +68,13 @@ pub async fn create_pr(
             .context("head repository not found")?;
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
-        if head_path.exists() {
-            get_ref_sha(&head_path, &head_branch).ok()
-        } else {
-            None
-        }
-    } else if target_path.exists() {
-        get_ref_sha(&target_path, &head_branch).ok()
+        try_get_ref_sha(&head_path, &head_branch)?.ok_or_else(|| {
+            crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
+        })?
     } else {
-        None
+        try_get_ref_sha(&target_path, &head_branch)?.ok_or_else(|| {
+            crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
+        })?
     };
 
     let model = pull_request::ActiveModel {
@@ -92,7 +93,7 @@ pub async fn create_pr(
         reviewer_id: Set(None),
         head_branch: Set(head_branch),
         base_branch: Set(base_branch),
-        head_sha: Set(head_sha),
+        head_sha: Set(Some(head_sha)),
         merge_strategy: Set(None),
         merge_commit_sha: Set(None),
         head_repo_id: Set(head_repo_id),
@@ -1938,15 +1939,37 @@ fn get_head_sha_with_repo(repo: &gix::Repository) -> Result<String> {
     Ok(head_id.to_string())
 }
 
-/// Resolve a branch reference to its SHA using gix.
-fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
+/// Look up a branch SHA, distinguishing an absent ref from a failed repository read.
+fn try_get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<Option<String>> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let ref_str = format!("refs/heads/{}", branch);
-    let id = repo
-        .rev_parse_single(ref_str.as_str())
-        .map_err(|e| anyhow::anyhow!("failed to resolve {}: {}", ref_str, e))?;
-    Ok(id.to_string())
+    let Some(mut reference) = repo.try_find_reference(ref_str.as_str()).with_context(|| {
+        format!(
+            "failed to look up {} in repository: {:?}",
+            ref_str, repo_path
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    let id = reference.peel_to_id().with_context(|| {
+        format!(
+            "failed to resolve {} in repository: {:?}",
+            ref_str, repo_path
+        )
+    })?;
+    Ok(Some(id.to_string()))
+}
+
+/// Resolve a branch reference to its SHA using gix.
+fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
+    try_get_ref_sha(repo_path, branch)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to resolve refs/heads/{}: reference does not exist",
+            branch
+        )
+    })
 }
 
 // ── Gix merge helpers ───────────────────────────────────────────────────

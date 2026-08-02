@@ -15,7 +15,10 @@
 //! "still a 400" baseline fails an endpoint that now 500s on everything, and the
 //! outage half fails an endpoint that kept the blanket `bad_request`.
 
-use crate::common::{create_repo, register_full, register_user, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, register_user, spawn_test_app_with_db,
+    spawn_test_app_with_db_and_repo_root,
+};
 use sea_orm::ConnectionTrait;
 
 /// The failure half: a broken write must be a 5xx carrying no internal detail.
@@ -35,6 +38,40 @@ fn assert_not_blamed_on_the_client(
         !message.contains("db:") && !message.contains("no such table"),
         "the {what} response body must not carry internal error detail, got: {message}"
     );
+}
+
+fn git(args: &[&str], cwd: Option<&std::path::Path>) {
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let output = gateway.run(args, cwd).unwrap();
+    output.ensure_success().unwrap();
+}
+
+/// Seed the bare repository with commits on both sides of a real PR. Empty
+/// repositories are useful in most tests, but must not stand in for a valid
+/// `head` when this suite is distinguishing validation from server failures.
+fn seed_pr_branches(bare_path: &std::path::Path) {
+    let worktree = tempfile::tempdir().expect("create PR fixture worktree");
+    let path = worktree.path();
+    let path_arg = path.to_str().expect("UTF-8 worktree path");
+    let bare_arg = bare_path.to_str().expect("UTF-8 bare repository path");
+
+    git(&["init", "-q", "-b", "main", path_arg], None);
+    git(&["config", "user.name", "PR failure test"], Some(path));
+    git(
+        &["config", "user.email", "pr-failure@example.invalid"],
+        Some(path),
+    );
+    std::fs::write(path.join("README.md"), "base\n").expect("write base file");
+    git(&["add", "."], Some(path));
+    git(&["commit", "-qm", "base"], Some(path));
+    git(&["remote", "add", "origin", bare_arg], Some(path));
+    git(&["push", "origin", "main"], Some(path));
+
+    git(&["checkout", "-q", "-b", "feature"], Some(path));
+    std::fs::write(path.join("feature.txt"), "feature\n").expect("write feature file");
+    git(&["add", "."], Some(path));
+    git(&["commit", "-qm", "feature"], Some(path));
+    git(&["push", "origin", "feature"], Some(path));
 }
 
 async fn app_with_repo(prefix: &str) -> (String, sea_orm::DatabaseConnection, String, i64) {
@@ -121,7 +158,10 @@ async fn issue_create_separates_an_empty_title_from_a_broken_insert() {
 /// nested `bad_request` the handler had around `create_pr` itself.
 #[tokio::test]
 async fn pr_create_separates_an_identical_head_and_base_from_a_broken_insert() {
-    let (base, db, token, _repo_id) = app_with_repo("prfail").await;
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, _) = register_full(&base, "prfail-owner", "prfail@example.com").await;
+    create_repo(&base, &token, "prfail-repo").await;
+    seed_pr_branches(&repo_root.join("prfail-owner/prfail-repo.git"));
     let client = reqwest::Client::new();
     let url = format!("{base}/api/v1/repos/prfail-owner/prfail-repo/pulls");
 
@@ -169,13 +209,65 @@ async fn pr_create_separates_an_identical_head_and_base_from_a_broken_insert() {
     let resp = client
         .post(&url)
         .bearer_auth(&token)
-        .json(&serde_json::json!({"title": "after", "head": "other", "base": "main"}))
+        .json(&serde_json::json!({"title": "after", "head": "feature", "base": "main"}))
         .send()
         .await
         .expect("request");
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_not_blamed_on_the_client(status, &body, "pull request");
+}
+
+/// `POST .../pulls` — an absent head branch is client input, while a repository
+/// that cannot be opened is a server failure. Neither may create a PR with a
+/// nullable `head_sha`.
+#[tokio::test]
+async fn pr_create_separates_a_missing_head_ref_from_an_unreadable_repository() {
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, _) = register_full(&base, "pr-head-owner", "pr-head@example.com").await;
+    create_repo(&base, &token, "pr-head-repo").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/pr-head-owner/pr-head-repo/pulls");
+
+    let missing_ref = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "missing branch",
+            "head": "does-not-exist",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .expect("missing-head request");
+    assert_eq!(
+        missing_ref.status(),
+        400,
+        "a missing head branch is the caller's mistake"
+    );
+
+    let repository_path = repo_root.join("pr-head-owner/pr-head-repo.git");
+    seed_pr_branches(&repository_path);
+    std::fs::remove_dir_all(&repository_path)
+        .unwrap_or_else(|error| panic!("remove test repository {repository_path:?}: {error}"));
+
+    let unreadable_repo = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "broken repository",
+            "head": "feature",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .expect("unreadable-repository request");
+    assert!(
+        unreadable_repo.status().is_server_error(),
+        "an unreadable repository is ours, not a nullable head SHA or a 4xx: {}",
+        unreadable_repo.status()
+    );
 }
 
 /// `POST .../collaborators` — an unknown permission and an already-listed user
