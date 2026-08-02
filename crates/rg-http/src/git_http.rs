@@ -288,14 +288,26 @@ where
 /// A join failure is a server failure too: the Git subprocess may have
 /// completed, but we cannot honestly tell the client that its response was
 /// delivered if the task that copied it failed or was cancelled.
-async fn collect_git_response(
+///
+/// Both failure modes collapse into one `anyhow::Error` here so every caller
+/// classifies them identically — the `unwrap_or_default()` that used to sit at
+/// these call sites is what turned a broken copy into a valid, empty protocol
+/// response.
+async fn collect_git_response_bytes(
     reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    operation: &'static str,
-) -> std::result::Result<Vec<u8>, Response> {
+) -> Result<Vec<u8>> {
     reader_task
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result.map_err(anyhow::Error::from))
+}
+
+async fn collect_git_response(
+    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    operation: &'static str,
+) -> std::result::Result<Vec<u8>, Response> {
+    collect_git_response_bytes(reader_task)
+        .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -303,6 +315,27 @@ async fn collect_git_response(
                 Body::from(git_failure_body(operation, &error)),
             )
                 .into_response()
+        })
+}
+
+/// The receive-pack twin of `collect_git_response`.
+///
+/// `handle_git_receive_pack` returns the bare tuple shape (not `Response`) on
+/// every branch, and its success branch also fires the post-push hooks — so it
+/// needs the error as a value it can `return` *before* those side effects,
+/// rather than an already-built `Response`.
+async fn collect_receive_pack_response(
+    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    operation: &'static str,
+) -> std::result::Result<Vec<u8>, (StatusCode, [(header::HeaderName, &'static str); 1], Body)> {
+    collect_git_response_bytes(reader_task)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(git_failure_body(operation, &error)),
+            )
         })
 }
 
@@ -906,14 +939,7 @@ pub(crate) async fn handle_git_receive_pack(
 
     let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
     // Spawn concurrent reader to prevent duplex deadlock when response > 64KB
-    let reader_task = tokio::spawn(async move {
-        let mut buf_reader = buf_reader;
-        let mut output = Vec::new();
-        if buf_reader.read_to_end(&mut output).await.is_err() {
-            output.clear();
-        }
-        output
-    });
+    let reader_task = spawn_git_response_reader(buf_reader);
 
     let require_signed_refs = signed_commit_required_refs(&protection_rules);
     let mut rejected_refs = branch_protection_rejected_refs(protection_rules, actor_id);
@@ -943,7 +969,23 @@ pub(crate) async fn handle_git_receive_pack(
                 );
             }
             drop(buf_writer);
-            let output = reader_task.await.unwrap_or_default();
+            // A copy that failed, panicked, or was cancelled cannot be
+            // reported as a delivered push: the partial (or empty) buffer
+            // would go out as `200 …-receive-pack-result`, telling the client
+            // its refs landed, and would fire the post-push hooks below on a
+            // response we never managed to read (card_9c1d563ece91 — the
+            // receive-pack twin of the upload-pack fix in card_2bfc8c1d8648).
+            // Every failure mode has to be resolved *before* those side
+            // effects, hence the early return.
+            let output = match collect_receive_pack_response(
+                reader_task,
+                "read receive-pack response",
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(response) => return response,
+            };
 
             // ── Post-push hooks: trigger CI + Webhook ───────────────
             //
@@ -1004,8 +1046,8 @@ async fn find_repo_by_name(
 #[cfg(test)]
 mod tests {
     use super::{
-        buffer_git_body, build_info_refs, git_failure_body, git_upload_pack_response,
-        spawn_git_response_reader, with_git_timeout,
+        buffer_git_body, build_info_refs, collect_receive_pack_response, git_failure_body,
+        git_upload_pack_response, spawn_git_response_reader, with_git_timeout,
     };
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
@@ -1399,5 +1441,64 @@ mod tests {
             cancelled_task.abort();
             assert_upload_pack_reader_failure(cancelled_task, operation).await;
         }
+    }
+
+    async fn assert_receive_pack_reader_failure(
+        reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+        label: &'static str,
+    ) {
+        let (status, headers, body) =
+            collect_receive_pack_response(reader_task, "read receive-pack response")
+                .await
+                .expect_err(label);
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{label}");
+        assert_eq!(headers[0].1, "text/plain", "{label}");
+        let body = body
+            .collect()
+            .await
+            .expect("reader failure body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"internal server error", "{label}");
+    }
+
+    /// `handle_git_receive_pack` may only answer `200
+    /// application/x-git-receive-pack-result` — and only fire the post-push
+    /// hooks — for a response it actually managed to read. A reader that failed
+    /// mid-copy, panicked, or was cancelled must surface as a sanitized 5xx
+    /// instead of a successful empty push confirmation (card_9c1d563ece91).
+    #[tokio::test]
+    async fn receive_pack_reader_failures_are_sanitized_5xx() {
+        assert_receive_pack_reader_failure(
+            spawn_git_response_reader(PartialThenFailReader::default()),
+            "partial read then I/O error",
+        )
+        .await;
+
+        let panic_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>> =
+            tokio::spawn(async { panic!("injected reader task panic") });
+        assert_receive_pack_reader_failure(panic_task, "reader task panic").await;
+
+        let cancelled_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<Vec<u8>, std::io::Error>(Vec::new())
+        });
+        cancelled_task.abort();
+        assert_receive_pack_reader_failure(cancelled_task, "cancelled reader task").await;
+    }
+
+    /// The guard must not cost a healthy push its response body: a reader that
+    /// completes normally still hands the full protocol response to the 200
+    /// path.
+    #[tokio::test]
+    async fn receive_pack_collects_a_complete_response_unchanged() {
+        let payload = b"0032unpack ok\n0000".to_vec();
+        let reader_task = spawn_git_response_reader(std::io::Cursor::new(payload.clone()));
+
+        let output = collect_receive_pack_response(reader_task, "read receive-pack response")
+            .await
+            .expect("healthy reader");
+
+        assert_eq!(output, payload);
     }
 }
