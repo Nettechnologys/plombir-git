@@ -31,7 +31,17 @@ pub async fn create_org(
         )));
     }
 
-    org_ops::create_org(db, name, display_name, description, owner_id, visibility).await
+    org_ops::create_org(db, name, display_name, description, owner_id, visibility)
+        .await
+        .map_err(|error| {
+            if rg_db::is_unique_violation_anyhow(&error) {
+                crate::error::invalid_request(format!(
+                    "organization name '{name}' is already taken"
+                ))
+            } else {
+                error
+            }
+        })
 }
 
 /// Get an organization by name.

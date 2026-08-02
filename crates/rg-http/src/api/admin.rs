@@ -657,6 +657,14 @@ pub async fn create_sso_provider(
         Ok(provider) => {
             (StatusCode::CREATED, Json(sso_provider_response(&provider))).into_response()
         }
+        // A concurrent request can cross the pre-check above and lose the
+        // UNIQUE race here.  It is still the same bad request; every other
+        // database failure remains a 5xx through the normal error funnel.
+        Err(error) if rg_db::is_unique_violation(&error) => AppError::bad_request(format!(
+            "an SSO provider with slug '{}' already exists",
+            body.slug
+        ))
+        .into_response(),
         // Everything the caller could get wrong was checked above, so what is
         // left is the insert: a dead pool is a retryable 503 and a statement
         // failure a 500, neither of them the admin's bad request.

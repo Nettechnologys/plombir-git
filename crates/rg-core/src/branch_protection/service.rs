@@ -36,6 +36,7 @@ pub async fn create_protection(
         )));
     }
 
+    let duplicate_message = format!("branch '{branch_name}' is already protected");
     let model = protected_branch::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo.id),
@@ -56,7 +57,15 @@ pub async fn create_protection(
         updated_at: Set(Utc::now()),
     };
 
-    protected_branch_ops::create(db, model).await
+    protected_branch_ops::create(db, model)
+        .await
+        .map_err(|error| {
+            if rg_db::is_unique_violation_anyhow(&error) {
+                crate::error::invalid_request(duplicate_message)
+            } else {
+                error
+            }
+        })
 }
 
 /// List all branch protection rules for a repo.

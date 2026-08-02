@@ -460,3 +460,197 @@ async fn commit_status_separates_a_bad_state_from_a_broken_upsert() {
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_not_blamed_on_the_client(status, &body, "commit status");
 }
+
+// These triggers make the check-then-insert window deterministic.  Each one
+// inserts the otherwise-missing row while the target insert is in progress, so
+// the target sees a real SQLite UNIQUE violation after its pre-check returned
+// `None`.  This is the exact error shape a concurrent request produces, without
+// relying on scheduler timing to make a test race happen.
+
+#[tokio::test]
+async fn register_unique_loss_after_the_precheck_stays_a_bad_request() {
+    let (base, db) = spawn_test_app_with_db().await;
+    db.execute_unprepared(
+        r#"
+        CREATE TRIGGER inject_register_unique_conflict
+        BEFORE INSERT ON users
+        WHEN NEW.username = 'race-register' AND NEW.email = 'race-register@example.test'
+        BEGIN
+            INSERT INTO users (username, email, password_hash, created_at, updated_at)
+            VALUES (
+                'race-register',
+                'race-register-trigger@example.test',
+                'not-used-by-this-test',
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            );
+        END
+        "#,
+    )
+    .await
+    .expect("install registration race injector");
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/register"))
+        .json(&serde_json::json!({
+            "username": "race-register",
+            "email": "race-register@example.test",
+            "password": "Qz7$wRtm",
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(
+        response.status(),
+        400,
+        "a registration that loses the UNIQUE race is the same client outcome as a sequential duplicate"
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(
+        body["error"]["message"], "username or email is already registered",
+        "the synthetic UNIQUE violation must not leak database detail"
+    );
+}
+
+#[tokio::test]
+async fn org_unique_loss_after_the_precheck_stays_a_bad_request() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _user_id) =
+        register_full(&base, "race-org-owner", "race-org-owner@example.test").await;
+    db.execute_unprepared(
+        r#"
+        CREATE TRIGGER inject_org_unique_conflict
+        BEFORE INSERT ON organizations
+        WHEN NEW.name = 'race-org' AND NEW.description = 'outer request'
+        BEGIN
+            INSERT INTO organizations (name, description, owner_id, visibility, created_at, updated_at)
+            VALUES (
+                'race-org',
+                'inserted by the deterministic race injector',
+                NEW.owner_id,
+                'public',
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            );
+        END
+        "#,
+    )
+    .await
+    .expect("install organization race injector");
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "race-org",
+            "description": "outer request",
+            "visibility": "public",
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(
+        response.status(),
+        400,
+        "an organization insert that loses the UNIQUE race must not become a 500"
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(
+        body["error"]["message"], "organization name 'race-org' is already taken",
+        "the synthetic UNIQUE violation must preserve the sequential duplicate message"
+    );
+}
+
+#[tokio::test]
+async fn branch_protection_unique_loss_after_the_precheck_stays_a_bad_request() {
+    let (base, db, token, _repo_id) = app_with_repo("racebranch").await;
+    db.execute_unprepared(
+        r#"
+        CREATE TRIGGER inject_branch_protection_unique_conflict
+        BEFORE INSERT ON protected_branches
+        WHEN NEW.branch_name = 'race-branch' AND NEW.required_status_checks IS NULL
+        BEGIN
+            INSERT INTO protected_branches (repo_id, branch_name, required_status_checks)
+            VALUES (NEW.repo_id, 'race-branch', '[]');
+        END
+        "#,
+    )
+    .await
+    .expect("install branch-protection race injector");
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/racebranch-owner/racebranch-repo/branches/protection"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branch_name": "race-branch",
+            "require_pr": true,
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(
+        response.status(),
+        400,
+        "a branch-protection insert that loses the UNIQUE race must not become a 500"
+    );
+}
+
+#[tokio::test]
+async fn sso_provider_unique_loss_after_the_precheck_stays_a_bad_request() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, user_id) =
+        register_full(&base, "race-sso-admin", "race-sso-admin@example.test").await;
+    rg_db::ops::user_ops::update_by_id(&db, user_id, None, None, Some(true), None)
+        .await
+        .expect("promote test user")
+        .expect("registered user must exist");
+    db.execute_unprepared(
+        r#"
+        CREATE TRIGGER inject_sso_provider_unique_conflict
+        BEFORE INSERT ON sso_providers
+        WHEN NEW.slug = 'race-sso' AND NEW.name = 'Race SSO outer request'
+        BEGIN
+            INSERT INTO sso_providers (name, slug, provider_type, enabled, created_at, updated_at)
+            VALUES (
+                'Race SSO injected winner',
+                'race-sso',
+                'oauth2',
+                false,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            );
+        END
+        "#,
+    )
+    .await
+    .expect("install SSO-provider race injector");
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/admin/sso/providers"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Race SSO outer request",
+            "slug": "race-sso",
+            "provider_type": "oauth2",
+            "enabled": false,
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(
+        response.status(),
+        400,
+        "an SSO-provider insert that loses the UNIQUE race must not become a 500"
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(
+        body["error"]["message"], "an SSO provider with slug 'race-sso' already exists",
+        "the synthetic UNIQUE violation must preserve the sequential duplicate message"
+    );
+}

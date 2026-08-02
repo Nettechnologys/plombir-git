@@ -187,7 +187,16 @@ pub async fn register(
         ..Default::default()
     };
 
-    let user = user_ops::create(db, model).await?;
+    let user = user_ops::create(db, model).await.map_err(|error| {
+        // The two lookups above keep their precise sequential messages.  A
+        // concurrent registration can still lose the gap before this insert;
+        // that is the same client-correctable outcome, not an outage.
+        if rg_db::is_unique_violation_anyhow(&error) {
+            crate::error::invalid_request("username or email is already registered")
+        } else {
+            error
+        }
+    })?;
     let token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
 
     Ok(AuthResponse {
