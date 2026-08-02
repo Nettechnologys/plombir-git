@@ -156,13 +156,10 @@ pub async fn register(
     validate_username(username)?;
 
     // ── Email validation ─────────────────────────────────────────
-    match email.split_once('@') {
-        Some((local, domain)) if !local.is_empty() && !domain.is_empty() => {}
-        _ => {
-            return Err(crate::error::invalid_request(
-                "email must contain '@' with a non-empty local and domain part",
-            ))
-        }
+    if !valid_email(email) {
+        return Err(crate::error::invalid_request(
+            "email must contain '@' with a non-empty local and domain part",
+        ));
     }
 
     // ── Password validation ──────────────────────────────────────
@@ -685,7 +682,11 @@ async fn resolve_raced_ldap_identity(
     Ok(None)
 }
 
-fn valid_email(email: &str) -> bool {
+/// The shape every stored address must have, wherever it enters ForgeKeep:
+/// self-registration, an LDAP directory entry, or an SSO provider's profile.
+/// One rule in one place — the three call sites used to spell it out
+/// separately, and an address is an account lookup key in all three.
+pub(crate) fn valid_email(email: &str) -> bool {
     matches!(email.split_once('@'), Some((local, domain)) if !local.is_empty() && !domain.is_empty())
 }
 

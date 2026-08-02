@@ -442,10 +442,7 @@ pub async fn callback(
     let user_info =
         rg_core::auth::sso::oauth2_fetch_user_info(&config, &token_response.access_token)
             .await
-            .map_err(|e| {
-                tracing::error!("SSO user info error: {}", e);
-                AppError::bad_request("failed to fetch user info")
-            })?;
+            .map_err(|error| sso_user_info_error(&provider.slug, &error))?;
 
     // ── Find or create user ──────────────────────────────────────
     let user_id =
@@ -738,10 +735,35 @@ pub async fn unlink_oauth_account(
 
 // ── User helpers ─────────────────────────────────────────────────
 
+/// Classify a failed user-info fetch.
+///
+/// "The provider is unreachable" and "the provider answered, and its answer
+/// identifies nobody" are two different things to whoever is signing in: the
+/// first is ours to fix, the second is theirs, and the fix (grant the
+/// `user:email` scope, confirm the address) is only actionable if we say which
+/// one it was. Both are still `400` — the request is what cannot proceed.
+fn sso_user_info_error(provider_slug: &str, error: &anyhow::Error) -> AppError {
+    if let Some(defect) = error.downcast_ref::<rg_core::auth::sso::SsoIdentityDefect>() {
+        tracing::warn!(
+            provider = %provider_slug,
+            defect = ?defect,
+            "SSO profile carries no usable identity key; refusing the login"
+        );
+        return AppError::bad_request(defect.message());
+    }
+
+    tracing::error!(
+        provider = %provider_slug,
+        error = %format!("{error:#}"),
+        "SSO user info error"
+    );
+    AppError::bad_request("failed to fetch user info")
+}
+
 async fn find_or_create_sso_user(
     state: &AppState,
     provider_slug: &str,
-    user_info: &rg_core::auth::sso::SsoUserInfo,
+    user_info: &rg_core::auth::sso::SsoIdentity,
     token_response: &rg_core::auth::sso::OAuth2TokenResponse,
 ) -> Result<i64, AppError> {
     let db = &state.db;
@@ -789,7 +811,13 @@ async fn find_or_create_sso_user(
         return Ok(oauth.user_id);
     }
 
-    // Check if user with this email already exists
+    // Check if user with this email already exists.
+    //
+    // This is a *merge*: whoever holds this address gets the new provider link
+    // attached to their account. `SsoIdentity` is what makes it safe to run —
+    // an absent email would arrive here as `""` and match whichever account was
+    // provisioned with it first, which is a login into a stranger's account
+    // rather than a merge.
     let user_id = match rg_db::ops::user_ops::find_by_email(db, &user_info.email)
         .await
         .map_err(AppError::from)?
@@ -865,7 +893,7 @@ const SSO_PROVISION_ATTEMPTS: usize = 3;
 async fn provision_sso_user(
     db: &sea_orm::DatabaseConnection,
     provider_slug: &str,
-    user_info: &rg_core::auth::sso::SsoUserInfo,
+    user_info: &rg_core::auth::sso::SsoIdentity,
 ) -> Result<i64, AppError> {
     for attempt in 1..=SSO_PROVISION_ATTEMPTS {
         let username = generate_unique_username(db, &user_info.provider_username)
@@ -926,10 +954,15 @@ async fn provision_sso_user(
 /// provider_user_id)` — precisely the row this callback was going to write —
 /// and the email is the key the non-racing path merges on. Nothing else
 /// (username, display name) identifies the person, so nothing else is consulted.
+///
+/// Both are read off an [`SsoIdentity`](rg_core::auth::sso::SsoIdentity), so
+/// neither can be the empty string here. That matters more on this path than on
+/// the ordinary one: it runs *after* a UNIQUE violation, where an empty key
+/// would reliably match the row that just caused it.
 async fn resolve_raced_sso_user(
     db: &sea_orm::DatabaseConnection,
     provider_slug: &str,
-    user_info: &rg_core::auth::sso::SsoUserInfo,
+    user_info: &rg_core::auth::sso::SsoIdentity,
 ) -> Result<Option<i64>, AppError> {
     if let Some(oauth) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
         db,
@@ -993,14 +1026,21 @@ mod tests {
     /// which `clippy::await_holding_lock` denies for a `std` mutex.
     static PROVISION_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn sso_user_info(uid: &str, username: &str, email: &str) -> rg_core::auth::sso::SsoUserInfo {
+    fn sso_profile(uid: &str, username: &str, email: &str) -> rg_core::auth::sso::SsoUserInfo {
         rg_core::auth::sso::SsoUserInfo {
             provider_user_id: uid.to_string(),
             provider_username: username.to_string(),
             email: email.to_string(),
+            email_verified: None,
             display_name: Some("Alice".to_string()),
             avatar_url: None,
         }
+    }
+
+    fn sso_user_info(uid: &str, username: &str, email: &str) -> rg_core::auth::sso::SsoIdentity {
+        sso_profile(uid, username, email)
+            .into_identity()
+            .expect("the fixture profile carries usable identity keys")
     }
 
     async fn migrated_db() -> sea_orm::DatabaseConnection {
