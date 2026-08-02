@@ -47,19 +47,30 @@ pub async fn delete(db: &DatabaseConnection, user_id: i64, id: i64) -> Result<bo
 }
 
 /// Persist an updated passkey (e.g. after the signature counter advanced) and
-/// stamp `last_used_at`.
+/// stamp `last_used_at`. Returns false when no row with that id exists.
+///
+/// The absent row is a `false`, not a `DbErr`, on purpose: the caller is the
+/// login path, and "this credential is no longer registered" and "the write
+/// failed" are two different answers there — one ends the ceremony, the other
+/// is a retryable outage. Folding the first into an error left the caller
+/// unable to tell them apart, so it swallowed both.
+///
+/// A single `UPDATE ... WHERE id = ?` rather than read-then-write, so the row
+/// cannot be deleted between the two statements and turn a concurrent
+/// revocation into `RecordNotUpdated`.
 pub async fn touch_and_update(
     db: &DatabaseConnection,
     id: i64,
     passkey_json: &str,
-) -> Result<(), DbErr> {
-    let existing = Entity::find_by_id(id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::RecordNotFound(format!("passkey {id}")))?;
-    let mut am: passkey_credential::ActiveModel = existing.into();
-    am.passkey = Set(passkey_json.to_string());
-    am.last_used_at = Set(Some(chrono::Utc::now()));
-    am.update(db).await?;
-    Ok(())
+) -> Result<bool, DbErr> {
+    let res = Entity::update_many()
+        .set(passkey_credential::ActiveModel {
+            passkey: Set(passkey_json.to_string()),
+            last_used_at: Set(Some(chrono::Utc::now())),
+            ..Default::default()
+        })
+        .filter(passkey_credential::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected > 0)
 }

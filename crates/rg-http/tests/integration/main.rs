@@ -88,6 +88,7 @@ mod org_tests;
 mod package_failure_status_tests;
 mod package_format_e2e_tests;
 mod package_permission_tests;
+mod passkey_counter_persistence_tests;
 mod password_hash_failure_status_tests;
 mod password_reset_mfa_tests;
 mod pat_api_tests;

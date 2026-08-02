@@ -616,6 +616,8 @@ pub struct PasskeyLoginResponse {
     responses(
         (status = 200, description = "Login successful", body = PasskeyLoginResponse),
         (status = 401, description = "Missing challenge, invalid credential, or locked account", body = serde_json::Value),
+        (status = 500, description = "The advanced signature counter could not be serialized or stored", body = serde_json::Value),
+        (status = 503, description = "The advanced signature counter could not be stored: the database is unreachable", body = serde_json::Value),
     ),
 )]
 pub async fn login_finish(
@@ -648,19 +650,58 @@ pub async fn login_finish(
     })?;
 
     // Advance the stored signature counter for the credential that just signed.
+    //
+    // This is ceremony material, not bookkeeping. The counter and backup state
+    // the authenticator just reported are exactly what the *next* assertion is
+    // checked against to detect a cloned or replayed credential, so a login
+    // whose new counter we could not store is an incomplete ceremony. Every
+    // failure below therefore fails the login: issuing a token for state we
+    // did not keep is the one outcome that must not happen.
     let matched_id = wa::credential_id_b64(result.cred_id());
-    if let Some((model, mut passkey)) = load_passkeys(&state, user.id)
+    let (model, mut passkey) = load_passkeys(&state, user.id)
         .await?
         .into_iter()
         .find(|(m, _)| m.credential_id == matched_id)
-    {
-        passkey.update_credential(&result);
-        let json = wa::passkey_to_json(&passkey).unwrap_or(model.passkey.clone());
-        if let Err(error) =
-            rg_db::ops::passkey_credential_ops::touch_and_update(&state.db, model.id, &json).await
-        {
-            tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to update passkey after login");
-        }
+        .ok_or_else(|| {
+            // The assertion verified against the challenge's allow-list, so the
+            // credential was registered when the ceremony began. It is gone now:
+            // revoked mid-flight, or its stored blob no longer parses (see
+            // `load_passkeys`). Either way it is no longer a credential this
+            // account can be signed in with.
+            tracing::warn!(
+                user_id = user.id,
+                "passkey assertion verified against a credential that is no longer usable"
+            );
+            AppError::unauthorized("passkey authentication failed")
+        })?;
+    if passkey.update_credential(&result).is_none() {
+        // `update_credential` answers `None` only when the credential id inside
+        // the stored blob differs from the one that signed — which the row we
+        // just matched by `credential_id` says it should not. The column and
+        // the blob have diverged, and the counter we would write back is not
+        // the one that just advanced.
+        tracing::error!(
+            user_id = user.id,
+            passkey_id = model.id,
+            "stored passkey does not carry the credential id its row is indexed by"
+        );
+        return Err(AppError::internal(
+            "stored passkey diverges from its credential id",
+        ));
+    }
+    // No fallback to the row's previous JSON here: re-storing that would write
+    // back the *pre-assertion* counter and report success for it.
+    let json = wa::passkey_to_json(&passkey).map_err(AppError::from)?;
+    let stored = rg_db::ops::passkey_credential_ops::touch_and_update(&state.db, model.id, &json)
+        .await
+        .map_err(AppError::from)?;
+    if !stored {
+        tracing::warn!(
+            user_id = user.id,
+            passkey_id = model.id,
+            "passkey row disappeared before its advanced counter could be stored"
+        );
+        return Err(AppError::unauthorized("passkey authentication failed"));
     }
 
     // Record the successful login the same way the MFA path does.
