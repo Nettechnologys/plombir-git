@@ -1,0 +1,248 @@
+//! Whether this instance accepts self-service registrations at all.
+//!
+//! `POST /users/register` used to be unconditional: the only thing standing
+//! between a public instance and an account farm was `[rate_limit].auth_max`,
+//! which is a throttle (10 accounts a minute, indefinitely) and not a refusal.
+//! An instance meant for two people has to be able to say "no new accounts from
+//! outside", and until this module existed there was no way to say it.
+//!
+//! Two things this mode deliberately is **not**:
+//!
+//! * **Not a bool.** `[auth].registration` is a string so that `"invite"` can
+//!   join `"open"` / `"closed"` later without breaking every config file that
+//!   already spells the setting out. Self-service sign-up is a product feature
+//!   with more than two states, not a stopgap flag for launch week.
+//! * **Not a gate on LDAP / SSO auto-provision.** Those channels create accounts
+//!   too (`forgekeep_auth_events_total{event="provision"}`), but the operator
+//!   who wired a directory or an identity provider into this instance has
+//!   already decided who may have an account there — the answer lives in the
+//!   provider, not here. Closing self-service registration must not
+//!   simultaneously lock out a whole company's directory; that would be a
+//!   separate switch with a separate decision behind it.
+
+use anyhow::Result;
+use sea_orm::DatabaseConnection;
+
+/// Serialises the bootstrap registration on a closed instance.
+///
+/// The window is narrow but real: between "the table is empty" and "the first
+/// row is committed", every concurrent request sees an empty table. Without
+/// this, a closed instance being probed at the moment an operator initialises
+/// it hands out as many accounts as the rate limiter allows through, not one.
+/// Held only on the closed-mode path, and only until the instance has its first
+/// account — after that the count check refuses before anything else happens.
+static BOOTSTRAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How this instance answers `POST /users/register`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RegistrationMode {
+    /// Anyone who can reach the endpoint may create an account (the historical
+    /// behaviour, and still the default so an existing deployment that upgrades
+    /// does not silently lose its sign-up page).
+    #[default]
+    Open,
+    /// Nobody may create an account through the endpoint — except the very
+    /// first one, on an instance that has never had a user. See
+    /// [`authorize`].
+    Closed,
+}
+
+impl RegistrationMode {
+    /// The values `[auth].registration` / `FORGEKEEP_REGISTRATION` accept.
+    pub const ACCEPTED: [&'static str; 2] = ["open", "closed"];
+
+    /// Parse a configured value, case- and whitespace-insensitively.
+    ///
+    /// Returns the accepted vocabulary in the error rather than falling back to
+    /// a default: an operator who writes `registration = "close"` is asking for
+    /// a *closed* instance, and answering that with a silently open one is the
+    /// exact failure this setting exists to prevent.
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            other => Err(format!(
+                "expected one of {} (got {other:?})",
+                Self::ACCEPTED
+                    .iter()
+                    .map(|mode| format!("\"{mode}\""))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            )),
+        }
+    }
+
+    /// The configured spelling, for logs and round-tripping.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+}
+
+/// Permission to run one self-service registration.
+///
+/// Keep it alive across the registration itself: on a closed instance it
+/// carries the bootstrap lock, and dropping it early re-opens the race the lock
+/// is there to close.
+pub struct RegistrationPermit {
+    _bootstrap: Option<tokio::sync::MutexGuard<'static, ()>>,
+}
+
+/// Decide whether a self-service registration may proceed **before** the
+/// request costs anything — no password hashing, no row written.
+///
+/// * `Ok(Some(permit))` — proceed, holding `permit` until the registration is
+///   done.
+/// * `Ok(None)` — refuse; the instance is closed and already has accounts.
+/// * `Err(_)` — the question could not be answered. The caller must turn this
+///   into a 5xx, never into a registration: a database that cannot be counted
+///   must not be read as "no users yet, let everyone in".
+pub async fn authorize(
+    db: &DatabaseConnection,
+    mode: RegistrationMode,
+) -> Result<Option<RegistrationPermit>> {
+    match mode {
+        RegistrationMode::Open => Ok(Some(RegistrationPermit { _bootstrap: None })),
+        RegistrationMode::Closed => {
+            // A closed instance still has to be initialisable — otherwise the
+            // setting can only be turned on *after* the first account exists,
+            // which is precisely the window an operator wants closed.
+            let guard = BOOTSTRAP_LOCK.lock().await;
+            if rg_db::ops::user_ops::count_all(db).await? == 0 {
+                Ok(Some(RegistrationPermit {
+                    _bootstrap: Some(guard),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_two_documented_spellings_parse() {
+        assert_eq!(RegistrationMode::parse("open"), Ok(RegistrationMode::Open));
+        assert_eq!(
+            RegistrationMode::parse("closed"),
+            Ok(RegistrationMode::Closed)
+        );
+        assert_eq!(
+            RegistrationMode::parse("  CLOSED \n"),
+            Ok(RegistrationMode::Closed)
+        );
+    }
+
+    /// The dangerous direction: a typo must not resolve to `open`.
+    #[test]
+    fn an_unrecognised_value_is_an_error_naming_the_vocabulary() {
+        let err = RegistrationMode::parse("close").unwrap_err();
+        assert!(err.contains("\"open\""), "no vocabulary: {err}");
+        assert!(err.contains("\"closed\""), "no vocabulary: {err}");
+        assert!(err.contains("close"), "does not echo the input: {err}");
+
+        assert!(RegistrationMode::parse("").is_err());
+        assert!(RegistrationMode::parse("true").is_err());
+    }
+
+    #[test]
+    fn the_default_is_open_so_an_upgrade_changes_nothing() {
+        assert_eq!(RegistrationMode::default(), RegistrationMode::Open);
+        assert!(!RegistrationMode::default().is_closed());
+        assert_eq!(RegistrationMode::Closed.as_str(), "closed");
+    }
+
+    async fn migrated_db() -> DatabaseConnection {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect test database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn an_open_instance_never_touches_the_database() {
+        let db = migrated_db().await;
+        assert!(authorize(&db, RegistrationMode::Open)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_closed_instance_admits_the_first_account_and_then_nobody() {
+        let db = migrated_db().await;
+
+        let permit = authorize(&db, RegistrationMode::Closed)
+            .await
+            .expect("the count must be readable");
+        assert!(
+            permit.is_some(),
+            "an empty closed instance must be initialisable"
+        );
+        drop(permit);
+
+        super::super::service::register(
+            &db,
+            "founder",
+            "founder@example.com",
+            "Qz7$wRtm",
+            "secret",
+        )
+        .await
+        .expect("bootstrap registration");
+
+        assert!(
+            authorize(&db, RegistrationMode::Closed)
+                .await
+                .unwrap()
+                .is_none(),
+            "the bootstrap window must close behind the first account"
+        );
+    }
+
+    /// A tombstoned account is still an account: the window is "this instance
+    /// has never had a user", not "it has none right now". Nothing soft-deletes
+    /// a user today (see `rg_db::entities::user::Model::is_usable`), which is
+    /// exactly why this is asserted now rather than discovered later.
+    #[tokio::test]
+    async fn a_soft_deleted_account_does_not_re_open_the_bootstrap_window() {
+        use sea_orm::ActiveModelTrait;
+
+        let db = migrated_db().await;
+        let user = super::super::service::register(
+            &db,
+            "founder",
+            "founder@example.com",
+            "Qz7$wRtm",
+            "secret",
+        )
+        .await
+        .expect("bootstrap registration");
+
+        let model = rg_db::ops::user_ops::find_by_id(&db, user.user_id)
+            .await
+            .expect("read back the founder")
+            .expect("the founder exists");
+        let mut tombstoned: rg_db::entities::user::ActiveModel = model.into();
+        tombstoned.deleted_at = sea_orm::Set(Some(chrono::Utc::now()));
+        tombstoned.update(&db).await.expect("tombstone the founder");
+
+        assert!(
+            authorize(&db, RegistrationMode::Closed)
+                .await
+                .unwrap()
+                .is_none(),
+            "a tombstone must not hand the instance back to the next stranger"
+        );
+    }
+}

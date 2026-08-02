@@ -132,6 +132,30 @@ directory, or take a hot SQLite backup with the commands in the
 | `FORGEKEEP_ENCRYPTION_KEY` | Strongly recommended | falls back to the JWT secret |
 | `FORGEKEEP_CORS_ORIGINS` | No | unset |
 | `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
+| `FORGEKEEP_REGISTRATION` | No (set it before exposing the port) | `open` — `[auth].registration` |
+
+### Who may create an account
+
+`FORGEKEEP_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env
+var wins) makes `POST /api/v1/users/register` answer `403` before it hashes a
+password or writes anything. Leave it at `open` and the endpoint accepts anyone
+who can reach it — `[rate_limit].auth_max` throttles that to ten accounts a
+minute but never refuses, so it is not a substitute on an instance meant for a
+handful of people.
+
+Two things `closed` still admits, on purpose:
+
+* **The first account.** An instance that has never had a user accepts exactly
+  one registration, otherwise a closed instance could never be initialised. Do
+  that registration before the port is reachable by anyone else — the window is
+  open until it is used.
+* **LDAP / SSO auto-provision.** First-login provisioning is a separate channel
+  (`forgekeep_auth_events_total{event="provision"}`), and the operator who wired
+  a directory or identity provider into this instance already decided who may
+  have an account there.
+
+A value neither `open` nor `closed` fails the start with the accepted spellings
+named, rather than booting an instance you believe is closed.
 
 ### Secrets and rotation
 

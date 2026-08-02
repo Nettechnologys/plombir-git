@@ -90,6 +90,13 @@ pub struct AppState {
     pub external_runners: bool,
     /// Whether imageless CI jobs may run as a shell on the host (default false).
     pub allow_host_runner: bool,
+    /// Whether `POST /users/register` accepts new accounts from outside.
+    /// Defaults to [`RegistrationMode::Open`] — the historical behaviour — and
+    /// is the *only* switch that closes it: `[rate_limit].auth_max` throttles
+    /// registration spam but never refuses it. LDAP/SSO auto-provision is a
+    /// separate channel this does not touch; see
+    /// [`rg_core::user::registration`].
+    pub registration: rg_core::user::registration::RegistrationMode,
     pub rate_limiter: rate_limit::RateLimiter,
     pub notification_hub: ws::NotificationHub,
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
@@ -281,6 +288,9 @@ pub struct HttpServerConfig {
     /// `false`: on shared/public instances every job must use a Docker sandbox
     /// or a dedicated runner so pushed CI config cannot execute on the server.
     pub allow_host_runner: bool,
+    /// Whether self-service registration is accepted. See
+    /// [`AppState::registration`].
+    pub registration: rg_core::user::registration::RegistrationMode,
     /// Rate limit: max requests per window (0 = disabled).
     pub rate_limit_max: u32,
     /// Rate limit: window duration in seconds.
@@ -414,6 +424,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         docker_enabled: config.docker_enabled,
         external_runners: config.external_runners,
         allow_host_runner: config.allow_host_runner,
+        registration: config.registration,
         rate_limiter: rate_limiter.clone(),
         notification_hub: notification_hub.clone(),
         smtp_config: config.smtp_config,

@@ -94,6 +94,11 @@ pub struct StateOverrides {
     /// still be open. Production samples every 30s; a test that has to observe
     /// the socket close cannot sit through that.
     pub ws_session_recheck_secs: Option<u64>,
+    /// Closes self-service registration for this state.
+    ///
+    /// The default is `Open`, which is what almost every test needs: the
+    /// harness's own `register_user` helper is how fixtures get accounts.
+    pub registration: Option<rg_core::user::registration::RegistrationMode>,
     /// Replaces this state's provenance signing identity.
     ///
     /// The default is derived from [`TEST_INSTANCE_KEY_SECRET`] rather than
@@ -166,6 +171,7 @@ pub fn build_test_app_state_with(
         docker_enabled: false,
         external_runners: false,
         allow_host_runner: false,
+        registration: overrides.registration.unwrap_or_default(),
         rate_limiter: rg_http::rate_limit::RateLimiter::new(10000, 60),
         notification_hub: rg_http::ws::NotificationHub::new(),
         smtp_config: None,

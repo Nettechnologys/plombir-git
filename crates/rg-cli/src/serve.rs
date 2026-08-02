@@ -192,6 +192,37 @@ fn env_secret(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Resolve whether this instance accepts self-service registrations:
+/// `FORGEKEEP_REGISTRATION` > `[auth].registration` > `"open"`.
+///
+/// A value neither source recognises is a **hard startup error**. Every other
+/// unparseable knob in this file behaves the same way, and this one has the
+/// sharpest edge: an operator who writes `registration = "close"` is asking for
+/// a closed instance, and quietly booting an open one would leave registration
+/// wide open on exactly the deployment that tried to shut it.
+///
+/// An empty / whitespace-only env value counts as unset (the `.env` convention
+/// [`env_secret`] documents), so a commented-out line does not fail the start.
+/// An empty value *in the config file* is a typo and is rejected — a TOML key
+/// you wrote deliberately means something.
+fn resolve_registration_mode(
+    cfg: Option<&crate::config::ConfigFile>,
+    env_value: Option<&str>,
+) -> anyhow::Result<rg_core::user::registration::RegistrationMode> {
+    use rg_core::user::registration::RegistrationMode;
+
+    if let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) {
+        return RegistrationMode::parse(raw)
+            .map_err(|reason| anyhow::anyhow!("env FORGEKEEP_REGISTRATION: {reason}"));
+    }
+
+    match cfg.and_then(|config| config.auth.registration.as_deref()) {
+        Some(raw) => RegistrationMode::parse(raw)
+            .map_err(|reason| anyhow::anyhow!("config `[auth].registration`: {reason}")),
+        None => Ok(RegistrationMode::default()),
+    }
+}
+
 /// Resolve the pair of secrets every server-side path needs: the one that
 /// *signs* and the one that *encrypts*. Shared with the one-shot subcommands
 /// that also have to open at-rest data, so "which key opens this database" has
@@ -507,6 +538,10 @@ pub(crate) async fn run_serve(
             .as_ref()
             .and_then(|c| c.ci.allow_host_runner)
             .unwrap_or(false);
+    let resolved_registration = resolve_registration_mode(
+        cfg.as_ref(),
+        std::env::var("FORGEKEEP_REGISTRATION").ok().as_deref(),
+    )?;
     // Env var wins over config file; both default off (opt-in).
     let resolved_attestation_enabled = match std::env::var("FORGEKEEP_ATTESTATION_ENABLED") {
         Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
@@ -837,6 +872,16 @@ pub(crate) async fn run_serve(
 
     validate_config(&resolved_auth_secrets.jwt_secret, &repo_root, &tls_config)?;
 
+    // Logged after the subscriber is up, so the one line an operator greps for
+    // when a colleague "cannot sign up" actually reaches the log.
+    if resolved_registration.is_closed() {
+        tracing::info!(
+            "self-service registration is CLOSED ([auth].registration): POST /users/register \
+             refuses with 403. The first account on an empty instance is still admitted, and \
+             LDAP/SSO auto-provision is unaffected."
+        );
+    }
+
     // One CI engine and one WebSocket hub for the whole process: the SSH
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
     // `push` events to the very clients the HTTP server's sockets belong to, so
@@ -857,6 +902,7 @@ pub(crate) async fn run_serve(
         docker_enabled: resolved_docker,
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,
+        registration: resolved_registration,
         rate_limit_max: resolved_rate_limit_max,
         rate_limit_window_secs: resolved_rate_limit_window,
         rate_limit_trusted_proxies: resolved_rate_limit_trusted_proxies,
@@ -960,6 +1006,63 @@ mod serve_tests {
             config.auth.key_file.as_deref(),
             Some("/srv/forgekeep/encryption_key")
         );
+    }
+
+    /// `[auth].registration` has to reach the model for the same
+    /// `deny_unknown_fields` reason, and has to resolve in the documented
+    /// order: env > config file > `"open"`.
+    #[test]
+    fn the_registration_mode_resolves_env_then_config_then_open() {
+        use rg_core::user::registration::RegistrationMode;
+
+        let closed: ConfigFile = toml::from_str("[auth]\nregistration = \"closed\"\n")
+            .expect("[auth].registration must be part of the config model");
+        assert_eq!(closed.auth.registration.as_deref(), Some("closed"));
+
+        // No config file, no env → the historical behaviour survives an upgrade.
+        assert_eq!(
+            super::resolve_registration_mode(None, None).unwrap(),
+            RegistrationMode::Open
+        );
+        // Config file alone.
+        assert_eq!(
+            super::resolve_registration_mode(Some(&closed), None).unwrap(),
+            RegistrationMode::Closed
+        );
+        // Env wins over the file, in both directions.
+        assert_eq!(
+            super::resolve_registration_mode(Some(&closed), Some("open")).unwrap(),
+            RegistrationMode::Open
+        );
+        let open: ConfigFile = toml::from_str("[auth]\nregistration = \"open\"\n").unwrap();
+        assert_eq!(
+            super::resolve_registration_mode(Some(&open), Some("CLOSED")).unwrap(),
+            RegistrationMode::Closed
+        );
+        // A blank env value is "not set", not "the empty mode" — same `.env`
+        // convention the secrets follow.
+        assert_eq!(
+            super::resolve_registration_mode(Some(&closed), Some("  ")).unwrap(),
+            RegistrationMode::Closed
+        );
+    }
+
+    /// The dangerous direction, and the reason this is a hard error: a typo must
+    /// never boot an instance that the operator believes is closed.
+    #[test]
+    fn an_unrecognised_registration_mode_fails_the_start() {
+        let typo: ConfigFile = toml::from_str("[auth]\nregistration = \"close\"\n").unwrap();
+
+        let err = super::resolve_registration_mode(Some(&typo), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[auth].registration"), "no source: {err}");
+        assert!(err.contains("\"closed\""), "no vocabulary: {err}");
+
+        let err = super::resolve_registration_mode(None, Some("disabled"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FORGEKEEP_REGISTRATION"), "no source: {err}");
     }
 
     /// Omitting it is the supported (and most common) state: existing

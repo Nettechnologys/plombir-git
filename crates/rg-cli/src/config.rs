@@ -89,6 +89,15 @@ pub(crate) struct AuthConfig {
     /// supplied. Kept next to the SSH host key by default so the whole instance
     /// state remains in one backupable directory.
     pub(crate) key_file: Option<String>,
+    /// Whether `POST /users/register` accepts new accounts: `"open"` (the
+    /// default, and the historical behaviour) or `"closed"`.
+    ///
+    /// A string rather than a bool so a third mode (`"invite"`) can be added
+    /// without breaking every config file that already spells this out —
+    /// self-service sign-up is a product decision with more than two states.
+    /// Also settable as `FORGEKEEP_REGISTRATION`, which wins; an unrecognised
+    /// value fails the start rather than falling back to `"open"`.
+    pub(crate) registration: Option<String>,
 }
 
 /// The SSH host-key location used by `serve` without a configured

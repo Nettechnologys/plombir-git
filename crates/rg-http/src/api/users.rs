@@ -135,6 +135,8 @@ pub struct UserProfile {
     responses(
         (status = 201, description = "User registered successfully", body = AuthResponse),
         (status = 400, description = "Invalid input", body = serde_json::Value),
+        (status = 403, description = "Self-service registration is closed on this instance", body = serde_json::Value),
+        (status = 503, description = "The database is unreachable", body = serde_json::Value),
     )
 )]
 pub async fn register(
@@ -142,15 +144,49 @@ pub async fn register(
     headers: HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    match rg_core::user::service::register(
+    // Ask before spending anything: a closed instance answers 403 here, ahead
+    // of the password hash (deliberately expensive) and ahead of every row this
+    // request would otherwise write.
+    let permit = match rg_core::user::registration::authorize(&state.db, state.registration).await {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            crate::metrics::recorder::auth_event("register", "closed");
+            tracing::info!(
+                username = %body.username,
+                "registration refused: self-service registration is closed on this instance"
+            );
+            return AppError::Forbidden(
+                "self-service registration is closed on this instance; ask an administrator for an account"
+                    .to_string(),
+            )
+            .into_response();
+        }
+        Err(error) => {
+            // Whether registration is allowed could not be *read*. Failing open
+            // here would turn a database blip into the very thing the setting
+            // forbids, so this is ours and it is a 5xx.
+            crate::metrics::recorder::auth_event("register", "failure");
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "could not read the registration policy; refusing to create an account"
+            );
+            return AppError::from(error).into_response();
+        }
+    };
+
+    let outcome = rg_core::user::service::register(
         &state.db,
         &body.username,
         &body.email,
         &body.password,
         &state.jwt_secret,
     )
-    .await
-    {
+    .await;
+    // The bootstrap permit has done its job the moment the row is committed;
+    // holding it past this point would serialise nothing but the audit write.
+    drop(permit);
+
+    match outcome {
         Ok(resp) => {
             // Record audit log
             let details = serde_json::json!({

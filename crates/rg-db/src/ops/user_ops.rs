@@ -97,6 +97,22 @@ pub async fn count_active(db: &DatabaseConnection) -> Result<u64> {
         .context("db: count active users")
 }
 
+/// Count every user row this instance has ever had, tombstones included.
+///
+/// The one caller that must **not** use [`count_active`] is the bootstrap
+/// window of a closed instance: `[auth].registration = "closed"` still lets the
+/// very first account through, otherwise a closed instance could never be
+/// initialised. Keyed on the active count, an instance whose only account was
+/// soft-deleted would silently re-open self-service registration to the next
+/// stranger who found the URL. "Has never had a user" is the property that
+/// window is actually about.
+pub async fn count_all(db: &DatabaseConnection) -> Result<u64> {
+    UserEntity::find()
+        .count(db)
+        .await
+        .context("db: count all users")
+}
+
 /// List all users with optional pagination.
 pub async fn list_users(
     db: &DatabaseConnection,

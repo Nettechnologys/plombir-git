@@ -40,6 +40,23 @@ jwt_secret = "change-me-in-production"
 # `forgekeep rotate-instance-key --yes`, which permanently invalidates every
 # attestation signed with the previous key.
 
+# Whether POST /api/v1/users/register accepts new accounts from outside:
+#   "open"   — anyone who can reach the endpoint may sign up (the default).
+#   "closed" — the endpoint answers 403 before hashing a password or touching
+#              the database.
+# Also settable as FORGEKEEP_REGISTRATION, which wins. An unrecognised value
+# (e.g. "close") fails the start instead of quietly leaving the instance open.
+#
+# [rate_limit].auth_max below is NOT a substitute: it throttles registration to
+# ten accounts a minute, forever. This is the setting that refuses.
+#
+# Two things "closed" deliberately still allows:
+#  * the FIRST account, on an instance that has never had a user — otherwise a
+#    closed instance could never be initialised;
+#  * LDAP / SSO auto-provision on first login, because the operator who wired a
+#    directory into this instance already decided who may have an account.
+registration = "open"
+
 [webhooks]
 # Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
 # external webhooks (POST /api/v1/repos/{owner}/{name}/webhooks/external/*).

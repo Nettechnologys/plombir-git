@@ -41,6 +41,14 @@ url = "sqlite:///data/forgekeep.db?mode=rwc"
 # or vault-backed deployments and wins over the file.
 # encryption_key = "..."
 # key_file = "/data/encryption_key"
+#
+# Whether strangers may create accounts on this instance. "closed" makes
+# POST /api/v1/users/register answer 403 — the first account (on an empty
+# instance) and LDAP/SSO auto-provision still go through. [rate_limit].auth_max
+# below only throttles sign-up; this is what refuses it. Set it to "closed"
+# before exposing the HTTP port to anything you do not control.
+# Also settable as FORGEKEEP_REGISTRATION in deploy/.env, which wins.
+registration = "open"
 
 [ci]
 # Run CI jobs in Docker containers. Requires mounting the host Docker socket

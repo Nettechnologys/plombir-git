@@ -104,6 +104,7 @@ mod pull_request_ci_tests;
 mod push_hook_drain_tests;
 mod pypi_simple_index_tests;
 mod rate_limit_mounted_tests;
+mod registration_toggle_tests;
 mod registry_lockout_tests;
 mod registry_mfa_tests;
 mod release_attestation_tests;
