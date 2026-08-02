@@ -426,6 +426,134 @@ async fn concurrent_star_toggles_all_succeed_and_leave_a_coherent_counter() {
     );
 }
 
+/// card_9dbabcda3c19: tagged manifest writes have two distinct UNIQUE keys.
+/// Two first pushes of `latest` can both observe no tag, but the loser must
+/// recover only when the winner occupies that same tag.  A digest collision at
+/// another tag is not interchangeable with this race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_manifest_tag_pushes_all_succeed_and_leave_one_tag_row() {
+    let (db, _temp) = setup("manifest-tag").await;
+    let (user_id, repo_id) = fixture(&db).await;
+    let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(&db, repo_id, "registry", user_id)
+        .await
+        .expect("create the OCI repository the tag belongs to");
+
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            let digest = format!("sha256:{i:064x}");
+            let manifest_json = format!(r#"{{"race_writer":{i}}}"#);
+            rg_db::ops::oci_ops::upsert_tag_manifest(
+                &db,
+                oci_repo.id,
+                "latest",
+                &digest,
+                "application/vnd.docker.distribution.manifest.v2+json",
+                manifest_json.len() as i64,
+                &manifest_json,
+                2,
+                Some(user_id),
+                &[],
+            )
+            .await
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "OCI manifest tag push");
+
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM oci_manifest WHERE oci_repository_id = {} AND tag = 'latest'",
+                oci_repo.id
+            ),
+        )
+        .await,
+        1,
+        "concurrent pushes must leave exactly one row for one tag",
+    );
+
+    let winner = rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "latest")
+        .await
+        .expect("read the winning tag")
+        .expect("one tag row remains");
+    assert!(
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .any(|manifest| {
+                manifest.digest == winner.digest && manifest.manifest_json == winner.manifest_json
+            }),
+        "the surviving row must be one complete push, not a fabricated merge",
+    );
+}
+
+/// A digest owned by another tag is a different constraint from a competing
+/// first push of this tag.  It must stay an error: recovering it as a tag race
+/// would silently retag content the caller did not win.
+#[tokio::test]
+async fn a_manifest_digest_conflict_is_not_retried_as_a_tag_conflict() {
+    let (db, _temp) = setup("manifest-digest-conflict").await;
+    let (user_id, repo_id) = fixture(&db).await;
+    let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(&db, repo_id, "registry", user_id)
+        .await
+        .expect("create the OCI repository the tags belong to");
+    let digest = "sha256:already-owned";
+    let first_manifest = r#"{"race_writer":"first"}"#;
+
+    rg_db::ops::oci_ops::upsert_tag_manifest(
+        &db,
+        oci_repo.id,
+        "latest",
+        digest,
+        "application/vnd.docker.distribution.manifest.v2+json",
+        first_manifest.len() as i64,
+        first_manifest,
+        2,
+        Some(user_id),
+        &[],
+    )
+    .await
+    .expect("the initial tag owns the digest");
+
+    let error = rg_db::ops::oci_ops::upsert_tag_manifest(
+        &db,
+        oci_repo.id,
+        "stable",
+        digest,
+        "application/vnd.docker.distribution.manifest.v2+json",
+        first_manifest.len() as i64,
+        first_manifest,
+        2,
+        Some(user_id),
+        &[],
+    )
+    .await
+    .expect_err("a digest owned by another tag is not a successful tag race");
+    assert!(
+        rg_db::is_unique_violation(&error),
+        "the distinct digest key must be returned as its original UNIQUE error: {error}"
+    );
+    assert!(
+        rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "stable")
+            .await
+            .expect("read the rejected tag")
+            .is_none(),
+        "the failed digest collision must not create the requested tag",
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "latest")
+            .await
+            .expect("read the original tag")
+            .expect("the original tag remains")
+            .manifest_json,
+        first_manifest,
+        "the existing digest owner must remain untouched",
+    );
+}
+
 /// The re-read is armed by a UNIQUE violation and nothing else. Each primitive
 /// is given a write that fails on a foreign key instead — SQLite enforces them
 /// (`connect_sqlite` sets `foreign_keys = ON`) — and must still report failure

@@ -818,7 +818,7 @@ async fn a_failed_manifest_tag_lookup_never_falls_through_to_insert() {
     );
 }
 
-/// Moving a tag is all-or-nothing: an INSERT failure must retain the old row.
+/// Moving a tag is all-or-nothing: an UPDATE failure must retain the old row.
 #[tokio::test]
 async fn a_failed_manifest_tag_move_keeps_the_old_tag_live() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -853,7 +853,7 @@ async fn a_failed_manifest_tag_move_keeps_the_old_tag_live() {
         initial.text().await.unwrap()
     );
 
-    let fault = fail_db_writes(&db, "oci_manifest", DbWrite::Insert).await;
+    let fault = fail_db_writes(&db, "oci_manifest", DbWrite::Update).await;
     let failed = put_tag(new_manifest.clone()).await.unwrap();
     assert_eq!(
         failed.status(),

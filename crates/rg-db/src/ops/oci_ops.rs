@@ -246,12 +246,119 @@ pub async fn insert_digest_manifest(
     Ok(outcome)
 }
 
+/// Write a tagged manifest once, reporting whether its INSERT path failed.
+///
+/// The UPDATE comes first so an existing tag is never deleted just to be
+/// replaced. If no row matches, the INSERT can race with another first push;
+/// only that path needs the caller's UNIQUE-conflict classification.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_tag_manifest_once(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    tag: &str,
+    new_digest: &str,
+    new_media_type: &str,
+    new_size: i64,
+    new_manifest_json: &str,
+    new_schema_version: i32,
+    push_by: Option<i64>,
+    referenced_blob_digests: &[String],
+) -> Result<oci_manifest::Model, (DbErr, bool)> {
+    use oci_blob::Entity as Blob;
+    use oci_manifest::Entity as Manifest;
+
+    let transaction = db.begin().await.map_err(|error| (error, false))?;
+    Manifest::update_many()
+        .col_expr(oci_manifest::Column::Digest, Expr::value(new_digest))
+        .col_expr(oci_manifest::Column::MediaType, Expr::value(new_media_type))
+        .col_expr(oci_manifest::Column::Size, Expr::value(new_size))
+        .col_expr(
+            oci_manifest::Column::ManifestJson,
+            Expr::value(new_manifest_json),
+        )
+        .col_expr(
+            oci_manifest::Column::SchemaVersion,
+            Expr::value(new_schema_version),
+        )
+        .col_expr(oci_manifest::Column::PushBy, Expr::value(push_by))
+        .col_expr(oci_manifest::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_manifest::Column::Tag.eq(tag))
+        .exec(&transaction)
+        .await
+        .map_err(|error| (error, false))?;
+
+    // `rows_affected` is not a presence test: MySQL reports zero when all
+    // assigned values were already equal. Read back through this transaction
+    // so an idempotent tag PUT does not fall into INSERT and misclassify its
+    // own tag constraint as a digest conflict.
+    let existing = Manifest::find()
+        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_manifest::Column::Tag.eq(tag))
+        .one(&transaction)
+        .await
+        .map_err(|error| (error, false))?;
+    let started_without_tag = existing.is_none();
+
+    let manifest = if let Some(existing) = existing {
+        existing
+    } else {
+        manifest_model(
+            oci_repo_id,
+            new_digest,
+            Some(tag),
+            new_media_type,
+            new_size,
+            new_manifest_json,
+            new_schema_version,
+            push_by,
+        )
+        .insert(&transaction)
+        .await
+        .map_err(|error| (error, true))?
+    };
+
+    for blob_digest in referenced_blob_digests {
+        let result = Blob::update_many()
+            .col_expr(
+                oci_blob::Column::RefCount,
+                Expr::col(oci_blob::Column::RefCount).add(1),
+            )
+            .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+            .filter(oci_blob::Column::Digest.eq(blob_digest))
+            .exec(&transaction)
+            .await
+            .map_err(|error| (error, started_without_tag))?;
+        if result.rows_affected != 1 {
+            return Err((
+                DbErr::Custom(format!(
+                    "referenced OCI blob {blob_digest} is missing from repository {oci_repo_id}"
+                )),
+                started_without_tag,
+            ));
+        }
+    }
+
+    transaction
+        .commit()
+        .await
+        .map_err(|error| (error, started_without_tag))?;
+    Ok(manifest)
+}
+
 /// Insert a tagged manifest or atomically move an existing tag to it.
 ///
 /// The tag lookup, replacement and blob-reference claims are one database
 /// transaction. A failed lookup must not be treated as an absent tag, and a
 /// failed replacement must leave the old tag live rather than deleting it
 /// before the new row can be written.
+///
+/// Concurrent first pushes need one extra recovery path.  If this transaction
+/// read no tag and lost the INSERT to a UNIQUE constraint, a fresh tag lookup
+/// distinguishes the two unique keys: a row at this tag means another push won
+/// the tag race, so retrying gives this request normal last-writer-wins
+/// semantics.  No tag row means the collision was on the separate digest key,
+/// which must remain an error rather than becoming a fabricated success.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_tag_manifest(
     db: &DatabaseConnection,
@@ -265,56 +372,38 @@ pub async fn upsert_tag_manifest(
     push_by: Option<i64>,
     referenced_blob_digests: &[String],
 ) -> Result<oci_manifest::Model, DbErr> {
-    use oci_blob::Entity as Blob;
-    use oci_manifest::Entity as Manifest;
+    let write_once = || {
+        upsert_tag_manifest_once(
+            db,
+            oci_repo_id,
+            tag,
+            new_digest,
+            new_media_type,
+            new_size,
+            new_manifest_json,
+            new_schema_version,
+            push_by,
+            referenced_blob_digests,
+        )
+    };
 
-    let transaction = db.begin().await?;
-    let existing = Manifest::find()
-        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
-        .filter(oci_manifest::Column::Tag.eq(tag))
-        .one(&transaction)
-        .await?;
+    match write_once().await {
+        Ok(manifest) => Ok(manifest),
+        Err((error, true)) if crate::is_unique_violation(&error) => {
+            // The failed transaction is gone before this query.  PostgreSQL
+            // aborts a transaction after a constraint error, so re-reading in
+            // it would turn a recoverable tag race into another database error.
+            if find_manifest_by_tag(db, oci_repo_id, tag).await?.is_none() {
+                return Err(error);
+            }
 
-    if existing.is_some() {
-        Manifest::delete_many()
-            .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
-            .filter(oci_manifest::Column::Tag.eq(tag))
-            .exec(&transaction)
-            .await?;
-    }
-
-    let manifest = manifest_model(
-        oci_repo_id,
-        new_digest,
-        Some(tag),
-        new_media_type,
-        new_size,
-        new_manifest_json,
-        new_schema_version,
-        push_by,
-    )
-    .insert(&transaction)
-    .await?;
-
-    for blob_digest in referenced_blob_digests {
-        let result = Blob::update_many()
-            .col_expr(
-                oci_blob::Column::RefCount,
-                Expr::col(oci_blob::Column::RefCount).add(1),
-            )
-            .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
-            .filter(oci_blob::Column::Digest.eq(blob_digest))
-            .exec(&transaction)
-            .await?;
-        if result.rows_affected != 1 {
-            return Err(DbErr::Custom(format!(
-                "referenced OCI blob {blob_digest} is missing from repository {oci_repo_id}"
-            )));
+            // A winner at the same tag proves this was the tag constraint,
+            // not the digest constraint.  The retry still has a complete
+            // transaction, so a failed replacement cannot make the tag vanish.
+            write_once().await.map_err(|(retry_error, _)| retry_error)
         }
+        Err((error, _)) => Err(error),
     }
-
-    transaction.commit().await?;
-    Ok(manifest)
 }
 
 // ── OCI Blob ────────────────────────────────────────────────
