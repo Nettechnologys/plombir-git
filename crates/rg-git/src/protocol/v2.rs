@@ -805,21 +805,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
     if needs_acknowledgments(haves, done) {
         // Check which haves we have — synchronously, before any .await
         // CRITICAL: gix::Repository is !Send (contains RefCell), must not cross .await
-        let acked_oids: Vec<String> = {
-            let repo = gix::open(repo_path).ok();
-            let mut acked = Vec::new();
-            for have in haves {
-                if let Some(ref r) = repo {
-                    if let Ok(oid) = gix::ObjectId::from_hex(have.as_bytes()) {
-                        if r.find_object(oid).is_ok() {
-                            acked.push(have.clone());
-                        }
-                    }
-                }
-            }
-            acked
-            // repo dropped here
-        };
+        let acked_oids = acknowledged_haves(repo_path, haves);
 
         if !write_acknowledgments(writer, &acked_oids).await? {
             return Ok(());
@@ -873,6 +859,36 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
         "Sent V2 fetch packfile"
     );
     Ok(())
+}
+
+/// Return the client's `have` objects that are present in the repository.
+///
+/// A repository that cannot be opened cannot answer the common-object question.
+/// Keep the existing best-effort fetch behavior, but make that degraded answer
+/// visible to operators instead of silently treating every `have` as absent.
+fn acknowledged_haves(repo_path: &Path, haves: &[String]) -> Vec<String> {
+    let repo = match gix::open(repo_path) {
+        Ok(repo) => repo,
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                error = %format!("{error:#}"),
+                "cannot open repository while negotiating V2 fetch acknowledgments"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut acked = Vec::new();
+    for have in haves {
+        if let Ok(oid) = gix::ObjectId::from_hex(have.as_bytes()) {
+            if repo.find_object(oid).is_ok() {
+                acked.push(have.clone());
+            }
+        }
+    }
+    acked
+    // `repo` is dropped here, before the caller awaits.
 }
 
 fn needs_acknowledgments(haves: &[String], done: bool) -> bool {
@@ -1369,6 +1385,50 @@ mod tests {
         assert!(needs_acknowledgments(&haves, false));
         assert!(!needs_acknowledgments(&haves, true));
         assert!(!needs_acknowledgments(&[], false));
+    }
+
+    fn repository_with_commit() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        let git = crate::cli_gateway::GitCommandGateway::new().unwrap();
+        git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            vec!["config", "user.email", "fetch@example.com"],
+            vec!["config", "user.name", "Fetch"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            git.run_or_bail(&args, Some(&repo_path)).unwrap();
+        }
+        let have = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+
+        (dir, repo_path, have)
+    }
+
+    #[test]
+    fn acknowledged_haves_preserves_a_common_commit() {
+        let (_dir, repo_path, have) = repository_with_commit();
+
+        assert_eq!(
+            acknowledged_haves(&repo_path, std::slice::from_ref(&have)),
+            vec![have]
+        );
+    }
+
+    #[test]
+    fn acknowledged_haves_returns_empty_when_repository_config_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("broken.git");
+        gix::init_bare(&repo_path).unwrap();
+        std::fs::write(repo_path.join("config"), "[core\n").unwrap();
+        assert!(gix::open(&repo_path).is_err());
+
+        assert!(acknowledged_haves(&repo_path, &["a".repeat(40)]).is_empty());
     }
 
     #[tokio::test]
