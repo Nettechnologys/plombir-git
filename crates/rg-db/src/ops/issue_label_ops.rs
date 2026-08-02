@@ -134,10 +134,16 @@ pub async fn find_issues_with_all_labels(
         .await
         .context("db: find issues with all labels")?;
 
-    let issue_ids: Vec<i64> = rows
+    // Every row the query returned is a match, so a row that will not decode is
+    // a failed query — not one issue fewer. Dropping it here was especially
+    // convincing because `total` above had already been counted successfully:
+    // the caller got a page shorter than the total it was handed, which reads
+    // as "the rest is on the next page" rather than as an error.
+    let issue_ids = rows
         .iter()
-        .filter_map(|row| row.try_get_by_index(0).ok())
-        .collect();
+        .map(|row| row.try_get_by_index(0))
+        .collect::<Result<Vec<i64>, DbErr>>()
+        .context("db: find issues with all labels: decode issue_id")?;
 
     Ok((issue_ids, total))
 }
@@ -202,6 +208,52 @@ mod tests {
                 .await
                 .expect("an empty label filter does not query the database"),
             (Vec::new(), 0)
+        );
+    }
+
+    /// The junction table as the production query sees it. SQLite's column
+    /// affinity is a preference, not a constraint, which is what lets the test
+    /// below store an `issue_id` the typed read cannot decode.
+    async fn labelled_issues(rows: &[(&str, i64)]) -> DatabaseConnection {
+        let db = memory_db().await;
+        db.execute_unprepared(
+            "CREATE TABLE issue_labels (issue_id INTEGER NOT NULL, label_id INTEGER NOT NULL);",
+        )
+        .await
+        .expect("create the junction table");
+        for (issue_id, label_id) in rows {
+            db.execute_unprepared(&format!(
+                "INSERT INTO issue_labels (issue_id, label_id) VALUES ('{issue_id}', {label_id});"
+            ))
+            .await
+            .expect("seed a junction row");
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn decodable_issue_ids_are_returned_with_their_total() {
+        let db = labelled_issues(&[("7", 1), ("9", 1)]).await;
+        assert_eq!(
+            find_issues_with_all_labels(&db, &[1], 0, 20)
+                .await
+                .expect("decodable rows are returned"),
+            (vec![9, 7], 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_issue_id_is_an_error_not_a_shorter_page() {
+        // `total` counts this row fine, so before the fix the caller received a
+        // successful `(vec![7], 2)` — a page one issue short of its own total.
+        let db = labelled_issues(&[("7", 1), ("not a number", 1)]).await;
+
+        let error = find_issues_with_all_labels(&db, &[1], 0, 20)
+            .await
+            .expect_err("an undecodable issue_id is a failed query, not a dropped row");
+        assert!(
+            format!("{error:#}").contains("decode issue_id"),
+            "the failure must identify the failed decode, got: {error:#}"
         );
     }
 }
