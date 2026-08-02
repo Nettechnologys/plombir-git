@@ -107,10 +107,12 @@ pub fn discover_issue_templates(
     let mut discovery = IssueTemplateDiscovery::default();
 
     for directory in ISSUE_TEMPLATE_DIRS {
-        for filename in list_directory(&git, repository_path, &commit_ref, directory)? {
-            if !filename.to_ascii_lowercase().ends_with(".md") {
-                continue;
-            }
+        let listing = list_directory(&git, repository_path, &commit_ref, directory)?;
+        // An entry we could not even name is a template we failed to read, not
+        // one that is absent — it joins the same diagnostics as a template that
+        // failed to parse instead of vanishing from a confident `200`.
+        discovery.errors.extend(listing.errors);
+        for filename in listing.names {
             let path = format!("{directory}/{filename}");
             match read_text_blob(&git, repository_path, &commit_ref, &path)
                 .and_then(|content| parse_markdown_template(&path, &content))
@@ -196,12 +198,28 @@ fn verified_branch_ref(
     Ok(Some(branch_ref))
 }
 
+/// The Markdown templates directly inside one directory, plus the entries that
+/// could not be named.
+#[derive(Debug, Default)]
+struct DirectoryListing {
+    names: Vec<String>,
+    /// `(path, reason)`, ready to join `IssueTemplateDiscovery::errors`.
+    errors: Vec<(String, String)>,
+}
+
+/// List the Markdown issue templates directly inside `directory`.
+///
+/// Git path bytes are not required to be UTF-8, and an entry we cannot decode
+/// is not an entry that is not there: the previous `from_utf8(..).ok()` dropped
+/// it, and the caller then reported the shortened list as the complete one. Such
+/// an entry is reported instead, named with a lossy rendering — recognizable to
+/// an operator without pretending the bytes were ever valid UTF-8.
 fn list_directory(
     git: &GitCommandGateway,
     repository_path: &Path,
     git_ref: &str,
     directory: &str,
-) -> Result<Vec<String>> {
+) -> Result<DirectoryListing> {
     let pathspec = format!("{directory}/");
     let output = git.run(
         &["ls-tree", "-rz", "--name-only", git_ref, "--", &pathspec],
@@ -209,16 +227,30 @@ fn list_directory(
     )?;
     output.ensure_success()?;
     let prefix = format!("{directory}/");
-    let mut names: Vec<String> = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-        .filter_map(|name| std::str::from_utf8(name).ok().map(str::to_string))
-        .filter_map(|name| name.strip_prefix(&prefix).map(str::to_string))
-        .filter(|name| !name.contains('/'))
-        .collect();
-    names.sort();
-    Ok(names)
+    let mut listing = DirectoryListing::default();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        let Some(relative) = entry.strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        // `-r` also walks nested directories; only this directory's own files
+        // are templates. The `.md` gate runs on the raw bytes so an undecodable
+        // name is still classified before it is reported.
+        if relative.is_empty()
+            || relative.contains(&b'/')
+            || !relative.to_ascii_lowercase().ends_with(b".md")
+        {
+            continue;
+        }
+        match std::str::from_utf8(relative) {
+            Ok(name) => listing.names.push(name.to_string()),
+            Err(error) => listing.errors.push((
+                format!("{prefix}{}", String::from_utf8_lossy(relative)),
+                format!("template file name is not valid UTF-8: {error}"),
+            )),
+        }
+    }
+    listing.names.sort();
+    Ok(listing)
 }
 
 fn try_read_text_blob(
@@ -386,6 +418,8 @@ impl Default for IssueConfig {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::discover_issue_templates;
     use super::{parse_markdown_template, split_front_matter, IssueConfig};
 
     #[test]
@@ -422,5 +456,68 @@ mod tests {
     fn issue_config_defaults_to_blank_enabled() {
         let config: IssueConfig = serde_yaml::from_str("contact_links: []").unwrap();
         assert!(config.blank_issues_enabled);
+    }
+
+    /// Git accepts path bytes that are not UTF-8. Such a template cannot be
+    /// served — but the listing must not answer "these are all of them" after
+    /// quietly leaving one out. It joins `errors`, the same channel a template
+    /// that fails to parse uses, while the healthy ones are unaffected.
+    #[cfg(unix)]
+    #[test]
+    fn an_undecodable_template_name_is_reported_instead_of_dropped() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("templates");
+        let git = rg_git::cli_gateway::GitCommandGateway::new().unwrap();
+        git.run_or_bail(
+            &["init", "-q", "-b", "main", repository.to_str().unwrap()],
+            None,
+        )
+        .unwrap();
+        for arguments in [
+            vec!["config", "user.email", "templates@example.com"],
+            vec!["config", "user.name", "Templates"],
+        ] {
+            git.run_or_bail(&arguments, Some(&repository)).unwrap();
+        }
+
+        let template_directory = repository.join(".gitea/ISSUE_TEMPLATE");
+        std::fs::create_dir_all(&template_directory).unwrap();
+        std::fs::write(
+            template_directory.join("bug.md"),
+            "---\nname: Bug report\n---\n\n## Steps\n",
+        )
+        .unwrap();
+        // 0xFF can never start a UTF-8 sequence, so this name is undecodable
+        // while remaining a perfectly ordinary path to Git.
+        let undecodable = std::ffi::OsStr::from_bytes(b"br\xffken.md");
+        std::fs::write(template_directory.join(undecodable), "# Broken name\n").unwrap();
+
+        for arguments in [
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "templates"],
+        ] {
+            git.run_or_bail(&arguments, Some(&repository)).unwrap();
+        }
+
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+
+        assert_eq!(
+            discovery
+                .templates
+                .iter()
+                .map(|template| template.file_name.as_str())
+                .collect::<Vec<_>>(),
+            [".gitea/ISSUE_TEMPLATE/bug.md"],
+            "a healthy template keeps its payload"
+        );
+        let (path, reason) = discovery
+            .errors
+            .iter()
+            .find(|(path, _)| path.contains("ken.md"))
+            .expect("the undecodable name must be reported, not dropped");
+        assert!(path.starts_with(".gitea/ISSUE_TEMPLATE/"), "{path}");
+        assert!(reason.contains("not valid UTF-8"), "{reason}");
     }
 }
