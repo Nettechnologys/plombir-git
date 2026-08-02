@@ -365,19 +365,38 @@ struct ReceivePackContext {
     repo_name: String,
 }
 
+/// What spoke for an account on this connection — and therefore what can take
+/// the connection back.
+///
+/// The two arms are revoked by different acts, and that is the whole reason
+/// they are told apart rather than folded into one nullable key id: a key is a
+/// durable credential of its own, a password is what a session generation is
+/// counted from.
+#[derive(Clone, Debug)]
+enum UserCredential {
+    /// The SSH key row that matched. Revoked by deleting the key — and
+    /// deliberately *not* by a password change: a registered key is a standing
+    /// credential in its own right, the same way a personal access token is
+    /// (see `rg_db::ops::user_ops::invalidate_sessions`).
+    SshKey { key_id: i64 },
+    /// A password, together with the `users.session_version` it was accepted
+    /// under. A password reset or a `POST /users/logout` bumps that column, and
+    /// a connection carrying the older generation stops being served.
+    Password { session_version: i64 },
+}
+
 /// Who a session speaks for — and, just as importantly, *what row* said so.
 ///
-/// The credential id is carried rather than dropped because authentication
+/// The credential is carried rather than dropped because authentication
 /// happens once and a connection carries any number of execs: without it the
-/// only thing a later exec could re-read is the account, and a revoked key
-/// would keep working for as long as the connection stayed open.
+/// only thing a later exec could re-read is the account, and a revoked key —
+/// or a session the owner has since ended — would keep working for as long as
+/// the connection stayed open.
 #[derive(Clone, Debug)]
 enum AuthenticatedIdentity {
     User {
         user_id: i64,
-        /// The SSH key that spoke for the account, or `None` when the session
-        /// authenticated by password — there is no key row to revoke then.
-        ssh_key_id: Option<i64>,
+        credential: UserCredential,
     },
     /// A deploy key, named by its row alone: the repository it opens and
     /// whether it may write are re-read on every exec, so caching them here
@@ -504,7 +523,7 @@ impl Handler for SshHandler {
                 }
                 self.authenticated_identity = Some(AuthenticatedIdentity::User {
                     user_id: key.user_id,
-                    ssh_key_id: Some(key.id),
+                    credential: UserCredential::SshKey { key_id: key.id },
                 });
                 if let Err(error) = rg_db::ops::ssh_key_ops::touch_last_used(db, key.id).await {
                     tracing::warn!(
@@ -619,13 +638,19 @@ impl Handler for SshHandler {
 
         match attempt {
             rg_core::auth::lockout::PasswordAttempt::Accepted => {
-                let user_id = found
+                let account = found
                     .as_ref()
-                    .map(|user| user.id)
                     .expect("an accepted password attempt resolved to an account");
+                // The generation is read from the row this password was checked
+                // against, so a reset racing the login can only make the session
+                // *older* than the database — and an older generation is refused
+                // on the first exec. The other direction, a session that outlives
+                // the reset, is the bug this carries the number for.
                 self.authenticated_identity = Some(AuthenticatedIdentity::User {
-                    user_id,
-                    ssh_key_id: None,
+                    user_id: account.id,
+                    credential: UserCredential::Password {
+                        session_version: account.session_version,
+                    },
                 });
                 tracing::info!(username, "SSH password auth accepted");
                 Ok(Auth::Accept)
@@ -1063,26 +1088,41 @@ async fn authorize_git_service(
     let allowed = match identity {
         AuthenticatedIdentity::User {
             user_id,
-            ssh_key_id,
+            credential,
         } => {
-            match rg_db::ops::user_ops::find_by_id(db, *user_id)
+            let account = match rg_db::ops::user_ops::find_by_id(db, *user_id)
                 .await
                 .map_err(GitServiceError::ServerUnavailable)?
             {
-                Some(user) if user.is_usable() => {}
+                Some(user) if user.is_usable() => user,
                 _ => return Err(GitServiceError::AccessDenied("account is disabled or gone")),
-            }
-            // A password session has no key row to revoke; a key session does,
-            // and deleting the key is the other half of offboarding.
-            if let Some(key_id) = ssh_key_id {
-                if rg_db::ops::ssh_key_ops::find_by_id(db, *key_id)
-                    .await
-                    .map_err(GitServiceError::ServerUnavailable)?
-                    .is_none_or(|key| key.user_id != *user_id)
-                {
-                    return Err(GitServiceError::AccessDenied(
-                        "the SSH key this session authenticated with is gone",
-                    ));
+            };
+            match credential {
+                // Deleting the key is the other half of offboarding, and the
+                // owner is re-checked with it: an id reused after a deletion
+                // must not reopen the door on somebody else's behalf.
+                UserCredential::SshKey { key_id } => {
+                    if rg_db::ops::ssh_key_ops::find_by_id(db, *key_id)
+                        .await
+                        .map_err(GitServiceError::ServerUnavailable)?
+                        .is_none_or(|key| key.user_id != *user_id)
+                    {
+                        return Err(GitServiceError::AccessDenied(
+                            "the SSH key this session authenticated with is gone",
+                        ));
+                    }
+                }
+                // The half a password session has instead. Nothing is deleted
+                // when the owner resets their password or logs out — the only
+                // record of it is that `session_version` moved, and a
+                // connection opened before the move is exactly what those two
+                // acts are performed to end.
+                UserCredential::Password { session_version } => {
+                    if account.session_version != *session_version {
+                        return Err(GitServiceError::AccessDenied(
+                            "this session ended when the account's password was reset or it logged out",
+                        ));
+                    }
                 }
             }
             match service {

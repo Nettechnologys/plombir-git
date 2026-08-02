@@ -18,6 +18,15 @@
 //! asks again on it. The `_on_an_open_connection` half is the one that reads
 //! the account and the key row on every exec rather than trusting what
 //! authentication decided.
+//!
+//! The last group is the same shape for the *session*, not the account: a
+//! password reset and a logout end the sessions that came before them, and an
+//! SSH connection that authenticated by password is one of those sessions.
+//! Nothing is deleted when they happen — the only record is that
+//! `users.session_version` moved — so a connection that does not carry the
+//! generation it authenticated at has no way to notice. A key session is
+//! deliberately left alone by both: a registered key is a standing credential
+//! of its own, revoked by deleting it, exactly as a personal access token is.
 
 use std::sync::Arc;
 
@@ -190,6 +199,30 @@ async fn harness(username: &str) -> Harness {
         client_key,
         server,
     }
+}
+
+/// Drive the real password reset, token and all.
+///
+/// The generation bump lives inside `reset_password`, after the password write
+/// — reaching for `invalidate_sessions` directly here would prove the primitive
+/// works and leave the question of whether the reset calls it untested.
+async fn reset_password(db: &rg_db::DatabaseConnection, user_id: i64, new_password: &str) {
+    use sha2::Digest;
+
+    const RAW_TOKEN: &str = "ssh-session-revocation-fixture-token";
+    let token_hash = hex::encode(sha2::Sha256::digest(RAW_TOKEN.as_bytes()));
+    rg_db::ops::password_reset_token_ops::create(
+        db,
+        user_id,
+        &token_hash,
+        chrono::Utc::now() + chrono::Duration::minutes(15),
+    )
+    .await
+    .expect("issue a password reset token");
+
+    rg_core::user::service::reset_password(db, RAW_TOKEN, new_password, "test-jwt-secret")
+        .await
+        .expect("reset the password");
 }
 
 async fn deactivate(db: &rg_db::DatabaseConnection, user_id: i64) {
@@ -388,6 +421,119 @@ async fn deleting_a_deploy_key_stops_execs_on_the_connection_it_opened() {
     assert!(
         !upload_pack_allowed(&session, &h.username).await,
         "a deleted deploy key kept serving git over the connection it had opened"
+    );
+
+    h.server.abort();
+}
+
+/// The reason somebody resets a password is that somebody else has it.
+///
+/// The web session was closed by `session_version` the day it was introduced,
+/// but SSH kept its own copy of "who authenticated": the connection the
+/// attacker was holding went on serving `git-upload-pack` for as long as they
+/// held it, which under `ControlMaster` is until the socket is closed. Nothing
+/// visible changes in the database except that one counter, so this is the
+/// whole of what the exec path had to learn to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resetting_the_password_stops_execs_on_the_password_session_it_ended() {
+    let h = harness("ssh_pw_reset_live").await;
+
+    let mut session = connect(&h.addr).await;
+    assert!(
+        session
+            .authenticate_password("ssh_pw_reset_live", PASSWORD)
+            .await
+            .unwrap()
+            .success(),
+        "baseline: the password authenticates before the reset"
+    );
+    assert!(
+        upload_pack_allowed(&session, &h.username).await,
+        "baseline: the account may read its own repository over this connection"
+    );
+
+    reset_password(&h.db, h.user_id, "Kp4!vNsy2Qd").await;
+
+    assert!(
+        !upload_pack_allowed(&session, &h.username).await,
+        "a password session kept serving git over the connection it had opened after the password was reset"
+    );
+
+    h.server.abort();
+}
+
+/// Logout is the same act with a narrower reason: the machine is not yours.
+///
+/// `POST /users/logout` bumps the same counter — that is what makes it a
+/// server-side end of session rather than a cookie deletion — so an SSH
+/// connection authenticated by password before it must stop being served too.
+/// Left alone, "log out of everything" would quietly mean "everything except
+/// the thing that can push".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logging_out_stops_execs_on_the_password_session_it_ended() {
+    let h = harness("ssh_pw_logout_live").await;
+
+    let mut session = connect(&h.addr).await;
+    assert!(
+        session
+            .authenticate_password("ssh_pw_logout_live", PASSWORD)
+            .await
+            .unwrap()
+            .success(),
+        "baseline: the password authenticates before the logout"
+    );
+    assert!(
+        upload_pack_allowed(&session, &h.username).await,
+        "baseline: the account may read its own repository over this connection"
+    );
+
+    // The primitive the logout handler calls; the HTTP half of the same act is
+    // covered in `rg-http/tests/integration/password_reset_mfa_tests.rs`.
+    rg_db::ops::user_ops::invalidate_sessions(&h.db, h.user_id)
+        .await
+        .expect("revoke the account's sessions");
+
+    assert!(
+        !upload_pack_allowed(&session, &h.username).await,
+        "a password session kept serving git over the connection it had opened after logout"
+    );
+
+    h.server.abort();
+}
+
+/// The written-down half of the policy, so it cannot drift into an accident.
+///
+/// A registered SSH key survives a password change on purpose: it is a standing
+/// credential, revoked by deleting it (proved above) or by deactivating the
+/// account (proved above), and the alternative — every reset re-keying every
+/// laptop and CI runner — is what people work around by never resetting.
+/// `invalidate_sessions` records the same decision for personal access tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resetting_the_password_leaves_a_key_session_alone() {
+    let h = harness("ssh_pw_reset_key").await;
+
+    let mut session = connect(&h.addr).await;
+    assert!(
+        session
+            .authenticate_publickey(
+                "git",
+                PrivateKeyWithHashAlg::new(h.client_key.clone(), None)
+            )
+            .await
+            .unwrap()
+            .success(),
+        "baseline: the key authenticates before the reset"
+    );
+    assert!(
+        upload_pack_allowed(&session, &h.username).await,
+        "baseline: the key may read the repository over this connection"
+    );
+
+    reset_password(&h.db, h.user_id, "Kp4!vNsy2Qd").await;
+
+    assert!(
+        upload_pack_allowed(&session, &h.username).await,
+        "a password reset cut off a session that authenticated with an SSH key, which is a durable credential of its own"
     );
 
     h.server.abort();

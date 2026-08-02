@@ -5343,6 +5343,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "libc",
  "rand 0.10.2",
  "rg-core",
@@ -5351,6 +5352,7 @@ dependencies = [
  "russh",
  "sea-orm",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
