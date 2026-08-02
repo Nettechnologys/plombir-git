@@ -782,7 +782,7 @@ pub(crate) fn build_all_routes(
         // ── Users ──────────────────────────────────────────────────────────
         .post_with(Public, "/users/register", api::users::register, &auth_rl)
         .post_with(Public, "/users/login", api::users::login, &auth_rl)
-        .post(Public, "/users/logout", api::users::logout)
+        .post(User, "/users/logout", api::users::logout)
         .get(User, "/users/me", api::users::me)
         .post(
             Public,

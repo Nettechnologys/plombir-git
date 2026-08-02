@@ -54,6 +54,17 @@ async fn login(base: &str, username: &str, password: &str) -> reqwest::Response 
         .unwrap()
 }
 
+async fn me_status(client: &reqwest::Client, base: &str, token: &str) -> u16 {
+    client
+        .get(format!("{base}/api/v1/users/me"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
 /// Every `Set-Cookie` value on a response, in order.
 fn set_cookies(resp: &reqwest::Response) -> Vec<String> {
     resp.headers()
@@ -204,5 +215,71 @@ async fn the_reset_token_of_an_mfa_account_is_single_use() {
         login(&base, "reset_mfa_once", "Ot8@vXbn").await.status(),
         401,
         "the replayed reset changed the password anyway"
+    );
+}
+
+/// A password reset is the recovery path for a stolen session. The old bearer
+/// token must therefore fail, while the response's replacement token proves the
+/// revocation generation did not lock the recovering owner out as well.
+#[tokio::test]
+async fn a_password_reset_revokes_old_sessions_and_keeps_its_replacement_live() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (old_token, user_id) =
+        register_full(&base, "reset_revoke", "reset_revoke@example.com").await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        me_status(&client, &base, &old_token).await,
+        200,
+        "baseline: the bearer token must be live before the reset"
+    );
+
+    let raw_token = issue_reset_token(&db, user_id, "raw-token-revoke").await;
+    let response = reset(&base, &raw_token, NEW_PASSWORD).await;
+    assert_eq!(response.status(), 200, "password reset failed");
+    let body: serde_json::Value = response.json().await.unwrap();
+    let replacement = body["token"]
+        .as_str()
+        .expect("a non-MFA reset must return its replacement session token");
+
+    assert_eq!(
+        me_status(&client, &base, &old_token).await,
+        401,
+        "a bearer token issued before the password reset still works"
+    );
+    assert_eq!(
+        me_status(&client, &base, replacement).await,
+        200,
+        "the session issued after the password reset was revoked with the old one"
+    );
+}
+
+/// Logout is a server-side revocation, not merely a browser cookie operation.
+/// The request deliberately presents the token as a Bearer credential to prove
+/// that a copy stolen before logout cannot keep using the API afterwards.
+#[tokio::test]
+async fn logout_revokes_the_bearer_token_it_authenticated() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _user_id) =
+        register_full(&base, "logout_revoke", "logout_revoke@example.com").await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        me_status(&client, &base, &token).await,
+        200,
+        "baseline: the bearer token must be live before logout"
+    );
+    let logout = client
+        .post(format!("{base}/api/v1/users/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "logout failed");
+
+    assert_eq!(
+        me_status(&client, &base, &token).await,
+        401,
+        "the bearer token stolen before logout still works"
     );
 }

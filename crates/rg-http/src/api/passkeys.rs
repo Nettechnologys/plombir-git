@@ -687,8 +687,14 @@ pub async fn login_finish(
         tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record passkey login attempt");
     }
 
-    let token = rg_core::auth::jwt::generate_token(user.id, &user.username, &state.jwt_secret, 7)
-        .map_err(AppError::from)?;
+    let token = rg_core::auth::jwt::generate_token(
+        user.id,
+        &user.username,
+        user.session_version,
+        &state.jwt_secret,
+        7,
+    )
+    .map_err(AppError::from)?;
 
     let is_https = is_https_request(&headers);
     let mut response = (

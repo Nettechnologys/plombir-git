@@ -478,6 +478,7 @@ async fn every_subscriber_is_notified_past_the_old_page_limit() {
                 last_login_at: Set(None),
                 login_attempts: Set(0),
                 locked_until: Set(None),
+                session_version: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
                 deleted_at: Set(None),

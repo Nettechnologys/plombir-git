@@ -487,15 +487,19 @@ pub async fn login(
     path = "/users/logout",
     tag = "Users",
     responses(
-        (status = 200, description = "Logged out; the auth cookie is cleared", body = serde_json::Value),
+        (status = 200, description = "All bearer sessions revoked and auth cookie cleared", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
     )
 )]
-/// POST /api/v1/users/logout — clears the HttpOnly auth cookie (M-4).
-///
-/// The frontend calls this on logout to invalidate the cookie.
-/// The JWT itself remains valid until expiry (stateless JWT), but the
-/// browser will no longer send it.
-pub async fn logout(headers: HeaderMap) -> impl IntoResponse {
+/// POST /api/v1/users/logout — revoke every bearer session and clear the cookie.
+pub async fn logout(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = rg_db::ops::user_ops::invalidate_sessions(&state.db, user_id).await {
+        return AppError::from(error).into_response();
+    }
     let is_https = is_https_request(&headers);
     let cookie = build_clear_cookie(is_https);
     (
@@ -503,6 +507,7 @@ pub async fn logout(headers: HeaderMap) -> impl IntoResponse {
         [(axum::http::header::SET_COOKIE, cookie)],
         Json(serde_json::json!({"logged_out": true})),
     )
+        .into_response()
 }
 
 #[utoipa::path(

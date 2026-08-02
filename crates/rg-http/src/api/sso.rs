@@ -522,8 +522,14 @@ pub async fn callback(
     }
 
     // ── Issue JWT ────────────────────────────────────────────────
-    let token = rg_core::auth::jwt::generate_token(user.id, &user.username, &state.jwt_secret, 7)
-        .map_err(AppError::from)?;
+    let token = rg_core::auth::jwt::generate_token(
+        user.id,
+        &user.username,
+        user.session_version,
+        &state.jwt_secret,
+        7,
+    )
+    .map_err(AppError::from)?;
 
     let mut redirect = Redirect::temporary("/dashboard").into_response();
     append_set_cookie(

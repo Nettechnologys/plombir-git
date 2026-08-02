@@ -44,6 +44,8 @@ pub struct Model {
     pub login_attempts: i32,
     /// Account locked until this timestamp
     pub locked_until: Option<DateTimeUtc>,
+    /// Monotonic generation for revoking all bearer sessions at once.
+    pub session_version: i64,
 
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

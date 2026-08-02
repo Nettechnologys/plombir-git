@@ -873,7 +873,7 @@ async fn through_router(
 }
 
 fn bearer(user_id: i64, username: &str) -> axum::http::HeaderMap {
-    let token = rg_core::auth::jwt::generate_token(user_id, username, "test-secret-key", 7)
+    let token = rg_core::auth::jwt::generate_token(user_id, username, 0, "test-secret-key", 7)
         .expect("generate token");
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(

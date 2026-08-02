@@ -50,6 +50,36 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<User>
         .context("db: find user by id")
 }
 
+/// Revoke every bearer session issued for a user before this call.
+///
+/// Password resets and logout deliberately share this primitive: a timestamp
+/// cannot order a JWT's second-resolution `iat` against a database timestamp
+/// without leaving a one-second survivor or rejecting the replacement token.
+/// The monotonically increasing version is exact and the expression keeps
+/// concurrent revocations from losing one another's update.
+///
+/// Personal access tokens and SSH keys are separate, durable credentials. They
+/// intentionally survive a password change; account deactivation remains the
+/// explicit operation that revokes every credential type at once.
+pub async fn invalidate_sessions(db: &DatabaseConnection, user_id: i64) -> Result<User> {
+    let result = UserEntity::update_many()
+        .col_expr(
+            user::Column::SessionVersion,
+            Expr::col(user::Column::SessionVersion).add(1),
+        )
+        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(user::Column::Id.eq(user_id))
+        .exec(db)
+        .await
+        .context("db: revoke user sessions")?;
+    if result.rows_affected == 0 {
+        anyhow::bail!("user {} not found", user_id);
+    }
+    find_by_id(db, user_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("user {} not found after session revocation", user_id))
+}
+
 pub async fn count_by_ldap_provider(db: &DatabaseConnection, provider_id: i64) -> Result<u64> {
     UserEntity::find()
         .filter(user::Column::LdapProviderId.eq(provider_id))
@@ -192,6 +222,7 @@ pub async fn create_user(
         last_login_at: Set(None),
         login_attempts: Set(0),
         locked_until: Set(None),
+        session_version: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -233,6 +264,7 @@ pub async fn create_ldap_user(
             last_login_at: Set(None),
             login_attempts: Set(0),
             locked_until: Set(None),
+            session_version: Set(0),
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),

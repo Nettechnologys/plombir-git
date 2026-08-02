@@ -184,6 +184,7 @@ async fn pat_to_bearer_jwt(
             let jwt = rg_core::auth::jwt::generate_token(
                 pat.user_id,
                 &owner.username,
+                owner.session_version,
                 &state.jwt_secret,
                 1,
             )

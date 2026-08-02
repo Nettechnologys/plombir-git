@@ -352,8 +352,14 @@ pub async fn verify_mfa(
     crate::metrics::recorder::auth_event("mfa", "success");
 
     // Issue JWT
-    let token = rg_core::auth::jwt::generate_token(user.id, &user.username, &state.jwt_secret, 7)
-        .map_err(AppError::from)?;
+    let token = rg_core::auth::jwt::generate_token(
+        user.id,
+        &user.username,
+        user.session_version,
+        &state.jwt_secret,
+        7,
+    )
+    .map_err(AppError::from)?;
 
     // M-4: Set HttpOnly cookie for browser-based auth
     let is_https = headers

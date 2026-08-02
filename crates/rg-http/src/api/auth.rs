@@ -119,7 +119,7 @@ fn extract_bearer_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims
 /// a server that does not echo the client's selected subprotocol fails the
 /// handshake (RFC 6455 §4.1).
 ///
-/// One reader, two consumers: [`presented_session_user_ids`] below checks every
+/// One reader, two consumers: [`presented_session_versions`] below checks every
 /// offered token against the revocation gate, and [`ws_session`] resolves the
 /// first one — the one a handler will actually act on.
 fn bearer_subprotocols(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -164,7 +164,7 @@ pub(crate) struct WsSession {
 /// looking for a cookie nobody sets — and failing silently, since an
 /// unauthenticated notification socket opens and then reports the error in a
 /// frame (card_24a8ef566056). Both WebSocket handlers now share this one
-/// resolution, and it sits next to [`presented_session_user_ids`], which has to
+/// resolution, and it sits next to [`presented_session_versions`], which has to
 /// agree with it about what counts as a presented session.
 pub(crate) fn ws_session(
     headers: &HeaderMap,
@@ -190,7 +190,8 @@ pub(crate) fn ws_session(
     }
 }
 
-/// Every session JWT this request presents, resolved to its user id.
+/// Every session JWT this request presents, resolved to its user id and
+/// generation.
 ///
 /// A session may arrive in any of the shapes this server accepts: the HttpOnly
 /// cookie, `Authorization: Bearer`, the `token ` spelling some clients use,
@@ -205,11 +206,11 @@ pub(crate) fn ws_session(
 /// Token, a CI job token, an OCI registry token and an MFA challenge all fail
 /// `validate_token` (different claim shape or a domain-separated key), and each
 /// carries its own owner check where it is resolved.
-fn presented_session_user_ids(
+fn presented_session_versions(
     headers: &HeaderMap,
     query: Option<&str>,
     jwt_secret: &str,
-) -> Vec<i64> {
+) -> Vec<(i64, i64)> {
     let mut candidates: Vec<String> = Vec::new();
 
     if let Some(token) = extract_token_from_cookie(headers) {
@@ -247,17 +248,18 @@ fn presented_session_user_ids(
         }
     }
 
-    let mut ids = Vec::new();
+    let mut sessions = Vec::new();
     for candidate in candidates {
         if let Some(claims) = rg_core::auth::jwt::validate_token(&candidate, jwt_secret) {
             if let Ok(id) = claims.sub.parse::<i64>() {
-                if !ids.contains(&id) {
-                    ids.push(id);
+                let session = (id, claims.session_version);
+                if !sessions.contains(&session) {
+                    sessions.push(session);
                 }
             }
         }
     }
-    ids
+    sessions
 }
 
 /// Reject a session whose account no longer stands — the revocation gate.
@@ -294,20 +296,16 @@ pub(crate) async fn session_standing_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let presented = presented_session_user_ids(req.headers(), req.uri().query(), &state.jwt_secret);
-    for user_id in presented {
+    let presented = presented_session_versions(req.headers(), req.uri().query(), &state.jwt_secret);
+    for (user_id, session_version) in presented {
         match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
-            Ok(Some(user)) if user.is_usable() => {}
+            Ok(Some(user)) if user.is_usable() && user.session_version == session_version => {}
             Ok(_) => {
                 tracing::warn!(
                     user_id,
-                    "rejecting session token: account is disabled or gone"
+                    "rejecting session token: account is disabled, gone, or its session was revoked"
                 );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "session belongs to a disabled account",
-                )
-                    .into_response();
+                return (StatusCode::UNAUTHORIZED, "session is no longer valid").into_response();
             }
             Err(e) => {
                 // Fail closed, but say which of the two it is: "revoked" and
@@ -410,7 +408,7 @@ mod tests {
     }
 
     fn session(user_id: i64) -> String {
-        rg_core::auth::jwt::generate_token(user_id, "gatekeeper", SECRET, 7).unwrap()
+        rg_core::auth::jwt::generate_token(user_id, "gatekeeper", 0, SECRET, 7).unwrap()
     }
 
     fn basic(user: &str, pass: &str) -> String {
@@ -445,15 +443,15 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                presented_session_user_ids(&headers(name, value), None, SECRET),
-                vec![42],
+                presented_session_versions(&headers(name, value), None, SECRET),
+                vec![(42, 0)],
                 "a session presented as {shape} is invisible to the gate"
             );
         }
 
         assert_eq!(
-            presented_session_user_ids(&HeaderMap::new(), Some(&format!("token={jwt}")), SECRET),
-            vec![42],
+            presented_session_versions(&HeaderMap::new(), Some(&format!("token={jwt}")), SECRET),
+            vec![(42, 0)],
             "a session presented as a WebSocket query parameter is invisible to the gate"
         );
     }
@@ -469,8 +467,8 @@ mod tests {
             format!("{AUTH_COOKIE_NAME}={jwt}").parse().unwrap(),
         );
         assert_eq!(
-            presented_session_user_ids(&h, Some(&format!("token={jwt}")), SECRET),
-            vec![7]
+            presented_session_versions(&h, Some(&format!("token={jwt}")), SECRET),
+            vec![(7, 0)]
         );
     }
 
@@ -478,10 +476,11 @@ mod tests {
     /// they are resolved; the gate must not try to read them as one.
     #[test]
     fn non_session_credentials_are_ignored() {
-        let foreign = rg_core::auth::jwt::generate_token(1, "mallory", "other-secret", 7).unwrap();
+        let foreign =
+            rg_core::auth::jwt::generate_token(1, "mallory", 0, "other-secret", 7).unwrap();
         let challenge =
             rg_core::auth::jwt::generate_mfa_challenge(1, "bob", "ldap", SECRET).unwrap();
-        let expired = rg_core::auth::jwt::generate_token(1, "stale", SECRET, -1).unwrap();
+        let expired = rg_core::auth::jwt::generate_token(1, "stale", 0, SECRET, -1).unwrap();
         for (what, token) in [
             ("a personal access token", "fk_pat_abcdef".to_string()),
             ("a JWT signed with another secret", foreign),
@@ -489,7 +488,7 @@ mod tests {
             ("an expired session", expired),
         ] {
             assert!(
-                presented_session_user_ids(
+                presented_session_versions(
                     &headers("authorization", format!("Bearer {token}")),
                     None,
                     SECRET
@@ -513,7 +512,7 @@ mod tests {
             "Negotiate whatever".to_string(),
         ] {
             assert!(
-                presented_session_user_ids(&headers("authorization", value.clone()), None, SECRET)
+                presented_session_versions(&headers("authorization", value.clone()), None, SECRET)
                     .is_empty(),
                 "{value} was read as a session"
             );

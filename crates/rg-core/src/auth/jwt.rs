@@ -14,6 +14,12 @@ pub struct Claims {
     pub sub: String,
     /// Username (convenience field, not authoritative).
     pub username: String,
+    /// Monotonic user-side generation. A mismatch revokes this bearer session.
+    ///
+    /// Old tokens decode as generation zero during a rolling upgrade; they are
+    /// then invalidated by the next password reset or logout.
+    #[serde(default)]
+    pub session_version: i64,
     /// Issued-at (Unix timestamp seconds).
     pub iat: i64,
     /// Expiry (Unix timestamp seconds).
@@ -33,13 +39,20 @@ fn mfa_challenge_key(secret: &str) -> String {
     format!("forgekeep:mfa-challenge:{secret}")
 }
 
-/// Generate a signed JWT for a user.
-pub fn generate_token(user_id: i64, username: &str, secret: &str, ttl_days: i64) -> Result<String> {
+/// Generate a signed JWT for a user and its current session generation.
+pub fn generate_token(
+    user_id: i64,
+    username: &str,
+    session_version: i64,
+    secret: &str,
+    ttl_days: i64,
+) -> Result<String> {
     let now = Utc::now();
     let exp = now + Duration::days(ttl_days);
     let claims = Claims {
         sub: user_id.to_string(),
         username: username.to_string(),
+        session_version,
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
@@ -104,10 +117,11 @@ mod tests {
     #[test]
     fn test_generate_and_validate() {
         let secret = "test_secret_key";
-        let token = generate_token(42, "alice", secret, 1).unwrap();
+        let token = generate_token(42, "alice", 3, secret, 1).unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, "42");
         assert_eq!(claims.username, "alice");
+        assert_eq!(claims.session_version, 3);
     }
 
     #[test]
@@ -117,19 +131,19 @@ mod tests {
 
     #[test]
     fn test_wrong_secret_fails() {
-        let token = generate_token(1, "bob", "secret_a", 7).unwrap();
+        let token = generate_token(1, "bob", 0, "secret_a", 7).unwrap();
         assert!(validate_token(&token, "secret_b").is_none());
     }
 
     #[test]
     fn test_expired_token_fails() {
-        let token = generate_token(1, "charlie", "secret", -1).unwrap(); // already expired
+        let token = generate_token(1, "charlie", 0, "secret", -1).unwrap(); // already expired
         assert!(validate_token(&token, "secret").is_none());
     }
 
     #[test]
     fn test_token_claims_fields() {
-        let token = generate_token(99, "testuser", "mykey", 30).unwrap();
+        let token = generate_token(99, "testuser", 7, "mykey", 30).unwrap();
         let claims = validate_token(&token, "mykey").unwrap();
         assert_eq!(claims.sub, "99");
         assert_eq!(claims.username, "testuser");
@@ -140,8 +154,8 @@ mod tests {
     #[test]
     fn test_different_user_ids() {
         let secret = "key";
-        let t1 = generate_token(0, "user0", secret, 7).unwrap();
-        let t2 = generate_token(i64::MAX, "usermax", secret, 7).unwrap();
+        let t1 = generate_token(0, "user0", 0, secret, 7).unwrap();
+        let t2 = generate_token(i64::MAX, "usermax", 0, secret, 7).unwrap();
 
         let c1 = validate_token(&t1, secret).unwrap();
         assert_eq!(c1.sub, "0");
@@ -171,7 +185,7 @@ mod tests {
         assert_eq!(claims.auth_provider, "ldap");
         assert!(claims.exp - claims.iat <= 300);
 
-        let session = generate_token(42, "alice", "secret", 7).unwrap();
+        let session = generate_token(42, "alice", 0, "secret", 7).unwrap();
         assert!(validate_mfa_challenge(&session, "secret").is_none());
     }
 }

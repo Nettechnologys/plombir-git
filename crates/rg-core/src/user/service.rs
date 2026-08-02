@@ -197,7 +197,7 @@ pub async fn register(
             error
         }
     })?;
-    let token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
+    let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
 
     Ok(AuthResponse {
         token,
@@ -247,7 +247,7 @@ pub async fn login(
         bail!("account is disabled");
     }
 
-    let token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
+    let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
 
     Ok(AuthResponse {
         token,
@@ -429,7 +429,8 @@ async fn login_via_ldap_inner(
                 return Err(error);
             }
         };
-        let token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
+        let token =
+            jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
         return Ok(LoginOutcome {
             response: AuthResponse {
                 token,
@@ -943,6 +944,10 @@ pub async fn reset_password(
     active.updated_at = Set(Utc::now());
     active.update(db).await?;
 
+    // This follows the password write, so a token minted after the reset uses
+    // the new generation while every session from before it is rejected.
+    let user = user_ops::invalidate_sessions(db, user.id).await?;
+
     // Mark token as used
     rg_db::ops::password_reset_token_ops::mark_used(db, token.id).await?;
 
@@ -964,7 +969,8 @@ pub async fn reset_password(
     }
 
     // Generate new JWT
-    let jwt_token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
+    let jwt_token =
+        jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
 
     Ok(PasswordResetOutcome::Session(AuthResponse {
         token: jwt_token,
