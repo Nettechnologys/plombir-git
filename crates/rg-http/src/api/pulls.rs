@@ -7,6 +7,8 @@ use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
+use rg_core::pull_request::merge_queue::CancelOutcome;
+
 use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
@@ -639,7 +641,11 @@ pub async fn enqueue_merge_queue(
     path = "/repos/{owner}/{name}/pulls/{number}/merge-queue",
     tag = "Pull Requests",
     params(("owner" = String, Path), ("name" = String, Path), ("number" = i64, Path)),
-    responses((status = 204), (status = 404, body = serde_json::Value))
+    responses(
+        (status = 204),
+        (status = 404, body = serde_json::Value),
+        (status = 409, description = "The merge queue is already merging this pull request", body = serde_json::Value),
+    )
 )]
 pub async fn cancel_merge_queue(
     State(state): State<AppState>,
@@ -662,8 +668,17 @@ pub async fn cancel_merge_queue(
     )
     .await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => AppError::not_found("pull request is not queued").into_response(),
+        Ok(CancelOutcome::Canceled) => StatusCode::NO_CONTENT.into_response(),
+        Ok(CancelOutcome::NotQueued) => {
+            AppError::not_found("pull request is not queued").into_response()
+        }
+        // Not a 404: the entry is right there, a worker is merging it, and the
+        // caller is simply too late. A 404 here reads as "you have the wrong
+        // PR" and sends the client looking for a resource it already has.
+        Ok(CancelOutcome::AlreadyMerging) => AppError::conflict(
+            "the merge queue is already merging this pull request; it can no longer be canceled",
+        )
+        .into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
 }

@@ -74,15 +74,37 @@ pub async fn enqueue(
     Ok(entry)
 }
 
+/// What a cancellation request found when it got there.
+///
+/// `merge_queue_ops::cancel` only moves an entry that is still `queued` — by
+/// design, since a worker that already claimed the entry is mid-merge and
+/// nothing here can call that back. But its `bool` collapsed two very different
+/// refusals into one: "there is nothing of yours in this queue" and "there is,
+/// and it is being merged right now". The caller answered `404 pull request is
+/// not queued` to both, which tells the second caller the opposite of the truth
+/// — its PR is in the queue, further along than it thought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The entry was `queued` and is now `canceled`.
+    Canceled,
+    /// No entry for this PR, or one that has already finished — nothing to
+    /// cancel, and nothing the caller can do about it.
+    NotQueued,
+    /// The entry exists but a worker holds it: the merge is under way and the
+    /// window for cancelling it has closed. A later state change (the merge
+    /// finishing or failing) is what unblocks the caller, so this is a conflict,
+    /// not a missing resource.
+    AlreadyMerging,
+}
+
 pub async fn cancel(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
     pr: &pull_request::Model,
     actor_id: i64,
-) -> Result<bool> {
-    let canceled = merge_queue_ops::cancel(db, pr.id).await?;
-    if canceled {
+) -> Result<CancelOutcome> {
+    if merge_queue_ops::cancel(db, pr.id).await? {
         rg_db::ops::pr_event_ops::record(
             db,
             pr.repo_id,
@@ -94,8 +116,18 @@ pub async fn cancel(
         )
         .await?;
         cleanup_merge_group_ref(db, repo_root, repository, pr.id).await;
+        return Ok(CancelOutcome::Canceled);
     }
-    Ok(canceled)
+
+    // The conditional write refused. Reading the row afterwards is what tells
+    // the two refusals apart — and both readings are honest whichever way the
+    // race went: an entry claimed a moment ago really is being merged, and an
+    // entry that finished a moment ago really is no longer cancellable.
+    let outcome = match merge_queue_ops::find_by_pr(db, pr.id).await? {
+        Some(entry) if entry.status == "running" => CancelOutcome::AlreadyMerging,
+        _ => CancelOutcome::NotQueued,
+    };
+    Ok(outcome)
 }
 
 async fn finish_entry(
@@ -989,7 +1021,7 @@ mod merge_group_ref_cleanup_tests {
         };
 
         let (logs, _guard) = capture_warnings();
-        let canceled = cancel(
+        let outcome = cancel(
             &fixture.db,
             &fixture.repo_root,
             &orphaned,
@@ -999,7 +1031,11 @@ mod merge_group_ref_cleanup_tests {
         .await
         .expect("cancel still succeeds");
 
-        assert!(canceled, "the queue entry was canceled");
+        assert_eq!(
+            outcome,
+            CancelOutcome::Canceled,
+            "the queue entry was canceled"
+        );
         let rendered = logs.rendered();
         assert!(rendered.contains(STALE_REF), "{rendered}");
         assert!(
