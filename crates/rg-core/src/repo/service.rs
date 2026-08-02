@@ -601,6 +601,25 @@ pub async fn create_repo_with_opts(
         return Err(error);
     }
 
+    let bare_repo = match gix::open(&git_path)
+        .with_context(|| format!("failed to open newly-created bare repository {git_path:?}"))
+    {
+        Ok(repo) => repo,
+        Err(error) => {
+            discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+            return Err(error);
+        }
+    };
+
+    // `gix::create` inherits its HEAD from the gix template (currently
+    // `refs/heads/main`), which is independent of the branch the caller asked
+    // us to create. Set it before every later success path, including an empty
+    // repository, so the database and Git agree about the default branch.
+    if let Err(error) = set_bare_repo_head_to_branch(&bare_repo, default_branch) {
+        discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+        return Err(error);
+    }
+
     // Auto-initialize with template files if requested
     if opts.auto_init {
         let init_result = auto_init_repo(
@@ -700,6 +719,41 @@ pub async fn create_repo_with_opts(
     crate::metrics_hook::record_repo_created();
 
     Ok(repo)
+}
+
+/// Set the symbolic HEAD of a newly-created bare repository to its default branch.
+///
+/// The branch can be unborn; the symbolic reference still records the branch a
+/// first push and a clone must use. This is intentionally fallible: persisting a
+/// row after the Git repository rejected the requested reference would make a
+/// successful create response lie about the repository's state.
+fn set_bare_repo_head_to_branch(repo: &gix::Repository, branch: &str) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    use gix::refs::{FullName, Target};
+
+    let branch_ref: FullName = format!("refs/heads/{branch}")
+        .try_into()
+        .map_err(|error| anyhow::anyhow!("invalid default branch reference: {error}"))?;
+    let head_name: FullName = "HEAD"
+        .try_into()
+        .map_err(|error| anyhow::anyhow!("invalid HEAD reference: {error}"))?;
+
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "set default branch".into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch_ref),
+        },
+        name: head_name,
+        deref: false,
+    })
+    .map_err(|error| anyhow::anyhow!("failed to set HEAD to refs/heads/{branch}: {error}"))?;
+
+    Ok(())
 }
 
 /// Roll back a repository directory that a failed step left with no row
@@ -889,19 +943,6 @@ fn auto_init_repo(
             .context("git push failed")?;
         if !output.success() {
             bail!("git push to bare repo failed: {}", output.stderr_str());
-        }
-
-        // Set HEAD in the bare repo to point to the default branch.
-        // Use --git-dir (cannot combine with the gateway's `-C`, so repo_path=None).
-        let head_ref = format!("refs/heads/{}", default_branch);
-        let head_output = gateway
-            .run(
-                &["--git-dir", &push_url, "symbolic-ref", "HEAD", &head_ref],
-                None,
-            )
-            .context("git symbolic-ref HEAD failed")?;
-        if !head_output.success() {
-            tracing::warn!(stderr = %head_output.stderr_str(), "failed to set HEAD in bare repo");
         }
 
         tracing::info!(
