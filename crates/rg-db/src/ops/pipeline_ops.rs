@@ -719,16 +719,22 @@ pub async fn find_pending_job_matching_labels(
         if !job_is_schedulable(db, &job).await? {
             continue;
         }
-        if runner_labels.is_empty() {
-            return Ok(Some(job));
-        }
-        let job_tags: Vec<String> = job
-            .tags
-            .as_ref()
-            .and_then(|t| serde_json::from_str(t).ok())
-            .unwrap_or_default();
+        let job_tags = match job.tags.as_deref() {
+            Some(tags) => match serde_json::from_str::<Vec<String>>(tags) {
+                Ok(tags) => tags,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = job.id,
+                        error = %error,
+                        "skipping pending job with malformed runner tags"
+                    );
+                    continue;
+                }
+            },
+            None => Vec::new(),
+        };
 
-        if job_tags.is_empty() {
+        if runner_labels.is_empty() || job_tags.is_empty() {
             return Ok(Some(job));
         }
 

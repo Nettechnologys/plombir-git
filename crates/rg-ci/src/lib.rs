@@ -389,7 +389,9 @@ impl PipelineGraph<'_> {
             let tags_json = job_config
                 .tags
                 .as_ref()
-                .map(|t| serde_json::to_string(t).unwrap_or_default());
+                .map(serde_json::to_string)
+                .transpose()
+                .context("serialize job tags")?;
             for variant in expand_matrix(job_name, job_config)? {
                 let variables_json = if variant.variables.is_empty() {
                     None

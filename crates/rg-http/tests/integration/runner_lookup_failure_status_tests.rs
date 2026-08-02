@@ -157,6 +157,74 @@ async fn runner_lookup_failure_never_becomes_an_empty_label_set() {
     assert_eq!(persisted.runner_id, None);
 }
 
+/// A corrupt job tag list is not an untagged job. In particular, an unlabelled
+/// runner must not receive it merely because the tag parser could not recover
+/// the stored requirement.
+#[tokio::test]
+async fn malformed_job_tags_are_not_routed_as_untagged() {
+    use tower::ServiceExt as _;
+
+    let (base, db, state) = spawn_test_app_with_state().await;
+    let seeded = seed_job(&base, &db, "malformed-job-tags").await;
+    db.execute_unprepared(&format!(
+        "UPDATE runners SET labels = '[]' WHERE id = {}",
+        seeded.runner_id
+    ))
+    .await
+    .expect("make the runner intentionally unlabelled");
+    db.execute_unprepared(&format!(
+        "UPDATE pipeline_jobs SET tags = '{{' WHERE id = {}",
+        seeded.job_id
+    ))
+    .await
+    .expect("make the job tag list malformed");
+
+    let request = axum::http::Request::builder()
+        .uri(format!(
+            "/api/v1/runners/{}/jobs/poll?timeout=1",
+            seeded.runner_id
+        ))
+        .body(axum::body::Body::empty())
+        .expect("build runner poll request");
+    let response = axum::Router::new()
+        .route(
+            "/api/v1/runners/{id}/jobs/poll",
+            axum::routing::get(rg_http::api::runners::poll_job),
+        )
+        .with_state(state)
+        .oneshot(request)
+        .await
+        .expect("runner poll response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload malformed-tag job")
+        .expect("malformed-tag job still exists");
+    assert_eq!(persisted.status, "pending");
+    assert_eq!(persisted.runner_id, None);
+}
+
+#[tokio::test]
+async fn null_and_empty_job_tags_remain_eligible_without_runner_labels() {
+    for (suffix, stored_tags) in [("null-tags", "NULL"), ("empty-tags", "'[]'")] {
+        let (base, db) = spawn_test_app_with_db().await;
+        let seeded = seed_job(&base, &db, suffix).await;
+        db.execute_unprepared(&format!(
+            "UPDATE pipeline_jobs SET tags = {stored_tags} WHERE id = {}",
+            seeded.job_id
+        ))
+        .await
+        .expect("set the untagged-job fixture");
+
+        let matched = rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
+            .await
+            .expect("find untagged job")
+            .expect("untagged job remains eligible");
+        assert_eq!(matched.id, seeded.job_id);
+    }
+}
+
 async fn assert_poll_context_lookup_failure(target: &str) {
     let (base, db) = spawn_test_app_with_db().await;
     let seeded = seed_job(&base, &db, &format!("poll-{target}")).await;
