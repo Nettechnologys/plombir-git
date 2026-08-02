@@ -326,6 +326,54 @@ pub async fn poll_job(
             .await
             {
                 Ok(Some(job)) => {
+                    // Decode every runner-facing JSON column BEFORE claiming the
+                    // job. Both used to be decoded after the assignment and with
+                    // the error thrown away: a corrupt `variables` collapsed into
+                    // an empty map and a corrupt `cache_paths` into `None`, so the
+                    // runner got a `200` and started work with its mandatory
+                    // environment missing and caching silently off — while the row
+                    // was already `running` and owned by that runner, so no other
+                    // runner could pick it up either. Refusing here answers 5xx and
+                    // leaves the row `pending` and unassigned.
+                    //
+                    // `NULL` still means "this optional column was never set" and
+                    // keeps its previous meaning; only undecodable text is refused.
+                    let mut variables = match job.variables.as_deref() {
+                        Some(json) => match serde_json::from_str::<
+                            serde_json::Map<String, serde_json::Value>,
+                        >(json)
+                        {
+                            Ok(variables) => variables,
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id = job.id,
+                                    runner_id,
+                                    error = %error,
+                                    "poll_job: stored job variables are invalid JSON"
+                                );
+                                return Err(AppError::internal("invalid job variables")
+                                    .into_response());
+                            }
+                        },
+                        None => serde_json::Map::new(),
+                    };
+                    let cache_paths = match job.cache_paths.as_deref() {
+                        Some(json) => match serde_json::from_str::<Vec<String>>(json) {
+                            Ok(cache_paths) => Some(cache_paths),
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id = job.id,
+                                    runner_id,
+                                    error = %error,
+                                    "poll_job: stored job cache_paths are invalid JSON"
+                                );
+                                return Err(AppError::internal("invalid job cache paths")
+                                    .into_response());
+                            }
+                        },
+                        None => None,
+                    };
+
                     // Found a candidate — now *claim* it. The candidate came out
                     // of a snapshot, and two things can have happened since: the
                     // pipeline was canceled, or another runner polling at the
@@ -420,14 +468,6 @@ pub async fn poll_job(
                         }
                     };
 
-                    let mut variables = job
-                        .variables
-                        .as_deref()
-                        .and_then(|json| {
-                            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)
-                                .ok()
-                        })
-                        .unwrap_or_default();
                     for reserved in [
                         "CI",
                         "FORGEKEEP",
@@ -510,10 +550,7 @@ pub async fn poll_job(
                         image: job.image,
                         variables: Some(serde_json::Value::Object(variables)),
                         cache_key: job.cache_key,
-                        cache_paths: job
-                            .cache_paths
-                            .as_deref()
-                            .and_then(|json| serde_json::from_str(json).ok()),
+                        cache_paths,
                         timeout: job
                             .timeout_seconds
                             .unwrap_or(state.job_timeout_secs as i64)

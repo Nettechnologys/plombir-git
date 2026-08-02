@@ -205,6 +205,123 @@ async fn malformed_job_tags_are_not_routed_as_untagged() {
     assert_eq!(persisted.runner_id, None);
 }
 
+/// card_2ba27c033497: the job row carries two runner-facing JSON columns, and a
+/// runner cannot tell a stored-empty one from an undecodable one. Both used to be
+/// decoded *after* the claim and with the error discarded — the runner got a
+/// `200`, started work without its mandatory environment (or with caching
+/// silently off), and the row was already `running` under its own id, so no other
+/// runner could take it either. The claim must not happen at all.
+async fn assert_undecodable_job_column_is_refused_before_assignment(column: &str, stored: &str) {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, &format!("corrupt-{column}-{}", stored.len())).await;
+    db.execute_unprepared(&format!(
+        "UPDATE pipeline_jobs SET {column} = '{stored}' WHERE id = {}",
+        seeded.job_id
+    ))
+    .await
+    .expect("store an undecodable runner-facing column");
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{base}/api/v1/runners/{}/jobs/poll?timeout=1",
+            seeded.runner_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("poll through the production router");
+    assert!(
+        response.status().is_server_error(),
+        "stored {column} `{stored}` could not be decoded but poll returned {}",
+        response.status()
+    );
+
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload the refused job")
+        .expect("the refused job still exists");
+    assert_eq!(
+        persisted.status, "pending",
+        "the job was claimed although its {column} never decoded"
+    );
+    assert_eq!(persisted.runner_id, None);
+}
+
+#[tokio::test]
+async fn poll_refuses_undecodable_runner_facing_job_columns() {
+    // Each case gets its own database so one poisoned row cannot mask another.
+    assert_undecodable_job_column_is_refused_before_assignment("variables", "{").await;
+    // Valid JSON of the wrong shape is undecodable too: `.ok()` erased this
+    // exactly like a syntax error did.
+    assert_undecodable_job_column_is_refused_before_assignment("variables", "[]").await;
+    assert_undecodable_job_column_is_refused_before_assignment("cache_paths", r#"["target""#).await;
+    assert_undecodable_job_column_is_refused_before_assignment("cache_paths", r#"{"dir":"target"}"#)
+        .await;
+}
+
+/// The other half of the rule: a stored `NULL` is still a genuinely unset
+/// optional column, and a decodable value still reaches the runner unchanged.
+#[tokio::test]
+async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
+    for (suffix, variables, cache_paths, expected_paths) in [
+        (
+            "decodable",
+            r#"'{"BUILD_MODE":"release"}'"#,
+            r#"'["target","node_modules"]'"#,
+            Some(serde_json::json!(["target", "node_modules"])),
+        ),
+        ("null", "NULL", "NULL", None),
+    ] {
+        let (base, db) = spawn_test_app_with_db().await;
+        let seeded = seed_job(&base, &db, &format!("wire-{suffix}")).await;
+        db.execute_unprepared(&format!(
+            "UPDATE pipeline_jobs SET variables = {variables}, cache_paths = {cache_paths} \
+             WHERE id = {}",
+            seeded.job_id
+        ))
+        .await
+        .expect("store the runner-facing columns");
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{base}/api/v1/runners/{}/jobs/poll?timeout=5",
+                seeded.runner_id
+            ))
+            .bearer_auth(&seeded.runner_token)
+            .send()
+            .await
+            .expect("poll through the production router");
+        let status = response.status();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("poll response is JSON");
+        assert_eq!(status, StatusCode::OK, "{suffix}: {body}");
+        assert_eq!(body["job_id"].as_i64(), Some(seeded.job_id));
+
+        match &expected_paths {
+            Some(paths) => assert_eq!(&body["cache_paths"], paths, "{suffix}"),
+            None => assert!(body["cache_paths"].is_null(), "{suffix}: {body}"),
+        }
+        // The injected CI environment is present either way; the stored entry
+        // only survives in the decodable case.
+        assert_eq!(body["variables"]["CI"], serde_json::json!("true"), "{body}");
+        assert_eq!(
+            body["variables"]["CI_PIPELINE_ID"].as_i64(),
+            Some(seeded.pipeline_id)
+        );
+        if suffix == "decodable" {
+            assert_eq!(body["variables"]["BUILD_MODE"], serde_json::json!("release"));
+        }
+
+        let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+            .await
+            .expect("reload the assigned job")
+            .expect("the assigned job still exists");
+        assert_eq!(persisted.runner_id, Some(seeded.runner_id));
+    }
+}
+
 #[tokio::test]
 async fn null_and_empty_job_tags_remain_eligible_without_runner_labels() {
     for (suffix, stored_tags) in [("null-tags", "NULL"), ("empty-tags", "'[]'")] {
