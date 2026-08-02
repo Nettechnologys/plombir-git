@@ -521,6 +521,18 @@ pub struct UpsertSsoProviderRequest {
     pub ldap_user_filter: Option<String>,
     #[serde(default)]
     pub enabled: bool,
+    /// May a first login through this provider create an account?
+    ///
+    /// `Option` on purpose, and the two handlers read the absence differently:
+    /// a **create** without it starts the provider at `false`, so "this
+    /// provider may hand out accounts" is something an operator states rather
+    /// than inherits; an **update** without it keeps whatever the provider has,
+    /// so a client that predates the field cannot switch a working directory
+    /// off by not mentioning it.
+    pub auto_provision: Option<bool>,
+    /// Comma-separated email domains this provider may provision accounts for.
+    /// Absent leaves the stored list alone; an empty string clears it.
+    pub allowed_email_domains: Option<String>,
     pub icon_url: Option<String>,
 }
 
@@ -592,6 +604,15 @@ pub async fn create_sso_provider(
     if let Err(error) = validate_ldap_provider_request(&body, false) {
         return AppError::bad_request(error).into_response();
     }
+    let allowed_email_domains = match body
+        .allowed_email_domains
+        .as_deref()
+        .map(rg_core::user::provisioning::normalize_email_domains)
+        .transpose()
+    {
+        Ok(domains) => domains.flatten(),
+        Err(error) => return AppError::bad_request(error).into_response(),
+    };
 
     // `sso_providers.slug` is UNIQUE, and the insert below is the only place that
     // ever noticed: the constraint violation came back as a `DbErr` that the
@@ -636,21 +657,30 @@ pub async fn create_sso_provider(
     match rg_db::ops::sso_provider_ops::upsert(
         &state.db,
         None,
-        &body.name,
-        &body.slug,
-        pt,
-        body.client_id.as_deref(),
-        client_secret_enc.as_deref(),
-        body.discovery_url.as_deref(),
-        body.scopes.as_deref(),
-        body.ldap_host.as_deref(),
-        body.ldap_port,
-        body.ldap_bind_dn.as_deref(),
-        ldap_password_enc.as_deref(),
-        body.ldap_base_dn.as_deref(),
-        body.ldap_user_filter.as_deref(),
-        body.enabled,
-        body.icon_url.as_deref(),
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: &body.name,
+            slug: &body.slug,
+            provider_type: pt,
+            client_id: body.client_id.as_deref(),
+            client_secret_enc: client_secret_enc.as_deref(),
+            discovery_url: body.discovery_url.as_deref(),
+            scopes: body.scopes.as_deref(),
+            ldap_host: body.ldap_host.as_deref(),
+            ldap_port: body.ldap_port,
+            ldap_bind_dn: body.ldap_bind_dn.as_deref(),
+            ldap_bind_password_enc: ldap_password_enc.as_deref(),
+            ldap_base_dn: body.ldap_base_dn.as_deref(),
+            ldap_user_filter: body.ldap_user_filter.as_deref(),
+            enabled: body.enabled,
+            // A brand-new provider provisions nobody until someone says
+            // otherwise. The migration default is the opposite (`true`) for the
+            // opposite reason: it must not change how a running instance
+            // behaves, while a provider being wired up right now has an
+            // operator present to answer the question.
+            auto_provision: body.auto_provision.unwrap_or(false),
+            allowed_email_domains: allowed_email_domains.as_deref(),
+            icon_url: body.icon_url.as_deref(),
+        },
     )
     .await
     {
@@ -706,6 +736,17 @@ pub async fn update_sso_provider(
     {
         return AppError::bad_request(error).into_response();
     }
+    let existing_auto_provision = existing_provider.auto_provision;
+    // Absent means "leave the policy alone", present-but-empty means "clear the
+    // allowlist". A client that has never heard of the field must not be able
+    // to widen who this provider provisions for by staying silent about it.
+    let allowed_email_domains = match body.allowed_email_domains.as_deref() {
+        Some(raw) => match rg_core::user::provisioning::normalize_email_domains(raw) {
+            Ok(domains) => domains,
+            Err(error) => return AppError::bad_request(error).into_response(),
+        },
+        None => existing_provider.allowed_email_domains.clone(),
+    };
 
     // Same UNIQUE constraint as on create — but here the row may legitimately
     // keep its own slug, so only a *different* provider holding it is a conflict.
@@ -748,21 +789,25 @@ pub async fn update_sso_provider(
     match rg_db::ops::sso_provider_ops::upsert(
         &state.db,
         Some(id),
-        &body.name,
-        &body.slug,
-        pt,
-        body.client_id.as_deref(),
-        client_secret_enc.as_deref(),
-        body.discovery_url.as_deref(),
-        body.scopes.as_deref(),
-        body.ldap_host.as_deref(),
-        body.ldap_port,
-        body.ldap_bind_dn.as_deref(),
-        ldap_password_enc.as_deref(),
-        body.ldap_base_dn.as_deref(),
-        body.ldap_user_filter.as_deref(),
-        body.enabled,
-        body.icon_url.as_deref(),
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: &body.name,
+            slug: &body.slug,
+            provider_type: pt,
+            client_id: body.client_id.as_deref(),
+            client_secret_enc: client_secret_enc.as_deref(),
+            discovery_url: body.discovery_url.as_deref(),
+            scopes: body.scopes.as_deref(),
+            ldap_host: body.ldap_host.as_deref(),
+            ldap_port: body.ldap_port,
+            ldap_bind_dn: body.ldap_bind_dn.as_deref(),
+            ldap_bind_password_enc: ldap_password_enc.as_deref(),
+            ldap_base_dn: body.ldap_base_dn.as_deref(),
+            ldap_user_filter: body.ldap_user_filter.as_deref(),
+            enabled: body.enabled,
+            auto_provision: body.auto_provision.unwrap_or(existing_auto_provision),
+            allowed_email_domains: allowed_email_domains.as_deref(),
+            icon_url: body.icon_url.as_deref(),
+        },
     )
     .await
     {
@@ -882,6 +927,8 @@ fn sso_provider_response(p: &rg_db::entities::sso_provider::Model) -> serde_json
         "ldap_base_dn": p.ldap_base_dn,
         "ldap_user_filter": p.ldap_user_filter,
         "enabled": p.enabled,
+        "auto_provision": p.auto_provision,
+        "allowed_email_domains": p.allowed_email_domains,
         "icon_url": p.icon_url,
         "created_at": p.created_at.to_string(),
         "updated_at": p.updated_at.to_string(),

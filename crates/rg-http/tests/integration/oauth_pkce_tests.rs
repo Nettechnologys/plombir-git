@@ -158,21 +158,17 @@ async fn sso_logins_without_a_usable_email_are_refused_instead_of_merged() {
     rg_db::ops::sso_provider_ops::upsert(
         &db,
         None,
-        "Mock OIDC",
-        "oidc-nomail",
-        "oidc",
-        Some("client-id"),
-        None,
-        Some(&format!("{oidc_base}/.well-known/openid-configuration")),
-        Some("openid profile"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        true,
-        None,
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: "Mock OIDC",
+            slug: "oidc-nomail",
+            provider_type: "oidc",
+            client_id: Some("client-id"),
+            discovery_url: Some(&format!("{oidc_base}/.well-known/openid-configuration")),
+            scopes: Some("openid profile"),
+            enabled: true,
+            auto_provision: true,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -299,21 +295,17 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     rg_db::ops::sso_provider_ops::upsert(
         &db,
         None,
-        "Mock OIDC",
-        "oidc-test",
-        "oidc",
-        Some("client-id"),
-        None,
-        Some(&format!("{oidc_base}/.well-known/openid-configuration")),
-        Some("openid profile email"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        true,
-        None,
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: "Mock OIDC",
+            slug: "oidc-test",
+            provider_type: "oidc",
+            client_id: Some("client-id"),
+            discovery_url: Some(&format!("{oidc_base}/.well-known/openid-configuration")),
+            scopes: Some("openid profile email"),
+            enabled: true,
+            auto_provision: true,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

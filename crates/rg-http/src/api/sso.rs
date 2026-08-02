@@ -416,7 +416,7 @@ pub async fn callback(
     let config = rg_core::auth::sso::SsoProviderConfig {
         slug: provider.slug.clone(),
         provider_type: provider.provider_type.clone(),
-        client_id: provider.client_id.unwrap_or_default(),
+        client_id: provider.client_id.clone().unwrap_or_default(),
         client_secret,
         redirect_url,
         scopes: provider
@@ -445,8 +445,7 @@ pub async fn callback(
             .map_err(|error| sso_user_info_error(&provider.slug, &error))?;
 
     // ── Find or create user ──────────────────────────────────────
-    let user_id =
-        find_or_create_sso_user(&state, &provider.slug, &user_info, &token_response).await?;
+    let user_id = find_or_create_sso_user(&state, &provider, &user_info, &token_response).await?;
 
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
@@ -760,13 +759,35 @@ fn sso_user_info_error(provider_slug: &str, error: &anyhow::Error) -> AppError {
     AppError::bad_request("failed to fetch user info")
 }
 
+/// Turn a refused first-login provisioning into the answer the person signing
+/// in gets.
+///
+/// A `403` and not a `500`: nothing failed. The provider authenticated them,
+/// this instance simply does not hand out accounts through that door — and the
+/// message says which of the two rules refused, because the remedies differ.
+fn sso_provisioning_refused(
+    provider_slug: &str,
+    user_info: &rg_core::auth::sso::SsoIdentity,
+    refusal: rg_core::user::provisioning::ProvisioningRefusal,
+) -> AppError {
+    crate::metrics::recorder::provisioning_refused(refusal.reason());
+    tracing::warn!(
+        provider = %provider_slug,
+        provider_username = %user_info.provider_username,
+        reason = refusal.reason(),
+        "SSO first login refused: this provider may not create accounts here"
+    );
+    AppError::forbidden(refusal.message())
+}
+
 async fn find_or_create_sso_user(
     state: &AppState,
-    provider_slug: &str,
+    provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
     token_response: &rg_core::auth::sso::OAuth2TokenResponse,
 ) -> Result<i64, AppError> {
     let db = &state.db;
+    let provider_slug = provider.slug.as_str();
 
     // Check if OAuth account already exists
     if let Some(oauth) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
@@ -823,7 +844,15 @@ async fn find_or_create_sso_user(
         .map_err(AppError::from)?
     {
         Some(existing) => existing.id,
-        None => provision_sso_user(db, provider_slug, user_info).await?,
+        None => {
+            // The only branch on this path that *creates* an account, and so
+            // the only one the provisioning policy governs. Both branches above
+            // sign in an account that already exists; refusing them would log
+            // people out of the instance instead of keeping strangers out of it.
+            rg_core::user::provisioning::authorize(provider, &user_info.email)
+                .map_err(|refusal| sso_provisioning_refused(provider_slug, user_info, refusal))?;
+            provision_sso_user(db, provider_slug, user_info).await?
+        }
     };
 
     // Encrypt and store tokens

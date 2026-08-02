@@ -423,6 +423,25 @@ pub async fn login(
                 "account is disabled",
                 "account is temporarily locked",
             ];
+
+            // A directory bind that succeeded and a provisioning policy that
+            // said no. Neither a rejected credential (the password was right,
+            // so 401 would be a lie and the brute-force counter below would
+            // punish someone for our policy) nor a server failure (nothing
+            // broke). It travels as a typed refusal precisely so this door can
+            // tell it apart from both, and answers with the rule that refused.
+            if let Some(refusal) =
+                error.downcast_ref::<rg_core::user::provisioning::ProvisioningRefusal>()
+            {
+                crate::metrics::recorder::provisioning_refused(refusal.reason());
+                tracing::warn!(
+                    login = %body.login,
+                    reason = refusal.reason(),
+                    "login refused: the directory that authenticated this person may not create accounts here"
+                );
+                return AppError::Forbidden(refusal.message().to_string()).into_response();
+            }
+
             let verdict = error.to_string();
             if !CREDENTIAL_VERDICTS.contains(&verdict.as_str()) {
                 crate::metrics::recorder::auth_event("login", "failure");

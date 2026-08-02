@@ -533,6 +533,18 @@ pub mod recorder {
         auth_event("provision", source);
     }
 
+    /// Record a first login an identity provider was not allowed to turn into
+    /// an account (`sso_providers.auto_provision` / `allowed_email_domains`).
+    ///
+    /// Deliberately **not** `auth_event("provision", …)`: that series spends its
+    /// `outcome` label on the *source* (`"ldap"` / `"sso"`), so a refusal filed
+    /// there would be counted as an account created by a provider named
+    /// "refused". It gets its own event, with `reason` carrying the rule that
+    /// refused (`"auto_provision_disabled"` / `"email_domain_not_allowed"`).
+    pub fn provisioning_refused(reason: &str) {
+        auth_event("provision_refused", reason);
+    }
+
     /// Record a repository created.
     pub fn repo_created() {
         if let Some(c) = business::REPOS_CREATED.get() {

@@ -13,12 +13,15 @@
 //!   already spells the setting out. Self-service sign-up is a product feature
 //!   with more than two states, not a stopgap flag for launch week.
 //! * **Not a gate on LDAP / SSO auto-provision.** Those channels create accounts
-//!   too (`forgekeep_auth_events_total{event="provision"}`), but the operator
-//!   who wired a directory or an identity provider into this instance has
-//!   already decided who may have an account there — the answer lives in the
-//!   provider, not here. Closing self-service registration must not
-//!   simultaneously lock out a whole company's directory; that would be a
-//!   separate switch with a separate decision behind it.
+//!   too (`forgekeep_auth_events_total{event="provision"}`), and closing
+//!   self-service registration must not simultaneously lock out a whole
+//!   company's directory. That is a separate switch with a separate decision
+//!   behind it, and it exists: [`crate::user::provisioning`] reads
+//!   `sso_providers.auto_provision` / `allowed_email_domains`, per provider.
+//!   The reasoning that used to live here — "the operator who wired a provider
+//!   in already decided who may have an account" — was true of a private
+//!   directory and false of `github.com`, where the identity is free and the
+//!   decision had never been made by anyone (card_0ae3deacd3f0).
 
 use anyhow::Result;
 use sea_orm::DatabaseConnection;

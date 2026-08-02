@@ -113,6 +113,8 @@ export interface AdminSsoProvider {
   ldap_base_dn: string | null;
   ldap_user_filter: string | null;
   enabled: boolean;
+  auto_provision: boolean;
+  allowed_email_domains: string | null;
   icon_url: string | null;
   created_at: string;
   updated_at: string;
@@ -133,6 +135,10 @@ export interface SsoProviderPayload {
   ldap_base_dn?: string;
   ldap_user_filter?: string;
   enabled?: boolean;
+  /** May a first login through this provider create an account? */
+  auto_provision?: boolean;
+  /** Comma-separated email domains that may be provisioned; empty clears the list. */
+  allowed_email_domains?: string;
   icon_url?: string;
 }
 

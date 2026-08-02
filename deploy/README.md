@@ -149,13 +149,39 @@ Two things `closed` still admits, on purpose:
   one registration, otherwise a closed instance could never be initialised. Do
   that registration before the port is reachable by anyone else — the window is
   open until it is used.
-* **LDAP / SSO auto-provision.** First-login provisioning is a separate channel
-  (`forgekeep_auth_events_total{event="provision"}`), and the operator who wired
-  a directory or identity provider into this instance already decided who may
-  have an account there.
+* **LDAP / SSO first-login provisioning.** It is a separate channel
+  (`forgekeep_auth_events_total{event="provision"}`) with its own switch, per
+  provider — see below. `FORGEKEEP_REGISTRATION` does not reach it in either
+  direction.
 
 A value neither `open` nor `closed` fails the start with the accepted spellings
 named, rather than booting an instance you believe is closed.
+
+### Who may get an account through an identity provider
+
+Each row in **Admin → Settings → SSO Providers** carries its own provisioning
+policy, because "who may sign in" and "who may be *created*" are different
+questions on a public IdP, where everyone already holds a valid identity:
+
+* **Create accounts on first login** (`auto_provision`). Off means only people
+  who already have an account here can use this provider; a stranger with a
+  perfectly valid identity at it gets a `403` naming the reason, and no row in
+  `users`. A provider you create today starts **off** — handing out accounts is
+  something you turn on deliberately.
+* **Allowed email domains** (`allowed_email_domains`). Comma-separated, empty
+  for no restriction. The match is on the exact domain of the address the
+  provider asserts: `example.com` admits `alice@example.com` and admits neither
+  `mail.example.com` nor `evil-example.com`.
+
+Both only govern account *creation*. Turning provisioning off never locks out an
+account that already exists, whether it was linked to the provider or matched on
+its email — so the switch is safe to flip on a live instance.
+
+> **Upgrading.** Providers that already existed keep `auto_provision = true`, so
+> an upgrade changes nothing about who can log in. If one of them is a public
+> IdP (`github.com`, `google.com`), that is the setting to revisit first: with it
+> on, anyone with an account *there* can have one *here*, and
+> `FORGEKEEP_REGISTRATION=closed` does not change that.
 
 ### Secrets and rotation
 
@@ -319,7 +345,7 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 ### Business Metrics (Phase 22-C)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `forgekeep_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `forgekeep_auth_events_total{event="provision",outcome="ldap"\|"sso"}`) |
+| `forgekeep_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `forgekeep_auth_events_total{event="provision",outcome="ldap"\|"sso"}`; refusals are a separate series, `event="provision_refused",outcome=<rule>`, and never count as an account) |
 | `forgekeep_repos_created_total` | Counter | Repos created |
 | `forgekeep_repos_deleted_total` | Counter | Repos deleted |
 | `forgekeep_repos_forked_total` | Counter | Repos forked |

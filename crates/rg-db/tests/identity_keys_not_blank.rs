@@ -70,6 +70,22 @@ fn steps_before_migration() -> u32 {
     u32::try_from(position).expect("migration index fits in u32")
 }
 
+/// How many steps back from head undo the migration under test, inclusive.
+///
+/// `down(Some(1))` was the same bug this file warns about at the top, one
+/// direction over: it means "undo the newest migration", which stopped being
+/// this one the moment another migration landed after it — and the failure read
+/// as "the constraint is not rolled back" rather than "you rolled back somebody
+/// else's work".
+fn steps_back_to_migration() -> u32 {
+    let migrations = rg_db::migrations::Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == MIGRATION)
+        .unwrap_or_else(|| panic!("{MIGRATION} must still be part of the migration list"));
+    u32::try_from(migrations.len() - position).expect("migration count fits in u32")
+}
+
 async fn execute(db: &DatabaseConnection, sql: &str) -> Result<(), DbErr> {
     db.execute(Statement::from_string(
         rg_db::sea_orm::DatabaseBackend::Sqlite,
@@ -194,7 +210,7 @@ async fn the_database_refuses_a_blank_identity_key_on_insert_and_on_update() {
     // ── The rollback is a real rollback ─────────────────────────────────────
     // A `down` that leaves its triggers behind makes the migration impossible to
     // step back over, and the failure would only show up during an incident.
-    rg_db::migrations::Migrator::down(&db, Some(1))
+    rg_db::migrations::Migrator::down(&db, Some(steps_back_to_migration()))
         .await
         .expect("roll the constraint back");
     execute(&db, &insert_user_sql(50, "afterdown", "", "<null>"))

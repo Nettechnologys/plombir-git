@@ -8,6 +8,7 @@ use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use rg_db::{entities::user::ActiveModel as UserActiveModel, ops::user_ops};
 
 use crate::auth::{jwt, password};
+use crate::user::provisioning::ProvisioningRefusal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginMethod {
@@ -406,9 +407,15 @@ async fn login_via_ldap_inner(
             }
         };
 
-        let user = match resolve_ldap_identity(db, existing.as_ref(), provider.id, ldap_user).await
-        {
+        let user = match resolve_ldap_identity(db, existing.as_ref(), &provider, ldap_user).await {
             Ok(user) => user,
+            // A policy refusal is a decision this instance made, not a failure:
+            // it is already logged at its source, it is the same answer for
+            // every remaining provider, and it must reach the caller intact so
+            // the door can answer 403 instead of "invalid credentials".
+            Err(error) if error.downcast_ref::<ProvisioningRefusal>().is_some() => {
+                return Err(error);
+            }
             Err(error) if error.to_string() == LDAP_IDENTITY_CONFLICT => {
                 tracing::warn!(
                     provider_id = provider.id,
@@ -534,9 +541,10 @@ pub async fn test_ldap_provider_connection(
 async fn resolve_ldap_identity(
     db: &DatabaseConnection,
     existing: Option<&rg_db::entities::user::Model>,
-    ldap_provider_id: i64,
+    provider: &rg_db::entities::sso_provider::Model,
     ldap_user: crate::auth::ldap::LdapUser,
 ) -> Result<rg_db::entities::user::Model> {
+    let ldap_provider_id = provider.id;
     let username = ldap_user
         .uid
         .as_deref()
@@ -573,6 +581,27 @@ async fn resolve_ldap_identity(
         .map(str::trim)
         .filter(|email| valid_email(email))
         .context("LDAP account does not have a valid email address")?;
+
+    // Everything above this line concerns an account that already exists; from
+    // here on the function creates one, which is the single question the
+    // provisioning policy answers. A directory that has stopped provisioning
+    // still signs in every member who already has an account — the branch that
+    // returns above never reaches this check.
+    //
+    // The bind succeeded, so this is not a rejected credential and must not be
+    // dressed as one: the refusal travels as itself and the HTTP layer answers
+    // 403 with the reason, rather than telling a member of the directory that
+    // their password was wrong.
+    if let Err(refusal) = crate::user::provisioning::authorize(provider, email) {
+        tracing::warn!(
+            provider_id = ldap_provider_id,
+            username,
+            reason = refusal.reason(),
+            "LDAP first login refused: this directory may not create accounts here"
+        );
+        return Err(anyhow::Error::new(refusal));
+    }
+
     if user_ops::find_by_email(db, email).await?.is_some() {
         bail!(LDAP_IDENTITY_CONFLICT);
     }
@@ -1005,6 +1034,8 @@ mod tests {
             ldap_base_dn: Some("dc=example,dc=com".into()),
             ldap_user_filter: Some("(uid={username})".into()),
             enabled: true,
+            auto_provision: true,
+            allowed_email_domains: None,
             icon_url: None,
             created_at: now,
             updated_at: now,
@@ -1045,7 +1076,7 @@ mod tests {
         let created = resolve_ldap_identity(
             &db,
             None,
-            1,
+            &ldap_provider("jwt-secret"),
             crate::auth::ldap::LdapUser {
                 username: "alice".into(),
                 email: Some("alice@example.com".into()),
@@ -1064,7 +1095,7 @@ mod tests {
         let synced = resolve_ldap_identity(
             &db,
             Some(&created),
-            1,
+            &ldap_provider("jwt-secret"),
             crate::auth::ldap::LdapUser {
                 username: "alice".into(),
                 email: Some("changed@example.com".into()),
@@ -1082,6 +1113,91 @@ mod tests {
             synced.ldap_dn.as_deref(),
             Some("uid=alice,ou=people,dc=example,dc=com")
         );
+    }
+
+    fn directory_member() -> crate::auth::ldap::LdapUser {
+        crate::auth::ldap::LdapUser {
+            username: "alice".into(),
+            email: Some("alice@example.com".into()),
+            display_name: Some("Alice".into()),
+            dn: "uid=alice,dc=example,dc=com".into(),
+            uid: Some("alice".into()),
+        }
+    }
+
+    /// card_0ae3deacd3f0: the LDAP door asks the same policy column the SSO
+    /// callback asks. A successful bind proves who someone is at the
+    /// directory; it does not decide that this instance hands them an account.
+    ///
+    /// The refusal travels as a typed [`ProvisioningRefusal`] rather than as
+    /// "invalid credentials", because the HTTP door has to answer 403 with the
+    /// reason instead of telling a member of the directory their password was
+    /// wrong — and has to keep it out of the brute-force counter.
+    #[tokio::test]
+    async fn a_directory_that_may_not_provision_creates_no_account() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+
+        let mut closed = ldap_provider("jwt-secret");
+        closed.auto_provision = false;
+        let error = resolve_ldap_identity(&db, None, &closed, directory_member())
+            .await
+            .expect_err("a directory that may not provision must refuse the first login");
+        assert_eq!(
+            error.downcast_ref::<ProvisioningRefusal>(),
+            Some(&ProvisioningRefusal::AutoProvisionDisabled),
+            "the refusal must stay recognisable to the door that answers it: {error:#}"
+        );
+        assert!(
+            user_ops::find_by_username(&db, "alice")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused LDAP first login provisioned an account anyway"
+        );
+
+        // Baseline in the same test: only the policy differs, and the identical
+        // bind now provisions — so the refusal above is the policy, not a
+        // broken fixture.
+        let created = resolve_ldap_identity(&db, None, &ldap_provider("jwt-secret"), directory_member())
+            .await
+            .expect("the same first login is provisioned when the directory may");
+        assert_eq!(created.username, "alice");
+
+        // And the switch keeps working for people who already have an account:
+        // the existing-identity branch never reaches the policy.
+        let synced = resolve_ldap_identity(&db, Some(&created), &closed, directory_member())
+            .await
+            .expect("an existing directory account still signs in through a closed provider");
+        assert_eq!(synced.id, created.id);
+    }
+
+    /// The narrower rule, on the same door: the directory provisions, but not
+    /// for this address's domain.
+    #[tokio::test]
+    async fn an_ldap_address_outside_the_allowlist_creates_no_account() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+
+        let mut narrowed = ldap_provider("jwt-secret");
+        narrowed.allowed_email_domains = Some("corp.example".into());
+        let error = resolve_ldap_identity(&db, None, &narrowed, directory_member())
+            .await
+            .expect_err("an address outside the allowlist must not be provisioned");
+        assert_eq!(
+            error.downcast_ref::<ProvisioningRefusal>(),
+            Some(&ProvisioningRefusal::EmailDomainNotAllowed)
+        );
+        assert!(user_ops::find_by_username(&db, "alice")
+            .await
+            .unwrap()
+            .is_none());
+
+        narrowed.allowed_email_domains = Some("example.com".into());
+        let created = resolve_ldap_identity(&db, None, &narrowed, directory_member())
+            .await
+            .expect("an address inside the allowlist is provisioned");
+        assert_eq!(created.email, "alice@example.com");
     }
 
     /// A concurrent request can pass the preflight before the winner writes its

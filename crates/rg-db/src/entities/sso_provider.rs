@@ -34,6 +34,22 @@ pub struct Model {
     /// LDAP user filter template, e.g. "(uid={username})"
     pub ldap_user_filter: Option<String>,
     pub enabled: bool,
+    /// May a first login through this provider *create* a ForgeKeep account?
+    ///
+    /// `enabled` says the provider can be used to sign in; this says whether
+    /// signing in is allowed to mint an account for someone who has none. They
+    /// are different questions on a public IdP, where everyone holds a valid
+    /// identity: `false` keeps already-linked accounts working and refuses the
+    /// first login of a stranger.
+    pub auto_provision: bool,
+    /// Comma-separated email domains this provider may provision accounts for,
+    /// canonicalised on write (trimmed, lowercased). `None` = no restriction.
+    ///
+    /// Matched on the exact domain of the address the provider asserts —
+    /// `example.com` does not admit `mail.example.com`. Only consulted when
+    /// `auto_provision` is on; it narrows who may be created, never who may
+    /// sign in with an account they already have.
+    pub allowed_email_domains: Option<String>,
     /// Icon URL for login button (optional)
     pub icon_url: Option<String>,
     pub created_at: DateTimeUtc,

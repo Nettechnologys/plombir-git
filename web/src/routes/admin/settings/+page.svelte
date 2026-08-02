@@ -50,6 +50,11 @@
       ldap_base_dn: '',
       ldap_user_filter: '',
       enabled: true,
+      // A new provider provisions nobody until the operator says otherwise —
+      // the same default the API applies, spelled out here so the box the
+      // admin sees matches what gets stored.
+      auto_provision: false,
+      allowed_email_domains: '',
       icon_url: '',
     };
   }
@@ -135,6 +140,8 @@
       ldap_base_dn: provider.ldap_base_dn || '',
       ldap_user_filter: provider.ldap_user_filter || '',
       enabled: provider.enabled,
+      auto_provision: provider.auto_provision,
+      allowed_email_domains: provider.allowed_email_domains || '',
       icon_url: provider.icon_url || '',
     };
   }
@@ -160,6 +167,10 @@
       ldap_bind_password: ssoForm.ldap_bind_password || undefined,
       ldap_base_dn: ssoForm.ldap_base_dn?.trim() || undefined,
       ldap_user_filter: ssoForm.ldap_user_filter?.trim() || undefined,
+      auto_provision: ssoForm.auto_provision ?? false,
+      // Always sent, empty string included: omitting it means "keep the stored
+      // allowlist", so an emptied field would silently keep the old one.
+      allowed_email_domains: ssoForm.allowed_email_domains?.trim() ?? '',
       icon_url: ssoForm.icon_url?.trim() || undefined,
     };
   }
@@ -331,6 +342,7 @@
                   <span>{provider.slug}</span>
                   <span>{provider.provider_type}</span>
                   <span class:enabled={provider.enabled}>{provider.enabled ? 'Enabled' : 'Disabled'}</span>
+                  <span>{provider.auto_provision ? 'Creates accounts' : 'No new accounts'}</span>
                 </div>
               </div>
               <div class="provider-actions">
@@ -417,6 +429,24 @@
           <input id="sso-enabled" type="checkbox" bind:checked={ssoForm.enabled} />
           <label for="sso-enabled">Enable this provider</label>
         </div>
+        <div class="toggle-row">
+          <input id="sso-auto-provision" type="checkbox" bind:checked={ssoForm.auto_provision} />
+          <label for="sso-auto-provision">Create accounts on first login</label>
+        </div>
+        <p class="field-hint">
+          Off means only people who already have an account here can sign in through this provider.
+          On a public identity provider (GitHub, Google) leaving it on hands an account to anyone
+          with an account there.
+        </p>
+        <div class="form-group">
+          <label for="sso-allowed-domains">Allowed email domains</label>
+          <input id="sso-allowed-domains" type="text" bind:value={ssoForm.allowed_email_domains} placeholder="example.com, partner.org" />
+          <p class="field-hint">
+            Comma-separated. Empty means no domain restriction. Exact match — <code>example.com</code>
+            does not admit <code>mail.example.com</code>. Only limits who gets an account created;
+            existing accounts keep signing in.
+          </p>
+        </div>
         <div class="inline-actions">
           <button class="btn-primary" type="button" onclick={saveSsoProvider} disabled={ssoSaving}>
             {ssoSaving ? 'Saving...' : editingSsoId ? 'Update Provider' : 'Create Provider'}
@@ -487,6 +517,8 @@
   .form-group { margin-top: 12px; }
   .form-group label { display: block; font-size: 13px; color: var(--text-secondary); margin-bottom: 4px; }
   .form-group input, .form-group select { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 14px; background: var(--bg-primary); color: var(--text-primary); box-sizing: border-box; }
+  .field-hint { margin: 4px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+  .field-hint code { font-size: 11px; }
   .actions { margin-top: 16px; }
   .inline-actions { display: flex; gap: 8px; margin-top: 16px; }
   .btn-primary { padding: 8px 20px; background: var(--accent); color: #fff; border: none; border-radius: var(--radius); font-size: 14px; cursor: pointer; }
