@@ -24,6 +24,24 @@ pub async fn find_by_email(db: &DatabaseConnection, email: &str) -> Result<Optio
         .context("db: find user by email")
 }
 
+/// Find a directory identity by the provider and stable LDAP uid that own it.
+///
+/// The caller must not substitute a username for this pair: usernames are
+/// account-local labels and can legitimately belong to an unrelated user.
+pub async fn find_by_ldap_provider_and_uid(
+    db: &DatabaseConnection,
+    ldap_provider_id: i64,
+    ldap_uid: &str,
+) -> Result<Option<User>> {
+    UserEntity::find()
+        .filter(user::Column::AuthProvider.eq("ldap"))
+        .filter(user::Column::LdapProviderId.eq(ldap_provider_id))
+        .filter(user::Column::LdapUid.eq(ldap_uid))
+        .one(db)
+        .await
+        .context("db: find user by LDAP provider and uid")
+}
+
 /// Find a user by id.
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<User>> {
     UserEntity::find_by_id(id)

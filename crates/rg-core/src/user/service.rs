@@ -20,6 +20,8 @@ pub struct LoginOutcome {
     pub method: LoginMethod,
 }
 
+const LDAP_IDENTITY_CONFLICT: &str = "LDAP identity conflicts with an existing account";
+
 /// A paginated list of users with total count.
 pub struct PaginatedUsers {
     pub users: Vec<UserInfo>,
@@ -401,13 +403,21 @@ async fn login_via_ldap_inner(
         let user = match resolve_ldap_identity(db, existing.as_ref(), provider.id, ldap_user).await
         {
             Ok(user) => user,
-            Err(error) => {
+            Err(error) if error.to_string() == LDAP_IDENTITY_CONFLICT => {
                 tracing::warn!(
                     provider_id = provider.id,
                     error = %format!("{error:#}"),
                     "LDAP identity could not be linked"
                 );
                 bail!("invalid credentials");
+            }
+            Err(error) => {
+                tracing::error!(
+                    provider_id = provider.id,
+                    error = %format!("{error:#}"),
+                    "LDAP identity provisioning failed after a successful bind"
+                );
+                return Err(error);
             }
         };
         let token = jwt::generate_token(user.id, &user.username, jwt_secret, 7)?;
@@ -534,7 +544,7 @@ async fn resolve_ldap_identity(
                 .ldap_provider_id
                 .is_some_and(|provider_id| provider_id != ldap_provider_id)
         {
-            bail!("LDAP identity conflicts with an existing account");
+            bail!(LDAP_IDENTITY_CONFLICT);
         }
         return user_ops::sync_ldap_identity(
             db,
@@ -548,7 +558,7 @@ async fn resolve_ldap_identity(
     }
 
     if user_ops::find_by_username(db, username).await?.is_some() {
-        bail!("LDAP identity conflicts with an existing account");
+        bail!(LDAP_IDENTITY_CONFLICT);
     }
     let email = ldap_user
         .email
@@ -557,9 +567,10 @@ async fn resolve_ldap_identity(
         .filter(|email| valid_email(email))
         .context("LDAP account does not have a valid email address")?;
     if user_ops::find_by_email(db, email).await?.is_some() {
-        bail!("LDAP identity conflicts with an existing account");
+        bail!(LDAP_IDENTITY_CONFLICT);
     }
-    let user = user_ops::create_ldap_user(
+
+    create_or_resolve_ldap_identity(
         db,
         ldap_provider_id,
         username,
@@ -568,12 +579,100 @@ async fn resolve_ldap_identity(
         &ldap_user.dn,
         ldap_user.uid.as_deref(),
     )
-    .await?;
-    // First-login LDAP auto-provision is a new account: count it in the
-    // `users_registered_total` funnel with `ldap` provenance so directory-only
-    // deployments don't silently undercount registrations.
-    crate::metrics_hook::record_user_provisioned("ldap");
-    Ok(user)
+    .await
+}
+
+/// Insert a post-bind LDAP identity or recover the winner of the same first-login race.
+///
+/// The preflight above is deliberately kept for clear, early conflict errors, but it
+/// cannot serialize two requests. A UNIQUE failure is only recoverable when the
+/// record that won carries this request's directory identity; a username alone is
+/// not an identity and must never be adopted.
+#[allow(clippy::too_many_arguments)]
+async fn create_or_resolve_ldap_identity(
+    db: &DatabaseConnection,
+    ldap_provider_id: i64,
+    username: &str,
+    email: &str,
+    display_name: Option<&str>,
+    ldap_dn: &str,
+    ldap_uid: Option<&str>,
+) -> Result<rg_db::entities::user::Model> {
+    let error = match user_ops::create_ldap_user(
+        db,
+        ldap_provider_id,
+        username,
+        email,
+        display_name,
+        ldap_dn,
+        ldap_uid,
+    )
+    .await
+    {
+        Ok(user) => {
+            // First-login LDAP auto-provision is a new account: count it in the
+            // `users_registered_total` funnel with `ldap` provenance so directory-only
+            // deployments don't silently undercount registrations.
+            crate::metrics_hook::record_user_provisioned("ldap");
+            return Ok(user);
+        }
+        Err(error) => error,
+    };
+
+    // Only the database's typed UNIQUE classification proves that a concurrent
+    // insert could have won. Connection, foreign-key and check failures remain
+    // real server errors; pretending that they created an identity would both
+    // hide the outage and authenticate the wrong principal.
+    if !rg_db::is_unique_violation_anyhow(&error) {
+        return Err(error);
+    }
+
+    if let Some(user) =
+        resolve_raced_ldap_identity(db, ldap_provider_id, username, email, ldap_uid).await?
+    {
+        return Ok(user);
+    }
+
+    // A UNIQUE violation with no matching directory identity was on an
+    // unrelated constraint. Preserve the original database error instead of
+    // fabricating a successful login.
+    Err(error)
+}
+
+/// Find the winner of a first-login LDAP race without adopting another account.
+async fn resolve_raced_ldap_identity(
+    db: &DatabaseConnection,
+    ldap_provider_id: i64,
+    username: &str,
+    email: &str,
+    ldap_uid: Option<&str>,
+) -> Result<Option<rg_db::entities::user::Model>> {
+    if let Some(ldap_uid) = ldap_uid {
+        if let Some(user) =
+            user_ops::find_by_ldap_provider_and_uid(db, ldap_provider_id, ldap_uid).await?
+        {
+            return Ok(Some(user));
+        }
+    }
+
+    if let Some(user) = user_ops::find_by_email(db, email).await? {
+        if user.auth_provider == "ldap"
+            && user.ldap_provider_id == Some(ldap_provider_id)
+            && user.ldap_uid.as_deref() == ldap_uid
+        {
+            return Ok(Some(user));
+        }
+        bail!(LDAP_IDENTITY_CONFLICT);
+    }
+
+    // A username collision belongs to another account unless the stable LDAP
+    // identity lookup above already proved otherwise. It remains an explicit
+    // conflict rather than an account takeover.
+    if user_ops::find_by_username(db, username).await?.is_some() {
+        bail!(LDAP_IDENTITY_CONFLICT);
+    }
+
+    Ok(None)
 }
 
 fn valid_email(email: &str) -> bool {
@@ -966,6 +1065,95 @@ mod tests {
         assert_eq!(
             synced.ldap_dn.as_deref(),
             Some("uid=alice,ou=people,dc=example,dc=com")
+        );
+    }
+
+    /// A concurrent request can pass the preflight before the winner writes its
+    /// row. Recreate that post-check state directly: the second INSERT reaches
+    /// the real UNIQUE constraint and must reuse the directory identity rather
+    /// than report a valid bind as bad credentials.
+    #[tokio::test]
+    async fn a_lost_ldap_first_login_race_reuses_the_winner_identity() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+
+        let winner = user_ops::create_ldap_user(
+            &db,
+            1,
+            "alice_winner",
+            "alice@example.com",
+            Some("Alice"),
+            "uid=directory-alice,dc=example,dc=com",
+            Some("directory-alice"),
+        )
+        .await
+        .expect("create the concurrent winner");
+
+        let resolved = create_or_resolve_ldap_identity(
+            &db,
+            1,
+            "alice",
+            "alice@example.com",
+            Some("Alice"),
+            "uid=directory-alice,dc=example,dc=com",
+            Some("directory-alice"),
+        )
+        .await
+        .expect("the losing first login reuses the winner");
+
+        assert_eq!(resolved.id, winner.id);
+        assert_eq!(
+            user_ops::find_by_ldap_provider_and_uid(&db, 1, "directory-alice")
+                .await
+                .expect("read LDAP identity")
+                .map(|user| user.id),
+            Some(winner.id),
+            "the provider and uid still name one ForgeKeep identity"
+        );
+        assert!(
+            user_ops::find_by_username(&db, "alice")
+                .await
+                .expect("read losing username")
+                .is_none(),
+            "the race must not create a second user"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_username_collision_does_not_adopt_a_local_account_as_ldap() {
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+
+        let local = user_ops::create_user(
+            &db,
+            "alice",
+            "local-alice@example.com",
+            "not-an-ldap-password",
+            "Local Alice",
+        )
+        .await
+        .expect("create unrelated local account");
+
+        let error = create_or_resolve_ldap_identity(
+            &db,
+            1,
+            "alice",
+            "directory-alice@example.com",
+            Some("Directory Alice"),
+            "uid=directory-alice,dc=example,dc=com",
+            Some("directory-alice"),
+        )
+        .await
+        .expect_err("a bare username collision is not the LDAP identity");
+
+        assert_eq!(error.to_string(), LDAP_IDENTITY_CONFLICT);
+        assert_eq!(
+            user_ops::find_by_username(&db, "alice")
+                .await
+                .expect("read local account")
+                .map(|user| user.id),
+            Some(local.id),
+            "the LDAP login must not take over the local account"
         );
     }
 
