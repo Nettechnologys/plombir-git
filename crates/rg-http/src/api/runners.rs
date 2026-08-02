@@ -919,10 +919,10 @@ pub async fn download_cache(
     };
     let path = cache_archive_path(&state, repo_id, key);
     let key_hash = cache_key_hash(key);
-    let existing = rg_db::ops::ci_retention_ops::find_cache_entry(&state.db, repo_id, &key_hash)
-        .await
-        .ok()
-        .flatten();
+    let existing = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
+        Ok(entry) => entry,
+        Err(error) => return error.into_response(),
+    };
     if let Some(entry) = &existing {
         if entry.expires_at <= chrono::Utc::now() {
             // Eviction is a side effect of answering 404 — it cannot change the
@@ -1193,6 +1193,20 @@ async fn assigned_job_repo(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("pipeline not found"))?;
     Ok((job, pipeline.repo_id))
+}
+
+/// Read the metadata that makes a cache archive safe to serve.
+///
+/// A lookup error is not a cache miss: without this row we cannot enforce the
+/// expiry or compare the archive against its recorded content digest.
+async fn cache_entry_for_download(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    key_hash: &str,
+) -> Result<Option<rg_db::entities::ci_cache_entry::Model>, AppError> {
+    rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, key_hash)
+        .await
+        .map_err(AppError::from)
 }
 
 fn cache_key_header(headers: &HeaderMap) -> Result<&str, AppError> {
@@ -1663,6 +1677,31 @@ pub async fn delete_runner_admin(
             tracing::error!(error = %format!("{e:#}"), "delete_runner_admin failed");
             AppError::from(e).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_entry_lookup_tests {
+    use super::*;
+
+    /// A failed lookup must stay distinguishable from `Ok(None)`: otherwise the
+    /// download path serves an archive without its expiry and digest metadata.
+    #[tokio::test]
+    async fn a_closed_pool_is_not_a_missing_cache_entry() {
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("open lookup test database");
+        db.clone().close().await.expect("close lookup test pool");
+
+        let error = cache_entry_for_download(&db, 1, "cache-key")
+            .await
+            .expect_err("a closed pool must not become an absent cache entry");
+
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a failed cache-entry lookup must be retryable, not a cache miss"
+        );
     }
 }
 
