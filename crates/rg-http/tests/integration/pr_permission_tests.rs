@@ -651,6 +651,27 @@ async fn creating_pr_requests_matching_codeowner_user() {
         .unwrap();
     assert_eq!(pr.status(), 201, "{}", pr.text().await.unwrap());
 
+    let diff = client
+        .get(format!(
+            "{base}/api/v1/repos/owners-owner/owned-code/pulls/1/diff"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    let diff_status = diff.status();
+    let diff_body = diff.text().await.unwrap();
+    assert_eq!(diff_status, 200, "{diff_body}");
+    let diff = serde_json::from_str::<serde_json::Value>(&diff_body).unwrap();
+    assert!(
+        diff["files_changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "src/lib.rs"),
+        "the native numstat must expose the nested changed file: {diff}"
+    );
+
     let reviewers = client
         .get(format!(
             "{base}/api/v1/repos/owners-owner/owned-code/pulls/1/reviewers"

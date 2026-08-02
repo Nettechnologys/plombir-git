@@ -897,6 +897,31 @@ fn gix_diff_numstat(
             .for_each_to_obtain_tree(
                 &new_tree,
                 |change| -> Result<std::ops::ControlFlow<()>, anyhow::Error> {
+                    // The tree walker emits directory entries as well as their
+                    // leaf children. A directory has no blob representation, so
+                    // handing it to `Change::diff` fails with "Can only diff
+                    // blobs and links, not Tree". The children that follow are
+                    // the file-level changes we expose to callers.
+                    let is_tree = match &change {
+                        gix::object::tree::diff::Change::Addition { entry_mode, .. }
+                        | gix::object::tree::diff::Change::Deletion { entry_mode, .. } => {
+                            entry_mode.is_tree()
+                        }
+                        gix::object::tree::diff::Change::Modification {
+                            previous_entry_mode,
+                            entry_mode,
+                            ..
+                        } => previous_entry_mode.is_tree() || entry_mode.is_tree(),
+                        gix::object::tree::diff::Change::Rewrite {
+                            source_entry_mode,
+                            entry_mode,
+                            ..
+                        } => source_entry_mode.is_tree() || entry_mode.is_tree(),
+                    };
+                    if is_tree {
+                        return Ok(std::ops::ControlFlow::Continue(()));
+                    }
+
                     let location = change.location().to_str_lossy().to_string();
 
                     // Only `Ok(None)` means "this file has no line count" — gix
@@ -960,9 +985,9 @@ fn gix_diff_numstat(
 mod diff_tests {
     use super::*;
 
-    /// `main` → `feature`, where the feature commit touches one text file and
-    /// one binary file. Returns the work tree, which is also the repo path we
-    /// hand to [`gix_diff_numstat`].
+    /// `main` → `feature`, where the feature commit touches a nested text file
+    /// and a nested binary file. Returns the work tree, which is also the repo
+    /// path we hand to [`gix_diff_numstat`].
     fn repo_with_a_text_and_a_binary_change() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
@@ -978,16 +1003,18 @@ mod diff_tests {
             git.run_or_bail(&args, Some(&work)).unwrap();
         }
 
-        std::fs::write(work.join("text.txt"), "one\ntwo\n").unwrap();
-        std::fs::write(work.join("blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::create_dir_all(work.join("assets")).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "one\ntwo\n").unwrap();
+        std::fs::write(work.join("assets/blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
         git.run_or_bail(&["add", "."], Some(&work)).unwrap();
         git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
             .unwrap();
 
         git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
             .unwrap();
-        std::fs::write(work.join("text.txt"), "one\ntwo\nthree\n").unwrap();
-        std::fs::write(work.join("blob.bin"), [0u8, 9, 9, 0, 7, 7]).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(work.join("assets/blob.bin"), [0u8, 9, 9, 0, 7, 7]).unwrap();
         git.run_or_bail(&["add", "."], Some(&work)).unwrap();
         git.run_or_bail(&["commit", "-qm", "change"], Some(&work))
             .unwrap();
@@ -1015,14 +1042,14 @@ mod diff_tests {
         assert_eq!(stats.files_changed, 2, "both files changed: {files:?}");
         let binary = files
             .iter()
-            .find(|f| f.path == "blob.bin")
+            .find(|f| f.path == "assets/blob.bin")
             .expect("the binary file must still be listed as changed");
         assert_eq!(
             (binary.additions, binary.deletions),
             (0, 0),
             "a binary blob has no line count — that is a zero numstat, not an error"
         );
-        let text = files.iter().find(|f| f.path == "text.txt").unwrap();
+        let text = files.iter().find(|f| f.path == "src/lib.rs").unwrap();
         assert_eq!((text.additions, text.deletions), (1, 0));
         assert_eq!((stats.total_additions, stats.total_deletions), (1, 0));
     }
@@ -1041,7 +1068,7 @@ mod diff_tests {
         numstat(&work).expect("the fixture must diff before we break it");
 
         let oid = git
-            .run(&["rev-parse", "feature:text.txt"], Some(&work))
+            .run(&["rev-parse", "feature:src/lib.rs"], Some(&work))
             .unwrap()
             .stdout_str()
             .trim()
@@ -1058,9 +1085,34 @@ mod diff_tests {
             numstat(&work).expect_err("an unreadable blob must not be reported as zero changes");
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("text.txt"),
+            rendered.contains("src/lib.rs"),
             "the error must name the file it failed on, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_nested_file_change_in_a_bare_repo_has_a_file_numstat() {
+        let (dir, work) = repo_with_a_text_and_a_binary_change();
+        let bare = dir.path().join("repo.git");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        git.run_or_bail(
+            &[
+                "clone",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let (files, stats) = numstat(&bare).expect("a bare repository must diff nested files");
+        assert_eq!(stats.files_changed, 2, "both leaf files changed: {files:?}");
+        let text = files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("the nested source file must be reported, not its src directory");
+        assert_eq!((text.additions, text.deletions), (1, 0));
     }
 
     #[test]
