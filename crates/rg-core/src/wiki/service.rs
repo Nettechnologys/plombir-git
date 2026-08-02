@@ -100,9 +100,22 @@ pub async fn update_page(
         .ok_or_else(|| crate::error::not_found("wiki page"))?;
 
     // Save the current content as a revision before overwriting.
+    //
+    // A failed lookup is not "this page has no history": `latest_version`
+    // already says that with `Ok(0)`, so the only thing `unwrap_or(0)` ever
+    // caught was the query failing — and it filed the snapshot as version 1 on
+    // top of the version 1 that was already there. Nothing downstream can tell
+    // the two apart: `wiki_revisions` is indexed by page alone, with no unique
+    // key on (wiki_page_id, version), so the history list and "restore this
+    // version" then pick between duplicates arbitrarily.
+    //
+    // A revision that fails to *insert* is still non-fatal below — we know
+    // where it belonged, we just could not store it. Not knowing the number is
+    // different, and it costs the caller only a retry: the page has not been
+    // overwritten yet, so nothing is lost by refusing here.
     let next_version = wiki_revision_ops::latest_version(db, existing.id)
         .await
-        .unwrap_or(0)
+        .context("find latest wiki revision version")?
         + 1;
     let rev = wiki_revision::ActiveModel {
         id: sea_orm::NotSet,
