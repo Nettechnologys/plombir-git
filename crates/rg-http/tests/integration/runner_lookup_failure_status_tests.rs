@@ -255,8 +255,11 @@ async fn poll_refuses_undecodable_runner_facing_job_columns() {
     // exactly like a syntax error did.
     assert_undecodable_job_column_is_refused_before_assignment("variables", "[]").await;
     assert_undecodable_job_column_is_refused_before_assignment("cache_paths", r#"["target""#).await;
-    assert_undecodable_job_column_is_refused_before_assignment("cache_paths", r#"{"dir":"target"}"#)
-        .await;
+    assert_undecodable_job_column_is_refused_before_assignment(
+        "cache_paths",
+        r#"{"dir":"target"}"#,
+    )
+    .await;
 }
 
 /// The other half of the rule: a stored `NULL` is still a genuinely unset
@@ -311,7 +314,10 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
             Some(seeded.pipeline_id)
         );
         if suffix == "decodable" {
-            assert_eq!(body["variables"]["BUILD_MODE"], serde_json::json!("release"));
+            assert_eq!(
+                body["variables"]["BUILD_MODE"],
+                serde_json::json!("release")
+            );
         }
 
         let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)

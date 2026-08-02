@@ -351,8 +351,9 @@ pub async fn poll_job(
                                     error = %error,
                                     "poll_job: stored job variables are invalid JSON"
                                 );
-                                return Err(AppError::internal("invalid job variables")
-                                    .into_response());
+                                return Err(
+                                    AppError::internal("invalid job variables").into_response()
+                                );
                             }
                         },
                         None => serde_json::Map::new(),
@@ -367,8 +368,9 @@ pub async fn poll_job(
                                     error = %error,
                                     "poll_job: stored job cache_paths are invalid JSON"
                                 );
-                                return Err(AppError::internal("invalid job cache paths")
-                                    .into_response());
+                                return Err(
+                                    AppError::internal("invalid job cache paths").into_response()
+                                );
                             }
                         },
                         None => None,
