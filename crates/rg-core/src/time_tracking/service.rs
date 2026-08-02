@@ -57,10 +57,18 @@ pub async fn total_time_minutes(db: &DatabaseConnection, issue_id: i64) -> Resul
 /// answer as an entry that does not exist at all: a distinct "exists, but not
 /// yours" would still confirm the id is real, which is most of what an
 /// id-walking caller wants to learn.
+/// A `DELETE` that removed no row reports `not_found` too: the scope check
+/// above is a separate statement, so a concurrent delete can empty the row out
+/// from under it, and `Ok(())` there would confirm a deletion this call did not
+/// perform.
 pub async fn delete_time_entry(db: &DatabaseConnection, issue_id: i64, id: i64) -> Result<()> {
     match rg_db::ops::time_entry_ops::find_by_id(db, id).await? {
         Some(entry) if entry.issue_id == issue_id => {
-            rg_db::ops::time_entry_ops::delete_by_id(db, id).await
+            if rg_db::ops::time_entry_ops::delete_by_id(db, id).await? {
+                Ok(())
+            } else {
+                Err(crate::error::not_found("time entry"))
+            }
         }
         _ => Err(crate::error::not_found("time entry")),
     }

@@ -137,11 +137,19 @@ pub async fn update_mirror(
 }
 
 /// Delete a mirror.
+///
+/// The lookup and the `DELETE` are two statements, so a concurrent delete can
+/// empty the row out from under this one; zero rows reports `not_found` rather
+/// than confirming a deletion this call did not perform.
 pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
-    rg_db::ops::mirror_ops::delete_by_id(db, mirror.id).await
+    if rg_db::ops::mirror_ops::delete_by_id(db, mirror.id).await? {
+        Ok(())
+    } else {
+        Err(crate::error::not_found("mirror"))
+    }
 }
 
 /// Sync a single mirror: clone (first time) or fetch (subsequent).

@@ -118,7 +118,7 @@ pub async fn update(
     }
 }
 
-#[utoipa::path(delete, path = "/repos/{owner}/{name}/tags/protection/{id}", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path), ("id" = i64, Path)), responses((status = 204)))]
+#[utoipa::path(delete, path = "/repos/{owner}/{name}/tags/protection/{id}", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path), ("id" = i64, Path)), responses((status = 204), (status = 404, description = "No such rule, or it belongs to another repository", body = serde_json::Value)))]
 pub async fn delete(
     State(state): State<AppState>,
     Path((_, _, id)): Path<(String, String, i64)>,
@@ -127,8 +127,12 @@ pub async fn delete(
     if let Err(e) = tag_protection_in_repo(&state, repo.id, id).await {
         return e.into_response();
     }
+    // That lookup and this `DELETE` are two statements, so a concurrent delete
+    // can land in between; the 204 therefore comes from `rows_affected` rather
+    // than from the row having existed a moment ago.
     match rg_db::ops::protected_tag_ops::delete_by_id(&state.db, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("tag protection rule not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

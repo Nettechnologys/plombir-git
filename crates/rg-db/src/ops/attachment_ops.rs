@@ -115,10 +115,15 @@ pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Resul
     Ok(())
 }
 
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    AttachmentEntity::delete_by_id(id)
+/// Delete an attachment by id. `Ok(false)` means no such row.
+///
+/// The caller's scope lookup and this `DELETE` are two statements: reporting
+/// `rows_affected` is what stops a route from confirming a deletion that a
+/// concurrent request had already performed.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = AttachmentEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete attachment")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }

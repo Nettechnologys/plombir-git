@@ -785,9 +785,16 @@ pub async fn delete_version(
         .delete_version(owner, repo, package_type, name, version_str)
         .await?;
 
-    // Delete DB records
+    // Delete DB records. The file rows are a bulk cascade — a version carrying
+    // no files legitimately matches zero of them. The version row is the single
+    // row this call claims to have deleted, and `get_version` above ran as a
+    // separate statement, so a concurrent delete can take it in between:
+    // reporting `Ok(())` for zero rows would answer 204 for a deletion this
+    // request never performed.
     rg_db::ops::package_file_ops::delete_by_version(db, v.id).await?;
-    rg_db::ops::package_version_ops::delete_by_id(db, v.id).await?;
+    if rg_db::ops::package_version_ops::delete_by_id(db, v.id).await? == 0 {
+        return Err(not_found("package version"));
+    }
 
     Ok(())
 }

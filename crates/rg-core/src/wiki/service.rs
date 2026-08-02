@@ -241,5 +241,12 @@ pub async fn delete_page(db: &DatabaseConnection, repo_id: i64, title: &str) -> 
         tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to delete from wiki_pages_fts index");
     }
 
-    wiki_page_ops::delete_by_id(db, page_id).await
+    // The lookup above and this `DELETE` are two statements, so a concurrent
+    // delete can empty the row out from under it; zero rows reports `not_found`
+    // rather than confirming a deletion this call did not perform.
+    if wiki_page_ops::delete_by_id(db, page_id).await? {
+        Ok(())
+    } else {
+        Err(crate::error::not_found("wiki page"))
+    }
 }

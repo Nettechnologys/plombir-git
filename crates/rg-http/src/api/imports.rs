@@ -241,8 +241,12 @@ pub async fn delete_import(
     if let Err(e) = import_task_of_user(&state, user_id, id).await {
         return e.into_response();
     }
+    // That lookup and this `DELETE` are two statements, so a concurrent delete
+    // can land in between; the 204 therefore comes from `rows_affected` rather
+    // than from the row having existed a moment ago.
     match rg_db::ops::import_task_ops::delete_by_id(&state.db, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("import task not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

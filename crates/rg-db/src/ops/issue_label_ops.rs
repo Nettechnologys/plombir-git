@@ -67,6 +67,11 @@ pub async fn get_labels(db: &DatabaseConnection, issue_id: i64) -> Result<Vec<Is
 }
 
 /// Delete all issue labels for a label ID (used when deleting a label).
+///
+/// Deliberately `Result<()>` and not `Result<bool>`: this is a bulk cascade
+/// helper run before the label row itself goes away, and a label carried by no
+/// issue legitimately matches zero rows. Only the single-row deletes whose
+/// `rows_affected` decides an HTTP status need to report it.
 pub async fn delete_by_label_id(db: &DatabaseConnection, label_id: i64) -> Result<()> {
     IssueLabelEntity::delete_many()
         .filter(issue_label::Column::LabelId.eq(label_id))

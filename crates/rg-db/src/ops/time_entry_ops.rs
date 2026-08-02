@@ -64,11 +64,15 @@ pub async fn total_minutes_by_issue(db: &DatabaseConnection, issue_id: i64) -> R
     Ok(total)
 }
 
-/// Delete a time entry by ID.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    TimeEntryEntity::delete_by_id(id)
+/// Delete a time entry by ID. `Ok(false)` means no such row.
+///
+/// The caller's scope lookup and this `DELETE` are two statements: reporting
+/// `rows_affected` is what stops a route from confirming a deletion that a
+/// concurrent request had already performed.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = TimeEntryEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete time entry")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }

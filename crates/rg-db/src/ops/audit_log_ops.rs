@@ -91,6 +91,10 @@ pub async fn list_before_limit(
 }
 
 /// Delete audit log entries by their IDs (after archival).
+///
+/// Deliberately `Result<()>` and not `Result<bool>`: this is the retention
+/// sweep's bulk delete, nothing answers an HTTP status from it, and a batch
+/// whose rows another sweep pass already removed is not an error.
 pub async fn delete_by_ids(db: &DatabaseConnection, ids: &[i64]) -> Result<(), DbErr> {
     Entity::delete_many()
         .filter(Column::Id.is_in(ids.iter().copied()))

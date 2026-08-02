@@ -392,9 +392,22 @@ pub async fn delete_release(
     )
     .await?;
 
-    if let Err(error) = rg_db::ops::release_ops::delete_by_id(db, id).await {
-        staging.restore(storage, "release", release.id).await;
-        return Err(error).context("failed to delete release metadata");
+    match rg_db::ops::release_ops::delete_by_id(db, id).await {
+        Ok(true) => {}
+        // The lookup and this statement are separate, so a concurrent delete can
+        // take the row in between. That request owns the deletion — it fires the
+        // webhook and retires its own staging — so this one must not report a
+        // success it did not perform. The staged blobs are still retired rather
+        // than restored: the release row is gone either way, and putting the
+        // bytes back would leave them with nothing pointing at them.
+        Ok(false) => {
+            staging.retire(storage, "release", release.id).await?;
+            return Err(crate::error::not_found("release"));
+        }
+        Err(error) => {
+            staging.restore(storage, "release", release.id).await;
+            return Err(error).context("failed to delete release metadata");
+        }
     }
 
     // Trigger release.deleted webhook
@@ -700,9 +713,20 @@ pub async fn delete_asset(
     )
     .await?;
 
-    if let Err(error) = rg_db::ops::release_ops::delete_asset_by_id(db, asset_id).await {
-        staging.restore(storage, "release asset", asset.id).await;
-        return Err(error).context("failed to delete release asset metadata");
+    match rg_db::ops::release_ops::delete_asset_by_id(db, asset_id).await {
+        Ok(true) => {}
+        // Same split as `delete_release`: a concurrent delete that took the row
+        // between the lookup and this statement owns the deletion, so this call
+        // reports `not_found` instead of a 204 it did not earn. The staged bytes
+        // are retired anyway — the row they belonged to is gone.
+        Ok(false) => {
+            staging.retire(storage, "release asset", asset.id).await?;
+            return Err(crate::error::not_found("release asset"));
+        }
+        Err(error) => {
+            staging.restore(storage, "release asset", asset.id).await;
+            return Err(error).context("failed to delete release asset metadata");
+        }
     }
 
     staging.retire(storage, "release asset", asset.id).await

@@ -65,13 +65,17 @@ pub async fn update(db: &DatabaseConnection, model: ReleaseActiveModel) -> Resul
     model.update(db).await.context("db: update release")
 }
 
-/// Delete a release by ID.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    ReleaseEntity::delete_by_id(id)
+/// Delete a release by ID. `Ok(false)` means no such row.
+///
+/// The caller's lookup and this `DELETE` are two statements: reporting
+/// `rows_affected` is what stops a route from confirming a deletion that a
+/// concurrent request had already performed.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = ReleaseEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete release")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 /// Create a release asset.
@@ -97,13 +101,17 @@ pub async fn find_asset_by_id(db: &DatabaseConnection, id: i64) -> Result<Option
         .context("db: find asset by id")
 }
 
-/// Delete an asset by ID.
-pub async fn delete_asset_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    AssetEntity::delete_by_id(id)
+/// Delete an asset by ID. `Ok(false)` means no such row.
+///
+/// The caller's lookup and this `DELETE` are two statements: reporting
+/// `rows_affected` is what stops a route from confirming a deletion that a
+/// concurrent request had already performed.
+pub async fn delete_asset_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = AssetEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete asset")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 /// Store (or clear) the detached attestation envelope JSON for an asset.

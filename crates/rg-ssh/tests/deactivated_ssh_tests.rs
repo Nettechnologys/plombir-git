@@ -355,9 +355,12 @@ async fn deleting_the_ssh_key_stops_execs_on_the_connection_it_opened() {
         "baseline: the key may read the repository over this connection"
     );
 
-    rg_db::ops::ssh_key_ops::delete_by_id(&h.db, h.ssh_key_id)
-        .await
-        .expect("delete the SSH key");
+    assert!(
+        rg_db::ops::ssh_key_ops::delete_by_id(&h.db, h.ssh_key_id)
+            .await
+            .expect("delete the SSH key"),
+        "the delete reported no rows — the rest of this test would prove nothing"
+    );
 
     assert!(
         !upload_pack_allowed(&session, &h.username).await,
@@ -414,9 +417,12 @@ async fn deleting_a_deploy_key_stops_execs_on_the_connection_it_opened() {
         "baseline: a read-only deploy key may fetch its repository"
     );
 
-    rg_db::ops::deploy_key_ops::delete_by_id(&h.db, deploy_key.id)
-        .await
-        .expect("delete the deploy key");
+    assert!(
+        rg_db::ops::deploy_key_ops::delete_by_id(&h.db, deploy_key.id)
+            .await
+            .expect("delete the deploy key"),
+        "the delete reported no rows — the rest of this test would prove nothing"
+    );
 
     assert!(
         !upload_pack_allowed(&session, &h.username).await,

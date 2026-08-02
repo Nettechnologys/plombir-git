@@ -884,6 +884,8 @@ pub async fn update_milestone(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 204, description = "No content"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No such milestone, or it belongs to another repository",
+         body = serde_json::Value),
     ),
 )]
 pub async fn delete_milestone(
@@ -898,8 +900,12 @@ pub async fn delete_milestone(
     if let Err(e) = milestone_in_repo(&state, repo.id, id).await {
         return e.into_response();
     }
+    // That lookup and this `DELETE` are two statements, so a concurrent delete
+    // can land in between; the 204 therefore comes from `rows_affected` rather
+    // than from the row having existed a moment ago.
     match rg_db::ops::milestone_ops::delete_by_id(&state.db, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("milestone not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

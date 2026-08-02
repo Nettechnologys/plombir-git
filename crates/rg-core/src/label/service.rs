@@ -157,7 +157,14 @@ pub async fn delete_label(
 
     // Delete all issue_labels referencing this label first
     issue_label_ops::delete_by_label_id(db, label_id).await?;
-    label_ops::delete_by_id(db, label_id).await
+    // The scope check above is a separate statement, so a concurrent delete can
+    // empty the row out from under it; reporting `Ok(())` for zero rows would
+    // confirm a deletion this call did not perform.
+    if label_ops::delete_by_id(db, label_id).await? {
+        Ok(())
+    } else {
+        Err(crate::error::not_found("label"))
+    }
 }
 
 /// Get labels for an issue (batch query — avoids N+1).

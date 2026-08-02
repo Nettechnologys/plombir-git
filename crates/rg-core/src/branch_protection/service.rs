@@ -197,8 +197,16 @@ pub async fn update_protection_for_repo(
 }
 
 /// Delete a branch protection rule. Unscoped — see [`get_protection`].
+///
+/// The caller's scope check and this `DELETE` are two statements, so a
+/// concurrent delete can empty the row out from under it; zero rows reports
+/// `not_found` rather than confirming a deletion this call did not perform.
 async fn delete_protection(db: &DatabaseConnection, protection_id: i64) -> Result<()> {
-    protected_branch_ops::delete_by_id(db, protection_id).await
+    if protected_branch_ops::delete_by_id(db, protection_id).await? {
+        Ok(())
+    } else {
+        Err(crate::error::not_found("branch protection rule"))
+    }
 }
 
 /// Delete a branch protection rule, scoped to a repository route.

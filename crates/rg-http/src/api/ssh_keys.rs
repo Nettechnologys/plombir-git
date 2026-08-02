@@ -170,8 +170,13 @@ pub async fn delete_ssh_key(
         return AppError::not_found("SSH key not found").into_response();
     }
 
+    // The lookup above and this `DELETE` are two statements. A concurrent
+    // revocation that lands in between leaves this one deleting nothing, and
+    // "revoked" is the most expensive answer to get wrong — so the 204 comes
+    // from `rows_affected`, not from the lookup that preceded it.
     match rg_db::ops::ssh_key_ops::delete_by_id(&state.db, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("SSH key not found").into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
 }

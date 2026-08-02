@@ -359,7 +359,17 @@ pub async fn delete_attachment(
         backup.cleanup().await;
         return Err(error).context("failed to delete attachment blob");
     }
-    if let Err(error) = rg_db::ops::attachment_ops::delete_by_id(db, attachment.id).await {
+    let delete = rg_db::ops::attachment_ops::delete_by_id(db, attachment.id).await;
+    // The scope lookup and this statement are separate, so a concurrent delete
+    // can take the row in between. That request owns the deletion; this one must
+    // not answer 204 for it. The blob is deliberately left deleted rather than
+    // restored — the row it belonged to is gone either way, and putting the
+    // bytes back would leave them with nothing pointing at them.
+    if let Ok(false) = delete {
+        backup.cleanup().await;
+        return Err(crate::error::not_found("attachment"));
+    }
+    if let Err(error) = delete {
         // The blob is already gone. If putting it back fails, the row survives
         // pointing at nothing and the bytes are lost for good — that outcome
         // must be named in the log, since the caller only ever sees the DB error.

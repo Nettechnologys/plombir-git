@@ -554,6 +554,9 @@ pub async fn get_version(
     responses(
         (status = 204, description = "Deleted", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No such package version — including one a \
+                                     concurrent request deleted first",
+         body = serde_json::Value),
         (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]

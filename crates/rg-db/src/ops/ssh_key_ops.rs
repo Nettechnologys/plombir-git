@@ -52,11 +52,15 @@ pub async fn touch_last_used(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Delete an SSH key by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    SshKeyEntity::delete_by_id(id)
+/// Delete an SSH key by id. `Ok(false)` means no such row.
+///
+/// The caller's lookup and this `DELETE` are two statements, so a concurrent
+/// revocation can win in between; reporting `rows_affected` is what lets the
+/// route answer 404 instead of confirming a revocation it did not perform.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = SshKeyEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete ssh key")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
