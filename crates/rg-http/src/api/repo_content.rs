@@ -456,63 +456,57 @@ fn list_tree_entries(
     // asking for a deleted branch was reported as a server fault and logged as
     // one on every miss (card_784afeaf9603, the mirror of card_aa048c2956b1
     // one endpoint over).
-    let commit_id = repo.rev_parse_single(git_ref).map_err(|e| {
-        anyhow::Error::new(rg_core::error::NotFound::new("ref")).context(format!(
-            "resolving ref '{}' in {:?}: {}",
-            git_ref, repo_path, e
-        ))
-    })?;
+    //
+    // Typing them is only half of it: `rev_parse_single` still answered "no
+    // such ref" for a ref store it could not read and for a ref whose target
+    // commit had left the object store, so a broken repository kept arriving
+    // as a client miss (card_7cb31c61cee2). Both boundaries below therefore
+    // come from APIs whose `None` means absence and nothing else.
+    let commit_id = resolve_content_ref(&repo, git_ref, repo_path)?;
 
-    let commit = repo
-        .find_commit(commit_id)
-        .map_err(|e| anyhow::anyhow!("failed to find commit: {}", e))?;
-
-    let decoded = commit
-        .decode()
-        .map_err(|e| anyhow::anyhow!("failed to decode commit: {}", e))?;
-
-    let tree_oid = decoded.tree();
-    let mut tree = repo
-        .find_tree(tree_oid)
-        .map_err(|e| anyhow::anyhow!("failed to get tree: {}", e))?;
+    let mut tree = commit_id
+        .object()
+        .with_context(|| {
+            format!(
+                "reading the object of ref '{}' in {} before listing its tree",
+                git_ref,
+                repo_path.display()
+            )
+        })?
+        .peel_to_tree()
+        .with_context(|| {
+            format!(
+                "resolving the tree of ref '{}' in {}",
+                git_ref,
+                repo_path.display()
+            )
+        })?;
 
     // Traverse into sub_path if specified
     if !sub_path.is_empty() {
-        for component in sub_path.split('/') {
-            let mut matching_entry = None;
-            for entry in tree.iter() {
-                let entry = entry.with_context(|| {
-                    format!(
-                        "failed to inspect tree while resolving sub-path '{}' at component '{}' in {:?} at '{}'",
-                        sub_path, component, repo_path, git_ref
-                    )
-                })?;
-                if entry.filename() == component {
-                    matching_entry = Some(entry);
-                    break;
-                }
-            }
-
-            let entry = matching_entry.ok_or_else(|| {
+        let Some(entry) = lookup_tree_path(&repo, tree, sub_path, repo_path, git_ref)? else {
+            return Err(
                 anyhow::Error::new(rg_core::error::NotFound::new("path")).context(format!(
-                    "sub-path '{}' has no component '{}' in {:?} at '{}'",
-                    sub_path, component, repo_path, git_ref
-                ))
-            })?;
-            if !entry.mode().is_tree() {
-                // The path resolves, it just is not a directory — the mirror of
-                // `get_blob_content`'s "path is not a file", and the fixed text
-                // carries no request data (H-05). Left to `find_tree` below it
-                // came out as a 500, because "the client pointed at a blob" and
-                // "the object store lost a tree" are the same untyped error
-                // once they are both `anyhow!("failed to find sub-tree")`.
-                return Err(rg_core::error::invalid_request("path is not a directory"));
-            }
-            let subtree_oid = entry.oid().to_owned();
-            tree = repo
-                .find_tree(subtree_oid)
-                .map_err(|e| anyhow::anyhow!("failed to find sub-tree: {}", e))?;
+                    "sub-path '{}' is not in {:?} at '{}'",
+                    sub_path, repo_path, git_ref
+                )),
+            );
+        };
+        if !entry.is_tree {
+            // The path resolves, it just is not a directory — the mirror of
+            // `get_blob_content`'s "path is not a file", and the fixed text
+            // carries no request data (H-05). Left to `find_tree` below it
+            // came out as a 500, because "the client pointed at a blob" and
+            // "the object store lost a tree" are the same untyped error
+            // once they are both `anyhow!("failed to find sub-tree")`.
+            return Err(rg_core::error::invalid_request("path is not a directory"));
         }
+        tree = repo.find_tree(entry.id).with_context(|| {
+            format!(
+                "reading the tree of sub-path '{}' in {:?} at '{}'",
+                sub_path, repo_path, git_ref
+            )
+        })?;
     }
 
     let mut entries = Vec::new();
@@ -584,8 +578,6 @@ fn get_blob_content(
     let repo = gix::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
-    let target = format!("{}:{}", git_ref, path);
-
     // Exactly two outcomes below belong to the client: the `ref:path` pair does
     // not resolve, and it resolves to something that is not a file. They carry
     // `rg_core::error::NotFound` / `InvalidRequest` so the HTTP layer can name
@@ -595,10 +587,42 @@ fn get_blob_content(
     // `AppError::not_found(e)` at the call site, which reported a broken
     // repository as an absent file *and* put `repo_path` in the response body
     // (404s are not sanitized by `IntoResponse`, H-05).
-    let object_id = repo.rev_parse_single(target.as_str()).map_err(|e| {
-        anyhow::Error::new(rg_core::error::NotFound::new("file"))
-            .context(format!("resolving '{}' in {:?}: {}", target, repo_path, e))
-    })?;
+    //
+    // `rev_parse_single("{ref}:{path}")` could not hold that line on its own:
+    // one error value covered the missing ref, the missing path, an unreadable
+    // ref store and a commit or tree that had left the object store, so a
+    // repository losing objects kept answering `404 file not found`
+    // (card_7cb31c61cee2). Ref and path are resolved separately below, each
+    // through an API whose `None` means absence and nothing else.
+    let commit_id = resolve_content_ref(&repo, git_ref, repo_path)?;
+
+    let tree = commit_id
+        .object()
+        .with_context(|| {
+            format!(
+                "reading the object of ref '{}' in {} before reading a file from it",
+                git_ref,
+                repo_path.display()
+            )
+        })?
+        .peel_to_tree()
+        .with_context(|| {
+            format!(
+                "resolving the tree of ref '{}' in {}",
+                git_ref,
+                repo_path.display()
+            )
+        })?;
+
+    let Some(entry) = lookup_tree_path(&repo, tree, path, repo_path, git_ref)? else {
+        return Err(
+            anyhow::Error::new(rg_core::error::NotFound::new("file")).context(format!(
+                "path '{}' is not in {:?} at '{}'",
+                path, repo_path, git_ref
+            )),
+        );
+    };
+    let object_id = entry.id;
 
     // Inspect the object header WITHOUT decoding the blob into memory, so an
     // oversized file is rejected before we ever buffer + base64-inflate it.
@@ -704,30 +728,97 @@ fn get_blob_size(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<i64> 
     Ok(blob.data.len() as i64)
 }
 
-/// Resolve the documented ref forms for the commit-log endpoint without asking
-/// `rev_parse_single` to encode both absence and a broken ref/object store in
-/// its one error value.
-fn resolve_commit_log_ref<'repo>(
+/// A tree entry located by [`lookup_tree_path`]. Only the two facts both
+/// content endpoints need travel out of the walk, so no tree buffer has to stay
+/// borrowed while the caller decides what the entry means.
+struct TreePathEntry {
+    id: gix::ObjectId,
+    is_tree: bool,
+}
+
+/// Walk `path` inside `tree`, keeping "this path is not in that tree" apart
+/// from "a tree on the way could not be read".
+///
+/// `Ok(None)` is the single honest absence: some component is not listed, or a
+/// component before the last one is not a directory, so no such path exists in
+/// this commit. A tree object that will not load or will not decode stays an
+/// `Err` — `gix`'s own `Tree::lookup_entry_by_path` cannot be used for this,
+/// because it drops undecodable entries (`filter_map(Result::ok)`) and so
+/// reports a corrupt tree as a missing path, which is exactly the collapse this
+/// walk exists to avoid.
+fn lookup_tree_path(
+    repo: &gix::Repository,
+    tree: gix::Tree<'_>,
+    path: &str,
+    repo_path: &std::path::Path,
+    git_ref: &str,
+) -> anyhow::Result<Option<TreePathEntry>> {
+    let mut tree = tree;
+    let mut components = path.split('/').filter(|c| !c.is_empty()).peekable();
+
+    while let Some(component) = components.next() {
+        let mut matching_entry = None;
+        for entry in tree.iter() {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to inspect tree while resolving path '{}' at component '{}' in {:?} at '{}'",
+                    path, component, repo_path, git_ref
+                )
+            })?;
+            if entry.filename() == component {
+                matching_entry = Some(TreePathEntry {
+                    id: entry.oid().to_owned(),
+                    is_tree: entry.mode().is_tree(),
+                });
+                break;
+            }
+        }
+
+        let Some(entry) = matching_entry else {
+            return Ok(None);
+        };
+        if components.peek().is_none() {
+            return Ok(Some(entry));
+        }
+        if !entry.is_tree {
+            // A deeper path underneath a file cannot exist. That is the client
+            // naming a path this commit does not have, not a storage fault.
+            return Ok(None);
+        }
+
+        tree = repo.find_tree(entry.id).with_context(|| {
+            format!(
+                "failed to read directory '{}' while resolving path '{}' in {:?} at '{}'",
+                component, path, repo_path, git_ref
+            )
+        })?;
+    }
+
+    // Only reachable for a path with no non-empty components (`""`, `"/"`).
+    Ok(None)
+}
+
+/// Resolve the documented ref forms of the content endpoints — branch, tag,
+/// commit SHA, `HEAD` — without asking `rev_parse_single` to encode both
+/// absence and a broken ref/object store in its one error value.
+fn resolve_content_ref<'repo>(
     repo: &'repo gix::Repository,
     git_ref: &str,
     repo_path: &std::path::Path,
 ) -> anyhow::Result<gix::Id<'repo>> {
+    use gix::prelude::ObjectIdExt as _;
+
     if git_ref == "HEAD" {
         let head = repo.head().with_context(|| {
             format!(
-                "reading HEAD before resolving commit-log ref in {}",
+                "reading HEAD before resolving content ref in {}",
                 repo_path.display()
             )
         })?;
 
         return head
             .try_into_peeled_id()
-            .with_context(|| {
-                format!(
-                    "resolving HEAD before walking commit log in {}",
-                    repo_path.display()
-                )
-            })?
+            .with_context(|| format!("resolving HEAD in {}", repo_path.display()))?
             .ok_or_else(|| anyhow::Error::new(rg_core::error::NotFound::new("ref")));
     }
 
@@ -747,7 +838,7 @@ fn resolve_commit_log_ref<'repo>(
             repo.try_find_reference(ref_name.as_str())
                 .with_context(|| {
                     format!(
-                        "looking up commit-log ref '{}' in {}",
+                        "looking up content ref '{}' in {}",
                         ref_name,
                         repo_path.display()
                     )
@@ -758,25 +849,35 @@ fn resolve_commit_log_ref<'repo>(
 
         return reference.peel_to_id().with_context(|| {
             format!(
-                "resolving commit-log ref '{}' in {}",
+                "resolving content ref '{}' in {}",
                 ref_name,
                 repo_path.display()
             )
         });
     }
 
-    // A full object id is also a documented ref form. It has no reference
-    // namespace to look up, so retain gix's resolver only after the named-ref
-    // branch above has ruled out a real reference.
-    if gix::ObjectId::from_hex(git_ref.as_bytes()).is_ok() {
-        return repo.rev_parse_single(git_ref).map_err(|e| {
-            anyhow::Error::new(rg_core::error::NotFound::new("ref")).context(format!(
-                "resolving commit-log object id '{}' in {}: {}",
+    // A commit SHA — full or abbreviated — is also a documented ref form. It
+    // has no reference namespace to look up, so it is resolved against the
+    // object database, and only after the named-ref branch above has ruled out
+    // a real reference of the same spelling. `lookup_prefix` is what keeps the
+    // boundary honest here too: its `None` is "no object has this id", while an
+    // object database that cannot be scanned is an `Err`. Routed through
+    // `rev_parse_single` both came back as `404 ref not found`.
+    if let Ok(prefix) = gix::hash::Prefix::from_hex(git_ref) {
+        let resolution = repo.objects.lookup_prefix(prefix, None).with_context(|| {
+            format!(
+                "looking up content ref '{}' in the object database of {}",
                 git_ref,
-                repo_path.display(),
-                e
-            ))
-        });
+                repo_path.display()
+            )
+        })?;
+        return match resolution {
+            None => Err(anyhow::Error::new(rg_core::error::NotFound::new("ref"))),
+            Some(Ok(id)) => Ok(id.attach(repo)),
+            // An ambiguous SHA prefix is a malformed request, not an absent ref
+            // and not a storage failure.
+            Some(Err(())) => Err(rg_core::error::invalid_request("ref SHA is ambiguous")),
+        };
     }
 
     Err(anyhow::Error::new(rg_core::error::NotFound::new("ref")))
@@ -793,7 +894,7 @@ fn get_commit_log(
 
     let mut entries = Vec::new();
 
-    let head_id = resolve_commit_log_ref(&repo, git_ref, repo_path)?;
+    let head_id = resolve_content_ref(&repo, git_ref, repo_path)?;
 
     // Resolving a ref only proves that its name carries an object id; it does
     // not prove that the object store can supply that commit. Read it before

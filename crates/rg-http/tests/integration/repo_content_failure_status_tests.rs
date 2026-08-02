@@ -83,9 +83,13 @@ async fn broken_repository_on_the_blob_endpoint_is_not_a_missing_file() {
     let (base, repo_root) = spawn_test_app_with_repo_root().await;
     let (token, _) = register_full(&base, "blobfail-owner", "blobfail@example.com").await;
     create_repo(&base, &token, "blobfail-repo").await;
-
-    let url = format!("{base}/api/v1/repos/blobfail-owner/blobfail-repo/blob/README.md");
     let client = reqwest::Client::new();
+    // The repository needs a commit for the baseline below to be about an
+    // absent *file*: on an unborn HEAD the ref is what fails to resolve, and
+    // since card_7cb31c61cee2 separated the two, that answers `ref not found`.
+    commit_a_file(&client, &base, &token, "blobfail-owner", "blobfail-repo").await;
+
+    let url = format!("{base}/api/v1/repos/blobfail-owner/blobfail-repo/blob/NOT-THERE.md");
 
     // Baseline on a healthy repository: the file really is absent → 404 with a
     // fixed message. Without it the assertion below cannot tell "we fixed the
@@ -572,6 +576,166 @@ async fn a_log_ref_with_a_missing_target_commit_is_a_server_error() {
          {status} (body: {body})"
     );
     assert_no_internal_detail(&body, &repo_root);
+}
+
+/// card_7cb31c61cee2: the same ref that still resolves after its target commit
+/// left the object store. `list_tree_entries` mapped *every* `rev_parse_single`
+/// failure onto `NotFound("ref")`, so a repository losing objects answered the
+/// tree endpoint with `404 ref not found` — indistinguishable from a branch the
+/// client mistyped, and invisible in the alerts.
+#[tokio::test]
+async fn a_tree_ref_with_a_missing_target_commit_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "treeobject-owner", "treeobject@example.com").await;
+    create_repo(&base, &token, "treeobject-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(
+        &client,
+        &base,
+        &token,
+        "treeobject-owner",
+        "treeobject-repo",
+    )
+    .await;
+
+    let url = format!("{base}/api/v1/repos/treeobject-owner/treeobject-repo/tree");
+
+    // Non-vacuous baseline: this exact repository lists before the break.
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "the fixture must list before the break");
+
+    let bare = repo_root.join("treeobject-owner/treeobject-repo.git");
+    let repo = gix::open(&bare).expect("fixture repository must open");
+    let target_id = repo
+        .head()
+        .expect("HEAD must be readable")
+        .try_into_peeled_id()
+        .expect("HEAD must resolve")
+        .expect("fixture repository must have a commit")
+        .to_string();
+    remove_loose_object(&bare, &target_id);
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        status.is_server_error(),
+        "a ref whose commit left the object store is a storage failure, not a \
+         missing ref and not an empty repository: {status} (body: {body})"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+}
+
+/// The blob half of the same collapse: `get_blob_content` resolved the whole
+/// `ref:path` pair with one `rev_parse_single`, so a file whose blob object had
+/// disappeared was reported as `404 file not found` — "someone deleted it" —
+/// while the ref and the tree entry naming it were both still there.
+#[tokio::test]
+async fn a_blob_whose_object_is_missing_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "blobobject-owner", "blobobject@example.com").await;
+    create_repo(&base, &token, "blobobject-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(
+        &client,
+        &base,
+        &token,
+        "blobobject-owner",
+        "blobobject-repo",
+    )
+    .await;
+
+    let url = format!("{base}/api/v1/repos/blobobject-owner/blobobject-repo/blob/README.md");
+
+    // Non-vacuous baseline: the file reads before the break, and a file that
+    // really is absent is still a 404 after it (asserted at the end).
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "the fixture must read before the break");
+
+    let bare = repo_root.join("blobobject-owner/blobobject-repo.git");
+    let repo = gix::open(&bare).expect("fixture repository must open");
+    let entry = repo
+        .head()
+        .expect("HEAD must be readable")
+        .try_into_peeled_id()
+        .expect("HEAD must resolve")
+        .expect("fixture repository must have a commit")
+        .object()
+        .expect("the commit object must be readable")
+        .peel_to_tree()
+        .expect("the commit must have a tree")
+        .lookup_entry_by_path("README.md")
+        .expect("the tree must be readable")
+        .expect("the fixture file must be in the tree");
+    let blob_id = entry.object_id().to_string();
+    remove_loose_object(&bare, &blob_id);
+
+    // The tree entry naming the file survives — only its object is gone, which
+    // is what separates this from a deleted file.
+    let repo = gix::open(&bare).expect("repository must still open after object removal");
+    assert!(
+        repo.head()
+            .expect("HEAD must still be readable")
+            .try_into_peeled_id()
+            .expect("HEAD must still resolve")
+            .expect("the commit must still be there")
+            .object()
+            .expect("the commit object must still be readable")
+            .peel_to_tree()
+            .expect("the tree must still be readable")
+            .lookup_entry_by_path("README.md")
+            .expect("the tree must still be readable")
+            .is_some(),
+        "fixture must leave the tree entry in place so only the blob read fails"
+    );
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        status.is_server_error(),
+        "a blob that left the object store is a storage failure, not a deleted \
+         file: {status} (body: {body})"
+    );
+    assert_no_internal_detail(&body, &repo_root);
+
+    // The 404 contract survives the fix: a path this commit never had is still
+    // a client miss on the very same broken repository.
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/repos/blobobject-owner/blobobject-repo/blob/NOT-THERE.md"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 404,
+        "an absent path is still the client's miss (body: {body})"
+    );
+    assert_eq!(body["error"]["message"], "file not found");
 }
 
 /// H-05: whatever the status, the body must not carry the storage path or the
