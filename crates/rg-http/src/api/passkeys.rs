@@ -441,8 +441,8 @@ pub async fn register_finish(
     )
     .await
     .map_err(|error| {
-        tracing::warn!(user_id, error = %format!("{error:#}"), "failed to store passkey (possible duplicate)");
-        AppError::conflict("this passkey is already registered")
+        tracing::warn!(user_id, error = %format!("{error:#}"), "failed to store passkey");
+        passkey_create_error(error)
     })?;
 
     let is_https = is_https_request(&headers);
@@ -469,6 +469,16 @@ fn sanitize_name(raw: &str) -> String {
         return "Passkey".to_string();
     }
     trimmed.chars().take(64).collect()
+}
+
+/// Preserve the conflict contract only for the database constraint that proves
+/// another registration already owns this credential id.
+fn passkey_create_error(error: rg_db::sea_orm::DbErr) -> AppError {
+    if rg_db::is_unique_violation(&error) {
+        AppError::conflict("this passkey is already registered")
+    } else {
+        AppError::from(error)
+    }
 }
 
 /// GET /users/passkeys
@@ -702,4 +712,60 @@ pub async fn login_finish(
             .append(axum::http::header::SET_COOKIE, value);
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{passkey_create_error, AppError};
+    use axum::http::StatusCode;
+    use rg_db::sea_orm::{
+        ConnAcquireErr, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DbErr,
+        Statement,
+    };
+
+    /// The actual UNIQUE error SQLite raises for a duplicate credential must
+    /// keep the public 409 contract of `register_finish`.
+    #[tokio::test]
+    async fn duplicate_passkey_credential_is_a_conflict() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect in-memory database");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "CREATE TABLE passkey_credentials (credential_id TEXT NOT NULL UNIQUE)",
+        ))
+        .await
+        .expect("create passkey table");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO passkey_credentials (credential_id) VALUES ('credential-id')",
+        ))
+        .await
+        .expect("store first credential");
+
+        let error = db
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO passkey_credentials (credential_id) VALUES ('credential-id')",
+            ))
+            .await
+            .expect_err("duplicate credential must violate UNIQUE");
+
+        let error = passkey_create_error(error);
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            error,
+            AppError::Conflict(message) if message == "this passkey is already registered"
+        ));
+    }
+
+    /// A failed write is not evidence of a duplicate. In particular, the pool
+    /// outage shape returned by `register_finish` must remain retryable.
+    #[test]
+    fn database_outage_is_not_a_duplicate_conflict() {
+        let error = passkey_create_error(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout));
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
