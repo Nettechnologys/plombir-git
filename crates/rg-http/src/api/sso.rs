@@ -900,6 +900,18 @@ async fn provision_sso_user(
             .await
             .map_err(AppError::from)?;
 
+        // The base satisfies the local rule because it came through
+        // `SsoIdentity`; the uniqueness suffix is the only thing added after
+        // that proof. Re-checking the value actually written keeps the
+        // guarantee attached to the row rather than to a function two crates
+        // away — and if it ever fires it is our arithmetic, not the client's
+        // request, so it is a 500 and not a 400.
+        rg_core::user::service::validate_username(&username).map_err(|error| {
+            AppError::internal(format!(
+                "generated SSO username `{username}` breaks the local username rule: {error}"
+            ))
+        })?;
+
         let error = match rg_db::ops::user_ops::create_user(
             db,
             &username,
@@ -1171,6 +1183,49 @@ mod tests {
             1,
             "a genuine first login is one registration",
         );
+        drop(guard);
+    }
+
+    /// `users.username` addresses `/{username}/{repo}` and shares a namespace
+    /// with organisation names, but a first SSO login used to write whatever
+    /// the provider's profile carried: an OIDC `preferred_username` of
+    /// `"John Doe"` became exactly that row, and `"a/../b"` put a path
+    /// separator in it. The local rule now runs on the provisioning path too.
+    #[tokio::test]
+    async fn a_provisioned_username_satisfies_the_same_rule_self_registration_does() {
+        let guard = PROVISION_COUNTER_LOCK.lock().await;
+        let db = migrated_db().await;
+
+        for (index, provider_name) in ["John Doe", "a/../b", "ünïcode"].iter().enumerate() {
+            let user_id = provision_sso_user(
+                &db,
+                "gitea",
+                &sso_user_info(
+                    &format!("provider-uid-{index}"),
+                    provider_name,
+                    &format!("person{index}@example.com"),
+                ),
+            )
+            .await
+            .expect("a provider name the local rule refuses is repaired, not refused");
+
+            let created = rg_db::ops::user_ops::find_by_id(&db, user_id)
+                .await
+                .expect("read back")
+                .expect("the account exists");
+
+            rg_core::user::service::validate_username(&created.username).unwrap_or_else(|error| {
+                panic!(
+                    "`{}` (from `{provider_name}`) must pass the local rule: {error}",
+                    created.username
+                )
+            });
+            assert!(
+                !created.username.contains('/') && !created.username.contains(".."),
+                "`{}` still addresses a URL path",
+                created.username
+            );
+        }
         drop(guard);
     }
 

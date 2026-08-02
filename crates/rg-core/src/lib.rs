@@ -61,30 +61,20 @@ pub(crate) mod test_support; // Fixtures shared by unit tests of several service
 
 use anyhow::Result;
 
-/// Check if a username is valid (alphanumeric + hyphen + underscore, max 39).
+/// The rule for a name that addresses the `/{owner}/…` namespace.
 ///
-/// Every failure here is the caller's, so each one carries
-/// [`error::InvalidRequest`]: a handler that funnels the result through
-/// `AppError::from` answers `400` with the rule that was broken instead of
-/// blaming itself with a `500`.
-pub fn validate_username(username: &str) -> Result<()> {
-    if username.is_empty() {
-        return Err(error::invalid_request("username cannot be empty"));
-    }
-    if username.len() > 39 {
-        return Err(error::invalid_request(
-            "username too long (max 39 characters)",
-        ));
-    }
-    for c in username.chars() {
-        if !c.is_alphanumeric() && c != '-' && c != '_' {
-            return Err(error::invalid_request(format!(
-                "username contains invalid character: {c}"
-            )));
-        }
-    }
-    Ok(())
-}
+/// Deliberately a re-export rather than a second implementation. Usernames and
+/// organisation names are two holders of *one* namespace — `/{owner}/{repo}`
+/// resolves either — and this used to be a separate, looser copy of the rule:
+/// up to 39 characters against 30, `char::is_alphanumeric` (so Cyrillic passed)
+/// against ASCII, and no requirement to start with an alphanumeric character.
+/// An organisation could therefore take a name no person could register, which
+/// is a homograph waiting to happen in a namespace shared with usernames.
+///
+/// Every failure carries [`error::InvalidRequest`]: a handler that funnels the
+/// result through `AppError::from` answers `400` with the rule that was broken
+/// instead of blaming itself with a `500`.
+pub use user::service::validate_username;
 
 /// Check if a repository name is valid.
 ///

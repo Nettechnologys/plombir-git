@@ -163,9 +163,13 @@ impl SsoUserInfo {
 
     /// Normalise the provider's strings and prove the identity keys.
     ///
-    /// The username is the one field allowed to be missing: it names the local
-    /// account rather than finding an existing one, so it is derived from the
-    /// (by now proven) address instead of failing the login.
+    /// The username is the one field allowed to be missing *and* the one field
+    /// allowed to be wrong: it names the local account rather than finding an
+    /// existing one, so a value the local rule refuses is repaired rather than
+    /// turned into a failed login. What it may not be is *unchecked* — it lands
+    /// in `users.username`, which addresses a URL path and shares one namespace
+    /// with organisation names, so the provider's spelling passes through
+    /// [`sanitize_username`] before it can become that key.
     pub fn into_identity(mut self) -> Result<SsoIdentity, SsoIdentityDefect> {
         self.provider_user_id = self.provider_user_id.trim().to_string();
         self.provider_username = self.provider_username.trim().to_string();
@@ -173,29 +177,77 @@ impl SsoUserInfo {
 
         self.check_identity_keys()?;
 
-        if self.provider_username.is_empty() {
-            self.provider_username =
-                username_from_email(&self.email).ok_or(SsoIdentityDefect::UnusableUsername)?;
-        }
+        // The address is the fallback for both "no username at all" and "a
+        // username with nothing usable in it" — by this point it is proven, so
+        // it is the better of the two sources either way.
+        self.provider_username = sanitize_username(&self.provider_username)
+            .or_else(|| username_from_email(&self.email))
+            .ok_or(SsoIdentityDefect::UnusableUsername)?;
 
         Ok(SsoIdentity(self))
     }
 }
 
-/// Derive a local username from an address when the provider withheld its own.
+/// Longest base username [`sanitize_username`] may return.
 ///
-/// Everything outside ForgeKeep's username alphabet is dropped: this value ends
-/// up in `users.username`, which also addresses a URL path, so a local part
-/// carrying `/` or `..` must not survive into it.
-fn username_from_email(email: &str) -> Option<String> {
-    let local: String = email
-        .split('@')
-        .next()
-        .unwrap_or_default()
+/// `provision_sso_user` appends a uniqueness suffix to this base — `_1` … `_99`
+/// first, then `_` plus six random letters — and the result still has to fit
+/// the 30-character limit [`crate::user::service::validate_username`] enforces.
+/// 23 + 7 is that limit exactly.
+const SSO_USERNAME_BASE_MAX: usize = 23;
+
+/// Shortest username the local rule accepts.
+const SSO_USERNAME_MIN: usize = 3;
+
+/// Reduce a name the *provider* chose to one the local rule accepts.
+///
+/// `users.username` is a local key: it addresses `/{username}/{repo}`, it is
+/// what `find_by_username` matches, and it shares a namespace with organisation
+/// names. Self-registration has had to satisfy
+/// [`crate::user::service::validate_username`] for that reason all along, while
+/// SSO provisioning wrote whatever the provider's JSON carried — an OIDC
+/// `preferred_username` of `"John Doe"` or `"a/../b"` became exactly that
+/// `users.username`.
+///
+/// So the provider's spelling is repaired instead of trusted:
+///
+/// * everything outside `[A-Za-z0-9_-]` is dropped (spaces, dots, `/`, and with
+///   them any `..`),
+/// * leading characters are dropped until the first alphanumeric one, because
+///   the rule requires the name to start with one,
+/// * the result is cut to [`SSO_USERNAME_BASE_MAX`],
+/// * and a 1–2 character remainder is padded rather than refused — the local
+///   minimum exists to keep names readable, not to lock out a person whose
+///   provider name is short.
+///
+/// `None` means nothing usable survived, which is the caller's cue to try the
+/// address instead.
+fn sanitize_username(candidate: &str) -> Option<String> {
+    let filtered: String = candidate
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    (!local.is_empty()).then_some(local)
+
+    // ASCII-only by construction above, so byte indexing is safe here.
+    let first_alphanumeric = filtered.find(|c: char| c.is_ascii_alphanumeric())?;
+    let mut name: String = filtered[first_alphanumeric..]
+        .chars()
+        .take(SSO_USERNAME_BASE_MAX)
+        .collect();
+    while name.len() < SSO_USERNAME_MIN {
+        name.push('0');
+    }
+
+    Some(name)
+}
+
+/// Derive a local username from an address when the provider withheld its own.
+///
+/// The local part goes through the same repair as a provider-supplied name —
+/// this value ends up in `users.username` too, so a local part carrying `/` or
+/// `..` must not survive into it.
+fn username_from_email(email: &str) -> Option<String> {
+    sanitize_username(email.split('@').next().unwrap_or_default())
 }
 
 /// Read the OIDC `email_verified` claim, tolerating the IdPs that send it as a
@@ -415,7 +467,13 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
         .await
         .context("GitHub user API request failed")?;
 
+    // Without this, a refusal is parsed as a profile: GitHub answers `401` with
+    // a JSON body, `user["id"]` is simply absent in it, and the login used to
+    // fail as "the provider returned no account id for this login" — pointing
+    // the person at a scope when the token was the problem.
     let user: serde_json::Value = user_resp
+        .error_for_status()
+        .context("GitHub user API returned an error")?
         .json()
         .await
         .context("failed to parse GitHub user response")?;
@@ -433,7 +491,7 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
     // that branch carries the provider's word for it. The profile fallback is a
     // different payload with no `verified` flag on it — claiming one would be
     // inventing a guarantee, so it stays `None`.
-    let (email, email_verified) = match fetch_github_email(client, access_token).await {
+    let (email, email_verified) = match fetch_github_email(client, access_token).await? {
         Some(email) => (email, Some(true)),
         None => (user["email"].as_str().unwrap_or("").to_string(), None),
     };
@@ -448,7 +506,28 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
     })
 }
 
-async fn fetch_github_email(client: &reqwest::Client, access_token: &str) -> Option<String> {
+/// Ask GitHub for the addresses it has confirmed for this account.
+///
+/// Three-valued on purpose:
+///
+/// * `Ok(Some(address))` — GitHub vouched for that address.
+/// * `Ok(None)` — the question was answered and there is no confirmed address
+///   to hand out, *or* this OAuth app was never granted the `user:email` scope.
+///   Either way the caller's profile fallback is the intended next step.
+/// * `Err` — the question could not be asked at all.
+///
+/// It used to be `Option<String>` built from two `.ok()?`, so a timeout, a DNS
+/// failure, a GitHub `500` and a truncated body were all indistinguishable from
+/// "this account has no verified address". The caller then fell back to the
+/// profile field — most often `""` — and an empty email is precisely the key
+/// that used to find a *different* person's account
+/// (see [`SsoIdentity`]). Refusing the login on "could not ask" is the honest
+/// answer, and it reaches the operator as a logged reason rather than as a
+/// silently weaker identity.
+async fn fetch_github_email(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Option<String>> {
     let resp = client
         .get("https://api.github.com/user/emails")
         .header("Authorization", format!("Bearer {}", access_token))
@@ -456,25 +535,45 @@ async fn fetch_github_email(client: &reqwest::Client, access_token: &str) -> Opt
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
-        .ok()?;
+        .context("GitHub user emails API request failed")?;
 
-    let emails: Vec<serde_json::Value> = resp.json().await.ok()?;
+    // An OAuth app without the `user:email` scope is refused here rather than
+    // told the list is empty. That is an *answer* — the deployment never asked
+    // for the scope — so it stays a fallback to the profile address instead of
+    // failing a sign-in that has worked all along. It is still worth a line:
+    // silence is how this ends up looking like an account with no email.
+    let status = resp.status();
+    if matches!(status.as_u16(), 401 | 403 | 404) {
+        tracing::warn!(
+            status = status.as_u16(),
+            "GitHub refused the verified-email list; falling back to the profile address \
+             (grant the OAuth app the `user:email` scope to avoid this)"
+        );
+        return Ok(None);
+    }
+
+    let emails: Vec<serde_json::Value> = resp
+        .error_for_status()
+        .context("GitHub user emails API returned an error")?
+        .json()
+        .await
+        .context("failed to parse the GitHub user emails response")?;
 
     for email in &emails {
         let primary = email["primary"].as_bool().unwrap_or(false);
         let verified = email["verified"].as_bool().unwrap_or(false);
         if primary && verified {
             if let Some(e) = email["email"].as_str() {
-                return Some(e.to_string());
+                return Ok(Some(e.to_string()));
             }
         }
     }
 
-    emails
+    Ok(emails
         .iter()
         .find(|e| e["verified"].as_bool().unwrap_or(false))
         .and_then(|e| e["email"].as_str())
-        .map(str::to_string)
+        .map(str::to_string))
 }
 
 // ── GitLab user info ─────────────────────────────────────────────
@@ -488,7 +587,12 @@ async fn fetch_gitlab_user(access_token: &str) -> Result<SsoUserInfo> {
         .await
         .context("GitLab user API request failed")?;
 
+    // Same reason as the GitHub profile fetch: an error body parses as a
+    // profile with every field missing, and the identity gate then reports the
+    // provider's refusal as a provider that named nobody.
     let user: serde_json::Value = resp
+        .error_for_status()
+        .context("GitLab user API returned an error")?
         .json()
         .await
         .context("failed to parse GitLab user response")?;
@@ -519,6 +623,8 @@ async fn fetch_google_user(access_token: &str) -> Result<SsoUserInfo> {
         .context("Google userinfo API request failed")?;
 
     let user: serde_json::Value = resp
+        .error_for_status()
+        .context("Google userinfo API returned an error")?
         .json()
         .await
         .context("failed to parse Google userinfo response")?;
@@ -783,14 +889,16 @@ mod tests {
     }
 
     /// That derived value lands in `users.username`, which also addresses a URL
-    /// path — so the local part is filtered, not copied.
+    /// path — so the local part is filtered, not copied. The trailing `0` is
+    /// the local minimum length being met, not part of the address.
     #[test]
     fn a_derived_username_carries_no_path_characters() {
         let identity = profile("provider-uid-1", "", "a/../b@example.com")
             .into_identity()
             .expect("something usable survives the filter");
 
-        assert_eq!(identity.provider_username, "ab");
+        assert_eq!(identity.provider_username, "ab0");
+        assert!(crate::user::service::validate_username(&identity.provider_username).is_ok());
     }
 
     #[test]
@@ -801,6 +909,64 @@ mod tests {
                 .unwrap_err(),
             SsoIdentityDefect::UnusableUsername,
         );
+    }
+
+    /// The bug this repair exists for: an OIDC `preferred_username` is a
+    /// display string on the provider's side and a *key* on ours. Copying it
+    /// put a space — and a URL path separator — into `users.username`.
+    #[test]
+    fn a_provider_username_the_local_rule_refuses_is_repaired_not_copied() {
+        for (provider_name, expected) in [
+            ("John Doe", "JohnDoe"),
+            ("a.b/c", "abc"),
+            ("a/../b", "ab0"),
+            ("_leading", "leading"),
+            ("ünïcode", "ncode"),
+            ("x", "x00"),
+        ] {
+            let identity = profile("provider-uid-1", provider_name, "alice@example.com")
+                .into_identity()
+                .unwrap_or_else(|error| {
+                    panic!("`{provider_name}` should name an account, got {error:?}")
+                });
+
+            assert_eq!(identity.provider_username, expected, "from `{provider_name}`");
+            assert!(
+                crate::user::service::validate_username(&identity.provider_username).is_ok(),
+                "`{}` must satisfy the same rule self-registration does",
+                identity.provider_username
+            );
+        }
+    }
+
+    /// A provider name with nothing usable in it falls back to the address
+    /// rather than failing the login — the address is already proven by now.
+    #[test]
+    fn an_unusable_provider_username_falls_back_to_the_address() {
+        let identity = profile("provider-uid-1", "...", "alice.smith@example.com")
+            .into_identity()
+            .expect("the address still names the account");
+
+        assert_eq!(identity.provider_username, "alicesmith");
+    }
+
+    /// The base has to leave room for the uniqueness suffix
+    /// `provision_sso_user` appends, or the *generated* name breaks the rule
+    /// the base was trimmed to satisfy.
+    #[test]
+    fn a_long_provider_username_leaves_room_for_the_uniqueness_suffix() {
+        let identity = profile("provider-uid-1", &"a".repeat(64), "alice@example.com")
+            .into_identity()
+            .expect("a long name is cut, not refused");
+
+        assert_eq!(identity.provider_username.len(), super::SSO_USERNAME_BASE_MAX);
+        for suffix in ["_99", "_abcdef"] {
+            let generated = format!("{}{suffix}", identity.provider_username);
+            assert!(
+                crate::user::service::validate_username(&generated).is_ok(),
+                "`{generated}` must still satisfy the local rule"
+            );
+        }
     }
 
     #[test]
