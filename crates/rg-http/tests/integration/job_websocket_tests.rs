@@ -251,6 +251,77 @@ async fn a_repository_turning_private_closes_an_outsider_job_log_socket() {
     );
 }
 
+/// card_7898025803a6, the job-log half: the re-check above re-asks the read
+/// gate and the account's standing, and both keep answering "yes" after a
+/// `POST /users/logout` — logging out revokes the *session*, deliberately
+/// leaving the account and its rights exactly where they were. So the one thing
+/// a user does to end a stream on a machine they are walking away from was the
+/// one thing this socket could not see.
+#[tokio::test]
+async fn a_logout_closes_a_job_log_socket_the_revoked_session_opened() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, db) = spawn_test_app_with_overrides(StateOverrides {
+        ws_session_recheck_secs: Some(1),
+        ..Default::default()
+    })
+    .await;
+    let (owner_token, owner_id) =
+        register_full(&base, "ws_job_logout", "ws_job_logout@example.com").await;
+    let (_repo_id, job_id) =
+        create_job_in_repo(&base, &db, &owner_token, owner_id, "logout-ws", true).await;
+
+    let (mut socket, response) =
+        tokio_tungstenite::connect_async(websocket_request(&base, job_id, Some(&owner_token)))
+            .await
+            .expect("the owner of the repository must reach their own job's log socket");
+    assert_eq!(response.status(), 101);
+
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("the socket must greet a reader who may read")
+        .expect("the socket closed before the welcome frame")
+        .expect("the welcome frame must be readable");
+    assert!(
+        matches!(&welcome, Message::Text(text) if text.contains("\"connected\"")),
+        "unexpected welcome frame: {welcome:?}"
+    );
+
+    // Baseline: several re-check intervals on a session in good standing, so
+    // the close below means "revoked" and not "this socket was never going to
+    // survive".
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(4), socket.next())
+            .await
+            .is_err(),
+        "the re-check closed a socket whose session is in good standing"
+    );
+
+    let logout = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/logout"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "logout failed");
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(Message::Close(_)) | Err(_) => return true,
+                Ok(_) => continue,
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        ended.unwrap_or(false),
+        "the job-log socket kept streaming to a session its owner had logged out of"
+    );
+}
+
 #[tokio::test]
 async fn job_websocket_rejects_invalid_token_before_upgrade() {
     let (base, _) = spawn_test_app_with_db().await;

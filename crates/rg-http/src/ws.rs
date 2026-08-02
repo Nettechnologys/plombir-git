@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
-use crate::api::auth::{ws_session, WsSession};
+use crate::api::auth::{ws_session, WsSession, WsSessionUser};
 use crate::AppState;
 
 /// RAII guard for the `forgekeep_ws_connections` gauge: bumps it on
@@ -57,29 +57,38 @@ const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 ///
 /// The revocation gate ([`crate::api::auth::session_standing_middleware`]) is a
 /// *request* middleware, and a WebSocket makes exactly one request — the
-/// handshake. After that there is nothing for the middleware to intercept, so a
-/// deactivation reaches an open socket through no path at all: the offboarded
-/// user's tab keeps receiving pushes until they close it. This is that same
-/// gate, sampled, which bounds the window by an interval instead of by how long
-/// someone leaves a browser open. Cost is one primary-key read per socket per
+/// handshake. After that there is nothing for the middleware to intercept, so
+/// neither a deactivation nor a revoked session reaches an open socket through
+/// any path at all: the offboarded — or logged-out — user's tab keeps receiving
+/// pushes until they close it. This is that same gate, asking both of its
+/// questions, sampled, which bounds the window by an interval instead of by how
+/// long someone leaves a browser open. Cost is one primary-key read per socket per
 /// interval — the sockets are idle between pushes, so this is what they do.
 pub const DEFAULT_WS_SESSION_RECHECK_SECS: u64 = 30;
 
-/// Does the account behind an open socket still stand?
+/// Does the session behind an open socket still stand?
 ///
-/// Fails closed, deliberately: "disabled" and "could not tell" both end the
-/// socket, because the alternative is that a database hiccup becomes the reason
-/// a revoked session keeps its stream. Closing is not a verdict the client has
-/// to live with — it reconnects, and the handshake goes through the same
-/// middleware every other request does, which answers `503` rather than `401`
-/// when it is the database that is unwell.
-async fn account_still_stands(db: &sea_orm::DatabaseConnection, user_id: i64) -> bool {
-    match rg_db::ops::user_ops::find_by_id(db, user_id).await {
-        Ok(Some(user)) => user.is_usable(),
+/// Both halves of [`crate::api::auth::session_standing_middleware`]'s question
+/// are asked, and for the same reason it asks both: an account can keep standing
+/// while the *session* is revoked. A `POST /users/logout` and a password reset
+/// leave `is_usable()` true and bump `users.session_version` instead, so a check
+/// that reads only the first is blind to exactly the two acts a user performs to
+/// end a session on purpose — and an open tab is not bounded by anything but how
+/// long it stays open (card_7898025803a6).
+///
+/// Fails closed, deliberately: "disabled", "revoked" and "could not tell" all
+/// end the socket, because the alternative is that a database hiccup becomes the
+/// reason a revoked session keeps its stream. Closing is not a verdict the
+/// client has to live with — it reconnects, and the handshake goes through the
+/// same middleware every other request does, which answers `503` rather than
+/// `401` when it is the database that is unwell.
+async fn account_still_stands(db: &sea_orm::DatabaseConnection, session: WsSessionUser) -> bool {
+    match rg_db::ops::user_ops::find_by_id(db, session.user_id).await {
+        Ok(Some(user)) => user.is_usable() && user.session_version == session.session_version,
         Ok(None) => false,
         Err(error) => {
             tracing::error!(
-                user_id,
+                user_id = session.user_id,
                 error = %format!("{error:#}"),
                 "could not verify account standing for an open WebSocket"
             );
@@ -94,13 +103,17 @@ async fn account_still_stands(db: &sea_orm::DatabaseConnection, user_id: i64) ->
 /// from `check_read_for`, and that answer can stop being true without the
 /// account going anywhere — the repository flips to private, a collaborator is
 /// removed. The repository row is re-read for the same reason.
-async fn job_log_access_still_stands(state: &AppState, repo_id: i64, user_id: i64) -> bool {
-    if !account_still_stands(&state.db, user_id).await {
+async fn job_log_access_still_stands(
+    state: &AppState,
+    repo_id: i64,
+    session: WsSessionUser,
+) -> bool {
+    if !account_still_stands(&state.db, session).await {
         return false;
     }
     match rg_db::ops::repo_ops::find_by_id(&state.db, repo_id).await {
         Ok(Some(repository)) => {
-            crate::api::repo_access::check_read_for(state, &repository, Some(user_id))
+            crate::api::repo_access::check_read_for(state, &repository, Some(session.user_id))
                 .await
                 .is_ok()
         }
@@ -108,7 +121,7 @@ async fn job_log_access_still_stands(state: &AppState, repo_id: i64, user_id: i6
         Err(error) => {
             tracing::error!(
                 repo_id,
-                user_id,
+                user_id = session.user_id,
                 error = %format!("{error:#}"),
                 "could not verify repository access for an open job-log WebSocket"
             );
@@ -266,10 +279,10 @@ pub async fn ws_notifications_handler(
     // it belongs with the constant that names it — see `api::auth::ws_session`.
     let WsSession {
         protocol_echo,
-        user_id,
+        user,
     } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
 
-    let Some(user_id) = user_id else {
+    let Some(session) = user else {
         return crate::error::AppError::unauthorized("authentication required").into_response();
     };
 
@@ -280,12 +293,13 @@ pub async fn ws_notifications_handler(
     };
 
     upgrade
-        .on_upgrade(move |socket| handle_ws_connection(socket, state, user_id))
+        .on_upgrade(move |socket| handle_ws_connection(socket, state, session))
         .into_response()
 }
 
 /// Handle an individual WebSocket connection.
-async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: i64) {
+async fn handle_ws_connection(socket: WebSocket, state: AppState, session: WsSessionUser) {
+    let user_id = session.user_id;
     let hub = state.notification_hub.clone();
     let (mut sender, mut receiver) = socket.split();
 
@@ -316,10 +330,10 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState, user_id: i64) 
     loop {
         tokio::select! {
             _ = recheck.tick() => {
-                if !account_still_stands(&state.db, user_id).await {
+                if !account_still_stands(&state.db, session).await {
                     tracing::warn!(
                         user_id,
-                        "closing a notification WebSocket: its account no longer stands"
+                        "closing a notification WebSocket: its session no longer stands"
                     );
                     if sender
                         .send(Message::Text(
@@ -437,12 +451,13 @@ pub async fn ws_job_log_handler(
     // same place — see `api::auth::ws_session`.
     let WsSession {
         protocol_echo,
-        user_id,
+        user,
     } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
 
-    let Some(user_id) = user_id else {
+    let Some(session) = user else {
         return crate::error::AppError::unauthorized("authentication required").into_response();
     };
+    let user_id = session.user_id;
 
     let job = match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
         Ok(Some(job)) => job,
@@ -500,7 +515,7 @@ pub async fn ws_job_log_handler(
     let repo_id = repository.id;
     upgrade
         .on_upgrade(move |socket| {
-            handle_job_log_connection(socket, state, job_id, repo_id, user_id)
+            handle_job_log_connection(socket, state, job_id, repo_id, session)
         })
         .into_response()
 }
@@ -511,8 +526,9 @@ async fn handle_job_log_connection(
     state: AppState,
     job_id: i64,
     repo_id: i64,
-    user_id: i64,
+    session: WsSessionUser,
 ) {
+    let user_id = session.user_id;
     let hub = state.notification_hub.clone();
     let (mut sender, mut receiver) = socket.split();
     let _ws_guard = WsConnGuard::new();
@@ -538,7 +554,7 @@ async fn handle_job_log_connection(
     loop {
         tokio::select! {
             _ = recheck.tick() => {
-                if !job_log_access_still_stands(&state, repo_id, user_id).await {
+                if !job_log_access_still_stands(&state, repo_id, session).await {
                     tracing::warn!(
                         job_id,
                         repo_id,

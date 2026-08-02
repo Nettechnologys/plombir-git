@@ -139,15 +139,32 @@ fn bearer_subprotocols(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The account a WebSocket handshake authenticated, and the session generation
+/// it was authenticated under.
+///
+/// The two travel as one value rather than as an id with a version alongside it,
+/// because a socket holding the id and not the generation can only ask half of
+/// the revocation question — which is precisely what both socket loops did
+/// (card_7898025803a6): they re-asked on an interval whether the account still
+/// stood, and had nothing left to compare a logout or a password reset against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WsSessionUser {
+    pub(crate) user_id: i64,
+    /// The `users.session_version` the presented JWT was minted under. A reset
+    /// or a `POST /users/logout` bumps that column; see
+    /// [`rg_db::ops::user_ops::invalidate_sessions`].
+    pub(crate) session_version: i64,
+}
+
 /// The session a WebSocket handshake presented, and the subprotocol to echo.
 pub(crate) struct WsSession {
     /// The `Sec-WebSocket-Protocol` value to select in the upgrade response,
     /// when the token arrived as one. `None` for the cookie and query shapes,
     /// which offer no subprotocol to echo.
     pub(crate) protocol_echo: Option<String>,
-    /// The account this handshake authenticated, or `None` when no shape carried
+    /// The session this handshake authenticated, or `None` when no shape carried
     /// a valid user session.
-    pub(crate) user_id: Option<i64>,
+    pub(crate) user: Option<WsSessionUser>,
 }
 
 /// Resolve the session a WebSocket handshake presents.
@@ -179,14 +196,19 @@ pub(crate) fn ws_session(
         },
     };
 
-    let user_id = token
+    let user = token
         .as_deref()
         .and_then(|token| rg_core::auth::jwt::validate_token(token, jwt_secret))
-        .and_then(|claims| claims.sub.parse::<i64>().ok());
+        .and_then(|claims| {
+            claims.sub.parse::<i64>().ok().map(|user_id| WsSessionUser {
+                user_id,
+                session_version: claims.session_version,
+            })
+        });
 
     WsSession {
         protocol_echo,
-        user_id,
+        user,
     }
 }
 
@@ -408,7 +430,18 @@ mod tests {
     }
 
     fn session(user_id: i64) -> String {
-        rg_core::auth::jwt::generate_token(user_id, "gatekeeper", 0, SECRET, 7).unwrap()
+        session_at(user_id, 0)
+    }
+
+    fn session_at(user_id: i64, generation: i64) -> String {
+        rg_core::auth::jwt::generate_token(user_id, "gatekeeper", generation, SECRET, 7).unwrap()
+    }
+
+    fn ws_user(user_id: i64, session_version: i64) -> Option<WsSessionUser> {
+        Some(WsSessionUser {
+            user_id,
+            session_version,
+        })
     }
 
     fn basic(user: &str, pass: &str) -> String {
@@ -552,7 +585,7 @@ mod tests {
             None,
             SECRET,
         );
-        assert_eq!(resolved.user_id, Some(42));
+        assert_eq!(resolved.user, ws_user(42, 0));
         assert!(
             resolved.protocol_echo.is_none(),
             "a cookie handshake offers no subprotocol, so none may be echoed"
@@ -569,7 +602,7 @@ mod tests {
             None,
             SECRET,
         );
-        assert_eq!(resolved.user_id, Some(7));
+        assert_eq!(resolved.user, ws_user(7, 0));
         assert_eq!(resolved.protocol_echo, Some(format!("bearer.{jwt}")));
     }
 
@@ -578,8 +611,45 @@ mod tests {
     fn a_query_token_handshake_is_a_session() {
         let jwt = session(9);
         let resolved = ws_session(&HeaderMap::new(), Some(&jwt), SECRET);
-        assert_eq!(resolved.user_id, Some(9));
+        assert_eq!(resolved.user, ws_user(9, 0));
         assert!(resolved.protocol_echo.is_none());
+    }
+
+    /// The generation the token was minted under has to survive the handshake,
+    /// or the socket loops that outlive it can only ask whether the *account*
+    /// still stands — and a logout, which revokes the session and leaves the
+    /// account alone, becomes invisible to them (card_7898025803a6).
+    #[test]
+    fn a_handshake_carries_the_session_generation_it_was_minted_under() {
+        for (shape, headers_in, query) in [
+            (
+                "a cookie",
+                headers(
+                    "cookie",
+                    format!("{AUTH_COOKIE_NAME}={}", session_at(42, 3)),
+                ),
+                None,
+            ),
+            (
+                "a subprotocol",
+                headers(
+                    "sec-websocket-protocol",
+                    format!("bearer.{}", session_at(42, 3)),
+                ),
+                None,
+            ),
+            (
+                "a query parameter",
+                HeaderMap::new(),
+                Some(session_at(42, 3)),
+            ),
+        ] {
+            assert_eq!(
+                ws_session(&headers_in, query.as_deref(), SECRET).user,
+                ws_user(42, 3),
+                "a handshake presenting {shape} dropped its session generation"
+            );
+        }
     }
 
     /// No shape carrying a valid user session authenticates nobody — and an
@@ -606,7 +676,7 @@ mod tests {
             ("a garbage query token", HeaderMap::new(), Some("not-a-jwt")),
         ] {
             assert_eq!(
-                ws_session(&headers_in, query, SECRET).user_id,
+                ws_session(&headers_in, query, SECRET).user,
                 None,
                 "a handshake presenting {what} was read as a session"
             );
@@ -627,7 +697,7 @@ mod tests {
         );
 
         let resolved = ws_session(&h, None, SECRET);
-        assert_eq!(resolved.user_id, Some(1));
+        assert_eq!(resolved.user, ws_user(1, 0));
         assert!(
             resolved.protocol_echo.is_none(),
             "the cookie won, so the unused subprotocol must not be selected"
