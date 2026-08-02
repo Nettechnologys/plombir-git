@@ -190,12 +190,21 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
                         })?;
                 }
             } else {
-                return Err(anyhow::anyhow!(
+                // A busy group is a *state* the caller can do something about:
+                // wait for the running pipeline, or set `cancel_in_progress`.
+                // As a bare `anyhow` this reached `AppError::from` with nothing
+                // to classify by and came out a 500 — the same answer a crashed
+                // server gives, with the advice below stripped off by the
+                // sanitizer on the way out. `Conflict` is the shape the rest of
+                // the codebase already uses for "correct request, wrong moment"
+                // (see `pull_request::service`'s "another merge attempt is
+                // already in progress"): a 409 whose message reaches the client.
+                return Err(rg_core::error::conflict(format!(
                     "Concurrency group '{}' has {} active pipeline(s). \
                      Set cancel_in_progress: true to auto-cancel, or wait for them to finish.",
                     group,
                     active.len()
-                ));
+                )));
             }
         }
     }
@@ -1652,6 +1661,164 @@ mod matrix_tests {
                 .len(),
             1
         );
+    }
+
+    /// The other half of the same branch: with `cancel_in_progress: false` a
+    /// busy group is a refusal the caller can act on, and it must not answer
+    /// with the code a crashed server uses. The test keeps both halves apart —
+    /// a busy group is a `Conflict` (409), a storage failure on the very same
+    /// call path is not — because that split is the whole point: a 500 tells a
+    /// retrying client "this will pass on its own", and a busy group only
+    /// passes when the pipeline ahead of it finishes.
+    #[tokio::test]
+    async fn a_busy_concurrency_group_is_a_conflict_not_a_server_failure() {
+        use sea_orm::ConnectionTrait;
+
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"concurrency:\n  group: ${{ ref }}\nbuild:\n  script: [echo one]\n" as &[u8],
+        )]);
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("busy-group.db").display()
+        ))
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "busy-owner",
+            "busy@example.com",
+            "unused",
+            "Busy Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("busy".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The pipeline that holds the group.
+        let in_progress = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &sha,
+            "refs/heads/main",
+            "push",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+
+        let error = trigger_pipeline(TriggerPipelineParams {
+            db: &db,
+            repo_path: temp.path(),
+            repo_id: repo.id,
+            commit_sha: &sha,
+            ref_name: "refs/heads/main",
+            trigger_type: "manual",
+            base_branch: None,
+            triggered_by: Some(user.id),
+            docker_enabled: false,
+            external_runners: true,
+            allow_host_runner: false,
+            jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
+            external_url: None,
+        })
+        .await
+        .unwrap_err();
+
+        let conflict = error
+            .downcast_ref::<rg_core::error::Conflict>()
+            .unwrap_or_else(|| {
+                panic!("a busy concurrency group must be a Conflict (409), got: {error:#}")
+            });
+        // `Conflict`'s message is the one the HTTP layer renders verbatim, so
+        // the instruction has to live *in it* — not in a `.context(...)` layer
+        // the sanitizer drops.
+        let message = conflict.to_string();
+        assert!(
+            message.contains("has 1 active pipeline"),
+            "the refusal must say what is holding the group: {message}"
+        );
+        assert!(
+            message.contains("cancel_in_progress: true"),
+            "the way out has to reach the client, not just the log: {message}"
+        );
+
+        // The refusal is a refusal: nothing was started.
+        assert_eq!(
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Second half of the split. A ref with no active pipeline clears the
+        // concurrency check, and only the pipeline write fails — that is a
+        // server-side failure and must NOT be dressed up as a busy group, or
+        // the 409 stops meaning "wait for the one ahead of you".
+        db.execute_unprepared(
+            "CREATE TRIGGER refuse_pipeline_insert BEFORE INSERT ON pipelines \
+             FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;",
+        )
+        .await
+        .expect("install the storage fault");
+
+        let storage_error = trigger_pipeline(TriggerPipelineParams {
+            db: &db,
+            repo_path: temp.path(),
+            repo_id: repo.id,
+            commit_sha: &sha,
+            ref_name: "refs/heads/other",
+            trigger_type: "manual",
+            base_branch: None,
+            triggered_by: Some(user.id),
+            docker_enabled: false,
+            external_runners: true,
+            allow_host_runner: false,
+            jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
+            external_url: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            storage_error
+                .downcast_ref::<rg_core::error::Conflict>()
+                .is_none(),
+            "a refused write is ours, not the caller's: {storage_error:#}"
+        );
+        assert_eq!(
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the failed write left nothing behind"
+        );
+        assert_eq!(in_progress.status, "pending");
     }
 
     #[test]
