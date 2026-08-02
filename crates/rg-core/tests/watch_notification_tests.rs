@@ -90,6 +90,46 @@ async fn notified_events(db: &sea_orm::DatabaseConnection, user_id: i64) -> Vec<
         .collect()
 }
 
+/// Give a PR fixture the same git preconditions a real push creates: a base
+/// commit on `main` and a distinct commit on `feature` in the bare repository.
+fn seed_pr_branches(bare_path: &Path) {
+    fn git(args: &[&str], cwd: Option<&Path>) {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, cwd)
+            .expect("run git")
+            .ensure_success()
+            .expect("git command succeeds");
+    }
+
+    let worktree = tempfile::tempdir().expect("create PR fixture worktree");
+    let path = worktree.path();
+    let path_arg = path.to_str().expect("UTF-8 worktree path");
+    let bare_arg = bare_path.to_str().expect("UTF-8 bare repository path");
+
+    git(&["init", "-q", "-b", "main", path_arg], None);
+    git(
+        &["config", "user.name", "Watch notification test"],
+        Some(path),
+    );
+    git(
+        &["config", "user.email", "watch-notification@example.invalid"],
+        Some(path),
+    );
+    std::fs::write(path.join("README.md"), "base\n").expect("write base file");
+    git(&["add", "."], Some(path));
+    git(&["commit", "-qm", "base"], Some(path));
+    git(&["remote", "add", "origin", bare_arg], Some(path));
+    git(&["push", "origin", "main"], Some(path));
+
+    git(&["checkout", "-q", "-b", "feature"], Some(path));
+    std::fs::write(path.join("feature.txt"), "feature\n").expect("write feature file");
+    git(&["add", "."], Some(path));
+    git(&["commit", "-qm", "feature"], Some(path));
+    git(&["push", "origin", "feature"], Some(path));
+}
+
 fn accepted_push(refname: &str, new_sha: &str) -> rg_git::protocol::receive_pack::RefUpdate {
     rg_git::protocol::receive_pack::RefUpdate {
         old_sha: "0".repeat(40),
@@ -325,6 +365,8 @@ async fn pull_request_transitions_notify_watchers_but_not_the_actor() {
         rg_core::repo::service::create_repo(&db, owner.id, "prrepo", None, false, &repo_root, None)
             .await
             .expect("create repo");
+    let bare_path = repo_root.join(format!("{}/{}.git", owner.username, repo.name));
+    seed_pr_branches(&bare_path);
 
     watch(&db, owner.id, repo.id, "watching").await;
     watch(&db, watcher.id, repo.id, "watching").await;
