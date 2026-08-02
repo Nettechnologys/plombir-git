@@ -45,8 +45,28 @@ fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-/// True when the process can create a file in `dir` right now.
-fn dir_is_writable(dir: &std::path::Path) -> bool {
+/// What a write probe actually established about a directory.
+///
+/// The point of the enum is the last variant. A `bool` had no room for "the
+/// probe could not be carried out", so every `ENOTDIR`, `ENOSPC` and `EIO`
+/// answered the question it never got to ask — and the caller told the operator
+/// to fix permissions on a directory whose real problem was the device, the
+/// disk, or the path not being a directory at all.
+enum DirWriteProbe {
+    /// A file was created there and removed again.
+    Writable,
+    /// The filesystem refused access. This is the case the diagnostic exists
+    /// for: a `/data` bind-mount owned by the host uid.
+    Denied,
+    /// The directory itself is not there.
+    Missing,
+    /// The probe failed for some other reason, so nothing was established
+    /// about writability.
+    Inconclusive(std::io::Error),
+}
+
+/// Try to create (and remove) a file in `dir`, reporting what that proved.
+fn probe_dir_writable(dir: &std::path::Path) -> DirWriteProbe {
     let probe = dir.join(".forgekeep_db_write_test");
     match std::fs::write(&probe, b"") {
         Ok(()) => {
@@ -56,9 +76,13 @@ fn dir_is_writable(dir: &std::path::Path) -> bool {
             if let Err(e) = std::fs::remove_file(&probe) {
                 tracing::debug!(probe = %probe.display(), error = %e, "failed to remove the database write-probe file");
             }
-            true
+            DirWriteProbe::Writable
         }
-        Err(_) => false,
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::PermissionDenied => DirWriteProbe::Denied,
+            std::io::ErrorKind::NotFound => DirWriteProbe::Missing,
+            _ => DirWriteProbe::Inconclusive(error),
+        },
     }
 }
 
@@ -71,6 +95,11 @@ fn dir_is_writable(dir: &std::path::Path) -> bool {
 /// `-shm` sidecar files need write access to the *directory*, not just the
 /// database file. Non-permission failures (corrupt file, bad URL, Postgres,
 /// MySQL) are returned untouched.
+///
+/// Only a *proven* verdict is annotated. A probe that could not run leaves the
+/// SQLite error exactly as it was: an operator sent to `chown` a directory
+/// whose real problem is a full disk or a path that is not a directory loses
+/// more time than one who got no hint at all.
 fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
     let Some(path) = sqlite_file_path(db_url) else {
         return error;
@@ -79,16 +108,31 @@ fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    if dir_is_writable(dir) {
-        return error;
-    }
 
-    let mut context = format!(
-        "SQLite database `{}` could not be opened: `{}` is not writable by the server, and SQLite \
-         needs to create the `-wal` / `-shm` sidecar files next to the database",
-        path.display(),
-        dir.display()
-    );
+    let mut context = match probe_dir_writable(dir) {
+        DirWriteProbe::Writable => return error,
+        DirWriteProbe::Inconclusive(probe_error) => {
+            tracing::debug!(
+                dir = %dir.display(),
+                error = %probe_error,
+                "could not establish whether the database directory is writable; \
+                 leaving the SQLite error unannotated"
+            );
+            return error;
+        }
+        DirWriteProbe::Missing => format!(
+            "SQLite database `{}` could not be opened: its directory `{}` does not exist — create \
+             it (or bind-mount it) before starting the server",
+            path.display(),
+            dir.display()
+        ),
+        DirWriteProbe::Denied => format!(
+            "SQLite database `{}` could not be opened: `{}` is not writable by the server, and \
+             SQLite needs to create the `-wal` / `-shm` sidecar files next to the database",
+            path.display(),
+            dir.display()
+        ),
+    };
     if let Some(hint) = rg_core::platform::fs::ownership_hint(dir) {
         context.push_str(&format!("\n  hint: {hint}"));
     }
@@ -152,6 +196,46 @@ mod tests {
         );
 
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The probe's own failure is not a verdict. Here the "directory" is a
+    /// regular file, so the write fails with `ENOTDIR` — nothing whatsoever was
+    /// established about permissions, and claiming otherwise sends the operator
+    /// to `chown` a path that needs a different fix entirely.
+    #[test]
+    fn a_probe_that_could_not_run_is_not_reported_as_a_permission_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let url = format!("sqlite://{}/data/forgekeep.db?mode=rwc", blocker.display());
+
+        let annotated = format!(
+            "{:#}",
+            super::annotate_db_open_error(anyhow::anyhow!("unable to open database file"), &url)
+        );
+
+        assert_eq!(annotated, "unable to open database file");
+    }
+
+    /// A directory that is simply not there needs `mkdir`, not `chmod`. Both
+    /// used to arrive as "is not writable by the server".
+    #[test]
+    fn a_missing_directory_is_named_as_missing_rather_than_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", missing.display());
+
+        let annotated = format!(
+            "{:#}",
+            super::annotate_db_open_error(anyhow::anyhow!("unable to open database file"), &url)
+        );
+
+        assert!(
+            annotated.contains("unable to open database file"),
+            "{annotated}"
+        );
+        assert!(annotated.contains("does not exist"), "{annotated}");
+        assert!(!annotated.contains("is not writable"), "{annotated}");
     }
 
     /// A corrupt database or a bad URL must not be blamed on permissions.
