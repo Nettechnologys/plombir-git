@@ -179,7 +179,10 @@ async fn search_all(
             _ => fetch_wiki(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
         };
         for (index, row) in rows.into_iter().enumerate() {
-            page.push((merge_position(&lengths, kind, slice_offset + index as u64), row));
+            page.push((
+                merge_position(&lengths, kind, slice_offset + index as u64),
+                row,
+            ));
         }
     }
 

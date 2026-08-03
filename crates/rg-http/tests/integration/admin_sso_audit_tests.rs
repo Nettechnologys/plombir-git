@@ -391,10 +391,7 @@ async fn enabled_oauth2_provider_requires_a_client_id_and_reachable_endpoints() 
     };
     let patch_github = |payload: serde_json::Value| {
         client
-            .patch(format!(
-                "{}/api/v1/admin/sso/providers/{}",
-                base, seeded.id
-            ))
+            .patch(format!("{}/api/v1/admin/sso/providers/{}", base, seeded.id))
             .bearer_auth(&admin_token)
             .json(&payload)
             .send()
@@ -435,7 +432,10 @@ async fn enabled_oauth2_provider_requires_a_client_id_and_reachable_endpoints() 
         .await
         .unwrap()
         .expect("the refused update must not have removed the provider");
-    assert!(!untouched.enabled, "a refused enable must not have enabled it");
+    assert!(
+        !untouched.enabled,
+        "a refused enable must not have enabled it"
+    );
     assert!(untouched.client_id.is_none());
 
     // The same body switched off is a draft, and drafts are the normal way to

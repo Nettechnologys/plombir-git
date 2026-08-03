@@ -347,8 +347,8 @@ pub async fn check_merge_allowed(
             // an unexplained 403, here it costs the branch its protection.
             // `?` makes an unreadable rule a server error, and a merge that
             // cannot be checked does not happen.
-            let required_checks: Vec<String> = serde_json::from_str(checks_json)
-                .with_context(|| {
+            let required_checks: Vec<String> =
+                serde_json::from_str(checks_json).with_context(|| {
                     format!(
                         "stored required_status_checks of protected branch '{target_branch}' \
                          is not a JSON array of check names"
@@ -388,9 +388,7 @@ pub async fn check_merge_allowed(
                 Some(p) if p.status != "success" => {
                     return Err(crate::error::forbidden(format!(
                         "branch '{}' requires all status checks to pass, but pipeline #{} is {}",
-                        target_branch,
-                        p.id,
-                        p.status
+                        target_branch, p.id, p.status
                     )));
                 }
                 Some(p) => {

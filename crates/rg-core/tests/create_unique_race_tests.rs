@@ -165,7 +165,10 @@ async fn concurrent_wiki_page_creations_leave_one_row_and_one_caller_conflict() 
     }
 
     assert_eq!(created, 1, "exactly one attempt may create the page");
-    assert_eq!(refused, 7, "every other attempt must be answered, not dropped");
+    assert_eq!(
+        refused, 7,
+        "every other attempt must be answered, not dropped"
+    );
     assert_eq!(
         count(
             &db,
@@ -243,16 +246,16 @@ async fn concurrent_release_creations_leave_one_row_and_one_caller_conflict() {
             Ok(_) => created += 1,
             Err(error) => {
                 refused += 1;
-                assert_is_the_caller_s_conflict(
-                    &error,
-                    "release with tag 'v1.0.0' already exists",
-                );
+                assert_is_the_caller_s_conflict(&error, "release with tag 'v1.0.0' already exists");
             }
         }
     }
 
     assert_eq!(created, 1, "exactly one attempt may publish the tag");
-    assert_eq!(refused, 7, "every other attempt must be answered, not dropped");
+    assert_eq!(
+        refused, 7,
+        "every other attempt must be answered, not dropped"
+    );
     assert_eq!(
         count(
             &db,
@@ -339,17 +342,10 @@ async fn a_repository_create_that_loses_the_namespace_race_is_the_caller_s_confl
     )
     .await;
 
-    let error = rg_core::repo::service::create_repo(
-        &db,
-        owner_id,
-        "racy",
-        None,
-        false,
-        &repo_root,
-        None,
-    )
-    .await
-    .expect_err("the insert lost the race");
+    let error =
+        rg_core::repo::service::create_repo(&db, owner_id, "racy", None, false, &repo_root, None)
+            .await
+            .expect_err("the insert lost the race");
 
     assert_is_the_caller_s_conflict(&error, "repository 'racy' already exists");
     // SQLite rolls a failed statement back together with what its trigger did,
@@ -385,17 +381,10 @@ async fn a_repository_create_that_fails_for_another_reason_stays_an_error() {
     .await
     .expect("install the write fault");
 
-    let error = rg_core::repo::service::create_repo(
-        &db,
-        owner_id,
-        "downy",
-        None,
-        false,
-        &repo_root,
-        None,
-    )
-    .await
-    .expect_err("the insert was refused");
+    let error =
+        rg_core::repo::service::create_repo(&db, owner_id, "downy", None, false, &repo_root, None)
+            .await
+            .expect_err("the insert was refused");
 
     assert!(
         error

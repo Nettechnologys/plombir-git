@@ -86,7 +86,8 @@ impl Fixture {
         let (db, app_dir) = setup_test_db().await;
         let repo_root = app_dir.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
-        let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root.clone()));
+        let app =
+            rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let base = format!("http://{addr}");

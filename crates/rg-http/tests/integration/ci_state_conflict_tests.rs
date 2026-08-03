@@ -189,9 +189,15 @@ async fn playing_a_job_that_is_not_manual_answers_conflict() {
 #[tokio::test]
 async fn canceling_a_finished_pipeline_answers_conflict() {
     let (fixture, db) = seed("cancel-done", false).await;
-    rg_db::ops::pipeline_ops::update_pipeline_status(&db, fixture.pipeline_id, "success", None, None)
-        .await
-        .expect("finish the pipeline");
+    rg_db::ops::pipeline_ops::update_pipeline_status(
+        &db,
+        fixture.pipeline_id,
+        "success",
+        None,
+        None,
+    )
+    .await
+    .expect("finish the pipeline");
 
     let response = fixture.post(&fixture.cancel_url()).await;
 

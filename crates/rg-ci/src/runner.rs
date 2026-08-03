@@ -1054,13 +1054,10 @@ impl PipelineRunner {
         let directory = self.cache_archive_dir();
         // What the live entry names before this save rewrites it, read while the
         // row still points at the previous run's archive.
-        let replaced = rg_db::ops::ci_retention_ops::find_cache_entry(
-            &self.db,
-            self.repo_id,
-            &key_hash,
-        )
-        .await?
-        .map(|entry| entry.file_path);
+        let replaced =
+            rg_db::ops::ci_retention_ops::find_cache_entry(&self.db, self.repo_id, &key_hash)
+                .await?
+                .map(|entry| entry.file_path);
         // Each save publishes under a name of its own. Packing over a stable
         // `<key_hash>.tar` destroyed the previous run's archive before anything
         // had confirmed this one — and then every failure below compensated by
@@ -1083,10 +1080,9 @@ impl PipelineRunner {
         // The row names this save's archive now, which is what makes the one it
         // named before ours to retire — and only now. A failure above left the
         // previous run's cache exactly where it was, still restorable.
-        if let Some(previous) =
-            replaced
-                .as_deref()
-                .and_then(|recorded| recorded_cache_archive(&directory, recorded))
+        if let Some(previous) = replaced
+            .as_deref()
+            .and_then(|recorded| recorded_cache_archive(&directory, recorded))
         {
             if previous != archive {
                 remove_cache_archive(&previous, "a newer archive took over the cache entry");
@@ -1526,7 +1522,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            restored_cache_content(&runner, "build-main").await.as_deref(),
+            restored_cache_content(&runner, "build-main")
+                .await
+                .as_deref(),
             Some("first"),
             "the failed retry destroyed the cache the live entry still names"
         );
@@ -1559,7 +1557,9 @@ mod tests {
             "the superseded archive stayed on disk with nothing naming it"
         );
         assert_eq!(
-            restored_cache_content(&runner, "build-main").await.as_deref(),
+            restored_cache_content(&runner, "build-main")
+                .await
+                .as_deref(),
             Some("second"),
         );
     }

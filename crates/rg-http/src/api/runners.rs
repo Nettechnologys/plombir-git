@@ -1192,12 +1192,7 @@ pub async fn upload_cache(
 /// Best-effort for the same reason as the rollback below: the upload succeeded,
 /// so a failure here cannot be reported to the runner without lying about the
 /// cache it just stored. What stays behind is waste, not loss.
-async fn discard_replaced_cache_file(
-    path: &std::path::Path,
-    repo_id: i64,
-    job_id: i64,
-    key: &str,
-) {
+async fn discard_replaced_cache_file(path: &std::path::Path, repo_id: i64, job_id: i64, key: &str) {
     match tokio::fs::remove_file(path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1323,10 +1318,7 @@ fn cache_key_header(headers: &HeaderMap) -> Result<&str, AppError> {
 
 /// Where one repository's cache archives live.
 fn cache_archive_dir(state: &AppState, repo_id: i64) -> std::path::PathBuf {
-    state
-        .repo_root
-        .join("_ci_cache")
-        .join(repo_id.to_string())
+    state.repo_root.join("_ci_cache").join(repo_id.to_string())
 }
 
 /// Resolve the archive a cache row names, inside `directory` and nowhere else.

@@ -131,19 +131,16 @@ async fn an_undecodable_check_list_does_not_open_the_gate() {
     // migration or a hand-edited row leaves behind.
     set_checks(&db, repo_id, "'{\"build\": true}'").await;
 
-    let error = rg_core::branch_protection::service::check_merge_allowed(
-        &db, repo_id, "main", pr_id,
-    )
-    .await
-    .expect_err("a rule the server cannot read must not be treated as no rule");
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("a rule the server cannot read must not be treated as no rule");
 
     // Not a `Forbidden`: a broken row of ours is not the caller being refused.
     // That distinction is what makes it a 5xx at the HTTP layer instead of a
     // 403 that blames the merger for our storage.
     assert!(
-        error
-            .downcast_ref::<rg_core::error::Forbidden>()
-            .is_none(),
+        error.downcast_ref::<rg_core::error::Forbidden>().is_none(),
         "an unreadable rule is our failure, not a policy refusal: {error:#}"
     );
     let chain = format!("{error:#}");
@@ -161,16 +158,13 @@ async fn a_readable_check_list_reaches_the_pipeline_check_and_refuses() {
     let directory = tempfile::tempdir().expect("temp dir");
     let (db, repo_id, pr_id) = setup(directory.path()).await;
 
-    let error = rg_core::branch_protection::service::check_merge_allowed(
-        &db, repo_id, "main", pr_id,
-    )
-    .await
-    .expect_err("no pipeline has run for the head commit, so the gate holds");
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("no pipeline has run for the head commit, so the gate holds");
 
     assert!(
-        error
-            .downcast_ref::<rg_core::error::Forbidden>()
-            .is_some(),
+        error.downcast_ref::<rg_core::error::Forbidden>().is_some(),
         "a rule the server can read and the PR fails is a policy refusal: {error:#}"
     );
     assert!(

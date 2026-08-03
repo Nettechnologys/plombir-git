@@ -101,9 +101,7 @@ pub async fn create_label(
 /// The name is echoed because the caller just sent it; nothing else from the
 /// database reaches the client, so no constraint or `db:` text leaks (H-05).
 fn label_already_exists(name: &str) -> anyhow::Error {
-    crate::error::conflict(format!(
-        "label '{name}' already exists in this repository"
-    ))
+    crate::error::conflict(format!("label '{name}' already exists in this repository"))
 }
 
 /// Update an existing label.

@@ -158,9 +158,7 @@ async fn concurrent_board_deletions_confirm_exactly_one_deletion() {
     let client = reqwest::Client::new();
 
     let created = client
-        .post(format!(
-            "{base}/api/v1/repos/boardracer/boardrace/boards"
-        ))
+        .post(format!("{base}/api/v1/repos/boardracer/boardrace/boards"))
         .bearer_auth(&owner)
         .json(&serde_json::json!({ "name": "raced" }))
         .send()
@@ -197,7 +195,9 @@ async fn concurrent_webhook_deletions_confirm_exactly_one_deletion() {
         .unwrap();
     assert_eq!(created.status(), 201, "create webhook");
     let created: serde_json::Value = created.json().await.unwrap();
-    let hook_id = created["id"].as_i64().expect("created webhook carries an id");
+    let hook_id = created["id"]
+        .as_i64()
+        .expect("created webhook carries an id");
 
     // 200 with `{"message": "webhook deleted"}` — the loser used to send that
     // sentence about a row it never touched.
@@ -233,7 +233,9 @@ async fn concurrent_sso_provider_deletions_confirm_exactly_one_deletion() {
         .unwrap();
     assert_eq!(created.status(), 201, "create SSO provider");
     let created: serde_json::Value = created.json().await.unwrap();
-    let provider_id = created["id"].as_i64().expect("created provider carries an id");
+    let provider_id = created["id"]
+        .as_i64()
+        .expect("created provider carries an id");
 
     // This one said it outright: `{"deleted": true}` from every racer.
     let statuses = race_deletes(

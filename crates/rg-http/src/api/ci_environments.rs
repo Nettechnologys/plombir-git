@@ -355,9 +355,7 @@ async fn authorize_approval(
         // rows disagreeing with each other. 409 puts it next to the branch
         // above — same request, same authorization, a state that admits no
         // approval — instead of telling the caller to fix a correct request.
-        None => {
-            return Err(AppError::conflict("job has no protected environment").into_response())
-        }
+        None => return Err(AppError::conflict("job has no protected environment").into_response()),
     };
     let environment = match environment_in_repo(state, repo.id, environment_id).await {
         // Gone, belonging to another repository, or no longer protected: the
@@ -368,9 +366,7 @@ async fn authorize_approval(
         // malformed.
         Ok(environment) if environment.protected => environment,
         Ok(_) | Err(AppError::NotFound(_)) => {
-            return Err(
-                AppError::conflict("protected environment no longer exists").into_response(),
-            )
+            return Err(AppError::conflict("protected environment no longer exists").into_response())
         }
         Err(error) => return Err(error.into_response()),
     };
