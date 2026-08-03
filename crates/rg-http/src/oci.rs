@@ -1491,7 +1491,9 @@ pub async fn chunk_upload(
     // Stream body to upload file
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
     match stream_body_to_file(body, &file_path).await {
-        Ok(total_size) => {
+        Ok(StagedWrite {
+            total: total_size, ..
+        }) => {
             // The `Range` below tells the client where to resume from. Reporting
             // it while the session row still holds the old offset hands the
             // client a position the server does not agree with, so a failed
@@ -1582,13 +1584,33 @@ pub async fn complete_upload(
     // If body is provided (single-chunk upload), stream it to the upload file first
     // Check by reading the first frame: if there's data, stream the rest
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
-    if let Err(e) = stream_body_to_file(body, &file_path).await {
-        return oci_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("{e:#}"),
-        );
-    }
+    let staged = match stream_body_to_file(body, &file_path).await {
+        Ok(staged) => staged,
+        Err(e) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{e:#}"),
+            );
+        }
+    };
+
+    // What the session says should be on disk, against what is. Every byte that
+    // reached the staging file came through a `PATCH` that recorded its new
+    // offset before answering, or through the append just above, so the two
+    // numbers are the same number on every push that works.
+    //
+    // They are not merely a sanity check. Finalizing hashes whatever the file
+    // holds, and a file holding something other than what the session received
+    // hashes to something other than the digest — which is indistinguishable,
+    // at the point where the error is classified, from a client that named the
+    // wrong digest for its layer. So the registry answered `400 digest invalid`
+    // for a staging file that had gone missing or been written twice: a failure
+    // of ours, reported as corrupt input, to a client that does not retry a
+    // `4xx`. Measured here rather than inferred later, because after the hash
+    // the evidence is gone.
+    let recorded = upload.bytes_uploaded;
+    let staged_is_accountable = staged.existed && staged.total == recorded + staged.written;
 
     // The repository the session was anchored to, not a second lookup that
     // could resolve — or create — a different one.
@@ -1676,6 +1698,45 @@ pub async fn complete_upload(
             )
                 .into_response()
         }
+        // A digest fault over bytes the session cannot account for is not the
+        // client's fault, whatever the error says. The client sent `recorded +
+        // written` bytes and the registry hashed something else, so the layer
+        // it named was never what got hashed — blaming the digest here is
+        // blaming the one party that did nothing wrong.
+        //
+        // Loud on both channels on purpose. The client gets a 5xx it will
+        // retry, and the operator gets the three numbers, because the reason
+        // the staging file diverged is not visible from inside this handler and
+        // the next occurrence is the only place it can be read off.
+        Err(e) if is_client_digest_fault(&e) && !staged_is_accountable => {
+            tracing::error!(
+                upload_uuid = %uuid,
+                staging_file = %file_path.display(),
+                staging_file_existed = staged.existed,
+                recorded_bytes = recorded,
+                appended_bytes = staged.written,
+                staged_bytes = staged.total,
+                error = %format!("{e:#}"),
+                "OCI blob finalize hashed a staging file that does not match its upload session; \
+                 answering 500 rather than blaming the client's digest"
+            );
+            oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!(
+                    "the staged upload does not match this session: it recorded {recorded} \
+                     byte(s), this request appended {}, and the staging file {} {} byte(s). \
+                     The digest cannot be blamed for bytes that changed behind the session: {e:#}",
+                    staged.written,
+                    if staged.existed {
+                        "held"
+                    } else {
+                        "was not there and was recreated holding"
+                    },
+                    staged.total,
+                ),
+            )
+        }
         // Finalizing fails for three unrelated reasons and only one of them is
         // the client's: a digest that does not match the bytes. An unreadable
         // staging file (`_oci_uploads/` gone or not writable) and a blob store
@@ -1698,14 +1759,38 @@ pub async fn complete_upload(
 
 // ── stream helper ──────────────────────────────────────────────
 
+/// What one append to a staging file did, and what it found there.
+///
+/// `total` alone was the whole return value, and it is the one number that
+/// cannot answer the question the caller has to ask: whether the bytes on disk
+/// are the bytes this session accounts for. A staging file that vanished
+/// between two requests and one that was written twice both come back with a
+/// `total` that reads perfectly well on its own — see the invariant in
+/// [`complete_upload`].
+struct StagedWrite {
+    /// Whether the staging file was already there when this request opened it.
+    ///
+    /// `POST .../blobs/uploads/` creates it empty, so by the time any other
+    /// handler touches it the answer is always `true` on a healthy instance.
+    /// A `false` here means the file went away under an open session.
+    existed: bool,
+    /// Bytes this request appended.
+    written: i64,
+    /// Size of the staging file after the append.
+    total: i64,
+}
+
 /// Stream an Axum `Body` to a file, appending to any existing content.
 /// Never buffers the entire body in memory—each frame is written directly.
-/// Returns the total file size after the write.
+/// Returns what the append did and what it found — see [`StagedWrite`].
 ///
 /// This is the write path of every `docker push`: the staging path is derived
 /// from `repo_root` plus a generated upload UUID, so a bare `?` on the io error
 /// hands the client an errno and nothing else. Every failure names the file.
-async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow::Result<i64> {
+async fn stream_body_to_file(
+    body: Body,
+    file_path: &std::path::Path,
+) -> anyhow::Result<StagedWrite> {
     let staged = |error: &std::io::Error| {
         rg_core::platform::fs::path_error(
             "OCI upload file",
@@ -1716,6 +1801,13 @@ async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow:
         )
     };
 
+    // Read before the open, not after: `create(true)` below is what makes the
+    // difference invisible, and it has to stay — a monolithic `PUT` with no
+    // preceding `PATCH` is a legal push, and on an instance whose staging tree
+    // was wiped the honest answer is still the one finalizing gives, not an
+    // errno from here.
+    let existed = tokio::fs::try_exists(file_path).await.unwrap_or(false);
+
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1725,11 +1817,13 @@ async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow:
 
     use futures::StreamExt;
     let mut stream = body.into_data_stream();
+    let mut written = 0_i64;
     while let Some(chunk) = stream.next().await {
         let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
         file.write_all(&data)
             .await
             .map_err(|error| staged(&error))?;
+        written += data.len() as i64;
     }
 
     // `tokio::fs::File` buffers, and `write_all` returns once the bytes are
@@ -1741,8 +1835,12 @@ async fn stream_body_to_file(body: Body, file_path: &std::path::Path) -> anyhow:
     // it already sent, and the push dies at the digest — as the client's fault.
     file.flush().await.map_err(|error| staged(&error))?;
 
-    let size = file.metadata().await.map_err(|error| staged(&error))?.len() as i64;
-    Ok(size)
+    let total = file.metadata().await.map_err(|error| staged(&error))?.len() as i64;
+    Ok(StagedWrite {
+        existed,
+        written,
+        total,
+    })
 }
 
 // ── DB helpers ────────────────────────────────────────────────

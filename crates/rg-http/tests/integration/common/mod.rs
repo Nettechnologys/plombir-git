@@ -651,3 +651,28 @@ pub async fn seed_artifact(
         .as_i64()
         .expect("artifact id")
 }
+
+/// Assert a blob finalize answered `201`, and say what it answered instead.
+///
+/// A bare `assert_eq!(status, 201)` is how this suite reported three separate
+/// flaky reds, in three different test files, over three days: `left: 400,
+/// right: 201`, and not one word about *why* the registry refused. The registry
+/// puts the reason in the body — a digest mismatch names both digests and the
+/// staged byte count — and a helper that drops the body is why the failure had
+/// to be reproduced before it could be read at all (card_c03bd9e96a66).
+///
+/// Shared rather than fixed per file for the same reason: the flake moved
+/// between test files twice, so a message improved in one of them would have
+/// gone quiet the next time it moved.
+#[allow(dead_code)]
+pub async fn assert_blob_push_created(finish: reqwest::Response, payload_len: usize) {
+    let status = finish.status();
+    if status == reqwest::StatusCode::CREATED {
+        return;
+    }
+    let body = finish.text().await.unwrap_or_default();
+    panic!(
+        "blob push failed: expected 201, got {status} for a {payload_len}-byte payload; \
+         body: {body}"
+    );
+}

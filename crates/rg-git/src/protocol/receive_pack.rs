@@ -851,7 +851,7 @@ mod rejection_pattern_tests {
         let output = |status: &str| crate::cli_gateway::GitOutput {
             stdout: format!("{status}\n").into_bytes(),
             stderr: Vec::new(),
-            status: success_status.clone(),
+            status: success_status,
             command: "git log --format=%G? -1 fixture".into(),
         };
 

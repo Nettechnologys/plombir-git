@@ -290,7 +290,7 @@ async fn a_created_blob_is_retrievable_right_after_the_push() {
         .send()
         .await
         .unwrap();
-    assert_eq!(finish.status(), 201, "complete upload failed");
+    crate::common::assert_blob_push_created(finish, payload.len()).await;
 
     // The invariant: whatever the push claimed, the blob must now be there.
     let head = client

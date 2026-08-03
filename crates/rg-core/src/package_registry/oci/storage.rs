@@ -129,11 +129,21 @@ async fn stage_directory(what: &str, live: &Path, aside: &Path) -> anyhow::Resul
 /// all three look alike, so the HTTP layer had nothing to classify on and
 /// answered `400 DIGEST_INVALID` to every one of them. The distinction has to
 /// travel inside the error, which is what this type is for.
+///
+/// The size travels with it because the two are read together and only one of
+/// them is in the message otherwise. `digest mismatch: expected X, got Y` is
+/// true of a layer that arrived corrupt, of one that arrived twice, and of a
+/// staging file that is no longer there at all — three different problems, one
+/// of which is not the client's. The byte count is what tells them apart, and
+/// it is the only part of the reply a `docker push` operator can compare
+/// against the layer they pushed.
 #[derive(Debug, thiserror::Error)]
-#[error("digest mismatch: expected {expected}, got {actual}")]
+#[error("digest mismatch: expected {expected}, got {actual} over {staged_bytes} staged byte(s)")]
 pub struct DigestMismatch {
     pub expected: String,
     pub actual: String,
+    /// How many bytes the staging file held when it was hashed.
+    pub staged_bytes: i64,
 }
 
 /// The digest string itself is not a well-formed `sha256:<64 hex digits>`.
@@ -721,6 +731,7 @@ impl OciStorage {
             return Err(DigestMismatch {
                 expected: expected_digest.to_string(),
                 actual,
+                staged_bytes: size,
             }
             .into());
         }
@@ -785,6 +796,7 @@ fn verify_digest(expected: &str, data: &[u8]) -> anyhow::Result<()> {
         return Err(DigestMismatch {
             expected: expected.to_string(),
             actual,
+            staged_bytes: data.len() as i64,
         }
         .into());
     }

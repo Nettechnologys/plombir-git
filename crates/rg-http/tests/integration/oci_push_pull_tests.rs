@@ -58,7 +58,7 @@ async fn push_blob(base: &str, token: &str, owner: &str, repo: &str, payload: &[
         .send()
         .await
         .unwrap();
-    assert_eq!(finish.status(), 201, "complete upload failed");
+    crate::common::assert_blob_push_created(finish, payload.len()).await;
 
     digest
 }

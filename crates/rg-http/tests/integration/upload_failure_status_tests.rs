@@ -234,3 +234,168 @@ async fn blob_mount_separates_a_missing_source_from_an_unreachable_store() {
         "a blob store that cannot answer the existence check is not a missing source blob"
     );
 }
+
+/// A staging file that disappeared under an open session is not a bad digest.
+///
+/// Finalizing hashes whatever the staging file holds and compares that to the
+/// digest the client named. Those are two different claims — "the bytes you
+/// sent do not hash to this" and "the bytes you sent are not the bytes I
+/// hashed" — and the second one is ours. The registry could not tell them
+/// apart: the finalize handler opens the staging file with `create(true)`, so a
+/// file that had gone missing came back as an empty one, hashed to the digest
+/// of nothing, and the client was told `400 digest invalid` for a layer it had
+/// uploaded correctly. `docker push` does not retry a `4xx`.
+///
+/// The session row is the witness. It records how many bytes each `PATCH`
+/// delivered, so a staging file holding anything other than that — nothing at
+/// all here, a doubled body elsewhere — is a divergence the client had no part
+/// in (card_c03bd9e96a66).
+#[tokio::test]
+async fn a_finalize_over_a_vanished_staging_file_is_not_the_client_s_digest() {
+    let (base, _repo_root, oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "stage_blame", "stage_blame@example.com").await;
+    create_repo(&base, &token, "blamed-layer").await;
+
+    let payload = b"forgekeep-staged-layer";
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
+    );
+
+    let start = client
+        .post(format!("{base}/v2/stage_blame/blamed-layer/blobs/uploads/"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 202, "start upload failed");
+    let location = start
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("start upload must return a Location")
+        .to_string();
+    let uuid = location.rsplit('/').next().expect("uuid in Location");
+
+    let chunk = client
+        .patch(format!("{base}{location}"))
+        .bearer_auth(&token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk.status(), 202, "chunk upload failed");
+
+    // The failure this reproduces, made deterministic: whatever removes the
+    // staged bytes in the wild — an operator, a stray cleanup, a volume that
+    // came back empty — the session row still says they arrived.
+    //
+    // The *file* goes and the directory stays, which is the whole point. With
+    // the directory gone too, `create(true)` fails on the missing parent and
+    // the registry already answered honestly; it is the file alone that
+    // `create(true)` silently invents, turning a lost upload into an empty one
+    // and an empty one into the client's bad digest.
+    let staged = oci_root
+        .join("oci-uploads")
+        .join("stage_blame")
+        .join("blamed-layer")
+        .join(uuid)
+        .join("data");
+    assert!(
+        staged.is_file(),
+        "the fixture did not find the staging file at {}",
+        staged.display()
+    );
+    std::fs::remove_file(&staged).expect("remove the staged bytes");
+
+    let finish = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let status = finish.status();
+    let body = finish.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 500,
+        "a staging file the registry lost is the registry's failure, not a bad digest: {body}"
+    );
+    assert!(
+        body.contains(&payload.len().to_string()),
+        "the failure must name what the session recorded, or the next occurrence is \
+         unreadable again: {body}"
+    );
+}
+
+/// The client's own bad digest still answers `400`, and now says how much it
+/// hashed.
+///
+/// The other half of the split above: strengthening the server-side branch is
+/// only worth anything if the client-side one still fires. A push whose bytes
+/// really do not match the digest it named is the one case where `400 digest
+/// invalid` is the honest answer — and the staged byte count in the message is
+/// what lets an operator tell a corrupt layer from a truncated one without
+/// reproducing anything.
+#[tokio::test]
+async fn a_digest_the_client_got_wrong_is_still_the_client_s() {
+    let (base, _repo_root, _oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "wrong_digest", "wrong_digest@example.com").await;
+    create_repo(&base, &token, "mismatched-layer").await;
+
+    let payload = b"forgekeep-honest-layer";
+    // A well-formed digest of something else entirely.
+    let claimed = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"not what was sent"))
+    );
+
+    let start = client
+        .post(format!(
+            "{base}/v2/wrong_digest/mismatched-layer/blobs/uploads/"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 202, "start upload failed");
+    let location = start
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("start upload must return a Location")
+        .to_string();
+
+    let chunk = client
+        .patch(format!("{base}{location}"))
+        .bearer_auth(&token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk.status(), 202, "chunk upload failed");
+
+    let finish = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", claimed.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let status = finish.status();
+    let body = finish.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 400,
+        "a digest that does not match the bytes sent is the client's: {body}"
+    );
+    assert!(
+        body.contains("DIGEST_INVALID"),
+        "the client's own bad digest keeps its OCI code: {body}"
+    );
+    assert!(
+        body.contains(&format!("{} staged byte", payload.len())),
+        "the mismatch must say how many bytes it hashed: {body}"
+    );
+}

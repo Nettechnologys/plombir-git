@@ -239,11 +239,7 @@ async fn a_finalize_elsewhere_cannot_delete_another_repositorys_session() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        finish.status(),
-        201,
-        "the owner's own finalize must succeed"
-    );
+    crate::common::assert_blob_push_created(finish, payload.len()).await;
     assert_eq!(
         session_bytes(&db, &victim_uuid).await,
         None,

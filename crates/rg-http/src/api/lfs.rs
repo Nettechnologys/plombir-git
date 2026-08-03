@@ -712,6 +712,22 @@ async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Resul
         written += data.len();
     }
 
+    // `tokio::fs::File` buffers: `write_all` returns once the bytes are queued
+    // for the blocking pool, not once they are in the file, and dropping the
+    // handle does not wait for that queue either. The caller hands this path
+    // straight to `store_object_from_file`, which opens it with `std::fs` and
+    // compresses whatever is there — so under load the object that reaches
+    // blob storage is the upload minus however much had not landed yet, while
+    // `written` (counted here, in memory) says the whole thing arrived.
+    //
+    // Nothing downstream would notice. The row records `written` as the
+    // object's size, the upload answers `200`, and LFS never hashes the bytes
+    // against the `oid` they are filed under, so a truncated object is
+    // indistinguishable from a good one until somebody clones. The same
+    // missing `flush` cost the OCI registry a three-day flake, where it was at
+    // least loud (`sol_07eb75f8fb62`).
+    file.flush().await.map_err(|error| staged(&error))?;
+
     Ok(written)
 }
 
