@@ -1526,6 +1526,21 @@ async fn probe(
     drive(fx, fact, persona, &fill(&fact.path, repo, org)).await
 }
 
+/// A minimal valid JSON body for routes whose handler must be reached to make
+/// the access decision. Keeping these with the sweep rather than quarantining
+/// the routes means a public outsider still proves the manual widening rejects
+/// them.
+fn access_body(fact: &RouteFact) -> serde_json::Value {
+    match fact.handler {
+        "rg_http::api::reviews::set_thread_resolution" => serde_json::json!({"resolved": true}),
+        "rg_http::api::reviews::apply_review_suggestions" => {
+            serde_json::json!({"comment_ids": []})
+        }
+        "rg_http::api::reviews::request_reviewer" => serde_json::json!({"username": OWNER}),
+        _ => serde_json::json!({}),
+    }
+}
+
 /// [`probe`] with the path already filled — for the anchored routes, whose
 /// placeholder [`fill`] cannot fill (see [`fill_anchored`]).
 async fn drive(fx: &Fixture, fact: &RouteFact, persona: Persona, path: &str) -> Answer {
@@ -1543,12 +1558,13 @@ async fn drive(fx: &Fixture, fact: &RouteFact, persona: Persona, path: &str) -> 
         req = req.bearer_auth(token);
     }
     if matches!(fact.method, "POST" | "PUT" | "PATCH") {
-        // An empty JSON object. Whether it satisfies the handler's schema is
-        // beside the point: the access gate is a `FromRequestParts` extractor,
-        // so it runs *before* the body is looked at. A route that answers a
-        // body-shape complaint to an anonymous caller has its gate in the wrong
-        // place — see `EXTRACTOR_BEFORE_GATE`.
-        req = req.json(&serde_json::json!({}));
+        // Most handlers have a `FromRequestParts` gate, so `{}` is enough: it
+        // runs before the body is looked at. The three signed-off PR-review
+        // widenings take `RepoAuthRead` and decide their remaining write rule
+        // in the handler, so they need valid input to reach that decision.
+        // A route that answers a body-shape complaint to an anonymous caller
+        // has its gate in the wrong place — see `EXTRACTOR_BEFORE_GATE`.
+        req = req.json(&access_body(fact));
     }
     let resp = req.send().await.expect("sweep request");
     let status = resp.status();

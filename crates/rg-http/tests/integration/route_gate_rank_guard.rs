@@ -173,7 +173,7 @@ const NON_REPO: &[(&str, &[&str])] = &[
 /// list cannot rot into a blanket allowance for a handler somebody later
 /// weakened for an entirely different reason.
 ///
-/// All eight name a row-specific exception to the ordinary `RepoWrite`
+/// All eleven name a row-specific exception to the ordinary `RepoWrite`
 /// contract. The row declares what an *arbitrary* caller needs — that is what a
 /// contract states, and what the persona sweep measures a stranger against.
 /// The handler takes `RepoAuthRead`, the floor for everybody, then resolves the
@@ -233,6 +233,27 @@ const SIGNED_OFF: &[(&str, &str, Rank, &str)] = &[
         Rank::AuthRead,
         "applying a suggestion mutates the PR head, so `require_suggestion_source` holds the \
          caller to write access on that source repository",
+    ),
+    (
+        "api::reviews::set_thread_resolution",
+        "RepoWrite",
+        Rank::AuthRead,
+        "the thread author or PR author may resolve a thread; any other caller is held to \
+         `may_write`",
+    ),
+    (
+        "api::reviews::apply_review_suggestions",
+        "RepoWrite",
+        Rank::AuthRead,
+        "applying suggestions mutates the PR head, so `require_suggestion_source` holds the \
+         caller to write access on that source repository, which can differ from the URL repository",
+    ),
+    (
+        "api::reviews::request_reviewer",
+        "RepoWrite",
+        Rank::AuthRead,
+        "the PR author may manage its reviewers; any other caller is held to `may_write` by \
+         `require_pr_manager`",
     ),
 ];
 

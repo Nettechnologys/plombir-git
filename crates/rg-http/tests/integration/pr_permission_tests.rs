@@ -235,6 +235,62 @@ async fn reviewer_requests_and_thread_resolution_enforce_permissions() {
     }
 }
 
+/// A fork PR is addressed through its target repository, but applying a batch
+/// of suggestions writes to its head repository. The source writer must keep
+/// this widening even without write access to the target.
+#[tokio::test]
+async fn batch_suggestions_accept_the_pr_source_writer_without_target_write() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (target_token, target_id) =
+        register_full(&base, "suggestion-target", "suggestion-target@example.com").await;
+    let (source_token, _source_id) =
+        register_full(&base, "suggestion-source", "suggestion-source@example.com").await;
+    let target_repo_id =
+        create_repo_with_visibility(&base, &target_token, "suggestion-target", false).await;
+    let source_repo_id =
+        create_repo_with_visibility(&base, &source_token, "suggestion-source", true).await;
+    let pr = insert_pr(&db, target_repo_id, target_id, 1).await;
+    let mut active: rg_db::entities::pull_request::ActiveModel = pr.into();
+    active.head_repo_id = Set(Some(source_repo_id));
+    rg_db::ops::pull_request_ops::update(&db, active)
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let reviewers_url =
+        format!("{base}/api/v1/repos/suggestion-target/suggestion-target/pulls/1/reviewers");
+    let no_target_write = client
+        .post(&reviewers_url)
+        .bearer_auth(&source_token)
+        .json(&serde_json::json!({"username": "suggestion-source"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_target_write.status(),
+        403,
+        "the source owner is not a writer of the target repository"
+    );
+
+    let batch = client
+        .post(format!(
+            "{base}/api/v1/repos/suggestion-target/suggestion-target/pulls/1/suggestions/apply"
+        ))
+        .bearer_auth(&source_token)
+        .json(&serde_json::json!({"comment_ids": []}))
+        .send()
+        .await
+        .unwrap();
+    let status = batch.status();
+    let body = batch.text().await.unwrap();
+    assert_eq!(
+        status,
+        400,
+        "a source writer reaches suggestion validation instead of being rejected as a target outsider: {body}"
+    );
+    assert!(body.contains("between 1 and 100 suggestions"), "{body}");
+}
+
 async fn insert_pr(
     db: &sea_orm::DatabaseConnection,
     repo_id: i64,
