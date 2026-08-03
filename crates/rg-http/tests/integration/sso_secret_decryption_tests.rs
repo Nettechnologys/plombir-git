@@ -36,6 +36,26 @@ async fn token(Form(_form): Form<HashMap<String, String>>) -> Json<serde_json::V
     }))
 }
 
+/// The subject the seeded OAuth link already points at, so the baseline
+/// callback completes a login instead of provisioning one.
+///
+/// The mock used to serve no `/userinfo` at all, which made the baseline
+/// callback a `404` from the provider — dressed up as `400 failed to fetch
+/// user info` by the handler of the day. The assertion below ("must not fail on
+/// the server's side") passed on that `400` and therefore proved nothing about
+/// the secret: the control never got as far as reading one. Once an unanswered
+/// provider became the `502` it is (card_1a7da084c197), the hollow control
+/// showed up as a failure. It is a real login now.
+async fn userinfo() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "sub": "subject-1",
+        "preferred_username": "sso-secret",
+        "email": "sso-secret@example.test",
+        "email_verified": true,
+        "name": "SSO Secret"
+    }))
+}
+
 struct Harness {
     db: sea_orm::DatabaseConnection,
     base: String,
@@ -71,7 +91,8 @@ impl Harness {
                     }
                 }),
             )
-            .route("/token", post(token));
+            .route("/token", post(token))
+            .route("/userinfo", get(userinfo));
         let idp_server = tokio::spawn(async move {
             axum::serve(idp_listener, idp_app).await.unwrap();
         });
@@ -234,9 +255,12 @@ async fn every_sso_door_answers_an_unreadable_client_secret_the_same_way() {
         "the replayed cookies must carry the callback past the CSRF check — otherwise \
          the 5xx asserted below would prove nothing about the secret"
     );
-    assert!(
-        !baseline_callback.status().is_server_error(),
-        "a provider without a stored secret must not fail on the server's side: {}",
+    assert_eq!(
+        baseline_callback.status(),
+        307,
+        "a provider without a stored secret must not merely avoid a 5xx — it must complete \
+         the login, or the 5xx asserted below is measured against a control that never \
+         reached the secret: {}",
         baseline_callback.status()
     );
     let baseline_refresh = app.refresh().await;

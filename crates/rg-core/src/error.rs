@@ -201,3 +201,44 @@ impl Forbidden {
 pub fn forbidden(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(Forbidden::new(message))
 }
+
+/// A host this instance does not own failed to answer.
+///
+/// The fifth member of the family, and the one the others cannot express: an
+/// identity provider that times out, an upstream registry that answers `503`,
+/// a token endpoint whose TLS handshake fails. None of that is
+/// [`InvalidRequest`] — the request was fine and no edit to it can help — and
+/// none of it is a bug of ours that [`InternalError`](crate) would name. The
+/// SSO callback used to answer `400 failed to fetch user info` to a GitHub
+/// outage, which tells the person signing in to fix a request that was never
+/// wrong and tells every retry layer in between not to bother trying again.
+///
+/// Attach it as `anyhow` **context** over the transport error rather than in
+/// place of it, so the operator log keeps the underlying cause:
+///
+/// ```rust,ignore
+/// anyhow::Error::new(transport_error)
+///     .context(UpstreamUnavailable::new("the github provider did not answer"))
+/// ```
+///
+/// Unlike the four types above, this message does **not** reach the client:
+/// the HTTP layer renders it as a fixed `502` body and keeps the detail in the
+/// log, so it may name the provider, the endpoint, or the stage that failed.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct UpstreamUnavailable {
+    pub message: String,
+}
+
+impl UpstreamUnavailable {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Shorthand for the `anyhow` form of [`UpstreamUnavailable`].
+pub fn upstream_unavailable(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UpstreamUnavailable::new(message))
+}

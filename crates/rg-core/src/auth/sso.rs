@@ -22,7 +22,7 @@
 //! redirect ban are the parts of the hardening that apply regardless of trust
 //! boundary.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
 use serde::Deserialize;
@@ -312,6 +312,53 @@ pub async fn oauth2_authorize_url(config: &SsoProviderConfig) -> Result<(String,
     Ok((url, csrf_state, code_verifier))
 }
 
+// ── Talking to a host we do not own ──────────────────────────────
+
+/// Tag a failed call to an identity provider as *its* failure.
+///
+/// Every request in this module goes to a host this instance does not own, and
+/// none of them can be fixed by the person signing in: a DNS failure, a
+/// connect timeout, a provider `500` and a truncated body are all "we could not
+/// ask", not "your request is wrong". Flattened into a bare `anyhow::Error`
+/// they were indistinguishable from a genuine client fault, and the SSO
+/// callback answered `400` to all of them.
+///
+/// The marker is layered as *context* over the transport error, so the operator
+/// log still gets the underlying reqwest cause under `{:#}` — see
+/// [`crate::error::UpstreamUnavailable`].
+trait ProviderCall<T> {
+    fn provider_call(self, what: &str) -> Result<T>;
+}
+
+impl<T> ProviderCall<T> for std::result::Result<T, reqwest::Error> {
+    fn provider_call(self, what: &str) -> Result<T> {
+        self.map_err(|error| {
+            anyhow::Error::new(error).context(crate::error::UpstreamUnavailable::new(what))
+        })
+    }
+}
+
+/// Classify an error status from a provider's **token** endpoint.
+///
+/// The one place where a provider's refusal really can be the caller's doing:
+/// an authorization code that has expired or was already redeemed comes back
+/// as a `4xx`, and starting the login again is exactly the right remedy — so
+/// that stays a `400`. A `429`, a `5xx`, no answer at all or an unparseable
+/// body is the provider failing, and telling the client to fix its request
+/// there is both wrong and un-retryable.
+fn token_endpoint_error(what: &str, error: reqwest::Error) -> anyhow::Error {
+    match error.status() {
+        Some(status)
+            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            anyhow::Error::new(error).context(crate::error::InvalidRequest::new(
+                "the identity provider rejected the authorization grant; start the sign-in again",
+            ))
+        }
+        _ => anyhow::Error::new(error).context(crate::error::UpstreamUnavailable::new(what)),
+    }
+}
+
 // ── Token exchange with PKCE ─────────────────────────────────────
 
 /// Exchange authorization code for tokens. Supports PKCE code_verifier.
@@ -353,14 +400,14 @@ pub async fn oauth2_exchange_code(
         .header("Accept", "application/json")
         .send()
         .await
-        .context("failed to exchange OAuth2 code")?;
+        .provider_call("failed to exchange OAuth2 code")?;
 
     let raw: RawTokenResponse = resp
         .error_for_status()
-        .context("OAuth2 token endpoint returned an error")?
+        .map_err(|error| token_endpoint_error("OAuth2 token endpoint returned an error", error))?
         .json()
         .await
-        .context("failed to parse token response")?;
+        .provider_call("failed to parse the token response")?;
 
     Ok(OAuth2TokenResponse {
         access_token: raw.access_token,
@@ -406,14 +453,14 @@ pub async fn oauth2_refresh_token(
         .header("Accept", "application/json")
         .send()
         .await
-        .context("failed to refresh OAuth2 token")?;
+        .provider_call("failed to refresh OAuth2 token")?;
 
     let raw: RawTokenResponse = resp
         .error_for_status()
-        .context("OAuth2 token endpoint returned an error")?
+        .map_err(|error| token_endpoint_error("OAuth2 token endpoint returned an error", error))?
         .json()
         .await
-        .context("failed to parse token refresh response")?;
+        .provider_call("failed to parse the token refresh response")?;
 
     Ok(OAuth2TokenResponse {
         access_token: raw.access_token,
@@ -465,7 +512,7 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
-        .context("GitHub user API request failed")?;
+        .provider_call("GitHub user API request failed")?;
 
     // Without this, a refusal is parsed as a profile: GitHub answers `401` with
     // a JSON body, `user["id"]` is simply absent in it, and the login used to
@@ -473,10 +520,10 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
     // the person at a scope when the token was the problem.
     let user: serde_json::Value = user_resp
         .error_for_status()
-        .context("GitHub user API returned an error")?
+        .provider_call("GitHub user API returned an error")?
         .json()
         .await
-        .context("failed to parse GitHub user response")?;
+        .provider_call("failed to parse the GitHub user response")?;
 
     let provider_user_id = user["id"]
         .as_i64()
@@ -535,7 +582,7 @@ async fn fetch_github_email(
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
-        .context("GitHub user emails API request failed")?;
+        .provider_call("GitHub user emails API request failed")?;
 
     // An OAuth app without the `user:email` scope is refused here rather than
     // told the list is empty. That is an *answer* — the deployment never asked
@@ -554,10 +601,10 @@ async fn fetch_github_email(
 
     let emails: Vec<serde_json::Value> = resp
         .error_for_status()
-        .context("GitHub user emails API returned an error")?
+        .provider_call("GitHub user emails API returned an error")?
         .json()
         .await
-        .context("failed to parse the GitHub user emails response")?;
+        .provider_call("failed to parse the GitHub user emails response")?;
 
     for email in &emails {
         let primary = email["primary"].as_bool().unwrap_or(false);
@@ -585,17 +632,17 @@ async fn fetch_gitlab_user(access_token: &str) -> Result<SsoUserInfo> {
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
-        .context("GitLab user API request failed")?;
+        .provider_call("GitLab user API request failed")?;
 
     // Same reason as the GitHub profile fetch: an error body parses as a
     // profile with every field missing, and the identity gate then reports the
     // provider's refusal as a provider that named nobody.
     let user: serde_json::Value = resp
         .error_for_status()
-        .context("GitLab user API returned an error")?
+        .provider_call("GitLab user API returned an error")?
         .json()
         .await
-        .context("failed to parse GitLab user response")?;
+        .provider_call("failed to parse the GitLab user response")?;
 
     Ok(SsoUserInfo {
         provider_user_id: user["id"]
@@ -620,14 +667,14 @@ async fn fetch_google_user(access_token: &str) -> Result<SsoUserInfo> {
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
-        .context("Google userinfo API request failed")?;
+        .provider_call("Google userinfo API request failed")?;
 
     let user: serde_json::Value = resp
         .error_for_status()
-        .context("Google userinfo API returned an error")?
+        .provider_call("Google userinfo API returned an error")?
         .json()
         .await
-        .context("failed to parse Google userinfo response")?;
+        .provider_call("failed to parse the Google userinfo response")?;
 
     Ok(SsoUserInfo {
         provider_user_id: user["sub"].as_str().unwrap_or_default().to_string(),
@@ -658,12 +705,12 @@ async fn fetch_oidc_userinfo(
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
-        .context("OIDC userinfo request failed")?
+        .provider_call("OIDC userinfo request failed")?
         .error_for_status()
-        .context("OIDC userinfo endpoint returned an error")?
+        .provider_call("OIDC userinfo endpoint returned an error")?
         .json::<serde_json::Value>()
         .await
-        .context("failed to parse OIDC userinfo response")?;
+        .provider_call("failed to parse the OIDC userinfo response")?;
 
     Ok(SsoUserInfo {
         provider_user_id: user["sub"].as_str().unwrap_or_default().to_string(),
@@ -696,12 +743,12 @@ async fn resolve_oidc_endpoints(config: &SsoProviderConfig) -> Result<OidcEndpoi
             .get(discovery_url)
             .send()
             .await
-            .context("OIDC discovery request failed")?
+            .provider_call("OIDC discovery request failed")?
             .error_for_status()
-            .context("OIDC discovery endpoint returned an error")?
+            .provider_call("OIDC discovery endpoint returned an error")?
             .json::<OidcEndpoints>()
             .await
-            .context("failed to parse OIDC discovery document");
+            .provider_call("failed to parse the OIDC discovery document");
     }
 
     if config.slug == "google" {

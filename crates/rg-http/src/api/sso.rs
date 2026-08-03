@@ -437,19 +437,29 @@ pub async fn callback(
     let config = provider_config(&provider, &enc_key, redirect_url)?;
 
     // ── Exchange code for tokens (with PKCE) ─────────────────────
+    // Same split as `sso_user_info_error`: a provider that refuses the grant
+    // (an expired or already-redeemed `code`) is the one failure here the
+    // person signing in can act on, and `rg_core` marks exactly that case as an
+    // `InvalidRequest` → `400`. A token endpoint that timed out or answered
+    // `5xx` is marked `UpstreamUnavailable` → `502`; flattening both into
+    // `bad_request` told the client to fix a request that was already correct.
     let token_response =
         rg_core::auth::sso::oauth2_exchange_code(&config, &query.code, &code_verifier)
             .await
-            .map_err(|e| {
-                tracing::error!("SSO token exchange error: {}", e);
-                AppError::bad_request("failed to exchange authorization code")
+            .map_err(|error| {
+                tracing::error!(
+                    provider = %provider.slug,
+                    error = %format!("{error:#}"),
+                    "failed to exchange authorization code"
+                );
+                AppError::from(error)
             })?;
 
     // ── Fetch user info ──────────────────────────────────────────
     let user_info =
         rg_core::auth::sso::oauth2_fetch_user_info(&config, &token_response.access_token)
             .await
-            .map_err(|error| sso_user_info_error(&provider.slug, &error))?;
+            .map_err(|error| sso_user_info_error(&provider.slug, error))?;
 
     // ── Find or create user ──────────────────────────────────────
     let user_id = find_or_create_sso_user(&state, &provider, &user_info, &token_response).await?;
@@ -600,11 +610,20 @@ pub async fn refresh_token(
         })?
     };
 
+    // The same classification as the callback's exchange, and for the same
+    // reason: leaving this door on a blanket `bad_request` is how the two
+    // halves of one flow end up disagreeing about whose fault an outage is. A
+    // provider that refuses the refresh grant (revoked token) is a `400`; a
+    // provider that did not answer is a `502`.
     let token_response = rg_core::auth::sso::oauth2_refresh_token(&config, &refresh_token)
         .await
-        .map_err(|e| {
-            tracing::error!("SSO token refresh error: {}", e);
-            AppError::bad_request("failed to refresh token")
+        .map_err(|error| {
+            tracing::error!(
+                provider = %slug,
+                error = %format!("{error:#}"),
+                "failed to refresh token"
+            );
+            AppError::from(error)
         })?;
 
     store_refreshed_oauth_tokens(
@@ -726,11 +745,23 @@ pub async fn unlink_oauth_account(
 /// Classify a failed user-info fetch.
 ///
 /// "The provider is unreachable" and "the provider answered, and its answer
-/// identifies nobody" are two different things to whoever is signing in: the
-/// first is ours to fix, the second is theirs, and the fix (grant the
-/// `user:email` scope, confirm the address) is only actionable if we say which
-/// one it was. Both are still `400` — the request is what cannot proceed.
-fn sso_user_info_error(provider_slug: &str, error: &anyhow::Error) -> AppError {
+/// identifies nobody" are two different things to whoever is signing in, and
+/// they are not even the same *kind* of answer:
+///
+/// * The profile that identifies nobody is a `400` with the reason, because the
+///   fix (grant the `user:email` scope, confirm the address) is on that side and
+///   is only actionable if we say which defect it was.
+/// * The provider that did not answer is **not** the client's fault. It used to
+///   be a `400` too — "the request is what cannot proceed" — which tells the
+///   person signing in to correct a request that was never wrong, and tells
+///   every retry layer between us and them that retrying is pointless. It is a
+///   `502` now: `AppError::from` routes the `UpstreamUnavailable` marker
+///   `rg_core::auth::sso` attaches to every failed provider call.
+///
+/// Anything that is neither — an unsupported provider slug, say — is a
+/// misconfiguration of ours and falls through to a `500`, which is where an
+/// operator should be looking for it.
+fn sso_user_info_error(provider_slug: &str, error: anyhow::Error) -> AppError {
     if let Some(defect) = error.downcast_ref::<rg_core::auth::sso::SsoIdentityDefect>() {
         tracing::warn!(
             provider = %provider_slug,
@@ -743,9 +774,9 @@ fn sso_user_info_error(provider_slug: &str, error: &anyhow::Error) -> AppError {
     tracing::error!(
         provider = %provider_slug,
         error = %format!("{error:#}"),
-        "SSO user info error"
+        "failed to fetch user info"
     );
-    AppError::bad_request("failed to fetch user info")
+    AppError::from(error)
 }
 
 /// Turn a refused first-login provisioning into the answer the person signing

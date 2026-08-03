@@ -81,6 +81,13 @@ pub enum AppError {
     Gone(String),
     #[error("{0}")]
     TooManyRequests(String),
+    /// 502 — a host this instance does not own failed to answer: an identity
+    /// provider that timed out, an upstream API that returned a `5xx`. The
+    /// request was well-formed and no edit to it can help, so it must not be
+    /// a `4xx`; and it is not our bug, so `500` would send the operator
+    /// looking in the wrong process.
+    #[error("{0}")]
+    BadGateway(String),
     /// 503 — a required downstream dependency (the database) is unreachable.
     /// A transient, retryable outage, not a logic error: load balancers and
     /// clients should retry rather than treat it as a fatal 500.
@@ -106,6 +113,7 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::Gone(_) => "GONE",
             Self::TooManyRequests(_) => "RATE_LIMITED",
+            Self::BadGateway(_) => "UPSTREAM_ERROR",
             Self::ServiceUnavailable(_) => "DB_UNAVAILABLE",
             Self::Timeout(_) => "GIT_TIMEOUT",
             Self::InternalError(_) => "INTERNAL_ERROR",
@@ -122,6 +130,7 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -142,6 +151,10 @@ impl IntoResponse for AppError {
             Self::InternalError(msg) => {
                 tracing::error!(error = %msg, "Internal server error returned to client");
                 "Internal server error".to_string()
+            }
+            Self::BadGateway(msg) => {
+                tracing::error!(error = %msg, "Upstream failure returned to client");
+                "Upstream service is unavailable".to_string()
             }
             Self::ServiceUnavailable(msg) => {
                 tracing::error!(error = %msg, "Service unavailable returned to client");
@@ -204,6 +217,26 @@ impl From<anyhow::Error> for AppError {
                 tracing::error!(error = %full_msg, "database unavailable (connection-level error via anyhow), returning 503");
                 return Self::ServiceUnavailable(full_msg);
             }
+        }
+
+        // A host we do not own failed to answer. Sits above the four
+        // client-fault branches below for the same reason the outage branch
+        // does: a call that never completed must not be reported as an absent
+        // resource or a malformed request, whatever context got layered on top.
+        // The `502` says which process to look in — theirs, not ours — and
+        // leaves the request retryable, which is the only useful thing a
+        // client or a proxy can do about it.
+        //
+        // `{:#}` keeps the transport error the marker was layered over: the
+        // marker's own `Display` names the provider, and the cause under it
+        // names the timeout / TLS failure / status. `IntoResponse` sanitizes
+        // the client-facing body, so none of it leaks (H-05).
+        if e.downcast_ref::<rg_core::error::UpstreamUnavailable>()
+            .is_some()
+        {
+            let full_msg = format!("{e:#}");
+            tracing::error!(error = %full_msg, "upstream dependency did not answer, returning 502");
+            return Self::BadGateway(full_msg);
         }
 
         // A service that reports "this row genuinely is not there" carries
