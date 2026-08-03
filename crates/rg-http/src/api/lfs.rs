@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::api::repo_access;
@@ -402,7 +403,38 @@ pub async fn upload_object(
     }
 
     match write_body_to_file(body, &temp_path).await {
-        Ok(written) => {
+        Ok(staged) => {
+            // An LFS object id is a SHA-256 of its uncompressed bytes, not just
+            // a well-formed name chosen by the client. Hashing happens in the
+            // streaming write above, before this path is handed to the
+            // compressor or can become visible through its stable blob key.
+            if staged.sha256 != oid {
+                discard_file_async("LFS staging file", &temp_path).await;
+                return AppError::bad_request(format!(
+                    "LFS object content digest does not match oid: expected {oid}, got {}",
+                    staged.sha256
+                ))
+                .into_response();
+            }
+
+            // `batch` registers the size the client promised before it gives
+            // out this upload URL. Do not turn a short/long body into a live
+            // object whose row says something else. Direct authenticated PUTs
+            // have no prior row and keep the historical behavior of recording
+            // the size that actually arrived.
+            match rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&state.db, repo_id, &oid).await {
+                Ok(Some(object)) if object.size != staged.written as i64 => {
+                    discard_file_async("LFS staging file", &temp_path).await;
+                    return AppError::bad_request(format!(
+                        "LFS object size does not match batch declaration: expected {} bytes, got {}",
+                        object.size, staged.written
+                    ))
+                    .into_response();
+                }
+                Ok(_) => {}
+                Err(error) => return AppError::from(error).into_response(),
+            }
+
             match rg_core::lfs::service::store_object_from_file(
                 &state.db,
                 repo_id,
@@ -411,7 +443,7 @@ pub async fn upload_object(
                 &repo,
                 &oid,
                 &temp_path,
-                written as i64,
+                staged.written as i64,
             )
             .await
             {
@@ -687,12 +719,19 @@ fn respond_with_lfs_bytes(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Stream an Axum `Body` to a file. Returns the number of bytes written.
+/// A verified staging upload, measured and hashed while it is written.
+#[derive(Debug)]
+struct StagedLfsUpload {
+    written: usize,
+    sha256: String,
+}
+
+/// Stream an Axum `Body` to a file, returning its size and SHA-256.
 ///
 /// This is the write path of every `git lfs push`: the staging path is derived
 /// from `repo_root` plus the object id, so a bare `?` on the io error hands the
 /// client an errno and nothing else. Every failure names the file.
-async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Result<usize> {
+async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Result<StagedLfsUpload> {
     let staged = |error: &std::io::Error| {
         rg_core::platform::fs::path_error("LFS staging file", path, error, LFS_STORAGE_HINT)
     };
@@ -703,12 +742,14 @@ async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Resul
 
     use futures::StreamExt;
     let mut written: usize = 0;
+    let mut hasher = Sha256::new();
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
         file.write_all(&data)
             .await
             .map_err(|error| staged(&error))?;
+        hasher.update(&data);
         written += data.len();
     }
 
@@ -728,7 +769,10 @@ async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Resul
     // least loud (`sol_07eb75f8fb62`).
     file.flush().await.map_err(|error| staged(&error))?;
 
-    Ok(written)
+    Ok(StagedLfsUpload {
+        written,
+        sha256: hex::encode(hasher.finalize()),
+    })
 }
 
 #[cfg(test)]

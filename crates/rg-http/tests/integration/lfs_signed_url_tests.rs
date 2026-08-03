@@ -168,6 +168,29 @@ async fn signed_lfs_urls_are_ttl_and_action_bound() {
         .unwrap();
     assert_eq!(wrong_action.status(), 403);
 
+    // A signed URL authorizes exactly one content-addressed object. It must
+    // not turn arbitrary bytes into a live object merely because its path has
+    // a syntactically valid oid. This is deliberately before the valid upload:
+    // without the verification below the bad bytes become the stored object
+    // and the later correct retry silently reuses them.
+    let substituted = b"different bytes under the signed LFS oid";
+    let rejected = reqwest::Client::new()
+        .put(upload_href)
+        .body(substituted.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 400);
+    let rejected_body = rejected.text().await.unwrap();
+    assert!(
+        rejected_body.contains(&oid),
+        "the bad oid is actionable: {rejected_body}"
+    );
+    assert!(
+        rejected_body.contains(&hex::encode(Sha256::digest(substituted))),
+        "the actual digest is actionable: {rejected_body}"
+    );
+
     // The signed action URL works without forwarding the Batch bearer token.
     let uploaded = reqwest::Client::new()
         .put(upload_href)
@@ -204,6 +227,23 @@ async fn signed_lfs_urls_are_ttl_and_action_bound() {
     assert_eq!(downloaded.status(), 200);
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), content);
 
+    // A later replay with different bytes is rejected too, leaving the object
+    // everybody can already download untouched.
+    let rejected_retry = reqwest::Client::new()
+        .put(upload_href)
+        .body(substituted.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected_retry.status(), 400);
+    let still_downloadable = reqwest::Client::new()
+        .get(download_href)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still_downloadable.status(), 200);
+    assert_eq!(still_downloadable.bytes().await.unwrap().as_ref(), content);
+
     let expires = chrono::Utc::now().timestamp() - 1;
     let signature = rg_core::lfs::service::sign_action_url(
         b"test-secret-key",
@@ -221,6 +261,59 @@ async fn signed_lfs_urls_are_ttl_and_action_bound() {
         .await
         .unwrap();
     assert_eq!(expired.status(), 410);
+}
+
+#[tokio::test]
+async fn lfs_upload_rejects_a_body_whose_size_disagrees_with_batch() {
+    let (base, _) = spawn_test_app_with_db().await;
+    let (owner_token, _) =
+        register_full(&base, "lfs_size_owner", "lfs_size_owner@example.com").await;
+    create_repo(&base, &owner_token, "size-lfs", true).await;
+
+    let content = b"the bytes whose declared LFS size is wrong";
+    let oid = hex::encode(Sha256::digest(content));
+    let upload = batch(
+        &base,
+        "lfs_size_owner",
+        "size-lfs",
+        Some(&owner_token),
+        "upload",
+        &oid,
+        content.len() + 1,
+    )
+    .await;
+    assert_eq!(upload.status(), 200);
+    let upload = upload.json::<serde_json::Value>().await.unwrap();
+    let upload_href = upload["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap();
+
+    let rejected = reqwest::Client::new()
+        .put(upload_href)
+        .body(content.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 400);
+    assert!(rejected
+        .text()
+        .await
+        .unwrap()
+        .contains("size does not match batch declaration"));
+
+    let download = batch(
+        &base,
+        "lfs_size_owner",
+        "size-lfs",
+        Some(&owner_token),
+        "download",
+        &oid,
+        content.len(),
+    )
+    .await;
+    assert_eq!(download.status(), 200);
+    let download = download.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(download["objects"][0]["error"]["code"], 404);
 }
 
 #[tokio::test]
