@@ -285,6 +285,7 @@ struct Fixture {
 struct Harness {
     base: String,
     db: rg_db::DatabaseConnection,
+    provider_id: i64,
     user_id: Option<i64>,
     client: reqwest::Client,
     app_server: tokio::task::JoinHandle<()>,
@@ -411,6 +412,7 @@ impl Harness {
         Harness {
             base,
             db,
+            provider_id: provider.id,
             user_id,
             client: reqwest::Client::new(),
             app_server,
@@ -429,6 +431,43 @@ impl Harness {
             .unwrap();
         let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
         (status, response.text().await.unwrap())
+    }
+
+    /// The admin's "test connection" button, pressed by an instance admin of
+    /// this instance. The admin is registered per call and named after the
+    /// provider, so a test may press the button for more than one row.
+    async fn press_test_button(&self, provider_id: i64) -> (StatusCode, String) {
+        let (token, admin_id) = crate::common::register_full(
+            &self.base,
+            &format!("dir_admin_{provider_id}"),
+            &format!("dir_admin_{provider_id}@example.com"),
+        )
+        .await;
+        rg_db::ops::user_ops::update_by_id(&self.db, admin_id, None, None, Some(true), None)
+            .await
+            .unwrap()
+            .expect("the registered admin must exist");
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v1/admin/sso/providers/{provider_id}/test",
+                self.base
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.text().await.unwrap())
+    }
+
+    /// Store an extra provider row and return its id.
+    async fn add_provider(&self, input: SsoProviderInput<'_>) -> i64 {
+        rg_db::ops::sso_provider_ops::upsert(&self.db, None, input)
+            .await
+            .unwrap()
+            .id
     }
 
     /// Strikes on the brute-force counter of the account that tried to sign in.
@@ -591,6 +630,128 @@ async fn a_misconfigured_provider_is_still_skipped_for_a_working_one() {
             .unwrap()
             .is_some(),
         "the working provider's bind must still have provisioned the account"
+    );
+}
+
+// ── The admin's "test connection" button ─────────────────────────
+//
+// card_a86f0776021c: the same split, one door further in. `POST
+// /admin/sso/providers/{id}/test` answered `400` to both halves of its own
+// question — "you asked me to test something that is not an LDAP provider" and
+// "the directory did not answer" — which is the one answer a diagnostic button
+// must never give: it exists precisely to say which of the two happened, and
+// `400` tells the admin to fix a request that was already correct.
+
+/// The baseline that makes the refusals below mean something: pressing the
+/// button against a directory that answers reports success. Without it, a
+/// handler that answered `502` to everything would pass the outage tests.
+#[tokio::test]
+async fn the_test_button_reports_a_healthy_directory() {
+    let harness = Harness::start(Behaviour::Healthy).await;
+
+    let (status, body) = harness.press_test_button(harness.provider_id).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a directory that binds must still test green, got body: {body}"
+    );
+}
+
+/// The defect: nothing is listening, and the admin was told their request was
+/// malformed.
+#[tokio::test]
+async fn an_unreachable_directory_makes_the_test_button_a_502() {
+    let harness = Harness::start(Behaviour::Unreachable).await;
+
+    let (status, body) = harness.press_test_button(harness.provider_id).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a directory nobody could reach is not a bad request, got body: {body}"
+    );
+    assert!(
+        !body.contains(SERVICE_BIND_DN) && !body.contains("service-secret"),
+        "the operator's detail must stay in the log, not in the response: {body}"
+    );
+}
+
+/// The directory answered, and refused the forge's own service account. Still
+/// its answer, still not a defect of the request that asked for the check.
+#[tokio::test]
+async fn a_refused_service_bind_makes_the_test_button_a_502() {
+    let harness = Harness::start(Behaviour::ServiceBindRefused).await;
+
+    let (status, body) = harness.press_test_button(harness.provider_id).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a directory that refused our service bind answered — the request did not, \
+         got body: {body}"
+    );
+}
+
+/// The first `400` that has to survive: the row is not an LDAP provider at all,
+/// so there is nothing to dial and the ask itself was wrong.
+#[tokio::test]
+async fn the_test_button_still_refuses_a_non_ldap_provider_with_a_400() {
+    let harness = Harness::start(Behaviour::Healthy).await;
+    let oidc = harness
+        .add_provider(SsoProviderInput {
+            name: "Mock IdP",
+            slug: "idp",
+            provider_type: "oidc",
+            client_id: Some("client-id"),
+            discovery_url: Some("https://example.com/.well-known/openid-configuration"),
+            enabled: true,
+            ..Default::default()
+        })
+        .await;
+
+    let (status, body) = harness.press_test_button(oidc).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "testing a provider that has no directory to dial is the caller's to fix, \
+         got body: {body}"
+    );
+}
+
+/// The second `400`: an LDAP row whose stored configuration cannot be turned
+/// into a bindable config. Nothing was dialled, so no directory failed — and the
+/// admin has a form field to fill in, which the refusal names.
+#[tokio::test]
+async fn the_test_button_still_refuses_an_unconfigured_ldap_provider_with_a_400() {
+    let harness = Harness::start(Behaviour::Healthy).await;
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
+    let bind_password_enc = rg_core::auth::encryption::encrypt("service-secret", &key).unwrap();
+    let unconfigured = harness
+        .add_provider(SsoProviderInput {
+            name: "Half-filled Directory",
+            slug: "half-filled",
+            provider_type: "ldap",
+            // No host: the config is refused before anything is dialled.
+            ldap_bind_dn: Some(SERVICE_BIND_DN),
+            ldap_bind_password_enc: Some(&bind_password_enc),
+            ldap_base_dn: Some(BASE_DN),
+            enabled: true,
+            ..Default::default()
+        })
+        .await;
+
+    let (status, body) = harness.press_test_button(unconfigured).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an incomplete provider row is the admin's form to fix, got body: {body}"
+    );
+    assert!(
+        body.contains("LDAP host is missing"),
+        "the refusal has to name the field that is missing, got: {body}"
     );
 }
 

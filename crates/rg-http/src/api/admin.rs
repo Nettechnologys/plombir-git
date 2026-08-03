@@ -919,8 +919,10 @@ pub async fn update_sso_provider(
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "Provider connection succeeded", body = serde_json::Value),
-        (status = 400, description = "Provider is not LDAP or connection failed", body = serde_json::Value),
+        (status = 400, description = "Provider is not LDAP, or its stored LDAP configuration is incomplete", body = serde_json::Value),
         (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 404, description = "SSO provider not found", body = serde_json::Value),
+        (status = 502, description = "The LDAP directory refused, was unreachable, or did not answer", body = serde_json::Value),
     ),
 )]
 pub async fn test_sso_provider_connection(
@@ -951,8 +953,12 @@ pub async fn test_sso_provider_connection(
                 error = %format!("{error:#}"),
                 "LDAP provider connection test failed"
             );
-            AppError::bad_request("LDAP connection test failed; check server logs for details")
-                .into_response()
+            // The button was pressed to find out *which* of the two happened, so
+            // it must not answer both with the same code: a row that cannot be
+            // turned into a bindable config is the admin's form to fix (`400`),
+            // a directory that refused or never answered is not (`502`). The
+            // service tags each one, and this is the funnel that reads the tag.
+            AppError::from(error).into_response()
         }
     }
 }

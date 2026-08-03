@@ -572,21 +572,47 @@ fn ldap_config_from_provider(
     })
 }
 
+/// Dial the directory this provider row describes, for the admin's "test
+/// connection" button.
+///
+/// Three outcomes, and they are three different answers — the whole reason the
+/// button exists is to say which one happened (card_a86f0776021c):
+///
+/// * the row is not an LDAP provider, or its stored configuration cannot be
+///   turned into a bindable config at all — [`crate::error::InvalidRequest`],
+///   nothing was dialled and the admin has a form to fix;
+/// * the directory refused, was unreachable, or never answered in time —
+///   [`crate::error::UpstreamUnavailable`], which is not the admin's request to
+///   fix and must stay retryable;
+/// * it bound, and the button says so.
 pub async fn test_ldap_provider_connection(
     provider: &rg_db::entities::sso_provider::Model,
     encryption_key: &str,
 ) -> Result<()> {
     if provider.provider_type != "ldap" {
-        bail!("provider is not LDAP");
+        return Err(crate::error::invalid_request(
+            "connection testing is only supported for LDAP providers",
+        ));
     }
-    let config = ldap_config_from_provider(provider, encryption_key)?;
-    tokio::time::timeout(
+    // `to_string()`, not `{:#}`: every outer context this helper attaches is one
+    // of its own fixed strings ("LDAP host is missing", "LDAP port is invalid"),
+    // which is exactly what the admin needs to see and is safe to render
+    // verbatim (H-05) — while the layered cause below it stays in the log.
+    let config = ldap_config_from_provider(provider, encryption_key).map_err(|error| {
+        let reason = error.to_string();
+        error.context(crate::error::InvalidRequest::new(reason))
+    })?;
+    match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::auth::ldap::test_connection(&config),
     )
     .await
-    .context("LDAP connection test timed out")??;
-    Ok(())
+    {
+        Ok(result) => result,
+        Err(elapsed) => Err(anyhow::Error::new(elapsed).context(
+            crate::error::UpstreamUnavailable::new("the LDAP directory did not answer in time"),
+        )),
+    }
 }
 
 async fn resolve_ldap_identity(

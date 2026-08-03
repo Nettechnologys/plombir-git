@@ -323,9 +323,10 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         .send()
         .await
         .unwrap();
-    assert_eq!(failed_test.status(), 400);
+    // card_a86f0776021c: port 1 has nothing on it, and a directory that never
+    // answered is not a malformed request — the detail stays in the log.
+    assert_eq!(failed_test.status(), 502);
     let failed_body = failed_test.text().await.unwrap();
-    assert!(failed_body.contains("LDAP connection test failed"));
     assert!(!failed_body.contains("127.0.0.1"));
     assert!(!failed_body.contains("bind-secret"));
 

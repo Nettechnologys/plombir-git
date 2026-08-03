@@ -1,7 +1,7 @@
 //! LDAP authentication service.
 //! Two-step: bind with service account, search user DN, rebind with user DN + password.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ldap3::{LdapConnAsync, LdapConnSettings, LdapError, Scope, SearchEntry};
 
 #[derive(Debug, Clone)]
@@ -218,6 +218,14 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
     })
 }
 
+/// Dial the directory and bind with the forge's own service account.
+///
+/// Every failure here belongs to the same host [`authenticate`] talks to, and
+/// none of it is a defect of the request that asked for the check — so each leg
+/// is tagged with [`DirectoryCall`] too. The admin's "test connection" button is
+/// the one door where that distinction is the whole point: it exists to report
+/// what the directory did, and a `400` there tells the admin to fix a request
+/// that was already correct (card_a86f0776021c).
 pub async fn test_connection(config: &LdapConfig) -> Result<()> {
     let url = if config.use_tls {
         format!("ldaps://{}:{}", config.host, config.port)
@@ -228,17 +236,19 @@ pub async fn test_connection(config: &LdapConfig) -> Result<()> {
     let settings = connection_settings(config);
     let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &url)
         .await
-        .context("failed to connect to LDAP")?;
+        .directory_call("could not connect to the LDAP directory")?;
 
     ldap3::drive!(conn);
 
     ldap.simple_bind(&config.bind_dn, &config.bind_password)
         .await
-        .map_err(|e| anyhow::anyhow!("LDAP bind failed: {}", e))?
+        .directory_call("the LDAP service bind did not complete")?
         .success()
-        .map_err(|e| anyhow::anyhow!("LDAP bind rejected: {:?}", e))?;
+        .directory_call("the LDAP directory refused the service bind")?;
 
-    ldap.unbind().await.ok();
+    if let Err(error) = ldap.unbind().await {
+        tracing::warn!(%error, "LDAP service unbind failed after connection test");
+    }
     Ok(())
 }
 
