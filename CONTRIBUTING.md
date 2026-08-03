@@ -46,7 +46,12 @@ cargo tree                  # inspect the dependency graph
 ```bash
 git clone https://github.com/Yahook/ForgeKeep.git
 cd ForgeKeep
-cargo build                 # verify dependencies fetch and compile
+
+# Use the repository-owned pre-push checks for this clone. They run the same
+# fast Rustfmt and Clippy gates as CI before a direct push to main.
+./scripts/install-git-hooks.sh
+
+cargo build -j 6            # verify dependencies fetch and compile
 
 # Generate a test SSH host key (one-off)
 ssh-keygen -t ed25519 -f ./forgekeep_host_key -N ""

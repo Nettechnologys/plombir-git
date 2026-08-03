@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+# Keep direct pushes from making `main` red after the fact.  CI repeats these
+# checks independently; this hook gives the author the same cheap feedback
+# before refs leave their machine.  Bypass remains Git's explicit
+# `git push --no-verify` escape hatch.
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+printf '%s\n' 'pre-push: checking Rust formatting'
+cargo fmt --all -- --check
+
+printf '%s\n' 'pre-push: running workspace clippy'
+cargo clippy --workspace --all-targets
