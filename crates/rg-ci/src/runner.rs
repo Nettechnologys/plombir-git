@@ -974,36 +974,36 @@ impl PipelineRunner {
         .await?
     }
 
-    fn cache_archive_path(&self, key: &str) -> std::path::PathBuf {
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(key.as_bytes());
-        let name = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+    /// Where this repository's cache archives live.
+    fn cache_archive_dir(&self) -> std::path::PathBuf {
         let root = self
             .repo_path
             .parent()
             .and_then(std::path::Path::parent)
             .unwrap_or_else(|| self.repo_path.parent().unwrap_or(&self.repo_path));
-        root.join("_ci_cache")
-            .join(self.repo_id.to_string())
-            .join(format!("{name}.tar"))
+        root.join("_ci_cache").join(self.repo_id.to_string())
     }
 
     async fn restore_cache(&self, key: &str) -> Result<()> {
-        let archive = self.cache_archive_path(key);
         let key_hash = cache_key_hash(key);
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await?;
         let existing =
             rg_db::ops::ci_retention_ops::find_cache_entry(&self.db, self.repo_id, &key_hash)
                 .await?;
-        if let Some(entry) = &existing {
-            if entry.expires_at <= chrono::Utc::now() {
-                remove_cache_archive(&archive, "the cache entry expired");
-                rg_db::ops::ci_retention_ops::delete_cache_entry(&self.db, entry.id).await?;
-                return Ok(());
-            }
+        // Publications are named per-save, so the row is the only handle on the
+        // archive: no row means no cache to restore, whatever is lying in the
+        // directory.
+        let Some(entry) = existing else {
+            return Ok(());
+        };
+        let Some(archive) = recorded_cache_archive(&self.cache_archive_dir(), &entry.file_path)
+        else {
+            anyhow::bail!("CI cache entry {} names no archive file", entry.id);
+        };
+        if entry.expires_at <= chrono::Utc::now() {
+            remove_cache_archive(&archive, "the cache entry expired");
+            rg_db::ops::ci_retention_ops::delete_cache_entry(&self.db, entry.id).await?;
+            return Ok(());
         }
         if !archive.exists() {
             return Ok(());
@@ -1017,7 +1017,7 @@ impl PipelineRunner {
         // carry no digest and are restored without this guard.
         let digest = hash_archive(&archive)
             .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
-        if let Some(expected) = existing.as_ref().and_then(|e| e.sha256.as_deref()) {
+        if let Some(expected) = entry.sha256.as_deref() {
             if digest != expected {
                 anyhow::bail!(
                     "CI cache integrity check failed: expected sha256 {expected}, got {digest}"
@@ -1050,40 +1050,52 @@ impl PipelineRunner {
     }
 
     async fn save_cache(&self, key: &str, paths: &[String]) -> Result<()> {
-        let archive = self.cache_archive_path(key);
-        let temporary = archive.with_extension("tar.tmp");
+        let key_hash = cache_key_hash(key);
+        let directory = self.cache_archive_dir();
+        // What the live entry names before this save rewrites it, read while the
+        // row still points at the previous run's archive.
+        let replaced = rg_db::ops::ci_retention_ops::find_cache_entry(
+            &self.db,
+            self.repo_id,
+            &key_hash,
+        )
+        .await?
+        .map(|entry| entry.file_path);
+        // Each save publishes under a name of its own. Packing over a stable
+        // `<key_hash>.tar` destroyed the previous run's archive before anything
+        // had confirmed this one — and then every failure below compensated by
+        // deleting that same path, leaving the live row pointing at bytes that
+        // no longer exist. Here the only file this save can roll back is the one
+        // it created.
+        let archive = directory.join(format!("{key_hash}.{}.tar", uuid::Uuid::new_v4()));
 
-        // Until the rename lands, the only unreferenced thing on disk is the
-        // staging file: `archive` may still hold the previous run's cache, and a
-        // live row names it. So this half discards `temporary` and nothing else
-        // — a cleanup that reached for `archive` here would delete a cache that
-        // is still in use.
-        if let Err(error) = self.pack_cache_archive(paths, &temporary) {
-            remove_cache_archive(&temporary, "packing the cache archive failed");
+        // Nothing names this archive until `record_cache_entry` succeeds, and
+        // retention walks rows — so every exit below has to take it along.
+        if let Err(error) = self.pack_cache_archive(paths, &archive) {
+            remove_cache_archive(&archive, "packing the cache archive failed");
             return Err(error);
         }
-        if let Err(error) = std::fs::rename(&temporary, &archive)
-            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))
-        {
-            remove_cache_archive(&temporary, "publishing the cache archive failed");
-            return Err(error);
-        }
-
-        // The rename replaced whatever the row named with bytes this run
-        // produced, so from here every exit has to take the archive with it.
-        // Leaving it costs either way: with no row at all it is invisible to
-        // retention (which walks rows) and to `download_cache` (which resolves
-        // through the database), and under a row the upsert failed to update it
-        // is bytes whose recorded digest no longer matches — a restore that
-        // fails its integrity check instead of missing cleanly.
         if let Err(error) = self.record_cache_entry(key, &archive).await {
             remove_cache_archive(&archive, "the cache entry could not be recorded");
             return Err(error);
         }
+
+        // The row names this save's archive now, which is what makes the one it
+        // named before ours to retire — and only now. A failure above left the
+        // previous run's cache exactly where it was, still restorable.
+        if let Some(previous) =
+            replaced
+                .as_deref()
+                .and_then(|recorded| recorded_cache_archive(&directory, recorded))
+        {
+            if previous != archive {
+                remove_cache_archive(&previous, "a newer archive took over the cache entry");
+            }
+        }
         Ok(())
     }
 
-    /// Pack `paths` from the workspace into the staging archive.
+    /// Pack `paths` from the workspace into this save's archive.
     fn pack_cache_archive(&self, paths: &[String], temporary: &std::path::Path) -> Result<()> {
         if let Some(parent) = temporary.parent() {
             std::fs::create_dir_all(parent)
@@ -1218,6 +1230,23 @@ fn append_job_notices(mut log: String, notices: &[String]) -> String {
 fn cache_key_hash(key: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(key.as_bytes()))
+}
+
+/// Resolve the archive a cache row names, inside `directory` and nowhere else.
+///
+/// A row records the full path it was written under, and the two writers — this
+/// runner and `rg_http`'s cache endpoints — spell that root differently (a path
+/// derived from the repository versus the configured `repo_root`), so the prefix
+/// is not something either side can compare against. The file name is: every
+/// archive of a repository sits directly in this one directory, which is also
+/// what keeps a row from ever addressing a file outside it.
+fn recorded_cache_archive(
+    directory: &std::path::Path,
+    recorded: &str,
+) -> Option<std::path::PathBuf> {
+    std::path::Path::new(recorded)
+        .file_name()
+        .map(|name| directory.join(name))
 }
 
 /// Hex-encoded SHA-256 of a file's *contents*, streamed in bounded chunks so a
@@ -1403,17 +1432,16 @@ mod tests {
         );
     }
 
-    /// The archive path is a SHA-256 of the cache key under a directory derived
-    /// from the repository storage root — nothing an operator can guess. A save
-    /// failure that only says `Permission denied (os error 13)` names neither
-    /// the file nor the directory to fix, which is exactly what a bind-mounted
-    /// repo root owned by another uid produces.
+    /// The archive lives in a directory derived from the repository storage
+    /// root — nothing an operator can guess. A save failure that only says
+    /// `Permission denied (os error 13)` names neither the file nor the
+    /// directory to fix, which is exactly what a bind-mounted repo root owned by
+    /// another uid produces.
     #[tokio::test]
     async fn cache_save_failure_names_the_archive_directory_and_the_remedy() {
         let temp = tempfile::tempdir().unwrap();
         let runner = cache_runner(temp.path()).await;
-        let archive = runner.cache_archive_path("build-main");
-        let archive_dir = archive.parent().unwrap().to_path_buf();
+        let archive_dir = runner.cache_archive_dir();
         // A regular file where `_ci_cache/` belongs fails the directory
         // creation deterministically, independent of the uid the tests run as.
         std::fs::write(archive_dir.parent().unwrap(), "not a directory").unwrap();
@@ -1433,8 +1461,8 @@ mod tests {
     }
 
     /// Everything left lying in the repository's cache directory, sorted.
-    fn cache_dir_leftovers(archive: &std::path::Path) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(archive.parent().unwrap()) else {
+    fn cache_dir_leftovers(directory: &std::path::Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(directory) else {
             return Vec::new();
         };
         let mut names: Vec<String> = entries
@@ -1444,68 +1472,124 @@ mod tests {
         names
     }
 
-    /// A save that never reached the rename must not keep its staging file.
-    ///
-    /// `<hash>.tar.tmp` is the whole cache, packed. No row names it — retention
-    /// walks rows and `download_cache` resolves through the database — so a
-    /// staging file left behind is a full cache's worth of disk that nothing
-    /// will ever come back for, once per failed save.
-    #[tokio::test]
-    async fn a_cache_save_that_could_not_publish_leaves_no_staging_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let runner = cache_runner(temp.path()).await;
+    /// Put `content` in the workspace and save it under `key`.
+    async fn save_workspace_cache(runner: &PipelineRunner, key: &str, content: &str) -> Result<()> {
         let workspace = runner.workspace_path();
         std::fs::create_dir_all(workspace.join("target")).unwrap();
-        std::fs::write(workspace.join("target/cache.txt"), "cached").unwrap();
+        std::fs::write(workspace.join("target/cache.txt"), content).unwrap();
+        runner.save_cache(key, &["target".into()]).await
+    }
 
-        // A directory where the published archive belongs fails the rename
-        // deterministically, independent of the uid the tests run as.
-        let archive = runner.cache_archive_path("build-main");
-        std::fs::create_dir_all(&archive).unwrap();
+    /// What a restore into an emptied workspace produces.
+    async fn restored_cache_content(runner: &PipelineRunner, key: &str) -> Option<String> {
+        let workspace = runner.workspace_path();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        runner.restore_cache(key).await.unwrap();
+        std::fs::read_to_string(workspace.join("target/cache.txt")).ok()
+    }
 
-        runner
-            .save_cache("build-main", &["target".into()])
+    /// A save that fails after packing must leave the previous run's cache
+    /// exactly where it was.
+    ///
+    /// This is the retry case: a repeat of a key that already has an archive.
+    /// Packing over the stable `<hash>.tar` destroyed it before anything had
+    /// confirmed the new one, and the compensation then deleted that same path
+    /// as if the failed save owned it — so one failed retry turned a working
+    /// cache into a row pointing at bytes that no longer exist.
+    #[tokio::test]
+    async fn a_failed_second_save_keeps_the_previous_cache_restorable() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = cache_runner(temp.path()).await;
+        save_workspace_cache(&runner, "build-main", "first")
             .await
-            .expect_err("save must fail when the archive cannot be published");
+            .unwrap();
+        let published = cache_dir_leftovers(&runner.cache_archive_dir());
+
+        // The row exists now, so the second save updates it — and that update is
+        // the last step before the new archive would become the live one.
+        runner
+            .db
+            .execute_unprepared(
+                "CREATE TRIGGER fk_fault_cache_update BEFORE UPDATE ON ci_cache_entries \
+                 BEGIN SELECT RAISE(ABORT, 'injected failure: UPDATE on ci_cache_entries'); END;",
+            )
+            .await
+            .unwrap();
+        save_workspace_cache(&runner, "build-main", "second")
+            .await
+            .expect_err("save must fail when the cache entry cannot be recorded");
+        runner
+            .db
+            .execute_unprepared("DROP TRIGGER fk_fault_cache_update")
+            .await
+            .unwrap();
 
         assert_eq!(
-            cache_dir_leftovers(&archive),
-            vec![archive.file_name().unwrap().to_string_lossy().into_owned()],
-            "the failed save kept its staging file"
+            restored_cache_content(&runner, "build-main").await.as_deref(),
+            Some("first"),
+            "the failed retry destroyed the cache the live entry still names"
+        );
+        assert_eq!(
+            cache_dir_leftovers(&runner.cache_archive_dir()),
+            published,
+            "the failed retry kept an archive no row points at"
+        );
+    }
+
+    /// A save that succeeds owns the archive it replaced, and takes it with it.
+    ///
+    /// The other half of the same rule: only a save that got its row through may
+    /// remove the previous one's bytes. Skipping that leaves one dead archive
+    /// per run — retention walks rows, so nothing else would ever collect them.
+    #[tokio::test]
+    async fn a_successful_save_retires_the_archive_it_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = cache_runner(temp.path()).await;
+        save_workspace_cache(&runner, "build-main", "first")
+            .await
+            .unwrap();
+        save_workspace_cache(&runner, "build-main", "second")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache_dir_leftovers(&runner.cache_archive_dir()).len(),
+            1,
+            "the superseded archive stayed on disk with nothing naming it"
+        );
+        assert_eq!(
+            restored_cache_content(&runner, "build-main").await.as_deref(),
+            Some("second"),
         );
     }
 
     /// An archive whose entry was never recorded must not stay on disk.
     ///
-    /// The rename publishes bytes at the path a row is about to name. Three
-    /// steps still stand between it and that row — `metadata`, the digest, the
-    /// retention policy — and each used to exit with the archive already in
-    /// place: invisible to retention, unreachable through `download_cache`, and
-    /// mismatched against whatever digest the previous row still records.
+    /// A first save has no previous archive to fall back on, so its own bytes
+    /// are the only thing on disk — and until the row lands they are invisible
+    /// to retention (which walks rows) and unreachable through `download_cache`
+    /// (which resolves through the database).
     #[tokio::test]
     async fn a_cache_archive_whose_entry_was_not_recorded_is_removed() {
         let temp = tempfile::tempdir().unwrap();
         let runner = cache_runner(temp.path()).await;
-        let workspace = runner.workspace_path();
-        std::fs::create_dir_all(workspace.join("target")).unwrap();
-        std::fs::write(workspace.join("target/cache.txt"), "cached").unwrap();
 
-        // Take the retention policy away: `get_policy` sits after the rename and
-        // before the row, which is exactly the stretch that had no cleanup.
+        // Take the retention policy away: `get_policy` sits after the archive is
+        // packed and before the row, which is exactly the stretch that had no
+        // cleanup.
         runner
             .db
             .execute_unprepared("DROP TABLE ci_retention_policies")
             .await
             .unwrap();
 
-        runner
-            .save_cache("build-main", &["target".into()])
+        save_workspace_cache(&runner, "build-main", "cached")
             .await
             .expect_err("save must fail when the retention policy cannot be read");
 
-        let archive = runner.cache_archive_path("build-main");
         assert_eq!(
-            cache_dir_leftovers(&archive),
+            cache_dir_leftovers(&runner.cache_archive_dir()),
             Vec::<String>::new(),
             "the failed save kept an archive no row points at"
         );

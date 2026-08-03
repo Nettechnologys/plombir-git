@@ -249,8 +249,143 @@ async fn a_failed_policy_read_takes_the_uploaded_archive_with_it() {
     );
 }
 
+/// A retry of a key that already has an archive must not let its own failure
+/// destroy the cache the live row still names.
+///
+/// Every upload used to be renamed onto one stable `<key_hash>.tar`, so a retry
+/// overwrote the previous publication's bytes before anything had confirmed the
+/// new ones — and the compensation then deleted that same path as if the failed
+/// request owned it. One failed retry was enough to turn a working cache hit
+/// into a row pointing at an archive that no longer exists.
+#[tokio::test]
+async fn a_failed_retry_keeps_the_previous_cache_archive_downloadable() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let cache_key = "deps-v3";
+    let (repo_id, runner_id, job_id, runner_token) = cache_upload_fixture(
+        &app.base,
+        &app.db,
+        "cache_retry_outage",
+        "retry-outage",
+        cache_key,
+    )
+    .await;
+    let url = format!(
+        "{}/api/v1/runners/{}/jobs/{}/cache",
+        app.base, runner_id, job_id
+    );
+
+    let published = b"the cache that already works".to_vec();
+    let first = client
+        .put(url.clone())
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(published.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 204, "the first upload must succeed");
+
+    // The row exists now, so the retry's `upsert_cache_entry` updates it — the
+    // last step before the new archive would become the live one.
+    let fault = fail_db_writes(&app.db, "ci_cache_entries", DbWrite::Update).await;
+    let retry = client
+        .put(url.clone())
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(b"the cache that never landed".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status(),
+        500,
+        "a lost cache row must fail the retry, not answer 204"
+    );
+    fault.clear().await;
+
+    let download = client
+        .get(url)
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        download.status(),
+        200,
+        "the failed retry took the previously published cache with it"
+    );
+    assert_eq!(
+        download
+            .headers()
+            .get("x-checksum-sha256")
+            .and_then(|value| value.to_str().ok()),
+        Some(hex::encode(Sha256::digest(&published)).as_str()),
+        "the archive on disk is no longer the one the row vouches for",
+    );
+    assert_eq!(download.bytes().await.unwrap().as_ref(), &published[..]);
+
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)).len(),
+        1,
+        "the failed retry kept an archive no row points at"
+    );
+}
+
+/// Two publications of one key racing each other: whichever the row ends up
+/// naming must still be downloadable, byte for byte.
+///
+/// The loser may leave its archive behind — waste, and the deliberate side of
+/// the trade — but it must never delete the winner's. Under one stable path the
+/// two renames and the two row updates could interleave into a row vouching for
+/// a digest that belongs to the other upload's bytes, which the download's
+/// integrity check reports as a corrupted cache.
+#[tokio::test]
+async fn concurrent_uploads_of_one_cache_key_keep_the_winner_downloadable() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let cache_key = "deps-v4";
+    let (_repo_id, runner_id, job_id, runner_token) =
+        cache_upload_fixture(&base, &db, "cache_race", "race", cache_key).await;
+    let url = format!("{base}/api/v1/runners/{runner_id}/jobs/{job_id}/cache");
+
+    let one = vec![b'a'; 4096];
+    let two = vec![b'b'; 8192];
+    let upload = |body: Vec<u8>| {
+        client
+            .put(url.clone())
+            .bearer_auth(&runner_token)
+            .header("x-cache-key", cache_key)
+            .body(body)
+            .send()
+    };
+    let (first, second) = tokio::join!(upload(one.clone()), upload(two.clone()));
+    assert_eq!(first.unwrap().status(), 204);
+    assert_eq!(second.unwrap().status(), 204);
+
+    let download = client
+        .get(url)
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .send()
+        .await
+        .unwrap();
+    // A 500 here is the integrity check: the row and the file it names disagree.
+    assert_eq!(
+        download.status(),
+        200,
+        "the entry no longer matches the archive it names"
+    );
+    let served = download.bytes().await.unwrap().to_vec();
+    assert!(
+        served == one || served == two,
+        "the download served neither upload's bytes"
+    );
+}
+
 /// The same for the cache row itself: the compensation must run on every branch
-/// past the rename, not only on the one that was noticed first.
+/// past the write, not only on the one that was noticed first.
 #[tokio::test]
 async fn a_failed_cache_row_takes_the_uploaded_archive_with_it() {
     let app = spawn_test_app_for_fault_sweep().await;

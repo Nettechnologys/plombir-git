@@ -961,41 +961,53 @@ pub async fn download_cache(
         Ok(key) => key,
         Err(error) => return error.into_response(),
     };
-    let path = cache_archive_path(&state, repo_id, key);
     let key_hash = cache_key_hash(key);
-    let existing = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
-        Ok(entry) => entry,
+    // The row is the handle on the archive, not a hint about it: every
+    // publication is written under its own name, so a file this lookup cannot
+    // reach is residue rather than a cache.
+    let entry = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return AppError::not_found("cache entry not found").into_response(),
         Err(error) => return error.into_response(),
     };
-    if let Some(entry) = &existing {
-        if entry.expires_at <= chrono::Utc::now() {
-            // Eviction is a side effect of answering 404 — it cannot change the
-            // response, but a half-done eviction leaves residue that nothing
-            // else will come back for.
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                // Already gone: eviction had nothing to do, not a failure.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::warn!(
-                    repo_id,
-                    cache_entry_id = entry.id,
-                    path = %path.display(),
-                    error = %error,
-                    "expired CI cache archive not deleted — the file stays on disk after its entry expired"
-                ),
-            }
-            if let Err(error) =
-                rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, entry.id).await
-            {
-                tracing::warn!(
-                    repo_id,
-                    cache_entry_id = entry.id,
-                    error = %format!("{error:#}"),
-                    "expired CI cache entry not deleted — the row survives pointing at an archive that was just removed"
-                );
-            }
-            return AppError::not_found("cache entry expired").into_response();
+    let directory = cache_archive_dir(&state, repo_id);
+    let path = match recorded_cache_archive(&directory, &entry.file_path) {
+        Some(path) => path,
+        None => {
+            return AppError::internal(anyhow::anyhow!(
+                "CI cache entry {} names no archive file",
+                entry.id
+            ))
+            .into_response()
         }
+    };
+    if entry.expires_at <= chrono::Utc::now() {
+        // Eviction is a side effect of answering 404 — it cannot change the
+        // response, but a half-done eviction leaves residue that nothing
+        // else will come back for.
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            // Already gone: eviction had nothing to do, not a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                repo_id,
+                cache_entry_id = entry.id,
+                path = %path.display(),
+                error = %error,
+                "expired CI cache archive not deleted — the file stays on disk after its entry expired"
+            ),
+        }
+        if let Err(error) =
+            rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, entry.id).await
+        {
+            tracing::warn!(
+                repo_id,
+                cache_entry_id = entry.id,
+                error = %format!("{error:#}"),
+                "expired CI cache entry not deleted — the row survives pointing at an archive that was just removed"
+            );
+        }
+        return AppError::not_found("cache entry expired").into_response();
     }
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
@@ -1004,7 +1016,7 @@ pub async fn download_cache(
             // at upload — a tampered/corrupted cache would otherwise inject files
             // into a downstream build. Legacy entries carry no digest and are
             // served without this guard.
-            if let Some(expected) = existing.as_ref().and_then(|e| e.sha256.as_deref()) {
+            if let Some(expected) = entry.sha256.as_deref() {
                 if sha256 != expected {
                     return AppError::internal(anyhow::anyhow!(
                         "cache integrity check failed: expected sha256 {expected}, got {sha256}"
@@ -1099,29 +1111,38 @@ pub async fn upload_cache(
         Ok(key) => key,
         Err(error) => return error.into_response(),
     };
-    let path = cache_archive_path(&state, repo_id, key);
-    if let Some(parent) = path.parent() {
-        if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            return cache_path_error("CI cache directory", parent, &error).into_response();
-        }
+    let key_hash = cache_key_hash(key);
+    let directory = cache_archive_dir(&state, repo_id);
+    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
+        return cache_path_error("CI cache directory", &directory, &error).into_response();
     }
+    // What the live entry names *before* this upload rewrites it. Read here
+    // because the upsert below is the point of no return: afterwards the row
+    // names this request's archive and the previous publication's bytes have no
+    // handle left in the database at all.
+    let replaced = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
+        Ok(entry) => entry.map(|entry| entry.file_path),
+        Err(error) => return error.into_response(),
+    };
     // Digest the payload before the write consumes `body` — the archive is
     // already fully buffered in memory (≤ 1 GiB, bounded above), so hashing the
     // in-memory bytes costs nothing extra.
     let sha256 = cache_content_hash(body.as_ref());
-    let temporary = path.with_extension("tar.tmp");
+    let size = body.len() as i64;
+    // Every publication is written under a name of its own. Under the stable
+    // `<key_hash>.tar` a retry wrote over the archive the live row still named,
+    // so any failure below compensated by deleting bytes that belonged to the
+    // *previous*, successful upload: one failed retry turned a working cache
+    // into a row pointing at nothing. A request-private name makes the rollback
+    // provable — the only file this request can ever remove is the one this
+    // request created.
+    let path = directory.join(format!("{key_hash}.{}.tar", uuid::Uuid::new_v4()));
     // From here until `upsert_cache_entry` succeeds there is a file on disk that
     // no DB row points at. Retention walks rows, so every early exit below has to
     // take its file with it — otherwise the failure leaks a cache-sized archive
     // that nothing will ever come back for.
-    if let Err(error) = tokio::fs::write(&temporary, body).await {
-        discard_unreferenced_cache_file("CI cache staging file", &temporary, repo_id, job_id, key)
-            .await;
-        return cache_path_error("CI cache staging file", &temporary, &error).into_response();
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-        discard_unreferenced_cache_file("CI cache staging file", &temporary, repo_id, job_id, key)
-            .await;
+    if let Err(error) = tokio::fs::write(&path, body).await {
+        discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
         return cache_path_error("CI cache archive", &path, &error).into_response();
     }
     let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
@@ -1131,17 +1152,10 @@ pub async fn upload_cache(
             return AppError::from(error).into_response();
         }
     };
-    let size = match tokio::fs::metadata(&path).await {
-        Ok(meta) => meta.len() as i64,
-        Err(error) => {
-            discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
-            return cache_path_error("CI cache archive", &path, &error).into_response();
-        }
-    };
     if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
         &state.db,
         repo_id,
-        &cache_key_hash(key),
+        &key_hash,
         path.to_string_lossy().as_ref(),
         size,
         Some(&sha256),
@@ -1152,7 +1166,50 @@ pub async fn upload_cache(
         discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
         return AppError::from(error).into_response();
     }
+    // The row names this request's archive now, and that — not the write that
+    // returned `Ok` earlier — is what makes the archive it named before ours to
+    // retire. Only a request that got this far may touch it; a failure above
+    // leaves it exactly where the previous upload put it, still restorable.
+    //
+    // Two uploads of one key racing here can leave the loser's archive behind
+    // with no row naming it: waste that retention (which walks rows) will not
+    // reclaim, and the deliberate side of the trade — the ordering that avoids
+    // it is the one that risks deleting a cache somebody is still restoring.
+    if let Some(previous) = replaced
+        .as_deref()
+        .and_then(|recorded| recorded_cache_archive(&directory, recorded))
+    {
+        if previous != path {
+            discard_replaced_cache_file(&previous, repo_id, job_id, key).await;
+        }
+    }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Retire the archive a previous publication left behind, once this request's
+/// own archive is the one the row names.
+///
+/// Best-effort for the same reason as the rollback below: the upload succeeded,
+/// so a failure here cannot be reported to the runner without lying about the
+/// cache it just stored. What stays behind is waste, not loss.
+async fn discard_replaced_cache_file(
+    path: &std::path::Path,
+    repo_id: i64,
+    job_id: i64,
+    key: &str,
+) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            repo_id,
+            job_id,
+            cache_key = %key,
+            path = %path.display(),
+            error = %error,
+            "superseded CI cache archive not deleted — the file stays on disk after the entry moved to the newly uploaded archive"
+        ),
+    }
 }
 
 /// Roll back a cache file that is on disk with no DB row pointing at it.
@@ -1264,20 +1321,36 @@ fn cache_key_header(headers: &HeaderMap) -> Result<&str, AppError> {
     Ok(key)
 }
 
-fn cache_archive_path(state: &AppState, repo_id: i64, key: &str) -> std::path::PathBuf {
-    let name = cache_key_hash(key);
+/// Where one repository's cache archives live.
+fn cache_archive_dir(state: &AppState, repo_id: i64) -> std::path::PathBuf {
     state
         .repo_root
         .join("_ci_cache")
         .join(repo_id.to_string())
-        .join(format!("{name}.tar"))
+}
+
+/// Resolve the archive a cache row names, inside `directory` and nowhere else.
+///
+/// A row records the full path it was written under, and both writers — this
+/// module and the in-process runner in `rg_ci` — spell that root differently
+/// (configured `repo_root` versus a path derived from the repository), so the
+/// prefix is not something either side can compare against. The file name is:
+/// every archive of a repository sits directly in this one directory, which is
+/// also what keeps a row from ever addressing a file outside it.
+fn recorded_cache_archive(
+    directory: &std::path::Path,
+    recorded: &str,
+) -> Option<std::path::PathBuf> {
+    std::path::Path::new(recorded)
+        .file_name()
+        .map(|name| directory.join(name))
 }
 
 /// One actionable error for a filesystem failure on the server side of the CI
 /// cache.
 ///
-/// The archive path is `_ci_cache/<repo_id>/<sha256-of-cache-key>.tar` under
-/// `repo_root`: it is derived inside the handler and never appears in the
+/// The archive path is `_ci_cache/<repo_id>/<sha256-of-cache-key>.<publication>.tar`
+/// under `repo_root`: it is built inside the handler and never appears in the
 /// request, so a bare `io::Error` hands the operator an errno for a file they
 /// cannot locate. This is the same directory the runner reports through
 /// `rg_ci`'s cache diagnostics — both halves quote one remedy, because one
