@@ -269,21 +269,27 @@ pub async fn redeliver(db: &DatabaseConnection, delivery_id: i64) -> Result<()> 
         .await?
         .ok_or_else(|| crate::error::not_found("webhook"))?;
 
-    let payload = delivery.request_payload.clone().unwrap_or_default();
+    // Redelivery is "send the recorded request again", so a payload we cannot
+    // reproduce has to stop the operation. Both fallbacks here used to produce
+    // a *different* request instead: a delivery row with no recorded payload
+    // became `""`, an unreadable one stayed a string that would not parse, and
+    // either way `unwrap_or(Value::Null)` posted a body of `null` to the
+    // receiver — under a `200 redelivery triggered`. That is the one failure
+    // mode a webhook must not have: not "did not arrive", but "arrived wrong".
+    let payload = delivery.request_payload.as_deref().ok_or_else(|| {
+        crate::error::conflict(format!(
+            "webhook delivery {delivery_id} has no recorded request payload to resend"
+        ))
+    })?;
+    let payload: Value = serde_json::from_str(payload).with_context(|| {
+        format!("stored request_payload of webhook delivery {delivery_id} is not valid JSON")
+    })?;
 
-    // Fire and record a new delivery
-    if let Err(e) = trigger_event(
-        db,
-        hook.repo_id,
-        &delivery.event,
-        &serde_json::from_str(&payload).unwrap_or(Value::Null),
-    )
-    .await
-    {
-        tracing::warn!(error = %format!("{e:#}"), "failed to redeliver webhook event");
-    }
-
-    Ok(())
+    // Fire and record a new delivery. A failure here is the hook lookup
+    // failing, not a receiver rejecting the POST — the per-hook delivery is
+    // spawned and records its own outcome — so it must not be reported as a
+    // triggered redelivery.
+    trigger_event(db, hook.repo_id, &delivery.event, &payload).await
 }
 
 // ── Convenience event helpers ───────────────────────────────────────────

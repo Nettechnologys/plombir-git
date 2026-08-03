@@ -566,16 +566,34 @@ async fn load_timeline_data(
     db: &sea_orm::DatabaseConnection,
     pr: pull_request::Model,
 ) -> Result<TimelineData, axum::response::Response> {
-    let persisted_events = rg_db::ops::pr_event_ops::list_by_pr(db, pr.id)
+    let stored_events = rg_db::ops::pr_event_ops::list_by_pr(db, pr.id)
         .await
-        .map_err(|error| AppError::from(error).into_response())?
-        .into_iter()
-        .map(|event| {
-            let metadata =
-                serde_json::from_str(&event.metadata).unwrap_or_else(|_| serde_json::json!({}));
-            (event, metadata)
-        })
-        .collect::<Vec<_>>();
+        .map_err(|error| AppError::from(error).into_response())?;
+    // `{}` used to stand in for metadata that would not decode, and it is not a
+    // neutral placeholder here. The entry renders empty but real, and — worse —
+    // `has_resource_event` deduplicates a stored event against the synthesized
+    // one *by a field inside metadata*, so an empty object matches nothing and
+    // the same event lands in the timeline twice: once hollow, once
+    // synthesized. One unreadable blob thus became a visibly
+    // self-contradicting history, served under `200`.
+    let mut persisted_events = Vec::with_capacity(stored_events.len());
+    for event in stored_events {
+        let metadata: serde_json::Value = match serde_json::from_str(&event.metadata) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::error!(
+                    pr_id = pr.id,
+                    event_id = event.id,
+                    error = %error,
+                    "stored pr_events.metadata is not valid JSON"
+                );
+                return Err(
+                    AppError::internal("stored pull request event is unreadable").into_response(),
+                );
+            }
+        };
+        persisted_events.push((event, metadata));
+    }
     let reviews = rg_db::ops::pr_review_ops::list_by_pr(db, pr.id)
         .await
         .map_err(|error| AppError::from(error).into_response())?;
