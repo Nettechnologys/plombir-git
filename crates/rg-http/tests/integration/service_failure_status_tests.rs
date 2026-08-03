@@ -134,8 +134,9 @@ async fn org_create_separates_a_rejected_name_from_a_broken_insert() {
     assert_not_blamed_on_the_client(status, &body, "organization");
 }
 
-/// `POST .../releases` — a duplicate tag is the caller's, a dead `releases`
-/// table is ours.
+/// `POST .../releases` — a duplicate tag is the caller's (a `409` since
+/// card_cfba32a77acd: the request is right, the tag that exists refuses it), a
+/// dead `releases` table is ours.
 #[tokio::test]
 async fn release_create_separates_a_duplicate_tag_from_a_broken_insert() {
     let (base, db, token, _repo_id) = app_with_repo("relfail").await;
@@ -161,8 +162,8 @@ async fn release_create_separates_a_duplicate_tag_from_a_broken_insert() {
         .expect("request");
     assert_eq!(
         resp.status(),
-        400,
-        "a duplicate tag is still the caller's mistake"
+        409,
+        "a duplicate tag is refused by the release that holds it"
     );
 
     // An empty title is the other request-shaped branch of the same service.
@@ -191,9 +192,10 @@ async fn release_create_separates_a_duplicate_tag_from_a_broken_insert() {
     assert_not_blamed_on_the_client(status, &body, "release");
 }
 
-/// `POST .../wiki` — a duplicate page title is the caller's, a dead
-/// `wiki_pages` table is ours. Covers the `resolve_repo_id` helper too: it used
-/// to swallow the lookup error with `.ok().flatten()` and answer `404`.
+/// `POST .../wiki` — a duplicate page title is the caller's (a `409` since
+/// card_cfba32a77acd), a dead `wiki_pages` table is ours. Covers the
+/// `resolve_repo_id` helper too: it used to swallow the lookup error with
+/// `.ok().flatten()` and answer `404`.
 #[tokio::test]
 async fn wiki_create_separates_a_duplicate_title_from_a_broken_insert() {
     let (base, db, token, _repo_id) = app_with_repo("wikifail").await;
@@ -219,8 +221,8 @@ async fn wiki_create_separates_a_duplicate_title_from_a_broken_insert() {
         .expect("request");
     assert_eq!(
         resp.status(),
-        400,
-        "a duplicate wiki title is still the caller's mistake"
+        409,
+        "a duplicate wiki title is refused by the page that holds it"
     );
 
     // A page that genuinely is not there stays a 404, so the 5xx below cannot

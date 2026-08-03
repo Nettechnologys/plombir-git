@@ -24,20 +24,27 @@ pub async fn create_org(
         ));
     }
 
+    // The one answer both the pre-read and a losing insert give, so a caller
+    // cannot tell which of the two noticed — and so the response code does not
+    // become a side channel for "you lost the race".
+    //
+    // `Conflict`, not `InvalidRequest`: `validate_username` above owns
+    // everything about the name the caller can fix, and it answers 400. What is
+    // left is an organization that already holds the name — the same reading as
+    // the taken-username branch of registration, which answers 409.
+    let already_taken =
+        || crate::error::conflict(format!("organization name '{name}' is already taken"));
+
     // Check if org name is already taken
     if org_ops::get_org_by_name(db, name).await?.is_some() {
-        return Err(crate::error::invalid_request(format!(
-            "organization name '{name}' is already taken"
-        )));
+        return Err(already_taken());
     }
 
     org_ops::create_org(db, name, display_name, description, owner_id, visibility)
         .await
         .map_err(|error| {
             if rg_db::is_unique_violation_anyhow(&error) {
-                crate::error::invalid_request(format!(
-                    "organization name '{name}' is already taken"
-                ))
+                already_taken()
             } else {
                 error
             }

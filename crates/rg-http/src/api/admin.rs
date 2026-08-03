@@ -669,7 +669,9 @@ fn validate_ldap_provider_request(
     request_body(content = serde_json::Value),
     responses(
         (status = 201, description = "Created"),
+        (status = 400, description = "Incomplete or unknown provider configuration"),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "A provider with that slug already exists"),
     ),
 )]
 pub async fn create_sso_provider(
@@ -698,11 +700,15 @@ pub async fn create_sso_provider(
     // `sso_providers.slug` is UNIQUE, and the insert below is the only place that
     // ever noticed: the constraint violation came back as a `DbErr` that the
     // handler relabelled a bad request, raw text and all. Check it here so a
-    // duplicate slug is a 400 that says so, and the insert's own failures are
-    // free to be the 5xx they are.
+    // duplicate slug says so, and the insert's own failures are free to be the
+    // 5xx they are.
+    //
+    // `conflict`, not `bad_request`: the body is valid and an existing provider
+    // holds the slug. The admin renames one of the two or deletes the other —
+    // there is nothing in the request to fix.
     match rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &body.slug).await {
         Ok(Some(_)) => {
-            return AppError::bad_request(format!(
+            return AppError::conflict(format!(
                 "an SSO provider with slug '{}' already exists",
                 body.slug
             ))
@@ -769,9 +775,11 @@ pub async fn create_sso_provider(
             (StatusCode::CREATED, Json(sso_provider_response(&provider))).into_response()
         }
         // A concurrent request can cross the pre-check above and lose the
-        // UNIQUE race here.  It is still the same bad request; every other
-        // database failure remains a 5xx through the normal error funnel.
-        Err(error) if rg_db::is_unique_violation(&error) => AppError::bad_request(format!(
+        // UNIQUE race here. It is the same outcome in the same words — a code
+        // of its own would make the response a side channel for "you lost the
+        // race". Every other database failure remains a 5xx through the normal
+        // error funnel.
+        Err(error) if rg_db::is_unique_violation(&error) => AppError::conflict(format!(
             "an SSO provider with slug '{}' already exists",
             body.slug
         ))
@@ -792,7 +800,9 @@ pub async fn create_sso_provider(
     request_body(content = serde_json::Value),
     responses(
         (status = 200, description = "Updated"),
+        (status = 400, description = "Incomplete or unknown provider configuration"),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "Another provider already holds that slug"),
     ),
 )]
 pub async fn update_sso_provider(
@@ -836,7 +846,7 @@ pub async fn update_sso_provider(
     if body.slug != existing_provider.slug {
         match rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &body.slug).await {
             Ok(Some(_)) => {
-                return AppError::bad_request(format!(
+                return AppError::conflict(format!(
                     "an SSO provider with slug '{}' already exists",
                     body.slug
                 ))

@@ -26,17 +26,25 @@ pub async fn create_protection(
 ) -> Result<ProtectedBranch> {
     let repo = resolve_repo(db, owner, repo_name).await?;
 
+    // `Conflict`, not `InvalidRequest`: the branch name is well-formed and an
+    // existing rule refuses it. The caller edits that rule or deletes it — the
+    // request itself has nothing to fix. Same reading as `tag protection
+    // pattern already exists`, its neighbour one route over, which already
+    // answers 409.
+    let already_protected =
+        || crate::error::conflict(format!("branch '{branch_name}' is already protected"));
+
     // Check if protection already exists
     if protected_branch_ops::find_by_repo_and_branch(db, repo.id, &branch_name)
         .await?
         .is_some()
     {
-        return Err(crate::error::invalid_request(format!(
-            "branch '{branch_name}' is already protected"
-        )));
+        return Err(already_protected());
     }
 
-    let duplicate_message = format!("branch '{branch_name}' is already protected");
+    // Taken before `branch_name` moves into the model below, so the losing
+    // insert can still name the branch it lost on.
+    let duplicate = already_protected();
     let model = protected_branch::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo.id),
@@ -71,7 +79,7 @@ pub async fn create_protection(
         .await
         .map_err(|error| {
             if rg_db::is_unique_violation_anyhow(&error) {
-                crate::error::invalid_request(duplicate_message)
+                duplicate
             } else {
                 error
             }

@@ -26,8 +26,10 @@ pub async fn create_page(
 ) -> Result<wiki_page::Model> {
     // The one answer both the pre-read and a losing insert give, so a caller
     // cannot tell which of the two noticed — and so no constraint text leaks.
+    // `Conflict`, not `InvalidRequest`: an existing page refuses the title, and
+    // the caller either picks another one or edits the page that holds it.
     let already_exists = || {
-        crate::error::invalid_request(format!(
+        crate::error::conflict(format!(
             "wiki page '{title}' already exists in this repository"
         ))
     };

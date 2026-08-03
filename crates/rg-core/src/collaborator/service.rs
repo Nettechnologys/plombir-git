@@ -29,11 +29,17 @@ pub async fn add_collaborator(
         }
     }
 
-    // Check if already a collaborator
+    // Check if already a collaborator.
+    //
+    // `Conflict`, not `InvalidRequest`: the permission is one of the three
+    // valid ones (the match above owns that, and answers 400) and the user
+    // exists — an existing membership row refuses the request. Adding them
+    // again is impossible until it is removed, or the permission is changed
+    // through `PATCH`, which is what the message points at.
     if let Some(existing) =
         repo_collaborator_ops::find_by_repo_and_user(db, repo.id, user_id).await?
     {
-        return Err(crate::error::invalid_request(format!(
+        return Err(crate::error::conflict(format!(
             "user {} is already a collaborator (permission: {})",
             user_id, existing.permission
         )));

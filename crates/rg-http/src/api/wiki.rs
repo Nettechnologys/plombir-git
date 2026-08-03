@@ -143,6 +143,7 @@ pub async fn get_page(
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 409, description = "A page with that title already exists in this repository", body = serde_json::Value),
     ),
 )]
 pub async fn create_page(

@@ -133,6 +133,7 @@ pub struct AddTeamMemberRequest {
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "That organization name is already taken", body = serde_json::Value),
     ),
 )]
 pub async fn create_org(

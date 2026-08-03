@@ -439,10 +439,11 @@ async fn register_separates_a_taken_username_from_a_broken_insert() {
 }
 
 /// `POST .../branches/protection` — protecting an already-protected branch is
-/// the caller's, the `protected_branches` insert is ours. The `PATCH`/`DELETE`
-/// pair adds the third outcome: a rule that is not there is a 404, which is
-/// what `get_protection` on the same routes already answered while its two
-/// siblings called it a bad request.
+/// the caller's (a `409` since card_cfba32a77acd, next to its neighbour `tag
+/// protection pattern already exists`), the `protected_branches` insert is
+/// ours. The `PATCH`/`DELETE` pair adds the third outcome: a rule that is not
+/// there is a 404, which is what `get_protection` on the same routes already
+/// answered while its two siblings called it a bad request.
 #[tokio::test]
 async fn branch_protection_separates_a_duplicate_rule_from_a_broken_insert() {
     let (base, db, token, _repo_id) = app_with_repo("bpfail").await;
@@ -468,8 +469,8 @@ async fn branch_protection_separates_a_duplicate_rule_from_a_broken_insert() {
         .expect("request");
     assert_eq!(
         resp.status(),
-        400,
-        "protecting the same branch twice is still the caller's mistake"
+        409,
+        "protecting the same branch twice is refused by the rule that exists"
     );
 
     let resp = client
@@ -614,7 +615,7 @@ async fn register_unique_loss_after_the_precheck_is_the_same_conflict() {
 }
 
 #[tokio::test]
-async fn org_unique_loss_after_the_precheck_stays_a_bad_request() {
+async fn org_unique_loss_after_the_precheck_is_the_same_conflict() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, _user_id) =
         register_full(&base, "race-org-owner", "race-org-owner@example.test").await;
@@ -653,8 +654,8 @@ async fn org_unique_loss_after_the_precheck_stays_a_bad_request() {
 
     assert_eq!(
         response.status(),
-        400,
-        "an organization insert that loses the UNIQUE race must not become a 500"
+        409,
+        "an organization insert that loses the UNIQUE race is the same client outcome as a sequential duplicate"
     );
     let body: serde_json::Value = response.json().await.expect("json body");
     assert_eq!(
@@ -664,7 +665,7 @@ async fn org_unique_loss_after_the_precheck_stays_a_bad_request() {
 }
 
 #[tokio::test]
-async fn branch_protection_unique_loss_after_the_precheck_stays_a_bad_request() {
+async fn branch_protection_unique_loss_after_the_precheck_is_the_same_conflict() {
     let (base, db, token, _repo_id) = app_with_repo("racebranch").await;
     db.execute_unprepared(
         r#"
@@ -695,13 +696,13 @@ async fn branch_protection_unique_loss_after_the_precheck_stays_a_bad_request() 
 
     assert_eq!(
         response.status(),
-        400,
-        "a branch-protection insert that loses the UNIQUE race must not become a 500"
+        409,
+        "a branch-protection insert that loses the UNIQUE race is the same client outcome as a sequential duplicate"
     );
 }
 
 #[tokio::test]
-async fn sso_provider_unique_loss_after_the_precheck_stays_a_bad_request() {
+async fn sso_provider_unique_loss_after_the_precheck_is_the_same_conflict() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) =
         register_full(&base, "race-sso-admin", "race-sso-admin@example.test").await;
@@ -745,8 +746,8 @@ async fn sso_provider_unique_loss_after_the_precheck_stays_a_bad_request() {
 
     assert_eq!(
         response.status(),
-        400,
-        "an SSO-provider insert that loses the UNIQUE race must not become a 500"
+        409,
+        "an SSO-provider insert that loses the UNIQUE race is the same client outcome as a sequential duplicate"
     );
     let body: serde_json::Value = response.json().await.expect("json body");
     assert_eq!(

@@ -300,6 +300,13 @@ pub async fn find_repo_by_owner_name(
 /// refusal in their own words ("already exists", "…in your account", "…at
 /// destination") and those wordings are what their tests read.
 ///
+/// The refusal is a [`Conflict`](crate::error::Conflict), not an
+/// [`InvalidRequest`](crate::error::InvalidRequest): the name is well-formed
+/// and the request is correct — an existing repository refuses it, and only
+/// deleting or renaming that repository changes the answer. Same reading as
+/// `label '…' already exists in this repository` and the taken-username branch
+/// of registration.
+///
 /// `except_repo_id` is the repository the name is being claimed *for*, when one
 /// already exists — a transfer moves a row rather than adding one, and a row
 /// never collides with itself.
@@ -320,7 +327,7 @@ async fn ensure_repo_name_free(
         None => repo_ops::find_personal_by_owner_and_name(db, owner_id, name).await?,
     };
     if occupies(taken).is_some() {
-        return Err(crate::error::invalid_request(taken_message.to_string()));
+        return Err(crate::error::conflict(taken_message.to_string()));
     }
 
     Ok(())
@@ -685,7 +692,7 @@ pub async fn create_repo_with_opts(
         Err(error) => {
             discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
-                crate::error::invalid_request(format!("repository '{name}' already exists"))
+                crate::error::conflict(format!("repository '{name}' already exists"))
             } else {
                 error
             });
@@ -1590,7 +1597,7 @@ pub async fn fork_repo(
         Err(error) => {
             discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
-                crate::error::invalid_request(format!(
+                crate::error::conflict(format!(
                     "repository '{repo_name}' already exists in your account"
                 ))
             } else {
@@ -1705,7 +1712,7 @@ pub async fn transfer_repo(
         // before this update landed. That is the caller's answer in the words
         // that check uses, not a server fault. Any other failure stays an error.
         return Err(if rg_db::is_unique_violation_anyhow(&error) {
-            crate::error::invalid_request(format!(
+            crate::error::conflict(format!(
                 "repository '{repo_name}' already exists at destination"
             ))
         } else {

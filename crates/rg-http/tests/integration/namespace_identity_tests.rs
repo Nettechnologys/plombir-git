@@ -220,7 +220,7 @@ async fn a_name_already_used_in_the_same_namespace_is_still_refused() {
     );
     assert_eq!(
         create_repo_in(&base, &token, "solo", None).await.0,
-        400,
+        409,
         "a second personal repository of the same name was accepted"
     );
 
@@ -236,7 +236,7 @@ async fn a_name_already_used_in_the_same_namespace_is_still_refused() {
         create_repo_in(&base, &token, "solo", Some("ni5corp"))
             .await
             .0,
-        400,
+        409,
         "a second repository of the same name in one organization was accepted"
     );
 }

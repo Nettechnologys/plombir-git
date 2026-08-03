@@ -185,8 +185,12 @@ async fn a_cookie_session_may_fork_and_an_anonymous_caller_may_not() {
     );
 }
 
-/// A repository the forker already owns under that name is a `400`, not a `500`
+/// A repository the forker already owns under that name is a `409`, not a `500`
 /// and not a silent second clone over the first one's directory.
+///
+/// `409` and not `400` since card_cfba32a77acd: the fork request is correct and
+/// an existing repository refuses it — the forker renames or deletes that one,
+/// there is nothing in the request to fix.
 #[tokio::test]
 async fn forking_twice_is_refused_without_touching_the_first_fork() {
     let (base, repo_root) = spawn_test_app_with_repo_root().await;
@@ -215,8 +219,8 @@ async fn forking_twice_is_refused_without_touching_the_first_fork() {
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(
-        status, 400,
-        "a second fork under the same name is the caller's mistake, got {status} (body: {body})"
+        status, 409,
+        "a second fork under the same name is refused by the name that is taken, got {status} (body: {body})"
     );
     assert_eq!(
         head_commit(&repo_root.join("twiceoutsider/twiceme.git")),

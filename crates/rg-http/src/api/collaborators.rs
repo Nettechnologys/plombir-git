@@ -77,6 +77,7 @@ pub async fn list_collaborators(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Repository admin access required", body = serde_json::Value),
         (status = 404, description = "Repository not found", body = serde_json::Value),
+        (status = 409, description = "That user is already a collaborator", body = serde_json::Value),
     ),
 )]
 pub async fn add_collaborator(

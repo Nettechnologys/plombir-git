@@ -11,6 +11,14 @@
 //! * **The race resolves to one row and one answer.** Exactly one attempt
 //!   creates the row; every loser is told the name is taken, in the same words
 //!   the pre-read branch uses and with no constraint text.
+//!
+//!   The type checked here is `Conflict` (409), not `InvalidRequest` (400):
+//!   card_cfba32a77acd moved the whole "that name is taken" family off 400,
+//!   because the request is correct and it is an existing row that refuses it.
+//!   What this file guards is unchanged either way — the loser must get the
+//!   pre-read branch's answer rather than a database failure, and both branches
+//!   must keep answering identically so the status code cannot become a side
+//!   channel for "you lost the race".
 //! * **The fold stays narrow.** A write that fails for any other reason is
 //!   still an error, or a storage outage would be reported to the client as
 //!   their own conflict.
@@ -95,9 +103,7 @@ fn assert_is_the_caller_s_conflict(error: &anyhow::Error, expected: &str) {
          database failure: {error:#}"
     );
     assert!(
-        error
-            .downcast_ref::<rg_core::error::InvalidRequest>()
-            .is_some(),
+        error.downcast_ref::<rg_core::error::Conflict>().is_some(),
         "the answer must carry the client-error type, or the handler still renders \
          a 5xx: {error:#}"
     );

@@ -37,9 +37,13 @@ pub async fn create_release(
 
     // The one answer both the pre-read and a losing insert give, so a caller
     // cannot tell which of the two noticed — and so no constraint text leaks.
-    let already_exists = || {
-        crate::error::invalid_request(format!("release with tag '{tag_name}' already exists"))
-    };
+    //
+    // `Conflict`, not `InvalidRequest`: the tag is well-formed (the empty-tag
+    // check above is the request's own fault and stays a 400) and an existing
+    // release refuses it. Editing the request cannot help; publishing under
+    // another tag, or deleting that release, can.
+    let already_exists =
+        || crate::error::conflict(format!("release with tag '{tag_name}' already exists"));
 
     // Check for duplicate tag. This read is the fast path only — the row can
     // still appear between here and the insert below, which is why the insert

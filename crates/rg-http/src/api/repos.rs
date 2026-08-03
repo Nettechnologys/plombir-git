@@ -168,6 +168,7 @@ pub struct RepoResponse {
         (status = 400, description = "Invalid input", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden (org membership required)", body = serde_json::Value),
+        (status = 409, description = "A repository of that name already exists in the namespace", body = serde_json::Value),
     )
 )]
 pub async fn create_repo(
@@ -696,6 +697,7 @@ pub struct ForkRequest {
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Source repository not readable by this caller", body = serde_json::Value),
         (status = 404, description = "No such source repository", body = serde_json::Value),
+        (status = 409, description = "The forker already owns a repository of that name", body = serde_json::Value),
     ),
 )]
 pub async fn fork_repo_handler(
@@ -830,6 +832,7 @@ impl TargetOwner for TransferRequest {
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden (source not owned, or destination namespace is someone else's)", body = serde_json::Value),
+        (status = 409, description = "The destination namespace already holds a repository of that name", body = serde_json::Value),
     ),
 )]
 pub async fn transfer_repo_handler(
