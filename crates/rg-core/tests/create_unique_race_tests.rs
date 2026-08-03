@@ -30,6 +30,13 @@
 //! two real racers collide in `gix init` before either reaches the insert. That
 //! window is opened deterministically instead, with a `BEFORE INSERT` trigger
 //! that plants the conflicting row — the insert then loses the race every run.
+//!
+//! card_a113f0339048 added the fifth and last site of the generator,
+//! `collaborator::service::add_collaborator`, raced for real like the wiki and
+//! release pairs. Its answer names the permission the membership already
+//! carries, which the losing attempt does not know — so it re-reads to say it,
+//! and what the race test proves is precisely that the loser still ends up with
+//! the pre-read branch's whole sentence.
 
 use sea_orm::ConnectionTrait;
 
@@ -444,5 +451,164 @@ async fn a_fork_that_loses_the_namespace_race_is_the_caller_s_conflict() {
     assert!(
         !repo_root.join("forker/cloneme.git").exists(),
         "the clone of the losing attempt must still be discarded"
+    );
+}
+
+// ── collaborators ─────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_collaborator_additions_leave_one_row_and_one_caller_conflict() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db = fresh_db(directory.path()).await;
+    let owner_id = create_user(&db, "collabowner").await;
+    let friend_id = create_user(&db, "collabfriend").await;
+    let repo_id = bare_repo_row(&db, owner_id, "collabraced").await;
+
+    let attempts: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                rg_core::collaborator::service::add_collaborator(
+                    &db,
+                    "collabowner",
+                    "collabraced",
+                    friend_id,
+                    "write".to_string(),
+                )
+                .await
+            })
+        })
+        .collect();
+
+    let mut created = 0;
+    let mut refused = 0;
+    for attempt in attempts {
+        match attempt.await.expect("task panicked") {
+            Ok(_) => created += 1,
+            Err(error) => {
+                refused += 1;
+                // The whole sentence, permission clause included: the loser
+                // re-reads the winning row so it answers in the pre-read
+                // branch's own words rather than a shortened variant that
+                // would tell the caller which of the two noticed.
+                assert_is_the_caller_s_conflict(
+                    &error,
+                    &format!("user {friend_id} is already a collaborator (permission: write)"),
+                );
+            }
+        }
+    }
+
+    assert_eq!(created, 1, "exactly one attempt may add the collaborator");
+    assert_eq!(
+        refused, 7,
+        "every other attempt must be answered, not dropped"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM repo_collaborators \
+                 WHERE repo_id = {repo_id} AND user_id = {friend_id}"
+            )
+        )
+        .await,
+        1,
+        "the repository must end up with exactly one membership for the user"
+    );
+}
+
+/// The eight-task race above cannot promise that any given run has a loser
+/// reaching the *insert* rather than the pre-read, so the classification itself
+/// is also opened deterministically: a `BEFORE INSERT` trigger plants the
+/// conflicting membership, and the insert loses every run.
+///
+/// SQLite rolls a failed statement back together with what its trigger did, so
+/// the planted row is gone by the time the loser re-reads it — which is exactly
+/// the "membership removed again in the meantime" case. The answer must still
+/// be the caller's 409, just without the permission clause it can no longer
+/// name; degrading to a 500 there would put the whole fix back.
+#[tokio::test]
+async fn a_collaborator_insert_that_loses_the_membership_race_is_the_caller_s_conflict() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db = fresh_db(directory.path()).await;
+    let owner_id = create_user(&db, "collabracer").await;
+    let friend_id = create_user(&db, "collabracedfriend").await;
+    let repo_id = bare_repo_row(&db, owner_id, "collabplanted").await;
+
+    // The planted row carries a permission the guard does not match, so it
+    // cannot re-arm the injector.
+    db.execute_unprepared(
+        "CREATE TRIGGER repo_collaborators_add_race BEFORE INSERT ON repo_collaborators \
+         WHEN NEW.permission = 'write' \
+         BEGIN \
+           INSERT INTO repo_collaborators (repo_id, user_id, permission, created_at) \
+           VALUES (NEW.repo_id, NEW.user_id, 'read', NEW.created_at); \
+         END;",
+    )
+    .await
+    .expect("install the race injector");
+
+    let error = rg_core::collaborator::service::add_collaborator(
+        &db,
+        "collabracer",
+        "collabplanted",
+        friend_id,
+        "write".to_string(),
+    )
+    .await
+    .expect_err("the insert lost the race");
+
+    assert_is_the_caller_s_conflict(
+        &error,
+        &format!("user {friend_id} is already a collaborator"),
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) AS n FROM repo_collaborators WHERE repo_id = {repo_id}")
+        )
+        .await,
+        0,
+        "the losing attempt must not leave a row behind"
+    );
+}
+
+#[tokio::test]
+async fn a_collaborator_insert_that_fails_for_another_reason_is_not_reported_as_a_duplicate() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db = fresh_db(directory.path()).await;
+    let owner_id = create_user(&db, "collabouroutage").await;
+    let friend_id = create_user(&db, "collabfrienddown").await;
+    bare_repo_row(&db, owner_id, "collabdown").await;
+
+    // Fails the INSERT only, so the pre-read still answers "not a collaborator"
+    // and the failure is reached where the classification lives.
+    db.execute_unprepared(
+        "CREATE TRIGGER repo_collaborators_storage_outage BEFORE INSERT ON repo_collaborators \
+         BEGIN SELECT RAISE(ABORT, 'storage is unavailable'); END;",
+    )
+    .await
+    .expect("install the write fault");
+
+    let error = rg_core::collaborator::service::add_collaborator(
+        &db,
+        "collabouroutage",
+        "collabdown",
+        friend_id,
+        "write".to_string(),
+    )
+    .await
+    .expect_err("the insert was refused");
+
+    assert!(
+        error.downcast_ref::<rg_core::error::Conflict>().is_none(),
+        "a refused write is not the caller's conflict: {error:#}"
+    );
+    assert!(
+        error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .is_none(),
+        "nor is it a malformed request: {error:#}"
     );
 }

@@ -31,18 +31,13 @@ pub async fn add_collaborator(
 
     // Check if already a collaborator.
     //
-    // `Conflict`, not `InvalidRequest`: the permission is one of the three
-    // valid ones (the match above owns that, and answers 400) and the user
-    // exists — an existing membership row refuses the request. Adding them
-    // again is impossible until it is removed, or the permission is changed
-    // through `PATCH`, which is what the message points at.
+    // This read is the fast path only — the membership row can appear between
+    // here and the insert below, which is why that insert classifies its own
+    // failure instead of trusting this answer.
     if let Some(existing) =
         repo_collaborator_ops::find_by_repo_and_user(db, repo.id, user_id).await?
     {
-        return Err(crate::error::conflict(format!(
-            "user {} is already a collaborator (permission: {})",
-            user_id, existing.permission
-        )));
+        return Err(already_a_collaborator(user_id, Some(&existing.permission)));
     }
 
     let model = repo_collaborator::ActiveModel {
@@ -53,9 +48,53 @@ pub async fn add_collaborator(
         created_at: Set(Utc::now()),
     };
 
-    let created = repo_collaborator_ops::create(db, model).await?;
+    let created = match repo_collaborator_ops::create(db, model).await {
+        Ok(created) => created,
+        // Losing the `idx_repo_collaborators_repo_user` race is the same
+        // outcome the read above reports, reached a moment later: someone else
+        // added this user first. Left unclassified it was a raw constraint
+        // failure, and the handler rendered a 500 for something the caller
+        // neither caused nor can fix.
+        //
+        // Only that one loss is folded — a foreign-key failure or a database
+        // outage stays an error, or a broken server would be reported as the
+        // client's own conflict.
+        //
+        // The winner's permission is not knowable from here (this attempt only
+        // knows the one it asked for), so it is re-read to answer in the
+        // pre-read branch's own words. A membership removed again in the
+        // meantime, or a read that fails too, drops that clause rather than
+        // turning a settled 409 back into a 500.
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
+            let winner = repo_collaborator_ops::find_by_repo_and_user(db, repo.id, user_id).await;
+            let permission = match &winner {
+                Ok(Some(existing)) => Some(existing.permission.as_str()),
+                Ok(None) | Err(_) => None,
+            };
+            return Err(already_a_collaborator(user_id, permission));
+        }
+        Err(error) => return Err(error),
+    };
     crate::repo::service::invalidate_perm_cache_user(db, repo.id, user_id);
     Ok(created)
+}
+
+/// The one answer both the pre-read and the losing insert give, so a caller
+/// cannot tell which of the two noticed. Carries no constraint or `db:` text —
+/// this message reaches the client verbatim.
+///
+/// A `Conflict`, not an `InvalidRequest`: the permission is one of the three
+/// valid ones (the `match` in [`add_collaborator`] owns that, and answers 400)
+/// and the user exists — an existing membership row refuses the request.
+/// Adding them again is impossible until it is removed, or the permission is
+/// changed through `PATCH`, which is what the message points at.
+fn already_a_collaborator(user_id: i64, permission: Option<&str>) -> anyhow::Error {
+    match permission {
+        Some(permission) => crate::error::conflict(format!(
+            "user {user_id} is already a collaborator (permission: {permission})"
+        )),
+        None => crate::error::conflict(format!("user {user_id} is already a collaborator")),
+    }
 }
 
 /// List all collaborators for a repo.
