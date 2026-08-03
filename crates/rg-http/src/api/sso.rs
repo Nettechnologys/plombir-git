@@ -185,6 +185,77 @@ fn get_api_base_url(state: &AppState, headers: &HeaderMap) -> String {
     format!("{}/api/v1", base.trim_end_matches('/'))
 }
 
+// ── Provider resolution ──────────────────────────────────────────
+
+/// Resolve the provider behind `slug` **in a state where it may be used**.
+///
+/// `enabled` used to be a convention: every entry point looked the provider up
+/// by slug and was expected to remember to re-read the flag afterwards.
+/// `authorize` and `callback` remembered; `refresh_token` did not — so an
+/// operator could switch a provider off and already-linked accounts kept
+/// renewing their OAuth tokens through it indefinitely. The question is asked
+/// once, here, and a door that does not ask it never gets a provider at all.
+///
+/// [`unlink_oauth_account`] deliberately does **not** come through here: a user
+/// must be able to drop a link to a provider the operator has since switched
+/// off. That is an exception with a reason, not a fourth handler that forgot.
+async fn resolve_usable_provider(
+    state: &AppState,
+    slug: &str,
+) -> Result<rg_db::entities::sso_provider::Model, AppError> {
+    let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, slug)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found(format!("SSO provider '{}' not found", slug)))?;
+
+    if !provider.enabled {
+        return Err(AppError::forbidden("SSO provider is disabled"));
+    }
+
+    Ok(provider)
+}
+
+/// Build the OAuth2/OIDC client config for a provider already proven usable.
+///
+/// The three doors used to carry their own copy of this, and the copies had
+/// drifted: `refresh_token`'s swallowed a decryption failure into an empty
+/// client secret and then asked the provider to refresh with it, so a wrong
+/// `[auth].encryption_key` surfaced as the provider's rejection rather than as
+/// ours. One body, one answer — a secret that will not decrypt is a 500 here
+/// too.
+fn provider_config(
+    provider: &rg_db::entities::sso_provider::Model,
+    enc_key: &[u8; 32],
+    redirect_url: String,
+) -> Result<rg_core::auth::sso::SsoProviderConfig, AppError> {
+    let client_secret = provider
+        .client_secret_enc
+        .as_ref()
+        .map(|secret| rg_core::auth::encryption::decrypt(secret, enc_key))
+        .transpose()
+        .map_err(|error| {
+            tracing::error!("Decryption error: {}", error);
+            AppError::internal("decryption failed")
+        })?
+        .unwrap_or_default();
+
+    Ok(rg_core::auth::sso::SsoProviderConfig {
+        slug: provider.slug.clone(),
+        provider_type: provider.provider_type.clone(),
+        client_id: provider.client_id.clone().unwrap_or_default(),
+        client_secret,
+        redirect_url,
+        scopes: provider
+            .scopes
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        discovery_url: provider.discovery_url.clone(),
+    })
+}
+
 // ── Types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -267,45 +338,13 @@ pub async fn authorize(
     headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &slug)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found(format!("SSO provider '{}' not found", slug)))?;
-
-    if !provider.enabled {
-        return Err(AppError::forbidden("SSO provider is disabled"));
-    }
+    let provider = resolve_usable_provider(&state, &slug).await?;
 
     let base_url = get_api_base_url(&state, &headers);
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    let client_secret = provider
-        .client_secret_enc
-        .as_ref()
-        .map(|s| rg_core::auth::encryption::decrypt(s, &enc_key))
-        .transpose()
-        .map_err(|e| {
-            tracing::error!("Decryption error: {}", e);
-            AppError::internal("decryption failed")
-        })?
-        .unwrap_or_default();
-
-    let config = rg_core::auth::sso::SsoProviderConfig {
-        slug: provider.slug.clone(),
-        provider_type: provider.provider_type.clone(),
-        client_id: provider.client_id.unwrap_or_default(),
-        client_secret,
-        redirect_url,
-        scopes: provider
-            .scopes
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-        discovery_url: provider.discovery_url.clone(),
-    };
+    let config = provider_config(&provider, &enc_key, redirect_url)?;
 
     let (auth_url, csrf_state, code_verifier) = rg_core::auth::sso::oauth2_authorize_url(&config)
         .await
@@ -389,45 +428,13 @@ pub async fn callback(
     })?;
 
     // ── Get provider config ──────────────────────────────────────
-    let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &slug)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found(format!("SSO provider '{}' not found", slug)))?;
-
-    if !provider.enabled {
-        return Err(AppError::forbidden("SSO provider is disabled"));
-    }
+    let provider = resolve_usable_provider(&state, &slug).await?;
 
     let base_url = get_api_base_url(&state, &headers);
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    let client_secret = provider
-        .client_secret_enc
-        .as_ref()
-        .map(|s| rg_core::auth::encryption::decrypt(s, &enc_key))
-        .transpose()
-        .map_err(|e| {
-            tracing::error!("Decryption error: {}", e);
-            AppError::internal("decryption failed")
-        })?
-        .unwrap_or_default();
-
-    let config = rg_core::auth::sso::SsoProviderConfig {
-        slug: provider.slug.clone(),
-        provider_type: provider.provider_type.clone(),
-        client_id: provider.client_id.clone().unwrap_or_default(),
-        client_secret,
-        redirect_url,
-        scopes: provider
-            .scopes
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-        discovery_url: provider.discovery_url.clone(),
-    };
+    let config = provider_config(&provider, &enc_key, redirect_url)?;
 
     // ── Exchange code for tokens (with PKCE) ─────────────────────
     let token_response =
@@ -552,6 +559,7 @@ pub async fn callback(
     responses(
         (status = 200, description = "Token refreshed"),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "SSO provider is disabled"),
         (status = 404, description = "SSO provider not found"),
     ),
 )]
@@ -561,35 +569,11 @@ pub async fn refresh_token(
     Path(slug): Path<String>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let provider = rg_db::ops::sso_provider_ops::find_by_slug(&state.db, &slug)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found("SSO provider not found"))?;
+    let provider = resolve_usable_provider(&state, &slug).await?;
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    let client_secret = provider
-        .client_secret_enc
-        .as_ref()
-        .map(|s| rg_core::auth::encryption::decrypt(s, &enc_key))
-        .transpose()
-        .unwrap_or_default()
-        .unwrap_or_default();
-
-    let config = rg_core::auth::sso::SsoProviderConfig {
-        slug: provider.slug.clone(),
-        provider_type: provider.provider_type.clone(),
-        client_id: provider.client_id.unwrap_or_default(),
-        client_secret,
-        redirect_url: String::new(), // not needed for refresh
-        scopes: provider
-            .scopes
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-        discovery_url: provider.discovery_url.clone(),
-    };
+    // The redirect URL is not part of a refresh grant.
+    let config = provider_config(&provider, &enc_key, String::new())?;
 
     // Use provided refresh_token or look up from stored OAuth account
     let refresh_token = if let Some(rt) = body.refresh_token {
@@ -707,6 +691,11 @@ pub async fn unlink_oauth_account(
     AuthUser(user_id): AuthUser,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    // No `resolve_usable_provider` here, on purpose: dropping a link must keep
+    // working after the operator switches the provider off, and it touches only
+    // this user's own row. The provider row is not read at all — the link is
+    // addressed by the slug the user already holds.
+    //
     // Find and delete the OAuth account link
     let accounts = rg_db::ops::oauth_account_ops::find_by_user_id(&state.db, user_id)
         .await
