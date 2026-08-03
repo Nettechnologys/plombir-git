@@ -389,9 +389,21 @@ async fn login_via_ldap_inner(
     } else if existing.is_some() && providers.len() != 1 {
         bail!("invalid credentials");
     }
+    // A directory that never answered is not a directory that said no. The
+    // loop keeps the first such failure so that, once every provider has been
+    // tried and none of them authenticated anybody, the outage — and not the
+    // `invalid credentials` verdict below — is what leaves this function. That
+    // verdict costs its subject a strike on the brute-force counter at the
+    // door, so laundering a ten-minute directory outage into it locks every
+    // LDAP account on this instance out for fifteen minutes past the recovery.
+    let mut outage: Option<anyhow::Error> = None;
     for provider in providers {
         let config = match ldap_config_from_provider(&provider, encryption_key) {
             Ok(config) => config,
+            // Configuration is read before anything is dialled, so a provider
+            // that cannot even be built has cost nobody anything: skipping it
+            // is right, and it is not an outage as long as another provider
+            // answers.
             Err(error) => {
                 tracing::warn!(
                     provider_id = provider.id,
@@ -410,11 +422,18 @@ async fn login_via_ldap_inner(
         {
             Ok(Ok(user)) => user,
             Ok(Err(error)) => {
+                let unreachable = error
+                    .downcast_ref::<crate::error::UpstreamUnavailable>()
+                    .is_some();
                 tracing::warn!(
                     provider_id = provider.id,
+                    unreachable,
                     error = %format!("{error:#}"),
                     "LDAP authentication attempt failed"
                 );
+                if unreachable {
+                    outage.get_or_insert(error);
+                }
                 continue;
             }
             Err(_) => {
@@ -422,6 +441,12 @@ async fn login_via_ldap_inner(
                     provider_id = provider.id,
                     "LDAP authentication attempt timed out"
                 );
+                outage.get_or_insert_with(|| {
+                    crate::error::upstream_unavailable(format!(
+                        "the LDAP directory of provider {} did not answer within 10s",
+                        provider.id
+                    ))
+                });
                 continue;
             }
         };
@@ -462,6 +487,13 @@ async fn login_via_ldap_inner(
             },
             method: LoginMethod::Ldap,
         });
+    }
+    // Nobody was authenticated. If that is because a directory broke, say so:
+    // the door enumerates *verdicts*, so an error it does not recognise becomes
+    // a retryable `502` with the chain in the operator log — and, crucially,
+    // never reaches `record_failed_login`.
+    if let Some(error) = outage {
+        return Err(error);
     }
     bail!("invalid credentials")
 }

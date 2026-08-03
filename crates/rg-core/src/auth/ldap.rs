@@ -2,7 +2,7 @@
 //! Two-step: bind with service account, search user DN, rebind with user DN + password.
 
 use anyhow::{Context, Result};
-use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+use ldap3::{LdapConnAsync, LdapConnSettings, LdapError, Scope, SearchEntry};
 
 #[derive(Debug, Clone)]
 pub struct LdapConfig {
@@ -50,6 +50,39 @@ fn escape_filter_value(value: &str) -> String {
     escaped
 }
 
+/// LDAP result code for "these credentials are wrong" (RFC 4511 §4.1.9).
+///
+/// The only non-zero bind result that is a *verdict* about the password. AD
+/// folds its "account locked", "password expired" and "must change password"
+/// cases into it too, with the detail in the diagnostic message — all of them
+/// are still the directory answering about this person's credential.
+const LDAP_INVALID_CREDENTIALS: u32 = 49;
+
+/// Tag a failed round-trip to the directory as *its* failure.
+///
+/// Everything this module does happens against a host the forge does not own,
+/// and none of it can be fixed by the person signing in: a refused connection,
+/// a TLS handshake that fails, a service account the directory no longer
+/// accepts, a search the directory refuses to run. Flattened into a bare
+/// `anyhow::Error` they were indistinguishable from "your password is wrong" —
+/// and one caller up, [`crate::user::service`] turned every one of them into
+/// `invalid credentials`, which the login door then answered with a `401` and
+/// a strike on the brute-force counter.
+///
+/// Layered as *context* over the `LdapError`, so `{:#}` in the operator log
+/// still carries the underlying cause — see [`crate::error::UpstreamUnavailable`].
+trait DirectoryCall<T> {
+    fn directory_call(self, what: &str) -> Result<T>;
+}
+
+impl<T> DirectoryCall<T> for std::result::Result<T, LdapError> {
+    fn directory_call(self, what: &str) -> Result<T> {
+        self.map_err(|error| {
+            anyhow::Error::new(error).context(crate::error::UpstreamUnavailable::new(what))
+        })
+    }
+}
+
 fn connection_settings(config: &LdapConfig) -> LdapConnSettings {
     let settings = LdapConnSettings::new().set_conn_timeout(std::time::Duration::from_secs(10));
     if config.use_tls && config.insecure_skip_tls_verify {
@@ -75,16 +108,19 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
     let settings = connection_settings(config);
     let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &url)
         .await
-        .context("failed to connect to LDAP")?;
+        .directory_call("could not connect to the LDAP directory")?;
 
     ldap3::drive!(conn);
 
-    // Step 1: bind with service account
+    // Step 1: bind with service account. Both halves are the forge's own
+    // credential, not the caller's: a directory that refuses it is broken or
+    // misconfigured, and saying "invalid credentials" to the person signing in
+    // would blame them for it.
     ldap.simple_bind(&config.bind_dn, &config.bind_password)
         .await
-        .map_err(|e| anyhow::anyhow!("LDAP service bind failed: {}", e))?
+        .directory_call("the LDAP service bind did not complete")?
         .success()
-        .map_err(|e| anyhow::anyhow!("LDAP service bind rejected: {:?}", e))?;
+        .directory_call("the LDAP directory refused the service bind")?;
 
     // Step 2: search for user
     let filter = config
@@ -98,9 +134,9 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
             vec!["uid", "mail", "displayName", "cn", "givenName", "sn"],
         )
         .await
-        .map_err(|e| anyhow::anyhow!("LDAP search failed: {}", e))?
+        .directory_call("the LDAP directory search did not complete")?
         .success()
-        .map_err(|e| anyhow::anyhow!("LDAP search rejected: {:?}", e))?;
+        .directory_call("the LDAP directory refused the search")?;
 
     if results.is_empty() {
         anyhow::bail!("user '{}' not found in LDAP directory", username);
@@ -139,22 +175,38 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
     let settings2 = connection_settings(config);
     let (conn2, mut ldap2) = LdapConnAsync::with_settings(settings2, &url)
         .await
-        .context("failed to reconnect to LDAP for user auth")?;
+        .directory_call("could not reconnect to the LDAP directory to verify the password")?;
 
     ldap3::drive!(conn2);
 
     let bind_result = ldap2
         .simple_bind(&user_dn, password)
         .await
-        .map_err(|e| anyhow::anyhow!("LDAP user bind failed: {}", e))?;
+        .directory_call("the LDAP password bind did not complete")?;
 
     if let Err(error) = ldap2.unbind().await {
         tracing::warn!(%error, "LDAP user unbind failed");
     }
 
-    // Check bind success via the result code
-    if bind_result.rc != 0 {
+    // The result code is where the directory answers the only question this
+    // module was asked. `49` is that answer — the password is wrong — and it is
+    // the sole non-zero code that may reach the caller as a verdict. Anything
+    // else (`busy`, `unavailable`, `unwillingToPerform`, a server-side error)
+    // means the bind never got to judge the password, so it travels as an
+    // outage: reporting it as a rejection would cost this person a strike on
+    // the brute-force counter for the directory's bad day.
+    if bind_result.rc == LDAP_INVALID_CREDENTIALS {
         anyhow::bail!("invalid LDAP credentials");
+    }
+    if bind_result.rc != 0 {
+        return Err(anyhow::anyhow!(
+            "LDAP bind returned result code {} ({})",
+            bind_result.rc,
+            bind_result.text
+        )
+        .context(crate::error::UpstreamUnavailable::new(
+            "the LDAP directory could not complete the password bind",
+        )));
     }
 
     Ok(LdapUser {
