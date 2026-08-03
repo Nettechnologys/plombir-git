@@ -81,11 +81,25 @@ pub async fn delete_by_label_id(db: &DatabaseConnection, label_id: i64) -> Resul
     Ok(())
 }
 
-/// Find issue IDs that have ALL of the specified labels.
-/// Returns (matching_issue_ids, total_count).
+/// Find issue IDs that have ALL of the specified labels, within one repo and
+/// optionally one state. Returns (page of issue ids, total_count).
+///
+/// `total` and the page are two answers to the same question, so they must be
+/// computed from the same predicate. The repo and the state used to be applied
+/// by the caller *after* `LIMIT/OFFSET` had already cut the page: `total`
+/// counted every issue carrying the labels while the page had been thinned by
+/// filters the count never saw, so `?labels=bug&state=closed` could answer with
+/// three rows and `total: 50`. Both filters now live inside the SQL, next to
+/// the `COUNT`, and the page comes back already narrowed.
+///
+/// `state` is caller-supplied text and is bound, never interpolated; the label
+/// ids are `i64` resolved from the database and are safe to inline (the `IN`
+/// list is variadic, which bind markers here would make unreadable).
 pub async fn find_issues_with_all_labels(
     db: &DatabaseConnection,
+    repo_id: i64,
     label_ids: &[i64],
+    state: Option<&str>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<i64>, i64)> {
@@ -93,43 +107,53 @@ pub async fn find_issues_with_all_labels(
         return Ok((Vec::new(), 0));
     }
 
-    // Find issue IDs that have all specified labels using GROUP BY + HAVING COUNT
-    let mut conditions = Vec::new();
-    for label_id in label_ids {
-        conditions.push(format!("label_id = {}", label_id));
+    // Issue ids carrying ALL of the labels, in this repo, in this state.
+    // GROUP BY + HAVING COUNT(DISTINCT ...) is the AND over labels; the join
+    // to `issues` is what lets the repo and state predicates apply before
+    // pagination instead of after it.
+    let label_list = label_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let state_clause = if state.is_some() {
+        " AND i.state = ?"
+    } else {
+        ""
+    };
+    let mut values: Vec<Value> = vec![repo_id.into()];
+    if let Some(s) = state {
+        values.push(s.into());
     }
-    let where_clause = conditions.join(" OR ");
-
-    // Get total count of distinct issue_ids matching all labels
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM (SELECT issue_id FROM issue_labels WHERE {} GROUP BY issue_id HAVING COUNT(DISTINCT label_id) = {})",
-        where_clause,
+    let matching_sql = format!(
+        "SELECT il.issue_id FROM issue_labels il \
+         JOIN issues i ON i.id = il.issue_id \
+         WHERE il.label_id IN ({label_list}) AND i.repo_id = ?{state_clause} \
+         GROUP BY il.issue_id HAVING COUNT(DISTINCT il.label_id) = {}",
         label_ids.len()
     );
+
+    // The subquery alias is not decoration: PostgreSQL rejects a derived table
+    // in `FROM` without one, so the count query used to be SQLite-only.
+    let count_sql = format!("SELECT COUNT(*) FROM ({matching_sql}) AS matched");
     let backend = db.get_database_backend();
     let total = db
         .query_one(Statement::from_sql_and_values(
             backend,
             crate::prepare_sql(backend, &count_sql),
-            [],
+            values.clone(),
         ))
         .await
         .context("db: count issues with all labels")?;
     let total = decode_total(total)?;
 
     // Get paginated issue IDs
-    let sql = format!(
-        "SELECT issue_id FROM issue_labels WHERE {} GROUP BY issue_id HAVING COUNT(DISTINCT label_id) = {} ORDER BY issue_id DESC LIMIT {} OFFSET {}",
-        where_clause,
-        label_ids.len(),
-        limit,
-        offset
-    );
+    let sql = format!("{matching_sql} ORDER BY il.issue_id DESC LIMIT {limit} OFFSET {offset}");
     let rows = db
         .query_all(Statement::from_sql_and_values(
             backend,
             crate::prepare_sql(backend, &sql),
-            [],
+            values,
         ))
         .await
         .context("db: find issues with all labels")?;
@@ -204,24 +228,39 @@ mod tests {
     async fn an_empty_label_filter_stays_an_empty_result() {
         let db = memory_db().await;
         assert_eq!(
-            find_issues_with_all_labels(&db, &[], 0, 20)
+            find_issues_with_all_labels(&db, 1, &[], None, 0, 20)
                 .await
                 .expect("an empty label filter does not query the database"),
             (Vec::new(), 0)
         );
     }
 
-    /// The junction table as the production query sees it. SQLite's column
-    /// affinity is a preference, not a constraint, which is what lets the test
-    /// below store an `issue_id` the typed read cannot decode.
-    async fn labelled_issues(rows: &[(&str, i64)]) -> DatabaseConnection {
+    /// The junction table and the issues it joins to, as the production query
+    /// sees them. SQLite's column affinity is a preference, not a constraint,
+    /// which is what lets the tests below store an `issue_id` the typed read
+    /// cannot decode.
+    ///
+    /// `issues` carries `(id, repo_id, state)`; junction rows are `(issue_id,
+    /// label_id)` and are seeded verbatim so a non-numeric id can be planted.
+    async fn labelled_issues(
+        issues: &[(&str, i64, &str)],
+        labels: &[(&str, i64)],
+    ) -> DatabaseConnection {
         let db = memory_db().await;
         db.execute_unprepared(
-            "CREATE TABLE issue_labels (issue_id INTEGER NOT NULL, label_id INTEGER NOT NULL);",
+            "CREATE TABLE issue_labels (issue_id INTEGER NOT NULL, label_id INTEGER NOT NULL);\
+             CREATE TABLE issues (id INTEGER NOT NULL, repo_id INTEGER NOT NULL, state TEXT NOT NULL);",
         )
         .await
-        .expect("create the junction table");
-        for (issue_id, label_id) in rows {
+        .expect("create the junction table and its issues");
+        for (id, repo_id, state) in issues {
+            db.execute_unprepared(&format!(
+                "INSERT INTO issues (id, repo_id, state) VALUES ('{id}', {repo_id}, '{state}');"
+            ))
+            .await
+            .expect("seed an issue");
+        }
+        for (issue_id, label_id) in labels {
             db.execute_unprepared(&format!(
                 "INSERT INTO issue_labels (issue_id, label_id) VALUES ('{issue_id}', {label_id});"
             ))
@@ -233,9 +272,10 @@ mod tests {
 
     #[tokio::test]
     async fn decodable_issue_ids_are_returned_with_their_total() {
-        let db = labelled_issues(&[("7", 1), ("9", 1)]).await;
+        let db =
+            labelled_issues(&[("7", 1, "open"), ("9", 1, "open")], &[("7", 1), ("9", 1)]).await;
         assert_eq!(
-            find_issues_with_all_labels(&db, &[1], 0, 20)
+            find_issues_with_all_labels(&db, 1, &[1], None, 0, 20)
                 .await
                 .expect("decodable rows are returned"),
             (vec![9, 7], 2)
@@ -246,14 +286,85 @@ mod tests {
     async fn an_undecodable_issue_id_is_an_error_not_a_shorter_page() {
         // `total` counts this row fine, so before the fix the caller received a
         // successful `(vec![7], 2)` — a page one issue short of its own total.
-        let db = labelled_issues(&[("7", 1), ("not a number", 1)]).await;
+        let db = labelled_issues(
+            &[("7", 1, "open"), ("not a number", 1, "open")],
+            &[("7", 1), ("not a number", 1)],
+        )
+        .await;
 
-        let error = find_issues_with_all_labels(&db, &[1], 0, 20)
+        let error = find_issues_with_all_labels(&db, 1, &[1], None, 0, 20)
             .await
             .expect_err("an undecodable issue_id is a failed query, not a dropped row");
         assert!(
             format!("{error:#}").contains("decode issue_id"),
             "the failure must identify the failed decode, got: {error:#}"
+        );
+    }
+
+    /// The defect the state predicate was moved into SQL for: `total` used to
+    /// count every labelled issue while the page was thinned afterwards, so a
+    /// one-row page came back announcing a total of three.
+    #[tokio::test]
+    async fn the_state_filter_narrows_the_total_and_the_page_together() {
+        let db = labelled_issues(
+            &[("7", 1, "open"), ("8", 1, "closed"), ("9", 1, "open")],
+            &[("7", 1), ("8", 1), ("9", 1)],
+        )
+        .await;
+
+        assert_eq!(
+            find_issues_with_all_labels(&db, 1, &[1], Some("closed"), 0, 20)
+                .await
+                .expect("the state filter is a database predicate"),
+            (vec![8], 1),
+            "total must count what the page contains, not what the labels alone match"
+        );
+    }
+
+    /// Same for the repo: it used to be applied in memory after `LIMIT`, so a
+    /// page could be emptied by a filter its own total had never seen.
+    #[tokio::test]
+    async fn another_repos_issue_is_counted_by_neither_the_total_nor_the_page() {
+        let db =
+            labelled_issues(&[("7", 1, "open"), ("8", 2, "open")], &[("7", 1), ("8", 1)]).await;
+
+        assert_eq!(
+            find_issues_with_all_labels(&db, 1, &[1], None, 0, 20)
+                .await
+                .expect("the repo filter is a database predicate"),
+            (vec![7], 1)
+        );
+    }
+
+    /// A page cut by `LIMIT` still reports the full total — the pair has to be
+    /// consistent, not equal.
+    #[tokio::test]
+    async fn a_limited_page_still_reports_the_whole_matching_total() {
+        let db = labelled_issues(
+            &[("7", 1, "open"), ("8", 1, "open"), ("9", 1, "open")],
+            &[("7", 1), ("8", 1), ("9", 1)],
+        )
+        .await;
+
+        assert_eq!(
+            find_issues_with_all_labels(&db, 1, &[1], Some("open"), 0, 2)
+                .await
+                .expect("a page and its total"),
+            (vec![9, 8], 3)
+        );
+    }
+
+    /// `state` is caller-supplied text: it must arrive as a bound value, so a
+    /// quote in it can only ever fail to match.
+    #[tokio::test]
+    async fn a_quoted_state_is_bound_not_interpolated() {
+        let db = labelled_issues(&[("7", 1, "open")], &[("7", 1)]).await;
+
+        assert_eq!(
+            find_issues_with_all_labels(&db, 1, &[1], Some("open' OR '1'='1"), 0, 20)
+                .await
+                .expect("a quote in the state is data, not syntax"),
+            (Vec::new(), 0)
         );
     }
 }

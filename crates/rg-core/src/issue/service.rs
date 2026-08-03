@@ -110,6 +110,14 @@ pub async fn list_issues_paginated(
 }
 
 /// Paginated list of issues filtered by labels. Returns issues that have ALL specified labels.
+///
+/// A label name the repo does not have is refused, not dropped. Silently
+/// skipping it turned `?labels=bug,typo` into `?labels=bug`: the client asked
+/// for an intersection of two labels, got the whole of one, and nothing in the
+/// response said the condition had been weakened.
+///
+/// The repo and state predicates live in SQL now, so `total` and the page are
+/// counted the same way — see `find_issues_with_all_labels`.
 pub async fn list_issues_filtered_by_labels(
     db: &DatabaseConnection,
     owner: &str,
@@ -121,42 +129,55 @@ pub async fn list_issues_filtered_by_labels(
 ) -> Result<(Vec<Issue>, i64)> {
     let repo = resolve_repo(db, owner, repo_name).await?;
 
-    // Resolve label names to IDs
+    // Resolve label names to IDs. Repeats collapse — `?labels=bug,bug` is one
+    // condition, not a `HAVING COUNT(DISTINCT label_id) = 2` that can never
+    // match.
     let all_labels = label_ops::list_by_repo(db, repo.id).await?;
-    let required_label_ids: Vec<i64> = all_labels
-        .iter()
-        .filter(|l| label_names.contains(&l.name))
-        .map(|l| l.id)
-        .collect();
+    let mut required_label_ids: Vec<i64> = Vec::with_capacity(label_names.len());
+    for name in label_names {
+        let Some(label) = all_labels.iter().find(|l| &l.name == name) else {
+            return Err(crate::error::invalid_request(format!(
+                "unknown label: {}",
+                name.chars().take(64).collect::<String>()
+            )));
+        };
+        if !required_label_ids.contains(&label.id) {
+            required_label_ids.push(label.id);
+        }
+    }
 
     if required_label_ids.is_empty() {
         return Ok((Vec::new(), 0));
     }
 
     // Find issue IDs that have ALL required labels
-    let (matching_issue_ids, total) =
-        issue_label_ops::find_issues_with_all_labels(db, &required_label_ids, offset, limit)
-            .await?;
+    let (matching_issue_ids, total) = issue_label_ops::find_issues_with_all_labels(
+        db,
+        repo.id,
+        &required_label_ids,
+        state,
+        offset,
+        limit,
+    )
+    .await?;
 
     if matching_issue_ids.is_empty() {
         return Ok((Vec::new(), total));
     }
 
-    // Fetch the actual issue models (batch query — avoids N+1)
-    let all_issues = issue_ops::find_by_ids(db, &matching_issue_ids).await?;
+    // Fetch the actual issue models (batch query — avoids N+1). `find_by_ids`
+    // answers in whatever order the database likes, so restore the page order
+    // the paginating query asked for.
+    let mut by_id: std::collections::HashMap<i64, Issue> =
+        issue_ops::find_by_ids(db, &matching_issue_ids)
+            .await?
+            .into_iter()
+            .map(|issue| (issue.id, issue))
+            .collect();
 
-    let issues: Vec<Issue> = all_issues
-        .into_iter()
-        .filter(|issue| {
-            // Apply state filter in-memory
-            if let Some(s) = state {
-                if issue.state != s {
-                    return false;
-                }
-            }
-            // Only include issues from this repo
-            issue.repo_id == repo.id
-        })
+    let issues: Vec<Issue> = matching_issue_ids
+        .iter()
+        .filter_map(|id| by_id.remove(id))
         .collect();
 
     Ok((issues, total))
