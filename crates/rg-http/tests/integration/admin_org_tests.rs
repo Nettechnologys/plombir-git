@@ -143,3 +143,96 @@ async fn admin_orgs_delete() {
         .unwrap();
     assert_eq!(get_after.status(), 404);
 }
+
+/// The delete above passes on a fixture where the owner's user id and the
+/// organization id are both 1, so an owner check fed the *organization* id
+/// still succeeded. Here the owner owns the second organization, so the two
+/// ids differ and the route has to answer on its own rule: an instance admin
+/// may delete an organization they do not own.
+#[tokio::test]
+async fn admin_deletes_an_org_it_does_not_own_when_org_id_differs_from_owner_id() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+
+    let (owner_token, owner_id) = register_full(
+        &base,
+        "admin_del_org_owner2",
+        "admin_del_org_owner2@example.com",
+    )
+    .await;
+    let (admin_token, admin_id) =
+        register_full(&base, "admin_del_org2", "admin_del_org2@example.com").await;
+
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("registered user must exist");
+
+    // First organization only exists to push the victim's id off the owner's.
+    let decoy = client
+        .post(format!("{}/api/v1/orgs", base))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({ "name": "decoy-org", "display_name": "Decoy Org" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(decoy.status(), 201);
+
+    let create_resp = client
+        .post(format!("{}/api/v1/orgs", base))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "name": "victim-org-2", "display_name": "Victim Org 2" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), 201);
+    let created: serde_json::Value = create_resp.json().await.unwrap();
+    let org_id = created["id"].as_i64().expect("created org carries an id");
+    assert_ne!(
+        org_id, owner_id,
+        "fixture must not let the org id stand in for the owner's user id"
+    );
+
+    let del_resp = client
+        .delete(format!("{}/api/v1/admin/orgs/victim-org-2", base))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        del_resp.status(),
+        200,
+        "instance admin must be able to delete an organization owned by someone else"
+    );
+
+    let get_after = client
+        .get(format!("{}/api/v1/admin/orgs/victim-org-2", base))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_after.status(), 404);
+
+    // The owner-only rule on the *user-facing* route is unchanged: a
+    // non-owner admin is still refused there.
+    let create_again = client
+        .post(format!("{}/api/v1/orgs", base))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "name": "victim-org-3", "display_name": "Victim Org 3" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_again.status(), 201);
+
+    let user_route_del = client
+        .delete(format!("{}/api/v1/orgs/victim-org-3", base))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        user_route_del.status(),
+        403,
+        "instance admin is not the owner — the user-facing route still refuses"
+    );
+}

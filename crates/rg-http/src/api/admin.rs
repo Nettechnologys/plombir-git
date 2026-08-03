@@ -431,7 +431,19 @@ pub async fn delete_org(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     match rg_core::org::get_org_by_name(&state.db, &name).await {
-        Ok(Some(org)) => match rg_core::org::delete_org(&state.db, org.id, org.id).await {
+        // Instance admins delete organizations they do not own — that is the
+        // point of the route, and `InstanceAdmin` above is the gate that says
+        // so. Naming the actor keeps it a decision instead of the accident it
+        // was: this call used to pass `org.id` into the actor position, and it
+        // only worked while the owner's user id and the org id happened to
+        // match.
+        Ok(Some(org)) => match rg_core::org::delete_org(
+            &state.db,
+            org.id,
+            rg_core::org::OrgDeleteActor::InstanceAdmin,
+        )
+        .await
+        {
             Ok(()) => {
                 let details = serde_json::json!({"org_name": org.name});
                 record_audit(

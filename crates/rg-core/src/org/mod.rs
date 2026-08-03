@@ -79,16 +79,36 @@ pub async fn update_org(
     org_ops::update_org(db, id, display_name, description, visibility).await
 }
 
-/// Delete an organization (only owner can do this).
-pub async fn delete_org(db: &DatabaseConnection, id: i64, requesting_user_id: i64) -> Result<()> {
+/// Who is asking for an organization to be deleted.
+///
+/// Deletion used to take the actor as a bare `i64`, which is the same type as
+/// the organization id sitting right next to it at every call site — and the
+/// admin route did pass the org id into that position. The two answers to "may
+/// this go away" are genuinely different rules, so they are spelled as
+/// different variants instead of being distinguished by which number was typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgDeleteActor {
+    /// A regular user. Allowed only when they own the organization.
+    Owner(i64),
+    /// An instance administrator. The route-level `InstanceAdmin` gate *is* the
+    /// authorization here; owning the organization is deliberately not required,
+    /// otherwise an admin could only ever delete their own organizations.
+    InstanceAdmin,
+}
+
+/// Delete an organization (only its owner, or an instance admin, can do this).
+pub async fn delete_org(db: &DatabaseConnection, id: i64, actor: OrgDeleteActor) -> Result<()> {
     let org = org_ops::get_org(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("organization"))?;
 
-    if org.owner_id != requesting_user_id {
-        return Err(crate::error::forbidden(
-            "only the organization owner can delete it",
-        ));
+    match actor {
+        OrgDeleteActor::Owner(user_id) if org.owner_id != user_id => {
+            return Err(crate::error::forbidden(
+                "only the organization owner can delete it",
+            ));
+        }
+        OrgDeleteActor::Owner(_) | OrgDeleteActor::InstanceAdmin => {}
     }
 
     // The ownership check above read the org in a statement of its own. Two

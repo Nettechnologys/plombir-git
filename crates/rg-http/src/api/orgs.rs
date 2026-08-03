@@ -316,7 +316,13 @@ pub async fn delete_org(
     OrgAdmin { org, actor_id }: OrgAdmin,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match rg_core::org::delete_org(&state.db, org.id, actor_id).await {
+    match rg_core::org::delete_org(
+        &state.db,
+        org.id,
+        rg_core::org::OrgDeleteActor::Owner(actor_id),
+    )
+    .await
+    {
         Ok(()) => {
             let details = serde_json::json!({"name": org.name});
             record_audit(
