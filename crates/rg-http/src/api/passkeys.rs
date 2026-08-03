@@ -14,6 +14,8 @@
 //! calls in a short-lived, HttpOnly, signed cookie (see
 //! [`rg_core::auth::webauthn`]) — ForgeKeep keeps no server-side session store.
 
+use std::collections::BTreeSet;
+
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -85,12 +87,23 @@ fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 // ── Relying-party resolution ──────────────────────────────────────────────
 
+/// The relying-party identity under which one WebAuthn ceremony runs.
+///
+/// Both fields are sealed into the short-lived ceremony state. `rp_id` is the
+/// durable credential boundary; `origin` is also bound because WebAuthn checks
+/// it while completing the ceremony.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct RelyingParty {
+    rp_id: String,
+    origin: String,
+}
+
 /// Resolve the WebAuthn relying-party id and origin for this request.
 ///
 /// Prefers the configured `external_url`; otherwise derives them from the
 /// request `Host` header + forwarded scheme. `rp_id` is the host without a port;
 /// `origin` is the exact `scheme://host[:port]` the browser will report.
-fn resolve_rp(state: &AppState, headers: &HeaderMap) -> Result<(String, String), AppError> {
+fn resolve_rp(state: &AppState, headers: &HeaderMap) -> Result<RelyingParty, AppError> {
     if let Some(ext) = state.external_url.as_deref() {
         let url = wa::Url::parse(ext)
             .map_err(|_| AppError::internal("configured external_url is not a valid URL"))?;
@@ -99,7 +112,7 @@ fn resolve_rp(state: &AppState, headers: &HeaderMap) -> Result<(String, String),
             .ok_or_else(|| AppError::internal("configured external_url has no host"))?
             .to_string();
         let origin = url.origin().ascii_serialization();
-        return Ok((rp_id, origin));
+        return Ok(RelyingParty { rp_id, origin });
     }
 
     let host = headers
@@ -123,12 +136,40 @@ fn resolve_rp(state: &AppState, headers: &HeaderMap) -> Result<(String, String),
         ));
     }
 
-    Ok((rp_id, origin))
+    Ok(RelyingParty { rp_id, origin })
 }
 
-fn webauthn_for(state: &AppState, headers: &HeaderMap) -> Result<wa::Webauthn, AppError> {
-    let (rp_id, origin) = resolve_rp(state, headers)?;
-    wa::build(&rp_id, &origin).map_err(AppError::from)
+fn webauthn_for(rp: &RelyingParty) -> Result<wa::Webauthn, AppError> {
+    wa::build(&rp.rp_id, &rp.origin).map_err(AppError::from)
+}
+
+/// Refuse a start/finish pair whose public URL changed mid-ceremony.
+///
+/// A different hostname means a different credential namespace, while a
+/// different origin under the same hostname also fails WebAuthn verification.
+/// Naming this before the cryptographic check keeps an operator from chasing a
+/// phantom "invalid credential" after a proxy or `external_url` change.
+fn require_same_ceremony_rp(
+    ceremony: &str,
+    started: &RelyingParty,
+    current: &RelyingParty,
+) -> Result<(), AppError> {
+    if started == current {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        ceremony,
+        started_rp_id = %started.rp_id,
+        current_rp_id = %current.rp_id,
+        started_origin = %started.origin,
+        current_origin = %current.origin,
+        "passkey ceremony changed relying party between start and finish"
+    );
+    Err(AppError::bad_request(format!(
+        "passkey {ceremony} must finish at the same external URL where it started; restart it at {}",
+        started.origin
+    )))
 }
 
 // ── Sealed ceremony state ─────────────────────────────────────────────────
@@ -136,6 +177,7 @@ fn webauthn_for(state: &AppState, headers: &HeaderMap) -> Result<wa::Webauthn, A
 #[derive(Serialize, Deserialize)]
 struct RegState {
     user_id: i64,
+    rp: RelyingParty,
     reg: wa::PasskeyRegistration,
 }
 
@@ -143,6 +185,7 @@ struct RegState {
 struct AuthState {
     user_id: i64,
     username: String,
+    rp: RelyingParty,
     auth: wa::PasskeyAuthentication,
 }
 
@@ -304,23 +347,66 @@ impl From<rg_db::entities::passkey_credential::Model> for PasskeyInfo {
     }
 }
 
-async fn load_passkeys(
+/// Stored credentials partitioned by the RP that the caller is using now.
+struct PasskeyRowsForRp {
+    matching: Vec<rg_db::entities::passkey_credential::Model>,
+    different_rp_ids: BTreeSet<String>,
+}
+
+/// Keep legacy rows selectable, but never treat a recorded different RP as a
+/// candidate. A legacy `NULL` means the pre-migration database genuinely does
+/// not know the RP, so rejecting it would needlessly lock out users who still
+/// arrive through their original hostname.
+fn select_passkey_rows_for_rp(
+    rows: Vec<rg_db::entities::passkey_credential::Model>,
+    rp_id: &str,
+) -> PasskeyRowsForRp {
+    let different_rp_ids = rows
+        .iter()
+        .filter_map(|row| row.rp_id.as_ref())
+        .filter(|stored_rp_id| stored_rp_id.as_str() != rp_id)
+        .cloned()
+        .collect();
+    let matching = rows
+        .into_iter()
+        .filter(|row| match row.rp_id.as_deref() {
+            Some(stored_rp_id) => stored_rp_id == rp_id,
+            None => true,
+        })
+        .collect();
+    PasskeyRowsForRp {
+        matching,
+        different_rp_ids,
+    }
+}
+
+struct LoadedPasskeysForRp {
+    passkeys: Vec<(rg_db::entities::passkey_credential::Model, wa::Passkey)>,
+    different_rp_ids: BTreeSet<String>,
+}
+
+async fn load_passkeys_for_rp(
     state: &AppState,
     user_id: i64,
-) -> Result<Vec<(rg_db::entities::passkey_credential::Model, wa::Passkey)>, AppError> {
+    rp_id: &str,
+) -> Result<LoadedPasskeysForRp, AppError> {
     let rows = rg_db::ops::passkey_credential_ops::list_by_user(&state.db, user_id)
         .await
         .map_err(AppError::from)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    let selected = select_passkey_rows_for_rp(rows, rp_id);
+    let mut passkeys = Vec::with_capacity(selected.matching.len());
+    for row in selected.matching {
         match wa::passkey_from_json(&row.passkey) {
-            Ok(pk) => out.push((row, pk)),
+            Ok(pk) => passkeys.push((row, pk)),
             Err(error) => {
                 tracing::warn!(passkey_id = row.id, error = %format!("{error:#}"), "skipping corrupt stored passkey");
             }
         }
     }
-    Ok(out)
+    Ok(LoadedPasskeysForRp {
+        passkeys,
+        different_rp_ids: selected.different_rp_ids,
+    })
 }
 
 // ── Registration ──────────────────────────────────────────────────────────
@@ -347,9 +433,11 @@ pub async fn register_start(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
-    let webauthn = webauthn_for(&state, &headers)?;
-    let exclude = load_passkeys(&state, user_id)
+    let rp = resolve_rp(&state, &headers)?;
+    let webauthn = webauthn_for(&rp)?;
+    let exclude = load_passkeys_for_rp(&state, user_id, &rp.rp_id)
         .await?
+        .passkeys
         .iter()
         .map(|(_, pk)| pk.cred_id().clone())
         .collect();
@@ -362,7 +450,7 @@ pub async fn register_start(
         .map_err(AppError::from)?;
 
     let token = wa::seal_state(
-        RegState { user_id, reg },
+        RegState { user_id, rp, reg },
         "reg",
         &state.jwt_secret,
         CEREMONY_TTL_SECS,
@@ -421,7 +509,9 @@ pub async fn register_finish(
         ));
     }
 
-    let webauthn = webauthn_for(&state, &headers)?;
+    let current_rp = resolve_rp(&state, &headers)?;
+    require_same_ceremony_rp("registration", &sealed.rp, &current_rp)?;
+    let webauthn = webauthn_for(&sealed.rp)?;
     let passkey =
         wa::finish_registration(&webauthn, &req.credential, &sealed.reg).map_err(|error| {
             tracing::warn!(user_id, error = %format!("{error:#}"), "passkey registration verification failed");
@@ -438,6 +528,7 @@ pub async fn register_finish(
         &credential_id,
         &passkey_json,
         &name,
+        &sealed.rp.rp_id,
     )
     .await
     .map_err(|error| {
@@ -446,11 +537,12 @@ pub async fn register_finish(
     })?;
 
     let is_https = is_https_request(&headers);
-    let passkeys: Vec<PasskeyInfo> = load_passkeys(&state, user_id)
-        .await?
-        .into_iter()
-        .map(|(m, _)| m.into())
-        .collect();
+    let passkeys: Vec<PasskeyInfo> =
+        rg_db::ops::passkey_credential_ops::list_by_user(&state.db, user_id)
+            .await?
+            .into_iter()
+            .map(PasskeyInfo::from)
+            .collect();
 
     Ok((
         StatusCode::OK,
@@ -479,6 +571,39 @@ fn passkey_create_error(error: rg_db::sea_orm::DbErr) -> AppError {
     } else {
         AppError::from(error)
     }
+}
+
+/// Name the two deployment states in which a browser can appear to "lose" a
+/// passkey before it ever sends an assertion to the server.
+///
+/// This is intentionally a warning rather than a startup failure. A legacy
+/// row has no recoverable RP provenance, and an instance can still serve it at
+/// its original host; refusing to start would turn a diagnostic upgrade into a
+/// lockout.
+pub(crate) async fn warn_about_rp_configuration(
+    db: &rg_db::DatabaseConnection,
+    external_url: Option<&str>,
+) -> Result<(), rg_db::sea_orm::DbErr> {
+    let registered = rg_db::ops::passkey_credential_ops::count_all(db).await?;
+    if registered == 0 {
+        return Ok(());
+    }
+
+    if external_url.is_none() {
+        tracing::warn!(
+            registered_passkey_count = registered,
+            "passkeys are registered but [server].external_url is unset; WebAuthn derives its relying-party id from each request Host, so a different hostname will not expose the credential. Set external_url to the canonical browser URL before enrolling more passkeys"
+        );
+    }
+
+    let legacy = rg_db::ops::passkey_credential_ops::count_legacy_without_rp_id(db).await?;
+    if legacy > 0 {
+        tracing::warn!(
+            legacy_passkey_count = legacy,
+            "passkeys created before relying-party ids were persisted have unknown RP provenance; they remain eligible for backward compatibility, but configure external_url and re-enrol them at the canonical host"
+        );
+    }
+    Ok(())
 }
 
 /// GET /users/passkeys
@@ -561,22 +686,29 @@ pub async fn login_start(
         .filter(|u| u.is_usable())
         .ok_or_else(no_passkey)?;
 
-    let passkeys: Vec<wa::Passkey> = load_passkeys(&state, user.id)
-        .await?
-        .into_iter()
-        .map(|(_, pk)| pk)
-        .collect();
+    let rp = resolve_rp(&state, &headers)?;
+    let selected = load_passkeys_for_rp(&state, user.id, &rp.rp_id).await?;
+    let passkeys: Vec<wa::Passkey> = selected.passkeys.into_iter().map(|(_, pk)| pk).collect();
     if passkeys.is_empty() {
+        if !selected.different_rp_ids.is_empty() {
+            tracing::warn!(
+                user_id = user.id,
+                current_rp_id = %rp.rp_id,
+                registered_rp_ids = ?selected.different_rp_ids,
+                "passkey login has credentials for a different relying-party id; they were intentionally excluded"
+            );
+        }
         return Err(no_passkey());
     }
 
-    let webauthn = webauthn_for(&state, &headers)?;
+    let webauthn = webauthn_for(&rp)?;
     let (rcr, auth) = wa::start_authentication(&webauthn, &passkeys).map_err(AppError::from)?;
 
     let token = wa::seal_state(
         AuthState {
             user_id: user.id,
             username: user.username.clone(),
+            rp,
             auth,
         },
         "auth",
@@ -643,7 +775,9 @@ pub async fn login_finish(
         return Err(AppError::unauthorized("account is temporarily locked"));
     }
 
-    let webauthn = webauthn_for(&state, &headers)?;
+    let current_rp = resolve_rp(&state, &headers)?;
+    require_same_ceremony_rp("login", &sealed.rp, &current_rp)?;
+    let webauthn = webauthn_for(&sealed.rp)?;
     let result = wa::finish_authentication(&webauthn, &credential, &sealed.auth).map_err(|error| {
         tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "passkey authentication verification failed");
         AppError::unauthorized("passkey authentication failed")
@@ -658,8 +792,9 @@ pub async fn login_finish(
     // failure below therefore fails the login: issuing a token for state we
     // did not keep is the one outcome that must not happen.
     let matched_id = wa::credential_id_b64(result.cred_id());
-    let (model, mut passkey) = load_passkeys(&state, user.id)
+    let (model, mut passkey) = load_passkeys_for_rp(&state, user.id, &sealed.rp.rp_id)
         .await?
+        .passkeys
         .into_iter()
         .find(|(m, _)| m.credential_id == matched_id)
         .ok_or_else(|| {
@@ -763,8 +898,12 @@ pub async fn login_finish(
 
 #[cfg(test)]
 mod tests {
-    use super::{passkey_create_error, AppError};
+    use super::{
+        passkey_create_error, require_same_ceremony_rp, select_passkey_rows_for_rp, AppError,
+        RelyingParty,
+    };
     use axum::http::StatusCode;
+    use rg_db::entities::passkey_credential;
     use rg_db::sea_orm::{
         ConnAcquireErr, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DbErr,
         Statement,
@@ -814,5 +953,72 @@ mod tests {
     fn database_outage_is_not_a_duplicate_conflict() {
         let error = passkey_create_error(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout));
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn passkey_row(id: i64, rp_id: Option<&str>) -> passkey_credential::Model {
+        passkey_credential::Model {
+            id,
+            user_id: 1,
+            credential_id: format!("credential-{id}"),
+            passkey: "{}".to_string(),
+            name: "Passkey".to_string(),
+            rp_id: rp_id.map(str::to_string),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+        }
+    }
+
+    /// A credential recorded for one Host must never enter a challenge for a
+    /// different Host. A pre-RP row remains eligible only because its original
+    /// Host is unknowable after the fact; startup emits an operator warning for
+    /// that migration state.
+    #[test]
+    fn stored_passkeys_are_scoped_to_their_relying_party_id() {
+        let selected = select_passkey_rows_for_rp(
+            vec![
+                passkey_row(1, Some("git.example.test")),
+                passkey_row(2, Some("internal.example.test")),
+                passkey_row(3, None),
+            ],
+            "git.example.test",
+        );
+
+        assert_eq!(
+            selected
+                .matching
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "a differently bound credential must not be offered to WebAuthn"
+        );
+        assert_eq!(
+            selected.different_rp_ids.into_iter().collect::<Vec<_>>(),
+            vec!["internal.example.test"],
+            "the login path needs the actual conflicting RP for its warning"
+        );
+    }
+
+    #[test]
+    fn a_ceremony_host_change_is_named_before_webauthn_verification() {
+        let error = require_same_ceremony_rp(
+            "login",
+            &RelyingParty {
+                rp_id: "git.example.test".to_string(),
+                origin: "https://git.example.test".to_string(),
+            },
+            &RelyingParty {
+                rp_id: "internal.example.test".to_string(),
+                origin: "https://internal.example.test".to_string(),
+            },
+        )
+        .expect_err("a ceremony may not switch its relying party");
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            error.to_string().contains("same external URL")
+                && error.to_string().contains("https://git.example.test"),
+            "the client must learn that the Host changed instead of seeing an invalid credential"
+        );
     }
 }

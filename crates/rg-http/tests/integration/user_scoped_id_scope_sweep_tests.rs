@@ -273,6 +273,7 @@ async fn seed(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id: i64) -> Se
         "user-scope-sweep-credential",
         "{}",
         "sweep passkey",
+        "scope-sweep.example.test",
     )
     .await
     .expect("seed passkey")

@@ -11,6 +11,7 @@ pub async fn create(
     credential_id: &str,
     passkey_json: &str,
     name: &str,
+    rp_id: &str,
 ) -> Result<passkey_credential::Model, DbErr> {
     let am = passkey_credential::ActiveModel {
         id: NotSet,
@@ -18,10 +19,28 @@ pub async fn create(
         credential_id: Set(credential_id.to_string()),
         passkey: Set(passkey_json.to_string()),
         name: Set(name.to_string()),
+        rp_id: Set(Some(rp_id.to_string())),
         created_at: Set(chrono::Utc::now()),
         last_used_at: Set(None),
     };
     am.insert(db).await
+}
+
+/// Count credentials created before the relying-party id was persisted.
+///
+/// A NULL value deliberately means "unknown", not an RP id inferred during an
+/// upgrade: inventing one would silently make a pre-existing credential belong
+/// to the wrong hostname.
+pub async fn count_legacy_without_rp_id(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    Entity::find()
+        .filter(passkey_credential::Column::RpId.is_null())
+        .count(db)
+        .await
+}
+
+/// Count every registered passkey without loading its serialized credential.
+pub async fn count_all(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    Entity::find().count(db).await
 }
 
 /// List all passkeys registered by a user (newest first).

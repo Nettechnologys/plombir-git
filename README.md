@@ -116,6 +116,23 @@ config-file equivalent (named in `forgekeep serve --help`), and values resolve
 as **CLI arg > config file > built-in default** — so a config-only deployment
 needs no flags at all.
 
+### Passkeys need one canonical public URL
+
+Set `[server].external_url` before anyone registers a passkey:
+
+```toml
+[server]
+external_url = "https://git.example.com"
+```
+
+WebAuthn credentials are bound to a relying-party hostname. Without this
+setting ForgeKeep has to use each request's `Host`, so the same person opening
+the instance through another proxy name will not see the credential in their
+browser. Credentials registered after this setting is present retain that RP
+id and are deliberately excluded from challenges at a different host. Existing
+credentials from before RP tracking remain compatible where possible; the
+startup warning names them so they can be re-enrolled at the canonical URL.
+
 ### Secrets and rotation
 
 ForgeKeep holds two configured secrets and one stored key. They do different

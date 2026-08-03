@@ -55,10 +55,16 @@ async fn seed_passkey(db: &rg_db::DatabaseConnection) -> (i64, i64) {
     .await
     .expect("create passkey fixture user");
 
-    let passkey =
-        passkey_credential_ops::create(db, user.id, "credential-id", "{\"counter\":1}", "yubikey")
-            .await
-            .expect("register fixture passkey");
+    let passkey = passkey_credential_ops::create(
+        db,
+        user.id,
+        "credential-id",
+        "{\"counter\":1}",
+        "yubikey",
+        "passkeys.example.test",
+    )
+    .await
+    .expect("register fixture passkey");
     (user.id, passkey.id)
 }
 
@@ -83,6 +89,11 @@ async fn an_advanced_counter_is_actually_persisted() {
     assert_eq!(
         row.passkey, "{\"counter\":2}",
         "the column must hold the advanced credential, not the pre-assertion one"
+    );
+    assert_eq!(
+        row.rp_id.as_deref(),
+        Some("passkeys.example.test"),
+        "advancing the counter must not lose the credential's relying-party id"
     );
     assert!(
         row.last_used_at.is_some(),

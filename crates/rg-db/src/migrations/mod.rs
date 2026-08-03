@@ -84,6 +84,7 @@ pub mod m20260802_000001_create_encryption_key_check;
 pub mod m20260802_000002_add_user_session_version;
 pub mod m20260802_000003_identity_keys_not_blank;
 pub mod m20260803_000001_add_sso_provisioning_policy;
+pub mod m20260803_000002_add_passkey_credential_rp_id;
 
 use sea_orm_migration::prelude::*;
 
@@ -181,6 +182,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260802_000002_add_user_session_version::Migration),
             Box::new(m20260802_000003_identity_keys_not_blank::Migration),
             Box::new(m20260803_000001_add_sso_provisioning_policy::Migration),
+            Box::new(m20260803_000002_add_passkey_credential_rp_id::Migration),
         ]
     }
 }

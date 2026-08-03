@@ -16,6 +16,12 @@ pub struct Model {
     pub passkey: String,
     /// User-supplied label for the authenticator.
     pub name: String,
+    /// Relying-party id under which this credential was registered.
+    ///
+    /// `None` is a credential created before RP ids were recorded. It remains
+    /// usable for backward compatibility, but the server warns the operator to
+    /// re-enrol it against the canonical external URL.
+    pub rp_id: Option<String>,
     pub created_at: DateTimeUtc,
     pub last_used_at: Option<DateTimeUtc>,
 }

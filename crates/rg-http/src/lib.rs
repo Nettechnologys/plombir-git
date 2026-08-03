@@ -312,7 +312,7 @@ pub struct HttpServerConfig {
     /// TLS configuration: (cert_path, key_path). None = HTTP only.
     pub tls_config: Option<(PathBuf, PathBuf)>,
     /// External-facing base URL (e.g., "https://git.example.com").
-    /// Used for SSO callbacks. Defaults to http://localhost:{port}.
+    /// Used for SSO callbacks and as the stable WebAuthn relying party.
     pub external_url: Option<String>,
     /// CI job timeout in seconds (default: 3600).
     pub job_timeout_secs: u64,
@@ -373,6 +373,12 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
 
     rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
     auth_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
+
+    if let Err(error) =
+        api::passkeys::warn_about_rp_configuration(&config.db, config.external_url.as_deref()).await
+    {
+        tracing::warn!(error = %format!("{error:#}"), "could not inspect passkey relying-party configuration at startup");
+    }
 
     let notification_hub = config.notification_hub.unwrap_or_default();
 
