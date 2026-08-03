@@ -14,7 +14,9 @@
 //! [`crate::search::dialect`]; this module stays dialect-agnostic.
 
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DatabaseConnection, QueryResult, Statement, TryGetable, Value};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, QueryResult, Statement, TryGetable, Value,
+};
 use serde::Serialize;
 
 use crate::search::dialect::{fts_match, ISSUES_FTS_COLS, REPOS_FTS_COLS, WIKI_FTS_COLS};
@@ -100,43 +102,137 @@ pub async fn search(
     page: u64,
     per_page: u64,
 ) -> Result<(Vec<SearchResult>, i64)> {
-    let offset = (page.saturating_sub(1)) * per_page;
+    // `page` is whatever the caller put in the query string, so the product is
+    // saturated rather than left to wrap: an overflowed offset would silently
+    // hand back page one under the name of page 10^18.
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
     let limit = per_page.min(100);
 
     let filters = SearchFilters::parse(raw_query);
     let raw_text = filters.query.as_str();
 
-    let mut results = Vec::new();
-    let mut total = 0i64;
+    match search_type {
+        "repos" => Ok((
+            fetch_repos(db, raw_text, &filters, viewer_id, offset, limit).await?,
+            count_repos(db, raw_text, &filters, viewer_id).await?,
+        )),
+        "issues" => Ok((
+            fetch_issues(db, raw_text, &filters, viewer_id, offset, limit).await?,
+            count_issues(db, raw_text, &filters, viewer_id).await?,
+        )),
+        "wiki" => Ok((
+            fetch_wiki(db, raw_text, &filters, viewer_id, offset, limit).await?,
+            count_wiki(db, raw_text, &filters, viewer_id).await?,
+        )),
+        "all" => search_all(db, raw_text, &filters, viewer_id, offset, limit).await,
+        _ => Ok((Vec::new(), 0)),
+    }
+}
 
-    if search_type == "all" || search_type == "repos" {
-        let (repos, count) = search_repos(db, raw_text, &filters, viewer_id, offset, limit).await?;
-        total += count;
-        results.extend(repos);
+/// The kinds a `type=all` page interleaves, in the order they take their turn.
+const KINDS: usize = 3;
+
+/// `type=all` pages **one** sequence, not three independent ones.
+///
+/// The three backends are merged round-robin: each contributes its next match
+/// in turn until it runs out. That sequence is fixed by the three totals alone,
+/// so the window `[offset, offset + limit)` of it maps back to exactly one
+/// contiguous slice per backend — which is what makes every match reachable on
+/// exactly one page, keeps pages full, and leaves `total` counting the same
+/// sequence the pages walk.
+///
+/// Handing each backend the *page's* own `offset`/`limit` and then cutting the
+/// concatenation a second time (as this used to) is not a bad sort order — it
+/// is a hole: on page one the trim keeps the repositories and drops everything
+/// the other two backends returned, and on page two those same rows have moved
+/// out of the window, so the first `per_page` issues are served by no page at
+/// all while `total` keeps promising them.
+///
+/// The counts must be known before the rows — they are what places a match in
+/// the merged order — but that costs no extra round-trip: each backend was
+/// already answering a `COUNT` next to its page.
+async fn search_all(
+    db: &DatabaseConnection,
+    raw_text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+    offset: u64,
+    limit: u64,
+) -> Result<(Vec<SearchResult>, i64)> {
+    let counts = [
+        count_repos(db, raw_text, filters, viewer_id).await?,
+        count_issues(db, raw_text, filters, viewer_id).await?,
+        count_wiki(db, raw_text, filters, viewer_id).await?,
+    ];
+    let total: i64 = counts.iter().sum();
+    let lengths = counts.map(|count| count.max(0) as u64);
+
+    let mut page: Vec<(u64, SearchResult)> = Vec::new();
+    for kind in 0..KINDS {
+        let (slice_offset, slice_limit) = merge_slice(&lengths, kind, offset, limit);
+        if slice_limit == 0 {
+            continue;
+        }
+        let rows = match kind {
+            0 => fetch_repos(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
+            1 => fetch_issues(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
+            _ => fetch_wiki(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
+        };
+        for (index, row) in rows.into_iter().enumerate() {
+            page.push((merge_position(&lengths, kind, slice_offset + index as u64), row));
+        }
     }
 
-    if search_type == "all" || search_type == "issues" {
-        let (issues, count) =
-            search_issues(db, raw_text, &filters, viewer_id, offset, limit).await?;
-        total += count;
-        results.extend(issues);
-    }
+    page.sort_by_key(|(position, _)| *position);
+    Ok((page.into_iter().map(|(_, row)| row).collect(), total))
+}
 
-    if search_type == "all" || search_type == "wiki" {
-        let (wiki, count) = search_wiki(db, raw_text, &filters, viewer_id, offset, limit).await?;
-        total += count;
-        results.extend(wiki);
-    }
+/// Where the `index`-th match of `kind` lands in the round-robin sequence.
+///
+/// Round `t` emits one match from every kind that still has one, in kind order,
+/// so everything from rounds before `index` comes first, then the kinds ahead
+/// of this one within round `index` itself.
+fn merge_position(lengths: &[u64; KINDS], kind: usize, index: u64) -> u64 {
+    let earlier_rounds: u64 = lengths.iter().map(|&length| length.min(index)).sum();
+    let ahead_this_round = lengths[..kind]
+        .iter()
+        .filter(|&&length| length > index)
+        .count() as u64;
+    earlier_rounds + ahead_this_round
+}
 
-    // For pagination when search_type is "all", apply offset/limit to the combined set
-    if search_type == "all" {
-        let skip = offset as usize;
-        let take = limit as usize;
-        let trimmed = results.into_iter().skip(skip).take(take).collect();
-        return Ok((trimmed, total));
+/// The half-open slice of `kind`'s own ordering that the merged window
+/// `[offset, offset + limit)` draws from, as `(offset, limit)` for its SQL.
+fn merge_slice(lengths: &[u64; KINDS], kind: usize, offset: u64, limit: u64) -> (u64, u64) {
+    let length = lengths[kind];
+    if length == 0 || limit == 0 {
+        return (0, 0);
     }
+    let window_end = offset.saturating_add(limit);
+    let start = first_index_where(length, |index| {
+        merge_position(lengths, kind, index) >= offset
+    });
+    let end = first_index_where(length, |index| {
+        merge_position(lengths, kind, index) >= window_end
+    });
+    (start, end - start)
+}
 
-    Ok((results, total))
+/// The first index in `0..length` satisfying `reached`, or `length` if none
+/// does. `merge_position` is strictly increasing in the index, so the predicate
+/// is monotone and a binary search is exact — which is what keeps a deep page
+/// from having to read everything before it.
+fn first_index_where(length: u64, reached: impl Fn(u64) -> bool) -> u64 {
+    let (mut low, mut high) = (0u64, length);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if reached(mid) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
 }
 
 /// Build SQL WHERE clauses from filters (parameterized — no SQL injection).
@@ -338,16 +434,40 @@ fn decode_total(rows: &[QueryResult], what: &str) -> Result<i64> {
     decode_required(row, 0, what, "count")
 }
 
-/// Search repositories by name and description, with optional filters.
-async fn search_repos(
-    db: &DatabaseConnection,
+/// The `WHERE` / `ORDER BY` / parameters a backend's page query and its
+/// `COUNT` are both built from. One value feeding both is what keeps `total` an
+/// answer about the very rows the page is drawn from.
+struct QueryParts {
+    joins_sql: String,
+    where_clause: String,
+    order_clause: String,
+    params: Vec<Value>,
+    count_params: Vec<Value>,
+}
+
+/// Append the tiebreaker a paged query needs on top of the FTS ranking.
+///
+/// A page and its successor are only disjoint if the rows carry a total order.
+/// The rank alone does not give one — ties are resolved however the engine
+/// happens to scan — and once the qualifiers have eaten the whole query there
+/// is no rank at all, so `LIMIT/OFFSET` would page over an order the database
+/// is free to change between two requests, serving a match twice or never.
+/// The primary key breaks every remaining tie.
+fn ordered_by(rank_clause: &str, id_column: &str) -> String {
+    if rank_clause.is_empty() {
+        format!("ORDER BY {id_column} DESC")
+    } else {
+        format!("{rank_clause}, {id_column} DESC")
+    }
+}
+
+/// Shared SQL for the repository backend.
+fn repos_parts(
+    backend: DatabaseBackend,
     raw_query: &str,
     filters: &SearchFilters,
     viewer_id: Option<i64>,
-    offset: u64,
-    limit: u64,
-) -> Result<(Vec<SearchResult>, i64)> {
-    let backend = db.get_database_backend();
+) -> QueryParts {
     let (mut filter_clauses, extra_joins, mut filter_params) = build_filter_clauses(filters, "r");
 
     let (visibility, visibility_params) = build_visibility_clause("r", viewer_id);
@@ -367,6 +487,27 @@ async fn search_repos(
         format!("\n{}", extra_joins.join("\n"))
     };
 
+    QueryParts {
+        params: search_params(&query_values, &filter_params, true),
+        count_params: search_params(&query_values, &filter_params, false),
+        order_clause: ordered_by(&order_clause, "r.id"),
+        joins_sql,
+        where_clause,
+    }
+}
+
+/// One page of repositories matching by name and description.
+async fn fetch_repos(
+    db: &DatabaseConnection,
+    raw_query: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<SearchResult>> {
+    let backend = db.get_database_backend();
+    let parts = repos_parts(backend, raw_query, filters, viewer_id);
+
     let sql = format!(
         r#"
         SELECT r.id, r.name as title, r.description as excerpt, u.username as owner_name
@@ -378,14 +519,13 @@ async fn search_repos(
         {}
         LIMIT {} OFFSET {}
         "#,
-        joins_sql, where_clause, order_clause, limit, offset
+        parts.joins_sql, parts.where_clause, parts.order_clause, limit, offset
     );
 
-    let params = search_params(&query_values, &filter_params, true);
     let sql = rg_db::prepare_sql(backend, &sql);
 
     let rows = db
-        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .query_all(Statement::from_sql_and_values(backend, &sql, parts.params))
         .await
         .context("fts: search repos")?;
 
@@ -407,6 +547,19 @@ async fn search_repos(
         });
     }
 
+    Ok(results)
+}
+
+/// How many repositories match — the same predicate the page is cut from.
+async fn count_repos(
+    db: &DatabaseConnection,
+    raw_query: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> Result<i64> {
+    let backend = db.get_database_backend();
+    let parts = repos_parts(backend, raw_query, filters, viewer_id);
+
     let count_sql = format!(
         r#"
         SELECT COUNT(DISTINCT repos_fts.rowid)
@@ -416,33 +569,27 @@ async fn search_repos(
         {}
         WHERE {}
         "#,
-        joins_sql, where_clause
+        parts.joins_sql, parts.where_clause
     );
-    let count_params = search_params(&query_values, &filter_params, false);
     let count_sql = rg_db::prepare_sql(backend, &count_sql);
     let count_rows = db
         .query_all(Statement::from_sql_and_values(
             backend,
             &count_sql,
-            count_params,
+            parts.count_params,
         ))
         .await
         .context("fts: count repos")?;
-    let total = decode_total(&count_rows, "count repos")?;
-
-    Ok((results, total))
+    decode_total(&count_rows, "count repos")
 }
 
-/// Search issues by title and body, with optional filters (repo, state, author, label).
-async fn search_issues(
-    db: &DatabaseConnection,
+/// Shared SQL for the issue backend (repo, state, author, label filters).
+fn issues_parts(
+    backend: DatabaseBackend,
     raw_query: &str,
     filters: &SearchFilters,
     viewer_id: Option<i64>,
-    offset: u64,
-    limit: u64,
-) -> Result<(Vec<SearchResult>, i64)> {
-    let backend = db.get_database_backend();
+) -> QueryParts {
     let (mut common_clauses, common_joins, mut common_params) = build_filter_clauses(filters, "i");
     let (issue_clauses, issue_joins, issue_params) = build_issue_filter_clauses(filters);
 
@@ -463,6 +610,27 @@ async fn search_issues(
 
     let (where_clause, _) = combine_where(&match_pred, &common_clauses);
 
+    QueryParts {
+        params: search_params(&query_values, &common_params, true),
+        count_params: search_params(&query_values, &common_params, false),
+        order_clause: ordered_by(&order_clause, "i.id"),
+        joins_sql: all_joins,
+        where_clause,
+    }
+}
+
+/// One page of issues matching by title and body.
+async fn fetch_issues(
+    db: &DatabaseConnection,
+    raw_query: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<SearchResult>> {
+    let backend = db.get_database_backend();
+    let parts = issues_parts(backend, raw_query, filters, viewer_id);
+
     let sql = format!(
         r#"
         SELECT i.id, i.title, i.body as excerpt, i.repo_id, r.name as repo_name, u.username as owner_name, i.state, i.number
@@ -475,10 +643,10 @@ async fn search_issues(
         {}
         LIMIT {} OFFSET {}
         "#,
-        all_joins, where_clause, order_clause, limit, offset
+        parts.joins_sql, parts.where_clause, parts.order_clause, limit, offset
     );
 
-    let params = search_params(&query_values, &common_params, true);
+    let params = parts.params;
     let sql = rg_db::prepare_sql(backend, &sql);
 
     let rows = db
@@ -510,6 +678,19 @@ async fn search_issues(
         });
     }
 
+    Ok(results)
+}
+
+/// How many issues match — the same predicate the page is cut from.
+async fn count_issues(
+    db: &DatabaseConnection,
+    raw_query: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> Result<i64> {
+    let backend = db.get_database_backend();
+    let parts = issues_parts(backend, raw_query, filters, viewer_id);
+
     let count_sql = format!(
         r#"
         SELECT COUNT(DISTINCT i.id)
@@ -519,33 +700,27 @@ async fn search_issues(
         {}
         WHERE {}
         "#,
-        all_joins, where_clause
+        parts.joins_sql, parts.where_clause
     );
-    let count_params = search_params(&query_values, &common_params, false);
     let count_sql = rg_db::prepare_sql(backend, &count_sql);
     let count_rows = db
         .query_all(Statement::from_sql_and_values(
             backend,
             &count_sql,
-            count_params,
+            parts.count_params,
         ))
         .await
         .context("fts: count issues")?;
-    let total = decode_total(&count_rows, "count issues")?;
-
-    Ok((results, total))
+    decode_total(&count_rows, "count issues")
 }
 
-/// Search wiki pages by title and content, with optional filters.
-async fn search_wiki(
-    db: &DatabaseConnection,
+/// Shared SQL for the wiki backend.
+fn wiki_parts(
+    backend: DatabaseBackend,
     raw_query: &str,
     filters: &SearchFilters,
     viewer_id: Option<i64>,
-    offset: u64,
-    limit: u64,
-) -> Result<(Vec<SearchResult>, i64)> {
-    let backend = db.get_database_backend();
+) -> QueryParts {
     let (mut filter_clauses, extra_joins, mut filter_params) = build_filter_clauses(filters, "w");
 
     let (visibility, visibility_params) = build_visibility_clause("r", viewer_id);
@@ -559,6 +734,32 @@ async fn search_wiki(
     };
 
     let (where_clause, _) = combine_where(&match_pred, &filter_clauses);
+    let joins_sql = if extra_joins.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", extra_joins.join("\n"))
+    };
+
+    QueryParts {
+        params: search_params(&query_values, &filter_params, true),
+        count_params: search_params(&query_values, &filter_params, false),
+        order_clause: ordered_by(&order_clause, "w.id"),
+        joins_sql,
+        where_clause,
+    }
+}
+
+/// One page of wiki pages matching by title and content.
+async fn fetch_wiki(
+    db: &DatabaseConnection,
+    raw_query: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<SearchResult>> {
+    let backend = db.get_database_backend();
+    let parts = wiki_parts(backend, raw_query, filters, viewer_id);
 
     let sql = format!(
         r#"
@@ -572,14 +773,10 @@ async fn search_wiki(
         {}
         LIMIT {} OFFSET {}
         "#,
-        extra_joins.join("\n"),
-        where_clause,
-        order_clause,
-        limit,
-        offset
+        parts.joins_sql, parts.where_clause, parts.order_clause, limit, offset
     );
 
-    let params = search_params(&query_values, &filter_params, true);
+    let params = parts.params;
     let sql = rg_db::prepare_sql(backend, &sql);
 
     let rows = db
@@ -608,11 +805,18 @@ async fn search_wiki(
         });
     }
 
-    let joins_sql = if extra_joins.is_empty() {
-        String::new()
-    } else {
-        format!("\n{}", extra_joins.join("\n"))
-    };
+    Ok(results)
+}
+
+/// How many wiki pages match — the same predicate the page is cut from.
+async fn count_wiki(
+    db: &DatabaseConnection,
+    raw_query: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> Result<i64> {
+    let backend = db.get_database_backend();
+    let parts = wiki_parts(backend, raw_query, filters, viewer_id);
 
     let count_sql = format!(
         r#"
@@ -624,27 +828,136 @@ async fn search_wiki(
         {}
         WHERE {}
         "#,
-        joins_sql, where_clause
+        parts.joins_sql, parts.where_clause
     );
-    let count_params = search_params(&query_values, &filter_params, false);
     let count_sql = rg_db::prepare_sql(backend, &count_sql);
     let count_rows = db
         .query_all(Statement::from_sql_and_values(
             backend,
             &count_sql,
-            count_params,
+            parts.count_params,
         ))
         .await
         .context("fts: count wiki")?;
-    let total = decode_total(&count_rows, "count wiki")?;
-
-    Ok((results, total))
+    decode_total(&count_rows, "count wiki")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::Database;
+
+    /// One `type=all` page, expressed the way `search_all` builds it: plan a
+    /// slice per kind, then put the slices back in merged order. Each element
+    /// is `(kind, index within that kind)`.
+    fn merged_page(lengths: &[u64; KINDS], offset: u64, limit: u64) -> Vec<(usize, u64)> {
+        let mut page = Vec::new();
+        for kind in 0..KINDS {
+            let (slice_offset, slice_limit) = merge_slice(lengths, kind, offset, limit);
+            for index in slice_offset..slice_offset + slice_limit {
+                page.push((merge_position(lengths, kind, index), (kind, index)));
+            }
+        }
+        page.sort_by_key(|(position, _)| *position);
+        page.into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// The property the old double-cut broke: walking the pages of `type=all`
+    /// must hand out every match exactly once, and `total` must be the number
+    /// of matches handed out. Checked over every shape of corpus small enough
+    /// to enumerate — including the one from the report, where one kind alone
+    /// is longer than a page and used to hide the other two entirely.
+    #[test]
+    fn every_match_is_reachable_on_exactly_one_page() {
+        for repos in 0..=5u64 {
+            for issues in 0..=5u64 {
+                for wiki in 0..=5u64 {
+                    let lengths = [repos, issues, wiki];
+                    let total = repos + issues + wiki;
+                    for per_page in 1..=4u64 {
+                        let mut seen = Vec::new();
+                        let pages = total.div_ceil(per_page);
+                        for page in 0..pages {
+                            let items = merged_page(&lengths, page * per_page, per_page);
+                            let expected = (total - page * per_page).min(per_page);
+                            assert_eq!(
+                                items.len() as u64,
+                                expected,
+                                "{lengths:?} per_page={per_page} page={page}: short page"
+                            );
+                            seen.extend(items);
+                        }
+                        assert!(
+                            merged_page(&lengths, pages * per_page, per_page).is_empty(),
+                            "{lengths:?} per_page={per_page}: a page past `total` returned rows"
+                        );
+
+                        let mut unique = seen.clone();
+                        unique.sort_unstable();
+                        unique.dedup();
+                        assert_eq!(
+                            unique.len(),
+                            seen.len(),
+                            "{lengths:?} per_page={per_page}: a match was served twice"
+                        );
+                        assert_eq!(
+                            unique.len() as u64,
+                            total,
+                            "{lengths:?} per_page={per_page}: matches served != total"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The visible half of the same bug: with 40 matching repositories and 40
+    /// matching issues, page one used to be repositories only.
+    #[test]
+    fn the_first_page_mixes_the_kinds_that_have_matches() {
+        let page = merged_page(&[40, 40, 0], 0, 20);
+        let kinds: Vec<usize> = page.iter().map(|(kind, _)| *kind).collect();
+        assert!(
+            kinds.contains(&0) && kinds.contains(&1),
+            "page one drew from one kind only: {kinds:?}"
+        );
+        assert_eq!(
+            &kinds[..4],
+            &[0, 1, 0, 1],
+            "the kinds must alternate while both still have matches"
+        );
+
+        // The first issue is on page one, not lost between the pages.
+        assert_eq!(page[1], (1, 0));
+    }
+
+    /// A kind that runs out mid-corpus must not leave a gap: the rest of the
+    /// pages stay full and keep the surviving kinds in order.
+    #[test]
+    fn an_exhausted_kind_yields_its_turn() {
+        // Repos run out after 2, wiki after 1; issues carry the tail.
+        let lengths = [2, 5, 1];
+        assert_eq!(
+            merged_page(&lengths, 0, 4),
+            vec![(0, 0), (1, 0), (2, 0), (0, 1)]
+        );
+        assert_eq!(
+            merged_page(&lengths, 4, 4),
+            vec![(1, 1), (1, 2), (1, 3), (1, 4)]
+        );
+        assert_eq!(merged_page(&lengths, 7, 4), vec![(1, 4)]);
+    }
+
+    /// A page past the corpus asks each backend for nothing at all — the empty
+    /// slice is what `search_all` skips the round-trip on.
+    #[test]
+    fn a_page_past_the_corpus_plans_no_query() {
+        let lengths = [3, 3, 3];
+        for kind in 0..KINDS {
+            assert_eq!(merge_slice(&lengths, kind, 9, 20).1, 0);
+            assert_eq!(merge_slice(&lengths, kind, u64::MAX, 20).1, 0);
+        }
+    }
 
     /// The decoders are the whole fix, and no caller can reach the branch they
     /// replace: on a healthy schema every one of these columns decodes. So they
