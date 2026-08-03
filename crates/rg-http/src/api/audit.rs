@@ -12,6 +12,48 @@ use utoipa::ToSchema;
 
 use crate::{api::admin::InstanceAdmin, error::AppError, AppState};
 
+/// Parse one `start_time` / `end_time` query parameter.
+///
+/// An absent bound is `None` — "no bound" — and that is the only way a bound
+/// may go missing. A bound that was *sent* and did not parse used to be dropped
+/// through `.ok()`, and the query then ran without it: the admin who typed
+/// `2026-08-01` instead of RFC 3339 while walking an incident got `200` and a
+/// convincing list covering all of time, with nothing but its length to hint
+/// that the window they asked for was never applied. Telling them the format is
+/// wrong is the only answer that leaves them able to trust the next list.
+fn parse_time_bound(
+    value: Option<&str>,
+    name: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+    value
+        .map(|value| {
+            chrono::DateTime::<chrono::Utc>::from_str(value).map_err(|_| {
+                AppError::bad_request(format!(
+                    "{name} must be an ISO 8601 / RFC 3339 timestamp with an offset, \
+                     e.g. 2026-08-01T00:00:00Z"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Reject a window that cannot contain anything, rather than answering with the
+/// empty list it selects — the two look identical to the caller.
+fn check_time_window(
+    start_time: Option<&chrono::DateTime<chrono::Utc>>,
+    end_time: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Result<(), AppError> {
+    if start_time
+        .zip(end_time)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err(AppError::bad_request(
+            "start_time must be earlier than or equal to end_time",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AuditLogQuery {
     page: Option<u64>,
@@ -111,14 +153,9 @@ pub async fn list_audit_logs(
     // sea_orm paginator is 0-based internally.
     let page_index = page - 1;
 
-    let start_time = q
-        .start_time
-        .as_deref()
-        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_str(s).ok());
-    let end_time = q
-        .end_time
-        .as_deref()
-        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_str(s).ok());
+    let start_time = parse_time_bound(q.start_time.as_deref(), "start_time")?;
+    let end_time = parse_time_bound(q.end_time.as_deref(), "end_time")?;
+    check_time_window(start_time.as_ref(), end_time.as_ref())?;
 
     let (logs, total) = rg_db::ops::audit_log_ops::list_paginated(
         &state.db,
@@ -183,25 +220,9 @@ pub async fn list_login_attempts(
 ) -> Result<Json<LoginAttemptResponse>, AppError> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(20).clamp(1, 100);
-    let parse_time = |value: Option<&str>, name: &str| {
-        value
-            .map(|value| {
-                chrono::DateTime::<chrono::Utc>::from_str(value)
-                    .map_err(|_| AppError::bad_request(format!("{name} must be ISO 8601")))
-            })
-            .transpose()
-    };
-    let start_time = parse_time(q.start_time.as_deref(), "start_time")?;
-    let end_time = parse_time(q.end_time.as_deref(), "end_time")?;
-    if start_time
-        .as_ref()
-        .zip(end_time.as_ref())
-        .is_some_and(|(start, end)| start > end)
-    {
-        return Err(AppError::bad_request(
-            "start_time must be earlier than or equal to end_time",
-        ));
-    }
+    let start_time = parse_time_bound(q.start_time.as_deref(), "start_time")?;
+    let end_time = parse_time_bound(q.end_time.as_deref(), "end_time")?;
+    check_time_window(start_time.as_ref(), end_time.as_ref())?;
     let username = q
         .username
         .as_deref()

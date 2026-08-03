@@ -26,6 +26,7 @@ mod api_tests;
 mod archive_failure_status_tests;
 mod artifact_file_tests;
 mod attachment_tests;
+mod audit_time_filter_tests;
 mod authz_extractor_guard;
 mod blob_api_tests;
 mod board_authz_tests;
