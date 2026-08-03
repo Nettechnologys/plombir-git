@@ -122,6 +122,45 @@ archive_after_days = 90
 interval_minutes = 60
 batch_size = 1000
 
+[backup]
+# In-process scheduled backups of the SQLite database (`VACUUM INTO`, safe to
+# take while the server is running). With this on, "are there backups?" is
+# answered by this file rather than by whether someone remembered to add a cron
+# entry on one particular host — and the snapshot is taken from the same pool
+# the server uses, so it cannot end up addressing a different database the way
+# `forgekeep backup-db` without `--config`/`--db-url` does.
+#
+# Defaults to false in code so an upgrade never starts consuming
+# keep_last x database-size of disk unannounced; it is on here because a fresh
+# install should be backed up from the first start.
+enabled = true
+# The server creates this directory and proves it is writable at startup — it
+# refuses to start otherwise, rather than discovering a day later that it cannot
+# write backups. Left unset it defaults to a sibling of `[server].repo_root` when
+# that is an absolute path (`/data/repos` → `/data/backups`), so snapshots land
+# on the same volume as the rest of the state; otherwise `./data/backups`.
+dir = "./data/backups"
+# Hours between snapshots. The first snapshot after a start is due from the
+# newest file already in `dir`, not from the boot: a server restarted more often
+# than this still gets backed up, and a crash-looping one does not rotate the
+# good snapshots out.
+interval_hours = 24
+# How many snapshots to keep. The N+1-th evicts the oldest. Only files this
+# scheduler wrote (`forgekeep-<timestamp>-<uuid>.db`) are ever deleted — a
+# hand-made backup left in the same directory is not touched.
+keep_last = 7
+#
+# NOT covered by this: repositories under `[server].repo_root`. A database
+# backup restores users, issues, PRs and settings; the git data is a separate
+# artifact. Either snapshot the whole data volume (rsync / filesystem snapshot),
+# or decide explicitly that bare repos are recoverable from developer clones —
+# but decide, rather than assume this section covers it.
+#
+# Only the SQLite backend can be snapshotted this way. On PostgreSQL/MySQL,
+# `enabled = true` fails the start by design (an instance that looks backed up
+# and is not is the failure worth being loud about) — schedule pg_dump /
+# mysqldump instead and leave this off.
+
 [observability]
 # OpenTelemetry distributed tracing (OTLP/HTTP export). Prometheus metrics at
 # /metrics are always on and independent of this section — these knobs only add

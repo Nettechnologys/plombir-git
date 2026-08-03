@@ -302,7 +302,7 @@ as an HTTP client of the ForgeKeep REST API and authenticates with a PAT.
 Configuration is resolved as **CLI args > config file > defaults**. The config
 file is TOML (`forgekeep.toml`; see `forgekeep.example.toml` for all sections:
 `server`, `database`, `auth`, `ci`, `rate_limit`, `smtp`, `tls`, `logging`,
-`audit`). The model and the resolution live in `rg-cli/src/config.rs` and are
+`audit`, `backup`). The model and the resolution live in `rg-cli/src/config.rs` and are
 shared by **every** subcommand, not just `serve`: `migrate`, `rebuild-fts`,
 `backup-db`, `restore-db`, `create-repo`, `import`, `index-repo` and
 `package list` all take `--config` and read `[database].url` /
@@ -315,8 +315,8 @@ typed, so it makes the config key unreachable; the built-in defaults live in
 Environment variables use the `FORGEKEEP_*` prefix.
 
 **Path-typed keys are checked at startup, not on first use.** `server.repo_root`,
-`tls.cert` / `tls.key`, `logging.file` and `audit.archive_dir` are created
-and/or write-probed before the servers come up, and a failure aborts the start
+`tls.cert` / `tls.key`, `logging.file`, `audit.archive_dir` and `backup.dir` are
+created and/or write-probed before the servers come up, and a failure aborts the start
 with the path, the uid/ownership diagnostic and the knob to fix
 (`rg_core::platform::fs::describe_path_error`). `server.host_key` is checked the
 same way but only fails the SSH listener — HTTP keeps serving. The rule exists

@@ -930,7 +930,10 @@ mod tests {
                     panic!("`{provider_name}` should name an account, got {error:?}")
                 });
 
-            assert_eq!(identity.provider_username, expected, "from `{provider_name}`");
+            assert_eq!(
+                identity.provider_username, expected,
+                "from `{provider_name}`"
+            );
             assert!(
                 crate::user::service::validate_username(&identity.provider_username).is_ok(),
                 "`{}` must satisfy the same rule self-registration does",
@@ -959,7 +962,10 @@ mod tests {
             .into_identity()
             .expect("a long name is cut, not refused");
 
-        assert_eq!(identity.provider_username.len(), super::SSO_USERNAME_BASE_MAX);
+        assert_eq!(
+            identity.provider_username.len(),
+            super::SSO_USERNAME_BASE_MAX
+        );
         for suffix in ["_99", "_abcdef"] {
             let generated = format!("{}{suffix}", identity.provider_username);
             assert!(

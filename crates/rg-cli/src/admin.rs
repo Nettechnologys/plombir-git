@@ -177,6 +177,62 @@ pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Res
 }
 
 #[cfg(test)]
+mod scheduled_backup_restore_tests {
+    use rg_db::sea_orm::{self, ConnectionTrait};
+
+    async fn connect(db_url: &str) -> sea_orm::DatabaseConnection {
+        rg_db::connect_with_pool(db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap()
+    }
+
+    /// The acceptance criterion for scheduled backups, and the only one that
+    /// proves anything: a snapshot the *scheduler* produced must survive a real
+    /// `restore-db` and come back with its rows. Testing that the file exists
+    /// would pass just as happily on a truncated or empty database — which is
+    /// exactly the class of failure `backup-db` without `--db-url` used to
+    /// produce, and the reason this path exists at all.
+    #[tokio::test]
+    async fn a_scheduled_snapshot_restores_into_a_working_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("forgekeep.db");
+        let live_url = format!("sqlite://{}?mode=rwc", live_path.display());
+        let live = connect(&live_url).await;
+        live.execute_unprepared("CREATE TABLE marker (v TEXT)")
+            .await
+            .unwrap();
+        live.execute_unprepared("INSERT INTO marker (v) VALUES ('survives-restore')")
+            .await
+            .unwrap();
+
+        let config = rg_core::backup::DbBackupConfig::with_dir(dir.path().join("backups"));
+        let snapshot = rg_core::backup::run_backup_once(&live, &config)
+            .await
+            .unwrap();
+
+        // Restore into a *different* database file, so a pass cannot come from
+        // reading the original back.
+        let restored_path = dir.path().join("restored.db");
+        let restored_url = format!("sqlite://{}?mode=rwc", restored_path.display());
+        super::restore_sqlite_db(&restored_url, &snapshot.path, false).unwrap();
+
+        let restored = connect(&restored_url).await;
+        let rows = restored
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT v FROM marker",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].try_get::<String>("", "v").unwrap(),
+            "survives-restore"
+        );
+    }
+}
+
+#[cfg(test)]
 mod jwt_secret_tests {
     use super::{generate_jwt_secret, validate_jwt_secret, KNOWN_BAD_JWT_SECRETS};
     use base64::Engine as _;

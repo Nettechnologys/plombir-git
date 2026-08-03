@@ -175,3 +175,39 @@ groups:
         annotations:
           summary: "Disk usage > 85% on {{ $labels.instance }}"
           description: "Filesystem: {{ $labels.mountpoint }} at {{ $value | humanizePercentage }}."
+
+  # Backup alerts
+  #
+  # These only fire where `[backup].enabled = true`; with scheduled backups off
+  # the series does not exist and the alerts stay silent by design — the "is
+  # this instance backed up at all?" question is answered by the config file and
+  # the startup log line, not by an alert that cannot tell "off" from "broken".
+  - name: forgekeep_backup
+    interval: 60s
+    rules:
+      # The one that matters: a backup task can keep running while every run
+      # fails, so alert on the age of the last *successful* snapshot rather than
+      # on failures. 0 = never succeeded since this process started, which is
+      # also worth paging about once the grace window has passed.
+      - alert: BackupTooOld
+        expr: |
+          (time() - forgekeep_db_backup_last_success_timestamp_seconds > 36 * 3600)
+          or
+          (forgekeep_db_backup_last_success_timestamp_seconds == 0)
+        for: 30m
+        labels:
+          severity: critical
+          service: forgekeep
+        annotations:
+          summary: "No successful database backup in over 36h"
+          description: "Check `docker compose logs | grep 'database backup'` — the run fails with the reason and the directory. Tuned for the default [backup].interval_hours = 24; raise the threshold if you lengthened the interval."
+
+      - alert: BackupRunsFailing
+        expr: increase(forgekeep_db_backups_total{status="failed"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: forgekeep
+        annotations:
+          summary: "Scheduled database backup run failed"
+          description: "{{ $value }} failed run(s) in the last hour. The warning in the server log names the directory and the cause."

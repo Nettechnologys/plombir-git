@@ -79,10 +79,7 @@ impl std::error::Error for ProvisioningRefusal {}
 ///
 /// Called on the creation branch only — see the module note on why an existing
 /// account never reaches this function.
-pub fn authorize(
-    provider: &sso_provider::Model,
-    email: &str,
-) -> Result<(), ProvisioningRefusal> {
+pub fn authorize(provider: &sso_provider::Model, email: &str) -> Result<(), ProvisioningRefusal> {
     if !provider.auto_provision {
         return Err(ProvisioningRefusal::AutoProvisionDisabled);
     }
@@ -200,7 +197,10 @@ mod tests {
 
     #[test]
     fn no_allowlist_means_no_domain_restriction() {
-        assert_eq!(authorize(&provider(true, None), "anyone@anywhere.io"), Ok(()));
+        assert_eq!(
+            authorize(&provider(true, None), "anyone@anywhere.io"),
+            Ok(())
+        );
     }
 
     #[test]
@@ -257,7 +257,12 @@ mod tests {
 
     #[test]
     fn normalisation_rejects_what_is_not_a_domain() {
-        for bad in ["alice@example.com", "exa mple.com", "example.com/path", "localhost"] {
+        for bad in [
+            "alice@example.com",
+            "exa mple.com",
+            "example.com/path",
+            "localhost",
+        ] {
             assert!(
                 normalize_email_domains(bad).is_err(),
                 "`{bad}` was accepted as an email domain"

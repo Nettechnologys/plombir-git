@@ -40,6 +40,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) audit: AuditConfig,
     #[serde(default)]
+    pub(crate) backup: BackupConfig,
+    #[serde(default)]
     pub(crate) timeouts: TimeoutConfig,
     #[serde(default)]
     pub(crate) webhooks: WebhooksConfig,
@@ -198,6 +200,24 @@ pub(crate) struct AuditConfig {
     pub(crate) archive_after_days: Option<i64>,
     pub(crate) interval_minutes: Option<u64>,
     pub(crate) batch_size: Option<u64>,
+}
+
+/// `[backup]` — the in-process database backup schedule.
+///
+/// Opt-in (`enabled` defaults to **false**) rather than on-by-default: a
+/// snapshot every `interval_hours` with `keep_last` copies retained multiplies
+/// the database's disk footprint, and that is not a cost to impose on an
+/// existing install during an upgrade. The shipped deployment configs
+/// (`forgekeep.example.toml`, `deploy/forgekeep.docker.toml`) turn it on, so a
+/// new instance is backed up from the first start; and a server with it off says
+/// so at startup, which is the point — "are there backups?" should be answerable
+/// from the config file and the log, not from an admin's memory of a cron entry.
+#[derive(Debug, serde::Deserialize, Default)]
+pub(crate) struct BackupConfig {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) dir: Option<String>,
+    pub(crate) interval_hours: Option<u64>,
+    pub(crate) keep_last: Option<usize>,
 }
 
 /// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
@@ -799,5 +819,25 @@ max_files = 7
         assert_eq!(config.audit.archive_after_days, Some(90));
         assert_eq!(config.audit.interval_minutes, Some(60));
         assert_eq!(config.audit.batch_size, Some(1_000));
+    }
+
+    /// The shipped configs are the answer to "are there backups?" on a fresh
+    /// install, so the section has to parse (`deny_unknown_fields` makes a
+    /// documented-but-unmodelled key a hard startup failure) *and* actually be
+    /// switched on. The docker one must also point at the mounted volume: a
+    /// backup under the image's `WORKDIR /app` is erased by the next
+    /// `--force-recreate`.
+    #[test]
+    fn the_shipped_configs_schedule_backups_onto_durable_storage() {
+        let example: ConfigFile =
+            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+        assert_eq!(example.backup.enabled, Some(true));
+        assert_eq!(example.backup.interval_hours, Some(24));
+        assert_eq!(example.backup.keep_last, Some(7));
+
+        let docker: ConfigFile =
+            toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
+        assert_eq!(docker.backup.enabled, Some(true));
+        assert_eq!(docker.backup.dir.as_deref(), Some("/data/backups"));
     }
 }

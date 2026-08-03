@@ -92,6 +92,20 @@ fn default_audit_archive_dir(repo_root: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Default `[backup].dir` — a sibling of `repo_root`, for exactly the reasons
+/// spelled out on [`default_audit_archive_dir`]: a cwd-relative default resolves
+/// inside the container layer (`WORKDIR /app`), and a backup that disappears on
+/// `docker compose up --force-recreate` is worse than no backup, because it
+/// looks like one.
+fn default_db_backup_dir(repo_root: &std::path::Path) -> PathBuf {
+    match repo_root.parent() {
+        Some(parent) if repo_root.is_absolute() && parent.parent().is_some() => {
+            parent.join("backups")
+        }
+        _ => PathBuf::from("./data/backups"),
+    }
+}
+
 /// Validate critical configuration before starting servers.
 /// Refuses to start with dangerous defaults or invalid settings.
 fn validate_config(
@@ -829,6 +843,53 @@ pub(crate) async fn run_serve(
         )?)
     } else {
         tracing::info!("Audit log archival disabled by configuration");
+        None
+    };
+
+    // ── Scheduled database backups ────────────────────────────────
+    // The point of doing this in-process rather than in a cron entry on one
+    // host: the schedule travels with the config file, the snapshot is taken
+    // from the pool the server itself is using (so it cannot address a
+    // different database, the way a `backup-db` without `--config` does), and
+    // an unusable backup directory fails the start instead of surfacing a day
+    // later as a warning.
+    let backup_config = cfg.as_ref().map(|config| &config.backup);
+    let _db_backup_handle = if backup_config
+        .and_then(|config| config.enabled)
+        .unwrap_or(false)
+    {
+        let backup_dir = backup_config
+            .and_then(|config| config.dir.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_db_backup_dir(&repo_root));
+        tracing::info!(
+            backup_dir = %std::path::absolute(&backup_dir)
+                .unwrap_or_else(|_| backup_dir.clone())
+                .display(),
+            "Scheduled database backups enabled"
+        );
+        let db_backup_config = rg_core::backup::DbBackupConfig {
+            dir: backup_dir,
+            interval_hours: backup_config
+                .and_then(|config| config.interval_hours)
+                .unwrap_or(24),
+            keep_last: backup_config
+                .and_then(|config| config.keep_last)
+                .unwrap_or(7),
+        };
+        Some(rg_core::backup::spawn_db_backup_with_shutdown(
+            db.clone(),
+            db_backup_config,
+            Some(shutdown_rx.clone()),
+        )?)
+    } else {
+        // Said out loud on purpose: an operator who greps the log for "backup"
+        // must not have to infer the answer from the absence of a line.
+        tracing::info!(
+            "Scheduled database backups are OFF ([backup].enabled): this database is only backed \
+             up when someone runs `forgekeep backup-db`. Note that repositories under repo_root \
+             are never covered by a database backup — snapshot the data volume for those."
+        );
         None
     };
 

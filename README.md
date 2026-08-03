@@ -289,7 +289,7 @@ Beyond `serve`, the `forgekeep` binary offers:
 | `serve` | Start the server (HTTP + SSH) |
 | `migrate` | Run database migrations and exit |
 | `rebuild-fts` | Rebuild full-text search indexes |
-| `backup-db` / `restore-db` | Create / restore a consistent SQLite backup |
+| `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key |
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
@@ -306,6 +306,15 @@ config-file deployment, pass `--config` rather than repeating the URL: with
 neither, they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working
 directory, so `migrate` would migrate an empty database and `backup-db` would
 back it up.
+
+That trap is the reason backups are not left to a manual command: enable
+`[backup]` in the config file and the server takes a `VACUUM INTO` snapshot
+every `interval_hours` from the pool it is already using, keeping the newest
+`keep_last`. An unwritable `[backup].dir` fails the start rather than surfacing a
+day later, and `forgekeep_db_backup_last_success_timestamp_seconds` lets
+monitoring alert on "the last backup is older than N hours". It covers the
+database only — repositories under `repo_root` need a volume snapshot of their
+own. See `deploy/README.md` for the details.
 
 Run `forgekeep <command> --help` for the full flag list.
 

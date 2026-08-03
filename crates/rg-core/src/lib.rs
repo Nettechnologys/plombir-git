@@ -44,6 +44,7 @@ pub mod release;
 
 // ── Infrastructure ──────────────────────────────────
 pub mod audit;
+pub mod backup; // Scheduled SQLite snapshots, so "are there backups?" is a config answer
 pub mod blob_storage;
 pub mod email;
 pub mod instance;

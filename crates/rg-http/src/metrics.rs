@@ -344,6 +344,17 @@ pub mod business {
     /// Gauge: total non-deleted repositories.
     pub static REPOS_TOTAL: OnceLock<IntGauge> = OnceLock::new();
 
+    /// Counter: scheduled database backup runs by status.
+    pub static DB_BACKUPS: OnceLock<IntCounterVec> = OnceLock::new();
+
+    /// Gauge: Unix timestamp of the last *successful* scheduled database
+    /// backup. A counter alone cannot answer "when was the last backup?" —
+    /// which is the only question that matters — so the alert
+    /// (`BackupTooOld` in `deploy/prometheus/alerts.yml`) reads this.
+    /// Stays 0 until the first successful run, so "never backed up" and
+    /// "backed up long ago" are both alertable.
+    pub static DB_BACKUP_LAST_SUCCESS: OnceLock<IntGauge> = OnceLock::new();
+
     /// Register all business metrics with the registry.
     pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         macro_rules! register_counter {
@@ -425,6 +436,27 @@ pub mod business {
             .set(rt.clone())
             .map_err(|_| prometheus::Error::Msg("REPOS_TOTAL already set".into()))?;
         registry.register(Box::new(rt))?;
+
+        let bk = IntCounterVec::new(
+            Opts::new(
+                "forgekeep_db_backups_total",
+                "Scheduled database backup runs by status",
+            ),
+            &["status"],
+        )?;
+        DB_BACKUPS
+            .set(bk.clone())
+            .map_err(|_| prometheus::Error::Msg("DB_BACKUPS already set".into()))?;
+        registry.register(Box::new(bk))?;
+
+        let bt = IntGauge::with_opts(Opts::new(
+            "forgekeep_db_backup_last_success_timestamp_seconds",
+            "Unix timestamp of the last successful scheduled database backup (0 = never)",
+        ))?;
+        DB_BACKUP_LAST_SUCCESS
+            .set(bt.clone())
+            .map_err(|_| prometheus::Error::Msg("DB_BACKUP_LAST_SUCCESS already set".into()))?;
+        registry.register(Box::new(bt))?;
 
         Ok(())
     }
@@ -634,6 +666,28 @@ pub mod recorder {
     pub fn set_repos_total(count: i64) {
         if let Some(g) = business::REPOS_TOTAL.get() {
             g.set(count);
+        }
+    }
+
+    /// Record a finished scheduled database backup run.
+    ///
+    /// A successful run also stamps
+    /// `forgekeep_db_backup_last_success_timestamp_seconds`, because the alert
+    /// worth having is "the last backup is older than N hours", and a counter
+    /// that stops increasing is indistinguishable from a quiet instance.
+    pub fn db_backup(success: bool) {
+        if let Some(c) = business::DB_BACKUPS.get() {
+            let status = if success { "success" } else { "failed" };
+            c.with_label_values(&[status]).inc();
+        }
+        if success {
+            if let Some(g) = business::DB_BACKUP_LAST_SUCCESS.get() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                g.set(now);
+            }
         }
     }
 }

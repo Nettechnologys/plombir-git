@@ -1159,9 +1159,10 @@ mod tests {
         // Baseline in the same test: only the policy differs, and the identical
         // bind now provisions — so the refusal above is the policy, not a
         // broken fixture.
-        let created = resolve_ldap_identity(&db, None, &ldap_provider("jwt-secret"), directory_member())
-            .await
-            .expect("the same first login is provisioned when the directory may");
+        let created =
+            resolve_ldap_identity(&db, None, &ldap_provider("jwt-secret"), directory_member())
+                .await
+                .expect("the same first login is provisioned when the directory may");
         assert_eq!(created.username, "alice");
 
         // And the switch keeps working for people who already have an account:

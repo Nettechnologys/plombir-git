@@ -90,3 +90,26 @@ pub fn record_user_provisioned(source: &str) {
         observer(source);
     }
 }
+
+/// Observer invoked when the scheduled database backup finishes a run. The
+/// `bool` is `true` for a snapshot that was written durably. Recorded here
+/// rather than in the HTTP layer because the scheduler is a `rg-core` background
+/// task; without it the only evidence a backup ran is a log line, and "the last
+/// backup is older than N hours" is precisely the question an operator wants a
+/// monitoring system — not a human reading logs — to answer.
+static DB_BACKUP_OBSERVER: OnceLock<fn(bool)> = OnceLock::new();
+
+/// Install the database-backup observer. Idempotent (first installer wins).
+pub fn set_db_backup_observer(observer: fn(bool)) {
+    if DB_BACKUP_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record a finished scheduled database backup. No-op when no observer is
+/// installed.
+pub fn record_db_backup(success: bool) {
+    if let Some(observer) = DB_BACKUP_OBSERVER.get() {
+        observer(success);
+    }
+}

@@ -386,6 +386,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     rg_core::metrics_hook::set_pr_merged_observer(metrics::recorder::pr_merged);
     rg_core::metrics_hook::set_repo_created_observer(metrics::recorder::repo_created);
     rg_core::metrics_hook::set_user_provisioned_observer(metrics::recorder::user_provisioned);
+    rg_core::metrics_hook::set_db_backup_observer(metrics::recorder::db_backup);
 
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = Arc::new(
         rg_core::blob_storage::LocalBlobStorage::new(config.repo_root.clone()),

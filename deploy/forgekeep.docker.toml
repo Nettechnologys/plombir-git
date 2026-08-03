@@ -83,3 +83,18 @@ archive_dir = "/data/audit-archive"
 archive_after_days = 90
 interval_minutes = 60
 batch_size = 1000
+
+[backup]
+# Scheduled `VACUUM INTO` snapshots of the SQLite database, taken by the server
+# itself — no cron entry on the host, and no way to snapshot the wrong database.
+# `/data` is the mounted volume, so the snapshots survive
+# `docker compose up --force-recreate`; a path under the image's `WORKDIR /app`
+# would not.
+#
+# Budget for this: keep_last x the size of /data/forgekeep.db.
+enabled = true
+dir = "/data/backups"
+interval_hours = 24
+keep_last = 7
+# This does NOT back up /data/repos. Snapshot the whole /data volume for that
+# (or accept that bare repos are recoverable from developer clones).

@@ -116,6 +116,8 @@ failures, prints the uid to `chown` to.
 | `SSH host key … Permission denied` | key file readable only by another uid | `chown <uid> data/ssh_host_key && chmod 600 data/ssh_host_key` |
 | `SSH host key path … is a directory` | bind-mounted a host key file that did not exist | remove the directory and let the server generate the key |
 | `audit archive_dir … is unusable` | `[audit].archive_dir` not writable by the container uid | `chown` it as above, point the key elsewhere, or set `[audit].enabled = false` |
+| `backup dir … is unusable` | `[backup].dir` not writable by the container uid | as above, or set `[backup].enabled = false` |
+| `scheduled database backups … cannot run on the Postgres backend` | `[backup].enabled = true` on a non-SQLite database | set `[backup].enabled = false` and schedule `pg_dump` / `mysqldump` instead |
 | HTTP works, SSH silent | SSH failed on its own; HTTP is unaffected by design | `docker compose logs \| grep 'SSH server error'` |
 
 ### Backup / restore
@@ -237,6 +239,42 @@ The Docker image includes all runtime binaries:
 | `forgekeep-mcp` | MCP stdio server |
 
 ### SQLite Backup / Restore
+
+**The server backs itself up.** `deploy/forgekeep.docker.toml` ships with:
+
+```toml
+[backup]
+enabled = true
+dir = "/data/backups"
+interval_hours = 24
+keep_last = 7
+```
+
+A background task inside the server takes a `VACUUM INTO` snapshot every
+`interval_hours` and deletes everything but the newest `keep_last`, so there is
+no cron entry to forget on one particular host — and the snapshot is taken from
+the pool the server is already using, which is the one thing a manual
+`backup-db` cannot guarantee. Snapshots are named
+`forgekeep-<UTC timestamp>-<uuid>.db`; rotation only ever deletes files matching
+that exact shape, so a hand-made backup left in the same directory is safe.
+
+Things worth knowing before you rely on it:
+
+| | |
+|-|-|
+| **Disk** | Budget `keep_last` × the size of `/data/forgekeep.db`. |
+| **Startup check** | An unwritable `dir` fails the start with the path and the uid, rather than surfacing a day later as a warning. Set `enabled = false` if you do not want scheduled backups. |
+| **Non-SQLite** | `enabled = true` on PostgreSQL/MySQL fails the start by design — `VACUUM INTO` cannot snapshot them. Schedule `pg_dump` / `mysqldump` and leave this off. |
+| **Not covered** | `/data/repos`. A database backup restores users, issues, PRs and settings; the git data is a separate artifact. Snapshot the whole `/data` volume, or decide explicitly that bare repos are recoverable from developer clones. |
+| **Monitoring** | `forgekeep_db_backup_last_success_timestamp_seconds` and `forgekeep_db_backups_total{status}`. The `BackupTooOld` / `BackupRunsFailing` rules in `deploy/prometheus/alerts.yml` read them. |
+| **Verify it** | Restore one. A backup that has never been restored is a file, not a backup — use the `restore-db` recipe below against a throwaway `--db-url`. |
+
+The first snapshot of a process is due from the newest file already in `dir`,
+not from the boot, and never sooner than a minute after start: a server
+restarted more often than `interval_hours` still gets backed up, and one stuck
+in a crash loop does not snapshot on every boot and rotate the good copies out.
+
+#### Taking one by hand
 
 Backups use SQLite `VACUUM INTO`, so they can be taken while ForgeKeep is
 running:
