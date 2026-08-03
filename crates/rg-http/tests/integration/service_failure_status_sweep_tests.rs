@@ -74,6 +74,26 @@ fn seed_pr_branches(bare_path: &std::path::Path) {
     git(&["push", "origin", "feature"], Some(path));
 }
 
+/// Add a real source branch to a fork that already has its inherited `main`.
+fn seed_fork_feature_branch(bare_path: &std::path::Path, branch: &str) {
+    let worktree = tempfile::tempdir().expect("create fork PR fixture worktree");
+    let path = worktree.path();
+    let path_arg = path.to_str().expect("UTF-8 worktree path");
+    let bare_arg = bare_path.to_str().expect("UTF-8 bare repository path");
+
+    git(&["clone", "-q", bare_arg, path_arg], None);
+    git(&["config", "user.name", "Fork PR failure test"], Some(path));
+    git(
+        &["config", "user.email", "fork-pr-failure@example.invalid"],
+        Some(path),
+    );
+    git(&["checkout", "-q", "-b", branch], Some(path));
+    std::fs::write(path.join("fork-feature.txt"), "feature\n").expect("write fork feature file");
+    git(&["add", "."], Some(path));
+    git(&["commit", "-qm", "fork feature"], Some(path));
+    git(&["push", "origin", branch], Some(path));
+}
+
 async fn app_with_repo(prefix: &str) -> (String, sea_orm::DatabaseConnection, String, i64) {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, _user_id) = register_full(
@@ -324,6 +344,138 @@ async fn pr_diff_names_a_deleted_head_branch_as_a_conflict() {
     let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("feature") && message.contains("no longer exists"),
+        "the client needs the missing branch and cause, got: {body}"
+    );
+}
+
+/// `POST .../merge` consumes the PR's stored head branch just like the diff
+/// endpoint. A branch deleted after the PR was opened is stale resource state,
+/// not a Git outage: the client must be told to refresh the PR rather than
+/// retrying a blank 500.
+#[tokio::test]
+async fn pr_merge_names_a_deleted_head_branch_as_a_conflict() {
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, _) = register_full(&base, "pr-merge-owner", "pr-merge@example.com").await;
+    create_repo(&base, &token, "pr-merge-repo").await;
+
+    let repository_path = repo_root.join("pr-merge-owner/pr-merge-repo.git");
+    seed_pr_branches(&repository_path);
+
+    let client = reqwest::Client::new();
+    let pulls_url = format!("{base}/api/v1/repos/pr-merge-owner/pr-merge-repo/pulls");
+    let created = client
+        .post(&pulls_url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "stale head branch",
+            "head": "feature",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .expect("create PR request");
+    assert_eq!(
+        created.status(),
+        201,
+        "fixture PR must be valid before deletion"
+    );
+    let pr: serde_json::Value = created.json().await.expect("created PR body");
+    let number = pr["number"].as_i64().expect("created PR number");
+
+    git(
+        &["update-ref", "-d", "refs/heads/feature"],
+        Some(&repository_path),
+    );
+
+    let response = client
+        .post(format!("{pulls_url}/{number}/merge"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .expect("merge request");
+    assert_eq!(
+        response.status(),
+        409,
+        "a deleted PR head is stale resource state, not an internal failure"
+    );
+    let body: serde_json::Value = response.json().await.expect("conflict body");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("feature") && message.contains("no longer exists"),
+        "the client needs the missing branch and cause, got: {body}"
+    );
+}
+
+/// Fork PRs used to reach `git fetch` directly, where a deleted source branch
+/// is indistinguishable from an infrastructure failure. The core merge service
+/// must apply the same stale-ref barrier before fetching the fork.
+#[tokio::test]
+async fn pr_merge_names_a_deleted_fork_head_branch_as_a_conflict() {
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (owner_token, _) = register_full(&base, "pr-fork-owner", "pr-fork-owner@example.com").await;
+    let (fork_token, _) = register_full(&base, "pr-fork-head", "pr-fork-head@example.com").await;
+    create_repo(&base, &owner_token, "pr-fork-repo").await;
+
+    let target_path = repo_root.join("pr-fork-owner/pr-fork-repo.git");
+    seed_pr_branches(&target_path);
+
+    let client = reqwest::Client::new();
+    let fork = client
+        .post(format!(
+            "{base}/api/v1/repos/pr-fork-owner/pr-fork-repo/fork"
+        ))
+        .bearer_auth(&fork_token)
+        .send()
+        .await
+        .expect("fork request");
+    assert_eq!(fork.status(), 201, "fixture fork must be created");
+
+    let fork_path = repo_root.join("pr-fork-head/pr-fork-repo.git");
+    let fork_branch = "fork-feature";
+    seed_fork_feature_branch(&fork_path, fork_branch);
+
+    let pulls_url = format!("{base}/api/v1/repos/pr-fork-owner/pr-fork-repo/pulls");
+    let created = client
+        .post(&pulls_url)
+        .bearer_auth(&fork_token)
+        .json(&serde_json::json!({
+            "title": "stale fork head branch",
+            "head": format!("pr-fork-head:{fork_branch}"),
+            "base": "main",
+        }))
+        .send()
+        .await
+        .expect("create fork PR request");
+    assert_eq!(
+        created.status(),
+        201,
+        "fixture fork PR must be valid before deletion"
+    );
+    let pr: serde_json::Value = created.json().await.expect("created PR body");
+    let number = pr["number"].as_i64().expect("created PR number");
+
+    git(
+        &["update-ref", "-d", &format!("refs/heads/{fork_branch}")],
+        Some(&fork_path),
+    );
+
+    let response = client
+        .post(format!("{pulls_url}/{number}/merge"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .expect("merge request");
+    assert_eq!(
+        response.status(),
+        409,
+        "a deleted fork PR head is stale resource state, not an internal failure"
+    );
+    let body: serde_json::Value = response.json().await.expect("conflict body");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(fork_branch) && message.contains("no longer exists"),
         "the client needs the missing branch and cause, got: {body}"
     );
 }

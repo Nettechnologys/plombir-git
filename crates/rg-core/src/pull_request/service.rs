@@ -1529,11 +1529,13 @@ async fn merge_claimed_pr(
     if !repo_path.exists() {
         bail!("repository path does not exist: {:?}", repo_path);
     }
+    require_pull_request_branch(&repo_path, "base", &pr.base_branch)?;
 
     // Read the base tip *before* the merge: afterwards the old commit is only
     // reachable through the reflog, and the post-push hooks need the `before`
     // half of the ref move to tell "branch advanced" from "branch created".
-    // A failed read costs the hooks for this merge, never the merge itself.
+    // The required-ref check above turns a deleted base into a conflict; a
+    // later failed read only costs the hooks for this merge, never the merge.
     let base_sha_before = match get_ref_sha(&repo_path, &pr.base_branch) {
         Ok(sha) => Some(sha),
         Err(error) => {
@@ -1556,60 +1558,64 @@ async fn merge_claimed_pr(
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{}/{}.git", head_namespace, head_repo.name));
 
-        if head_repo_path.exists() {
-            let fetch_ref = format!("refs/heads/{}", pr.head_branch);
-            let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
+        // A deleted head is stale PR state, while an unreadable fork repository
+        // is a server failure. Checking before fetch also prevents an old local
+        // `refs/forks/...` ref from being reused after the source branch vanished.
+        require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
+        let fetch_ref = format!("refs/heads/{}", pr.head_branch);
+        let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
 
-            let git = rg_git::cli_gateway::global_gateway()
-                .as_ref()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let git = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            let fetch_output = git.run(
-                &[
-                    "fetch",
-                    &head_repo_path.to_string_lossy(),
-                    &format!("{}:{}", fetch_ref, local_ref),
-                ],
-                Some(&repo_path),
-            )?;
+        let fetch_output = git.run(
+            &[
+                "fetch",
+                &head_repo_path.to_string_lossy(),
+                &format!("{}:{}", fetch_ref, local_ref),
+            ],
+            Some(&repo_path),
+        )?;
 
-            if !fetch_output.success() {
-                bail!(
-                    "failed to fetch fork branch: {}",
-                    String::from_utf8_lossy(&fetch_output.stderr)
-                );
-            }
-
-            // Merge and cleanup in spawn_blocking (CPU-intensive gix merge)
-            let merge_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
-            let merge_commit_sha = {
-                let repo_path = repo_path.clone();
-                let pr = pr.clone();
-                let merge_ref = merge_ref.clone();
-                tokio::task::spawn_blocking(move || -> Result<String> {
-                    let sha = merge_from_ref(&repo_path, &pr, &merge_ref, strategy)?;
-                    // Clean up fetched ref
-                    if let Err(e) = gix_delete_ref(&repo_path, &merge_ref) {
-                        tracing::warn!("failed to clean up fork ref '{}': {}", merge_ref, e);
-                    }
-                    Ok(sha)
-                })
-                .await??
-            };
-
-            return update_pr_merged(
-                db,
-                owner,
-                repo_name,
-                pr,
-                merge_commit_sha,
-                strategy,
-                base_sha_before,
-                delivery_tracker,
-            )
-            .await;
+        if !fetch_output.success() {
+            bail!(
+                "failed to fetch fork branch: {}",
+                String::from_utf8_lossy(&fetch_output.stderr)
+            );
         }
+
+        // Merge and cleanup in spawn_blocking (CPU-intensive gix merge)
+        let merge_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
+        let merge_commit_sha = {
+            let repo_path = repo_path.clone();
+            let pr = pr.clone();
+            let merge_ref = merge_ref.clone();
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let sha = merge_from_ref(&repo_path, &pr, &merge_ref, strategy)?;
+                // Clean up fetched ref
+                if let Err(e) = gix_delete_ref(&repo_path, &merge_ref) {
+                    tracing::warn!("failed to clean up fork ref '{}': {}", merge_ref, e);
+                }
+                Ok(sha)
+            })
+            .await??
+        };
+
+        return update_pr_merged(
+            db,
+            owner,
+            repo_name,
+            pr,
+            merge_commit_sha,
+            strategy,
+            base_sha_before,
+            delivery_tracker,
+        )
+        .await;
     }
+
+    require_pull_request_branch(&repo_path, "head", &pr.head_branch)?;
 
     // Same-repo merge — offload gix merge operations to spawn_blocking
     let merge_commit_sha = {

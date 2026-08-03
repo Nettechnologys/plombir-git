@@ -16,7 +16,9 @@
 //! seeded git repository; these tests cover the outcomes that are decided before
 //! any git work happens.
 
-use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, spawn_test_app_with_db, spawn_test_app_with_db_and_repo_root,
+};
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, Set};
 
@@ -152,7 +154,13 @@ async fn a_broken_protection_check_is_not_reported_as_a_refusal() {
 /// absolute path in the body.
 #[tokio::test]
 async fn a_merge_that_fails_on_storage_is_not_reported_as_a_bad_request() {
-    let (base, _db, token) = setup("mergestore", "open").await;
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, user_id) = register_full(&base, "mergestore-owner", "mergestore@example.com").await;
+    let repo_id = create_repo(&base, &token, "mergestore-repo").await;
+    insert_pr(&db, repo_id, user_id, 1, "open").await;
+    let repository_path = repo_root.join("mergestore-owner/mergestore-repo.git");
+    std::fs::remove_dir_all(&repository_path)
+        .unwrap_or_else(|error| panic!("remove test repository {repository_path:?}: {error}"));
 
     let resp = post_merge(&base, "mergestore", &token, "merge").await;
     let status = resp.status();
