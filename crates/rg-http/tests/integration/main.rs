@@ -89,6 +89,7 @@ mod org_team_authz_tests;
 mod org_tests;
 mod package_failure_status_tests;
 mod package_format_e2e_tests;
+mod package_manifest_publish_tests;
 mod package_permission_tests;
 mod passkey_counter_persistence_tests;
 mod password_hash_failure_status_tests;

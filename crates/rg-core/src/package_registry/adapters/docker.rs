@@ -20,9 +20,18 @@ impl PackageAdapter for DockerAdapter {
         )
     }
 
+    /// There is no payload this endpoint can accept for a Docker image, so the
+    /// refusal belongs here rather than only in `extract_metadata`.
+    ///
+    /// It used to answer `Ok(())` unconditionally and leave the refusal to
+    /// `extract_metadata`, whose error the publish handler dropped: `POST
+    /// /packages/docker/publish?name=x&version=1` answered `201 Created` and
+    /// put a row in the registry that no `docker pull` will ever find, instead
+    /// of sending the caller to `/v2/`.
     fn validate(&self, _data: &[u8]) -> anyhow::Result<()> {
-        // OCI manifest validation happens in the /v2/ API handler
-        Ok(())
+        anyhow::bail!(
+            "Docker images must be pushed via the OCI v2 API, not the package upload endpoint"
+        )
     }
 
     fn content_type_for_file(&self, filename: &str) -> String {

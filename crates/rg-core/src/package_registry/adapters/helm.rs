@@ -35,32 +35,23 @@ impl PackageAdapter for HelmAdapter {
         extract_from_chart(data)
     }
 
+    /// A chart whose `Chart.yaml` does not parse is not a well-formed chart, so
+    /// the manifest is read here and not only in `extract_metadata`.
+    ///
+    /// This used to check that `Chart.yaml` *existed* and stop there, which put
+    /// the only parse of it behind `extract_metadata` — whose verdict the
+    /// publish handler was free to ignore, and did. A chart with a corrupt
+    /// `Chart.yaml` and explicit `?name=&version=` was accepted, stored, and
+    /// then served to `helm` clients that cannot install it. `ComposerAdapter`
+    /// has always parsed its `composer.json` here; this is the same rule.
     fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
             anyhow::bail!("invalid Helm chart: not a gzip file");
         }
 
-        // Check for Chart.yaml inside
-        let mut decoder = GzDecoder::new(data);
-        let mut tar_data = Vec::new();
-        decoder
-            .read_to_end(&mut tar_data)
-            .map_err(|e| anyhow::anyhow!("invalid Helm chart (gzip decode failed): {e}"))?;
-
-        let mut archive = tar::Archive::new(&tar_data[..]);
-        let mut found = false;
-        for entry in archive.entries()? {
-            let entry = entry?;
-            let path = entry.path()?;
-            if path.file_name().map(|n| n == "Chart.yaml").unwrap_or(false) {
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
-            anyhow::bail!("invalid Helm chart: no Chart.yaml found");
-        }
+        // Locates `Chart.yaml` and parses it — "no Chart.yaml found" is its own
+        // error, so the presence check is not lost by folding the two together.
+        extract_from_chart(data)?;
         Ok(())
     }
 

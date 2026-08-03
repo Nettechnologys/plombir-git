@@ -257,7 +257,46 @@ pub async fn publish(
                 &format!("invalid package payload: {e:#}"),
             );
         }
-        adapter.extract_metadata(&filename, &body).ok()
+        // `validate` above is the verdict on the artifact itself, and it is
+        // fatal. What is left here is reading a name and a version out of it,
+        // which is a convenience the caller can also do by hand — so its
+        // failure is fatal only when nothing else can supply them.
+        //
+        // Both halves of that used to be wrong, because `.ok()` dropped the
+        // verdict and its reason together. Without query params the caller was
+        // answered `package name is required` by the resolution below — a
+        // message naming the wrong cause, since the name was not missing, it
+        // was unreadable. With query params the failure left no trace at all,
+        // not even a log line.
+        //
+        // The fall-through is not a loophole: a multi-artifact format reaches
+        // it legitimately. Maven publishes one version as a `.pom` plus a
+        // `.jar` plus `matrix-1.0.0-sources.jar`, and only the first carries a
+        // manifest — the classifier suffix defeats the `{name}-{version}`
+        // filename convention by design, and the caller names the coordinates
+        // in the query precisely because the file cannot. That is why the
+        // corrupt-manifest cases this guards against belong in `validate`,
+        // where they are unconditional: `HelmAdapter` and `DockerAdapter` were
+        // moved there rather than being caught by a blanket refusal here.
+        //
+        // The adapter's message is passed through verbatim — each already
+        // names its own manifest and reason ("invalid Chart.yaml: … at line 3
+        // column 5", ".nuspec missing <id> element"), and a wrapper sentence of
+        // ours would only talk over it.
+        match adapter.extract_metadata(&filename, &body) {
+            Ok(meta) => Some(meta),
+            Err(e) if query.name.is_some() && query.version.is_some() => {
+                tracing::warn!(
+                    package_type = %pkg_type,
+                    filename = %filename,
+                    error = %format!("{e:#}"),
+                    "no metadata read from the uploaded file; publishing under the \
+                     name and version given in the query"
+                );
+                None
+            }
+            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        }
     } else {
         None
     };
