@@ -206,32 +206,31 @@ async fn issue_attachment_roundtrip_enforces_type_permission_and_ownership() {
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-/// The upload gate is `RepoAuthRead`, and both halves of that choice are load
-/// bearing.
+/// The upload contract is `RepoWrite`, with a signed-off `RepoAuthRead`
+/// widening for the author of its target. Both halves are load bearing.
 ///
 /// *Auth* is why an anonymous caller is turned away before the multipart parser
-/// runs: the handlers used to take `RepoRead`, which admits anonymous callers on
+/// runs. The handlers used to take `RepoRead`, which admits anonymous callers on
 /// a public repository, and look the session up further down — so the answer
-/// came from `Multipart` as a `415` instead of from the gate as a `401`. The
-/// route was closed, but by the parser, not by the gate (`card_d3695d1dbe1b`).
+/// came from `Multipart` as a `415` instead of from the gate as a `401`.
 ///
-/// *Read* — rather than `RepoWrite` — is why a reader may still attach a file to
+/// The handler's *read* gate is why a reader may still attach a file to
 /// something they authored themselves. That allowance lives past the gate, in
-/// the handler's `author_id` check, and it is the whole reason the level here is
-/// not `RepoWrite`; without a test it would be the first thing a tightening
-/// silently removed.
+/// the handler's `author_id` check; the route table meanwhile describes what an
+/// arbitrary caller needs. Without this test, a future tightening could silently
+/// remove the exceptional author path.
 #[tokio::test]
-async fn an_author_without_write_access_may_attach_to_their_own_issue_and_comment() {
-    let base = spawn_test_app().await;
+async fn an_author_without_write_access_may_attach_to_each_own_target() {
+    let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let owner = format!("attgateowner{}", &suffix[..8]);
     let reader = format!("attgatereader{}", &suffix[..8]);
     let repo = format!("attgate{}", &suffix[..8]);
-    let owner_token = register_user(&base, &owner, &format!("{owner}@example.com"), PASSWORD).await;
-    let reader_token =
-        register_user(&base, &reader, &format!("{reader}@example.com"), PASSWORD).await;
-    create_repo(&base, &owner_token, &repo).await;
+    let (owner_token, _) = register_full(&base, &owner, &format!("{owner}@example.com")).await;
+    let (reader_token, reader_id) =
+        register_full(&base, &reader, &format!("{reader}@example.com")).await;
+    let repo_id = create_repo(&base, &owner_token, &repo).await;
 
     let file = || {
         Form::new().part(
@@ -308,8 +307,95 @@ async fn an_author_without_write_access_may_attach_to_their_own_issue_and_commen
         "a comment's own author may attach to it without write access"
     );
 
+    // The same exception covers a pull request and an inline review comment.
+    // Seed the PR directly because the property under test is attachment
+    // authorization, not the separate branch-validation contract of creating a
+    // PR through HTTP.
+    let reader_pull = rg_db::ops::pull_request_ops::create(
+        &db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: sea_orm::NotSet,
+            repo_id: Set(repo_id),
+            number: Set(1),
+            title: Set("reader's pull request".to_string()),
+            body: Set(Some("reader's changes".to_string())),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(reader_id),
+            reviewer_id: Set(None),
+            head_branch: Set("feature".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(None),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+    let own_pull = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/pulls/{}/assets",
+            reader_pull.number
+        ))
+        .bearer_auth(&reader_token)
+        .multipart(file())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own_pull.status(),
+        reqwest::StatusCode::CREATED,
+        "a pull request's own author may attach to it without write access"
+    );
+
+    let review_comment: Value = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/pulls/{}/comments",
+            reader_pull.number
+        ))
+        .bearer_auth(&reader_token)
+        .json(&serde_json::json!({
+            "path": "src/lib.rs",
+            "line": 1,
+            "side": "RIGHT",
+            "body": "my review comment"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let review_comment_id = review_comment["id"].as_i64().unwrap();
+    let own_review_comment = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/pulls/comments/{review_comment_id}/assets"
+        ))
+        .bearer_auth(&reader_token)
+        .multipart(file())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own_review_comment.status(),
+        reqwest::StatusCode::CREATED,
+        "a review comment's own author may attach to it without write access"
+    );
+
     // And the anonymous caller is answered by the gate, not by the parser: a
-    // `415` here would mean the multipart reader got there first.
+    // `415` here would mean the multipart reader got there first. The route
+    // sweep covers the complementary public-outsider refusal for all four rows.
     for (what, url) in [
         (
             "issue",
@@ -318,6 +404,17 @@ async fn an_author_without_write_access_may_attach_to_their_own_issue_and_commen
         (
             "issue comment",
             format!("{base}/api/v1/repos/{owner}/{repo}/issues/comments/{comment_id}/assets"),
+        ),
+        (
+            "pull request",
+            format!(
+                "{base}/api/v1/repos/{owner}/{repo}/pulls/{}/assets",
+                reader_pull.number
+            ),
+        ),
+        (
+            "review comment",
+            format!("{base}/api/v1/repos/{owner}/{repo}/pulls/comments/{review_comment_id}/assets"),
         ),
     ] {
         let anonymous = client.post(&url).multipart(file()).send().await.unwrap();

@@ -1081,15 +1081,16 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/issues/{number}/comments",
             api::issues::add_comment,
         )
-        // Attachments. Deleting one takes write access unless you uploaded it,
-        // so `RepoWrite` is the level a stranger is measured against.
+        // Attachments. Uploading or deleting one takes write access unless the
+        // caller authored its target or uploaded it, so `RepoWrite` is the
+        // level a stranger is measured against.
         .get(
             RepoRead,
             "/repos/{owner}/{name}/issues/{number}/assets",
             api::attachments::list_issue_attachments,
         )
         .post_with(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/issues/{number}/assets",
             api::attachments::create_issue_attachment,
             &limit_101mb,
@@ -1110,7 +1111,7 @@ pub(crate) fn build_all_routes(
             api::attachments::list_issue_comment_attachments,
         )
         .post_with(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
             api::attachments::create_issue_comment_attachment,
             &limit_101mb,
@@ -1152,7 +1153,7 @@ pub(crate) fn build_all_routes(
             api::attachments::list_pull_request_attachments,
         )
         .post_with(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/assets",
             api::attachments::create_pull_request_attachment,
             &limit_101mb,
@@ -1173,7 +1174,7 @@ pub(crate) fn build_all_routes(
             api::attachments::list_review_comment_attachments,
         )
         .post_with(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
             api::attachments::create_review_comment_attachment,
             &limit_101mb,

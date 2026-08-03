@@ -86,6 +86,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use reqwest::multipart::{Form, Part};
 use reqwest::{Client, StatusCode};
 use rg_http::route_table::{Access, RouteFact};
 
@@ -1541,6 +1542,20 @@ fn access_body(fact: &RouteFact) -> serde_json::Value {
     }
 }
 
+/// Upload handlers are the exception to the sweep's ordinary JSON probe: axum
+/// validates a multipart boundary before the handler can decide the signed-off
+/// author-or-writer widening. Sending JSON here would make the test measure the
+/// parser rather than the access rule.
+fn takes_multipart_attachment(fact: &RouteFact) -> bool {
+    matches!(
+        fact.handler,
+        "rg_http::api::attachments::create_issue_attachment"
+            | "rg_http::api::attachments::create_issue_comment_attachment"
+            | "rg_http::api::attachments::create_pull_request_attachment"
+            | "rg_http::api::attachments::create_review_comment_attachment"
+    )
+}
+
 /// [`probe`] with the path already filled — for the anchored routes, whose
 /// placeholder [`fill`] cannot fill (see [`fill_anchored`]).
 async fn drive(fx: &Fixture, fact: &RouteFact, persona: Persona, path: &str) -> Answer {
@@ -1559,12 +1574,26 @@ async fn drive(fx: &Fixture, fact: &RouteFact, persona: Persona, path: &str) -> 
     }
     if matches!(fact.method, "POST" | "PUT" | "PATCH") {
         // Most handlers have a `FromRequestParts` gate, so `{}` is enough: it
-        // runs before the body is looked at. The three signed-off PR-review
-        // widenings take `RepoAuthRead` and decide their remaining write rule
-        // in the handler, so they need valid input to reach that decision.
+        // runs before the body is looked at. The signed-off `RepoAuthRead`
+        // widenings decide their remaining write rule in the handler, so they
+        // need valid input to reach that decision.
         // A route that answers a body-shape complaint to an anonymous caller
         // has its gate in the wrong place — see `EXTRACTOR_BEFORE_GATE`.
-        req = req.json(&access_body(fact));
+        // Multipart uploads need a real boundary to reach their signed-off
+        // author-or-writer rule instead of stopping at Axum's body extractor.
+        req = if takes_multipart_attachment(fact) {
+            req.multipart(
+                Form::new().part(
+                    "attachment",
+                    Part::bytes(b"route access sweep".to_vec())
+                        .file_name("sweep.txt")
+                        .mime_str("text/plain")
+                        .expect("literal MIME type"),
+                ),
+            )
+        } else {
+            req.json(&access_body(fact))
+        };
     }
     let resp = req.send().await.expect("sweep request");
     let status = resp.status();

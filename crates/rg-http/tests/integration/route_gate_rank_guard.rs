@@ -173,7 +173,7 @@ const NON_REPO: &[(&str, &[&str])] = &[
 /// list cannot rot into a blanket allowance for a handler somebody later
 /// weakened for an entirely different reason.
 ///
-/// All eleven name a row-specific exception to the ordinary `RepoWrite`
+/// All fifteen name a row-specific exception to the ordinary `RepoWrite`
 /// contract. The row declares what an *arbitrary* caller needs — that is what a
 /// contract states, and what the persona sweep measures a stranger against.
 /// The handler takes `RepoAuthRead`, the floor for everybody, then resolves the
@@ -188,6 +188,34 @@ const SIGNED_OFF: &[(&str, &str, Rank, &str)] = &[
         "an issue's own author may edit the title and body of their own issue without write \
          access; a caller who is not the author, or who touches labels / assignee / milestone, \
          is held to `may_write`",
+    ),
+    (
+        "api::attachments::create_issue_attachment",
+        "RepoWrite",
+        Rank::AuthRead,
+        "an issue's own author may upload an attachment; anybody else is held to \
+         `may_write` in `attachments::create`",
+    ),
+    (
+        "api::attachments::create_issue_comment_attachment",
+        "RepoWrite",
+        Rank::AuthRead,
+        "an issue comment's own author may upload an attachment; anybody else is held to \
+         `may_write` in `attachments::create`",
+    ),
+    (
+        "api::attachments::create_pull_request_attachment",
+        "RepoWrite",
+        Rank::AuthRead,
+        "a pull request's own author may upload an attachment; anybody else is held to \
+         `may_write` in `attachments::create`",
+    ),
+    (
+        "api::attachments::create_review_comment_attachment",
+        "RepoWrite",
+        Rank::AuthRead,
+        "a review comment's own author may upload an attachment; anybody else is held to \
+         `may_write` in `attachments::create`",
     ),
     (
         "api::attachments::delete_issue_attachment",
