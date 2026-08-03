@@ -532,6 +532,60 @@ mod tests {
         assert!(!body.contains("git -C"), "leaked internal detail: {body}");
     }
 
+    /// The mirror of the test above, and the reason `InvalidRequest` exists: on
+    /// the 400 branch the message is not a log line, it is the answer. A service
+    /// that checked the caller's own file and knows exactly what is wrong with
+    /// it — `rg_ci`'s config reader is the case this was written for — has to
+    /// get that text out through the same funnel that sanitizes the 5xx bodies,
+    /// or the caller is told "Internal server error" about their own typo.
+    #[tokio::test]
+    async fn invalid_request_reaches_the_client_as_a_400_that_keeps_its_reason() {
+        use axum::response::IntoResponse;
+
+        let err: AppError = rg_core::error::invalid_request(
+            "job 'build' uses unsupported when: 'allways'; supported values are 'on_success' and 'manual'",
+        )
+        .context("failed to trigger pipeline")
+        .into();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.code(), "BAD_REQUEST");
+
+        let body = axum::body::to_bytes(err.into_response().into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        // Which job, which field, which value, and what is allowed instead —
+        // all four have to survive the render, not just the status code.
+        for expected in ["build", "when", "allways", "on_success"] {
+            assert!(body.contains(expected), "missing {expected:?}: {body}");
+        }
+        assert!(
+            !body.contains("Internal server error"),
+            "a rejected request must not be reported as a server fault: {body}"
+        );
+    }
+
+    /// The other half of that split, on the same shape of message. Without the
+    /// `InvalidRequest` marker the identical text is *ours*, and the sanitizer
+    /// is right to withhold it: a failure to read the repository must not be
+    /// dressed up as advice about the caller's file.
+    #[tokio::test]
+    async fn an_unmarked_error_of_the_same_shape_stays_a_sanitized_500() {
+        use axum::response::IntoResponse;
+
+        let err: AppError = anyhow::anyhow!("failed to read CI config object .forgekeep-ci.yml")
+            .context("failed to trigger pipeline")
+            .into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(err.into_response().into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Internal server error"), "{body}");
+        assert!(!body.contains(".forgekeep-ci.yml"), "{body}");
+    }
+
     #[test]
     fn anyhow_wrapped_db_connection_error_maps_to_503() {
         // `rg_db::ops` helpers return `anyhow::Result`, wrapping the `DbErr`

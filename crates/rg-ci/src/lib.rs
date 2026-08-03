@@ -579,28 +579,51 @@ fn spawn_internal_runner(
     });
 }
 
+/// Reject a CI config whose jobs declare something this engine cannot run.
+///
+/// Every rejection here is a rule the *user's own file* broke, so each one
+/// carries [`rg_core::error::InvalidRequest`]: as a bare `anyhow` they reached
+/// `AppError::from` with nothing to classify by and came out a `500` whose body
+/// the H-05 sanitizer replaced with "Internal server error" — so someone who
+/// typed `when: allways` was told the server had crashed and never learned
+/// which job, which field, or which value was wrong. The messages name the job
+/// and the rule and nothing else (no path, no errno), which is what lets them
+/// reach the client verbatim.
 fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
     for (name, job) in &config.jobs {
         if let Some(when) = job.when.as_deref() {
             if when != "on_success" && when != "manual" {
-                anyhow::bail!("job '{name}' uses unsupported when: '{when}'; supported values are 'on_success' and 'manual'");
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' uses unsupported when: '{when}'; supported values are 'on_success' and 'manual'"
+                )));
             }
         }
         if job.timeout_seconds == Some(0) || job.timeout_seconds.is_some_and(|value| value > 86_400)
         {
-            anyhow::bail!("job '{name}' timeout_seconds must be between 1 and 86400");
+            return Err(rg_core::error::invalid_request(format!(
+                "job '{name}' timeout_seconds must be between 1 and 86400"
+            )));
         }
         if let Some(environment) = job.environment.as_deref() {
             if environment.is_empty()
                 || environment.len() > 255
                 || environment.chars().any(char::is_control)
             {
-                anyhow::bail!("job '{name}' has an invalid environment name");
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' has an invalid environment name"
+                )));
             }
         }
         if let Some(condition) = job.condition.as_deref() {
-            crate::condition::validate_condition(condition)
-                .with_context(|| format!("job '{name}' has an unsupported if condition"))?;
+            // The parser's complaint ("unsupported condition function 'foo'")
+            // is the half that says what to fix, so it is folded into the
+            // message rather than left as a `.context(...)` source the
+            // client-facing render would drop.
+            if let Err(error) = crate::condition::validate_condition(condition) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' has an unsupported if condition: {error:#}"
+                )));
+            }
         }
     }
     Ok(())
@@ -658,15 +681,27 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
             variables: base,
         }]);
     };
+    // Same split as `validate_execution_semantics`: an unusable `matrix:` block
+    // is the user's file being wrong, not this server failing, and it is only
+    // reached from the pipeline build inside `trigger_pipeline` — where a bare
+    // `anyhow` became a sanitized 500 that named neither the job nor the limit.
     if matrix.values().any(Vec::is_empty) {
-        anyhow::bail!("job '{job_name}' has an empty matrix dimension");
+        return Err(rg_core::error::invalid_request(format!(
+            "job '{job_name}' has an empty matrix dimension"
+        )));
     }
     let count = matrix
         .values()
         .try_fold(1usize, |total, values| total.checked_mul(values.len()))
-        .context("matrix size overflow")?;
+        .ok_or_else(|| {
+            rg_core::error::invalid_request(format!(
+                "job '{job_name}' matrix is too large to expand; maximum is 256 variants"
+            ))
+        })?;
     if count > 256 {
-        anyhow::bail!("job '{job_name}' matrix expands to {count} variants; maximum is 256");
+        return Err(rg_core::error::invalid_request(format!(
+            "job '{job_name}' matrix expands to {count} variants; maximum is 256"
+        )));
     }
     let mut variants = vec![(Vec::<(String, String)>::new(), base)];
     for (key, values) in matrix {
@@ -715,6 +750,17 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
 /// `.gitea/workflows` is absent, or holds no workflow triggered by this event.
 /// A workflow file that *is* there but cannot be read or parsed is an error
 /// naming the file and the reason — never a silent "no CI config found".
+///
+/// The errors split in two, and the split is load-bearing. Anything about the
+/// *content* committed to the repository — a file that is not UTF-8, YAML that
+/// does not parse, no config at that commit at all — carries
+/// [`rg_core::error::InvalidRequest`], so the manual-trigger and retry routes
+/// answer `400` with the reason in the body. Anything about *reaching* that
+/// content — the repository not opening, a commit or tree that will not resolve,
+/// an object the database cannot hand over — stays a bare `anyhow` and therefore
+/// a `5xx`: the caller's file is fine and retrying is the right advice. Those
+/// messages also carry absolute filesystem paths, which is the other reason they
+/// must never take the branch that reaches the client (H-05).
 fn read_ci_config(
     repo_path: &std::path::Path,
     commit_sha: &str,
@@ -749,18 +795,18 @@ fn read_ci_config(
             // saying so is the difference between fixing an `on:` filter and
             // hunting for a file that is already there.
             if workflows_untriggered {
-                anyhow::anyhow!(
+                rg_core::error::invalid_request(format!(
                     "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.forgekeep-ci.yml) at commit {}",
                     WORKFLOW_DIR,
                     event,
                     ref_name,
                     commit_sha
-                )
+                ))
             } else {
-                anyhow::anyhow!(
+                rg_core::error::invalid_request(format!(
                     "no CI config found (.gitea/workflows/*.yml or .forgekeep-ci.yml) at commit {}",
                     commit_sha
-                )
+                ))
             }
         })?;
 
@@ -771,18 +817,25 @@ fn read_ci_config(
     let object = entry
         .object()
         .with_context(|| format!("failed to read CI config object {ci_filename}"))?;
+    // The object came out of the database fine; it is simply not a file. That
+    // is the committed tree's shape, so it is the client's to fix.
     let blob = object
         .try_into_blob()
-        .with_context(|| format!("expected a blob object for {}", ci_filename))?;
+        .map_err(|_| rg_core::error::invalid_request(format!("{ci_filename} is not a file")))?;
 
-    let ci_yml = String::from_utf8(blob.data.to_vec())
-        .with_context(|| format!("{} is not valid UTF-8", ci_filename))?;
+    let ci_yml = String::from_utf8(blob.data.to_vec()).map_err(|_| {
+        rg_core::error::invalid_request(format!("{ci_filename} is not valid UTF-8"))
+    })?;
 
     // The reason (with its line/column) goes into the message, not into a
-    // `with_context` source: callers log this with `Display`. Dumping the whole
-    // file here used to bury the actual complaint.
-    let config: CiConfig = serde_yaml::from_str(&ci_yml)
-        .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", ci_filename, e))?;
+    // `with_context` source: callers log this with `Display`, and the client
+    // that just typed the broken YAML is shown this text verbatim. Dumping the
+    // whole file here used to bury the actual complaint. `serde_yaml` reports
+    // only a line/column and its own complaint — no filesystem path — so it is
+    // safe to hand over (H-05).
+    let config: CiConfig = serde_yaml::from_str(&ci_yml).map_err(|e| {
+        rg_core::error::invalid_request(format!("failed to parse {ci_filename}: {e}"))
+    })?;
 
     Ok(config)
 }
@@ -846,9 +899,14 @@ fn try_read_gitea_workflows(
     for (name, yml) in sorted_workflows(&workflow_sources) {
         // The cause is folded into the message instead of being a `with_context`
         // source: callers log this error with `Display`, and the YAML line/column
-        // is the whole point of reporting it.
-        let workflow = gitea_actions::GiteaWorkflow::parse(yml)
-            .map_err(|e| anyhow::anyhow!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))?;
+        // is the whole point of reporting it. All three failures below are the
+        // committed workflow being wrong — an unparseable file, a reusable
+        // workflow that does not resolve, a feature this engine cannot run — so
+        // they carry `InvalidRequest` and reach the client as a 400 that names
+        // the file, instead of the sanitized 500 they used to produce.
+        let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|e| {
+            rg_core::error::invalid_request(format!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))
+        })?;
 
         // Check if this workflow should be triggered
         if !workflow.matches_event(event, ref_name, &match_branch) {
@@ -856,10 +914,16 @@ fn try_read_gitea_workflows(
         }
         let workflow = workflow
             .expand_local_reusable_workflows(&workflow_sources)
-            .map_err(|e| anyhow::anyhow!("failed to expand {WORKFLOW_DIR}/{name}: {e:#}"))?;
-        workflow
-            .validate_supported_actions()
-            .map_err(|e| anyhow::anyhow!("unsupported workflow {WORKFLOW_DIR}/{name}: {e:#}"))?;
+            .map_err(|e| {
+                rg_core::error::invalid_request(format!(
+                    "failed to expand {WORKFLOW_DIR}/{name}: {e:#}"
+                ))
+            })?;
+        workflow.validate_supported_actions().map_err(|e| {
+            rg_core::error::invalid_request(format!(
+                "unsupported workflow {WORKFLOW_DIR}/{name}: {e:#}"
+            ))
+        })?;
 
         tracing::info!("Triggering workflow from {}/{}", WORKFLOW_DIR, name);
 
@@ -941,12 +1005,12 @@ fn load_workflow_sources(
     let object = workflow_dir
         .object()
         .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
+    // Shape of the committed tree, not a storage failure: the client put a file
+    // where the workflow directory belongs, and only the client can move it.
     let tree = object.try_into_tree().map_err(|_| {
-        anyhow::anyhow!(
-            "{} exists at commit {} but is a file, not a directory",
-            WORKFLOW_DIR,
-            commit_sha
-        )
+        rg_core::error::invalid_request(format!(
+            "{WORKFLOW_DIR} exists at commit {commit_sha} but is a file, not a directory"
+        ))
     })?;
 
     let mut workflow_sources = std::collections::HashMap::new();
@@ -971,11 +1035,12 @@ fn load_workflow_sources(
                 WORKFLOW_DIR, name
             )
         })?;
-        let blob = entry_object
-            .try_into_blob()
-            .map_err(|_| anyhow::anyhow!("{}/{} is not a file", WORKFLOW_DIR, name))?;
-        let yml = String::from_utf8(blob.data.to_vec())
-            .with_context(|| format!("{}/{} is not valid UTF-8", WORKFLOW_DIR, name))?;
+        let blob = entry_object.try_into_blob().map_err(|_| {
+            rg_core::error::invalid_request(format!("{WORKFLOW_DIR}/{name} is not a file"))
+        })?;
+        let yml = String::from_utf8(blob.data.to_vec()).map_err(|_| {
+            rg_core::error::invalid_request(format!("{WORKFLOW_DIR}/{name} is not valid UTF-8"))
+        })?;
         workflow_sources.insert(name, yml);
     }
     Ok(Some(workflow_sources))
@@ -1134,6 +1199,14 @@ mod matrix_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("maximum is 256"));
+        // Reached from the pipeline build inside `trigger_pipeline`, so an
+        // oversized matrix is the client's file being wrong, not a server fault.
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "an oversized matrix must be a 400: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -2113,6 +2186,121 @@ mod matrix_tests {
         assert!(
             rendered.contains("failed to read .gitea/workflows/ci.yml from the object database"),
             "{rendered}"
+        );
+    }
+
+    /// A CI config the client committed wrong is the client's mistake, and the
+    /// answer has to say what is wrong with it. As a bare `anyhow` every one of
+    /// these reached `AppError::from` with nothing to classify by and came back
+    /// a `500` whose body the H-05 sanitizer had already replaced with
+    /// "Internal server error" — so pressing "Run pipeline" on a repository with
+    /// `when: allways` in it reported a server crash and named neither the job
+    /// nor the field.
+    ///
+    /// Both halves of the split are asserted, because the fix is worth nothing
+    /// unless the other half still fails loudly: a config that is committed and
+    /// correct but whose blob the object database cannot hand over is *ours*,
+    /// stays a 5xx, and must not be dressed up as the client's typo.
+    #[tokio::test]
+    async fn a_broken_ci_config_is_the_clients_mistake_not_a_server_failure() {
+        // Every case below fails in step 1 of `trigger_pipeline`, before the
+        // first query, so the connection only has to exist.
+        async fn trigger(repo_path: &std::path::Path, sha: &str) -> anyhow::Error {
+            let db = rg_db::connect("sqlite::memory:").await.unwrap();
+            trigger_pipeline(TriggerPipelineParams {
+                db: &db,
+                repo_path,
+                repo_id: 1,
+                commit_sha: sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "manual",
+                base_branch: None,
+                triggered_by: Some(1),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            })
+            .await
+            .expect_err("a broken CI config must not build a pipeline")
+        }
+
+        // 1. A typo in `when:` — the config parses, and the rule it breaks is
+        //    known exactly. That is the definition of "checked, and it is not
+        //    allowed", and it has to arrive as such.
+        let (typo, typo_sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo ok]\n  when: allways\n" as &[u8],
+        )]);
+        let error = trigger(typo.path(), &typo_sha).await;
+        let invalid = error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .unwrap_or_else(|| panic!("a rejected `when:` must be a 400, got: {error:#}"));
+        // `InvalidRequest`'s own `Display` is what the HTTP layer renders
+        // verbatim, so everything the client needs has to live *in it* — not in
+        // a `.context(...)` layer the sanitizer drops.
+        let message = invalid.to_string();
+        for expected in ["build", "when", "allways", "on_success"] {
+            assert!(
+                message.contains(expected),
+                "the client has to learn which job, which field and what is allowed \
+                 (missing {expected:?}): {message}"
+            );
+        }
+
+        // 2. YAML that does not parse at all. The reason travels; the server's
+        //    filesystem does not (H-05).
+        let (broken, broken_sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo ok\n" as &[u8],
+        )]);
+        let error = trigger(broken.path(), &broken_sha).await;
+        let invalid = error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .unwrap_or_else(|| panic!("unparseable YAML must be a 400, got: {error:#}"));
+        let message = invalid.to_string();
+        assert!(
+            message.contains(".forgekeep-ci.yml"),
+            "the answer names the offending file: {message}"
+        );
+        let repo_dir = broken.path().to_string_lossy().into_owned();
+        assert!(
+            !message.contains(&repo_dir),
+            "H-05: where the repository lives on disk must not reach the client: {message}"
+        );
+
+        // 3. The other half. The config is committed and valid; its blob is gone
+        //    from the object database. Answering 400 here would tell the client
+        //    to fix a file that is already correct, and would hide the outage.
+        let (dangling, dangling_sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo ok]\n" as &[u8],
+        )]);
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let object_id = git
+            .run(
+                &["rev-parse", &format!("{dangling_sha}:.forgekeep-ci.yml")],
+                Some(dangling.path()),
+            )
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        remove_loose_object(dangling.path(), &object_id);
+
+        let error = trigger(dangling.path(), &dangling_sha).await;
+        let rendered = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_none(),
+            "an unreadable object is the server's failure, not the client's: {rendered}"
+        );
+        assert!(
+            rendered.contains("failed to read CI config object"),
+            "the 5xx has to be the config read failing, not something further down: {rendered}"
         );
     }
 
