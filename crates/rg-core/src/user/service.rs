@@ -134,21 +134,38 @@ pub async fn register(
     plaintext_password: &str,
     jwt_secret: &str,
 ) -> Result<AuthResponse> {
-    // Validate inputs. The taken-name / taken-email checks are the caller's to
-    // fix and carry `InvalidRequest`; the lookups performing them are ours, and
-    // a failed one now stays a 5xx instead of telling the client its own
-    // registration was malformed.
+    // Validate inputs. A taken name or a taken address is the caller's to fix
+    // and carries `Conflict`; the lookups performing them are ours, and a
+    // failed one stays a 5xx instead of telling the client its own registration
+    // was malformed.
+    //
+    // `Conflict`, not `InvalidRequest`: the body is well-formed and every rule
+    // it must satisfy — charset, address shape, password strength — is checked
+    // *below* this point and still answers 400. What refuses here is a row that
+    // already exists, and no edit to the request removes it; the caller either
+    // picks a different name or signs in as the account that holds it. That is
+    // the same distinction `POST /user/keys` and `POST /repos/.../keys` already
+    // draw when they answer 409 to "this SSH key is already registered".
+    //
+    // On enumeration: 409 states the account's existence no more loudly than
+    // the message beside it already does — this instance names the taken
+    // username verbatim, and `require_namespace_create` records why that is a
+    // deliberate position rather than an oversight (the namespace is global, so
+    // `POST /orgs` discloses the same thing to anyone who can log in). An
+    // instance that decides to hide it has to drop the *message*, and the status
+    // code follows it; hiding behind 400 while the body spells the name out
+    // protects nothing.
     if rg_db::ops::user_ops::find_by_username(db, username)
         .await?
         .is_some()
     {
-        return Err(crate::error::invalid_request(format!(
+        return Err(crate::error::conflict(format!(
             "username '{username}' is already taken"
         )));
     }
 
     if user_ops::find_by_email(db, email).await?.is_some() {
-        return Err(crate::error::invalid_request(format!(
+        return Err(crate::error::conflict(format!(
             "email '{email}' is already registered"
         )));
     }
@@ -188,9 +205,11 @@ pub async fn register(
     let user = user_ops::create(db, model).await.map_err(|error| {
         // The two lookups above keep their precise sequential messages.  A
         // concurrent registration can still lose the gap before this insert;
-        // that is the same client-correctable outcome, not an outage.
+        // that is the same client-correctable outcome, not an outage — and it
+        // carries the same `Conflict` they do, so the status code does not
+        // become a side-channel telling the loser it lost a race.
         if rg_db::is_unique_violation_anyhow(&error) {
-            crate::error::invalid_request("username or email is already registered")
+            crate::error::conflict("username or email is already registered")
         } else {
             error
         }

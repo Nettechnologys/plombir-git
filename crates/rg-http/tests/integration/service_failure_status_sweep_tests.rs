@@ -373,7 +373,11 @@ async fn register_separates_a_taken_username_from_a_broken_insert() {
         .send()
         .await
         .expect("request");
-    assert_eq!(resp.status(), 400, "a taken username is still a 400");
+    assert_eq!(
+        resp.status(),
+        409,
+        "a taken username is a state conflict, not a malformed request"
+    );
 
     let resp = client
         .post(&url)
@@ -385,7 +389,11 @@ async fn register_separates_a_taken_username_from_a_broken_insert() {
         .send()
         .await
         .expect("request");
-    assert_eq!(resp.status(), 400, "a taken email is still a 400");
+    assert_eq!(
+        resp.status(),
+        409,
+        "a taken email is a state conflict, not a malformed request"
+    );
 
     let resp = client
         .post(&url)
@@ -560,7 +568,7 @@ async fn commit_status_separates_a_bad_state_from_a_broken_upsert() {
 // relying on scheduler timing to make a test race happen.
 
 #[tokio::test]
-async fn register_unique_loss_after_the_precheck_stays_a_bad_request() {
+async fn register_unique_loss_after_the_precheck_is_the_same_conflict() {
     let (base, db) = spawn_test_app_with_db().await;
     db.execute_unprepared(
         r#"
@@ -595,7 +603,7 @@ async fn register_unique_loss_after_the_precheck_stays_a_bad_request() {
 
     assert_eq!(
         response.status(),
-        400,
+        409,
         "a registration that loses the UNIQUE race is the same client outcome as a sequential duplicate"
     );
     let body: serde_json::Value = response.json().await.expect("json body");

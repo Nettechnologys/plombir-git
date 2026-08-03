@@ -16,6 +16,7 @@
 //! everything moved to 409 together.
 
 use axum::http::StatusCode;
+use sea_orm::ConnectionTrait;
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 
@@ -226,6 +227,108 @@ async fn approving_a_job_that_is_not_waiting_answers_conflict() {
     );
 }
 
+/// Park the seeded job and its pipeline on an approval, optionally pointing the
+/// job at `environment_id`. Both of the branches below are only reachable once
+/// the job really is `waiting_approval`, which is what the status check ahead of
+/// them enforces.
+async fn park_on_approval(
+    db: &rg_db::DatabaseConnection,
+    fixture: &Fixture,
+    environment_id: Option<i64>,
+) {
+    let environment = match environment_id {
+        Some(id) => id.to_string(),
+        None => "NULL".to_string(),
+    };
+    db.execute_unprepared(&format!(
+        "UPDATE pipeline_jobs SET status = 'waiting_approval', environment_id = {environment} \
+         WHERE id = {}; \
+         UPDATE pipelines SET status = 'waiting_approval' WHERE id = {};",
+        fixture.job_id, fixture.pipeline_id
+    ))
+    .await
+    .expect("park the job on an approval");
+}
+
+/// card_a118728d147c, first of the pair: the job says it is waiting for an
+/// approval and names no environment to be approved for. Two of our own rows
+/// disagree — there is nothing in the request to fix, and 400 would send the
+/// caller looking for it.
+#[tokio::test]
+async fn approving_a_job_with_no_environment_answers_conflict() {
+    let (fixture, db) = seed("approve-no-env", false).await;
+    park_on_approval(&db, &fixture, None).await;
+
+    let response = fixture.post(&fixture.approve_url()).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "a job waiting on an approval it has no environment for is a state conflict"
+    );
+    let body = response.text().await.unwrap_or_default();
+    assert!(
+        body.contains("job has no protected environment"),
+        "the conflict must still say what is wrong, got: {body}"
+    );
+}
+
+/// card_a118728d147c, second of the pair: the environment the job is waiting on
+/// was deleted (or un-protected) while it waited. The comment at the call site
+/// already reasoned that this is a *stale request* rather than a missing
+/// resource — which rules out the helper's 404 and lands exactly on 409, not on
+/// the 400 it used to answer.
+#[tokio::test]
+async fn approving_a_job_whose_environment_vanished_answers_conflict() {
+    let (fixture, db) = seed("approve-gone-env", false).await;
+
+    // A real protected environment, attached to the job, then deleted — the
+    // sequence an operator produces by removing an environment that still has a
+    // job parked on it.
+    let environment = rg_db::ops::ci_environment_ops::create(
+        &db,
+        rg_db::entities::ci_environment::ActiveModel {
+            repo_id: sea_orm::ActiveValue::Set(
+                rg_db::ops::pipeline_ops::get_pipeline(&db, fixture.pipeline_id)
+                    .await
+                    .expect("load pipeline")
+                    .expect("pipeline exists")
+                    .repo_id,
+            ),
+            name: sea_orm::ActiveValue::Set("production".to_string()),
+            protected: sea_orm::ActiveValue::Set(true),
+            required_approvals: sea_orm::ActiveValue::Set(1),
+            allowed_approver_ids: sea_orm::ActiveValue::Set(None),
+            created_at: sea_orm::ActiveValue::Set(chrono::Utc::now()),
+            updated_at: sea_orm::ActiveValue::Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create protected environment");
+
+    park_on_approval(&db, &fixture, Some(environment.id)).await;
+    assert!(
+        rg_db::ops::ci_environment_ops::delete(&db, environment.id)
+            .await
+            .expect("delete environment"),
+        "the environment must actually be gone for this test to mean anything"
+    );
+
+    let response = fixture.post(&fixture.approve_url()).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "a job waiting on an environment that no longer exists is a state conflict"
+    );
+    let body = response.text().await.unwrap_or_default();
+    assert!(
+        body.contains("protected environment no longer exists"),
+        "the conflict must still say what is wrong, got: {body}"
+    );
+}
+
 /// The other half of the claim: 400 did not simply become 409 everywhere. A
 /// request that really is malformed — a pipeline id that is not a number — is
 /// still a 400 on the very same routes.
@@ -240,6 +343,12 @@ async fn a_genuinely_malformed_request_is_still_a_bad_request() {
         ),
         format!(
             "{}/api/v1/repos/{}/{}/pipelines/not-a-number/jobs/{}/play",
+            fixture.base, fixture.owner, fixture.repo, fixture.job_id
+        ),
+        // The approve route carries two more 409s since card_a118728d147c, so
+        // its 400 needs pinning here too.
+        format!(
+            "{}/api/v1/repos/{}/{}/pipelines/not-a-number/jobs/{}/approve",
             fixture.base, fixture.owner, fixture.repo, fixture.job_id
         ),
     ] {

@@ -99,8 +99,13 @@ pub async fn create_mirror(
 /// The one answer both the pre-read and the losing insert give, so a caller
 /// cannot tell which of the two noticed. Carries no constraint or `db:` text —
 /// this message reaches the client verbatim.
+///
+/// A `Conflict`, not an `InvalidRequest`: the request named a real repository
+/// and a valid remote, and the only thing wrong with it is that this repository
+/// already has a mirror. Nothing the caller can edit fixes that — deleting the
+/// existing mirror does — which is what separates 409 from 400 here.
 fn mirror_already_exists() -> anyhow::Error {
-    crate::error::invalid_request("mirror already exists for this repository")
+    crate::error::conflict("mirror already exists for this repository")
 }
 
 /// Get mirror for a repository.

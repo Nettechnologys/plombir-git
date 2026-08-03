@@ -350,19 +350,26 @@ async fn authorize_approval(
     }
     let environment_id = match job.environment_id {
         Some(id) => id,
+        // The job says it is waiting for approval and carries no environment to
+        // be approved for: nothing the caller sent produced that, it is our own
+        // rows disagreeing with each other. 409 puts it next to the branch
+        // above — same request, same authorization, a state that admits no
+        // approval — instead of telling the caller to fix a correct request.
         None => {
-            return Err(AppError::bad_request("job has no protected environment").into_response())
+            return Err(AppError::conflict("job has no protected environment").into_response())
         }
     };
     let environment = match environment_in_repo(state, repo.id, environment_id).await {
         // Gone, belonging to another repository, or no longer protected: the
         // job is waiting on an environment that cannot admit it, which makes
-        // the request stale rather than the resource missing — so this keeps
-        // answering 400, not the helper's 404.
+        // the request stale rather than the resource missing — so not the
+        // helper's 404. Stale is precisely what 409 names, though: the caller
+        // is to re-read the state, not to re-examine a request that was never
+        // malformed.
         Ok(environment) if environment.protected => environment,
         Ok(_) | Err(AppError::NotFound(_)) => {
             return Err(
-                AppError::bad_request("protected environment no longer exists").into_response(),
+                AppError::conflict("protected environment no longer exists").into_response(),
             )
         }
         Err(error) => return Err(error.into_response()),

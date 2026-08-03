@@ -416,7 +416,7 @@ async fn get_mirror(client: &reqwest::Client, url: &str, token: &str) -> serde_j
 /// One mirror per repository — the unique index the create migration builds is
 /// on `mirrors`, so this also proves the index followed the table rename.
 #[tokio::test]
-async fn a_second_mirror_for_the_same_repo_is_refused_as_a_bad_request() {
+async fn a_second_mirror_for_the_same_repo_is_refused_as_a_conflict() {
     let base = spawn_test_app().await;
     let (token, _user_id) = register_full(&base, "mirror-dup", "mirror-dup@example.com").await;
     create_repo(&base, &token, "once-only").await;
@@ -443,7 +443,23 @@ async fn a_second_mirror_for_the_same_repo_is_refused_as_a_bad_request() {
         .expect("request");
     assert_eq!(
         resp.status(),
+        409,
+        "a duplicate mirror is the repository's state, not a malformed request \
+         and not a server failure"
+    );
+
+    // The genuine 400 on the same route has to stay reachable, or the change
+    // above just moved every refusal onto one code.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"url": "not-a-git-url", "sync_interval_seconds": 3600}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
         400,
-        "a duplicate mirror is the caller's mistake, not a server failure"
+        "a remote the caller can fix by editing it is still a bad request"
     );
 }

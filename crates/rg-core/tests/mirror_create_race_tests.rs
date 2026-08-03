@@ -114,11 +114,10 @@ async fn concurrent_mirror_registrations_leave_one_row_and_one_caller_conflict()
                      not a database failure: {error:#}"
                 );
                 assert!(
-                    error
-                        .downcast_ref::<rg_core::error::InvalidRequest>()
-                        .is_some(),
-                    "the answer must carry the client-error type, or the handler \
-                     still renders a 5xx: {error:#}"
+                    error.downcast_ref::<rg_core::error::Conflict>().is_some(),
+                    "the answer must carry the state-conflict type, or the handler \
+                     either renders a 5xx or blames a request that was never \
+                     malformed: {error:#}"
                 );
                 let chain = format!("{error:#}").to_ascii_lowercase();
                 for leak in ["unique", "constraint", "db:", "sqlite"] {

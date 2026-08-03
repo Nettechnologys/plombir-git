@@ -136,6 +136,7 @@ pub struct UserProfile {
         (status = 201, description = "User registered successfully", body = AuthResponse),
         (status = 400, description = "Invalid input", body = serde_json::Value),
         (status = 403, description = "Self-service registration is closed on this instance", body = serde_json::Value),
+        (status = 409, description = "The username or email is already taken", body = serde_json::Value),
         (status = 503, description = "The database is unreachable", body = serde_json::Value),
     )
 )]
