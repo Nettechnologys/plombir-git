@@ -115,6 +115,7 @@ pub async fn get_label(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "A label with this name already exists in the repository", body = serde_json::Value),
     ),
 )]
 pub async fn create_label(
@@ -155,6 +156,7 @@ pub async fn create_label(
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "A label with this name already exists in the repository", body = serde_json::Value),
     ),
 )]
 pub async fn update_label(

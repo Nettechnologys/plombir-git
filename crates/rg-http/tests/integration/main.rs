@@ -64,6 +64,7 @@ mod issue_lookup_failure_status_tests;
 mod issue_template_tests;
 mod issue_tests;
 mod job_websocket_tests;
+mod label_duplicate_tests;
 mod label_lookup_failure_status_tests;
 mod lfs_signed_url_tests;
 mod login_enumeration_tests;

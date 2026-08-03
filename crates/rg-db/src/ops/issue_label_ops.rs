@@ -32,8 +32,20 @@ pub async fn set_labels(db: &DatabaseConnection, issue_id: i64, label_ids: Vec<i
         .await
         .context("db: delete existing issue labels")?;
 
-    // Insert new labels
-    for label_id in label_ids {
+    // Insert new labels.
+    //
+    // Deduplicated first: `idx_issue_labels_issue_label_unique` refuses the
+    // second insert of a repeated id, so a body that names one label twice used
+    // to abort the transaction and reach the client as a `500`. Asking for the
+    // same label twice is not a failure — the state the caller asked for is the
+    // state they get either way — so the duplicate is dropped rather than
+    // classified into a 4xx. Order is preserved: the first mention of each id
+    // wins, which keeps the rows in the order the caller listed them.
+    //
+    // A UNIQUE violation surviving this is therefore no longer the caller's
+    // repeated id, and stays the error it is.
+    let mut seen = std::collections::HashSet::new();
+    for label_id in label_ids.into_iter().filter(|id| seen.insert(*id)) {
         let model = ActiveModel {
             issue_id: Set(issue_id),
             label_id: Set(label_id),

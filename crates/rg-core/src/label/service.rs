@@ -64,7 +64,7 @@ pub async fn create_label(
     let now = Utc::now();
     let model = LabelActiveModel {
         repo_id: Set(repo.id),
-        name: Set(name),
+        name: Set(name.clone()),
         color: Set(color),
         description: Set(description),
         created_at: Set(now),
@@ -72,7 +72,38 @@ pub async fn create_label(
         ..Default::default()
     };
 
-    label_ops::create(db, model).await
+    // `idx_labels_repo_name_unique` refuses a repeated name, and there is no
+    // read before this insert to notice it first — so unlike the create paths
+    // that carry a pre-check, this is not a race that only a loser hits. Every
+    // caller who reuses a label name lands here, and the unclassified `DbErr`
+    // left as a `500`: the API said the server had broken for the single most
+    // ordinary mistake a labels UI can make.
+    //
+    // Classified rather than pre-read: a pre-check would add a second statement
+    // whose answer this one already has, and the sequential and concurrent
+    // cases would then need two different messages for one outcome.
+    label_ops::create(db, model).await.map_err(|error| {
+        if rg_db::is_unique_violation_anyhow(&error) {
+            label_already_exists(&name)
+        } else {
+            error
+        }
+    })
+}
+
+/// The answer to a name this repository has already used.
+///
+/// `Conflict`, not `InvalidRequest`: the name is well-formed and the request is
+/// correct — an existing row refuses it, and only deleting or renaming that row
+/// changes the answer. Same reading as `mirror already exists for this
+/// repository` and the taken-username branch of registration.
+///
+/// The name is echoed because the caller just sent it; nothing else from the
+/// database reaches the client, so no constraint or `db:` text leaks (H-05).
+fn label_already_exists(name: &str) -> anyhow::Error {
+    crate::error::conflict(format!(
+        "label '{name}' already exists in this repository"
+    ))
 }
 
 /// Update an existing label.
@@ -113,10 +144,14 @@ pub async fn update_label(
     // Typed rather than `bail!`: the HTTP layer answers `400` only to
     // `InvalidRequest`, so a plain `anyhow!` here would arrive as a 500 and a
     // failed query would arrive as a 400.
+    // Kept for the classification below — `active.name` is a `Set(…)` from here
+    // on and the message needs the name the caller sent.
+    let mut renamed_to = None;
     if let Some(n) = name {
         if n.trim().is_empty() {
             return Err(crate::error::invalid_request("label name cannot be empty"));
         }
+        renamed_to = Some(n.clone());
         active.name = Set(n);
     }
     if let Some(c) = color {
@@ -133,7 +168,19 @@ pub async fn update_label(
 
     active.updated_at = Set(Utc::now());
 
-    label_ops::update(db, active).await
+    // A rename onto a name the repository already uses hits the same unique
+    // index as `create_label`, one route over. Renaming `bug` to `enhancement`
+    // is the same ordinary mistake as creating a second `enhancement`, and it
+    // was answered the same wrong way — an unclassified 500.
+    label_ops::update(db, active).await.map_err(|error| {
+        match renamed_to {
+            Some(name) if rg_db::is_unique_violation_anyhow(&error) => label_already_exists(&name),
+            // A write that failed for any other reason — or one that never
+            // touched the name — stays an error. Reporting an outage as the
+            // caller's duplicate is the misattribution this whole class costs.
+            _ => error,
+        }
+    })
 }
 
 /// Delete a label.
