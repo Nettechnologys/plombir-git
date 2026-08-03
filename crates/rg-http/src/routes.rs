@@ -101,6 +101,87 @@ const WS_JOB_LOG: Access = Foreign(Handler {
     gates: &["check_read_for"],
     note: "WebSocket: session via `ws_session`, then the repository read gate",
 });
+/// Split the configured origin list into what the CORS layer will accept and
+/// what it had to drop, with the reason for each drop.
+///
+/// A malformed entry used to disappear inside a `filter_map`: the list was
+/// filtered through `HeaderValue::from_str(...).ok()` and whatever failed was
+/// gone without a word. Two things were wrong with that.
+///
+/// The first is the silence. A dropped origin is diagnosed from the browser,
+/// as a CORS failure on one frontend while the others keep working — the most
+/// expensive place to debug anything, because the server said nothing.
+///
+/// The second is that `HeaderValue::from_str` was never the check anyone
+/// thought it was. It rejects only control bytes (`b >= 32 && b != 127`), so
+/// `https:// example.com`, `example.com`, `не origin` and `https://foo/bar`
+/// all pass it, land in the allowlist, and then match no browser `Origin`
+/// header ever — silently, and for the whole life of the process. That is the
+/// same symptom, reached without a single invalid header value.
+///
+/// So the entries are checked as *origins* (RFC 6454: `scheme://host[:port]`,
+/// nothing after the authority), which is what they are compared against.
+/// `*` is passed through unchanged: it is a wildcard the operator may have
+/// configured, not an origin to validate.
+fn parse_cors_origins(configured: &str) -> (Vec<HeaderValue>, Vec<(String, &'static str)>) {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+
+    for entry in configured
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        match cors_origin_defect(entry) {
+            None => match HeaderValue::from_str(entry) {
+                Ok(value) => accepted.push(value),
+                // Unreachable for anything `cors_origin_defect` accepts, but
+                // the layer takes `HeaderValue`s and this is where the
+                // conversion lives — a defect here is reported, not dropped.
+                Err(_) => rejected.push((entry.to_string(), "not a valid HTTP header value")),
+            },
+            Some(defect) => rejected.push((entry.to_string(), defect)),
+        }
+    }
+
+    (accepted, rejected)
+}
+
+/// Why `entry` cannot be an origin, or `None` if it can.
+fn cors_origin_defect(entry: &str) -> Option<&'static str> {
+    if entry == "*" {
+        return None;
+    }
+
+    let Some((scheme, authority)) = entry.split_once("://") else {
+        return Some("missing a scheme — an origin looks like 'https://host[:port]'");
+    };
+    if scheme.is_empty()
+        || !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return Some("the scheme is not a valid URL scheme");
+    }
+    if authority.is_empty() {
+        return Some("no host after the scheme");
+    }
+    if authority.contains(['/', '?', '#']) {
+        return Some("an origin carries no path, query or fragment");
+    }
+    if authority.contains('@') {
+        return Some("an origin carries no userinfo");
+    }
+    if !authority
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '[' | ']' | '_'))
+    {
+        return Some("the host contains characters that cannot appear in an origin");
+    }
+    None
+}
+
 /// Build a restrictive CORS layer.
 ///
 /// If `FORGEKEEP_CORS_ORIGINS` is set (comma-separated URLs), only those
@@ -125,12 +206,14 @@ fn build_cors_layer() -> CorsLayer {
 
     match std::env::var("FORGEKEEP_CORS_ORIGINS").ok() {
         Some(origins_str) if !origins_str.is_empty() => {
-            let origins: Vec<HeaderValue> = origins_str
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| HeaderValue::from_str(s).ok())
-                .collect();
+            let (origins, rejected) = parse_cors_origins(&origins_str);
+            for (entry, defect) in &rejected {
+                tracing::warn!(
+                    entry = %entry,
+                    reason = defect,
+                    "FORGEKEEP_CORS_ORIGINS: ignoring an entry that is not a usable origin"
+                );
+            }
 
             if origins.is_empty() {
                 tracing::warn!(
@@ -2217,4 +2300,91 @@ pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<Rout
         .with_state(state);
 
     (router, facts)
+}
+
+#[cfg(test)]
+mod cors_origin_tests {
+    use super::parse_cors_origins;
+
+    fn rejected_entries(configured: &str) -> Vec<String> {
+        parse_cors_origins(configured)
+            .1
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect()
+    }
+
+    fn accepted_entries(configured: &str) -> Vec<String> {
+        parse_cors_origins(configured)
+            .0
+            .into_iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The defect: one bad entry in the list used to vanish, leaving the
+    /// operator with a CORS failure on exactly one frontend and no log line.
+    #[test]
+    fn a_malformed_entry_is_dropped_and_named() {
+        let configured = "https://ok.test, не origin";
+
+        assert_eq!(accepted_entries(configured), vec!["https://ok.test"]);
+        assert_eq!(rejected_entries(configured), vec!["не origin"]);
+    }
+
+    /// A fully valid list stays quiet — a warning that fires on healthy config
+    /// is a warning nobody reads.
+    #[test]
+    fn a_valid_list_reports_nothing() {
+        let configured = "https://app.example.com, http://localhost:5173, https://[::1]:8443";
+
+        assert_eq!(
+            accepted_entries(configured),
+            vec![
+                "https://app.example.com",
+                "http://localhost:5173",
+                "https://[::1]:8443"
+            ]
+        );
+        assert!(rejected_entries(configured).is_empty());
+    }
+
+    /// The entries `HeaderValue::from_str` waved through. Each of these used to
+    /// enter the allowlist and then match no browser `Origin` header for the
+    /// life of the process, which is the same failure with no invalid header
+    /// value anywhere in sight.
+    #[test]
+    fn entries_that_are_valid_header_values_but_not_origins_are_rejected() {
+        for entry in [
+            "example.com",
+            "https://foo.test/some/path",
+            "https:// example.test",
+            "https://user@example.test",
+            "https://example.test?x=1",
+            "://example.test",
+        ] {
+            assert_eq!(
+                rejected_entries(entry),
+                vec![entry.to_string()],
+                "'{entry}' is not an origin and must be reported, not silently kept"
+            );
+        }
+    }
+
+    /// Blank entries are formatting, not typos — a trailing comma must not
+    /// produce a warning.
+    #[test]
+    fn empty_entries_are_neither_accepted_nor_reported() {
+        let configured = "https://ok.test,, ,";
+
+        assert_eq!(accepted_entries(configured), vec!["https://ok.test"]);
+        assert!(rejected_entries(configured).is_empty());
+    }
+
+    /// A wildcard is a configuration choice, not an origin to parse.
+    #[test]
+    fn a_wildcard_passes_through_unchanged() {
+        assert_eq!(accepted_entries("*"), vec!["*"]);
+        assert!(rejected_entries("*").is_empty());
+    }
 }
