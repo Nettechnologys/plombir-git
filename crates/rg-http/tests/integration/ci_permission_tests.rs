@@ -398,7 +398,9 @@ async fn manual_job_play_requires_write_access_and_is_atomic() {
             .await
             .unwrap()
             .status(),
-        400
+        // card_8e5d79bdb8bd: the second release is a well-formed request that
+        // arrived after the state moved — 409, not "you sent rubbish".
+        409
     );
     assert_eq!(
         rg_db::ops::pipeline_ops::get_job(&db, job.id)

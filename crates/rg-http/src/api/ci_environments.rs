@@ -307,10 +307,12 @@ async fn authorize_approval(
         Ok(_) => return Err(AppError::not_found("job not found").into_response()),
         Err(error) => return Err(AppError::from(error).into_response()),
     };
+    // Already approved, already rejected, or never protected: the request is
+    // well-formed and authorized, and it is the job's state that has no
+    // approval left to give. 409 sends the client to re-read that state
+    // instead of to re-examine a request with nothing wrong in it.
     if job.status != "waiting_approval" || pipeline.status != "waiting_approval" {
-        return Err(
-            AppError::bad_request("job is not awaiting environment approval").into_response(),
-        );
+        return Err(AppError::conflict("job is not awaiting environment approval").into_response());
     }
     let environment_id = match job.environment_id {
         Some(id) => id,

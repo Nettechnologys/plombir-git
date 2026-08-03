@@ -308,7 +308,7 @@ pub async fn get_job(
     ),
     responses(
         (status = 200, description = "Manual job released", body = serde_json::Value),
-        (status = 400, description = "Job is not awaiting manual action", body = serde_json::Value),
+        (status = 409, description = "Job is not awaiting manual action, or was already released", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -333,15 +333,22 @@ pub async fn play_job(
     if !belongs {
         return AppError::not_found("job not found").into_response();
     }
+    // Nothing is wrong with the request here: the path is valid, the caller is
+    // allowed, the body parsed. The *job* is in a state that has no manual
+    // action left to take. A 400 tells the client to fix a request that has
+    // nothing to fix; a 409 tells it to re-read the state, which is the only
+    // useful thing it can do.
     if pipeline.status != "manual" || job.status != "manual" || job.when_condition != "manual" {
-        return AppError::bad_request("job is not awaiting manual action").into_response();
+        return AppError::conflict("job is not awaiting manual action").into_response();
     }
     let released = match rg_db::ops::pipeline_ops::play_manual_job(&state.db, job.id).await {
         Ok(released) => released,
         Err(error) => return AppError::from(error).into_response(),
     };
     if !released {
-        return AppError::bad_request("manual job was already released").into_response();
+        // Losing this race is the textbook `Conflict`: a double click, or a
+        // retry after a timeout whose first attempt actually landed.
+        return AppError::conflict("manual job was already released").into_response();
     }
     if let Err(error) =
         rg_db::ops::pipeline_ops::resume_pipeline_chain(&state.db, pipeline_id, job.stage_id).await
@@ -577,8 +584,8 @@ pub async fn retry_pipeline(
     ),
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "Pipeline is not active", body = serde_json::Value),
     ),
 )]
 pub async fn cancel_pipeline(
@@ -592,7 +599,9 @@ pub async fn cancel_pipeline(
 
     match rg_db::ops::pipeline_ops::cancel_pipeline_chain(&state.db, id).await {
         Ok(true) => Json(serde_json::json!({"id": id, "status": "canceled"})).into_response(),
-        Ok(false) => AppError::bad_request("pipeline is not active").into_response(),
+        // The pipeline finished on its own before the cancel landed. The
+        // request was fine; the state moved.
+        Ok(false) => AppError::conflict("pipeline is not active").into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
 }
