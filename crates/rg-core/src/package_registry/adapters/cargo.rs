@@ -15,6 +15,7 @@
 //!   one entry per version. Cargo never asks for the bare name: it spells it
 //!   out as a directory prefix, see [`cargo_index_prefix`].
 
+use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use std::io::Read;
 use tar::Archive;
@@ -204,7 +205,19 @@ const INDEX_FIELDS: [&str; 6] = [
 /// is not a partial answer but a wrong one — it asserts the crate depends on
 /// nothing, and resolution succeeds on that lie before the build fails at
 /// `unresolved import`.
-pub fn build_sparse_index_entry(name: &str, version: &CargoIndexVersion<'_>) -> serde_json::Value {
+///
+/// A stored blob that cannot be read is an error rather than an absent overlay.
+/// The three outcomes are genuinely different and only two of them are fine:
+///
+/// * `None` — the version predates the adapter recording anything. The
+///   placeholders above are the honest answer for it.
+/// * a JSON object — the recorded facts, overlaid.
+/// * anything else — the row is damaged, and the entry that would be served
+///   instead is the lie this doc comment describes. Refuse to serve it.
+pub fn build_sparse_index_entry(
+    name: &str,
+    version: &CargoIndexVersion<'_>,
+) -> Result<serde_json::Value> {
     let mut entry = serde_json::json!({
         "name": name,
         "vers": version.version,
@@ -215,10 +228,26 @@ pub fn build_sparse_index_entry(name: &str, version: &CargoIndexVersion<'_>) -> 
         "links": serde_json::Value::Null,
     });
 
-    let stored = version
-        .metadata
-        .and_then(|blob| serde_json::from_str::<serde_json::Value>(blob).ok());
-    if let Some(serde_json::Value::Object(stored)) = stored {
+    if let Some(blob) = version.metadata {
+        let stored = serde_json::from_str::<serde_json::Value>(blob).map_err(|error| {
+            tracing::error!(
+                package = %name,
+                version = %version.version,
+                error = %error,
+                "stored cargo index metadata is not valid JSON — refusing to serve an \
+                 index entry that would claim the crate has no dependencies"
+            );
+            unreadable_metadata(name, version.version)
+        })?;
+        let serde_json::Value::Object(stored) = stored else {
+            tracing::error!(
+                package = %name,
+                version = %version.version,
+                "stored cargo index metadata is valid JSON but not an object — refusing to \
+                 serve an index entry that would claim the crate has no dependencies"
+            );
+            return Err(unreadable_metadata(name, version.version));
+        };
         for field in INDEX_FIELDS {
             if let Some(value) = stored.get(field) {
                 entry[field] = value.clone();
@@ -226,18 +255,24 @@ pub fn build_sparse_index_entry(name: &str, version: &CargoIndexVersion<'_>) -> 
         }
     }
 
-    entry
+    Ok(entry)
+}
+
+/// Untyped on purpose: this is the registry's own row being unreadable, so it
+/// must reach the client as a 5xx and never as "fix your request".
+fn unreadable_metadata(name: &str, version: &str) -> anyhow::Error {
+    anyhow::anyhow!("stored metadata for '{name}' {version} could not be read")
 }
 
 /// Build the full sparse-index response: one JSON line per version.
-pub fn build_sparse_index(name: &str, versions: &[CargoIndexVersion<'_>]) -> String {
+pub fn build_sparse_index(name: &str, versions: &[CargoIndexVersion<'_>]) -> Result<String> {
     let mut lines = String::new();
     for version in versions {
-        let entry = build_sparse_index_entry(name, version);
-        lines.push_str(&serde_json::to_string(&entry).unwrap_or_default());
+        let entry = build_sparse_index_entry(name, version)?;
+        lines.push_str(&serde_json::to_string(&entry).context("serialize sparse index entry")?);
         lines.push('\n');
     }
-    lines
+    Ok(lines)
 }
 
 /// The `Cargo.toml` sections that have no package column of their own, in the
@@ -527,6 +562,7 @@ mod tests {
                 metadata: Some(&stored),
             },
         )
+        .expect("the manifest's own metadata is readable")
     }
 
     #[test]
@@ -729,28 +765,81 @@ version = "1.0.0"
         assert!(stored.get("links").is_none());
     }
 
-    /// Versions published before the adapter stored index fields — and rows
-    /// whose metadata is not the JSON object this expects — still serve a
-    /// well-formed entry rather than a line cargo cannot parse.
+    /// Versions published before the adapter stored index fields still serve a
+    /// well-formed entry: nothing was ever recorded for them, so the
+    /// placeholders are the honest answer rather than a claim.
     #[test]
     fn an_entry_without_stored_metadata_keeps_the_old_shape() {
-        for metadata in [None, Some("not json"), Some("[1,2]")] {
-            let entry = build_sparse_index_entry(
+        let entry = build_sparse_index_entry(
+            "matrix-crate",
+            &CargoIndexVersion {
+                version: "1.0.0",
+                sha256: None,
+                yanked: true,
+                metadata: None,
+            },
+        )
+        .expect("a version with no stored metadata still has an entry");
+
+        assert_eq!(entry["deps"], serde_json::json!([]));
+        assert_eq!(entry["features"], serde_json::json!({}));
+        assert_eq!(entry["cksum"], "");
+        assert_eq!(entry["yanked"], true);
+        assert!(entry["links"].is_null());
+    }
+
+    /// card_49d7caba8e4f: a row that *has* metadata which cannot be read is a
+    /// different thing entirely. The placeholders would state, in cargo's own
+    /// resolver input, that the crate depends on nothing — resolution succeeds
+    /// on that and the build dies later at `unresolved import`. Refusing to
+    /// serve the index is the smaller failure, and the only honest one.
+    #[test]
+    fn an_entry_whose_stored_metadata_cannot_be_read_is_refused() {
+        for metadata in ["not json", "[1,2]", "null", "\"deps\""] {
+            let refused = build_sparse_index_entry(
                 "matrix-crate",
                 &CargoIndexVersion {
                     version: "1.0.0",
                     sha256: None,
-                    yanked: true,
-                    metadata,
+                    yanked: false,
+                    metadata: Some(metadata),
                 },
             );
 
-            assert_eq!(entry["deps"], serde_json::json!([]), "{metadata:?}");
-            assert_eq!(entry["features"], serde_json::json!({}), "{metadata:?}");
-            assert_eq!(entry["cksum"], "", "{metadata:?}");
-            assert_eq!(entry["yanked"], true, "{metadata:?}");
-            assert!(entry["links"].is_null(), "{metadata:?}");
+            let error = refused
+                .err()
+                .unwrap_or_else(|| panic!("damaged metadata {metadata:?} must not be served"));
+            assert!(
+                error
+                    .downcast_ref::<crate::error::InvalidRequest>()
+                    .is_none(),
+                "an unreadable row of ours is not the client's bad request: {error:#}"
+            );
         }
+
+        // And the whole index refuses with it — one damaged version must not be
+        // quietly dropped from a listing the client reads as complete.
+        assert!(
+            build_sparse_index(
+                "matrix-crate",
+                &[
+                    CargoIndexVersion {
+                        version: "1.0.0",
+                        sha256: Some("aa"),
+                        yanked: false,
+                        metadata: Some(r#"{"deps":[]}"#),
+                    },
+                    CargoIndexVersion {
+                        version: "1.1.0",
+                        sha256: Some("bb"),
+                        yanked: false,
+                        metadata: Some("not json"),
+                    },
+                ],
+            )
+            .is_err(),
+            "a damaged version must fail the index it belongs to"
+        );
     }
 
     /// The metadata column is free-form JSON; only the index's own keys may
@@ -765,7 +854,8 @@ version = "1.0.0"
                 yanked: false,
                 metadata: Some(r#"{"deps":[],"summary":"leaked"}"#),
             },
-        );
+        )
+        .expect("a readable blob is served");
 
         assert!(entry.get("summary").is_none(), "{entry}");
     }
@@ -788,7 +878,8 @@ version = "1.0.0"
                     metadata: None,
                 },
             ],
-        );
+        )
+        .expect("both versions are readable");
 
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2, "{body}");

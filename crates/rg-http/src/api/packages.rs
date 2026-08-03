@@ -839,7 +839,13 @@ pub async fn cargo_sparse_index(
         })
         .collect();
 
-    let body = rg_core::package_registry::build_sparse_index(pkg_name, &entries);
+    // A row this registry cannot read is this registry's failure. Serving the
+    // entry anyway would tell cargo the crate has no dependencies — resolution
+    // then succeeds on that and the build dies at `unresolved import`.
+    let body = match rg_core::package_registry::build_sparse_index(pkg_name, &entries) {
+        Ok(body) => body,
+        Err(e) => return package_error_response(e),
+    };
 
     (
         StatusCode::OK,
@@ -914,13 +920,18 @@ pub async fn npm_registry_metadata(
         })
         .collect();
 
-    let metadata = rg_core::package_registry::build_npm_metadata(
+    // Same as the cargo index above: an unreadable row must not be served as a
+    // packument saying the version depends on nothing.
+    let metadata = match rg_core::package_registry::build_npm_metadata(
         &pkg_name,
         &npm_versions,
         &base_url,
         &owner,
         &name,
-    );
+    ) {
+        Ok(metadata) => metadata,
+        Err(e) => return package_error_response(e),
+    };
 
     (StatusCode::OK, Json(metadata)).into_response()
 }

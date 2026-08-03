@@ -50,6 +50,7 @@
 //! ForgeKeep serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/npm/{pkg_name}`
 
+use anyhow::Result;
 use flate2::read::GzDecoder;
 use std::io::Read;
 use tar::Archive;
@@ -344,13 +345,19 @@ fn sri(algorithm: &str, hex_digest: Option<&str>) -> Option<String> {
 /// Build the npm registry "abbreviated" metadata JSON response.
 ///
 /// This is the format npm expects when querying a registry.
+///
+/// A stored metadata blob that cannot be read is an error rather than an absent
+/// overlay: `dependencies` is seeded with `{}` above so a version published
+/// before the adapter recorded anything still answers, and serving that
+/// placeholder for a *damaged* row would tell the client the package depends on
+/// nothing — a resolution that succeeds and an install that is wrong.
 pub fn build_npm_metadata(
     name: &str,
     versions: &[NpmVersionInfo],
     base_url: &str,
     owner: &str,
     repo: &str,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
     let mut versions_map = serde_json::Map::new();
     let mut latest_version: Option<String> = None;
 
@@ -381,11 +388,26 @@ pub fn build_npm_metadata(
         // and saying it outright keeps the response self-describing.
         ver_obj.insert("dependencies".into(), serde_json::json!({}));
 
-        let stored = vi
-            .metadata
-            .as_deref()
-            .and_then(|blob| serde_json::from_str::<serde_json::Value>(blob).ok());
-        if let Some(serde_json::Value::Object(stored)) = stored {
+        if let Some(blob) = vi.metadata.as_deref() {
+            let stored = serde_json::from_str::<serde_json::Value>(blob).map_err(|error| {
+                tracing::error!(
+                    package = %name,
+                    version = %vi.version,
+                    error = %error,
+                    "stored npm metadata is not valid JSON — refusing to serve a packument \
+                     that would claim the version has no dependencies"
+                );
+                unreadable_metadata(name, &vi.version)
+            })?;
+            let serde_json::Value::Object(stored) = stored else {
+                tracing::error!(
+                    package = %name,
+                    version = %vi.version,
+                    "stored npm metadata is valid JSON but not an object — refusing to serve \
+                     a packument that would claim the version has no dependencies"
+                );
+                return Err(unreadable_metadata(name, &vi.version));
+            };
             for field in ABBREVIATED_FIELDS {
                 if let Some(value) = stored.get(field) {
                     ver_obj.insert(field.into(), value.clone());
@@ -422,7 +444,13 @@ pub fn build_npm_metadata(
         document.insert("dist-tags".into(), serde_json::json!({ "latest": latest }));
     }
     document.insert("versions".into(), serde_json::Value::Object(versions_map));
-    serde_json::Value::Object(document)
+    Ok(serde_json::Value::Object(document))
+}
+
+/// Untyped on purpose: this is the registry's own row being unreadable, so it
+/// must reach the client as a 5xx and never as "fix your request".
+fn unreadable_metadata(name: &str, version: &str) -> anyhow::Error {
+    anyhow::anyhow!("stored metadata for '{name}' {version} could not be read")
 }
 
 /// Info needed for each version in the npm metadata response.
@@ -503,7 +531,8 @@ mod tests {
             "https://forge.example",
             "acme",
             "tools",
-        );
+        )
+        .expect("the manifest's own metadata is readable");
         document["versions"]["1.0.0"].clone()
     }
 
@@ -588,7 +617,8 @@ mod tests {
             "https://forge.example",
             "acme",
             "tools",
-        );
+        )
+        .expect("a version with no stored metadata still has a packument");
         let dist = &document["versions"]["1.0.0"]["dist"];
 
         assert!(
@@ -630,7 +660,8 @@ mod tests {
             "https://forge.example",
             "acme",
             "tools",
-        );
+        )
+        .expect("a version with no stored metadata still has a packument");
         let dist = &document["versions"]["1.0.0"]["dist"];
 
         assert!(dist.get("shasum").is_none(), "dist: {dist}");
@@ -760,17 +791,45 @@ mod tests {
         assert_eq!(stored["dependencies"], serde_json::json!({}));
     }
 
-    /// Versions published before the adapter stored anything — and rows whose
-    /// metadata is not the JSON object this expects — still serve a well-formed
-    /// version object rather than one npm cannot read.
+    /// Versions published before the adapter stored anything still serve a
+    /// well-formed version object: nothing was ever recorded for them, so the
+    /// empty `dependencies` table is the honest answer rather than a claim.
     #[test]
     fn a_version_without_stored_metadata_keeps_the_old_shape() {
-        for metadata in [
-            None,
-            Some("not json".to_string()),
-            Some("[1,2]".to_string()),
-        ] {
-            let document = build_npm_metadata(
+        let document = build_npm_metadata(
+            "matrix-npm",
+            &[NpmVersionInfo {
+                version: "1.0.0".into(),
+                description: None,
+                sha256: None,
+                sha1: None,
+                sha512: None,
+                filename: None,
+                yanked: false,
+                metadata: None,
+            }],
+            "https://forge.example",
+            "acme",
+            "tools",
+        )
+        .expect("a version with no stored metadata still has a packument");
+        let version = &document["versions"]["1.0.0"];
+
+        assert_eq!(version["dependencies"], serde_json::json!({}));
+        assert_eq!(version["version"], "1.0.0");
+        assert_eq!(
+            version["dist"]["tarball"],
+            "https://forge.example/api/v1/repos/acme/tools/packages/npm/matrix-npm/1.0.0/package.tgz",
+        );
+    }
+
+    /// card_49d7caba8e4f: a row that *has* metadata which cannot be read is a
+    /// different thing entirely. Serving the placeholder would tell npm the
+    /// version depends on nothing — the install then succeeds and is wrong.
+    #[test]
+    fn a_version_whose_stored_metadata_cannot_be_read_is_refused() {
+        for metadata in ["not json", "[1,2]", "null", "\"dependencies\""] {
+            let refused = build_npm_metadata(
                 "matrix-npm",
                 &[NpmVersionInfo {
                     version: "1.0.0".into(),
@@ -780,24 +839,21 @@ mod tests {
                     sha512: None,
                     filename: None,
                     yanked: false,
-                    metadata: metadata.clone(),
+                    metadata: Some(metadata.to_string()),
                 }],
                 "https://forge.example",
                 "acme",
                 "tools",
             );
-            let version = &document["versions"]["1.0.0"];
 
-            assert_eq!(
-                version["dependencies"],
-                serde_json::json!({}),
-                "{metadata:?}"
-            );
-            assert_eq!(version["version"], "1.0.0", "{metadata:?}");
-            assert_eq!(
-                version["dist"]["tarball"],
-                "https://forge.example/api/v1/repos/acme/tools/packages/npm/matrix-npm/1.0.0/package.tgz",
-                "{metadata:?}",
+            let error = refused
+                .err()
+                .unwrap_or_else(|| panic!("damaged metadata {metadata:?} must not be served"));
+            assert!(
+                error
+                    .downcast_ref::<crate::error::InvalidRequest>()
+                    .is_none(),
+                "an unreadable row of ours is not the client's bad request: {error:#}"
             );
         }
     }
@@ -827,7 +883,8 @@ mod tests {
             "https://forge.example",
             "acme",
             "tools",
-        );
+        )
+        .expect("a readable blob is served");
         let version = &document["versions"]["1.0.0"];
 
         assert!(version.get("summary").is_none(), "{version}");
@@ -870,7 +927,8 @@ mod tests {
             "https://forge.example",
             "acme",
             "tools",
-        );
+        )
+        .expect("both versions are readable");
 
         assert_eq!(document["dist-tags"]["latest"], "1.0.0", "{document}");
         assert_eq!(
@@ -903,7 +961,8 @@ mod tests {
             "https://forge.example",
             "acme",
             "tools",
-        );
+        )
+        .expect("a yanked version with no stored metadata still has a packument");
 
         assert!(
             document.get("dist-tags").is_none(),
