@@ -256,6 +256,24 @@ async fn check_git_access(
 /// path, the gix internals and the `db: <operation>` context straight in front
 /// of whoever ran `git clone` (H-05). `operation` names the step for the log;
 /// the client gets a fixed string chosen by the status.
+/// Every ref a push must be refused, branch rules and tag rules together.
+///
+/// Both halves read an allow-list out of a stored JSON column and both are
+/// fallible for the same reason, so they are joined here and the call site has
+/// one error to answer rather than two identical arms.
+fn receive_pack_rejected_refs(
+    protection_rules: Vec<rg_db::entities::protected_branch::Model>,
+    tag_protection_rules: Vec<rg_db::entities::protected_tag::Model>,
+    actor_id: Option<i64>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut rejected = branch_protection_rejected_refs(protection_rules, actor_id)?;
+    rejected.extend(tag_protection_rejected_refs(
+        tag_protection_rules,
+        actor_id,
+    )?);
+    Ok(rejected)
+}
+
 fn git_failure_body(operation: &'static str, e: &anyhow::Error) -> String {
     let status = git_db_status(e);
     tracing::error!(
@@ -930,6 +948,26 @@ pub(crate) async fn handle_git_receive_pack(
             }
         };
 
+    // Decided before anything is spawned: a rule whose stored allow-list does
+    // not decode is a fault of ours, and the client has to hear that rather
+    // than "push to protected branch … is not allowed" — which would blame the
+    // pusher for a broken row and, for a pusher who *is* on the list, be a lie.
+    let require_signed_refs = signed_commit_required_refs(&protection_rules);
+    let rejected_refs =
+        match receive_pack_rejected_refs(protection_rules, tag_protection_rules, actor_id) {
+            Ok(refs) => refs,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(
+                        header::CONTENT_TYPE,
+                        "application/x-git-receive-pack-result",
+                    )],
+                    Body::from(git_failure_body("evaluate push protection rules", &e)),
+                );
+            }
+        };
+
     let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
     tokio::spawn(async move {
         if pipe_write.write_all(&body).await.is_err() {
@@ -941,9 +979,6 @@ pub(crate) async fn handle_git_receive_pack(
     // Spawn concurrent reader to prevent duplex deadlock when response > 64KB
     let reader_task = spawn_git_response_reader(buf_reader);
 
-    let require_signed_refs = signed_commit_required_refs(&protection_rules);
-    let mut rejected_refs = branch_protection_rejected_refs(protection_rules, actor_id);
-    rejected_refs.extend(tag_protection_rejected_refs(tag_protection_rules, actor_id));
     match with_git_timeout(
         state.git_stream_timeout_secs,
         rg_git::protocol::receive_pack::handle_receive_pack_http_with_rejections(

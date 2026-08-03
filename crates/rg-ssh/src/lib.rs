@@ -894,14 +894,19 @@ impl Handler for SshHandler {
                         let ref_updates = if let Some(context) = receive_pack_context {
                             let require_signed_refs =
                                 signed_commit_required_refs(&context.protection_rules);
+                            // A rule whose stored allow-list does not decode
+                            // aborts the session with a server error: rejecting
+                            // the ref instead would blame the pusher for a
+                            // broken row, and would be flatly wrong for a
+                            // pusher who is on that list.
                             let mut rejected_refs = branch_protection_rejected_refs(
                                 context.protection_rules,
                                 context.actor_id,
-                            );
+                            )?;
                             rejected_refs.extend(tag_protection_rejected_refs(
                                 context.tag_protection_rules,
                                 context.actor_id,
-                            ));
+                            )?);
                             handle_receive_pack_stream_with_rejections(
                                 &repo_full_path,
                                 &mut stream,

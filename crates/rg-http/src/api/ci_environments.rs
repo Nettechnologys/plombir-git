@@ -34,20 +34,41 @@ pub struct EnvironmentResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
-fn response(model: rg_db::entities::ci_environment::Model) -> EnvironmentResponse {
-    EnvironmentResponse {
+/// Decode the stored approver allow-list of one environment.
+///
+/// `NULL` is a configured absence — no allow-list — and reads as an empty vec.
+/// A present-but-undecodable column is a broken row, and must not read as one
+/// either: `[]` would tell the operator the environment has no approvers, and
+/// the obvious next move (`GET`, edit a field, `PUT` the object back) would
+/// then write that emptiness over a list that was merely unreadable.
+fn decode_allowed_approver_ids(
+    model: &rg_db::entities::ci_environment::Model,
+) -> Result<Vec<i64>, AppError> {
+    let Some(json) = model.allowed_approver_ids.as_deref() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(json).map_err(|error| {
+        tracing::error!(
+            environment_id = model.id,
+            error = %error,
+            "stored allowed_approver_ids is not a JSON array of user ids"
+        );
+        AppError::internal("stored environment approver list is unreadable")
+    })
+}
+
+fn response(
+    model: rg_db::entities::ci_environment::Model,
+) -> Result<EnvironmentResponse, AppError> {
+    Ok(EnvironmentResponse {
         id: model.id,
+        allowed_approver_ids: decode_allowed_approver_ids(&model)?,
         name: model.name,
         protected: model.protected,
         required_approvals: model.required_approvals,
-        allowed_approver_ids: model
-            .allowed_approver_ids
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or_default(),
         created_at: model.created_at,
         updated_at: model.updated_at,
-    }
+    })
 }
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && !name.chars().any(char::is_control)
@@ -97,7 +118,14 @@ pub async fn list(
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     match rg_db::ops::ci_environment_ops::list(&state.db, repo.id).await {
-        Ok(items) => Json(items.into_iter().map(response).collect::<Vec<_>>()).into_response(),
+        Ok(items) => match items
+            .into_iter()
+            .map(response)
+            .collect::<Result<Vec<_>, AppError>>()
+        {
+            Ok(items) => Json(items).into_response(),
+            Err(error) => error.into_response(),
+        },
         Err(error) => AppError::from(error).into_response(),
     }
 }
@@ -126,7 +154,10 @@ pub async fn create(
         updated_at: Set(now),
     };
     match rg_db::ops::ci_environment_ops::create(&state.db, model).await {
-        Ok(model) => (StatusCode::CREATED, Json(response(model))).into_response(),
+        Ok(model) => match response(model) {
+            Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
+            Err(error) => error.into_response(),
+        },
         // `(repo_id, name)` is UNIQUE (`uq_ci_environments_repo_name`), and
         // there is no pre-check: a second environment of the same name lands
         // here every time, not just on a race.
@@ -160,7 +191,10 @@ pub async fn update(
     ));
     active.updated_at = Set(chrono::Utc::now());
     match rg_db::ops::ci_environment_ops::update(&state.db, active).await {
-        Ok(model) => Json(response(model)).into_response(),
+        Ok(model) => match response(model) {
+            Ok(body) => Json(body).into_response(),
+            Err(error) => error.into_response(),
+        },
         // Renaming onto a name a sibling environment already holds.
         Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("environment already exists").into_response()
@@ -333,19 +367,24 @@ async fn authorize_approval(
         }
         Err(error) => return Err(error.into_response()),
     };
-    let allowed: Vec<i64> = environment
-        .allowed_approver_ids
-        .as_deref()
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_default();
     let is_admin = match repo_access::may_admin(state, &repo, Some(actor_id)).await {
         Ok(value) => value,
         Err(error) => return Err(error.into_response()),
     };
-    if !is_admin && !allowed.contains(&actor_id) {
-        return Err(
-            AppError::forbidden("user is not an allowed environment approver").into_response(),
-        );
+    // The allow-list is read only where it decides, and an unreadable one is a
+    // broken row rather than "nobody is an approver": answering the old
+    // `403 user is not an allowed environment approver` would tell an approver
+    // who *is* listed that they are not.
+    if !is_admin {
+        let allowed = match decode_allowed_approver_ids(&environment) {
+            Ok(allowed) => allowed,
+            Err(error) => return Err(error.into_response()),
+        };
+        if !allowed.contains(&actor_id) {
+            return Err(
+                AppError::forbidden("user is not an allowed environment approver").into_response(),
+            );
+        }
     }
     Ok(ApprovalContext {
         repo,

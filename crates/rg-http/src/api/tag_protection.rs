@@ -28,18 +28,38 @@ pub struct TagProtectionResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn response(model: rg_db::entities::protected_tag::Model) -> TagProtectionResponse {
-    TagProtectionResponse {
+/// Decode the stored allow-list of one tag-protection rule.
+///
+/// `NULL` is a configured absence — no allow-list — and reads as an empty vec.
+/// A present-but-undecodable column must not read as one too: `[]` would show
+/// the operator a rule that admits nobody, and a `GET` → edit → `PATCH` round
+/// trip would then persist that emptiness over a list that was only unreadable.
+fn decode_allowed_user_ids(
+    model: &rg_db::entities::protected_tag::Model,
+) -> Result<Vec<i64>, AppError> {
+    let Some(json) = model.allowed_user_ids.as_deref() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(json).map_err(|error| {
+        tracing::error!(
+            protected_tag_id = model.id,
+            error = %error,
+            "stored allowed_user_ids is not a JSON array of user ids"
+        );
+        AppError::internal("stored tag protection allow-list is unreadable")
+    })
+}
+
+fn response(
+    model: rg_db::entities::protected_tag::Model,
+) -> Result<TagProtectionResponse, AppError> {
+    Ok(TagProtectionResponse {
         id: model.id,
+        allowed_user_ids: decode_allowed_user_ids(&model)?,
         pattern: model.pattern,
-        allowed_user_ids: model
-            .allowed_user_ids
-            .as_deref()
-            .and_then(|v| serde_json::from_str(v).ok())
-            .unwrap_or_default(),
         created_at: model.created_at,
         updated_at: model.updated_at,
-    }
+    })
 }
 fn valid_pattern(pattern: &str) -> bool {
     !pattern.is_empty()
@@ -52,11 +72,14 @@ fn valid_pattern(pattern: &str) -> bool {
 #[utoipa::path(get, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [TagProtectionResponse])))]
 pub async fn list(State(state): State<AppState>, RepoRead { repo }: RepoRead) -> impl IntoResponse {
     match rg_db::ops::protected_tag_ops::list_by_repo(&state.db, repo.id).await {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(items.into_iter().map(response).collect::<Vec<_>>()),
-        )
-            .into_response(),
+        Ok(items) => match items
+            .into_iter()
+            .map(response)
+            .collect::<Result<Vec<_>, AppError>>()
+        {
+            Ok(items) => (StatusCode::OK, Json(items)).into_response(),
+            Err(e) => e.into_response(),
+        },
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -86,7 +109,10 @@ pub async fn create(
         updated_at: Set(now),
     };
     match rg_db::ops::protected_tag_ops::create(&state.db, model).await {
-        Ok(v) => (StatusCode::CREATED, Json(response(v))).into_response(),
+        Ok(v) => match response(v) {
+            Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
+            Err(e) => e.into_response(),
+        },
         // `(repo_id, pattern)` is unique and nothing pre-checks it, so every
         // repeat of an existing pattern arrives here.
         Err(e) if rg_db::is_unique_violation_anyhow(&e) => {
@@ -113,7 +139,10 @@ pub async fn update(
     ));
     active.updated_at = Set(chrono::Utc::now());
     match rg_db::ops::protected_tag_ops::update(&state.db, active).await {
-        Ok(v) => (StatusCode::OK, Json(response(v))).into_response(),
+        Ok(v) => match response(v) {
+            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Err(e) => e.into_response(),
+        },
         Err(e) => AppError::from(e).into_response(),
     }
 }

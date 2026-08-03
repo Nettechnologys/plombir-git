@@ -236,14 +236,17 @@ pub async fn check_push_allowed(
         return Ok(());
     };
 
-    // Check if user is in the allowed list
-    if let Some(uid) = user_id {
-        if let Some(allowed_json) = &protection.allowed_push_user_ids {
-            if let Ok(allowed_ids) = serde_json::from_str::<Vec<i64>>(allowed_json) {
-                if allowed_ids.contains(&uid) {
-                    return Ok(());
-                }
-            }
+    // Check if user is in the allowed list. A column that does not decode is a
+    // broken row, not an empty allow-list — reporting "push is not allowed"
+    // would pin a storage fault on the pusher.
+    if let Some(allowed_json) = &protection.allowed_push_user_ids {
+        let allowed_ids: Vec<i64> = serde_json::from_str(allowed_json).with_context(|| {
+            format!(
+                "stored allowed_push_user_ids of protected branch '{branch_name}' is not a JSON array of user ids"
+            )
+        })?;
+        if user_id.is_some_and(|uid| allowed_ids.contains(&uid)) {
+            return Ok(());
         }
     }
 
