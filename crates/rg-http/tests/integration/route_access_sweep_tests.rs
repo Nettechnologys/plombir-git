@@ -204,15 +204,7 @@ const NO_FIXTURE: &[(&str, &str)] = &[
 /// owner would panic on anyone the gate admits. Each entry is a filed defect;
 /// the list is checked both ways, so a route that stops falling over has to be
 /// removed from it.
-const FALLS_OVER: &[(&str, &str)] = &[(
-    "GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff",
-    "a pull request whose head branch is not in the repository answers `500 Internal server \
-     error` — no ref name, no reason. The fixture's pull request is seeded through the database \
-     and has no branches, but the condition is not a fixture artefact: deleting the source branch \
-     of an open PR is an everyday thing, and every reader of that PR gets the same blank 500 \
-     afterwards. The gate itself is right — all three personas are admitted or refused exactly as \
-     `RepoRead` promises — so this is the handler behind it. Filed as card_5c50a08c4cac",
-)];
+const FALLS_OVER: &[(&str, &str)] = &[];
 
 /// Routes whose successful effect breaks the fixture for everything after them.
 ///

@@ -576,6 +576,7 @@ pub async fn compute_diff(
     if !base_repo_path.exists() {
         bail!("repository path does not exist: {:?}", base_repo_path);
     }
+    require_pull_request_branch(&base_repo_path, "base", &pr.base_branch)?;
 
     // For fork PRs, fetch the head branch into the target repo first
     if let Some(head_repo_id) = pr.head_repo_id {
@@ -589,40 +590,40 @@ pub async fn compute_diff(
         let head_repo_path =
             repo_root.join(format!("{}/{}.git", head_owner.username, head_repo.name));
 
-        if head_repo_path.exists() {
-            let fetch_ref = format!("refs/heads/{}", pr.head_branch);
-            let local_ref = format!("refs/forks/{}/{}", head_owner.username, pr.head_branch);
+        // Do not let a failed fetch silently reuse an old `refs/forks/...` ref:
+        // a deleted head branch is a stale PR state (409), whereas an unreadable
+        // fork repository or a failed fetch is our retryable failure (5xx).
+        require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
+        let fetch_ref = format!("refs/heads/{}", pr.head_branch);
+        let local_ref = format!("refs/forks/{}/{}", head_owner.username, pr.head_branch);
 
-            let git = rg_git::cli_gateway::global_gateway()
-                .as_ref()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let git = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            let fetch_output = git.run(
-                &[
-                    "fetch",
-                    &head_repo_path.to_string_lossy(),
-                    &format!("{}:{}", fetch_ref, local_ref),
-                ],
-                Some(&base_repo_path),
-            )?;
+        let fetch_output = git.run(
+            &[
+                "fetch",
+                &head_repo_path.to_string_lossy(),
+                &format!("{}:{}", fetch_ref, local_ref),
+            ],
+            Some(&base_repo_path),
+        )?;
+        fetch_output
+            .ensure_success()
+            .context("failed to fetch pull request head branch")?;
 
-            if !fetch_output.success() {
-                tracing::warn!(
-                    "fetch of fork branch failed (non-fatal): {}",
-                    String::from_utf8_lossy(&fetch_output.stderr)
-                );
-            }
-
-            // Compute diff inside spawn_blocking (CPU-intensive gix tree-diff)
-            let base_path = base_repo_path.clone();
-            let pr_clone = pr.clone();
-            let local_ref = local_ref.clone();
-            return tokio::task::spawn_blocking(move || {
-                compute_cross_repo_diff(&base_path, &pr_clone.base_branch, &local_ref, &pr_clone)
-            })
-            .await?;
-        }
+        // Compute diff inside spawn_blocking (CPU-intensive gix tree-diff)
+        let base_path = base_repo_path.clone();
+        let pr_clone = pr.clone();
+        let local_ref = local_ref.clone();
+        return tokio::task::spawn_blocking(move || {
+            compute_cross_repo_diff(&base_path, &pr_clone.base_branch, &local_ref, &pr_clone)
+        })
+        .await?;
     }
+
+    require_pull_request_branch(&base_repo_path, "head", &pr.head_branch)?;
 
     // Same-repo diff — offload to spawn_blocking
     let base_path = base_repo_path.clone();
@@ -1960,6 +1961,25 @@ fn try_get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<Option<S
         )
     })?;
     Ok(Some(id.to_string()))
+}
+
+/// Require the branch recorded on a pull request to still exist.
+///
+/// The branch is not request input at this point: it was accepted when the PR
+/// was created and may legitimately have been deleted afterwards. Keep that
+/// stale resource state separate from a failed repository read so API callers
+/// can refresh on 409 and retry on 5xx.
+fn require_pull_request_branch(
+    repo_path: &std::path::Path,
+    kind: &str,
+    branch: &str,
+) -> Result<()> {
+    try_get_ref_sha(repo_path, branch)?.ok_or_else(|| {
+        crate::error::conflict(format!(
+            "pull request {kind} branch '{branch}' no longer exists"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Resolve a branch reference to its SHA using gix.

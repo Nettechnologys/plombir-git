@@ -270,6 +270,64 @@ async fn pr_create_separates_a_missing_head_ref_from_an_unreadable_repository() 
     );
 }
 
+/// `GET .../pulls/{number}/diff` reads the PR's stored head branch. Once the
+/// branch has been deleted, the PR is stale but the request is not malformed:
+/// tell the caller to refresh its view instead of hiding that state behind a
+/// retryable 500.
+#[tokio::test]
+async fn pr_diff_names_a_deleted_head_branch_as_a_conflict() {
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, _) = register_full(&base, "pr-diff-owner", "pr-diff@example.com").await;
+    create_repo(&base, &token, "pr-diff-repo").await;
+
+    let repository_path = repo_root.join("pr-diff-owner/pr-diff-repo.git");
+    seed_pr_branches(&repository_path);
+
+    let client = reqwest::Client::new();
+    let pulls_url = format!("{base}/api/v1/repos/pr-diff-owner/pr-diff-repo/pulls");
+    let created = client
+        .post(&pulls_url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "stale head branch",
+            "head": "feature",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .expect("create PR request");
+    assert_eq!(
+        created.status(),
+        201,
+        "fixture PR must be valid before deletion"
+    );
+    let pr: serde_json::Value = created.json().await.expect("created PR body");
+    let number = pr["number"].as_i64().expect("created PR number");
+
+    git(
+        &["update-ref", "-d", "refs/heads/feature"],
+        Some(&repository_path),
+    );
+
+    let response = client
+        .get(format!("{pulls_url}/{number}/diff"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("diff request");
+    assert_eq!(
+        response.status(),
+        409,
+        "a deleted PR head is stale resource state, not an internal failure"
+    );
+    let body: serde_json::Value = response.json().await.expect("conflict body");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("feature") && message.contains("no longer exists"),
+        "the client needs the missing branch and cause, got: {body}"
+    );
+}
+
 /// `POST .../collaborators` — an unknown permission and an already-listed user
 /// are the caller's, the `repo_collaborators` insert is ours. The handler had
 /// *two* blanket `bad_request`s: one on the service, one on the helper that
