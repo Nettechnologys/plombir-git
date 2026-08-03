@@ -222,9 +222,12 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         .expect("delete smoke-test repository");
     // `organizations.owner_id` carries no foreign key, so deleting the user
     // below would leave this row behind.
-    rg_db::ops::org_ops::delete_org(&db, org.id)
-        .await
-        .expect("delete smoke-test organization");
+    assert!(
+        rg_db::ops::org_ops::delete_org(&db, org.id)
+            .await
+            .expect("delete smoke-test organization"),
+        "deleting the smoke-test organization removed no row"
+    );
     rg_db::ops::user_ops::delete_by_id(&db, user.id)
         .await
         .expect("delete smoke-test user");

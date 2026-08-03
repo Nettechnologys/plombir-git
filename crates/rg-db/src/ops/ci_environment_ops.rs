@@ -43,12 +43,19 @@ pub async fn update(
 ) -> Result<ci_environment::Model> {
     model.update(db).await.context("db: update CI environment")
 }
-pub async fn delete(db: &DatabaseConnection, id: i64) -> Result<()> {
-    ci_environment::Entity::delete_by_id(id)
+/// Delete an environment, reporting whether this call is the one that removed it.
+///
+/// The caller looks the environment up and checks it for pipeline history
+/// before getting here, and those are separate statements from this one: a
+/// concurrent delete can win in between. `false` means the row was already
+/// gone, which is not the same outcome as "deleted" and must not be answered
+/// as one.
+pub async fn delete(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = ci_environment::Entity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete CI environment")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 /// Attach a job to its environment, gating it behind approval when the

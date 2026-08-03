@@ -120,8 +120,9 @@ pub async fn update_board(
     rg_db::ops::board_ops::update_board(db, model).await
 }
 
-/// Delete a board.
-pub async fn delete_board(db: &DatabaseConnection, id: i64) -> Result<()> {
+/// Delete a board. `false` means the row was already gone — see
+/// [`rg_db::ops::board_ops::delete_board_by_id`].
+pub async fn delete_board(db: &DatabaseConnection, id: i64) -> Result<bool> {
     rg_db::ops::board_ops::delete_board_by_id(db, id).await
 }
 
@@ -172,8 +173,8 @@ pub async fn update_column(
     rg_db::ops::board_ops::update_column(db, model).await
 }
 
-/// Delete a column.
-pub async fn delete_column(db: &DatabaseConnection, id: i64) -> Result<()> {
+/// Delete a column. `false` means the row was already gone.
+pub async fn delete_column(db: &DatabaseConnection, id: i64) -> Result<bool> {
     rg_db::ops::board_ops::delete_column_by_id(db, id).await
 }
 
@@ -250,8 +251,8 @@ pub async fn reorder_cards(db: &DatabaseConnection, positions: Vec<(i64, i32)>) 
     rg_db::ops::board_ops::update_card_positions(db, &positions).await
 }
 
-/// Delete a card.
-pub async fn delete_card(db: &DatabaseConnection, id: i64) -> Result<()> {
+/// Delete a card. `false` means the row was already gone.
+pub async fn delete_card(db: &DatabaseConnection, id: i64) -> Result<bool> {
     rg_db::ops::board_ops::delete_card_by_id(db, id).await
 }
 

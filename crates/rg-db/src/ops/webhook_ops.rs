@@ -56,13 +56,18 @@ pub async fn update_webhook(db: &DatabaseConnection, model: WebhookActiveModel) 
     model.update(db).await.context("db: update webhook")
 }
 
-/// Delete a webhook by id.
-pub async fn delete_webhook_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    WebhookEntity::delete_by_id(id)
+/// Delete a webhook by id, reporting whether this call removed it.
+///
+/// `false` means the row was already gone when the DELETE ran — the caller's
+/// own lookup happened in a separate statement, so a concurrent delete can win
+/// in between. Only the request that actually removed the row may report a
+/// deletion.
+pub async fn delete_webhook_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = WebhookEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete webhook")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 // ── Webhook Delivery ──────────────────────────────────────────────────────

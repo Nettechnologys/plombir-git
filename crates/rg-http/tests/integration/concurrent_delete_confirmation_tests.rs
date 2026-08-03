@@ -12,7 +12,9 @@
 //! whichever way the runtime interleaves them, and it cannot hold at all if the
 //! response is derived from the lookup instead of from `rows_affected`.
 
-use crate::common::{register_user, spawn_test_app};
+use crate::common::{
+    create_repo, register_full, register_user, spawn_test_app, spawn_test_app_with_db,
+};
 
 const VALID_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA race@forgekeep";
@@ -49,11 +51,18 @@ async fn race_deletes(url: &str, jwt: &str) -> Vec<u16> {
 }
 
 fn assert_exactly_one_deleter(statuses: &[u16], what: &str) {
-    let confirmed = statuses.iter().filter(|s| **s == 204).count();
+    assert_one_confirmation(statuses, 204, what);
+}
+
+/// The same property for the routes that confirm with a body instead of a 204
+/// — `{"deleted": true}`, `{"message": "webhook deleted"}`. The status code
+/// differs; the claim those bodies make does not.
+fn assert_one_confirmation(statuses: &[u16], success: u16, what: &str) {
+    let confirmed = statuses.iter().filter(|s| **s == success).count();
     let absent = statuses.iter().filter(|s| **s == 404).count();
     assert_eq!(
         confirmed, 1,
-        "{what}: exactly one request may confirm the revocation, got {statuses:?}"
+        "{what}: exactly one request may confirm the deletion, got {statuses:?}"
     );
     assert_eq!(
         absent,
@@ -132,4 +141,105 @@ async fn concurrent_ssh_key_revocations_confirm_exactly_one_deletion() {
         listed.is_empty(),
         "the SSH key survived the race: {listed:?}"
     );
+}
+
+// ── card_4e8df0264c53: the second batch ──────────────────────────────────
+//
+// The same shape, found by sweeping for the op signature rather than for the
+// route list: `board`, `webhook`, `sso_provider`, `ci_environment` and `org`
+// all had a `delete` returning `Result<()>`, so their handlers could not tell a
+// deletion from a no-op either. Two of them said so in the response body.
+
+#[tokio::test]
+async fn concurrent_board_deletions_confirm_exactly_one_deletion() {
+    let base = spawn_test_app().await;
+    let owner = register_user(&base, "boardracer", "boardracer@example.com", "Qz7$wRtm").await;
+    create_repo(&base, &owner, "boardrace").await;
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!(
+            "{base}/api/v1/repos/boardracer/boardrace/boards"
+        ))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({ "name": "raced" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let board_id = created["id"].as_i64().expect("created board carries an id");
+
+    let statuses = race_deletes(
+        &format!("{base}/api/v1/repos/boardracer/boardrace/boards/{board_id}"),
+        &owner,
+    )
+    .await;
+    assert_exactly_one_deleter(&statuses, "board");
+}
+
+#[tokio::test]
+async fn concurrent_webhook_deletions_confirm_exactly_one_deletion() {
+    let base = spawn_test_app().await;
+    let owner = register_user(&base, "hookracer", "hookracer@example.com", "Qz7$wRtm").await;
+    create_repo(&base, &owner, "hookrace").await;
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("{base}/api/v1/repos/hookracer/hookrace/hooks"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({
+            "url": "https://example.test/hook",
+            "events": ["push"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "create webhook");
+    let created: serde_json::Value = created.json().await.unwrap();
+    let hook_id = created["id"].as_i64().expect("created webhook carries an id");
+
+    // 200 with `{"message": "webhook deleted"}` — the loser used to send that
+    // sentence about a row it never touched.
+    let statuses = race_deletes(
+        &format!("{base}/api/v1/repos/hookracer/hookrace/hooks/{hook_id}"),
+        &owner,
+    )
+    .await;
+    assert_one_confirmation(&statuses, 200, "webhook");
+}
+
+#[tokio::test]
+async fn concurrent_sso_provider_deletions_confirm_exactly_one_deletion() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (admin, admin_id) = register_full(&base, "ssoracer", "ssoracer@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .expect("promote test user")
+        .expect("registered user must exist");
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("{base}/api/v1/admin/sso/providers"))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({
+            "name": "Raced IdP",
+            "slug": "raced-idp",
+            "provider_type": "oauth2",
+            "enabled": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "create SSO provider");
+    let created: serde_json::Value = created.json().await.unwrap();
+    let provider_id = created["id"].as_i64().expect("created provider carries an id");
+
+    // This one said it outright: `{"deleted": true}` from every racer.
+    let statuses = race_deletes(
+        &format!("{base}/api/v1/admin/sso/providers/{provider_id}"),
+        &admin,
+    )
+    .await;
+    assert_one_confirmation(&statuses, 200, "SSO provider");
 }

@@ -91,7 +91,14 @@ pub async fn delete_org(db: &DatabaseConnection, id: i64, requesting_user_id: i6
         ));
     }
 
-    org_ops::delete_org(db, id).await
+    // The ownership check above read the org in a statement of its own. Two
+    // concurrent deletes both pass it, and only one of them removes the row —
+    // the loser gets the same 404 as a request for an organization that was
+    // never there, rather than a success it did not cause.
+    if !org_ops::delete_org(db, id).await? {
+        return Err(crate::error::not_found("organization"));
+    }
+    Ok(())
 }
 
 /// Add a member to an organization.

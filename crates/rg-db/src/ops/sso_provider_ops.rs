@@ -133,8 +133,12 @@ pub async fn upsert(
     am.insert(db).await
 }
 
-/// Delete a provider by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<(), DbErr> {
-    Entity::delete_by_id(id).exec(db).await?;
-    Ok(())
+/// Delete a provider by id, reporting whether this call removed it.
+///
+/// The handler reads the provider and counts its linked identities before
+/// getting here, in statements of their own. `false` means a concurrent delete
+/// won the race — an outcome that must not come back as `{"deleted": true}`.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool, DbErr> {
+    let result = Entity::delete_by_id(id).exec(db).await?;
+    Ok(result.rows_affected > 0)
 }

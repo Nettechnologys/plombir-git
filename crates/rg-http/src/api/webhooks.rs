@@ -216,11 +216,16 @@ pub async fn delete_webhook(
     }
 
     match rg_core::webhook::service::delete_webhook(&state.db, id).await {
-        Ok(()) => (
+        Ok(true) => (
             StatusCode::OK,
             Json(serde_json::json!({"message": "webhook deleted"})),
         )
             .into_response(),
+        // "webhook deleted" is a statement about this request. The scoping
+        // lookup above ran in a statement of its own, so a concurrent delete
+        // can have taken the row in between — that request deleted it, this
+        // one did not.
+        Ok(false) => AppError::not_found("webhook not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

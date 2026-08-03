@@ -127,16 +127,20 @@ pub async fn update_org(
     active.update(db).await.context("db: update org")
 }
 
-/// Delete an organization.
-pub async fn delete_org(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let model = organization::Entity::find_by_id(id)
-        .one(db)
+/// Delete an organization, reporting whether this call removed it.
+///
+/// This used to read the row first and turn a miss into an `anyhow!` — a
+/// second statement that bought nothing: the caller has already read the org
+/// to check ownership, and between that read and this delete a concurrent
+/// request can win. One statement, and the row count is the answer: `false`
+/// means somebody else deleted it, and the caller decides what to tell the
+/// client.
+pub async fn delete_org(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = organization::Entity::delete_by_id(id)
+        .exec(db)
         .await
-        .context("db: find org for delete")?
-        .ok_or_else(|| anyhow::anyhow!("org {} not found", id))?;
-
-    model.delete(db).await.context("db: delete org")?;
-    Ok(())
+        .context("db: delete org")?;
+    Ok(result.rows_affected > 0)
 }
 
 // ── Organization Member ops ──────────────────────────────────

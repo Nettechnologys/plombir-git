@@ -903,7 +903,12 @@ pub async fn delete_sso_provider(
         Err(error) => return AppError::from(error).into_response(),
     }
     match rg_db::ops::sso_provider_ops::delete_by_id(&state.db, id).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
+        // `{"deleted": true}` is a claim about what this request did, and the
+        // lookup that found the provider is a statement of its own: a
+        // concurrent delete can take the row in between. Only the request that
+        // removed it may make the claim.
+        Ok(false) => AppError::not_found("SSO provider not found").into_response(),
         // The two client-side outcomes (unknown provider, provider still linked)
         // were answered above; a failed DELETE is ours.
         Err(e) => AppError::from(e).into_response(),

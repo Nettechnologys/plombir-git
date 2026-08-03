@@ -109,8 +109,9 @@ pub async fn update_webhook(
     webhook_ops::update_webhook(db, model).await
 }
 
-/// Delete a webhook.
-pub async fn delete_webhook(db: &DatabaseConnection, id: i64) -> Result<()> {
+/// Delete a webhook. `false` means the row was already gone — see
+/// [`webhook_ops::delete_webhook_by_id`].
+pub async fn delete_webhook(db: &DatabaseConnection, id: i64) -> Result<bool> {
     webhook_ops::delete_webhook_by_id(db, id).await
 }
 

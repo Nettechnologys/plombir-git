@@ -187,7 +187,11 @@ pub async fn delete(
         Err(error) => return AppError::from(error).into_response(),
     }
     match rg_db::ops::ci_environment_ops::delete(&state.db, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        // The scoping lookup and the job check above are separate statements
+        // from the DELETE. A request that removed nothing did not delete the
+        // environment, and answers like a request for one that is not there.
+        Ok(false) => AppError::not_found("environment not found").into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
 }

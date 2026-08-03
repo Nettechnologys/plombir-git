@@ -51,13 +51,17 @@ pub async fn update_board(db: &DatabaseConnection, model: BoardAM) -> Result<Boa
     model.update(db).await.context("db: update board")
 }
 
-/// Delete a board by ID.
-pub async fn delete_board_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    BoardEntity::delete_by_id(id)
+/// Delete a board by ID, reporting whether this call removed it.
+///
+/// `false` means the row was already gone. The caller's repository-scoping
+/// lookup is a separate statement from this delete, so two concurrent DELETEs
+/// both pass it and only one of them actually deletes anything.
+pub async fn delete_board_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = BoardEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete board")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 // ── Columns ──────────────────────────────────────────────────────────────
@@ -90,13 +94,15 @@ pub async fn update_column(db: &DatabaseConnection, model: ColumnAM) -> Result<C
     model.update(db).await.context("db: update column")
 }
 
-/// Delete a column by ID.
-pub async fn delete_column_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    ColumnEntity::delete_by_id(id)
+/// Delete a column by ID, reporting whether this call removed it.
+///
+/// See [`delete_board_by_id`] for why the boolean matters.
+pub async fn delete_column_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = ColumnEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete column")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 // ── Cards ────────────────────────────────────────────────────────────────
@@ -129,13 +135,15 @@ pub async fn update_card(db: &DatabaseConnection, model: CardAM) -> Result<Card>
     model.update(db).await.context("db: update card")
 }
 
-/// Delete a card by ID.
-pub async fn delete_card_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    CardEntity::delete_by_id(id)
+/// Delete a card by ID, reporting whether this call removed it.
+///
+/// See [`delete_board_by_id`] for why the boolean matters.
+pub async fn delete_card_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = CardEntity::delete_by_id(id)
         .exec(db)
         .await
         .context("db: delete card")?;
-    Ok(())
+    Ok(result.rows_affected > 0)
 }
 
 /// Update positions of multiple cards in a single transaction.

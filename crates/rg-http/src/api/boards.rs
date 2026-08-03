@@ -333,7 +333,11 @@ pub async fn delete_board(
     }
 
     match rg_core::board::service::delete_board(&state.db, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        // The repository-scoping lookup above is a separate statement from the
+        // DELETE, so a request that removed nothing must not confirm a deletion
+        // it did not perform.
+        Ok(false) => AppError::not_found("board not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -445,7 +449,8 @@ pub async fn delete_column(
     }
 
     match rg_core::board::service::delete_column(&state.db, col_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("column not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -661,7 +666,8 @@ pub async fn delete_card(
     }
 
     match rg_core::board::service::delete_card(&state.db, card_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::not_found("card not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
