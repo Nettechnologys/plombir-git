@@ -142,6 +142,7 @@ mod time_tracking_authz_tests;
 mod time_tracking_tests;
 mod transfer_namespace_tests;
 mod undecodable_allow_list_tests;
+mod undecodable_status_check_tests;
 mod undecodable_stored_blob_tests;
 mod unmatched_route_tests;
 mod upload_failure_status_tests;

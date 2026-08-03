@@ -43,16 +43,26 @@ pub async fn create_protection(
         branch_name: Set(branch_name),
         require_pr: Set(require_pr),
         require_status_check: Set(require_status_check),
-        required_status_checks: Set(
-            required_status_checks.map(|v| serde_json::to_string(&v).unwrap_or_default())
-        ),
+        // `?`, not `unwrap_or_default()`: the default is `""`, which is not
+        // JSON, and the reader of this column now refuses a merge it cannot
+        // parse. Writing a value that arms that refusal would trade an
+        // impossible-in-practice serialization failure for a branch nobody can
+        // merge into. Serializing a `Vec<String>` does not fail, so this only
+        // ever changes what happens if that stops being true.
+        required_status_checks: Set(required_status_checks
+            .map(|v| serde_json::to_string(&v))
+            .transpose()
+            .context("serialize required_status_checks")?),
         require_approval: Set(require_approval),
         required_approvals: Set(required_approvals),
         allow_force_push: Set(allow_force_push),
         require_signed_commits: Set(require_signed_commits),
-        allowed_push_user_ids: Set(
-            allowed_push_user_ids.map(|v| serde_json::to_string(&v).unwrap_or_default())
-        ),
+        // Same reasoning: `check_push_allowed` and `push_rules.rs` both `?` on
+        // this column, so `""` here would lock every pusher out of the branch.
+        allowed_push_user_ids: Set(allowed_push_user_ids
+            .map(|v| serde_json::to_string(&v))
+            .transpose()
+            .context("serialize allowed_push_user_ids")?),
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
     };
@@ -142,7 +152,11 @@ async fn update_protection(
         active.require_status_check = Set(v);
     }
     if let Some(v) = required_status_checks {
-        active.required_status_checks = Set(Some(serde_json::to_string(&v).unwrap_or_default()));
+        // Same reasoning as the create path: `""` is not a list of no checks,
+        // it is a value the merge gate cannot read.
+        active.required_status_checks = Set(Some(
+            serde_json::to_string(&v).context("serialize required_status_checks")?,
+        ));
     }
     if let Some(v) = require_approval {
         active.require_approval = Set(v);
@@ -157,7 +171,9 @@ async fn update_protection(
         active.require_signed_commits = Set(v);
     }
     if let Some(v) = allowed_push_user_ids {
-        active.allowed_push_user_ids = Set(Some(serde_json::to_string(&v).unwrap_or_default()));
+        active.allowed_push_user_ids = Set(Some(
+            serde_json::to_string(&v).context("serialize allowed_push_user_ids")?,
+        ));
     }
     active.updated_at = Set(Utc::now());
 
@@ -308,75 +324,96 @@ pub async fn check_merge_allowed(
     // Check required status checks
     if protection.require_status_check {
         if let Some(checks_json) = &protection.required_status_checks {
-            if let Ok(required_checks) = serde_json::from_str::<Vec<String>>(checks_json) {
-                // Find the PR to get its head commit SHA
-                let pr = pull_request::Entity::find()
-                    .filter(pull_request::Column::Id.eq(pr_id))
-                    .one(db)
-                    .await
-                    .context("db: find PR for status check")?;
+            // A stored list that does not decode is a broken row, not "no
+            // checks are required". This whole block used to sit inside an
+            // `if let Ok(...)`, so a column that failed to parse skipped
+            // *everything* below it — the head-sha lookup, the pipeline
+            // lookup, the job comparison — and `check_merge_allowed`
+            // returned `Ok(())`. The rule stayed `true` in the database and
+            // lit up in the UI while every merge into the protected branch
+            // went through with no CI checked at all.
+            //
+            // Its sibling in `check_push_allowed` fails *closed* on the same
+            // shape of data — an unreadable allow-list refuses the push — and
+            // that is the whole difference: a broken row there costs someone
+            // an unexplained 403, here it costs the branch its protection.
+            // `?` makes an unreadable rule a server error, and a merge that
+            // cannot be checked does not happen.
+            let required_checks: Vec<String> = serde_json::from_str(checks_json)
+                .with_context(|| {
+                    format!(
+                        "stored required_status_checks of protected branch '{target_branch}' \
+                         is not a JSON array of check names"
+                    )
+                })?;
 
-                let head_sha = match pr.and_then(|p| p.head_sha) {
-                    Some(s) if !s.is_empty() => s,
-                    _ => {
+            // Find the PR to get its head commit SHA
+            let pr = pull_request::Entity::find()
+                .filter(pull_request::Column::Id.eq(pr_id))
+                .one(db)
+                .await
+                .context("db: find PR for status check")?;
+
+            let head_sha = match pr.and_then(|p| p.head_sha) {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(crate::error::forbidden(format!(
+                        "branch '{}' requires status checks but no CI pipeline found for PR {}",
+                        target_branch, pr_id
+                    )));
+                }
+            };
+
+            // Find the latest pipeline for this commit
+            let pipeline = pipeline_ops::find_latest_by_repo_and_commit(db, repo_id, &head_sha)
+                .await
+                .context("db: find pipeline for status check")?;
+
+            match pipeline {
+                None => {
+                    return Err(crate::error::forbidden(format!(
+                        "branch '{}' requires status checks to pass, but no CI pipeline has run for commit {}",
+                        target_branch,
+                        &head_sha[..8.min(head_sha.len())]
+                    )));
+                }
+                Some(p) if p.status != "success" => {
+                    return Err(crate::error::forbidden(format!(
+                        "branch '{}' requires all status checks to pass, but pipeline #{} is {}",
+                        target_branch,
+                        p.id,
+                        p.status
+                    )));
+                }
+                Some(p) => {
+                    // All pipeline jobs must have passed — check job names match required list
+                    let jobs = pipeline_ops::list_jobs_by_pipeline(db, p.id).await?;
+                    let passed_jobs: std::collections::HashSet<_> = jobs
+                        .iter()
+                        .filter(|j| j.status == "success")
+                        .map(|j| j.name.clone())
+                        .collect();
+
+                    let missing: Vec<_> = required_checks
+                        .iter()
+                        .filter(|name| !passed_jobs.contains(*name))
+                        .collect();
+
+                    if !missing.is_empty() {
                         return Err(crate::error::forbidden(format!(
-                            "branch '{}' requires status checks but no CI pipeline found for PR {}",
-                            target_branch, pr_id
-                        )));
-                    }
-                };
-
-                // Find the latest pipeline for this commit
-                let pipeline = pipeline_ops::find_latest_by_repo_and_commit(db, repo_id, &head_sha)
-                    .await
-                    .context("db: find pipeline for status check")?;
-
-                match pipeline {
-                    None => {
-                        return Err(crate::error::forbidden(format!(
-                            "branch '{}' requires status checks to pass, but no CI pipeline has run for commit {}",
+                            "branch '{}' requires status checks {:?} to pass, but {:?} are missing or failed",
                             target_branch,
-                            &head_sha[..8.min(head_sha.len())]
+                            required_checks,
+                            missing
                         )));
                     }
-                    Some(p) if p.status != "success" => {
-                        return Err(crate::error::forbidden(format!(
-                            "branch '{}' requires all status checks to pass, but pipeline #{} is {}",
-                            target_branch,
-                            p.id,
-                            p.status
-                        )));
-                    }
-                    Some(p) => {
-                        // All pipeline jobs must have passed — check job names match required list
-                        let jobs = pipeline_ops::list_jobs_by_pipeline(db, p.id).await?;
-                        let passed_jobs: std::collections::HashSet<_> = jobs
-                            .iter()
-                            .filter(|j| j.status == "success")
-                            .map(|j| j.name.clone())
-                            .collect();
 
-                        let missing: Vec<_> = required_checks
-                            .iter()
-                            .filter(|name| !passed_jobs.contains(*name))
-                            .collect();
-
-                        if !missing.is_empty() {
-                            return Err(crate::error::forbidden(format!(
-                                "branch '{}' requires status checks {:?} to pass, but {:?} are missing or failed",
-                                target_branch,
-                                required_checks,
-                                missing
-                            )));
-                        }
-
-                        tracing::info!(
-                            branch = %target_branch,
-                            pipeline_id = %p.id,
-                            checks = ?required_checks,
-                            "Branch protection: all status checks passed"
-                        );
-                    }
+                    tracing::info!(
+                        branch = %target_branch,
+                        pipeline_id = %p.id,
+                        checks = ?required_checks,
+                        "Branch protection: all status checks passed"
+                    );
                 }
             }
         }
