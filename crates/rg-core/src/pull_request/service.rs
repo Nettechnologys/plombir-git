@@ -58,7 +58,7 @@ pub async fn create_pr(
 
     // Resolve head SHA (for same-repo PRs, look up branch; for fork PRs, use the head repo).
     // A missing branch is a caller error, but an unreadable repository or ref store
-    // is ours: `try_get_ref_sha` preserves that distinction instead of turning both
+    // is ours: `try_get_branch_sha` preserves that distinction instead of turning both
     // into a nullable `head_sha` on a newly-created PR.
     let head_sha = if let Some(head_repo_id) = head_repo_id {
         // For fork PRs, resolve from the fork repo's git data
@@ -68,11 +68,11 @@ pub async fn create_pr(
             .context("head repository not found")?;
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
-        try_get_ref_sha(&head_path, &head_branch)?.ok_or_else(|| {
+        crate::repo::service::try_get_branch_sha(&head_path, &head_branch)?.ok_or_else(|| {
             crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
         })?
     } else {
-        try_get_ref_sha(&target_path, &head_branch)?.ok_or_else(|| {
+        crate::repo::service::try_get_branch_sha(&target_path, &head_branch)?.ok_or_else(|| {
             crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
         })?
     };
@@ -1946,29 +1946,6 @@ fn get_head_sha_with_repo(repo: &gix::Repository) -> Result<String> {
     Ok(head_id.to_string())
 }
 
-/// Look up a branch SHA, distinguishing an absent ref from a failed repository read.
-fn try_get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<Option<String>> {
-    let repo = gix::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
-    let ref_str = format!("refs/heads/{}", branch);
-    let Some(mut reference) = repo.try_find_reference(ref_str.as_str()).with_context(|| {
-        format!(
-            "failed to look up {} in repository: {:?}",
-            ref_str, repo_path
-        )
-    })?
-    else {
-        return Ok(None);
-    };
-    let id = reference.peel_to_id().with_context(|| {
-        format!(
-            "failed to resolve {} in repository: {:?}",
-            ref_str, repo_path
-        )
-    })?;
-    Ok(Some(id.to_string()))
-}
-
 /// Require the branch recorded on a pull request to still exist.
 ///
 /// The branch is not request input at this point: it was accepted when the PR
@@ -1980,7 +1957,7 @@ fn require_pull_request_branch(
     kind: &str,
     branch: &str,
 ) -> Result<()> {
-    try_get_ref_sha(repo_path, branch)?.ok_or_else(|| {
+    crate::repo::service::try_get_branch_sha(repo_path, branch)?.ok_or_else(|| {
         crate::error::conflict(format!(
             "pull request {kind} branch '{branch}' no longer exists"
         ))
@@ -1990,7 +1967,7 @@ fn require_pull_request_branch(
 
 /// Resolve a branch reference to its SHA using gix.
 fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
-    try_get_ref_sha(repo_path, branch)?.ok_or_else(|| {
+    crate::repo::service::try_get_branch_sha(repo_path, branch)?.ok_or_else(|| {
         anyhow::anyhow!(
             "failed to resolve refs/heads/{}: reference does not exist",
             branch

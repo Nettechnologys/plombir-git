@@ -2039,6 +2039,52 @@ pub struct FileUpdate {
     pub expected_blob_sha: String,
 }
 
+/// Look up a branch SHA without collapsing an absent ref into a repository
+/// failure. Callers that hold a persisted branch name can report the former as
+/// stale resource state while keeping an unreadable ref store as an operation
+/// failure.
+pub fn try_get_branch_sha(repo_path: &std::path::Path, branch: &str) -> Result<Option<String>> {
+    let repo = gix::open(repo_path)
+        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+    let ref_name = format!("refs/heads/{branch}");
+    let Some(mut reference) = repo
+        .try_find_reference(ref_name.as_str())
+        .with_context(|| {
+            format!(
+                "failed to look up {ref_name} in repository: {:?}",
+                repo_path
+            )
+        })?
+    else {
+        return Ok(None);
+    };
+    let id = reference.peel_to_id().with_context(|| {
+        format!(
+            "failed to resolve {ref_name} in repository: {:?}",
+            repo_path
+        )
+    })?;
+    Ok(Some(id.to_string()))
+}
+
+/// Confirm that a persisted branch still names the expected commit before an
+/// operation starts a working clone. A missing ref is stale PR state; an error
+/// opening or resolving the repository remains an operational failure.
+fn ensure_expected_branch_head(
+    repo_path: &std::path::Path,
+    branch: &str,
+    expected_head_sha: &str,
+) -> Result<()> {
+    let actual_head = try_get_branch_sha(repo_path, branch)?
+        .ok_or_else(|| crate::error::conflict(format!("branch '{branch}' no longer exists")))?;
+    if actual_head != expected_head_sha {
+        return Err(crate::error::conflict(format!(
+            "branch head changed: expected {expected_head_sha}, got {actual_head}"
+        )));
+    }
+    Ok(())
+}
+
 /// Update multiple existing files and publish them as one commit.
 ///
 /// The branch head and every touched blob are checked before writing. The
@@ -2064,6 +2110,7 @@ pub fn update_files_in_commit(
     if !repo_path.exists() {
         bail!("repository path not found: {:?}", repo_path);
     }
+    ensure_expected_branch_head(&repo_path, branch, expected_head_sha)?;
 
     let mut unique_paths = HashSet::new();
     for update in updates {
@@ -2102,7 +2149,13 @@ pub fn update_files_in_commit(
             ],
             None,
         )?;
-        clone.ensure_success()?;
+        if !clone.success() {
+            // A ref can disappear between the preflight check and clone. Check
+            // it once more so that normal stale-PR state still reaches callers
+            // as 409; a live ref means the clone failure is genuinely ours.
+            ensure_expected_branch_head(&repo_path, branch, expected_head_sha)?;
+            bail!("git clone failed: {}", clone.stderr_str());
+        }
 
         let head = gateway.run(&["rev-parse", "HEAD"], Some(&tmp))?;
         head.ensure_success()?;

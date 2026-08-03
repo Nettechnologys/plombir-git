@@ -19,7 +19,7 @@ use crate::common::{
     create_repo, register_full, register_user, spawn_test_app_with_db,
     spawn_test_app_with_db_and_repo_root,
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ActiveValue::NotSet, ConnectionTrait, Set};
 
 /// The failure half: a broken write must be a 5xx carrying no internal detail.
 fn assert_not_blamed_on_the_client(
@@ -44,6 +44,109 @@ fn git(args: &[&str], cwd: Option<&std::path::Path>) {
     let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
     let output = gateway.run(args, cwd).unwrap();
     output.ensure_success().unwrap();
+}
+
+fn git_stdout(args: &[&str], cwd: Option<&std::path::Path>) -> String {
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let output = gateway.run(args, cwd).unwrap();
+    output.ensure_success().unwrap();
+    output.stdout_str().trim().to_string()
+}
+
+struct PrSuggestionSeed<'a> {
+    repo_id: i64,
+    author_id: i64,
+    number: i64,
+    branch: &'a str,
+    head_sha: &'a str,
+}
+
+async fn create_pr_suggestion(
+    db: &sea_orm::DatabaseConnection,
+    base: &str,
+    token: &str,
+    seed: PrSuggestionSeed<'_>,
+) -> i64 {
+    let now = chrono::Utc::now();
+    rg_db::ops::pull_request_ops::create(
+        db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(seed.repo_id),
+            number: Set(seed.number),
+            title: Set(format!("stale suggestion branch {}", seed.branch)),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(seed.author_id),
+            reviewer_id: Set(None),
+            head_branch: Set(seed.branch.to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some(seed.head_sha.to_string())),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed pull request");
+
+    let comment = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/suggestion-stale/suggestion-stale/pulls/{}/comments",
+            seed.number
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "path": "README.md",
+            "line": 1,
+            "side": "RIGHT",
+            "body": "rewrite the base line",
+            "suggestion": "reviewed base",
+            "commit_id": seed.head_sha,
+        }))
+        .send()
+        .await
+        .expect("create suggestion comment");
+    assert_eq!(
+        comment.status(),
+        201,
+        "the fixture suggestion must be accepted before its branch is deleted"
+    );
+    comment
+        .json::<serde_json::Value>()
+        .await
+        .expect("suggestion body")["id"]
+        .as_i64()
+        .expect("suggestion id")
+}
+
+async fn assert_deleted_pr_branch_conflict(
+    response: reqwest::Response,
+    branch: &str,
+    operation: &str,
+) {
+    assert_eq!(
+        response.status(),
+        409,
+        "{operation} must report a deleted persisted PR branch as stale state"
+    );
+    let body: serde_json::Value = response.json().await.expect("conflict body");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(branch) && message.contains("no longer exists"),
+        "{operation} must name the deleted ref for the client, got: {body}"
+    );
 }
 
 /// Seed the bare repository with commits on both sides of a real PR. Empty
@@ -287,6 +390,103 @@ async fn pr_create_separates_a_missing_head_ref_from_an_unreadable_repository() 
         unreadable_repo.status().is_server_error(),
         "an unreadable repository is ours, not a nullable head SHA or a 4xx: {}",
         unreadable_repo.status()
+    );
+}
+
+/// Both suggestion-apply routes consume a head branch stored when the PR was
+/// valid. If that ref is deleted later, its old commit can still be read by SHA
+/// but cloning the named branch used to leak a generic 500. The absent ref is
+/// stale resource state; an unreadable repository remains a server failure.
+#[tokio::test]
+async fn applying_suggestions_to_a_deleted_pr_head_branch_returns_conflict_not_500() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, author_id) =
+        register_full(&base, "suggestion-stale", "suggestion-stale@example.com").await;
+    let repo_id = create_repo(&base, &token, "suggestion-stale").await;
+    let repository_path = repo_root.join("suggestion-stale/suggestion-stale.git");
+    seed_pr_branches(&repository_path);
+
+    let main_sha = git_stdout(&["rev-parse", "refs/heads/main"], Some(&repository_path));
+    let feature_sha = git_stdout(&["rev-parse", "refs/heads/feature"], Some(&repository_path));
+    let single_comment = create_pr_suggestion(
+        &db,
+        &base,
+        &token,
+        PrSuggestionSeed {
+            repo_id,
+            author_id,
+            number: 1,
+            branch: "main",
+            head_sha: &main_sha,
+        },
+    )
+    .await;
+    let batch_comment = create_pr_suggestion(
+        &db,
+        &base,
+        &token,
+        PrSuggestionSeed {
+            repo_id,
+            author_id,
+            number: 2,
+            branch: "feature",
+            head_sha: &feature_sha,
+        },
+    )
+    .await;
+
+    git(
+        &["update-ref", "-d", "refs/heads/main"],
+        Some(&repository_path),
+    );
+    git(
+        &["update-ref", "-d", "refs/heads/feature"],
+        Some(&repository_path),
+    );
+
+    let client = reqwest::Client::new();
+    let single_url = format!(
+        "{base}/api/v1/repos/suggestion-stale/suggestion-stale/pulls/1/comments/{single_comment}/suggestion/apply"
+    );
+    assert_deleted_pr_branch_conflict(
+        client
+            .post(&single_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("single suggestion request"),
+        "main",
+        "single suggestion apply",
+    )
+    .await;
+
+    assert_deleted_pr_branch_conflict(
+        client
+            .post(format!(
+                "{base}/api/v1/repos/suggestion-stale/suggestion-stale/pulls/2/suggestions/apply"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "comment_ids": [batch_comment] }))
+            .send()
+            .await
+            .expect("batch suggestion request"),
+        "feature",
+        "batch suggestion apply",
+    )
+    .await;
+
+    std::fs::remove_dir_all(&repository_path)
+        .unwrap_or_else(|error| panic!("remove test repository {repository_path:?}: {error}"));
+    let unavailable_repository = client
+        .post(&single_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("unreadable repository request");
+    assert!(
+        unavailable_repository.status().is_server_error(),
+        "a missing repository is an operational failure, not stale PR state: {}",
+        unavailable_repository.status()
     );
 }
 
