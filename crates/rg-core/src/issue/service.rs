@@ -6,7 +6,7 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set, Transactio
 
 use rg_db::entities::issue::{self, Model as Issue};
 use rg_db::entities::issue_comment::{self, Model as Comment};
-use rg_db::ops::{issue_comment_ops, issue_label_ops, issue_ops, label_ops};
+use rg_db::ops::{issue_comment_ops, issue_label_ops, issue_ops};
 
 // ── Issue CRUD ──────────────────────────────────────────────────────────
 
@@ -26,6 +26,15 @@ pub async fn create_issue(
     if title.trim().is_empty() {
         return Err(crate::error::invalid_request("issue title cannot be empty"));
     }
+
+    // Resolved before anything is written: an unknown name is the caller's
+    // mistake and must not leave a half-labelled issue behind. The denormalised
+    // JSON column and the junction table are filled from the same resolution
+    // below, so the response cannot list a label the issue does not carry.
+    let label_ids = match labels.as_deref() {
+        Some(names) => Some(crate::label::service::resolve_label_ids(db, repo_id, names).await?),
+        None => None,
+    };
 
     let number = issue_ops::next_number(db, repo_id).await?;
     let labels_json = labels
@@ -53,6 +62,17 @@ pub async fn create_issue(
     let txn = db.begin().await.context("db: begin transaction")?;
 
     let issue = model.insert(&txn).await.context("db: create issue")?;
+
+    // Dual-write: the labels JSON column and the issue_labels junction table
+    // are two views of one decision, so they commit together. Written outside
+    // the transaction — and with the failure downgraded to a `warn` — the two
+    // drifted apart on any error, and the client still got a `201` listing
+    // labels that `GET /issues?labels=…` (which reads the junction) would never
+    // match.
+    if let Some(ids) = label_ids {
+        issue_label_ops::set_labels(&txn, issue.id, ids).await?;
+    }
+
     txn.commit().await.context("db: commit transaction")?;
 
     // Trigger issue.opened webhook
@@ -66,20 +86,6 @@ pub async fn create_issue(
     });
     if let Err(e) = crate::webhook::service::trigger_issue_opened(db, repo_id, &payload).await {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.opened webhook");
-    }
-
-    // Dual-write: sync labels to issue_labels junction table
-    if let Some(ref label_names) = labels {
-        if let Ok(all_labels) = label_ops::list_by_repo(db, repo_id).await {
-            let label_ids: Vec<i64> = all_labels
-                .iter()
-                .filter(|l| label_names.contains(&l.name))
-                .map(|l| l.id)
-                .collect();
-            if let Err(e) = issue_label_ops::set_labels(db, issue.id, label_ids).await {
-                tracing::warn!(issue_id = %issue.id, error = %format!("{e:#}"), "failed to set issue labels");
-            }
-        }
     }
 
     Ok(issue)
@@ -131,20 +137,10 @@ pub async fn list_issues_filtered_by_labels(
 
     // Resolve label names to IDs. Repeats collapse — `?labels=bug,bug` is one
     // condition, not a `HAVING COUNT(DISTINCT label_id) = 2` that can never
-    // match.
-    let all_labels = label_ops::list_by_repo(db, repo.id).await?;
-    let mut required_label_ids: Vec<i64> = Vec::with_capacity(label_names.len());
-    for name in label_names {
-        let Some(label) = all_labels.iter().find(|l| &l.name == name) else {
-            return Err(crate::error::invalid_request(format!(
-                "unknown label: {}",
-                name.chars().take(64).collect::<String>()
-            )));
-        };
-        if !required_label_ids.contains(&label.id) {
-            required_label_ids.push(label.id);
-        }
-    }
+    // match. Shared with the write paths so one name cannot be legal on the way
+    // in and unknown on the way out.
+    let required_label_ids =
+        crate::label::service::resolve_label_ids(db, repo.id, label_names).await?;
 
     if required_label_ids.is_empty() {
         return Ok((Vec::new(), 0));
@@ -246,21 +242,15 @@ pub async fn update_issue(
             active.closed_at = Set(None);
         }
     }
+    // Resolved before the update statement, and applied inside the same
+    // transaction as it — see `create_issue`. An unknown name refuses the whole
+    // edit instead of quietly narrowing it.
+    let mut label_ids: Option<Vec<i64>> = None;
     if let Some(l) = labels {
+        label_ids = Some(crate::label::service::resolve_label_ids(db, issue_repo_id, &l).await?);
         active.labels = Set(Some(
             serde_json::to_string(&l).unwrap_or_else(|_| "[]".into()),
         ));
-        // Dual-write: sync labels to issue_labels junction table
-        if let Ok(all_labels) = label_ops::list_by_repo(db, issue_repo_id).await {
-            let label_ids: Vec<i64> = all_labels
-                .iter()
-                .filter(|label| l.contains(&label.name))
-                .map(|id| id.id)
-                .collect();
-            if let Err(e) = issue_label_ops::set_labels(db, issue_id, label_ids).await {
-                tracing::warn!(%issue_id, error = %format!("{e:#}"), "failed to set issue labels");
-            }
-        }
     }
     if let Some(a) = assignee_id {
         active.assignee_id = Set(a);
@@ -271,7 +261,12 @@ pub async fn update_issue(
 
     active.updated_at = Set(Utc::now());
 
-    let updated = issue_ops::update(db, active).await?;
+    let txn = db.begin().await.context("db: begin transaction")?;
+    let updated = active.update(&txn).await.context("db: update issue")?;
+    if let Some(ids) = label_ids {
+        issue_label_ops::set_labels(&txn, issue_id, ids).await?;
+    }
+    txn.commit().await.context("db: commit transaction")?;
 
     // FTS sync is handled by database triggers created in the migration chain.
 

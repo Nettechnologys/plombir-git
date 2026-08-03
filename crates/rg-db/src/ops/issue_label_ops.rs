@@ -8,7 +8,15 @@ use crate::entities::issue_label::{
 };
 
 /// Set labels for an issue (replace all existing labels).
-pub async fn set_labels(db: &DatabaseConnection, issue_id: i64, label_ids: Vec<i64>) -> Result<()> {
+///
+/// Generic over the connection so the junction write can join a caller's
+/// transaction instead of committing on its own. Passing a `DatabaseTransaction`
+/// nests a savepoint: the delete+insert pair stays atomic, and it rolls back
+/// with the outer transaction when the row it labels never lands.
+pub async fn set_labels<C>(db: &C, issue_id: i64, label_ids: Vec<i64>) -> Result<()>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
     let txn = db.begin().await.context("db: begin transaction")?;
 
     // CRITICAL: SeaORM batch delete (pitfall #3)

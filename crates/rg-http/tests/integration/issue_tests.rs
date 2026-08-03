@@ -399,6 +399,162 @@ async fn label_filter_counts_the_same_issues_it_returns() {
     );
 }
 
+/// Writing labels has to mean the same thing as reading them.
+///
+/// The write path filtered the repo's labels by `names.contains(&label.name)`,
+/// so a name the repo did not have simply produced no row: `POST` answered
+/// `201` with `labels: ["bug", "typo"]` echoed from the denormalised JSON
+/// column while `issue_labels` held one row. The same name was a `400` on
+/// `GET /issues?labels=typo` — legal on the way in, unknown on the way out.
+///
+/// The junction is what the label filter reads, so this test asks the filter,
+/// not the JSON column: an issue is only labelled if `?labels=…` finds it.
+#[tokio::test]
+async fn writing_an_unknown_label_is_refused_instead_of_dropped() {
+    let (base, token, owner, repo) = setup("9").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/v1/repos/{}/{}/labels", base, owner, repo))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "bug", "color": "#ee0701"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create label 'bug' failed");
+
+    // ── create ────────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{}/api/v1/repos/{}/{}/issues", base, owner, repo))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"title": "half-labelled", "labels": ["bug", "typo"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "creating with an unknown label must be refused, not silently narrowed"
+    );
+    let error: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        error.to_string().contains("typo"),
+        "the refusal must name the label the repo does not have, got: {error}"
+    );
+
+    // Refused before the insert: no issue was left behind.
+    let body: serde_json::Value = client
+        .get(format!("{}/api/v1/repos/{}/{}/issues", base, owner, repo))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        body["data"].as_array().unwrap().is_empty(),
+        "a refused create must not leave an issue behind, got: {body}"
+    );
+
+    // A create whose labels all exist writes both stores.
+    let created: serde_json::Value = client
+        .post(format!("{}/api/v1/repos/{}/{}/issues", base, owner, repo))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"title": "properly labelled", "labels": ["bug"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let number = created["number"].as_i64().unwrap();
+
+    let found: serde_json::Value = client
+        .get(format!(
+            "{}/api/v1/repos/{}/{}/issues?labels=bug",
+            base, owner, repo
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        found["data"].as_array().unwrap().len(),
+        1,
+        "the label the response listed must be the label the filter finds, got: {found}"
+    );
+
+    // ── update ────────────────────────────────────────────────────────────
+    let resp = client
+        .patch(format!(
+            "{}/api/v1/repos/{}/{}/issues/{}",
+            base, owner, repo, number
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"labels": ["bug", "typo"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "updating with an unknown label must be refused too"
+    );
+    let error: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        error.to_string().contains("typo"),
+        "the refusal must name the label, got: {error}"
+    );
+
+    // The refused edit changed nothing: the issue still carries `bug`.
+    let found: serde_json::Value = client
+        .get(format!(
+            "{}/api/v1/repos/{}/{}/issues?labels=bug",
+            base, owner, repo
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        found["data"].as_array().unwrap().len(),
+        1,
+        "a refused update must not drop the labels the issue already had, got: {found}"
+    );
+
+    // And a legal edit reaches the junction, not just the JSON column.
+    let resp = client
+        .patch(format!(
+            "{}/api/v1/repos/{}/{}/issues/{}",
+            base, owner, repo, number
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"labels": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let found: serde_json::Value = client
+        .get(format!(
+            "{}/api/v1/repos/{}/{}/issues?labels=bug",
+            base, owner, repo
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        found["data"].as_array().unwrap().is_empty(),
+        "clearing the labels must clear the junction as well, got: {found}"
+    );
+}
+
 // ── Milestones ────────────────────────────────────────────────────────────────
 
 #[tokio::test]

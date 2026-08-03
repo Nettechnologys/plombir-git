@@ -229,6 +229,46 @@ pub async fn set_issue_labels(
     issue_label_ops::set_labels(db, issue_id, label_ids).await
 }
 
+/// Resolve label names to the ids of this repository's labels.
+///
+/// One helper for every path that turns names into ids — reading and writing
+/// alike. The three copies of `filter(|l| names.contains(&l.name))` that
+/// preceded it disagreed on what an unknown name meant: the filter on the read
+/// path narrowed a search, the two on the write path dropped the label and
+/// still answered `201`/`200` listing it. A name the repository does not have
+/// is refused here, once, with the name in the message.
+///
+/// Repeats collapse: `["bug", "bug"]` is one label, not a condition that can
+/// never match and not a duplicate insert.
+pub async fn resolve_label_ids(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    names: &[String],
+) -> Result<Vec<i64>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A failed read is not "the repository has no such label": answering
+    // `invalid_request` to a dead connection would blame the caller for our
+    // outage, so the query's own error propagates.
+    let all_labels = label_ops::list_by_repo(db, repo_id).await?;
+
+    let mut ids: Vec<i64> = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(label) = all_labels.iter().find(|l| &l.name == name) else {
+            return Err(crate::error::invalid_request(format!(
+                "unknown label: {}",
+                name.chars().take(64).collect::<String>()
+            )));
+        };
+        if !ids.contains(&label.id) {
+            ids.push(label.id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Resolve owner/repo_name to a repository model.
 ///
 /// The two "no such row" outcomes are typed rather than `.context(…)`-tagged:
