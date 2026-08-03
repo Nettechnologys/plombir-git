@@ -35,14 +35,20 @@ pub async fn create_release(
         return Err(crate::error::invalid_request("title cannot be empty"));
     }
 
-    // Check for duplicate tag
+    // The one answer both the pre-read and a losing insert give, so a caller
+    // cannot tell which of the two noticed — and so no constraint text leaks.
+    let already_exists = || {
+        crate::error::invalid_request(format!("release with tag '{tag_name}' already exists"))
+    };
+
+    // Check for duplicate tag. This read is the fast path only — the row can
+    // still appear between here and the insert below, which is why the insert
+    // classifies its own failure rather than trusting this answer.
     if rg_db::ops::release_ops::find_by_repo_and_tag(db, repo_id, tag_name)
         .await?
         .is_some()
     {
-        return Err(crate::error::invalid_request(format!(
-            "release with tag '{tag_name}' already exists"
-        )));
+        return Err(already_exists());
     }
 
     let now = Utc::now();
@@ -60,7 +66,15 @@ pub async fn create_release(
         ..Default::default()
     };
 
-    let release = rg_db::ops::release_ops::create(db, model).await?;
+    // Losing the `idx_releases_repo_tag_unique` race is the same outcome the
+    // read above reports, reached a moment later: someone else published the
+    // tag first. Only that one loss is folded — any other write failure stays
+    // an error.
+    let release = match rg_db::ops::release_ops::create(db, model).await {
+        Ok(release) => release,
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => return Err(already_exists()),
+        Err(error) => return Err(error),
+    };
 
     // Trigger release.created webhook
     let payload = serde_json::json!({

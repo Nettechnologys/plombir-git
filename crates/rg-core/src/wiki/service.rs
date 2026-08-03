@@ -24,15 +24,23 @@ pub async fn create_page(
     message: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<wiki_page::Model> {
-    // Check for duplicate title
+    // The one answer both the pre-read and a losing insert give, so a caller
+    // cannot tell which of the two noticed — and so no constraint text leaks.
+    let already_exists = || {
+        crate::error::invalid_request(format!(
+            "wiki page '{title}' already exists in this repository"
+        ))
+    };
+
+    // Check for duplicate title. This read is the fast path only — the row can
+    // still appear between here and the insert below, which is why the insert
+    // classifies its own failure rather than trusting this answer.
     if wiki_page_ops::find_by_repo_and_title(db, repo_id, title)
         .await
         .context("check existing wiki page")?
         .is_some()
     {
-        return Err(crate::error::invalid_request(format!(
-            "wiki page '{title}' already exists in this repository"
-        )));
+        return Err(already_exists());
     }
 
     let now = Utc::now();
@@ -48,7 +56,14 @@ pub async fn create_page(
         updated_at: sea_orm::Set(now),
     };
 
-    let page = wiki_page_ops::create(db, model).await?;
+    // Losing the `idx_wiki_repo_title` race is the same outcome the read above
+    // reports, reached a moment later: someone else created the page first.
+    // Only that one loss is folded — any other write failure stays an error.
+    let page = match wiki_page_ops::create(db, model).await {
+        Ok(page) => page,
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => return Err(already_exists()),
+        Err(error) => return Err(error),
+    };
 
     // Keep the metadata FTS table in sync (non-fatal). Database triggers also
     // maintain it; the upsert makes the explicit write safe on every backend.

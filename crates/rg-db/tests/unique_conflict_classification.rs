@@ -260,6 +260,93 @@ async fn a_duplicate_mirror_for_one_repository_is_classifiable() {
     assert_conflict_is_classifiable(&error, "mirror");
 }
 
+/// card_8e6bac4c98db: the same read-then-insert shape as the mirror, for wiki
+/// pages, releases and repository names. Each service answers the loser of its
+/// race with the caller's own conflict, and can only do so while the violation
+/// is still recognisable through the `db: ...` context its op attaches.
+#[tokio::test]
+async fn a_duplicate_wiki_page_title_in_one_repository_is_classifiable() {
+    let (db, _temp) = setup("wiki").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let page = || rg_db::entities::wiki_page::ActiveModel {
+        id: NotSet,
+        repo_id: Set(repo_id),
+        title: Set("Home".to_string()),
+        content: Set("first".to_string()),
+        message: Set(None),
+        author_id: Set(Some(user_id)),
+        sha: Set(None),
+        created_at: Set(chrono::Utc::now()),
+        updated_at: Set(chrono::Utc::now()),
+    };
+
+    rg_db::ops::wiki_page_ops::create(&db, page())
+        .await
+        .expect("the first page is created");
+    let error = rg_db::ops::wiki_page_ops::create(&db, page())
+        .await
+        .expect_err("(repo_id, title) is UNIQUE");
+    assert_conflict_is_classifiable(&error, "wiki page");
+}
+
+#[tokio::test]
+async fn a_duplicate_release_tag_in_one_repository_is_classifiable() {
+    let (db, _temp) = setup("releases").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let release = || rg_db::entities::release::ActiveModel {
+        repo_id: Set(repo_id),
+        author_id: Set(user_id),
+        tag_name: Set("v1.0.0".to_string()),
+        title: Set("First".to_string()),
+        body: Set(None),
+        target_commitish: Set("main".to_string()),
+        is_draft: Set(false),
+        is_prerelease: Set(false),
+        created_at: Set(chrono::Utc::now()),
+        updated_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+
+    rg_db::ops::release_ops::create(&db, release())
+        .await
+        .expect("the first release is published");
+    let error = rg_db::ops::release_ops::create(&db, release())
+        .await
+        .expect_err("(repo_id, tag_name) is UNIQUE");
+    assert_conflict_is_classifiable(&error, "release tag");
+}
+
+#[tokio::test]
+async fn a_repository_name_taken_in_the_same_namespace_is_classifiable() {
+    let (db, _temp) = setup("repositories").await;
+    let (user_id, _repo_id) = fixture(&db).await;
+
+    // `fixture` already created `forge` in this account's personal namespace.
+    let duplicate = repository::ActiveModel {
+        id: NotSet,
+        owner_id: Set(user_id),
+        name: Set("forge".to_string()),
+        description: Set(None),
+        is_private: Set(false),
+        default_branch: Set("main".to_string()),
+        fork_id: Set(None),
+        stars_count: Set(0),
+        forks_count: Set(0),
+        org_id: Set(None),
+        created_at: Set(chrono::Utc::now()),
+        updated_at: Set(chrono::Utc::now()),
+        deleted_at: Set(None),
+        origin_repo_id: Set(None),
+    };
+
+    let error = rg_db::ops::repo_ops::create(&db, duplicate)
+        .await
+        .expect_err("(namespace_key, name) is UNIQUE");
+    assert_conflict_is_classifiable(&error, "repository name");
+}
+
 #[tokio::test]
 async fn a_duplicate_reviewer_request_is_classifiable() {
     let (db, _temp) = setup("reviewers").await;

@@ -674,11 +674,21 @@ pub async fn create_repo_with_opts(
     // Same rollback as the auto-init branch above, for the same reason: the
     // bare repository is on disk and this row is what was supposed to point at
     // it. Leaving it makes the name permanently un-creatable.
+    //
+    // Losing the namespace-unique race is the same outcome `ensure_repo_name_free`
+    // reports, reached a moment later: someone else claimed the name first. It
+    // is answered in that check's words rather than as a server fault. Only
+    // that one loss is folded; every other write failure stays an error, and
+    // the directory is discarded either way.
     let repo = match repo_ops::create(db, model).await {
         Ok(repo) => repo,
         Err(error) => {
             discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
-            return Err(error);
+            return Err(if rg_db::is_unique_violation_anyhow(&error) {
+                crate::error::invalid_request(format!("repository '{name}' already exists"))
+            } else {
+                error
+            });
         }
     };
 
@@ -1570,11 +1580,22 @@ pub async fn fork_repo(
     // database check (still no row) and dies in `git clone` on "destination
     // path already exists" — for good, since nothing ever removes that
     // directory.
+    //
+    // And losing the namespace-unique race is the same outcome the free-name
+    // check above reports, reached a moment later — answered in its words, not
+    // as a server fault. Every other write failure stays an error; the clone is
+    // discarded either way.
     let forked = match repo_ops::create(db, model).await {
         Ok(forked) => forked,
         Err(error) => {
             discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
-            return Err(error);
+            return Err(if rg_db::is_unique_violation_anyhow(&error) {
+                crate::error::invalid_request(format!(
+                    "repository '{repo_name}' already exists in your account"
+                ))
+            } else {
+                error
+            });
         }
     };
 
@@ -1679,7 +1700,17 @@ pub async fn transfer_repo(
                  by hand"
             );
         }
-        return Err(error);
+        // Same race as the create paths, one statement later: the free-name
+        // check above passed, and someone else claimed the destination name
+        // before this update landed. That is the caller's answer in the words
+        // that check uses, not a server fault. Any other failure stays an error.
+        return Err(if rg_db::is_unique_violation_anyhow(&error) {
+            crate::error::invalid_request(format!(
+                "repository '{repo_name}' already exists at destination"
+            ))
+        } else {
+            error
+        });
     }
     // Ownership (and thus who can read/write) changed — drop cached decisions.
     invalidate_perm_cache_repo(db, repo.id);
