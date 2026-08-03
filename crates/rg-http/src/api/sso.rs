@@ -239,10 +239,31 @@ fn provider_config(
         })?
         .unwrap_or_default();
 
+    // The row is not supposed to get here without a client id — the admin API
+    // refuses to store an enabled provider without one. A row that predates
+    // that check, or one written around it, used to become `client_id=""` and
+    // go out to the IdP anyway: the IdP said no, and our missing field was
+    // reported to the operator as the provider's refusal. It is ours, so it is
+    // a 500 that names the field and never leaves the process.
+    let client_id = provider
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|client_id| !client_id.is_empty())
+        .ok_or_else(|| {
+            tracing::error!(
+                provider_id = provider.id,
+                provider_slug = %provider.slug,
+                "SSO provider has no client_id; refusing to build an authorization request"
+            );
+            AppError::internal("SSO provider is missing its client ID")
+        })?
+        .to_string();
+
     Ok(rg_core::auth::sso::SsoProviderConfig {
         slug: provider.slug.clone(),
         provider_type: provider.provider_type.clone(),
-        client_id: provider.client_id.clone().unwrap_or_default(),
+        client_id,
         client_secret,
         redirect_url,
         scopes: provider

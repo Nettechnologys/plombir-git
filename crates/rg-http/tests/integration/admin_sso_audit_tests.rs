@@ -90,7 +90,10 @@ async fn admin_sso_create_get_update_delete() {
         .json(&serde_json::json!({
             "name": "Gitea Login",
             "slug": "gitea-login-1",
-            "provider_type": "oauth2",
+            // `oidc`, not `oauth2`: plain OAuth2 has no discovery step, so a
+            // slug outside the built-in endpoint table could never authorize
+            // anybody — which the admin API now refuses instead of storing.
+            "provider_type": "oidc",
             "enabled": true,
             "client_id": "client-id",
             "client_secret": "secret",
@@ -148,7 +151,7 @@ async fn admin_sso_create_get_update_delete() {
         .json(&serde_json::json!({
             "name": "Gitea Login Updated",
             "slug": "gitea-login-1",
-            "provider_type": "oauth2",
+            "provider_type": "oidc",
             "enabled": false,
         }))
         .send()
@@ -344,6 +347,230 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         .await
         .unwrap();
     assert_eq!(delete_linked.status(), 400);
+}
+
+/// card_d77d2b7e02e6: the completeness question used to be asked of LDAP only.
+///
+/// An enabled `oauth2` provider with no `client_id` was a `201`, showed up on
+/// the login page, and sent the first login off with `client_id=""` — so our
+/// unfinished configuration arrived as the IdP's refusal.
+///
+/// The instance ships `github` / `gitlab` / `google` seeded and disabled, with
+/// no `client_id` — so the shortest path to the bug is the one an operator
+/// takes on day one: press "Enable" on the GitHub provider and get a `200`
+/// back. That is what the first half of this test presses. The counter-example
+/// in each pair matters as much as the refusal: a *draft* must stay saveable,
+/// or the form becomes impossible to fill in one field at a time.
+#[tokio::test]
+async fn enabled_oauth2_provider_requires_a_client_id_and_reachable_endpoints() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (admin_token, admin_id) =
+        register_full(&base, "oauth_admin", "oauth_admin@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("registered user must exist");
+
+    let seeded = rg_db::ops::sso_provider_ops::find_by_slug(&db, "github")
+        .await
+        .unwrap()
+        .expect("the instance ships a disabled GitHub provider");
+    assert!(
+        seeded.client_id.is_none() && !seeded.enabled,
+        "the fixture this test needs is the shipped row: disabled, no client id"
+    );
+
+    let create = |payload: serde_json::Value| {
+        client
+            .post(format!("{}/api/v1/admin/sso/providers", base))
+            .bearer_auth(&admin_token)
+            .json(&payload)
+            .send()
+    };
+    let patch_github = |payload: serde_json::Value| {
+        client
+            .patch(format!(
+                "{}/api/v1/admin/sso/providers/{}",
+                base, seeded.id
+            ))
+            .bearer_auth(&admin_token)
+            .json(&payload)
+            .send()
+    };
+
+    // Switching the shipped provider on, exactly as the admin UI's "Enable"
+    // button does — with nothing to identify us to GitHub.
+    let enabled_as_shipped = patch_github(serde_json::json!({
+        "name": "GitHub",
+        "slug": "github",
+        "provider_type": "oauth2",
+        "enabled": true
+    }))
+    .await
+    .unwrap();
+    assert_eq!(enabled_as_shipped.status(), 400);
+    let message = enabled_as_shipped.text().await.unwrap();
+    assert!(
+        message.contains("client ID"),
+        "the refusal must name the field that is missing, got {message}"
+    );
+
+    // A blank string is the same emptiness with a value in it.
+    let blank_client_id = patch_github(serde_json::json!({
+        "name": "GitHub",
+        "slug": "github",
+        "provider_type": "oauth2",
+        "enabled": true,
+        "client_id": "   "
+    }))
+    .await
+    .unwrap();
+    assert_eq!(blank_client_id.status(), 400);
+
+    // A refused write leaves the row alone — including the flag it was asked
+    // to flip.
+    let untouched = rg_db::ops::sso_provider_ops::find_by_id(&db, seeded.id)
+        .await
+        .unwrap()
+        .expect("the refused update must not have removed the provider");
+    assert!(!untouched.enabled, "a refused enable must not have enabled it");
+    assert!(untouched.client_id.is_none());
+
+    // The same body switched off is a draft, and drafts are the normal way to
+    // fill this form in one field at a time.
+    let draft = patch_github(serde_json::json!({
+        "name": "GitHub",
+        "slug": "github",
+        "provider_type": "oauth2",
+        "enabled": false,
+        "scopes": "read:user user:email"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(draft.status(), 200);
+
+    // Complete, and on a slug the built-in endpoint table knows: accepted with
+    // no discovery URL at all.
+    let complete = patch_github(serde_json::json!({
+        "name": "GitHub",
+        "slug": "github",
+        "provider_type": "oauth2",
+        "enabled": true,
+        "client_id": "client-id",
+        "scopes": "read:user user:email"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(complete.status(), 200);
+
+    // Enabled OIDC without a discovery URL and on a slug the built-in table
+    // does not know: `resolve_oidc_endpoints` would bail at the first login.
+    let oidc_without_discovery = create(serde_json::json!({
+        "name": "Keycloak",
+        "slug": "keycloak",
+        "provider_type": "oidc",
+        "enabled": true,
+        "client_id": "client-id"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(oidc_without_discovery.status(), 400);
+
+    // Same provider, discovery URL supplied — accepted.
+    let oidc_with_discovery = create(serde_json::json!({
+        "name": "Keycloak",
+        "slug": "keycloak",
+        "provider_type": "oidc",
+        "enabled": true,
+        "client_id": "client-id",
+        "discovery_url": "https://idp.example.com/.well-known/openid-configuration"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(oidc_with_discovery.status(), 201);
+
+    // Plain OAuth2 has no discovery step, so an unknown slug has no
+    // authorization endpoint at all — `oauth2_authorize_url` gives up on it,
+    // and the discovery URL supplied here is never read.
+    let oauth2_unknown_slug = create(serde_json::json!({
+        "name": "Gitea",
+        "slug": "gitea",
+        "provider_type": "oauth2",
+        "enabled": true,
+        "client_id": "client-id",
+        "discovery_url": "https://gitea.example.com/.well-known/openid-configuration"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(oauth2_unknown_slug.status(), 400);
+
+    // A typo in the type used to be stored verbatim and then behave like
+    // `oauth2` — including the LDAP checks never running against it.
+    let unknown_type = create(serde_json::json!({
+        "name": "Directory",
+        "slug": "ldpa",
+        "provider_type": "ldpa",
+        "enabled": true,
+        "client_id": "client-id"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(unknown_type.status(), 400);
+}
+
+/// The other half of card_d77d2b7e02e6: a row that got past the admin API —
+/// enabled before the check existed, or written straight into the database —
+/// must fail on our side rather than at the IdP.
+///
+/// The redirect is the request: a `302` to the provider's authorize endpoint
+/// carrying `client_id=` is exactly the outcome where the operator reads our
+/// empty field as the provider's refusal.
+#[tokio::test]
+async fn a_provider_stored_without_a_client_id_fails_before_reaching_the_idp() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = rg_db::ops::sso_provider_ops::find_by_slug(&db, "github")
+        .await
+        .unwrap()
+        .expect("the instance ships a disabled GitHub provider");
+    rg_db::ops::sso_provider_ops::upsert(
+        &db,
+        Some(seeded.id),
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: &seeded.name,
+            slug: &seeded.slug,
+            provider_type: &seeded.provider_type,
+            client_id: None,
+            scopes: seeded.scopes.as_deref(),
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("enable the provider behind the admin API's back");
+
+    // No redirect following: a regression must show up as the 302 it is, not
+    // as a request that leaves this machine for github.com.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .get(format!("{}/api/v1/auth/sso/github", base))
+        .send()
+        .await
+        .expect("authorize request");
+
+    assert_eq!(
+        response.status(),
+        500,
+        "a provider we cannot identify ourselves with is our failure, not the IdP's"
+    );
+    let location = response.headers().get(reqwest::header::LOCATION);
+    assert!(
+        location.is_none(),
+        "the login must not be sent to the provider with an empty client_id, got {location:?}"
+    );
 }
 
 #[tokio::test]

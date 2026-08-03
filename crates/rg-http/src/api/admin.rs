@@ -548,13 +548,82 @@ pub struct UpsertSsoProviderRequest {
     pub icon_url: Option<String>,
 }
 
+/// Refuse a provider the login page would offer and no one could log in through.
+///
+/// The completeness question used to be asked for LDAP only: the validator's
+/// first line was `if body.provider_type != "ldap" { return Ok(()) }`, so the
+/// OAuth2/OIDC half of the very same form could be saved *enabled* with no
+/// `client_id` at all. The API answered `201`, the provider appeared on the
+/// login page, and the first login went out with `client_id=""` — leaving the
+/// operator reading the IdP's refusal as the IdP's fault, with nothing in our
+/// own log to say a field was empty.
+///
+/// Both families answer here now, and an unknown `provider_type` is a bad
+/// request rather than a row that silently behaves like `oauth2`.
+///
+/// `provider_type` is the *effective* type (the handlers default an empty one
+/// to `oauth2`), not `body.provider_type`.
+fn validate_sso_provider_request(
+    body: &UpsertSsoProviderRequest,
+    provider_type: &str,
+    has_stored_ldap_password: bool,
+) -> Result<(), String> {
+    match provider_type {
+        "ldap" => validate_ldap_provider_request(body, has_stored_ldap_password),
+        "oauth2" | "oidc" => validate_oauth2_provider_request(body, provider_type),
+        other => Err(format!(
+            "unknown SSO provider type '{other}': expected one of oauth2, oidc, ldap"
+        )),
+    }
+}
+
+/// The OAuth2/OIDC half of [`validate_sso_provider_request`].
+///
+/// A disabled provider is a draft an operator is still filling in, exactly as
+/// on the LDAP side — the completeness questions start once it is switched on.
+///
+/// The client *secret* is deliberately not required: a public PKCE client
+/// legitimately has none, and `provider_config` already treats a stored secret
+/// that will not decrypt as our 500. A missing `client_id` has no such
+/// legitimate reading.
+fn validate_oauth2_provider_request(
+    body: &UpsertSsoProviderRequest,
+    provider_type: &str,
+) -> Result<(), String> {
+    if !body.enabled {
+        return Ok(());
+    }
+    if body
+        .client_id
+        .as_deref()
+        .is_none_or(|client_id| client_id.trim().is_empty())
+    {
+        return Err("client ID is required when the provider is enabled".into());
+    }
+    if !rg_core::auth::sso::has_resolvable_endpoints(
+        provider_type,
+        &body.slug,
+        body.discovery_url.as_deref(),
+    ) {
+        return Err(if provider_type == "oidc" {
+            format!(
+                "OIDC provider '{}' has no built-in endpoints: a discovery URL is required when the provider is enabled",
+                body.slug
+            )
+        } else {
+            format!(
+                "no built-in OAuth2 endpoints for slug '{}': use provider type 'oidc' with a discovery URL",
+                body.slug
+            )
+        });
+    }
+    Ok(())
+}
+
 fn validate_ldap_provider_request(
     body: &UpsertSsoProviderRequest,
     has_stored_password: bool,
 ) -> Result<(), String> {
-    if body.provider_type != "ldap" {
-        return Ok(());
-    }
     if body
         .ldap_port
         .is_some_and(|port| !(1..=65_535).contains(&port))
@@ -613,7 +682,7 @@ pub async fn create_sso_provider(
     } else {
         &body.provider_type
     };
-    if let Err(error) = validate_ldap_provider_request(&body, false) {
+    if let Err(error) = validate_sso_provider_request(&body, pt, false) {
         return AppError::bad_request(error).into_response();
     }
     let allowed_email_domains = match body
@@ -743,9 +812,11 @@ pub async fn update_sso_provider(
         Ok(None) => return AppError::not_found("SSO provider not found").into_response(),
         Err(e) => return AppError::from(e).into_response(),
     };
-    if let Err(error) =
-        validate_ldap_provider_request(&body, existing_provider.ldap_bind_password_enc.is_some())
-    {
+    if let Err(error) = validate_sso_provider_request(
+        &body,
+        pt,
+        existing_provider.ldap_bind_password_enc.is_some(),
+    ) {
         return AppError::bad_request(error).into_response();
     }
     let existing_auto_provision = existing_provider.auto_provision;

@@ -794,19 +794,55 @@ fn url_encode(s: &str) -> String {
 
 impl SsoProviderConfig {
     fn default_oauth2_auth_url(&self) -> Option<String> {
-        match self.slug.as_str() {
-            "github" => Some("https://github.com/login/oauth/authorize".into()),
-            "gitlab" => Some("https://gitlab.com/oauth/authorize".into()),
-            _ => None,
-        }
+        builtin_oauth2_auth_url(&self.slug)
     }
 
     fn default_oauth2_token_url(&self) -> Option<String> {
-        match self.slug.as_str() {
-            "github" => Some("https://github.com/login/oauth/access_token".into()),
-            "gitlab" => Some("https://gitlab.com/oauth/token".into()),
-            _ => None,
+        builtin_oauth2_token_url(&self.slug)
+    }
+}
+
+fn builtin_oauth2_auth_url(slug: &str) -> Option<String> {
+    match slug {
+        "github" => Some("https://github.com/login/oauth/authorize".into()),
+        "gitlab" => Some("https://gitlab.com/oauth/authorize".into()),
+        _ => None,
+    }
+}
+
+fn builtin_oauth2_token_url(slug: &str) -> Option<String> {
+    match slug {
+        "github" => Some("https://github.com/login/oauth/access_token".into()),
+        "gitlab" => Some("https://gitlab.com/oauth/token".into()),
+        _ => None,
+    }
+}
+
+/// Can a login through this provider build an authorization request at all?
+///
+/// The admin API asks this before storing an **enabled** OAuth2/OIDC provider,
+/// so a configuration that can never reach an IdP is a `400` while the operator
+/// is still looking at the form — instead of a login that dies inside
+/// [`oauth2_authorize_url`] weeks later and reads as the IdP's fault.
+///
+/// It lives here, next to the endpoint tables it consults, rather than as a
+/// second slug list in the HTTP layer: an answer given far from the table it
+/// describes is an answer that drifts away from what the login path does.
+pub fn has_resolvable_endpoints(
+    provider_type: &str,
+    slug: &str,
+    discovery_url: Option<&str>,
+) -> bool {
+    match provider_type {
+        // Mirrors `resolve_oidc_endpoints`: the discovery document first, and
+        // the built-in table only for the slugs that have one.
+        "oidc" => {
+            discovery_url.is_some_and(|url| !url.trim().is_empty())
+                || default_oidc_auth_url(slug).is_some()
         }
+        // Plain OAuth2 has no discovery step — `oauth2_authorize_url` takes the
+        // endpoint from the built-in table or gives up.
+        _ => builtin_oauth2_auth_url(slug).is_some(),
     }
 }
 
