@@ -173,15 +173,13 @@ const NON_REPO: &[(&str, &[&str])] = &[
 /// list cannot rot into a blanket allowance for a handler somebody later
 /// weakened for an entirely different reason.
 ///
-/// All five are one pattern, and it is worth naming because it is the only
-/// legitimate way past this guard. The row declares what an *arbitrary* caller
-/// needs — that is what a contract states, and what the persona sweep measures a
-/// stranger against. The handler takes `RepoAuthRead`, the floor for everybody,
-/// and then widens for one specific person by asking `repo_access::may_write`:
-/// the same gate module, as a *question* on top of a gate already passed, not a
-/// second copy of the rule. What separates this from the defect is that the
-/// widening is a property of the row being acted on — its author — and not of
-/// the caller's repository permission, so no weaker caller gets in.
+/// All eight name a row-specific exception to the ordinary `RepoWrite`
+/// contract. The row declares what an *arbitrary* caller needs — that is what a
+/// contract states, and what the persona sweep measures a stranger against.
+/// The handler takes `RepoAuthRead`, the floor for everybody, then resolves the
+/// remaining rule through `repo_access`: an author widening or write access to
+/// the PR source repository. The decision remains in the gate module, not in a
+/// second copy of the rule, and no weaker caller gets in.
 const SIGNED_OFF: &[(&str, &str, Rank, &str)] = &[
     (
         "api::issues::update_issue",
@@ -215,6 +213,26 @@ const SIGNED_OFF: &[(&str, &str, Rank, &str)] = &[
         "RepoWrite",
         Rank::AuthRead,
         "same widening as `delete_issue_attachment` — the four share `attachments::delete`",
+    ),
+    (
+        "api::pulls::update_pr",
+        "RepoWrite",
+        Rank::AuthRead,
+        "the PR author may edit their own PR; anybody else is held to `may_write`",
+    ),
+    (
+        "api::reviews::remove_requested_reviewer",
+        "RepoWrite",
+        Rank::AuthRead,
+        "the PR author may manage its reviewers; anybody else is held to `may_write` by \
+         `require_pr_manager`",
+    ),
+    (
+        "api::reviews::apply_review_suggestion",
+        "RepoWrite",
+        Rank::AuthRead,
+        "applying a suggestion mutates the PR head, so `require_suggestion_source` holds the \
+         caller to write access on that source repository",
     ),
 ];
 

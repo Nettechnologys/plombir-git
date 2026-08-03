@@ -1142,7 +1142,7 @@ pub(crate) fn build_all_routes(
             api::pulls::get_pr,
         )
         .patch(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}",
             api::pulls::update_pr,
         )
@@ -1265,7 +1265,7 @@ pub(crate) fn build_all_routes(
             api::reviews::set_thread_resolution,
         )
         .post(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/comments/{id}/suggestion/apply",
             api::reviews::apply_review_suggestion,
         )
@@ -1285,7 +1285,7 @@ pub(crate) fn build_all_routes(
             api::reviews::request_reviewer,
         )
         .delete(
-            RepoAuthRead,
+            RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/reviewers/{username}",
             api::reviews::remove_requested_reviewer,
         )

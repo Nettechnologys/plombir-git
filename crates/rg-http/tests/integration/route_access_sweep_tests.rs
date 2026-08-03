@@ -752,26 +752,7 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
 /// An entry is `(persona scope METHOD /path, why)`. The test fails if a route
 /// not in this list misbehaves — and it *also* fails if a route in this list
 /// starts behaving, so the list cannot quietly rot into a blanket allowance.
-const KNOWN_GAPS: &[(&str, &str)] = &[
-    (
-        "outsider public-repo PATCH /api/v1/repos/{owner}/{name}/pulls/{number}",
-        "declared RepoAuthRead, enforces \"the PR author or a repository writer\" by hand inside \
-         the handler body. The behaviour is right and the declaration is not — a write route \
-         under a read level, whose real gate neither this sweep nor `route_gate_rank_guard` can \
-         read. card_313a45749bb5",
-    ),
-    (
-        "outsider public-repo DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers/{username}",
-        "same as PATCH .../pulls/{number}: \"only the PR author or a repository writer may manage \
-         reviewers\", decided in the body under a declared RepoAuthRead. card_313a45749bb5",
-    ),
-    (
-        "outsider public-repo POST /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/suggestion/apply",
-        "same class, one rung further: \"write access to the PR source repository is required\" — \
-         a level about a *different* repository than the one in the path, and the table says \
-         RepoAuthRead. card_313a45749bb5",
-    ),
-];
+const KNOWN_GAPS: &[(&str, &str)] = &[];
 
 // ── Personas ───────────────────────────────────────────────────────────────
 
