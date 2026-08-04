@@ -5,16 +5,37 @@
 //! - CRUD for webhook registrations
 //! - Event dispatch (find matching webhooks and fire HTTP POST)
 //! - Delivery recording (status, response, timing)
+//!
+//! # The signing secret
+//!
+//! `webhooks.secret_encrypted` holds the key every delivery's
+//! `X-Hub-Signature-256` is computed with. The server has to read it back on
+//! every dispatch, so it cannot be a digest the way a runner token is — it is
+//! AES-256-GCM ciphertext under the instance's at-rest key, like
+//! `ci_secrets.encrypted_value` and `mirrors.password_encrypted`, and it is
+//! registered in [`crate::auth::encrypted_columns`] so the startup preflight
+//! and `forgekeep rotate-encryption-key` cover it without being told twice.
+//!
+//! Writing it takes the key as a parameter ([`create_webhook`],
+//! [`update_webhook`] — both are called straight from a handler that has it).
+//! Reading it back cannot: delivery is detached into a background task from
+//! every corner of the codebase that raises a repository event, so the
+//! dispatcher takes the key from [`crate::auth::at_rest_key`], which the server
+//! publishes at startup.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use sea_orm::DatabaseConnection;
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use rg_db::entities::webhook;
 use rg_db::entities::webhook_delivery;
 use rg_db::ops::webhook_ops;
+
+use crate::auth::{at_rest_key, encryption};
 
 // ── API types ─────────────────────────────────────────────────────────────
 
@@ -36,6 +57,118 @@ pub struct UpdateWebhookRequest {
     pub events: Option<Vec<String>>,
 }
 
+// ── The secret at rest ────────────────────────────────────────────────────
+
+/// Seal an operator-supplied signing secret for storage.
+///
+/// An absent or empty secret is stored as `NULL` rather than as the ciphertext
+/// of `""`: "no secret configured" is what both the API (`has_secret`) and the
+/// dispatcher read out of the column, and encrypting emptiness would make the
+/// row claim a secret that signs nothing.
+fn seal_secret(secret: Option<&str>, encryption_key: &str) -> Result<Option<String>> {
+    let Some(secret) = secret.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let key = encryption::derive_key(encryption_key);
+    encryption::encrypt(secret, &key)
+        .map(Some)
+        .context("encrypt the webhook signing secret")
+}
+
+/// Open the stored secret for a delivery about to be signed.
+///
+/// Three cases, classified the way [`crate::auth::rekey`] classifies every
+/// other at-rest column:
+/// * no secret — the delivery goes out unsigned, which is what it always did;
+/// * a value that is structurally not our ciphertext — a row written before
+///   this column was encrypted, used as the plaintext it is (the startup pass
+///   [`seal_legacy_secrets`] normally seals these before any dispatch runs);
+/// * our ciphertext — opened with the published at-rest key.
+///
+/// The last case is the only one that can fail, and it fails *loudly*: an
+/// unopenable secret returns an error, which the caller records as a delivery
+/// error. Signing with the ciphertext, or dropping the signature and posting
+/// anyway, would both hand the receiver a request it cannot tell from a forgery
+/// — the one failure mode a webhook must not have.
+fn secret_for_delivery(
+    stored: Option<&str>,
+    encryption_key: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(stored) = stored.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !encryption::looks_like_ciphertext(stored) {
+        tracing::warn!(
+            "webhook signing secret is still stored in the clear; it will be sealed on the \
+             next start"
+        );
+        return Ok(Some(stored.to_string()));
+    }
+    let encryption_key = encryption_key.ok_or_else(|| {
+        anyhow!(
+            "no at-rest encryption key was published to this process, so the webhook signing \
+             secret cannot be opened"
+        )
+    })?;
+    let key = encryption::derive_key(encryption_key);
+    encryption::decrypt(stored, &key).map(Some).context(
+        "open the webhook signing secret — the at-rest encryption key does not match the \
+         stored value",
+    )
+}
+
+/// Seal every webhook secret still stored in the clear.
+///
+/// The rename to `secret_encrypted` is a schema change and happens in the
+/// migration runner, which has no access to the at-rest key; this is the other
+/// half, run by `forgekeep serve` right after the key preflight — the first
+/// point in the boot where the migrated schema and the key both exist. Returns
+/// how many rows it sealed.
+///
+/// Idempotent: a value that already is our ciphertext is left alone, so a
+/// restart costs one query and rewrites nothing.
+pub async fn seal_legacy_secrets(db: &DatabaseConnection, encryption_key: &str) -> Result<usize> {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    let mut pages = webhook::Entity::find()
+        .filter(webhook::Column::SecretEncrypted.is_not_null())
+        .order_by_asc(webhook::Column::Id)
+        .paginate(db, 500);
+
+    let key = encryption::derive_key(encryption_key);
+    let mut sealed = 0_usize;
+
+    while let Some(hooks) = pages
+        .fetch_and_next()
+        .await
+        .context("read webhook signing secrets")?
+    {
+        for hook in hooks {
+            let Some(stored) = hook.secret_encrypted.as_deref() else {
+                continue;
+            };
+            if stored.is_empty() || encryption::looks_like_ciphertext(stored) {
+                continue;
+            }
+            let ciphertext = encryption::encrypt(stored, &key)
+                .context("encrypt a legacy webhook signing secret")?;
+            let id = hook.id;
+            let mut model: webhook::ActiveModel = hook.into();
+            model.secret_encrypted = Set(Some(ciphertext));
+            model
+                .update(db)
+                .await
+                .with_context(|| format!("seal the signing secret of webhook {id}"))?;
+            sealed += 1;
+        }
+    }
+
+    if sealed > 0 {
+        tracing::info!(count = sealed, "sealed webhook signing secrets at rest");
+    }
+    Ok(sealed)
+}
+
 // ── CRUD ──────────────────────────────────────────────────────────────────
 
 /// Register a new webhook for a repository.
@@ -43,6 +176,7 @@ pub async fn create_webhook(
     db: &DatabaseConnection,
     repo_id: i64,
     req: &CreateWebhookRequest,
+    encryption_key: &str,
 ) -> Result<webhook::Model> {
     // Reject obviously-internal targets (bad scheme / private IP literal) at
     // registration for immediate feedback; delivery re-checks with DNS.
@@ -58,7 +192,7 @@ pub async fn create_webhook(
                 .clone()
                 .unwrap_or_else(|| "json".to_string()),
         ),
-        secret: sea_orm::Set(req.secret.clone()),
+        secret_encrypted: sea_orm::Set(seal_secret(req.secret.as_deref(), encryption_key)?),
         active: sea_orm::Set(req.active.unwrap_or(true)),
         events: sea_orm::Set(events_str),
         created_at: sea_orm::Set(now),
@@ -78,14 +212,23 @@ pub async fn get_webhook(db: &DatabaseConnection, id: i64) -> Result<Option<webh
 }
 
 /// Update a webhook.
+///
+/// The secret follows the same write-only rule the API does: `None` keeps the
+/// stored ciphertext (the caller cannot read it back to resend it), a value
+/// replaces it, and an empty string clears it.
 pub async fn update_webhook(
     db: &DatabaseConnection,
     existing: &webhook::Model,
     req: &UpdateWebhookRequest,
+    encryption_key: &str,
 ) -> Result<webhook::Model> {
     if let Some(url) = req.url.as_deref() {
         crate::net::check_url_static(url).context("invalid webhook URL")?;
     }
+    let secret_encrypted = match req.secret.as_deref() {
+        Some(secret) => seal_secret(Some(secret), encryption_key)?,
+        None => existing.secret_encrypted.clone(),
+    };
     let model = webhook::ActiveModel {
         id: sea_orm::Set(existing.id),
         repo_id: sea_orm::Set(existing.repo_id),
@@ -95,7 +238,7 @@ pub async fn update_webhook(
                 .clone()
                 .unwrap_or_else(|| existing.content_type.clone()),
         ),
-        secret: sea_orm::Set(req.secret.clone().or_else(|| existing.secret.clone())),
+        secret_encrypted: sea_orm::Set(secret_encrypted),
         active: sea_orm::Set(req.active.unwrap_or(existing.active)),
         events: sea_orm::Set(
             req.events
@@ -154,14 +297,18 @@ pub(crate) async fn trigger_event_with_tracker(
         let payload_str = serde_json::to_string(payload).unwrap_or_default();
         let url = hook.url.clone();
         let content_type = hook.content_type.clone();
-        let secret = hook.secret.clone();
+        // Still sealed here. It is opened inside `deliver`, so a secret this
+        // instance cannot read surfaces as a recorded delivery error on the
+        // hook's own delivery list instead of a hook that quietly stops firing.
+        let secret_encrypted = hook.secret_encrypted.clone();
 
         delivery_tracker.spawn(async move {
             let delivery_id = uuid::Uuid::new_v4().to_string();
             let start = std::time::Instant::now();
 
             let (status, response_body) =
-                match deliver(&url, &content_type, &secret, &payload_str).await {
+                match deliver(&url, &content_type, secret_encrypted.as_deref(), &payload_str).await
+                {
                     Ok(resp_status) => (Some(resp_status), None::<String>),
                     Err(e) => {
                         tracing::warn!(webhook_id = hook_id, error = %format!("{e:#}"), "webhook delivery failed");
@@ -199,12 +346,18 @@ pub(crate) async fn trigger_event_with_tracker(
 }
 
 /// Deliver a webhook payload via HTTP POST.
+///
+/// `secret_encrypted` is the column as stored. Opening it is the first thing
+/// that happens: a hook whose signature cannot be computed must not be posted
+/// unsigned, so the failure has to land before the request is built.
 async fn deliver(
     url: &str,
     content_type: &str,
-    secret: &Option<String>,
+    secret_encrypted: Option<&str>,
     payload: &str,
 ) -> Result<i32> {
+    let secret = secret_for_delivery(secret_encrypted, at_rest_key::resolve())?;
+
     // SSRF guard: reject non-http(s) schemes and any target that resolves to a
     // private / loopback / link-local address (e.g. cloud metadata). A blocked
     // delivery surfaces as a recorded delivery error — it is never sent.
@@ -228,7 +381,7 @@ async fn deliver(
     }
 
     // Sign with HMAC-SHA256 if secret is configured
-    if let Some(secret) = secret {
+    if let Some(secret) = secret.as_deref() {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
@@ -447,4 +600,64 @@ pub async fn trigger_milestone_closed(
         "milestone": milestone,
     });
     trigger_event(db, repo_id, "milestone.closed", &payload).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "the-instance-at-rest-key";
+    const SECRET: &str = "s3cr3t-the-receiver-also-knows";
+
+    /// The defect itself: what goes into the column must not be what the
+    /// operator typed, and what comes back out must be exactly that.
+    #[test]
+    fn a_secret_is_sealed_on_the_way_in_and_opened_on_the_way_out() {
+        let stored = seal_secret(Some(SECRET), KEY)
+            .expect("seal")
+            .expect("a secret was supplied");
+
+        assert_ne!(stored, SECRET, "the operator's secret is in the column");
+        assert!(encryption::looks_like_ciphertext(&stored));
+
+        let opened = secret_for_delivery(Some(&stored), Some(KEY)).expect("open");
+        assert_eq!(opened.as_deref(), Some(SECRET));
+    }
+
+    /// Encrypting emptiness would leave a row claiming a secret that signs
+    /// nothing — `has_secret` and the dispatcher both read the column as
+    /// "configured or not".
+    #[test]
+    fn an_absent_or_empty_secret_stays_null() {
+        assert_eq!(seal_secret(None, KEY).expect("seal"), None);
+        assert_eq!(seal_secret(Some(""), KEY).expect("seal"), None);
+        assert_eq!(secret_for_delivery(None, Some(KEY)).expect("open"), None);
+        assert_eq!(
+            secret_for_delivery(Some(""), Some(KEY)).expect("open"),
+            None
+        );
+    }
+
+    /// A row written before the column was encrypted keeps signing until the
+    /// startup pass seals it. Reading it as "ciphertext that failed to open"
+    /// would take every one of those hooks off the air on upgrade.
+    #[test]
+    fn a_legacy_plaintext_secret_still_signs() {
+        let opened = secret_for_delivery(Some(SECRET), Some(KEY)).expect("open");
+        assert_eq!(opened.as_deref(), Some(SECRET));
+    }
+
+    /// The one case that must fail rather than improvise: signing with the
+    /// ciphertext, or posting unsigned, hands the receiver a request it cannot
+    /// tell from a forged one.
+    #[test]
+    fn a_secret_that_cannot_be_opened_is_an_error_not_a_guess() {
+        let stored = seal_secret(Some(SECRET), KEY).expect("seal").expect("some");
+
+        let wrong_key = secret_for_delivery(Some(&stored), Some("a-different-key"));
+        assert!(wrong_key.is_err(), "signed with a mis-keyed secret");
+
+        let no_key = secret_for_delivery(Some(&stored), None);
+        assert!(no_key.is_err(), "signed without an at-rest key at all");
+    }
 }

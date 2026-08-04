@@ -650,7 +650,7 @@ async fn seed_vault(
             repo_id: Set(repo),
             url: Set("https://hooks.example.com/scope-sweep".to_string()),
             content_type: Set("json".to_string()),
-            secret: Set(None),
+            secret_encrypted: Set(None),
             active: Set(false),
             events: Set("push".to_string()),
             created_at: Set(Utc::now()),

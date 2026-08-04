@@ -177,6 +177,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
             active: Some(true),
             events: vec!["push".to_string()],
         },
+        crate::common::TEST_ENCRYPTION_KEY,
     )
     .await
     .expect("register push webhook");
@@ -298,6 +299,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
             active: Some(true),
             events: vec!["push".to_string()],
         },
+        crate::common::TEST_ENCRYPTION_KEY,
     )
     .await
     .expect("register push webhook");

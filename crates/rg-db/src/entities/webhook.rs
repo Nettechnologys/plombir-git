@@ -14,8 +14,10 @@ pub struct Model {
     pub url: String,
     /// Content type: json / form
     pub content_type: String,
-    /// Secret for HMAC-SHA256 signature
-    pub secret: Option<String>,
+    /// HMAC-SHA256 signing secret, AES-256-GCM ciphertext under the instance's
+    /// at-rest key — see `rg_core::webhook::service`. The dispatcher opens it
+    /// on every delivery, so unlike a runner token it cannot be a digest.
+    pub secret_encrypted: Option<String>,
     /// Whether the webhook is active
     pub active: bool,
     /// Events that trigger this webhook (comma-separated: push,issues,pull_request,etc.)

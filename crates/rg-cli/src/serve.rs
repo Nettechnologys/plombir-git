@@ -770,6 +770,19 @@ pub(crate) async fn run_serve(
     // before any other startup path writes encrypted state.
     establish_encryption_key(&db, &mut resolved_auth_secrets).await?;
 
+    // Webhook delivery is detached from the request that caused it and signs
+    // with an encrypted column, so it is the one reader that cannot be handed
+    // the key as a parameter. Publish before anything can dispatch.
+    rg_core::auth::at_rest_key::publish(&resolved_auth_secrets.encryption_key);
+
+    // The migration renamed `webhooks.secret` to `secret_encrypted`; sealing the
+    // values it already holds needs the key, which only exists here. Fatal on
+    // failure: a half-sealed column is exactly what this pass exists to prevent,
+    // and the write uses the key the preflight above just verified.
+    rg_core::webhook::service::seal_legacy_secrets(&db, &resolved_auth_secrets.encryption_key)
+        .await
+        .context("seal webhook signing secrets at rest")?;
+
     // ── Instance provenance identity ──────────────────────────────
     // The Ed25519 key that signs release attestations and backs the CI OIDC
     // JWKS. Loaded from the database — on the first start it adopts exactly the

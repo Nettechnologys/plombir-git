@@ -147,6 +147,12 @@ pub fn build_test_app_state_with(
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = overrides
         .blob_storage
         .unwrap_or_else(|| Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root)));
+    // Production publishes this in `forgekeep serve` and in `AppState::new`;
+    // this fixture builds the state by hand, so it owes the same. Without it a
+    // webhook delivery cannot open `webhooks.secret_encrypted` to sign with.
+    // Every test app shares `TEST_ENCRYPTION_KEY`, which is what makes one
+    // process-wide value correct here.
+    rg_core::auth::at_rest_key::publish(TEST_ENCRYPTION_KEY);
     rg_http::AppState {
         blob_storage: blob_storage.clone(),
         repo_root: Arc::new(repo_root),

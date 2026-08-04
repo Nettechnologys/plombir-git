@@ -389,6 +389,14 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
     // PR merges funnel through the core service across three paths) into
     // Prometheus via the observer hooks, since `rg-core` sits below the recorder.
     rg_core::metrics_hook::set_webhook_delivery_observer(metrics::recorder::webhook_delivery);
+
+    // Same reason, for the one secret a detached task has to open rather than
+    // report: a webhook delivery signs with `webhooks.secret_encrypted`, and it
+    // is dispatched from too many call sites to be handed the at-rest key as a
+    // parameter. `forgekeep serve` publishes it too; this covers a state built
+    // without the full boot.
+    rg_core::auth::at_rest_key::publish(&config.encryption_key);
+
     rg_core::metrics_hook::set_pr_merged_observer(metrics::recorder::pr_merged);
     rg_core::metrics_hook::set_repo_created_observer(metrics::recorder::repo_created);
     rg_core::metrics_hook::set_user_provisioned_observer(metrics::recorder::user_provisioned);

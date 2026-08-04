@@ -55,7 +55,7 @@ impl From<rg_db::entities::webhook::Model> for WebhookResponse {
             repo_id: hook.repo_id,
             url: hook.url,
             content_type: hook.content_type,
-            has_secret: hook.secret.is_some_and(|s| !s.is_empty()),
+            has_secret: hook.secret_encrypted.is_some_and(|s| !s.is_empty()),
             active: hook.active,
             events: hook.events,
             created_at: hook.created_at,
@@ -120,7 +120,14 @@ pub async fn create_webhook(
     RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
 ) -> impl IntoResponse {
-    match rg_core::webhook::service::create_webhook(&state.db, repo.id, &body).await {
+    match rg_core::webhook::service::create_webhook(
+        &state.db,
+        repo.id,
+        &body,
+        &state.encryption_key,
+    )
+    .await
+    {
         Ok(hook) => (StatusCode::CREATED, Json(WebhookResponse::from(hook))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -183,7 +190,14 @@ pub async fn update_webhook(
         Err(e) => return e.into_response(),
     };
 
-    match rg_core::webhook::service::update_webhook(&state.db, &existing, &body).await {
+    match rg_core::webhook::service::update_webhook(
+        &state.db,
+        &existing,
+        &body,
+        &state.encryption_key,
+    )
+    .await
+    {
         Ok(hook) => (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

@@ -24,6 +24,7 @@ const NEW_SECRET: &str = "a-freshly-generated-secret-after-a-leak";
 
 const TOTP_PLAINTEXT: &str = "JBSWY3DPEHPK3PXP";
 const CI_SECRET_PLAINTEXT: &str = "ghp_a-deploy-token-nobody-wants-to-retype";
+const WEBHOOK_SECRET_PLAINTEXT: &str = "the-key-every-delivery-is-signed-with";
 
 async fn fresh_db(dir: &Path) -> DatabaseConnection {
     let db = rg_db::connect_with_pool(
@@ -39,8 +40,9 @@ async fn fresh_db(dir: &Path) -> DatabaseConnection {
 }
 
 /// A database that looks like a live instance: a user enrolled in MFA, a CI
-/// secret on a repository, and the instance signing key established — the three
-/// things an operator would lose if a key rotation quietly skipped a column.
+/// secret and a signed webhook on a repository, and the instance signing key
+/// established — the things an operator would lose if a key rotation quietly
+/// skipped a column.
 async fn live_instance(db: &DatabaseConnection, secret: &str) {
     let user = rg_db::ops::user_ops::create_user(db, "alice", "alice@example.invalid", "", "Alice")
         .await
@@ -80,6 +82,23 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) {
         .await
         .expect("store ci secret");
 
+    // A webhook whose deliveries are signed. Registered through the service so
+    // the secret is sealed exactly the way a running server seals it.
+    rg_core::webhook::service::create_webhook(
+        db,
+        repo.id,
+        &rg_core::webhook::service::CreateWebhookRequest {
+            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            content_type: None,
+            secret: Some(WEBHOOK_SECRET_PLAINTEXT.to_string()),
+            active: Some(true),
+            events: vec!["push".to_string()],
+        },
+        secret,
+    )
+    .await
+    .expect("register webhook");
+
     // Establishes `instance_signing_key.seed_encrypted` the way the first
     // server start does.
     rg_core::auth::instance_key::load_or_adopt(db, "a-signing-secret", secret)
@@ -94,6 +113,17 @@ async fn stored_totp(db: &DatabaseConnection) -> String {
         .expect("user exists")
         .totp_secret
         .expect("totp secret stored")
+}
+
+async fn stored_webhook_secret(db: &DatabaseConnection) -> String {
+    use sea_orm::EntityTrait;
+    rg_db::entities::webhook::Entity::find()
+        .one(db)
+        .await
+        .expect("read webhook")
+        .expect("webhook exists")
+        .secret_encrypted
+        .expect("webhook secret stored")
 }
 
 fn opens(value: &str, secret: &str) -> bool {
@@ -126,6 +156,7 @@ async fn a_live_database_moves_onto_the_new_key() {
         column(&report, "instance_signing_key.seed_encrypted").rewritten,
         1
     );
+    assert_eq!(column(&report, "webhooks.secret_encrypted").rewritten, 1);
     assert_eq!(report.unreadable(), 0, "{report:?}");
 
     // The values are the same secrets, just sealed differently.
@@ -138,6 +169,18 @@ async fn a_live_database_moves_onto_the_new_key() {
         encryption::decrypt(&totp, &encryption::derive_key(NEW_SECRET)).unwrap(),
         TOTP_PLAINTEXT,
         "re-encryption must preserve the plaintext, not just the shape"
+    );
+
+    // Same for the signing secret: a rotation that changed it would leave every
+    // receiver rejecting deliveries it used to accept.
+    let webhook_secret = stored_webhook_secret(&db).await;
+    assert!(
+        !opens(&webhook_secret, OLD_SECRET),
+        "the old key must no longer open it"
+    );
+    assert_eq!(
+        encryption::decrypt(&webhook_secret, &encryption::derive_key(NEW_SECRET)).unwrap(),
+        WEBHOOK_SECRET_PLAINTEXT,
     );
 
     verify_encryption_key(&db, NEW_SECRET)
@@ -188,7 +231,7 @@ async fn a_dry_run_reports_everything_and_changes_nothing() {
         .await
         .expect("dry run");
     assert!(report.dry_run);
-    assert_eq!(report.rewritten(), 3, "{report:?}");
+    assert_eq!(report.rewritten(), 4, "{report:?}");
 
     assert_eq!(before, stored_totp(&db).await, "a dry run must not write");
     verify_encryption_key(&db, OLD_SECRET)
@@ -292,7 +335,7 @@ async fn a_second_run_recognises_the_already_rotated_values() {
         .expect("a re-run must not fail");
 
     assert_eq!(second.rewritten(), 0, "{second:?}");
-    assert_eq!(second.already_new(), 3, "{second:?}");
+    assert_eq!(second.already_new(), 4, "{second:?}");
     assert_eq!(second.unreadable(), 0, "{second:?}");
 }
 

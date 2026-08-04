@@ -1,4 +1,5 @@
 //! Authentication — password hashing, JWT, CI tokens, LDAP, SSO, OCI tokens.
+pub mod at_rest_key;
 pub mod ci_oidc;
 pub mod ci_token;
 pub mod encrypted_columns;

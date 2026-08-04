@@ -87,6 +87,7 @@ pub mod m20260803_000001_add_sso_provisioning_policy;
 pub mod m20260803_000002_add_passkey_credential_rp_id;
 pub mod m20260804_000001_add_lfs_publication_lease;
 pub mod m20260804_000002_hash_runner_tokens;
+pub mod m20260804_000003_rename_webhook_secret_encrypted;
 
 use sea_orm_migration::prelude::*;
 
@@ -187,6 +188,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260803_000002_add_passkey_credential_rp_id::Migration),
             Box::new(m20260804_000001_add_lfs_publication_lease::Migration),
             Box::new(m20260804_000002_hash_runner_tokens::Migration),
+            Box::new(m20260804_000003_rename_webhook_secret_encrypted::Migration),
         ]
     }
 }

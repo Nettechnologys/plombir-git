@@ -46,6 +46,10 @@ macro_rules! with_encrypted_columns {
                 "instance_signing_key.seed_encrypted", required;
             mirror, PasswordEncrypted, password_encrypted,
                 "mirrors.password_encrypted", optional;
+            // Read back on every delivery to sign it, so this one is encrypted
+            // rather than hashed — see `crate::webhook::service`.
+            webhook, SecretEncrypted, secret_encrypted,
+                "webhooks.secret_encrypted", optional;
         }
     };
 }

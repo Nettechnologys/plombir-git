@@ -157,6 +157,7 @@ mod web_editor_push_hook_tests;
 mod webhook_authz_tests;
 mod webhook_external_authz_tests;
 mod webhook_external_hmac_tests;
+mod webhook_secret_at_rest_tests;
 mod websocket_session_revocation_tests;
 mod wiki_authz_tests;
 mod wiki_tests;
