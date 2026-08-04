@@ -72,9 +72,10 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
     let (owner_token, _owner_id) =
         register_full(&base, "cache_owner", "cache_owner@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "private-cache").await;
-    let runner = rg_db::ops::runner_ops::register_runner(&db, "cache-runner", "", None, None, None)
-        .await
-        .unwrap();
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(&db, "cache-runner", "", None, None, None)
+            .await
+            .unwrap();
     let cache_key = "deps-v1";
     let job_id = create_cached_job(&db, repo_id, runner.id, cache_key).await;
 
@@ -88,7 +89,7 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
             "{}/api/v1/runners/{}/jobs/{}/cache",
             base, runner.id, job_id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-cache-key", cache_key)
         .body(archive.to_vec())
         .send()
@@ -115,7 +116,7 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
             "{}/api/v1/runners/{}/jobs/{}/cache",
             base, runner.id, job_id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-cache-key", cache_key)
         .send()
         .await
@@ -144,7 +145,7 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
             "{}/api/v1/runners/{}/jobs/{}/cache",
             base, runner.id, job_id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-cache-key", cache_key)
         .send()
         .await
@@ -188,11 +189,12 @@ async fn cache_upload_fixture(
     let (owner_token, _owner_id) =
         register_full(base, login, &format!("{login}@example.com")).await;
     let repo_id = create_private_repo(base, &owner_token, repo_name).await;
-    let runner = rg_db::ops::runner_ops::register_runner(db, "cache-runner", "", None, None, None)
-        .await
-        .unwrap();
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(db, "cache-runner", "", None, None, None)
+            .await
+            .unwrap();
     let job_id = create_cached_job(db, repo_id, runner.id, cache_key).await;
-    (repo_id, runner.id, job_id, runner.token)
+    (repo_id, runner.id, job_id, runner_token)
 }
 
 /// A retention-policy read that fails must not leave the archive on disk.

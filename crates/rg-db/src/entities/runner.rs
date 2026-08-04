@@ -9,7 +9,15 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub name: String,
-    pub token: String,
+    /// SHA-256 (hex) of the bearer token this runner authenticates with.
+    ///
+    /// The plaintext exists exactly once, in the response to
+    /// `POST /runners/register`, and is never stored: nothing after issuance
+    /// needs it, since every later use arrives from the outside and is checked
+    /// by hashing the presented value (`ops::runner_ops::find_by_token`). Same
+    /// shape as `access_token.token_hash` and `password_reset_token.token_hash`
+    /// — a database dump hands out no working runner credential.
+    pub token_hash: String,
     pub status: String,
     pub labels: String,
     pub last_seen_at: DateTimeUtc,

@@ -1874,7 +1874,7 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
     let (token, _user_id) =
         register_full(&app.base, "artifact_orphan", "artifact_orphan@example.com").await;
     let repo_id = create_repo(&app.base, &token, "orphan-artifact").await;
-    let runner =
+    let (runner, runner_token) =
         rg_db::ops::runner_ops::register_runner(&app.db, "orphan-runner", "", None, None, None)
             .await
             .unwrap();
@@ -1887,7 +1887,7 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
     let fault = fail_db_writes(&app.db, "artifacts", DbWrite::Insert).await;
     let failed = client
         .post(&artifacts_url)
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-artifact-name", "report.txt")
         .body(b"forgekeep-artifact-bytes".to_vec())
         .send()
@@ -1910,7 +1910,7 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
     fault.clear().await;
     let accepted = client
         .post(&artifacts_url)
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-artifact-name", "report.txt")
         .body(b"forgekeep-artifact-bytes".to_vec())
         .send()

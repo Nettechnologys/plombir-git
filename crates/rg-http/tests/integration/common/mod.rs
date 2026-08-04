@@ -608,9 +608,10 @@ pub async fn seed_artifact(
     repo: i64,
     runner_name: &str,
 ) -> i64 {
-    let runner = rg_db::ops::runner_ops::register_runner(db, runner_name, "", None, None, None)
-        .await
-        .expect("register runner");
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(db, runner_name, "", None, None, None)
+            .await
+            .expect("register runner");
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         db,
         repo,
@@ -638,7 +639,7 @@ pub async fn seed_artifact(
             "{base}/api/v1/runners/{}/jobs/{}/artifacts",
             runner.id, job.id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-artifact-name", "report.txt")
         .body("artifact bytes")
         .send()

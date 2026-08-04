@@ -123,7 +123,7 @@ async fn fixture(db: &DatabaseConnection, label: &str, runners: usize) -> (i64, 
 
     let mut runner_ids = Vec::with_capacity(runners);
     for i in 0..runners {
-        let runner = rg_db::ops::runner_ops::register_runner(
+        let (runner, _runner_token) = rg_db::ops::runner_ops::register_runner(
             db,
             &format!("runner-{label}-{i}"),
             r#"["linux"]"#,

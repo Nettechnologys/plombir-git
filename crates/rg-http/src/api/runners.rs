@@ -145,11 +145,14 @@ pub async fn register(
     )
     .await
     {
-        Ok(runner) => (
+        // The only place the plaintext token exists after generation: the row
+        // carries its hash, so this response is the operator's one chance to
+        // copy it into the runner's config.
+        Ok((runner, token)) => (
             StatusCode::CREATED,
             Json(RegisterRunnerResponse {
                 id: runner.id,
-                token: runner.token,
+                token,
                 message: "Runner registered successfully".to_string(),
             }),
         )

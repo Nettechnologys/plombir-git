@@ -129,10 +129,11 @@ async fn seed(
         .as_i64()
         .expect("repo id");
 
-    let mine = rg_db::ops::runner_ops::register_runner(db, "foreign-mine", "[]", None, None, None)
-        .await
-        .expect("register the owning runner");
-    let stranger =
+    let (mine, mine_token) =
+        rg_db::ops::runner_ops::register_runner(db, "foreign-mine", "[]", None, None, None)
+            .await
+            .expect("register the owning runner");
+    let (stranger, stranger_token) =
         rg_db::ops::runner_ops::register_runner(db, "foreign-stranger", "[]", None, None, None)
             .await
             .expect("register the walking runner");
@@ -173,11 +174,11 @@ async fn seed(
     (
         Runner {
             id: mine.id,
-            token: mine.token,
+            token: mine_token,
         },
         Runner {
             id: stranger.id,
-            token: stranger.token,
+            token: stranger_token,
         },
         job.id,
     )

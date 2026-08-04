@@ -9,7 +9,13 @@ use crate::entities::runner::{ActiveModel, Column, Entity as RunnerEntity, Model
 
 /// Register a new runner.
 ///
-/// Generates a unique token and creates a runner record.
+/// Generates a token, stores only its SHA-256, and returns the row together
+/// with the plaintext — which is the caller's one and only chance to see it.
+///
+/// Returning the pair rather than a model carrying the token is what makes the
+/// hashing hard to undo by accident: there is no field left to read the secret
+/// back out of, so a future handler that wants to show a runner's token has to
+/// notice it cannot.
 pub async fn register_runner(
     db: &DatabaseConnection,
     name: &str,
@@ -17,14 +23,14 @@ pub async fn register_runner(
     version: Option<&str>,
     os: Option<&str>,
     arch: Option<&str>,
-) -> Result<Runner> {
+) -> Result<(Runner, String)> {
     let now = Utc::now();
     let token = generate_token();
 
     let active_model = ActiveModel {
         id: NotSet,
         name: Set(name.to_string()),
-        token: Set(token),
+        token_hash: Set(hash_token(&token)),
         status: Set("offline".to_string()),
         labels: Set(labels.to_string()),
         last_seen_at: Set(now),
@@ -35,7 +41,12 @@ pub async fn register_runner(
         updated_at: Set(now),
     };
 
-    active_model.insert(db).await.context("db: register runner")
+    let runner = active_model
+        .insert(db)
+        .await
+        .context("db: register runner")?;
+
+    Ok((runner, token))
 }
 
 /// Update runner heartbeat (last_seen_at).
@@ -76,10 +87,13 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Runne
         .context("db: find runner by id")
 }
 
-/// Find a runner by token.
+/// Find a runner by the token it presented.
+///
+/// The argument is the plaintext bearer token off the wire; the stored column
+/// holds only its hash, so the comparison happens between hashes.
 pub async fn find_by_token(db: &DatabaseConnection, token: &str) -> Result<Option<Runner>> {
     RunnerEntity::find()
-        .filter(Column::Token.eq(token))
+        .filter(Column::TokenHash.eq(hash_token(token)))
         .one(db)
         .await
         .context("db: find runner by token")
@@ -152,4 +166,51 @@ fn generate_token() -> String {
     // Use UUID v4 to generate a unique token (36 chars with hyphens)
     // Remove hyphens to get 32-char token
     uuid::Uuid::new_v4().to_string().replace('-', "")
+}
+
+/// Hash a runner token for storage and lookup.
+///
+/// Plain SHA-256 with no salt, exactly as `access_token.token_hash` and
+/// `password_reset_token.token_hash`: the lookup is *by* the hash, so there is
+/// nowhere to put a per-row salt. That is sound here because the input is not
+/// user-chosen — a v4 UUID carries 122 bits out of the CSPRNG, which no
+/// dictionary or rainbow table reaches.
+pub fn hash_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The floor this whole change rests on: the token is a v4 UUID's 122 bits
+    /// of CSPRNG output, so the unsalted hash has nothing to attack. If the
+    /// generator is ever weakened to something guessable, that is the moment
+    /// the storage scheme stops being sound — so the format is pinned here.
+    #[test]
+    fn a_generated_token_is_32_hex_characters_and_never_repeats() {
+        let a = generate_token();
+        let b = generate_token();
+
+        assert_eq!(a.len(), 32, "token: {a}");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "token is not hex: {a}"
+        );
+        assert_ne!(a, b, "two registrations produced the same token");
+    }
+
+    #[test]
+    fn hashing_is_deterministic_and_hides_the_token() {
+        let token = generate_token();
+        let hash = hash_token(&token);
+
+        assert_eq!(hash, hash_token(&token));
+        assert_ne!(hash, token);
+        assert_eq!(hash.len(), 64, "expected SHA-256 hex, got {hash}");
+        assert_ne!(hash, hash_token(&generate_token()));
+    }
 }

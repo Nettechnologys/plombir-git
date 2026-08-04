@@ -57,7 +57,7 @@ async fn seed(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> Fixtu
         .as_i64()
         .expect("repository response carries its id");
 
-    let runner = rg_db::ops::runner_ops::register_runner(
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         db,
         &format!("runner-{suffix}"),
         r#"["linux"]"#,
@@ -102,7 +102,7 @@ async fn seed(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> Fixtu
         owner: username,
         repo: repo_name,
         runner_id: runner.id,
-        runner_token: runner.token,
+        runner_token,
         pipeline_id: pipeline.id,
         stage_id: stage.id,
         job_id: job.id,

@@ -82,7 +82,7 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
     let (owner_token, _owner_id) =
         register_full(&base, "artifact_owner", "artifact_owner@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "private-artifacts").await;
-    let runner =
+    let (runner, runner_token) =
         rg_db::ops::runner_ops::register_runner(&db, "artifact-runner", "", None, None, None)
             .await
             .unwrap();
@@ -118,7 +118,7 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
             "{}/api/v1/runners/{}/jobs/{}/artifacts",
             base, runner.id, job_id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-artifact-name", "report.txt")
         .body("artifact bytes")
         .send()
@@ -225,7 +225,7 @@ async fn artifact_metadata_upload_separates_missing_files_from_storage_failures(
     )
     .await;
     let repo_id = create_private_repo(&app.base, &owner_token, "artifact-metadata-errors").await;
-    let runner = rg_db::ops::runner_ops::register_runner(
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         &app.db,
         "artifact-metadata-runner",
         "",
@@ -250,7 +250,7 @@ async fn artifact_metadata_upload_separates_missing_files_from_storage_failures(
     let missing = job_root.join("missing.bin");
     let missing_response = client
         .post(&upload_url)
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .json(&serde_json::json!({
             "name": "missing",
             "file_path": missing,
@@ -273,7 +273,7 @@ async fn artifact_metadata_upload_separates_missing_files_from_storage_failures(
     assert!(tokio::fs::read(&unreadable).await.is_err());
     let failed_response = client
         .post(&upload_url)
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .json(&serde_json::json!({
             "name": "unreadable",
             "file_path": unreadable,
@@ -325,7 +325,7 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
     // so a pipeline of this one listed through the other one's URL is refused
     // by the anchoring, not by the gate.
     let other_repo_id = create_private_repo(&base, &owner_token, "gated-artifacts-two").await;
-    let runner =
+    let (runner, runner_token) =
         rg_db::ops::runner_ops::register_runner(&db, "artifact-gate-runner", "", None, None, None)
             .await
             .unwrap();
@@ -338,7 +338,7 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
             "{}/api/v1/runners/{}/jobs/{}/artifacts",
             base, runner.id, job_id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-artifact-name", "report.txt")
         .body("artifact bytes")
         .send()
@@ -480,7 +480,7 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
             "{}/api/v1/runners/{}/jobs/{}/artifacts",
             base, runner.id, job_id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .header("x-artifact-name", "aged.txt")
         .body("stale bytes")
         .send()

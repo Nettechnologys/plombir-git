@@ -343,9 +343,10 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
 
     // One runner, one job on the PR head — the shape an external-runner CI run
     // has when its last job reports in.
-    let runner = rg_db::ops::runner_ops::register_runner(&db, "ci-runner", "[]", None, None, None)
-        .await
-        .expect("register runner");
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(&db, "ci-runner", "[]", None, None, None)
+            .await
+            .expect("register runner");
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         &db,
         repo_id,
@@ -374,7 +375,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
             "{base}/api/v1/runners/{}/jobs/{}/finish",
             runner.id, job.id
         ))
-        .bearer_auth(&runner.token)
+        .bearer_auth(&runner_token)
         .json(&serde_json::json!({"status": "success", "exit_code": 0}))
         .send()
         .await

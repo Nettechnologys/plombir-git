@@ -71,6 +71,111 @@ async fn runner_register_accepts_admin_httponly_cookie() {
     assert_eq!(resp.status(), 201);
 }
 
+/// The runner token is a bearer credential for the whole CI API — jobs,
+/// artifacts, the build cache — so a database dump must not contain a working
+/// one. It is issued once, in this response, and stored only as its SHA-256.
+///
+/// The assertion is against the *whole* row, not against the column we happen
+/// to have renamed: a future column that quietly kept a copy would fail this.
+#[tokio::test]
+async fn a_registered_runners_token_is_not_recoverable_from_the_database() {
+    use sea_orm::EntityTrait;
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (admin_token, admin_id) =
+        register_full(&base, "runner_at_rest", "runner_at_rest@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("registered user must exist");
+
+    let resp = client
+        .post(format!("{base}/api/v1/runners/register"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"name": "at-rest-runner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let issued = body["token"]
+        .as_str()
+        .expect("a token was issued")
+        .to_owned();
+    let runner_id = body["id"].as_i64().unwrap();
+
+    let row = rg_db::entities::runner::Entity::find_by_id(runner_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the registered runner is in the database");
+    let dump = serde_json::to_string(&row).unwrap();
+    assert!(
+        !dump.contains(&issued),
+        "the issued runner token is readable from the row: {dump}"
+    );
+    assert_eq!(row.token_hash, rg_db::ops::runner_ops::hash_token(&issued));
+
+    // ...and the credential that is no longer stored still works, which is what
+    // makes the absence above a fix rather than a broken registration.
+    let heartbeat = client
+        .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+        .bearer_auth(&issued)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.status(), 200);
+}
+
+/// A token issued *before* the tokens were hashed keeps working: the migration
+/// hashes the stored values in place rather than reissuing them, so no operator
+/// has to re-register a fleet of runners to install this fix.
+///
+/// The stored value here is a literal SHA-256 hex digest, computed outside the
+/// code under test. That pins the two halves to the same algorithm: if either
+/// the migration's digest or `find_by_token`'s ever changed, this row would
+/// stop opening.
+#[tokio::test]
+async fn a_token_issued_before_the_hashing_still_authenticates() {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    const LEGACY_TOKEN: &str = "legacy-runner-token";
+    const LEGACY_TOKEN_SHA256: &str =
+        "41470fa2ea0568b3bc5b14c8c29e0450bd39dad7b0cd457f8ce08343867ee34e";
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let now = chrono::Utc::now();
+    let runner = rg_db::entities::runner::ActiveModel {
+        id: sea_orm::NotSet,
+        name: Set("pre-migration-runner".to_string()),
+        token_hash: Set(LEGACY_TOKEN_SHA256.to_string()),
+        status: Set("offline".to_string()),
+        labels: Set("[]".to_string()),
+        last_seen_at: Set(now),
+        version: Set(None),
+        os: Set(None),
+        arch: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await
+    .expect("seed a runner as the migration leaves it");
+
+    let heartbeat = reqwest::Client::new()
+        .post(format!("{base}/api/v1/runners/{}/heartbeat", runner.id))
+        .bearer_auth(LEGACY_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        heartbeat.status(),
+        200,
+        "a runner token issued before the migration was locked out"
+    );
+}
+
 /// `{job_id}` is an instance-wide primary key, so another runner's job must be
 /// indistinguishable from a job that does not exist.
 ///
@@ -122,12 +227,14 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
         .unwrap()
         .to_owned();
 
-    let mine = rg_db::ops::runner_ops::register_runner(&db, "mine", "[]", None, None, None)
-        .await
-        .unwrap();
-    let stranger = rg_db::ops::runner_ops::register_runner(&db, "stranger", "[]", None, None, None)
-        .await
-        .unwrap();
+    let (mine, mine_token) =
+        rg_db::ops::runner_ops::register_runner(&db, "mine", "[]", None, None, None)
+            .await
+            .unwrap();
+    let (stranger, stranger_token) =
+        rg_db::ops::runner_ops::register_runner(&db, "stranger", "[]", None, None, None)
+            .await
+            .unwrap();
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         &db,
         repo_id,
@@ -185,7 +292,7 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
                 "PUT" => client.put(url),
                 _ => client.post(url),
             };
-            req = req.bearer_auth(&stranger.token);
+            req = req.bearer_auth(&stranger_token);
             if *suffix == "cache" {
                 req = req.header("x-cache-key", "scope-key");
             }
@@ -224,7 +331,7 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
             "{base}/api/v1/runners/{}/jobs/{}/start",
             mine.id, job.id
         ))
-        .bearer_auth(&mine.token)
+        .bearer_auth(&mine_token)
         .send()
         .await
         .unwrap();
