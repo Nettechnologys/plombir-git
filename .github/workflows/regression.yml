@@ -243,8 +243,11 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Prove PostgreSQL code FTS create/retry boundary
+        run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
+
       - name: Run PostgreSQL runtime smoke
-        run: cargo test -p rg-core --test multi_backend_smoke -- --ignored --nocapture
+        run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
   mysql-smoke:
     name: MySQL migration, CRUD and FTS smoke
@@ -285,6 +288,9 @@ jobs:
 
       - name: Prove MySQL FTS migration maintenance boundary
         run: cargo test -p rg-db -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture
+
+      - name: Prove MySQL code FTS create/retry boundary
+        run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
