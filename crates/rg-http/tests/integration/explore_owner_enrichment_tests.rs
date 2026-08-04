@@ -16,6 +16,8 @@
 //! sweep cannot inject, and its healthy/broken differential would have read
 //! `200`/`200` and called the route untouched.
 
+use std::collections::BTreeSet;
+
 use sea_orm::ConnectionTrait;
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
@@ -42,6 +44,59 @@ fn only_row(body: &serde_json::Value) -> &serde_json::Value {
          enrichment branch never runs and this test proves nothing (body: {body})"
     );
     &rows[0]
+}
+
+fn object_keys(value: &serde_json::Value) -> BTreeSet<String> {
+    value
+        .as_object()
+        .expect("JSON object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn explore_runtime_body_matches_its_published_openapi_schema() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "explspec", "explspec@example.com").await;
+    create_repo(&base, &token, "explspec-repo").await;
+
+    let (status, body) = explore(&base).await;
+    assert_eq!(status, 200, "the fixture must produce one explore row");
+
+    let spec: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api-docs/openapi.json"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("fetch the published OpenAPI document")
+        .json()
+        .await
+        .expect("published OpenAPI is JSON");
+
+    let response_schema = &spec["paths"]["/repos/explore"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(
+        response_schema["$ref"].as_str(),
+        Some("#/components/schemas/PaginatedExploreRepoResponse"),
+        "explore must not reuse the full repository listing schema: {response_schema}"
+    );
+
+    let row_schema = &spec["components"]["schemas"]["ExploreRepoResponse"];
+    assert_eq!(
+        object_keys(only_row(&body)),
+        object_keys(&row_schema["properties"]),
+        "the fields in the live explore row and its published schema must match"
+    );
+
+    let owner_name_schema = &row_schema["properties"]["owner_name"];
+    let nullable_type = owner_name_schema["type"]
+        .as_array()
+        .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
+    assert!(
+        owner_name_schema["nullable"].as_bool() == Some(true) || nullable_type,
+        "owner_name must remain nullable in the published schema: {owner_name_schema}"
+    );
 }
 
 /// The whole point of the field: an account that exists is named.

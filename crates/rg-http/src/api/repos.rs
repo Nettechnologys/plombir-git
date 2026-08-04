@@ -25,7 +25,11 @@ use crate::api::repo_access::{
 };
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
-use crate::{api::auth::extract_user_id, openapi::PaginatedRepoResponse, AppState};
+use crate::{
+    api::auth::extract_user_id,
+    openapi::{PaginatedExploreRepoResponse, PaginatedRepoResponse},
+    AppState,
+};
 
 /// Helper to record audit log (fire-and-forget).
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +160,23 @@ pub struct RepoResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Public repository row as it appears in the explore listing.
+///
+/// This is intentionally not [`RepoResponse`]: explore exposes an owner's
+/// display name so clients can build the repository URL, while withholding
+/// fields that are irrelevant to the public catalogue.
+#[derive(serde::Serialize, ToSchema)]
+pub struct ExploreRepoResponse {
+    pub id: i64,
+    pub owner_id: i64,
+    pub owner_name: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub stars_count: i64,
+    pub forks_count: i64,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[utoipa::path(
@@ -1094,7 +1115,7 @@ pub struct ExploreQuery {
         ("per_page" = Option<u64>, Query, description = "Items per page (1-100)"),
     ),
     responses(
-        (status = 200, description = "Paginated list of public repositories", body = PaginatedRepoResponse),
+        (status = 200, description = "Paginated list of public repositories", body = PaginatedExploreRepoResponse),
     )
 )]
 pub async fn explore(
@@ -1129,22 +1150,22 @@ pub async fn explore(
             )
             .await;
 
-            let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(data.len());
+            let mut enriched: Vec<ExploreRepoResponse> = Vec::with_capacity(data.len());
             for (repo, lookup) in data.iter().zip(lookups) {
                 let owner_name = match lookup {
                     Ok(owner) => owner.map(|user| user.username),
                     Err(error) => return AppError::from(error).into_response(),
                 };
-                enriched.push(serde_json::json!({
-                    "id": repo.id,
-                    "owner_id": repo.owner_id,
-                    "owner_name": owner_name,
-                    "name": repo.name,
-                    "description": repo.description,
-                    "stars_count": repo.stars_count,
-                    "forks_count": repo.forks_count,
-                    "updated_at": repo.updated_at,
-                }));
+                enriched.push(ExploreRepoResponse {
+                    id: repo.id,
+                    owner_id: repo.owner_id,
+                    owner_name,
+                    name: repo.name.clone(),
+                    description: repo.description.clone(),
+                    stars_count: repo.stars_count,
+                    forks_count: repo.forks_count,
+                    updated_at: repo.updated_at,
+                });
             }
 
             (
