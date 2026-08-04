@@ -27,6 +27,7 @@ const ORG_ID: i64 = 1;
 const PERSONAL_REPO_ID: i64 = 1;
 const ORG_REPO_ID: i64 = 2;
 const REUSED_REPO_ID: i64 = 3;
+const HIGH_WATER_REPO_ID: i64 = 50;
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
 struct TempDb {
@@ -185,6 +186,15 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
     insert_star(&db, PERSONAL_REPO_ID)
         .await
         .expect("seed a child row behind ON DELETE CASCADE");
+    insert_repo(&db, HIGH_WATER_REPO_ID, None, "deleted-high-water")
+        .await
+        .expect("advance the AUTOINCREMENT counter beyond the surviving rows");
+    execute(
+        &db,
+        &format!("DELETE FROM repositories WHERE id = {HIGH_WATER_REPO_ID}"),
+    )
+    .await
+    .expect("hard-delete the row that established the high-water mark");
     assert_eq!(
         scalar(
             &db,
@@ -257,7 +267,8 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
         )
         .await,
         sequence_before,
-        "the AUTOINCREMENT counter was reset, so the next repository can reuse an id"
+        "the AUTOINCREMENT counter was reset below a deleted high-water row, so the next \
+         repository can reuse an id"
     );
 
     // ── What the change was for: the two namespaces hold the same name ───────

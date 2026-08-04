@@ -62,8 +62,12 @@
 //! `list_personal_by_owner`), and on MySQL it is also what lets the old index be
 //! dropped at all — the `owner_id` foreign key needs an index to live on.
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use std::future::Future;
+
+use sea_orm::sqlx::{Executor as _, Row as _, Sqlite};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::SchemaManagerConnection;
 
 pub struct Migration;
 
@@ -130,6 +134,14 @@ enum Shape {
     OwnerAccount,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SqliteRebuildPoint {
+    WriteBoundary,
+    TriggersDropped,
+    TableCopied,
+    SchemaRestored,
+}
+
 // ── SQLite ──────────────────────────────────────────────────────────────────
 
 /// The generated column, spelled for SQLite (`||` concatenates).
@@ -167,11 +179,64 @@ const SQLITE_FTS_TRIGGERS: &str = r#"
 /// the documented table-rebuild (see the module header for why foreign key
 /// enforcement has to be suspended across it).
 async fn sqlite_rebuild(manager: &SchemaManager<'_>, shape: Shape) -> Result<(), DbErr> {
-    let db = manager.get_connection();
+    sqlite_rebuild_with_hook(manager, shape, |_| async { Ok(()) }).await
+}
 
-    assert_sqlite_columns(manager).await?;
-    assert_foreign_keys_can_be_suspended(manager).await?;
-    let sequence = sqlite_autoincrement_seq(manager).await?;
+/// Rebuild on one pinned SQLite connection under an explicit write boundary.
+///
+/// `foreign_keys` and `legacy_alter_table` are connection-local and cannot be
+/// changed after a transaction starts.  Acquiring the connection first lets us
+/// establish and verify those settings, then `BEGIN IMMEDIATE` excludes every
+/// source writer before the FTS triggers are removed.  SQLite DDL is
+/// transactional, so any later error restores the old table, triggers, child
+/// references and sequence together.
+async fn sqlite_rebuild_with_hook<F, Fut>(
+    manager: &SchemaManager<'_>,
+    shape: Shape,
+    after_step: F,
+) -> Result<(), DbErr>
+where
+    F: Fn(SqliteRebuildPoint) -> Fut,
+    Fut: Future<Output = Result<(), DbErr>>,
+{
+    let pool = match manager.get_connection() {
+        SchemaManagerConnection::Connection(
+            db @ DatabaseConnection::SqlxSqlitePoolConnection(_),
+        ) => db.get_sqlite_connection_pool(),
+        SchemaManagerConnection::Connection(_) => {
+            return Err(DbErr::Migration(
+                "m20260730_000001: SQLite rebuild received a non-SQLite connection".to_string(),
+            ));
+        }
+        SchemaManagerConnection::Transaction(_) => {
+            return Err(DbErr::Migration(
+                "m20260730_000001: SQLite rebuild requires a non-transactional migration \
+                 connection so its connection-local PRAGMAs can be set before BEGIN"
+                    .to_string(),
+            ));
+        }
+    };
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|error| sqlite_error("acquire a dedicated connection", error))?;
+
+    assert_sqlite_columns(&mut connection).await?;
+    let sequence = sqlite_autoincrement_seq(&mut connection).await?;
+
+    if let Err(error) = prepare_sqlite_rebuild_connection(&mut connection).await {
+        return finish_sqlite_rebuild(&mut connection, Err(error), false).await;
+    }
+
+    if let Err(error) = sqlite_execute(
+        &mut connection,
+        "begin the write boundary",
+        "BEGIN IMMEDIATE",
+    )
+    .await
+    {
+        return finish_sqlite_rebuild(&mut connection, Err(error), false).await;
+    }
 
     let (extra_column, table_constraint, extra_index) = match shape {
         Shape::NamespaceKey => (
@@ -194,11 +259,8 @@ async fn sqlite_rebuild(manager: &SchemaManager<'_>, shape: Shape) -> Result<(),
         .collect::<Vec<_>>()
         .join(", ");
 
-    let sql = format!(
+    let drop_dependent_schema = format!(
         r#"
-        PRAGMA foreign_keys = OFF;
-        PRAGMA legacy_alter_table = ON;
-
         DROP TRIGGER IF EXISTS repos_fts_insert;
         DROP TRIGGER IF EXISTS repos_fts_delete;
         DROP TRIGGER IF EXISTS repos_fts_update;
@@ -206,7 +268,11 @@ async fn sqlite_rebuild(manager: &SchemaManager<'_>, shape: Shape) -> Result<(),
         DROP INDEX IF EXISTS "idx_repositories_origin_repo_id";
         DROP INDEX IF EXISTS "{OWNER_NAME_INDEX}";
         DROP INDEX IF EXISTS "{NAMESPACE_INDEX}";
+        "#
+    );
 
+    let rebuild_table = format!(
+        r#"
         ALTER TABLE "repositories" RENAME TO "repositories_pre_namespace_key";
 
         CREATE TABLE "repositories" (
@@ -231,36 +297,81 @@ async fn sqlite_rebuild(manager: &SchemaManager<'_>, shape: Shape) -> Result<(),
             SELECT {columns} FROM "repositories_pre_namespace_key";
 
         DROP TABLE "repositories_pre_namespace_key";
+        "#
+    );
 
+    let restore_dependent_schema = format!(
+        r#"
         {extra_index}
         CREATE INDEX "{OWNER_NAME_INDEX}" ON "repositories" ("owner_id", "name");
         CREATE INDEX "idx_repositories_org_id" ON "repositories" ("org_id");
         CREATE INDEX "idx_repositories_origin_repo_id" ON "repositories" ("origin_repo_id");
 
         {SQLITE_FTS_TRIGGERS}
-
-        PRAGMA legacy_alter_table = OFF;
-        PRAGMA foreign_keys = ON;
         "#
     );
 
-    db.execute_unprepared(&sql).await?;
-    assert_referential_integrity(manager).await?;
-
-    // The new table's AUTOINCREMENT counter starts from the highest id copied
-    // in, which is lower than the old one whenever the most recent repository
-    // was hard-deleted. Restore it, or the next repository created reuses an id
-    // that already appeared in URLs, audit rows and on disk.
-    if let Some(seq) = sequence {
-        db.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('repositories', ?)",
-            [seq.into()],
-        ))
+    let work_result = async {
+        after_step(SqliteRebuildPoint::WriteBoundary).await?;
+        sqlite_execute(
+            &mut connection,
+            "drop the old repository triggers and indexes",
+            &drop_dependent_schema,
+        )
         .await?;
-    }
+        after_step(SqliteRebuildPoint::TriggersDropped).await?;
 
-    Ok(())
+        sqlite_execute(
+            &mut connection,
+            "copy repositories into the replacement table",
+            &rebuild_table,
+        )
+        .await?;
+        after_step(SqliteRebuildPoint::TableCopied).await?;
+
+        sqlite_execute(
+            &mut connection,
+            "restore the repository indexes and FTS triggers",
+            &restore_dependent_schema,
+        )
+        .await?;
+
+        // The new table's AUTOINCREMENT counter starts from the highest id
+        // copied in, which is lower than the old one whenever the most recent
+        // repository was hard-deleted. A direct sqlite_sequence UPDATE inside
+        // this transaction is overwritten by SQLite's in-memory sequence state
+        // at commit. Advance it through a real, temporary row instead; the FTS
+        // triggers are already restored, so their insert/delete also cancels
+        // out before the same commit becomes visible.
+        if let Some(sequence) = sequence {
+            sqlite_execute(
+                &mut connection,
+                "restore the repositories AUTOINCREMENT high-water mark",
+                &format!(
+                    r#"
+                    INSERT INTO repositories
+                        (id, owner_id, name, created_at, updated_at)
+                    SELECT
+                        {sequence}, 0, '_forgekeep_sequence_high_water',
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    WHERE {sequence} > COALESCE((SELECT MAX(id) FROM repositories), 0);
+                    DELETE FROM repositories
+                    WHERE id = {sequence}
+                      AND owner_id = 0
+                      AND name = '_forgekeep_sequence_high_water';
+                    "#
+                ),
+            )
+            .await?;
+        }
+
+        assert_referential_integrity(&mut connection).await?;
+        after_step(SqliteRebuildPoint::SchemaRestored).await?;
+        sqlite_execute(&mut connection, "commit the rebuilt table", "COMMIT").await
+    }
+    .await;
+
+    finish_sqlite_rebuild(&mut connection, work_result, true).await
 }
 
 /// Prove, on this database, that the two pragmas the rebuild depends on still do
@@ -285,48 +396,98 @@ async fn sqlite_rebuild(manager: &SchemaManager<'_>, shape: Shape) -> Result<(),
 /// dependency, holding up the difference between a migration and a data loss.
 /// So rather than trust the combination, exercise it: rename a throwaway parent
 /// and read back whether its child's `REFERENCES` clause followed.
-async fn assert_foreign_keys_can_be_suspended(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+async fn prepare_sqlite_rebuild_connection(
+    connection: &mut SqlitePoolConnection,
+) -> Result<(), DbErr> {
+    sqlite_execute(
+        connection,
+        "disable foreign keys on the rebuild connection",
+        "PRAGMA foreign_keys = OFF",
+    )
+    .await?;
+    sqlite_execute(
+        connection,
+        "enable legacy ALTER TABLE semantics on the rebuild connection",
+        "PRAGMA legacy_alter_table = ON",
+    )
+    .await?;
+
+    let foreign_keys = sqlite_scalar(
+        connection,
+        "read PRAGMA foreign_keys",
+        "PRAGMA foreign_keys",
+    )
+    .await?
+    .unwrap_or(-1);
+    let legacy_alter_table = sqlite_scalar(
+        connection,
+        "read PRAGMA legacy_alter_table",
+        "PRAGMA legacy_alter_table",
+    )
+    .await?
+    .unwrap_or(-1);
+    if foreign_keys != 0 || legacy_alter_table != 1 {
+        return Err(DbErr::Migration(format!(
+            "m20260730_000001: refusing to rebuild `repositories` — the dedicated \
+             connection reported foreign_keys={foreign_keys} and \
+             legacy_alter_table={legacy_alter_table}, expected 0 and 1"
+        )));
+    }
+
+    assert_foreign_keys_can_be_suspended(connection).await
+}
+
+async fn assert_foreign_keys_can_be_suspended(
+    connection: &mut SqlitePoolConnection,
+) -> Result<(), DbErr> {
     const PARENT: &str = "_forgekeep_fk_probe_parent";
     const CHILD: &str = "_forgekeep_fk_probe_child";
     const RENAMED: &str = "_forgekeep_fk_probe_parent_renamed";
 
-    let db = manager.get_connection();
+    let probe_result = async {
+        sqlite_execute(
+            connection,
+            "exercise the foreign-key rename probe",
+            &format!(
+                r#"
+                DROP TABLE IF EXISTS "{CHILD}";
+                DROP TABLE IF EXISTS "{PARENT}";
+                DROP TABLE IF EXISTS "{RENAMED}";
+                CREATE TABLE "{PARENT}" ("id" integer NOT NULL PRIMARY KEY);
+                CREATE TABLE "{CHILD}" (
+                    "id" integer NOT NULL PRIMARY KEY,
+                    "pid" integer NULL REFERENCES "{PARENT}" ("id") ON DELETE CASCADE
+                );
+                ALTER TABLE "{PARENT}" RENAME TO "{RENAMED}";
+                "#
+            ),
+        )
+        .await?;
 
-    db.execute_unprepared(&format!(
-        r#"
-        DROP TABLE IF EXISTS "{CHILD}";
-        DROP TABLE IF EXISTS "{PARENT}";
-        DROP TABLE IF EXISTS "{RENAMED}";
+        sqlite_optional_string(
+            connection,
+            "read the foreign-key rename probe",
+            &format!("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{CHILD}'"),
+        )
+        .await
+    }
+    .await;
 
-        PRAGMA foreign_keys = OFF;
-        PRAGMA legacy_alter_table = ON;
-        CREATE TABLE "{PARENT}" ("id" integer NOT NULL PRIMARY KEY);
-        CREATE TABLE "{CHILD}" (
-            "id" integer NOT NULL PRIMARY KEY,
-            "pid" integer NULL REFERENCES "{PARENT}" ("id") ON DELETE CASCADE
-        );
-        ALTER TABLE "{PARENT}" RENAME TO "{RENAMED}";
-        PRAGMA legacy_alter_table = OFF;
-        PRAGMA foreign_keys = ON;
-        "#
-    ))
-    .await?;
+    let cleanup_result = sqlite_execute(
+        connection,
+        "remove the foreign-key rename probe",
+        &format!(r#"DROP TABLE IF EXISTS "{CHILD}"; DROP TABLE IF EXISTS "{RENAMED}";"#),
+    )
+    .await;
 
-    let child_sql = manager
-        .get_connection()
-        .query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-            [CHILD.into()],
-        ))
-        .await?
-        .map(|row| row.try_get::<String>("", "sql"))
-        .transpose()?;
-
-    db.execute_unprepared(&format!(
-        r#"DROP TABLE IF EXISTS "{CHILD}"; DROP TABLE IF EXISTS "{RENAMED}";"#
-    ))
-    .await?;
+    let child_sql = match (probe_result, cleanup_result) {
+        (Ok(child_sql), Ok(())) => child_sql,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => {
+            return Err(combine_sqlite_errors(error, vec![cleanup_error]));
+        }
+    };
 
     let followed_the_rename = child_sql.as_deref().is_none_or(|sql| sql.contains(RENAMED));
 
@@ -344,19 +505,14 @@ async fn assert_foreign_keys_can_be_suspended(manager: &SchemaManager<'_>) -> Re
 }
 
 /// Fail loudly if the rebuild left a dangling reference behind.
-async fn assert_referential_integrity(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let row = manager
-        .get_connection()
-        .query_one(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT count(*) AS violations FROM pragma_foreign_key_check",
-        ))
-        .await?;
-
-    let violations = match row {
-        Some(row) => row.try_get::<i64>("", "violations")?,
-        None => 0,
-    };
+async fn assert_referential_integrity(connection: &mut SqlitePoolConnection) -> Result<(), DbErr> {
+    let violations = sqlite_scalar(
+        connection,
+        "check the rebuilt table's foreign keys",
+        "SELECT count(*) FROM pragma_foreign_key_check",
+    )
+    .await?
+    .unwrap_or(0);
 
     if violations > 0 {
         return Err(DbErr::Migration(format!(
@@ -370,19 +526,19 @@ async fn assert_referential_integrity(manager: &SchemaManager<'_>) -> Result<(),
 
 /// Refuse to rebuild a table whose columns are not the ones this migration
 /// knows how to copy.
-async fn assert_sqlite_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let rows = manager
-        .get_connection()
-        .query_all(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT name FROM pragma_table_info('repositories')",
-        ))
-        .await?;
+async fn assert_sqlite_columns(connection: &mut SqlitePoolConnection) -> Result<(), DbErr> {
+    let rows = (&mut **connection)
+        .fetch_all("SELECT name FROM pragma_table_info('repositories')")
+        .await
+        .map_err(|error| sqlite_error("read the repositories columns", error))?;
 
-    let mut live: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        live.push(row.try_get::<String>("", "name")?);
-    }
+    let mut live = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<String, _>(0)
+                .map_err(|error| sqlite_error("decode a repositories column", error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     live.sort();
 
     let mut expected: Vec<String> = SQLITE_COLUMNS.iter().map(|c| (*c).to_string()).collect();
@@ -404,20 +560,133 @@ async fn assert_sqlite_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr>
 }
 
 /// The current `AUTOINCREMENT` high-water mark for `repositories`, if any.
-async fn sqlite_autoincrement_seq(manager: &SchemaManager<'_>) -> Result<Option<i64>, DbErr> {
-    let row = manager
-        .get_connection()
-        .query_one(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT seq FROM sqlite_sequence WHERE name = 'repositories'",
-        ))
-        .await?;
+async fn sqlite_autoincrement_seq(
+    connection: &mut SqlitePoolConnection,
+) -> Result<Option<i64>, DbErr> {
+    sqlite_scalar(
+        connection,
+        "read the repositories AUTOINCREMENT high-water mark",
+        "SELECT seq FROM sqlite_sequence WHERE name = 'repositories'",
+    )
+    .await
+}
 
-    match row {
-        Some(row) => Ok(Some(row.try_get::<i64>("", "seq")?)),
-        None => Ok(None),
+type SqlitePoolConnection = sea_orm::sqlx::pool::PoolConnection<Sqlite>;
+
+async fn sqlite_execute(
+    connection: &mut SqlitePoolConnection,
+    action: &str,
+    sql: &str,
+) -> Result<(), DbErr> {
+    (&mut **connection)
+        .execute(sql)
+        .await
+        .map(|_| ())
+        .map_err(|error| sqlite_error(action, error))
+}
+
+async fn sqlite_scalar(
+    connection: &mut SqlitePoolConnection,
+    action: &str,
+    sql: &str,
+) -> Result<Option<i64>, DbErr> {
+    (&mut **connection)
+        .fetch_optional(sql)
+        .await
+        .map_err(|error| sqlite_error(action, error))?
+        .map(|row| {
+            row.try_get::<i64, _>(0)
+                .map_err(|error| sqlite_error(action, error))
+        })
+        .transpose()
+}
+
+async fn sqlite_optional_string(
+    connection: &mut SqlitePoolConnection,
+    action: &str,
+    sql: &str,
+) -> Result<Option<String>, DbErr> {
+    (&mut **connection)
+        .fetch_optional(sql)
+        .await
+        .map_err(|error| sqlite_error(action, error))?
+        .map(|row| {
+            row.try_get::<String, _>(0)
+                .map_err(|error| sqlite_error(action, error))
+        })
+        .transpose()
+}
+
+async fn finish_sqlite_rebuild(
+    connection: &mut SqlitePoolConnection,
+    work_result: Result<(), DbErr>,
+    transaction_started: bool,
+) -> Result<(), DbErr> {
+    let mut cleanup_errors = Vec::new();
+    if work_result.is_err() && transaction_started {
+        if let Err(error) =
+            sqlite_execute(connection, "roll back the rebuilt table", "ROLLBACK").await
+        {
+            cleanup_errors.push(error);
+        }
+    }
+    if let Err(error) = sqlite_execute(
+        connection,
+        "disable legacy ALTER TABLE semantics",
+        "PRAGMA legacy_alter_table = OFF",
+    )
+    .await
+    {
+        cleanup_errors.push(error);
+    }
+    if let Err(error) = sqlite_execute(
+        connection,
+        "restore foreign-key enforcement",
+        "PRAGMA foreign_keys = ON",
+    )
+    .await
+    {
+        cleanup_errors.push(error);
+    }
+
+    match (work_result, cleanup_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => {
+            connection.close_on_drop();
+            Err(combine_sqlite_errors(
+                DbErr::Migration(
+                    "m20260730_000001: SQLite rebuild committed but connection cleanup failed"
+                        .to_string(),
+                ),
+                cleanup_errors,
+            ))
+        }
+        (Err(error), true) => Err(error),
+        (Err(error), false) => {
+            connection.close_on_drop();
+            Err(combine_sqlite_errors(error, cleanup_errors))
+        }
     }
 }
+
+fn sqlite_error(action: &str, error: sea_orm::sqlx::Error) -> DbErr {
+    DbErr::Migration(format!(
+        "m20260730_000001: SQLite rebuild failed to {action}: {error}"
+    ))
+}
+
+fn combine_sqlite_errors(primary: DbErr, cleanup: Vec<DbErr>) -> DbErr {
+    let cleanup = cleanup
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    DbErr::Migration(format!("{primary}; cleanup also failed: {cleanup}"))
+}
+
+#[cfg(test)]
+#[path = "m20260730_000001_repositories_namespace_unique_tests.rs"]
+mod tests;
 
 // ── Postgres ────────────────────────────────────────────────────────────────
 
