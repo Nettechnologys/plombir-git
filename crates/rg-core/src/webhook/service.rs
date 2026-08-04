@@ -41,6 +41,9 @@ use crate::auth::{at_rest_key, encryption};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateWebhookRequest {
+    /// Where deliveries are POSTed. It is stored and shown as typed, so it may
+    /// not carry a credential (`https://user:token@host/hook`) — see
+    /// [`reject_url_credentials`].
     pub url: String,
     pub content_type: Option<String>, // "json" (default) or "form"
     pub secret: Option<String>,
@@ -50,6 +53,7 @@ pub struct CreateWebhookRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateWebhookRequest {
+    /// Replacement target. Same rule as on create: no credential in the URL.
     pub url: Option<String>,
     pub content_type: Option<String>,
     pub secret: Option<String>,
@@ -169,7 +173,88 @@ pub async fn seal_legacy_secrets(db: &DatabaseConnection, encryption_key: &str) 
     Ok(sealed)
 }
 
+/// Take the credential out of every webhook URL that still carries one.
+///
+/// [`reject_url_credentials`] refuses them on the way in, but a hook registered
+/// before that check holds `https://user:token@host/hook` in a plaintext
+/// column. Run at startup next to [`seal_legacy_secrets`]. Returns how many
+/// rows it rewrote.
+///
+/// Lossy on purpose, and the only honest option available: there is no column
+/// to move a webhook credential into, so a delivery that relied on it starts
+/// answering `401` — visible on the hook's own delivery list — instead of the
+/// secret staying readable in the database. The removal is logged per hook so
+/// the operator can act on it.
+///
+/// A credential in the *query* (`?token=…`) is not touched: it is part of the
+/// address the receiver routes on, indistinguishable from any other parameter.
+///
+/// Idempotent: a URL with no userinfo is left alone.
+pub async fn strip_legacy_url_credentials(db: &DatabaseConnection) -> Result<usize> {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    let mut pages = webhook::Entity::find()
+        .filter(webhook::Column::Url.contains("@"))
+        .order_by_asc(webhook::Column::Id)
+        .paginate(db, 500);
+
+    let mut stripped = 0_usize;
+    while let Some(hooks) = pages
+        .fetch_and_next()
+        .await
+        .context("read webhook target URLs")?
+    {
+        for hook in hooks {
+            let target = crate::net::strip_url_credentials(&hook.url);
+            if !target.is_present() {
+                // An `@` in the path or query — nothing that authenticates.
+                continue;
+            }
+            let id = hook.id;
+            let mut model: webhook::ActiveModel = hook.into();
+            model.url = Set(target.url);
+            model
+                .update(db)
+                .await
+                .with_context(|| format!("rewrite the target URL of webhook {id}"))?;
+            tracing::warn!(
+                webhook_id = id,
+                "webhook {id} carried a credential in its target URL; it was removed — the \
+                 receiver must authenticate deliveries by their signature instead"
+            );
+            stripped += 1;
+        }
+    }
+
+    if stripped > 0 {
+        tracing::info!(count = stripped, "removed credentials from webhook URLs");
+    }
+    Ok(stripped)
+}
+
 // ── CRUD ──────────────────────────────────────────────────────────────────
+
+/// A webhook target may not carry a credential in its userinfo.
+///
+/// `webhooks.url` is a plaintext column and the hook's *own* secret is the only
+/// thing this table encrypts, so `https://user:token@host/hook` would store a
+/// usable credential in the clear — and hand it back out through every
+/// `GET /hooks` response and every recorded delivery error. Unlike a mirror
+/// there is nowhere to move it to: a webhook authenticates by signing its
+/// payload, not by logging in. So the URL is refused, with the alternative
+/// named.
+fn reject_url_credentials(url: &str) -> Result<()> {
+    let target = crate::net::split_url_credentials(url).context("invalid webhook URL")?;
+    if target.is_present() {
+        return Err(crate::error::invalid_request(
+            "a webhook URL may not carry a credential in it (`https://user:token@host/hook`): \
+             the URL is stored and shown as typed, so the credential would sit in the database \
+             in the clear. Authenticate the delivery with the hook's signing secret \
+             (`X-Hub-Signature-256`) instead.",
+        ));
+    }
+    Ok(())
+}
 
 /// Register a new webhook for a repository.
 pub async fn create_webhook(
@@ -181,6 +266,7 @@ pub async fn create_webhook(
     // Reject obviously-internal targets (bad scheme / private IP literal) at
     // registration for immediate feedback; delivery re-checks with DNS.
     crate::net::check_url_static(&req.url).context("invalid webhook URL")?;
+    reject_url_credentials(&req.url)?;
     let now = Utc::now();
     let events_str = req.events.join(",");
     let model = webhook::ActiveModel {
@@ -224,6 +310,7 @@ pub async fn update_webhook(
 ) -> Result<webhook::Model> {
     if let Some(url) = req.url.as_deref() {
         crate::net::check_url_static(url).context("invalid webhook URL")?;
+        reject_url_credentials(url)?;
     }
     let secret_encrypted = match req.secret.as_deref() {
         Some(secret) => seal_secret(Some(secret), encryption_key)?,
@@ -311,8 +398,13 @@ pub(crate) async fn trigger_event_with_tracker(
                 {
                     Ok(resp_status) => (Some(resp_status), None::<String>),
                     Err(e) => {
-                        tracing::warn!(webhook_id = hook_id, error = %format!("{e:#}"), "webhook delivery failed");
-                        (None, Some(format!("delivery error: {:#}", e)))
+                        // The reason is persisted on the delivery and shown in
+                        // the hook's delivery list, and `reqwest` quotes the URL
+                        // it failed on. A hook registered before the userinfo
+                        // check existed still carries a credential there.
+                        let reason = crate::net::mask_url_credentials(&format!("{e:#}"));
+                        tracing::warn!(webhook_id = hook_id, error = %reason, "webhook delivery failed");
+                        (None, Some(format!("delivery error: {reason}")))
                     }
                 };
 

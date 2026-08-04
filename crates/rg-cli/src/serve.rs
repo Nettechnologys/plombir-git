@@ -783,6 +783,26 @@ pub(crate) async fn run_serve(
         .await
         .context("seal webhook signing secrets at rest")?;
 
+    // The same boot slot, for the credential that was never in a column at all:
+    // one typed into the URL of a mirror, an import or a webhook. Create and
+    // update now split it out, so these three passes only ever have rows that
+    // predate that to convert — and they run before anything can sync, import
+    // or deliver, which is where such a URL would be quoted into a persisted
+    // error. Fatal for the same reason as the sealing above: a half-converted
+    // column is exactly what the pass exists to prevent.
+    rg_core::mirror::service::lift_legacy_url_credentials(
+        &db,
+        &resolved_auth_secrets.encryption_key,
+    )
+    .await
+    .context("move credentials out of mirror remote URLs")?;
+    rg_core::import::service::strip_legacy_source_url_credentials(&db)
+        .await
+        .context("remove tokens from import source URLs")?;
+    rg_core::webhook::service::strip_legacy_url_credentials(&db)
+        .await
+        .context("remove credentials from webhook URLs")?;
+
     // ── Instance provenance identity ──────────────────────────────
     // The Ed25519 key that signs release attestations and backs the CI OIDC
     // JWKS. Loaded from the database — on the first start it adopts exactly the

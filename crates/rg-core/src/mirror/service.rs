@@ -17,6 +17,18 @@
 //! verbatim into `.git/config` on disk. See
 //! [`rg_git::credentials::credential_invocation`], which the import pipeline
 //! shares — both carry a secret to a user-supplied remote.
+//!
+//! ## A credential typed into the URL
+//!
+//! `https://user:token@host/repo.git` puts the same secret in `mirrors.url`,
+//! which is a plaintext column — past the encryption `password_encrypted`
+//! provides, and back out through `MirrorResponse.url` and
+//! `last_sync_error`. So the credential is taken out of the URL on the way in
+//! ([`crate::net::split_url_credentials`]) and put where it belongs: the login
+//! in `username`, the secret in `password_encrypted`. Rows written before that
+//! are converted at startup by [`lift_legacy_url_credentials`], and
+//! [`mask_credential`] is the last net in front of anything persisted or
+//! logged.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -33,6 +45,11 @@ use std::path::Path;
 /// `password` is the plaintext credential as the operator typed it; it is
 /// encrypted here and never stored as given. An empty string means "no
 /// credential", the same as `None`.
+///
+/// A credential written into `url` itself is lifted out into the same two
+/// fields, so it is stored the same way wherever it was typed. An explicit
+/// `username` / `password` wins over the URL's — the form is the place the
+/// operator meant it, and the URL is the place they pasted it.
 pub async fn create_mirror(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -54,6 +71,17 @@ pub async fn create_mirror(
     // Reject an obviously-internal / non-git-transport remote at registration
     // for immediate operator feedback; sync re-checks with DNS resolution.
     crate::net::check_git_url_static(&url).context("invalid mirror URL")?;
+
+    // Take a credential out of the URL before anything stores it. `url` is a
+    // plaintext column; `password_encrypted` is not.
+    let remote = crate::net::split_url_credentials(&url).context("invalid mirror URL")?;
+    let url = remote.url;
+    let username = username
+        .filter(|value| !value.is_empty())
+        .or(remote.username);
+    let password = password
+        .filter(|value| !value.is_empty())
+        .or(remote.password);
 
     // Check for existing mirror. This read is the fast path only — the row can
     // still appear between here and the insert below, which is why the insert
@@ -138,7 +166,17 @@ pub async fn update_mirror(
     if let Some(v) = url {
         // Same static SSRF/scheme guard as create; sync re-checks with DNS.
         crate::net::check_git_url_static(&v).context("invalid mirror URL")?;
-        model.url = Set(v);
+        // …and the same split, for the same reason. Whatever the URL carried is
+        // written to the credential fields first, so an explicit `username` /
+        // `password` in this same request still overwrites it below.
+        let remote = crate::net::split_url_credentials(&v).context("invalid mirror URL")?;
+        model.url = Set(remote.url);
+        if let Some(lifted) = remote.username {
+            model.username = Set(Some(lifted));
+        }
+        if let Some(lifted) = remote.password {
+            model.password_encrypted = Set(encrypt_password(Some(&lifted), encryption_key)?);
+        }
     }
     if let Some(v) = username {
         model.username = Set(Some(v));
@@ -322,13 +360,111 @@ fn load_credentials(mirror: &Mirror, encryption_key: &str) -> Result<Option<GitC
 }
 
 /// Replace the credential in a message that is about to be persisted or logged.
+///
+/// Two sources, because a mirror has two places a credential can come from: the
+/// one this sync loaded out of `password_encrypted`, and one still written into
+/// a URL that the message quotes — git echoes the remote it failed to reach,
+/// and a row predating the create-time split still carries it.
 fn mask_credential(message: &str, credentials: Option<&Option<GitCredentials>>) -> String {
+    let message = crate::net::mask_url_credentials(message);
     match credentials.and_then(Option::as_ref) {
         Some(credentials) => {
-            crate::auth::encryption::mask_values(message, &[credentials.password().to_string()])
+            crate::auth::encryption::mask_values(&message, &[credentials.password().to_string()])
         }
-        None => message.to_string(),
+        None => message,
     }
+}
+
+/// Move a credential typed into `mirrors.url` into the columns that protect it.
+///
+/// The create/update path splits every URL it is handed, but a row written
+/// before it did still holds `https://user:token@host/repo.git` in a plaintext
+/// column. Run by `forgekeep serve` right after the key preflight — the first
+/// point in the boot where the schema and the at-rest key both exist, and
+/// before any sync can quote such a URL into `last_sync_error`. Returns how
+/// many rows it rewrote.
+///
+/// Idempotent: a URL with no userinfo is left alone, so a restart costs one
+/// query and rewrites nothing.
+///
+/// Two cases are converted rather than kept:
+///
+/// * `user:token@` — the login goes to `username`, the secret to
+///   `password_encrypted`, unless the row already has one of its own (an
+///   operator's explicit entry outranks a pasted URL, and dropping the URL copy
+///   is the point).
+/// * a lone `user@` on `http(s)` — dropped. Git was never given a password to
+///   pair it with and prompting is off, so it authenticated nothing; promoting
+///   it into `username` would only move a possible token from one plaintext
+///   column to another.
+pub async fn lift_legacy_url_credentials(
+    db: &DatabaseConnection,
+    encryption_key: &str,
+) -> Result<usize> {
+    use rg_db::entities::mirror;
+    use sea_orm::{ActiveModelTrait, ColumnTrait, PaginatorTrait, QueryFilter, QueryOrder};
+
+    let mut pages = mirror::Entity::find()
+        .filter(mirror::Column::Url.contains("@"))
+        .order_by_asc(mirror::Column::Id)
+        .paginate(db, 500);
+
+    let mut lifted_rows = 0_usize;
+    while let Some(mirrors) = pages
+        .fetch_and_next()
+        .await
+        .context("read mirror remote URLs")?
+    {
+        for mirror in mirrors {
+            let lifted = crate::net::strip_url_credentials(&mirror.url);
+            if !lifted.is_present() {
+                // An `@` elsewhere in the URL — a scoped path, an scp-like
+                // `git@host:path` remote. Nothing to take out.
+                continue;
+            }
+
+            let id = mirror.id;
+            let had_password = mirror.password_encrypted.is_some();
+            let had_username = mirror.username.is_some();
+            let mut model: mirror::ActiveModel = mirror.into();
+            model.url = Set(lifted.url);
+
+            match lifted.password {
+                Some(password) if !had_password => {
+                    model.password_encrypted =
+                        Set(encrypt_password(Some(&password), encryption_key)?);
+                    if let (false, Some(username)) = (had_username, lifted.username) {
+                        model.username = Set(Some(username));
+                    }
+                }
+                Some(_) => tracing::warn!(
+                    mirror_id = id,
+                    "mirror {id} had a credential in its URL and one of its own; the URL copy \
+                     was dropped and the stored credential kept"
+                ),
+                None => tracing::warn!(
+                    mirror_id = id,
+                    "mirror {id} had a credential in its URL with no password half; it could \
+                     not have authenticated anything and was dropped — re-enter it in the \
+                     mirror settings if the remote needs one"
+                ),
+            }
+
+            model
+                .update(db)
+                .await
+                .with_context(|| format!("rewrite the remote URL of mirror {id}"))?;
+            lifted_rows += 1;
+        }
+    }
+
+    if lifted_rows > 0 {
+        tracing::info!(
+            count = lifted_rows,
+            "moved credentials out of mirror remote URLs"
+        );
+    }
+    Ok(lifted_rows)
 }
 
 // ── Git helpers ─────────────────────────────────────────────────────────
@@ -484,6 +620,23 @@ mod tests {
             credentials.as_ref(),
         );
         assert!(!masked.contains("hunter2"), "{masked}");
+    }
+
+    /// The other half of the same net: the secret is not always the one this
+    /// sync loaded. git echoes the remote it failed to reach, and a row written
+    /// before the create-time split still carries the credential in it — with
+    /// nothing in `password_encrypted` for `mask_values` to match on.
+    #[test]
+    fn a_sync_error_never_carries_a_credential_out_of_the_url_either() {
+        let masked = mask_credential(
+            "fatal: unable to access 'https://bot:ghp_SECRET@example.com/o/r.git/': 403",
+            None,
+        );
+        assert!(!masked.contains("ghp_SECRET"), "{masked}");
+        assert!(
+            masked.contains("example.com/o/r.git"),
+            "the remote must still be identifiable: {masked}"
+        );
     }
 
     /// The acceptance check of card_c29cb3416941: a mirror of a *private* remote

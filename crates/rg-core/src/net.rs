@@ -245,8 +245,12 @@ fn split_git_remote(raw: &str) -> Result<(String, String)> {
             }
         }
     }
+    // The rejected text is quoted back, so it goes through the mask first: a
+    // remote that failed to parse can still have carried a credential, and this
+    // message reaches both the client and the log.
     Err(crate::error::invalid_request(format!(
-        "'{raw}' is not a valid git remote (expected an https/http/git/ssh URL or scp-like host:path)"
+        "'{}' is not a valid git remote (expected an https/http/git/ssh URL or scp-like host:path)",
+        mask_url_credentials(raw)
     )))
 }
 
@@ -318,6 +322,205 @@ pub async fn guard_git_url(raw: &str) -> Result<()> {
         anyhow::bail!("git remote host '{host}' did not resolve to any address");
     }
     Ok(())
+}
+
+// ── Credentials written inside the URL ──────────────────────────────────────
+//
+// A remote typed as `https://user:token@host/repo.git` carries its credential
+// in the URL itself. Every column that holds such a URL — `mirrors.url`,
+// `import_tasks.source_url`, `webhooks.url` — is plaintext, so the secret walks
+// straight past the encryption the row's *own* credential column provides, and
+// then out again through every response and error message that quotes the URL.
+//
+// These helpers are the one place that takes a credential back out of a URL, so
+// the three call sites cannot drift apart on what counts as a secret:
+// **the password is one, the login name is not**.
+
+/// A user-supplied URL with the credential taken out of its userinfo section.
+///
+/// Two rewritten forms, because the callers differ in what they can store:
+///
+/// * [`url`](Self::url) — the whole `user[:password]@` gone. For a caller with
+///   a column for the login (`mirrors.username`).
+/// * [`url_without_secret`](Self::url_without_secret) — only the password gone,
+///   `user@` kept. For a caller with nowhere to put a login
+///   (`import_tasks.source_url`): a login name is not a secret, and leaving it
+///   in the URL is what lets `git` authenticate at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlCredentials {
+    /// The URL with the entire userinfo section removed.
+    pub url: String,
+    /// The URL with the password removed and the login kept.
+    pub url_without_secret: String,
+    /// The login half of the userinfo, when there was one to lift.
+    pub username: Option<String>,
+    /// The secret half of the userinfo.
+    pub password: Option<String>,
+}
+
+impl UrlCredentials {
+    /// Did the URL carry anything this type had to take out of it?
+    pub fn is_present(&self) -> bool {
+        self.username.is_some() || self.password.is_some()
+    }
+}
+
+/// Take the credential out of a URL, rejecting the shapes that cannot be
+/// stored safely. Use at create/update time, where the operator is present to
+/// read the error and fix the input.
+///
+/// Two rejections, both of them cases where storing what was typed would leave
+/// a usable secret in a plaintext column:
+///
+/// * a password on a non-`http(s)` transport (`ssh://u:p@host/…`) — `git` never
+///   uses it, so it would be stored for nothing;
+/// * a lone `user@` on `http(s)` — GitHub documents `https://<token>@host/…`,
+///   and nothing in the URL distinguishes that token from a login name. Guessing
+///   either way is wrong half the time, so the operator is asked to put the
+///   credential in the password field instead.
+pub fn split_url_credentials(raw: &str) -> Result<UrlCredentials> {
+    let lifted = strip_url_credentials(raw);
+    if !lifted.is_present() {
+        return Ok(lifted);
+    }
+
+    let scheme = reqwest::Url::parse(raw.trim())
+        .map(|url| url.scheme().to_string())
+        .unwrap_or_default();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        if lifted.password.is_some() {
+            return Err(crate::error::invalid_request(format!(
+                "a password written into a '{scheme}' URL is never used by git and would be \
+                 stored in the clear — remove it from the URL"
+            )));
+        }
+        return Ok(lifted);
+    }
+
+    if lifted.password.is_none() {
+        return Err(crate::error::invalid_request(
+            "the URL carries a credential with no password (`https://something@host/…`), and \
+             nothing in it says whether `something` is a login name or a token — put the \
+             credential in the password field instead (the username may be anything the remote \
+             accepts, e.g. `x-access-token`)",
+        ));
+    }
+    Ok(lifted)
+}
+
+/// The lenient twin of [`split_url_credentials`], for values already in the
+/// database. Never rejects: a row is not an input an operator can correct, and
+/// leaving the secret in place because its shape is ambiguous is the one
+/// outcome the startup passes exist to prevent.
+pub fn strip_url_credentials(raw: &str) -> UrlCredentials {
+    let raw = raw.trim();
+    let untouched = || UrlCredentials {
+        url: raw.to_string(),
+        url_without_secret: raw.to_string(),
+        username: None,
+        password: None,
+    };
+
+    // scp-like shorthand (`git@host:path`) and bare paths do not parse as a
+    // URL. The shorthand's `user@` is an ssh login and has no password half, so
+    // there is nothing in it to lift.
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return untouched();
+    };
+    let username = decode_userinfo(url.username());
+    let password = url.password().map(decode_userinfo);
+    if username.is_empty() && password.is_none() {
+        return untouched();
+    }
+
+    // Only `http(s)` puts the userinfo to work as a credential (HTTP Basic).
+    // On `ssh://` and `git://` the login belongs to the transport and must stay
+    // in the URL; only a password is worth taking out.
+    let http = matches!(url.scheme(), "http" | "https");
+
+    let mut bare = url.clone();
+    let stripped = bare
+        .set_username("")
+        .and_then(|()| bare.set_password(None))
+        .is_ok();
+    let mut without_secret = url.clone();
+    let secret_stripped = without_secret.set_password(None).is_ok();
+
+    if !stripped || !secret_stripped {
+        // A URL that cannot hold a userinfo section cannot have had one, so
+        // this is unreachable for anything `Url::parse` accepted with a
+        // credential — but silently keeping the secret is not the failure mode
+        // to pick if it ever is.
+        tracing::warn!("a URL credential could not be rewritten out of its URL");
+        return untouched();
+    }
+
+    UrlCredentials {
+        url: if http {
+            bare.to_string()
+        } else {
+            without_secret.to_string()
+        },
+        url_without_secret: without_secret.to_string(),
+        username: if http {
+            Some(username).filter(|u| !u.is_empty())
+        } else {
+            None
+        },
+        password,
+    }
+}
+
+/// Percent-decode one half of a userinfo section back to what was typed.
+///
+/// A password with a `@` or `/` in it only survives a URL as `%40` / `%2F`;
+/// storing the encoded form would hand `git` a credential the remote rejects.
+/// Undecodable bytes are kept as they came — a credential that is not valid
+/// UTF-8 is still the credential, and this is not the place to refuse it.
+fn decode_userinfo(raw: &str) -> String {
+    urlencoding::decode(raw)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// Replace the `user[:password]@` section of every URL in `text` with `***`.
+///
+/// The last net in front of text that is about to be persisted or logged —
+/// `mirrors.last_sync_error`, `import_tasks.error`, a delivery record, a
+/// `tracing` line — for a URL that still carries a credential: one an operator
+/// typed before the create-time split existed, or one echoed back at us inside
+/// a remote's own error text.
+///
+/// Masks the login as well as the password. It cannot tell a `git@` from a
+/// token (that ambiguity is why [`split_url_credentials`] refuses the shape),
+/// and a masked login costs one diagnostic detail while a leaked token costs
+/// the account.
+pub fn mask_url_credentials(text: &str) -> String {
+    const AUTHORITY_END: &[char] = &['/', '?', '#', '"', '\'', '`', '<', '>', ')', ',', ';'];
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(marker) = rest.find("://") {
+        let authority_start = marker + "://".len();
+        out.push_str(&rest[..authority_start]);
+        let tail = &rest[authority_start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || AUTHORITY_END.contains(&c))
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        // `rfind`: a literal `@` inside a password has to be percent-encoded to
+        // parse at all, so the last one is the userinfo separator.
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -453,6 +656,125 @@ mod tests {
         );
         // scp-like pointing at an internal literal is caught statically.
         assert!(check_git_url_static("git@127.0.0.1:owner/repo.git").is_err());
+    }
+
+    // ── Credentials inside the URL ──────────────────────────────────────────
+
+    #[test]
+    fn a_user_password_url_is_split_into_a_bare_url_and_its_two_halves() {
+        let split = split_url_credentials("https://sync-bot:ghp_SECRET@example.com/o/r.git")
+            .expect("a `user:password@` URL is the shape that can be stored safely");
+
+        assert_eq!(split.url, "https://example.com/o/r.git");
+        assert_eq!(
+            split.url_without_secret,
+            "https://sync-bot@example.com/o/r.git"
+        );
+        assert_eq!(split.username.as_deref(), Some("sync-bot"));
+        assert_eq!(split.password.as_deref(), Some("ghp_SECRET"));
+        // Neither rewritten form may still carry the secret — that is the whole
+        // point of the split.
+        assert!(!split.url.contains("ghp_SECRET"));
+        assert!(!split.url_without_secret.contains("ghp_SECRET"));
+    }
+
+    #[test]
+    fn a_percent_encoded_password_is_decoded_back_to_what_was_typed() {
+        // `@` and `/` only survive a URL encoded; storing the encoded form would
+        // hand git a credential the remote rejects.
+        let split = split_url_credentials("https://bot:p%40ss%2Fword@example.com/r.git").unwrap();
+        assert_eq!(split.password.as_deref(), Some("p@ss/word"));
+    }
+
+    #[test]
+    fn a_url_without_a_credential_is_returned_untouched() {
+        for raw in [
+            "https://example.com/o/r.git",
+            "git@github.com:owner/repo.git", // scp-like: an ssh login, no secret
+            "ssh://git@example.com/o/r.git", // ditto, in URL form
+            "git://example.com/r.git",
+        ] {
+            let split = split_url_credentials(raw).expect("no credential to reject");
+            assert!(!split.is_present(), "{raw} was treated as carrying one");
+            assert_eq!(split.url, raw);
+            assert_eq!(split.url_without_secret, raw);
+        }
+    }
+
+    #[test]
+    fn a_lone_userinfo_on_http_is_refused_rather_than_guessed() {
+        // `https://<token>@host/…` is GitHub's documented paste form, and it is
+        // also what a login name looks like. Storing it as a username would put
+        // a token in a plaintext column; storing it as a password would break a
+        // login. The operator is asked instead.
+        let error = split_url_credentials("https://ghp_SECRET@github.com/o/r.git")
+            .expect_err("an ambiguous credential must not be stored");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("password field"),
+            "the rejection must say what to do instead: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ghp_SECRET"),
+            "the rejection quoted the credential back: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_password_on_a_transport_that_cannot_use_one_is_refused() {
+        let error = split_url_credentials("ssh://git:hunter2@example.com/o/r.git")
+            .expect_err("git never uses a password from an ssh URL");
+        assert!(format!("{error:#}").contains("ssh"));
+    }
+
+    #[test]
+    fn the_lenient_strip_never_refuses_a_stored_row() {
+        // A lone userinfo — refused on the way in, still has to be taken out of
+        // a row written before that check existed.
+        let lifted = strip_url_credentials("https://ghp_SECRET@github.com/o/r.git");
+        assert_eq!(lifted.url, "https://github.com/o/r.git");
+        assert_eq!(lifted.username.as_deref(), Some("ghp_SECRET"));
+        assert_eq!(lifted.password, None);
+
+        // An ssh login stays in the URL; only the password is worth lifting.
+        let lifted = strip_url_credentials("ssh://git:hunter2@example.com/o/r.git");
+        assert_eq!(lifted.url, "ssh://git@example.com/o/r.git");
+        assert_eq!(lifted.username, None);
+        assert_eq!(lifted.password.as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn masking_removes_the_userinfo_and_keeps_the_rest_of_the_message() {
+        assert_eq!(
+            mask_url_credentials(
+                "fatal: could not read from https://bot:ghp_SECRET@example.com/o/r.git"
+            ),
+            "fatal: could not read from https://***@example.com/o/r.git"
+        );
+        // Several URLs in one message, and one without a credential.
+        assert_eq!(
+            mask_url_credentials("a https://u:p@a.example/x and b https://b.example/y"),
+            "a https://***@a.example/x and b https://b.example/y"
+        );
+        // Idempotent: masking an already-masked message changes nothing.
+        let once = mask_url_credentials("https://u:p@host/x");
+        assert_eq!(mask_url_credentials(&once), once);
+        // Nothing that looks like a URL: untouched.
+        assert_eq!(mask_url_credentials("no urls here"), "no urls here");
+        // A `@` after the authority (an e-mail in a path) is not userinfo.
+        assert_eq!(
+            mask_url_credentials("https://example.com/u/a@b.com"),
+            "https://example.com/u/a@b.com"
+        );
+    }
+
+    #[test]
+    fn a_rejected_remote_is_quoted_back_without_its_credential() {
+        // `ext::` is refused for what it is; the refusal must not repeat the
+        // token that was sitting in the URL.
+        let error = check_git_url_static("ext::https://u:ghp_SECRET@example.com/r.git")
+            .expect_err("ext:: is not an allowed transport");
+        assert!(!format!("{error:#}").contains("ghp_SECRET"));
     }
 
     #[tokio::test]

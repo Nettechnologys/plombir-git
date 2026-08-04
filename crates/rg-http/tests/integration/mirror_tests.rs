@@ -334,6 +334,87 @@ async fn a_stored_mirror_password_is_encrypted_at_rest() {
     );
 }
 
+/// card_e71e1ba04ae7: the encryption above only covers the credential the
+/// operator typed into the *password* field. Typed into the URL instead —
+/// `https://user:token@host/repo.git`, the form GitHub and GitLab both document
+/// — it used to be stored verbatim in `mirrors.url`, a plaintext column, and
+/// handed straight back out by every mirror endpoint.
+///
+/// This is that acceptance check, from the client's side: create through the
+/// API, then read the row *and* the response.
+#[tokio::test]
+async fn a_credential_typed_into_the_mirror_url_reaches_neither_the_row_nor_the_reply() {
+    const URL_TOKEN: &str = "ghp-URL-SECRET-TOKEN";
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "mirror-url", "mirror-url@example.com").await;
+    create_repo(&base, &token, "url-credential").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/mirror-url/url-credential/mirror");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": format!("https://sync-bot:{URL_TOKEN}@example.com/upstream.git"),
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let created: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 201,
+        "a pasted credential URL must still register a mirror: {created}"
+    );
+
+    // The reply, which is what the settings page renders.
+    assert!(
+        !created.to_string().contains(URL_TOKEN),
+        "the create reply handed the token back: {created}"
+    );
+    assert_eq!(created["url"], "https://example.com/upstream.git");
+    assert_eq!(created["username"], "sync-bot");
+    assert_eq!(
+        created["has_credentials"], true,
+        "the credential was dropped instead of stored: {created}"
+    );
+
+    // The row, which is what a database dump holds.
+    let repo_id = created["repo_id"].as_i64().expect("repo_id");
+    let row = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert!(
+        !row.url.contains(URL_TOKEN),
+        "the token is still in `mirrors.url`: {}",
+        row.url
+    );
+    let stored = row
+        .password_encrypted
+        .expect("the credential moved to the encrypted column, so it is there");
+    assert_ne!(stored, URL_TOKEN, "the token is stored in the clear");
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(
+            &stored,
+            &rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY)
+        )
+        .expect("decrypt"),
+        URL_TOKEN,
+        "the mirror can no longer authenticate with what was pasted"
+    );
+
+    // And the read the settings page performs on every visit.
+    let fetched = get_mirror(&client, &url, &token).await;
+    assert!(
+        !fetched.to_string().contains(URL_TOKEN),
+        "GET returned the token: {fetched}"
+    );
+}
+
 /// The other half of card_c29cb3416941: the credential is not just stored, it
 /// is *read* by the sync. Proving that without a network is easy from the
 /// failure side — a value the server cannot decrypt (one written under a

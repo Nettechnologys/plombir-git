@@ -68,6 +68,12 @@ impl From<rg_db::entities::mirror::Model> for MirrorResponse {
 /// Request body for creating/updating a mirror.
 #[derive(Deserialize, ToSchema)]
 pub struct CreateMirrorRequest {
+    /// The remote to mirror. A credential written into the URL
+    /// (`https://user:token@host/repo.git`) is moved into `username` +
+    /// the encrypted password column and does not stay in the stored URL, so
+    /// `url` here and the `url` in the response need not be byte-identical.
+    /// A URL with a `user@` and no password is refused: nothing in it says
+    /// whether that is a login name or a token.
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -86,6 +92,7 @@ fn default_interval() -> i64 {
 /// Request body for updating a mirror.
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateMirrorRequest {
+    /// Replacement remote. Same credential handling as on create.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

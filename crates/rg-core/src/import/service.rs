@@ -31,6 +31,17 @@
 //! clone URL, which git copies verbatim into the new repository's
 //! `remote.origin.url`. See [`rg_git::credentials::credential_invocation`],
 //! which mirror sync shares: both hand a secret to a user-supplied remote.
+//!
+//! ## A token typed into the source URL
+//!
+//! `https://user:token@host/repo.git` would put that same token in
+//! `import_tasks.source_url`, which *is* stored and *is* returned by every
+//! status poll. So [`start_import`] takes it back out
+//! ([`crate::net::split_url_credentials`]) and treats it as the token it is —
+//! in memory, for the life of the import. The login half stays in the URL: it
+//! is not a secret, this table has no column for it, and `git` needs it to
+//! authenticate. Rows written before that are stripped at startup by
+//! [`strip_legacy_source_url_credentials`].
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -126,7 +137,7 @@ async fn run_git_import(
             repo_root,
             &task.target_owner,
             &task.target_name,
-            source_credentials(&task.platform, auth_token).as_ref(),
+            source_credentials(&task.platform, &task.source_url, auth_token).as_ref(),
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 90, "Repository cloned").await?;
@@ -177,7 +188,7 @@ async fn run_github_import(
             repo_root,
             &task.target_owner,
             &task.target_name,
-            source_credentials(&task.platform, token).as_ref(),
+            source_credentials(&task.platform, &task.source_url, token).as_ref(),
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 10, "Repository cloned").await?;
@@ -352,7 +363,7 @@ async fn run_gitlab_import(
             repo_root,
             &task.target_owner,
             &task.target_name,
-            source_credentials(&task.platform, token).as_ref(),
+            source_credentials(&task.platform, &task.source_url, token).as_ref(),
         )?;
         stats.repo_cloned = true;
         update_stage(db, task.id, "importing", 10, "Repository cloned").await?;
@@ -538,15 +549,25 @@ async fn resolve_or_create_target_repo(
 ///
 /// An empty token means the user described a public source: the clone stays
 /// anonymous rather than offering an empty password.
-fn source_credentials(platform: &str, token: &str) -> Option<GitCredentials> {
+///
+/// `source_url` is read for one thing only: the login the operator left in it
+/// (`https://user@host/repo.git`, what remains after [`start_import`] lifted the
+/// token out of `user:token@`). A self-hosted remote that checks the username
+/// gets the one that was typed instead of a placeholder that would not match;
+/// a URL without one falls back to the platform's.
+fn source_credentials(platform: &str, source_url: &str, token: &str) -> Option<GitCredentials> {
     if token.is_empty() {
         return None;
     }
-    let username = match platform {
-        "github" => "x-access-token",
-        _ => "oauth2",
+    let from_url = crate::net::strip_url_credentials(source_url).username;
+    let username = match from_url {
+        Some(username) => username,
+        None => match platform {
+            "github" => "x-access-token".to_string(),
+            _ => "oauth2".to_string(),
+        },
     };
-    Some(GitCredentials::token(username, token))
+    Some(GitCredentials::token(&username, token))
 }
 
 /// Clone a repository (bare) into the ForgeKeep repo root.
@@ -1419,8 +1440,12 @@ async fn update_stage(
 /// the user on every status poll, which is exactly the path this module refuses
 /// to put the token on. Masking is the same last-resort net `mirror::service`
 /// puts in front of `last_sync_error`.
+///
+/// The URL userinfo is masked as well: a task row written before the
+/// create-time split still carries `user:token@` in its source URL, and the
+/// message quoting it is the same message.
 fn failure_reason(error: &anyhow::Error, auth_token: Option<&str>) -> String {
-    let reason = format!("{error:#}");
+    let reason = crate::net::mask_url_credentials(&format!("{error:#}"));
     match auth_token.filter(|token| !token.is_empty()) {
         Some(token) => crate::auth::encryption::mask_values(&reason, &[token.to_string()]),
         None => reason,
@@ -1452,6 +1477,16 @@ pub async fn start_import(
 ) -> Result<ImportTask> {
     let now = Utc::now();
     let supports_metadata = matches!(platform.as_str(), "github" | "gitlab");
+
+    // A token pasted into the URL is a token, not part of the address: take it
+    // out before the row is written, and run the import with it. The login half
+    // stays in the URL — `import_tasks` has no column for it, and it is what
+    // `git` pairs the token with (see the module note).
+    let source = crate::net::split_url_credentials(&source_url).context("invalid source URL")?;
+    let source_url = source.url_without_secret;
+    let auth_token = auth_token
+        .filter(|token| !token.is_empty())
+        .or(source.password);
 
     let model = import_task::ActiveModel {
         user_id: Set(user_id),
@@ -1531,6 +1566,61 @@ pub async fn start_import(
     import_task_ops::find_by_id(db, task.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("import task not found after creation"))
+}
+
+/// Take a token back out of every `import_tasks.source_url` that still has one.
+///
+/// The twin of `mirror::service::lift_legacy_url_credentials`, run from the
+/// same point in the boot — but there is nowhere here to *lift* the secret to:
+/// this table deliberately has no credential column (see the module note), and
+/// an import is one-shot, so a token in a finished task's URL is a copy that
+/// has already outlived its purpose. It is dropped, and the login half of the
+/// userinfo stays. Returns how many rows it rewrote.
+///
+/// Idempotent: a URL with no password in it is left alone.
+pub async fn strip_legacy_source_url_credentials(db: &DatabaseConnection) -> Result<usize> {
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    };
+
+    let mut pages = import_task::Entity::find()
+        .filter(import_task::Column::SourceUrl.contains("@"))
+        .order_by_asc(import_task::Column::Id)
+        .paginate(db, 500);
+
+    let mut stripped = 0_usize;
+    while let Some(tasks) = pages
+        .fetch_and_next()
+        .await
+        .context("read import source URLs")?
+    {
+        for task in tasks {
+            let lifted = crate::net::strip_url_credentials(&task.source_url);
+            if lifted.password.is_none() {
+                // An `@` in the path, an scp-like remote, or a bare login — no
+                // secret to take out.
+                continue;
+            }
+            let id = task.id;
+            let mut model: import_task::ActiveModel = task.into();
+            model.source_url = Set(lifted.url_without_secret);
+            model
+                .update(db)
+                .await
+                .with_context(|| format!("rewrite the source URL of import task {id}"))?;
+            tracing::warn!(
+                task_id = id,
+                "import task {id} carried a token in its source URL; it was removed — re-run \
+                 the import with the token in its own field if it is still needed"
+            );
+            stripped += 1;
+        }
+    }
+
+    if stripped > 0 {
+        tracing::info!(count = stripped, "removed tokens from import source URLs");
+    }
+    Ok(stripped)
 }
 
 #[cfg(test)]
@@ -1613,15 +1703,16 @@ mod clone_credential_tests {
     /// turn an anonymous clone into a refused authenticated one.
     #[test]
     fn a_public_source_is_cloned_anonymously() {
-        assert!(source_credentials("github", "").is_none());
-        assert!(source_credentials("gitlab", "").is_none());
+        assert!(source_credentials("github", "https://github.com/o/r.git", "").is_none());
+        assert!(source_credentials("gitlab", "https://gitlab.com/o/r.git", "").is_none());
     }
 
     /// Basic auth has nowhere to put a lone token, so each platform's
     /// placeholder username has to be the one that platform actually accepts.
     #[test]
     fn each_platform_gets_the_username_it_documents() {
-        let github = source_credentials("github", TOKEN).expect("a token is a credential");
+        let github = source_credentials("github", "https://github.com/o/r.git", TOKEN)
+            .expect("a token is a credential");
         assert_eq!(github.password(), TOKEN);
         let (_, env) = credential_invocation(Some(&github));
         let env: HashMap<_, _> = env.into_iter().collect();
@@ -1631,7 +1722,8 @@ mod clone_credential_tests {
             Some("x-access-token")
         );
 
-        let gitlab = source_credentials("gitlab", TOKEN).expect("a token is a credential");
+        let gitlab = source_credentials("gitlab", "https://gitlab.com/o/r.git", TOKEN)
+            .expect("a token is a credential");
         let (_, env) = credential_invocation(Some(&gitlab));
         let env: HashMap<_, _> = env.into_iter().collect();
         assert_eq!(
@@ -1654,7 +1746,8 @@ mod clone_credential_tests {
             .expect("source repo");
 
         let repo_root = directory.path().join("repo_root");
-        let credentials = source_credentials("github", TOKEN).expect("a token");
+        let credentials =
+            source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
         clone_repo(
             &source.to_string_lossy(),
             &repo_root,
@@ -1685,7 +1778,8 @@ mod clone_credential_tests {
     fn a_private_source_receives_the_supplied_token() {
         let (address, seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
-        let credentials = source_credentials("github", TOKEN).expect("a token");
+        let credentials =
+            source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
 
         let outcome = clone_repo(
             &format!("http://{address}/upstream.git"),
