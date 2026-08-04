@@ -492,15 +492,10 @@ fn run_git_clone_mirror(
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let (credential_args, env) = credential_invocation(credentials);
+    let invocation = credential_invocation(credentials);
     let destination = path.to_string_lossy();
-    let mut args: Vec<&str> = credential_args.iter().map(String::as_str).collect();
-    args.extend(["clone", "--mirror", url, &destination]);
-    let env: Vec<(&str, &str)> = env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    git.run_with_env(&args, None, &env)?
+    invocation
+        .run(git, &["clone", "--mirror", url, &destination], None)?
         .ensure_success()
         .context("git clone --mirror")
 }
@@ -509,14 +504,8 @@ fn run_git_remote_update(path: &Path, credentials: Option<&GitCredentials>) -> R
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let (credential_args, env) = credential_invocation(credentials);
-    let mut args: Vec<&str> = credential_args.iter().map(String::as_str).collect();
-    args.extend(["remote", "update", "--prune"]);
-    let env: Vec<(&str, &str)> = env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    git.run_with_env(&args, Some(path), &env)?
+    credential_invocation(credentials)
+        .run(git, &["remote", "update", "--prune"], Some(path))?
         .ensure_success()
         .context("git remote update")
 }
@@ -564,15 +553,7 @@ mod tests {
             .expect("decrypt")
             .expect("a stored credential is readable");
         assert_eq!(loaded.password(), "hunter2");
-        // The username is only ever observable where it is used — in what the
-        // credential helper answers with.
-        let (_, env) = credential_invocation(Some(&loaded));
-        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(
-            env.get(rg_git::credentials::USERNAME_ENV)
-                .map(String::as_str),
-            Some("sync-bot")
-        );
+        assert_eq!(loaded.username(), Some("sync-bot"));
     }
 
     /// Two encryptions of one password differ (fresh nonce), so the column can't

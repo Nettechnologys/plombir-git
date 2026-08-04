@@ -606,15 +606,10 @@ fn clone_repo(
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let (credential_args, env) = credential_invocation(credentials);
+    let invocation = credential_invocation(credentials);
     let destination = target_dir.to_string_lossy();
-    let mut args: Vec<&str> = credential_args.iter().map(String::as_str).collect();
-    args.extend(["clone", "--bare", source_url, &destination]);
-    let env: Vec<(&str, &str)> = env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    git.run_with_env(&args, None, &env)?
+    invocation
+        .run(git, &["clone", "--bare", source_url, &destination], None)?
         .ensure_success()
         .context("git clone --bare")?;
 
@@ -1714,23 +1709,11 @@ mod clone_credential_tests {
         let github = source_credentials("github", "https://github.com/o/r.git", TOKEN)
             .expect("a token is a credential");
         assert_eq!(github.password(), TOKEN);
-        let (_, env) = credential_invocation(Some(&github));
-        let env: HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(
-            env.get(rg_git::credentials::USERNAME_ENV)
-                .map(String::as_str),
-            Some("x-access-token")
-        );
+        assert_eq!(github.username(), Some("x-access-token"));
 
         let gitlab = source_credentials("gitlab", "https://gitlab.com/o/r.git", TOKEN)
             .expect("a token is a credential");
-        let (_, env) = credential_invocation(Some(&gitlab));
-        let env: HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(
-            env.get(rg_git::credentials::USERNAME_ENV)
-                .map(String::as_str),
-            Some("oauth2")
-        );
+        assert_eq!(gitlab.username(), Some("oauth2"));
     }
 
     /// The acceptance check of card_64918e1184ff, on-disk half: git copies the

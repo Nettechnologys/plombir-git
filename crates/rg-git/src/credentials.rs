@@ -9,6 +9,13 @@
 //! back by an inline credential helper. Never through argv, never through the
 //! remote URL.
 
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+
+use anyhow::Result;
+
+use crate::cli_gateway::{GitCommandGateway, GitOutput};
+
 /// Environment variables the credential helper reads the secret out of. Named
 /// after the product so they cannot collide with something the operator has
 /// already exported for their own git usage.
@@ -22,6 +29,63 @@ pub const PASSWORD_ENV: &str = "FORGEKEEP_GIT_PASSWORD";
 /// if its ownership ever drifted; `/dev/null` is stable, root-owned, and makes
 /// every attempted child path fail closed with `ENOTDIR`.
 const DISARMED_HOME: &str = "/dev/null";
+
+/// One complete invocation policy for a git remote selected by a user.
+///
+/// Keeping the argument, explicit-environment, and inherited-environment
+/// policies together makes it impossible for import and mirror sync to pick up
+/// only the credential half and silently omit the transport hardening half.
+#[must_use = "an outbound git invocation must be run to apply its environment policy"]
+pub struct OutboundGitInvocation {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+impl OutboundGitInvocation {
+    /// Run the outbound operation under this policy.
+    pub fn run(
+        &self,
+        git: &GitCommandGateway,
+        args: &[&str],
+        repo_path: Option<&Path>,
+    ) -> Result<GitOutput> {
+        let mut full_args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        full_args.extend_from_slice(args);
+        let env: Vec<(&str, &str)> = self
+            .env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let inherited_env_to_remove: Vec<OsString> = std::env::vars_os()
+            .filter_map(|(key, _)| is_ambient_transport_env(&key).then_some(key))
+            .collect();
+
+        git.run_with_env_removed(&full_args, repo_path, &env, &inherited_env_to_remove)
+    }
+}
+
+/// Whether an inherited variable can change, authenticate, or observe the
+/// transport used for a remote chosen by somebody other than the operator.
+///
+/// The `GIT_` family is intentionally handled as a namespace, not as a frozen
+/// list: besides the obvious proxy/TLS/SSH knobs it includes indexed
+/// `GIT_CONFIG_KEY_<n>` injections and trace destinations capable of recording
+/// credentials. `SSH_` covers agents and askpass programs. libcurl's proxy
+/// namespace is open-ended by URL scheme, hence the suffix match.
+fn is_ambient_transport_env(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    let key = key.to_ascii_uppercase();
+
+    key.starts_with("GIT_")
+        || key.starts_with("SSH_")
+        || key.ends_with("_PROXY")
+        || matches!(
+            key.as_str(),
+            "CURL_SSL_BACKEND" | "NETRC" | "SSL_CERT_DIR" | "SSL_CERT_FILE" | "SSLKEYLOGFILE"
+        )
+}
 
 /// A remote's credential, in plaintext, for the duration of a single git
 /// invocation.
@@ -61,6 +125,11 @@ impl GitCredentials {
     pub fn password(&self) -> &str {
         &self.password
     }
+
+    /// The optional HTTP Basic username paired with the password or token.
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
 }
 
 /// Extra `git` arguments and environment that let the subprocess authenticate.
@@ -87,6 +156,10 @@ impl GitCredentials {
 ///   already approved the URL the user supplied;
 /// - `HOME` and `XDG_CONFIG_HOME` pointed at `/dev/null` put `~/.netrc`,
 ///   `~/.gitconfig`, and other per-user files outside the subprocess's reach;
+/// - inherited `GIT_*`, `SSH_*`, proxy, and TLS environment is removed before
+///   these explicit values are applied, so neither branch can acquire a proxy,
+///   client certificate, askpass program, ssh-agent, or injected Git config
+///   from the server process;
 /// - `GIT_TERMINAL_PROMPT=0`, because nothing here runs with a terminal behind
 ///   it: a remote that asks for authentication must fail fast instead of
 ///   blocking until the gateway's timeout.
@@ -99,9 +172,7 @@ impl GitCredentials {
 /// an isolated home would hide `~/.ssh`, but an inherited ssh-agent would remain
 /// ambient authority. Supporting private SSH remotes therefore needs a future
 /// explicit identity contract rather than another process-wide default.
-pub fn credential_invocation(
-    credentials: Option<&GitCredentials>,
-) -> (Vec<String>, Vec<(String, String)>) {
+pub fn credential_invocation(credentials: Option<&GitCredentials>) -> OutboundGitInvocation {
     let mut args = vec!["-c".to_string(), "credential.helper=".to_string()];
     let mut env = vec![
         ("HOME".to_string(), DISARMED_HOME.to_string()),
@@ -111,7 +182,7 @@ pub fn credential_invocation(
         ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
     ];
     let Some(credentials) = credentials else {
-        return (args, env);
+        return OutboundGitInvocation { args, env };
     };
 
     // git runs a `!`-prefixed helper through `sh -c '<value> "$@"' <value> get`,
@@ -128,7 +199,7 @@ pub fn credential_invocation(
         env.push((USERNAME_ENV.to_string(), username.clone()));
     }
     env.push((PASSWORD_ENV.to_string(), credentials.password.clone()));
-    (args, env)
+    OutboundGitInvocation { args, env }
 }
 
 #[cfg(test)]
@@ -140,7 +211,9 @@ mod tests {
     #[test]
     fn the_password_never_reaches_the_command_line() {
         let credentials = GitCredentials::token("sync-bot", "hunter2");
-        let (args, env) = credential_invocation(Some(&credentials));
+        let invocation = credential_invocation(Some(&credentials));
+        let args = &invocation.args;
+        let env = &invocation.env;
 
         let command_line = args.join(" ");
         assert!(
@@ -156,7 +229,7 @@ mod tests {
         assert_eq!(args[1], "credential.helper=");
         assert!(args[3].contains(USERNAME_ENV) && args[3].contains(PASSWORD_ENV));
 
-        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env.iter().cloned().collect();
         assert_eq!(env.get(PASSWORD_ENV).map(String::as_str), Some("hunter2"));
         assert_eq!(env.get(USERNAME_ENV).map(String::as_str), Some("sync-bot"));
         assert_eq!(
@@ -175,13 +248,15 @@ mod tests {
     /// with "authentication required".
     #[test]
     fn an_anonymous_remote_disarms_the_host_config_too() {
-        let (args, env) = credential_invocation(None);
+        let invocation = credential_invocation(None);
+        let args = &invocation.args;
+        let env = &invocation.env;
         assert_eq!(
             args,
-            vec!["-c".to_string(), "credential.helper=".to_string()],
+            &vec!["-c".to_string(), "credential.helper=".to_string()],
             "an anonymous invocation left the host's helper list in place"
         );
-        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env.iter().cloned().collect();
         assert_eq!(
             env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
             Some("0")
@@ -209,20 +284,24 @@ mod tests {
     #[test]
     fn both_branches_disarm_the_host_identically() {
         let credentials = GitCredentials::token("sync-bot", "hunter2");
-        let (with_args, with_env) = credential_invocation(Some(&credentials));
-        let (without_args, without_env) = credential_invocation(None);
+        let with_credentials = credential_invocation(Some(&credentials));
+        let without_credentials = credential_invocation(None);
 
         assert_eq!(
-            with_args[..2],
-            without_args[..2],
+            with_credentials.args[..2],
+            without_credentials.args[..2],
             "the helper reset differs between the two branches"
         );
-        let ambient = |env: Vec<(String, String)>| -> Vec<(String, String)> {
-            env.into_iter()
+        let ambient = |env: &[(String, String)]| -> Vec<(String, String)> {
+            env.iter()
                 .filter(|(key, _)| key != USERNAME_ENV && key != PASSWORD_ENV)
+                .cloned()
                 .collect()
         };
-        assert_eq!(ambient(with_env), ambient(without_env));
+        assert_eq!(
+            ambient(&with_credentials.env),
+            ambient(&without_credentials.env)
+        );
     }
 
     /// A username the caller left empty is not a username: the helper must
@@ -231,11 +310,45 @@ mod tests {
     #[test]
     fn an_empty_username_is_no_username() {
         let credentials = GitCredentials::new(Some(String::new()), "hunter2".to_string());
-        let (args, env) = credential_invocation(Some(&credentials));
+        let invocation = credential_invocation(Some(&credentials));
+        let args = &invocation.args;
+        let env = &invocation.env;
 
         assert!(!args[3].contains(USERNAME_ENV), "{}", args[3]);
-        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env.iter().cloned().collect();
         assert!(!env.contains_key(USERNAME_ENV));
         assert_eq!(env.get(PASSWORD_ENV).map(String::as_str), Some("hunter2"));
+    }
+
+    #[test]
+    fn the_transport_denylist_covers_namespaces_not_a_frozen_sample() {
+        for key in [
+            "GIT_PROXY_COMMAND",
+            "git_ssl_no_verify",
+            "GIT_CONFIG_KEY_17",
+            "GIT_TRACE_CURL_NO_DATA",
+            "SSH_AUTH_SOCK",
+            "ssh_askpass",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "CURL_SSL_BACKEND",
+            "SSL_CERT_FILE",
+            "SSLKEYLOGFILE",
+            "NETRC",
+        ] {
+            assert!(
+                is_ambient_transport_env(OsStr::new(key)),
+                "ambient transport variable escaped the denylist: {key}"
+            );
+        }
+
+        for key in ["PATH", "LANG", "FORGEKEEP_GIT_PASSWORD", "DATABASE_URL"] {
+            assert!(
+                !is_ambient_transport_env(OsStr::new(key)),
+                "unrelated server variable was removed from outbound git: {key}"
+            );
+        }
     }
 }

@@ -19,11 +19,17 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::credential_invocation;
+
+const TRANSPORT_CHILD_URL: &str = "FORGEKEEP_TEST_TRANSPORT_URL";
+const TRANSPORT_CHILD_DESTINATION: &str = "FORGEKEEP_TEST_TRANSPORT_DESTINATION";
+const TRANSPORT_CHILD_HARDENED: &str = "FORGEKEEP_TEST_TRANSPORT_HARDENED";
 
 /// One HTTP request the stub remote saw.
 #[derive(Clone, Debug)]
@@ -138,37 +144,158 @@ fn clone_attempt(url: &str, home: &Path, destination: &Path, reach: Reach, syste
             system.to_string_lossy().into_owned(),
         ));
     }
-    let mut args: Vec<String> = Vec::new();
-
-    if matches!(reach, Reach::Hardened) {
-        // Last write wins in the gateway, so the hardened values land on top of
-        // the ambient ones set above.
-        let (hardened_args, hardened_env) = credential_invocation(None);
-        args.extend(hardened_args);
-        env.extend(hardened_env);
-    }
-
-    let destination = destination.to_string_lossy().into_owned();
-    args.extend([
-        "clone".to_string(),
-        "--bare".to_string(),
-        url.to_string(),
-        destination,
-    ]);
-
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let env: Vec<(&str, &str)> = env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let output = global_gateway()
-        .as_ref()
-        .expect("git is installed")
-        .run_with_env(&args, None, &env)
-        .expect("git ran");
+    run_transport_child(matches!(reach, Reach::Hardened), url, destination, &env);
+}
+
+/// Run this integration-test binary in a fresh process so the planted
+/// transport variables are genuine inherited state, without mutating the
+/// process-global environment of a parallel test runner.
+fn run_transport_child(hardened: bool, url: &str, destination: &Path, env: &[(&str, &str)]) {
+    let executable = std::env::current_exe().expect("current test executable");
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", "/dev/null")
+        .env("XDG_CONFIG_HOME", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(TRANSPORT_CHILD_URL, url)
+        .env(
+            TRANSPORT_CHILD_DESTINATION,
+            destination.to_string_lossy().as_ref(),
+        )
+        .env(TRANSPORT_CHILD_HARDENED, if hardened { "1" } else { "0" })
+        .args([
+            "--exact",
+            "transport_environment_child",
+            "--ignored",
+            "--nocapture",
+        ]);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("spawn transport child");
+    assert!(
+        output.status.success(),
+        "transport child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Helper selected only by the parent acceptance tests in this file. The early
+/// return keeps `--run-ignored all` useful: the parent is what supplies a
+/// complete fixture and drives both the control and hardened mutations.
+#[test]
+#[ignore = "spawned by the ambient-authority acceptance tests"]
+fn transport_environment_child() {
+    let Ok(url) = std::env::var(TRANSPORT_CHILD_URL) else {
+        return;
+    };
+    let destination = std::env::var(TRANSPORT_CHILD_DESTINATION).expect("destination");
+    let hardened = std::env::var(TRANSPORT_CHILD_HARDENED).expect("mode") == "1";
+    let git = global_gateway().as_ref().expect("git is installed");
+    let args = ["clone", "--bare", url.as_str(), destination.as_str()];
+
+    let output = if hardened {
+        credential_invocation(None)
+            .run(git, &args, None)
+            .expect("hardened git ran")
+    } else {
+        git.run(&args, None).expect("control git ran")
+    };
     assert!(
         !output.success(),
-        "the stub remote refuses everyone — the clone cannot succeed"
+        "the deliberately unreachable remote unexpectedly cloned"
+    );
+}
+
+/// Acceptance for `card_37fd88e76723`.
+///
+/// Each variable gets a live control that proves real git obeyed it, followed
+/// by the outbound invocation against the same fixture. Removing the
+/// environment scrub from `OutboundGitInvocation::run` makes both hardened
+/// halves fail.
+#[test]
+fn transport_environment_is_not_inherited() {
+    let directory = tempfile::tempdir().expect("tempdir");
+
+    let proxy_script = directory.path().join("git-proxy-command.sh");
+    let proxy_marker = directory.path().join("git-proxy-command-ran");
+    std::fs::write(
+        &proxy_script,
+        "#!/bin/sh\n: > \"$FORGEKEEP_TEST_PROXY_MARKER\"\nexit 1\n",
+    )
+    .expect("write proxy command");
+    let mut permissions = std::fs::metadata(&proxy_script)
+        .expect("proxy command metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&proxy_script, permissions).expect("make proxy command executable");
+
+    let proxy_script = proxy_script.to_string_lossy().into_owned();
+    let proxy_marker_string = proxy_marker.to_string_lossy().into_owned();
+    let git_url = "git://127.0.0.1:9/upstream.git";
+    let git_proxy_env = [
+        ("GIT_PROXY_COMMAND", proxy_script.as_str()),
+        ("FORGEKEEP_TEST_PROXY_MARKER", proxy_marker_string.as_str()),
+    ];
+    run_transport_child(
+        false,
+        git_url,
+        &directory.path().join("git-proxy-control.git"),
+        &git_proxy_env,
+    );
+    assert!(
+        proxy_marker.exists(),
+        "the GIT_PROXY_COMMAND control never ran, so it proves no influence"
+    );
+
+    std::fs::remove_file(&proxy_marker).expect("reset proxy marker");
+    run_transport_child(
+        true,
+        git_url,
+        &directory.path().join("git-proxy-hardened.git"),
+        &git_proxy_env,
+    );
+    assert!(
+        !proxy_marker.exists(),
+        "GIT_PROXY_COMMAND from the server process ran for a user-selected remote"
+    );
+
+    let remote_url = "http://127.0.0.1:9/upstream.git";
+    let (control_proxy, control_seen) = spawn_recording_remote();
+    let control_proxy = format!("http://{control_proxy}");
+    run_transport_child(
+        false,
+        remote_url,
+        &directory.path().join("http-proxy-control.git"),
+        &[("http_proxy", control_proxy.as_str()), ("NO_PROXY", "")],
+    );
+    assert!(
+        !control_seen.lock().expect("lock").is_empty(),
+        "the http_proxy control never reached the proxy, so it proves no influence"
+    );
+
+    let (hardened_proxy, hardened_seen) = spawn_recording_remote();
+    let hardened_proxy = format!("http://{hardened_proxy}");
+    run_transport_child(
+        true,
+        remote_url,
+        &directory.path().join("http-proxy-hardened.git"),
+        &[("http_proxy", hardened_proxy.as_str()), ("NO_PROXY", "")],
+    );
+    assert!(
+        hardened_seen.lock().expect("lock").is_empty(),
+        "http_proxy from the server process redirected a user-selected remote"
     );
 }
 

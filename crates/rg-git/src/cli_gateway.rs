@@ -11,6 +11,7 @@
 //! - **Convenience** — automatic `-C <repo_path>` when a repo path is given
 //! - **Async pipe support** — `spawn()` for pack-objects / index-pack streaming
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -138,7 +139,7 @@ impl GitCommandGateway {
     /// - Enforces the configured timeout; kills the child on timeout.
     /// - Returns `GitOutput` with the captured stdout, stderr, and status.
     pub fn run(&self, args: &[&str], repo_path: Option<&Path>) -> Result<GitOutput> {
-        self.run_inner(args, repo_path, None)
+        self.run_inner(args, repo_path, None, &[])
     }
 
     /// Run a git command with extra environment variables.
@@ -153,15 +154,33 @@ impl GitCommandGateway {
         repo_path: Option<&Path>,
         env: &[(&str, &str)],
     ) -> Result<GitOutput> {
-        self.run_inner(args, repo_path, Some(env))
+        self.run_inner(args, repo_path, Some(env), &[])
     }
 
-    /// Core implementation shared by [`run`] and [`run_with_env`].
+    /// Run with explicit environment overrides after removing selected values
+    /// inherited from the server process.
+    ///
+    /// This is deliberately crate-private: ordinary repository-local commands
+    /// may rely on operator-provided identity or tooling settings. The outbound
+    /// remote contract in `credentials` is the sole caller that decides which
+    /// ambient transport settings are unsafe for a user-selected address.
+    pub(crate) fn run_with_env_removed(
+        &self,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        env: &[(&str, &str)],
+        inherited_env_to_remove: &[OsString],
+    ) -> Result<GitOutput> {
+        self.run_inner(args, repo_path, Some(env), inherited_env_to_remove)
+    }
+
+    /// Core implementation shared by the synchronous invocation variants.
     fn run_inner(
         &self,
         args: &[&str],
         repo_path: Option<&Path>,
         env: Option<&[(&str, &str)]>,
+        inherited_env_to_remove: &[OsString],
     ) -> Result<GitOutput> {
         let full_cmd = self.build_command_line(args, repo_path);
         let command_str = full_cmd.join(" ");
@@ -173,6 +192,9 @@ impl GitCommandGateway {
 
         let mut builder = Command::new("git");
         builder.args(&full_cmd);
+        for key in inherited_env_to_remove {
+            builder.env_remove(key);
+        }
         if let Some(envs) = env {
             for (k, v) in envs {
                 builder.env(k, v);
