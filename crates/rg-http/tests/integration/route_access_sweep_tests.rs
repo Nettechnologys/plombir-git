@@ -104,6 +104,28 @@ const PRIVATE_REPO: &str = "sweepprivate";
 const PUBLIC_REPO: &str = "sweeppublic";
 const ORG: &str = "sweeporg";
 
+/// Accounts that are neither of the two personas.
+///
+/// Each one exists because a route addresses somebody who is *inside* — a
+/// collaborator, a member of the organization, a member of one of its teams —
+/// and the outsider may not be any of those: his being a stranger is what every
+/// `Denied` row in the matrix is measured against. They hold no session the
+/// sweep drives; they are rows for a path to name.
+/// A second private organization, owned by the same account and used for
+/// nothing but being deleted.
+///
+/// `DELETE /orgs/{name}` is registered ahead of every other organization
+/// delete, so it runs first in the owner's deferred `DELETE` group and takes
+/// the organization its members and teams hang on — which is why three
+/// organization rows were signed off as "the fixture has one team and one
+/// member, so the ids are a guess" when the ids were fine and the organization
+/// was simply gone. The row is pointed here instead.
+const SPARE_ORG: &str = "sweepspareorg";
+
+const COLLABORATOR: &str = "sweepcollaborator";
+const ORG_MEMBER: &str = "sweeporgmember";
+const TEAM_MEMBER: &str = "sweepteammember";
+
 /// An organization name nothing in this fixture ever creates.
 ///
 /// The reference reply the private organization has to be indistinguishable
@@ -147,20 +169,24 @@ const ABSENT_ID: &str = "999999";
 /// being out of reach, keeps its exemption, and nobody is checking who it lets
 /// through.
 ///
-/// Writing it also corrected two reasons that were simply untrue: the two
-/// `DELETE .../assets/{attachment_id}` rows were signed off as "answered 404 for
-/// every persona" while on the private repository they answer `401` to an
-/// anonymous caller and `403` to the outsider. They stay on the list — no
-/// fixture here can seed a pull request — but on a reason that describes them
-/// (card_3cc941a766a0), and one that names *which* persona is the reason.
+/// The two `DELETE .../pulls/…/assets/{attachment_id}` rows were on this list
+/// for three revisions of the same wrong reason — first "answered 404 for every
+/// persona", then a correction that still had the anonymous caller's `401`
+/// wrong, and finally "no fixture here can seed a pull request", which had
+/// stopped being true the day the fixture started seeding one straight into the
+/// database (card_3cc941a766a0, card_41d5b5cf0cbb). They are gone now: the
+/// fixture seeds an attachment on the pull request and one on its review
+/// comment, and both rows are judged by the matrix like everything else.
 ///
-/// That second correction did not go far enough, which is the standing hazard
-/// of a reason written as prose: the rewritten text still claimed the public
-/// half answered `404` to *everyone*, when an anonymous caller has been getting
-/// `401` there all along — first from an `extract_user_id` call at the top of
-/// the handler body, now from the `RepoAuthRead` in its signature
-/// (card_41d5b5cf0cbb). Nothing in this file compares a reason to a status
-/// code, so only a reader re-measuring catches it.
+/// **That is the standing hazard of this list, and it is not fixed.**
+/// [`the_out_of_reach_routes_are_still_out_of_reach`] drives every entry with
+/// [`RepoSeed::placeholders`] — a seed whose every id is `1` — so it can catch a
+/// route that starts letting somebody in *without* a row, and cannot catch the
+/// case that actually happened: the fixture grows a row the entry claims is
+/// impossible, and the reverse check never asks with it. An entry whose reason
+/// is "no such row exists" is therefore checked by a pass that guarantees no
+/// such row exists. Read a new entry with that in mind; the one left is
+/// row-independent, which is the only reason the gap is currently harmless.
 ///
 /// The three artifact rows used to be here, excused as "this fixture builds no
 /// pipeline — every persona is answered 404 before any gate runs". True, and
@@ -175,28 +201,11 @@ const ABSENT_ID: &str = "999999";
 /// for the two personas who cannot read the repository it lives in, paired
 /// against [`ABSENT_ID`] the way an organization row is paired against
 /// [`ABSENT_ORG`].
-const NO_FIXTURE: &[(&str, &str)] = &[
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
-        "only the *owner* persona is out of reach: seeding a pull request needs commits on \
-         two branches, so the row answers 404 for want of one. The gate itself answers \
-         everybody else, and the row is listed on measured values rather than a guess — \
-         private: 401 anonymous, 403 outsider, 404 owner; public: 401 anonymous, 404 \
-         outsider, 404 owner. The anonymous 401 on the *public* repository is what the \
-         handler's `RepoAuthRead` says (card_41d5b5cf0cbb); the outsider gets as far as the \
-         missing pull request because reading a public repository is his right",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
-        "same as DELETE .../pulls/{number}/assets/{attachment_id}: no pull request, so no \
-         review comment to hang an attachment on",
-    ),
-    (
-        "GET /metrics",
-        "the test harness never installs the Prometheus registry, so this answers 503 to \
+const NO_FIXTURE: &[(&str, &str)] = &[(
+    "GET /metrics",
+    "the test harness never installs the Prometheus registry, so this answers 503 to \
          everyone; the route carries no gate of its own to check",
-    ),
-];
+)];
 
 /// Routes that fall over (5xx) *after* letting the right caller through: the
 /// access decision is correct, the handler behind it is not.
@@ -299,6 +308,17 @@ const QUERY_BEFORE_GATE: &[&str] = &[];
 const HOSTILE_QUERY: &str = "?page=zz&per_page=zz&page_size=zz&limit=zz&offset=zz\
                              &unread_only=zz&success=zz&user_id=zz";
 
+/// Why the protocol-specific package routes cannot be seeded, written once.
+///
+/// Twenty entries of [`VACUOUS_ALLOW`] share it, and they shared a paragraph
+/// before that too — one that had gone false ("no package is published in
+/// either repository") the moment the fixture started publishing a generic one.
+/// A single constant is what makes correcting it one edit instead of twenty.
+const PACKAGE_PROTOCOL: &str = "the fixture publishes to the *generic* registry, which is the one \
+     whose upload is a plain byte body. This is a protocol route, and each protocol — npm, PyPI, \
+     Maven, Cargo, RubyGems, NuGet, Composer, Helm — reads its own index out of an artifact in \
+     its own format, so seeding it is a publish per protocol rather than one more row";
+
 /// Routes whose `Expect::Allowed` cells are satisfied by a `404` — the fixture
 /// never seeded the row the path addresses.
 ///
@@ -321,8 +341,21 @@ const HOSTILE_QUERY: &str = "?page=zz&per_page=zz&page_size=zz&limit=zz&offset=z
 ///   like [`FALLS_OVER`]: seed the row and the entry has to go, or the run
 ///   fails. An entry cannot quietly outlive the fixture gap that justified it.
 ///
-/// An entry is a route label, and the reason has to say why the fixture cannot
-/// seed it rather than that it has not.
+/// An entry is a route label **or a single cell** — `persona scope METHOD
+/// /path`, the key [`cell`] builds and the one [`KNOWN_GAPS`] already uses — and
+/// the reason has to say why the fixture cannot seed it rather than that it has
+/// not.
+///
+/// The cell form exists because a route-wide sign-off is too coarse for one
+/// recurring shape: a row that belongs to *one account*, addressed by an
+/// instance-wide id, on a route declaring [`Access::User`]. The owner and the
+/// outsider are both owed `Expect::Allowed` there, one id can only be one of
+/// theirs, and the other persona is answered `404` by the handler's own
+/// ownership check — correctly, and for good. Signing the whole route off would
+/// take the owner's cell with it, and the owner's cell is exactly the baseline
+/// this list exists to protect: the fixture really does seed the owner a token,
+/// an SSH key and a notification, and if one of those stopped being found
+/// nothing would say so.
 const VACUOUS_ALLOW: &[(&str, &str)] = &[
     (
         "DELETE /api/v1/auth/sso/{slug}/unlink",
@@ -333,123 +366,28 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
         "no repository import is seeded",
     ),
     (
-        "DELETE /api/v1/notifications/{id}",
-        "no notification is seeded: the owner acts on their own repositories, and nothing here \
-         notifies anybody",
-    ),
-    (
-        "DELETE /api/v1/orgs/{name}/members/{user_id}",
-        "the fixture's organization has one team and one member — its owner — so the `{user_id}` and \
-         `{team_id}` these routes address are filled with a guess and hit nothing",
-    ),
-    (
-        "DELETE /api/v1/orgs/{name}/teams/{team_id}",
-        "the fixture's organization has one team and one member — its owner — so the `{user_id}` and \
-         `{team_id}` these routes address are filled with a guess and hit nothing",
-    ),
-    (
-        "DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}",
-        "the fixture's organization has one team and one member — its owner — so the `{user_id}` and \
-         `{team_id}` these routes address are filled with a guess and hit nothing",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/actions/environments/{id}",
-        "no deployment environment is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}",
-        "no repository secret is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/boards/{id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/branches/protection/{id}",
-        "no branch protection rule is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/collaborators/{id}",
-        "the outsider is deliberately not a collaborator — that is what makes every `Denied` row \
-         above mean something — so there is no collaborator row to address",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/hooks/{id}",
-        "no webhook is registered, so neither the hook nor its delivery log exists",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
-        "the seeded attachments hang off the issue and the pull request themselves; a comment \
-         attachment is a third upload against a fourth parent",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/issues/{number}/time/{id}",
-        "no time entry is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/keys/{id}",
-        "no deploy key is seeded",
+        "outsider global DELETE /api/v1/notifications/{id}",
+        "the notification the fixture seeds belongs to the owner, and one id can only be one \
+         account's: the outsider is answered 404 by the handler's own ownership check, which is \
+         the route working rather than the fixture missing. The owner's cell is real",
     ),
     (
         "DELETE /api/v1/repos/{owner}/{name}/mirror",
         "the fixture's repositories are ordinary repositories, not mirrors",
     ),
     (
-        "DELETE /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/merge-queue",
-        "the seeded pull request is not in the merge queue",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers/{username}",
-        "no reviewer is requested on the seeded pull request; the outsider is the only other account \
-         and requesting him would make him a participant, which several `Denied` rows above are \
-         measured against",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}",
-        "the asset *is* seeded; it is gone by the time this route is driven. `DELETE \
-         .../releases/{id}` is registered ahead of it and runs first in the same deferred DELETE \
-         group, taking the release and its assets with it. Reordering would only move the hole onto \
-         the release route",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/tags/protection/{id}",
-        "no tag protection rule is seeded",
-    ),
-    (
-        "DELETE /api/v1/repos/{owner}/{name}/wiki/{title}",
-        "no wiki page is seeded",
-    ),
-    (
         "DELETE /api/v1/users/passkeys/{id}",
         "the fixture accounts register with a password and hold no passkey",
     ),
     (
-        "DELETE /api/v1/users/ssh-keys/{id}",
-        "the fixture accounts hold no SSH key",
+        "outsider global DELETE /api/v1/users/ssh-keys/{id}",
+        "the SSH key is the owner's, and a key id belongs to one account: the outsider is \
+         answered 404 by the ownership check behind the gate. The owner's cell is real",
     ),
     (
-        "DELETE /api/v1/users/tokens/{id}",
-        "the fixture accounts authenticate with the session from `register_user` and hold no personal \
-         access token",
-    ),
-    (
-        "GET /api-docs/{*tail}",
-        "the wildcard is filled with `README.md`, which is not one of the generated documentation \
-         assets",
+        "outsider global DELETE /api/v1/users/tokens/{id}",
+        "the personal access token is the owner's, and a token id belongs to one account: the \
+         outsider is answered 404 by the ownership check behind the gate. The owner's cell is real",
     ),
     (
         "GET /api/v1/auth/sso/{slug}",
@@ -465,236 +403,93 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
          resolves in them",
     ),
     (
-        "GET /api/v1/repos/{owner}/{name}/boards/{id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/branches/protection/{id}",
-        "no branch protection rule is seeded",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/hooks/{id}",
-        "no webhook is registered, so neither the hook nor its delivery log exists",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries",
-        "no webhook is registered, so neither the hook nor its delivery log exists",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
-        "the seeded attachments hang off the issue and the pull request themselves; a comment \
-         attachment is a third upload against a fourth parent",
-    ),
-    (
         "GET /api/v1/repos/{owner}/{name}/mirror",
         "the fixture's repositories are ordinary repositories, not mirrors",
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/cargo/index/{c1}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/cargo/index/{c1}/{c2}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/cargo/index/{c1}/{c2}/{c3}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/composer/packages.json",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/helm/index.yaml",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}/{m8}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/maven/{m1}/{m2}/{m3}/{m4}/{m5}/{m6}/{m7}/{m8}/{m9}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/npm/list",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/npm/{pkg_name}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/nuget/query",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/index.json",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems/{gem_name}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/rubygems/gems/{filename}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/packages/rubygems/info/{gem_name}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/versions",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}",
-        "no package is published in either repository. Publishing one is not one seed but seven — \
-         npm, PyPI, Maven, Cargo, RubyGems, NuGet and the generic protocol each have their own upload \
-         shape — and the routes below are the read side of all of them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/pipelines/{id}",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
-        "the seeded attachments hang off the issue and the pull request themselves; a comment \
-         attachment is a third upload against a fourth parent",
+        PACKAGE_PROTOCOL,
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
         "the seeded release asset carries no attestation — producing one needs a CI job to sign it, \
          and this harness runs `NoopCiEngine`",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/wiki/{title}",
-        "no wiki page is seeded",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/wiki/{title}/history",
-        "no wiki page is seeded",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/wiki/{title}/revisions/{rev_id}",
-        "no wiki page is seeded",
-    ),
-    (
-        "PATCH /api/v1/repos/{owner}/{name}/boards/{id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "PATCH /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "PATCH /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
-        "no project board, column or card is seeded",
-    ),
-    (
-        "PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}",
-        "no branch protection rule is seeded",
-    ),
-    (
-        "PATCH /api/v1/repos/{owner}/{name}/hooks/{id}",
-        "no webhook is registered, so neither the hook nor its delivery log exists",
     ),
     (
         "PATCH /api/v1/repos/{owner}/{name}/mirror",
@@ -705,13 +500,9 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
         "no SSO provider is configured on this instance",
     ),
     (
-        "POST /api/v1/notifications/{id}/read",
-        "no notification is seeded: the owner acts on their own repositories, and nothing here \
-         notifies anybody",
-    ),
-    (
-        "POST /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards",
-        "no project board, column or card is seeded",
+        "outsider global POST /api/v1/notifications/{id}/read",
+        "same as DELETE /notifications/{id}: the seeded notification is the owner's, and the \
+         outsider is answered by the ownership check behind the gate",
     ),
     (
         "POST /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
@@ -720,26 +511,6 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
     (
         "POST /api/v1/repos/{owner}/{name}/mirror/sync",
         "the fixture's repositories are ordinary repositories, not mirrors",
-    ),
-    (
-        "POST /api/v1/repos/{owner}/{name}/pipelines/{id}/cancel",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
-    ),
-    (
-        "POST /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
-    ),
-    (
-        "POST /api/v1/repos/{owner}/{name}/pipelines/{id}/retry",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
-    ),
-    (
-        "POST /api/v1/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve",
-        "the fixture's only pipeline is the one `seed_artifact` builds in the *private* repository, \
-         so the public half of every pipeline route answers for want of a row",
     ),
     (
         "POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify",
@@ -1044,11 +815,24 @@ async fn create_repo(fx: &Fixture, name: &str, private: bool) -> i64 {
         .expect("repo id")
 }
 
-/// A *private* organization owned by the fixture owner, with one team in it.
+/// A *private* organization owned by the fixture owner, with two teams and two
+/// members in it.
 ///
 /// Private on purpose: a public organization is anonymously readable by design,
 /// which would make every `OrgRead` row of the matrix vacuous.
-async fn create_org_with_team(fx: &Fixture) {
+///
+/// Two teams and two members because the owner pass ends with every `DELETE` in
+/// registration order, and that order is
+/// `.../members/{user_id}`, `.../teams/{team_id}`,
+/// `.../teams/{team_id}/members/{user_id}`. One team would be gone before its
+/// member route was asked about it, and one member would have been dropped from
+/// the organization — and so from its teams — before the team route reached
+/// them. Each destructive row therefore gets a row of its own to destroy.
+async fn create_org_with_teams(
+    fx: &Fixture,
+    org_member: &Account,
+    team_member: &Account,
+) -> (String, String) {
     let resp = fx
         .client
         .post(format!("{}/api/v1/orgs", fx.base))
@@ -1067,23 +851,142 @@ async fn create_org_with_team(fx: &Fixture) {
         resp.status()
     );
 
-    let resp = fx
+    let team = |name: &'static str| async move {
+        let resp = fx
+            .client
+            .post(format!("{}/api/v1/orgs/{ORG}/teams", fx.base))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"name": name, "permission": "read"}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "fixture: creating team '{name}' in '{ORG}' failed with {status}: {body}"
+        );
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|team| team["id"].as_i64())
+            .unwrap_or_else(|| panic!("fixture: team '{name}' in '{ORG}' has no id: {body}"))
+            .to_string()
+    };
+    let team_id = team("sweepteam").await;
+    let doomed_team_id = team("sweepspareteam").await;
+
+    let spare = fx
         .client
-        .post(format!("{}/api/v1/orgs/{ORG}/teams", fx.base))
+        .post(format!("{}/api/v1/orgs", fx.base))
         .bearer_auth(&fx.owner_token)
-        .json(&serde_json::json!({"name": "sweepteam", "permission": "read"}))
+        .json(&serde_json::json!({
+            "name": SPARE_ORG,
+            "display_name": "Sweep Spare Org",
+            "visibility": "private",
+        }))
         .send()
         .await
         .unwrap();
     assert!(
-        resp.status().is_success(),
-        "fixture: creating a team in '{ORG}' failed: {}",
-        resp.status()
+        spare.status().is_success(),
+        "fixture: creating the spare org '{SPARE_ORG}' failed: {}",
+        spare.status()
     );
+
+    // Both accounts join the organization; only one of them also joins a team.
+    for (account, path) in [
+        (org_member, format!("/api/v1/orgs/{ORG}/members")),
+        (team_member, format!("/api/v1/orgs/{ORG}/members")),
+        (
+            team_member,
+            format!("/api/v1/orgs/{ORG}/teams/{team_id}/members"),
+        ),
+    ] {
+        let resp = fx
+            .client
+            .post(format!("{}{path}", fx.base))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"user_id": account.id, "role": "member"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "fixture: adding '{}' through {path} failed: {}",
+            account.name,
+            resp.status()
+        );
+    }
+
+    (team_id, doomed_team_id)
 }
 
-/// What the fixture actually seeded in one repository, for the placeholders a
-/// constant cannot fill.
+/// The account's own rows that no repository owns: a personal access token, an
+/// SSH key, a notification.
+///
+/// All three belong to the *owner*. The outsider is owed `Expect::Allowed` on
+/// the same routes — they declare `Access::User` — and his cell stays a `404`
+/// however much this seeds, because the row behind the gate is somebody else's.
+/// That is the route's own ownership check rather than a fixture gap, and it is
+/// signed off cell by cell in [`VACUOUS_ALLOW`].
+async fn seed_owner_rows(
+    fx: &Fixture,
+    db: &rg_db::DatabaseConnection,
+    owner_id: i64,
+) -> (String, String, String) {
+    let id_of = |what: &'static str, body: &str| {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value["id"].as_i64())
+            .unwrap_or_else(|| panic!("fixture: the owner's {what} has no id: {body}"))
+            .to_string()
+    };
+    let created = |what: &'static str, path: &'static str, body: serde_json::Value| async move {
+        let resp = fx
+            .client
+            .post(format!("{}{path}", fx.base))
+            .bearer_auth(&fx.owner_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "fixture: seeding the owner's {what} failed with {status}: {text}"
+        );
+        id_of(what, &text)
+    };
+
+    let ssh_key_id = created(
+        "SSH key",
+        "/api/v1/users/ssh-keys",
+        serde_json::json!({"title": "sweep laptop", "key": ed25519_key('A', "sweep-ssh")}),
+    )
+    .await;
+    let token_id = created(
+        "personal access token",
+        "/api/v1/users/tokens",
+        serde_json::json!({"name": "sweep-cli"}),
+    )
+    .await;
+    // Written straight to the database: nothing this fixture does notifies
+    // anybody — the owner acts only on their own repositories.
+    let notification = rg_core::notification::notify(
+        db,
+        owner_id,
+        "issue",
+        "sweep notification",
+        Some("seeded by the route access sweep"),
+        None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fixture: seeding the owner's notification failed: {error}"));
+
+    (ssh_key_id, token_id, notification.id.to_string())
+}
+
 /// What the fixture actually seeded in one repository, for the placeholders a
 /// constant cannot fill.
 ///
@@ -1097,6 +1000,15 @@ async fn create_org_with_team(fx: &Fixture) {
 /// while the handlers scope them to the repository in the path: the public
 /// repository's label is not label 1, and a handler that refused it would be
 /// refusing correctly.
+///
+/// A few fields are `doomed_*`, and they are the one shape a reader would not
+/// guess. The owner's pass ends with every `DELETE` in the table, in the order
+/// the routes were registered — so `DELETE /boards/{id}` runs *before*
+/// `DELETE /boards/{id}/columns/{col_id}`, and a single board would be gone by
+/// the time the column route is asked about it. The hole does not disappear if
+/// the order is reversed, it only moves onto whichever route now goes first.
+/// A second, expendable row is what actually closes it: the destructive route
+/// is pointed at the spare and the rest of the family keeps the one they share.
 struct RepoSeed {
     name: String,
     /// Id of the issue comment seeded in this repository. Comment ids are
@@ -1121,8 +1033,57 @@ struct RepoSeed {
     /// Different rows: the two families resolve through different parents.
     issue_attachment_id: String,
     pull_attachment_id: String,
+    /// Attachments hanging off the two *comment* parents rather than off the
+    /// issue and the pull request themselves. A fourth and a fifth upload,
+    /// because `/issues/comments/{comment_id}/assets/...` and
+    /// `/pulls/comments/{comment_id}/assets/...` resolve through the comment
+    /// they hang on and refuse an attachment that hangs on anything else.
+    issue_comment_attachment_id: String,
+    review_comment_attachment_id: String,
     release_id: String,
     asset_id: String,
+    /// The release `DELETE /releases/{id}` is pointed at, so that deleting it
+    /// does not take [`RepoSeed::asset_id`] with it.
+    doomed_release_id: String,
+    board_id: String,
+    board_column_id: String,
+    /// The column `DELETE /boards/{id}/columns/{col_id}` is pointed at. A
+    /// column takes its cards with it, and the card route is registered after
+    /// it.
+    doomed_board_column_id: String,
+    board_card_id: String,
+    /// The board `DELETE /boards/{id}` is pointed at — see the note above.
+    doomed_board_id: String,
+    hook_id: String,
+    branch_protection_id: String,
+    tag_protection_id: String,
+    environment_id: String,
+    deploy_key_id: String,
+    /// The account added as a collaborator, by `users.id`.
+    ///
+    /// `DELETE .../collaborators/{id}` takes a `users.id` while `PATCH` on the
+    /// identical URL takes the collaborator row id — deliberately, and said so
+    /// in `remove_collaborator`. Only the `DELETE` needs a real value here: the
+    /// `PATCH` answers a body complaint before it ever looks the id up.
+    ///
+    /// A *third* account rather than the outsider, who stays a stranger on
+    /// purpose: every `Denied` row in the matrix is measured against his not
+    /// being one of the repository's people.
+    collaborator_user_id: String,
+    /// The same account by name — the reviewer requested on the seeded pull
+    /// request, and so the `{username}` of
+    /// `DELETE /pulls/{number}/reviewers/{username}`. Requesting the *outsider*
+    /// would make him a participant, and several `Denied` rows are measured
+    /// against his not being one.
+    collaborator_name: String,
+    time_entry_id: String,
+    /// Revision of the seeded wiki page — `/wiki/{title}/revisions/{rev_id}`.
+    wiki_revision_id: String,
+    /// A pipeline and one of its jobs, in *this* repository. `seed_artifact`
+    /// builds one in the private repository only, and the public half of every
+    /// pipeline route was answered `404` for want of a row.
+    pipeline_id: String,
+    job_id: String,
 }
 
 impl RepoSeed {
@@ -1145,8 +1106,72 @@ impl RepoSeed {
             review_id: absent(),
             issue_attachment_id: absent(),
             pull_attachment_id: absent(),
+            issue_comment_attachment_id: absent(),
+            review_comment_attachment_id: absent(),
             release_id: absent(),
             asset_id: absent(),
+            doomed_release_id: absent(),
+            board_id: absent(),
+            board_column_id: absent(),
+            doomed_board_column_id: absent(),
+            board_card_id: absent(),
+            doomed_board_id: absent(),
+            hook_id: absent(),
+            branch_protection_id: absent(),
+            tag_protection_id: absent(),
+            environment_id: absent(),
+            deploy_key_id: absent(),
+            collaborator_user_id: absent(),
+            collaborator_name: OUTSIDER.to_string(),
+            time_entry_id: absent(),
+            wiki_revision_id: absent(),
+            pipeline_id: absent(),
+            job_id: absent(),
+        }
+    }
+}
+
+/// The rows that belong to nobody's repository: an account's own credentials,
+/// the fixture organization's people, a notification.
+///
+/// Separate from [`RepoSeed`] because they are seeded once rather than once per
+/// repository, and because a `Scope::Global` route has no repository to read
+/// them out of.
+struct GlobalSeed {
+    /// The team every `/orgs/{name}/teams/{team_id}/...` route is pointed at.
+    team_id: String,
+    /// The team `DELETE /orgs/{name}/teams/{team_id}` is pointed at, for the
+    /// same reason [`RepoSeed::doomed_board_id`] exists: the delete is
+    /// registered ahead of `DELETE .../teams/{team_id}/members/{user_id}` and
+    /// would take the team its member hangs on.
+    doomed_team_id: String,
+    /// The account `DELETE /orgs/{name}/members/{user_id}` removes, and the one
+    /// `DELETE /orgs/{name}/teams/{team_id}/members/{user_id}` removes. Two
+    /// accounts, because the organization removal is registered first and
+    /// dropping somebody from the organization drops them from its teams.
+    org_member_id: String,
+    team_member_id: String,
+    ssh_key_id: String,
+    token_id: String,
+    /// A notification addressed to the *owner*. The outsider's cell on the same
+    /// routes stays a `404` and always will — see the note on
+    /// [`VACUOUS_ALLOW`]'s cell-keyed entries.
+    notification_id: String,
+}
+
+impl GlobalSeed {
+    /// The counterpart of [`RepoSeed::placeholders`], for the passes that seed
+    /// nothing on purpose.
+    fn placeholders() -> Self {
+        let absent = || "1".to_string();
+        Self {
+            team_id: absent(),
+            doomed_team_id: absent(),
+            org_member_id: absent(),
+            team_member_id: absent(),
+            ssh_key_id: absent(),
+            token_id: absent(),
+            notification_id: absent(),
         }
     }
 }
@@ -1169,16 +1194,22 @@ struct Seeded {
 /// git. The rows hanging off it (review, review comment, attachment) do go
 /// through the API, so the routes that read them are answered by the same code
 /// a client reaches.
+#[allow(clippy::too_many_lines)]
 async fn seed_repo_rows(
     fx: &Fixture,
     db: &rg_db::DatabaseConnection,
     repo: &str,
     repo_id: i64,
     owner_id: i64,
+    collaborator: &Account,
 ) -> RepoSeed {
     use sea_orm::{NotSet, Set};
 
-    let prefix = format!("{}/api/v1/repos/{OWNER}/{repo}", fx.base);
+    // Borrowed rather than owned, because the per-family seeds below are async
+    // closures called more than once: an `async move` block that captured a
+    // `String` would consume it on the first call.
+    let prefix_owned = format!("{}/api/v1/repos/{OWNER}/{repo}", fx.base);
+    let prefix = prefix_owned.as_str();
     // Every seed asserts, and every assertion names the row: a fixture that
     // half-built itself is the failure mode this whole card is about, and it is
     // only cheap to diagnose while it is still the fixture talking.
@@ -1322,17 +1353,37 @@ async fn seed_repo_rows(
     ))
     .await;
 
-    let release = json_of(created("release")(
-        fx.client
-            .post(format!("{prefix}/releases"))
-            .bearer_auth(&fx.owner_token)
-            .json(&serde_json::json!({"tag_name": "v1.0.0", "title": "sweep release"}))
-            .send()
-            .await
-            .unwrap(),
+    let comment_id = id_of(comment);
+    let review_comment_id = id_of(review_comment);
+    let issue_comment_attachment = json_of(created("issue comment attachment")(
+        attachment(format!("{prefix}/issues/comments/{comment_id}/assets")).await,
     ))
     .await;
-    let release_id = id_of(release);
+    let review_comment_attachment = json_of(created("review comment attachment")(
+        attachment(format!(
+            "{prefix}/pulls/comments/{review_comment_id}/assets"
+        ))
+        .await,
+    ))
+    .await;
+
+    let release = |tag: &'static str| async move {
+        json_of(created("release")(
+            fx.client
+                .post(format!("{prefix}/releases"))
+                .bearer_auth(&fx.owner_token)
+                .json(&serde_json::json!({"tag_name": tag, "title": "sweep release"}))
+                .send()
+                .await
+                .unwrap(),
+        ))
+        .await
+    };
+    let release_id = id_of(release("v1.0.0").await);
+    // The second release exists only to be deleted: `DELETE /releases/{id}` is
+    // registered ahead of `DELETE /releases/assets/{asset_id}` and would take
+    // the asset with it.
+    let doomed_release_id = id_of(release("v2.0.0").await);
     let asset = json_of(created("release asset")(
         fx.client
             .post(format!("{prefix}/releases/{release_id}/assets"))
@@ -1345,19 +1396,365 @@ async fn seed_repo_rows(
     ))
     .await;
 
+    // ── Project boards ─────────────────────────────────────────────────────
+    //
+    // `create_board` builds its own columns, so the column and the card come
+    // out of what the board answered rather than out of a second guess.
+    let board = |name: &'static str| async move {
+        json_of(created("project board")(
+            fx.client
+                .post(format!("{prefix}/boards"))
+                .bearer_auth(&fx.owner_token)
+                .json(&serde_json::json!({"name": name}))
+                .send()
+                .await
+                .unwrap(),
+        ))
+        .await
+    };
+    let board_id = id_of(board("sweep board").await);
+    let doomed_board_id = id_of(board("sweep spare board").await);
+    let (_, full_board) = json_of(created("project board read-back")(
+        fx.client
+            .get(format!("{prefix}/boards/{board_id}"))
+            .bearer_auth(&fx.owner_token)
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let column_id = |index: usize| {
+        full_board["columns"][index]["column"]["id"]
+            .as_i64()
+            .unwrap_or_else(|| {
+                panic!("fixture: the board seeded in {repo} has no column {index}: {full_board}")
+            })
+            .to_string()
+    };
+    // `create_board` builds three columns. The card lives in the first and the
+    // column delete is pointed at the second, so neither route can take the
+    // other's row.
+    let board_column_id = column_id(0);
+    let doomed_board_column_id = column_id(1);
+    let board_card = json_of(created("project board card")(
+        fx.client
+            .post(format!(
+                "{prefix}/boards/{board_id}/columns/{board_column_id}/cards"
+            ))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"note": "sweep card"}))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+
+    // ── Repository administration ──────────────────────────────────────────
+    let hook = json_of(created("webhook")(
+        fx.client
+            .post(format!("{prefix}/hooks"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({
+                "url": "https://sweep.example.com/hook",
+                "secret": "sweep-hook-secret",
+                "events": ["push"],
+            }))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let branch_protection = json_of(created("branch protection rule")(
+        fx.client
+            .post(format!("{prefix}/branches/protection"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"branch_name": "main", "require_pr": true}))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let tag_protection = json_of(created("tag protection rule")(
+        fx.client
+            .post(format!("{prefix}/tags/protection"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"pattern": "v*"}))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let environment = json_of(created("deployment environment")(
+        fx.client
+            .post(format!("{prefix}/actions/environments"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"name": "sweep-production"}))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    // The secret is addressed by name, so there is no id to carry: `fill` puts
+    // `SWEEP_SECRET` in the path and this is the row it lands on.
+    let secret = fx
+        .client
+        .put(format!("{prefix}/actions/secrets/{SWEEP_SECRET}"))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"value": "sweep-secret-value"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        secret.status().is_success(),
+        "fixture: seeding the {SWEEP_SECRET} secret in {repo} failed with {}",
+        secret.status()
+    );
+    // Deploy keys are unique instance-wide by fingerprint, so the two
+    // repositories cannot share one.
+    let deploy_key = json_of(created("deploy key")(
+        fx.client
+            .post(format!("{prefix}/keys"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({
+                "title": format!("sweep deploy key for {repo}"),
+                "key": deploy_key_for(repo),
+                "read_only": true,
+            }))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let collaborator_added = fx
+        .client
+        .post(format!("{prefix}/collaborators"))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"username": collaborator.name, "permission": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        collaborator_added.status().is_success(),
+        "fixture: adding the collaborator to {repo} failed with {}",
+        collaborator_added.status()
+    );
+
+    // ── Time tracking and the wiki ─────────────────────────────────────────
+    let time_entry = json_of(created("time entry")(
+        fx.client
+            .post(format!("{prefix}/issues/{issue_number}/time"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"duration_minutes": 30, "description": "sweep"}))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    // `WIKI_TITLE` is what `fill` puts in `{title}`, so the page has to carry
+    // exactly that name.
+    let wiki_page = fx
+        .client
+        .post(format!("{prefix}/wiki"))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"title": WIKI_TITLE, "content": "# sweep"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        wiki_page.status().is_success(),
+        "fixture: seeding the wiki page in {repo} failed with {}",
+        wiki_page.status()
+    );
+    // A page is born with no revision — `create_page` writes the page, and only
+    // an *edit* records what it used to say. Without this one edit
+    // `/wiki/{title}/revisions/{rev_id}` has nothing to address.
+    let wiki_edit = fx
+        .client
+        .patch(format!("{prefix}/wiki/{WIKI_TITLE}"))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"content": "# sweep, revised", "message": "sweep"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        wiki_edit.status().is_success(),
+        "fixture: editing the wiki page in {repo} failed with {}",
+        wiki_edit.status()
+    );
+    let (_, wiki_history) = json_of(created("wiki page history")(
+        fx.client
+            .get(format!("{prefix}/wiki/{WIKI_TITLE}/history"))
+            .bearer_auth(&fx.owner_token)
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let wiki_revision_id = wiki_revision_of(&wiki_history)
+        .unwrap_or_else(|| {
+            panic!("fixture: the wiki page seeded in {repo} has no revision: {wiki_history}")
+        })
+        .to_string();
+
+    // ── A reviewer, a queued merge, a published package ────────────────────
+    let reviewer = fx
+        .client
+        .post(format!("{prefix}/pulls/{}/reviewers", pull.number))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"username": collaborator.name}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        reviewer.status().is_success(),
+        "fixture: requesting a reviewer on the pull request in {repo} failed with {}",
+        reviewer.status()
+    );
+    // Through `rg_db`, because the API route puts a pull request in the queue
+    // only once it is mergeable — which needs the commits this harness has no
+    // git to make.
+    rg_db::ops::merge_queue_ops::enqueue(db, repo_id, pull.id, owner_id, "merge")
+        .await
+        .unwrap_or_else(|error| {
+            panic!("fixture: queueing the pull request in {repo} failed: {error}")
+        });
+    // `generic` is the one registry whose publish is a plain byte body with the
+    // name and version in the query, so it goes through the API like everything
+    // else here rather than straight into the package tables.
+    let package = fx
+        .client
+        .post(format!(
+            "{prefix}/packages/{PACKAGE_TYPE}/publish\
+             ?name={PACKAGE_NAME}&version={PACKAGE_VERSION}"
+        ))
+        .bearer_auth(&fx.owner_token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{PACKAGE_FILE}\""),
+        )
+        .body(b"sweep package bytes".to_vec())
+        .send()
+        .await
+        .unwrap();
+    let package_status = package.status();
+    let package_body = package.text().await.unwrap_or_default();
+    assert!(
+        package_status.is_success(),
+        "fixture: publishing the generic package in {repo} failed with \
+         {package_status}: {package_body}"
+    );
+
+    // ── One pipeline per repository ────────────────────────────────────────
+    //
+    // Written through `rg_db` rather than through the API: a pipeline is
+    // created by a push, and this harness runs no git.
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        "1234567890123456789012345678901234567890",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fixture: seeding the pipeline in {repo} failed: {error}"));
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+        .await
+        .unwrap_or_else(|error| panic!("fixture: seeding the stage in {repo} failed: {error}"));
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fixture: seeding the job in {repo} failed: {error}"));
+
     RepoSeed {
         name: repo.to_string(),
-        comment_id: id_of(comment),
+        comment_id,
         milestone_id: id_of(milestone),
         label_id: id_of(label),
         pull_number: pull.number.to_string(),
-        pull_comment_id: id_of(review_comment),
+        pull_comment_id: review_comment_id,
         review_id: id_of(review),
         issue_attachment_id: id_of(issue_attachment),
         pull_attachment_id: id_of(pull_attachment),
+        issue_comment_attachment_id: id_of(issue_comment_attachment),
+        review_comment_attachment_id: id_of(review_comment_attachment),
         release_id,
         asset_id: id_of(asset),
+        doomed_release_id,
+        board_id,
+        board_column_id,
+        doomed_board_column_id,
+        board_card_id: id_of(board_card),
+        doomed_board_id,
+        hook_id: id_of(hook),
+        branch_protection_id: id_of(branch_protection),
+        tag_protection_id: id_of(tag_protection),
+        environment_id: id_of(environment),
+        deploy_key_id: id_of(deploy_key),
+        collaborator_user_id: collaborator.id.to_string(),
+        collaborator_name: collaborator.name.clone(),
+        time_entry_id: id_of(time_entry),
+        wiki_revision_id,
+        pipeline_id: pipeline.id.to_string(),
+        job_id: job.id.to_string(),
     }
+}
+
+/// One fixture account, by the two things a path can name it with.
+struct Account {
+    name: String,
+    id: i64,
+}
+
+/// The secret name `fill` puts in `{secret_name}`, and the one the fixture
+/// therefore has to create.
+const SWEEP_SECRET: &str = "SWEEP_SECRET";
+
+/// The wiki page title `fill` puts in `{title}`.
+const WIKI_TITLE: &str = "Home";
+
+/// The registry, package name, version and file name `fill` puts in the
+/// `/packages/{pkg_type}/…` family, and that the fixture therefore publishes.
+const PACKAGE_TYPE: &str = "generic";
+const PACKAGE_NAME: &str = "sweeppkg";
+const PACKAGE_VERSION: &str = "1.0.0";
+const PACKAGE_FILE: &str = "sweep-package.bin";
+
+/// An ed25519 public key whose last byte is `tail`.
+///
+/// The prefix is the wire encoding every ed25519 key shares — a length-prefixed
+/// `ssh-ed25519`, then a length-prefixed 32-byte key — and only the final base64
+/// character varies, which is the last of those 32 bytes. Varying anything
+/// earlier risks landing on the length prefix and producing a key the parser
+/// rejects for a reason that has nothing to do with what is being tested.
+fn ed25519_key(tail: char, comment: &str) -> String {
+    let filler = "A".repeat(42);
+    format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI{filler}{tail} {comment}")
+}
+
+/// A deploy key nothing else in the instance holds.
+///
+/// Deploy keys are refused as duplicates by fingerprint across the whole
+/// instance, so the two repositories cannot be seeded with the same one — and a
+/// fixture that shared it would report the second repository's `409` as a dead
+/// seed rather than as the collision it is.
+fn deploy_key_for(repo: &str) -> String {
+    let tail = if repo == PRIVATE_REPO { 'B' } else { 'C' };
+    ed25519_key(tail, &format!("sweep-deploy-{repo}"))
+}
+
+/// The id of the newest revision in a wiki page's history.
+///
+/// The endpoint answers either a bare array or an object wrapping one, and a
+/// fixture that guessed wrong would report an absent revision rather than an
+/// unexpected shape.
+fn wiki_revision_of(history: &serde_json::Value) -> Option<i64> {
+    let rows = history
+        .as_array()
+        .or_else(|| history["revisions"].as_array())
+        .or_else(|| history["items"].as_array())?;
+    rows.first()?["id"].as_i64()
 }
 
 /// The id addressing the row this fixture seeded for one anchor.
@@ -1394,7 +1791,20 @@ fn is_repo_path(path: &str) -> bool {
 /// `org` is a parameter rather than a constant because the paired probe behind
 /// [`Expect::Hidden`] needs the same URL twice with one word changed: the
 /// fixture's private organization, and [`ABSENT_ORG`].
-fn fill(path: &str, repo: &RepoSeed, org: &str) -> String {
+///
+/// The *method* is read as well as the path, for the handful of rows where the
+/// two together decide which row is meant. Two shapes need it:
+///
+/// - a destructive route pointed at a spare row, so that deleting it does not
+///   take a row a later route in the same deferred group still needs — see the
+///   `doomed_*` fields of [`RepoSeed`];
+/// - `.../collaborators/{id}`, where `DELETE` takes a `users.id` and `PATCH`
+///   takes the collaborator row id. That asymmetry is deliberate and documented
+///   in `remove_collaborator`; a filler that knew only the path would have to
+///   get one of the two wrong.
+fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> String {
+    let path = fact.path.as_str();
+    let deletes = fact.method == "DELETE";
     let is_org_route = path.starts_with("/api/v1/orgs/") || path.starts_with("/api/v1/admin/orgs/");
 
     let mut out = String::new();
@@ -1412,6 +1822,14 @@ fn fill(path: &str, repo: &RepoSeed, org: &str) -> String {
         // carry no id at all.
         out.push_str(match name {
             "owner" => OWNER,
+            // The organization delete is pointed at the spare, so that it does
+            // not take the fixture's own organization out from under the three
+            // rows registered after it. `ABSENT_ORG` still varies, or the
+            // paired probe behind `Expect::Hidden` would have nothing to
+            // compare against.
+            "name" if is_org_route && deletes && path == "/api/v1/orgs/{name}" && org == ORG => {
+                SPARE_ORG
+            }
             "name" if is_org_route => org,
             "name" | "repo" => &repo.name,
             // Comments are numbered instance-wide while the handlers scope them
@@ -1420,26 +1838,73 @@ fn fill(path: &str, repo: &RepoSeed, org: &str) -> String {
             "comment_id" if path.contains("/pulls/comments/") => &repo.pull_comment_id,
             "comment_id" => &repo.comment_id,
             "number" if path.contains("/pulls/") => &repo.pull_number,
+            "attachment_id" if path.contains("/pulls/comments/") => {
+                &repo.review_comment_attachment_id
+            }
+            "attachment_id" if path.contains("/issues/comments/") => {
+                &repo.issue_comment_attachment_id
+            }
             "attachment_id" if path.contains("/pulls/") => &repo.pull_attachment_id,
             "attachment_id" => &repo.issue_attachment_id,
             "id" if path.contains("/milestones/{id}") => &repo.milestone_id,
             "id" if path.contains("/labels/{id}") => &repo.label_id,
+            "id" if path.contains("/releases/{id}") && deletes => &repo.doomed_release_id,
             "id" if path.contains("/releases/{id}") => &repo.release_id,
             "id" if path.contains("/reviews/{id}") => &repo.review_id,
             "id" if path.contains("/comments/{id}") => &repo.pull_comment_id,
+            "id" if path.contains("/boards/{id}") && deletes && path.ends_with("/boards/{id}") => {
+                &repo.doomed_board_id
+            }
+            "id" if path.contains("/boards/{id}") => &repo.board_id,
+            "id" if path.contains("/hooks/{id}") => &repo.hook_id,
+            "id" if path.contains("/branches/protection/{id}") => &repo.branch_protection_id,
+            "id" if path.contains("/tags/protection/{id}") => &repo.tag_protection_id,
+            "id" if path.contains("/actions/environments/{id}") => &repo.environment_id,
+            "id" if path.contains("/keys/{id}") => &repo.deploy_key_id,
+            // `DELETE` takes a `users.id` here and `PATCH` the collaborator row
+            // id; only the delete needs a real value, because the patch answers
+            // a body complaint before it looks anything up.
+            "id" if path.contains("/collaborators/{id}") => &repo.collaborator_user_id,
+            "id" if path.contains("/time/{id}") => &repo.time_entry_id,
+            "id" if path.contains("/pipelines/{id}") => &repo.pipeline_id,
+            "id" if path.contains("/notifications/{id}") => &globals.notification_id,
+            "id" if path.contains("/users/ssh-keys/{id}") => &globals.ssh_key_id,
+            "id" if path.contains("/users/tokens/{id}") => &globals.token_id,
+            "col_id" if deletes => &repo.doomed_board_column_id,
+            "col_id" => &repo.board_column_id,
+            "card_id" => &repo.board_card_id,
+            "pipeline_id" => &repo.pipeline_id,
+            "job_id" => &repo.job_id,
+            "rev_id" => &repo.wiki_revision_id,
             "release_id" => &repo.release_id,
             "asset_id" => &repo.asset_id,
-            "username" => OUTSIDER,
+            "team_id" if deletes && path.ends_with("/teams/{team_id}") => &globals.doomed_team_id,
+            "team_id" => &globals.team_id,
+            "user_id" if path.contains("/teams/") => &globals.team_member_id,
+            "user_id" => &globals.org_member_id,
+            "username" => &repo.collaborator_name,
+            // The published package's own file. `README.md` is what the
+            // repository-content routes want and is not what a registry holds.
+            "file" if path.contains("/packages/") => PACKAGE_FILE,
             "path" | "file" => "README.md",
-            "title" => "Home",
+            // The Swagger UI's own index, which `utoipa_swagger_ui::serve`
+            // really does hold — the wildcard used to fall through to `1` and
+            // the route answered `404` to everybody.
+            "tail" => "index.html",
+            "title" => WIKI_TITLE,
             "slug" => "sweep-provider",
             "archive" => "main.zip",
-            "secret_name" => "SWEEP_SECRET",
-            "pkg_type" => "cargo",
-            "pkg" | "pkg_name" | "gem_name" => "sweeppkg",
+            "secret_name" => SWEEP_SECRET,
+            // `generic` rather than a protocol: it is the one registry whose
+            // upload is a plain byte body, so the `/packages/{pkg_type}/…`
+            // family below can be answered by a package this fixture really
+            // published. The protocol-specific routes still cannot — see
+            // `VACUOUS_ALLOW`.
+            "pkg_type" => PACKAGE_TYPE,
+            "pkg" | "pkg_name" | "gem_name" => PACKAGE_NAME,
             "group_id" => "com.example",
             "artifact_id" => "sweep",
-            "version" => "1.0.0",
+            "version" => PACKAGE_VERSION,
             "reference" => "latest",
             "digest" | "uuid" => {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -1522,9 +1987,10 @@ async fn probe(
     fact: &RouteFact,
     persona: Persona,
     repo: &RepoSeed,
+    globals: &GlobalSeed,
     org: &str,
 ) -> Answer {
-    drive(fx, fact, persona, &fill(&fact.path, repo, org)).await
+    drive(fx, fact, persona, &fill(fact, repo, globals, org)).await
 }
 
 /// A minimal valid JSON body for routes whose handler must be reached to make
@@ -1648,9 +2114,51 @@ async fn every_route_answers_its_declared_access_level() {
             .and_then(|user| user["id"].as_i64())
             .unwrap_or_else(|| panic!("fixture: the owner has no id: {body}"))
     };
+    // Three accounts besides the two personas, each one because a route
+    // addresses a person who is neither the owner nor a stranger. They are not
+    // personas and never drive a probe: the outsider stays the only other
+    // session, because every `Denied` row is measured against his being one.
+    let register_account = |name: &'static str| {
+        let base = fx.base.clone();
+        async move {
+            let token = register_user(&base, name, &format!("{name}@example.com"), PW).await;
+            let client = Client::builder().build().expect("http client");
+            let body = client
+                .get(format!("{base}/api/v1/users/me"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("read the fixture account")
+                .text()
+                .await
+                .unwrap_or_default();
+            let id = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|user| user["id"].as_i64())
+                .unwrap_or_else(|| panic!("fixture: account '{name}' has no id: {body}"));
+            Account {
+                name: name.to_string(),
+                id,
+            }
+        }
+    };
+    let collaborator = register_account(COLLABORATOR).await;
+    let org_member = register_account(ORG_MEMBER).await;
+    let team_member = register_account(TEAM_MEMBER).await;
+
     let private_repo_id = create_repo(&fx, PRIVATE_REPO, true).await;
     let public_repo_id = create_repo(&fx, PUBLIC_REPO, false).await;
-    create_org_with_team(&fx).await;
+    let (team_id, doomed_team_id) = create_org_with_teams(&fx, &org_member, &team_member).await;
+    let (ssh_key_id, token_id, notification_id) = seed_owner_rows(&fx, &db, owner_id).await;
+    let globals = GlobalSeed {
+        team_id,
+        doomed_team_id,
+        org_member_id: org_member.id.to_string(),
+        team_member_id: team_member.id.to_string(),
+        ssh_key_id,
+        token_id,
+        notification_id,
+    };
     // One artifact in the *private* repository, which is what makes the anchored
     // rows judgeable at all: without it every anchored route answers `404` for
     // want of a row, and a wall of `404`s satisfies `Expect::Hidden` while
@@ -1684,7 +2192,7 @@ async fn every_route_answers_its_declared_access_level() {
         (PRIVATE_REPO, private_repo_id),
         (PUBLIC_REPO, public_repo_id),
     ] {
-        seeds.push(seed_repo_rows(&fx, &db, repo, repo_id, owner_id).await);
+        seeds.push(seed_repo_rows(&fx, &db, repo, repo_id, owner_id, &collaborator).await);
     }
     let (private_seed, public_seed) = (&seeds[0], &seeds[1]);
 
@@ -1862,8 +2370,8 @@ async fn every_route_answers_its_declared_access_level() {
                 // repository is resolved from.
                 let (url, twin) = match anchor {
                     None => (
-                        fill(&fact.path, repo, ORG),
-                        Some(fill(&fact.path, repo, ABSENT_ORG)),
+                        fill(fact, repo, &globals, ORG),
+                        Some(fill(fact, repo, &globals, ABSENT_ORG)),
                     ),
                     Some(target) => {
                         let Some(id) = anchored_id(target, &seeded) else {
@@ -2076,19 +2584,28 @@ async fn every_route_answers_its_declared_access_level() {
     // The admitted half of the matrix, held to the same standard as the refused
     // half: a cell that would be green with no gate at all proves nothing, and
     // has to be seeded or signed off rather than counted.
+    //
+    // A sign-off covers either the whole route or one named cell — see
+    // [`VACUOUS_ALLOW`] — so both keys are tried before a cell is reported.
     let unsigned: Vec<String> = vacuous
         .iter()
         .filter(|(label, _)| !listed(VACUOUS_ALLOW, label))
-        .map(|(label, cells)| {
-            format!(
-                "  {label}\n      {} cell(s) owed Expect::Allowed and answered 404:\n{}",
-                cells.len(),
-                cells
-                    .iter()
-                    .map(|cell| format!("        {cell}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
+        .filter_map(|(label, cells)| {
+            let orphans: Vec<&String> = cells
+                .iter()
+                .filter(|cell| !listed(VACUOUS_ALLOW, cell))
+                .collect();
+            (!orphans.is_empty()).then(|| {
+                format!(
+                    "  {label}\n      {} cell(s) owed Expect::Allowed and answered 404:\n{}",
+                    orphans.len(),
+                    orphans
+                        .iter()
+                        .map(|cell| format!("        {cell}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            })
         })
         .collect();
     let vacuous_cells: usize = vacuous.values().map(BTreeSet::len).sum();
@@ -2102,11 +2619,14 @@ async fn every_route_answers_its_declared_access_level() {
         unsigned.len(),
         unsigned.join("\n"),
     );
+    let all_vacuous_cells: BTreeSet<&String> = vacuous.values().flatten().collect();
     let seeded_since: Vec<String> = VACUOUS_ALLOW
         .iter()
-        .filter(|(label, _)| !vacuous.contains_key(*label))
-        .map(|(label, reason)| {
-            format!("  {label} no longer answers 404 — drop it from VACUOUS_ALLOW (was: {reason})")
+        .filter(|(entry, _)| {
+            !vacuous.contains_key(*entry) && !all_vacuous_cells.contains(&(*entry).to_string())
+        })
+        .map(|(entry, reason)| {
+            format!("  {entry} no longer answers 404 — drop it from VACUOUS_ALLOW (was: {reason})")
         })
         .collect();
     assert!(
@@ -2145,6 +2665,7 @@ async fn no_route_answers_a_query_complaint_before_its_gate() {
     // Nothing is seeded: every probe here is anonymous, and the question is
     // only which *kind* of answer comes back.
     let seed = RepoSeed::placeholders("nosuchrepo");
+    let globals = GlobalSeed::placeholders();
 
     let labels: BTreeSet<String> = facts.iter().map(RouteFact::label).collect();
     for label in QUERY_BEFORE_GATE {
@@ -2177,7 +2698,7 @@ async fn no_route_answers_a_query_complaint_before_its_gate() {
             continue;
         }
 
-        let url = format!("{base}{}{HOSTILE_QUERY}", fill(&fact.path, &seed, ORG));
+        let url = format!("{base}{}{HOSTILE_QUERY}", fill(fact, &seed, &globals, ORG));
         let mut req = match fact.method {
             "GET" => client.get(url),
             "HEAD" => client.head(url),
@@ -2561,6 +3082,7 @@ async fn no_public_route_names_the_private_repo() {
     };
     create_repo(&fx, PRIVATE_REPO, true).await;
     let seed = RepoSeed::placeholders(PRIVATE_REPO);
+    let globals = GlobalSeed::placeholders();
 
     // The owner can see it — otherwise "nobody mentioned it" would just mean
     // the fixture never created anything.
@@ -2583,7 +3105,7 @@ async fn no_public_route_names_the_private_repo() {
         if !matches!(fact.method, "GET" | "HEAD") {
             continue;
         }
-        let url = format!("{}{}", fx.base, fill(&fact.path, &seed, ORG));
+        let url = format!("{}{}", fx.base, fill(fact, &seed, &globals, ORG));
         let req = if fact.method == "HEAD" {
             fx.client.head(url)
         } else {
@@ -2705,6 +3227,7 @@ async fn the_self_filtering_routes_show_public_and_hide_private() {
     create_repo(&fx, PUBLIC_REPO, false).await;
     create_repo(&fx, PRIVATE_REPO, true).await;
     let seed = RepoSeed::placeholders(PRIVATE_REPO);
+    let globals = GlobalSeed::placeholders();
 
     let probes = filtered_probes();
 
@@ -2738,7 +3261,7 @@ async fn the_self_filtering_routes_show_public_and_hide_private() {
             .iter()
             .find(|f| f.label() == label)
             .expect("probe names a route in the table");
-        fill(&fact.path, &seed, ORG)
+        fill(fact, &seed, &globals, ORG)
     };
 
     let mut failures: Vec<String> = Vec::new();
@@ -2923,9 +3446,15 @@ async fn every_instance_admin_route_demands_the_admin_pat_scope() {
 /// sweep an answer instead of an excuse.
 ///
 /// It deliberately does *not* demand a particular non-answer. The rows measure
-/// differently by scope — the `pulls/.../assets` pair answers `401`/`403` on the
-/// private repository and `404` on the public one — and pinning a single status
-/// would only encode the fixture's shape of the day.
+/// differently by scope and by persona, and pinning a single status would only
+/// encode the fixture's shape of the day.
+///
+/// What it cannot see is written on [`NO_FIXTURE`] rather than here, because
+/// that is where a reader deciding whether to add an entry will be: it seeds
+/// nothing, so an entry excused as "no such row exists" is re-checked against a
+/// fixture in which no such row exists. The kind of rot that actually bit this
+/// list — the main fixture grew the row and the excuse outlived it — is
+/// invisible from in here.
 #[tokio::test]
 async fn the_out_of_reach_routes_are_still_out_of_reach() {
     let (base, facts) = spawn_test_app_with_routes().await;
@@ -2956,6 +3485,7 @@ async fn the_out_of_reach_routes_are_still_out_of_reach() {
     // pull request first, and the question this pass asks does not get as far
     // as anything hanging off one.
     let seeds = [PRIVATE_REPO, PUBLIC_REPO].map(RepoSeed::placeholders);
+    let globals = GlobalSeed::placeholders();
 
     let mut offenders: Vec<String> = Vec::new();
     let mut probed = 0usize;
@@ -2967,7 +3497,7 @@ async fn the_out_of_reach_routes_are_still_out_of_reach() {
 
         for seed in &seeds {
             for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
-                let answer = probe(&fx, fact, persona, seed, ORG).await;
+                let answer = probe(&fx, fact, persona, seed, &globals, ORG).await;
                 probed += 1;
                 if !answer.status.is_success() {
                     continue;
