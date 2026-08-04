@@ -422,13 +422,34 @@ pub async fn delete_artifact(
         actor_id: _,
     }: ArtifactWrite,
 ) -> impl IntoResponse {
-    if let Err(error) = delete_artifact_blob(&state, &artifact.file_path).await {
-        return AppError::from(error).into_response();
-    }
+    let staging =
+        match ArtifactDeletionStaging::prepare(&state, artifact.id, &artifact.file_path).await {
+            Ok(staging) => staging,
+            Err(error) => return AppError::from(error).into_response(),
+        };
+
     match rg_db::ops::artifact_ops::delete_by_id(&state.db, artifact.id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => AppError::not_found("artifact not found").into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Ok(true) => {}
+        // The lookup and this statement are separate, so a concurrent delete can
+        // take the row in between. That request owns the deletion, so this one
+        // must not report a success it did not perform — but the staged bytes
+        // are still retired rather than restored: the row is gone either way,
+        // and putting them back would leave them with nothing pointing at them.
+        Ok(false) => {
+            if let Err(error) = staging.retire(&state).await {
+                return AppError::from(error).into_response();
+            }
+            return AppError::not_found("artifact not found").into_response();
+        }
+        Err(error) => {
+            staging.restore(&state).await;
+            return AppError::from(error).into_response();
+        }
+    }
+
+    match staging.retire(&state).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -617,45 +638,213 @@ async fn read_artifact_bytes(state: &AppState, storage_path: &str) -> Result<Vec
     }
 }
 
-pub(crate) async fn delete_artifact_blob(
-    state: &AppState,
-    storage_path: &str,
-) -> anyhow::Result<()> {
-    match rg_core::blob_storage::BlobKey::new(storage_path) {
-        Ok(key) => {
-            state.blob_storage.delete(&key).await?;
-        }
-        Err(_) => {
-            let file_path = PathBuf::from(storage_path);
-            if !is_path_under(&file_path, &artifact_root(state)) {
-                // Nothing to unlink is a success, not a refusal — otherwise the
-                // row outlives its file and every retention sweep fails on it.
-                if legacy_artifact_is_gone(&file_path, &artifact_root(state)) {
-                    return Ok(());
+/// A portable artifact object, parked under a private key.
+#[derive(Debug)]
+struct StagedArtifactBlob {
+    live: rg_core::blob_storage::BlobKey,
+    staged: rg_core::blob_storage::BlobKey,
+}
+
+/// A pre-migration artifact file, renamed beside itself.
+#[derive(Debug)]
+struct StagedLegacyArtifact {
+    live: PathBuf,
+    staged: PathBuf,
+}
+
+/// An artifact's bytes, taken out of the live namespace but not yet destroyed.
+///
+/// Deleting the object first and the row second is not compensable: a database
+/// failure after a successful unlink leaves a live row advertising a download
+/// whose bytes are gone for good, and the `5xx` the caller sees says nothing
+/// about which of the two halves already happened. The reversible order is the
+/// one repository, release and OCI deletion already use — move the bytes to a
+/// request-private name, delete the metadata, and only then destroy the
+/// tombstone. Every stage is recoverable up to the commit, and after it the
+/// remaining debt is physical cleanup, which is reported rather than assumed.
+#[derive(Debug)]
+pub(crate) struct ArtifactDeletionStaging {
+    artifact_id: i64,
+    blob: Option<StagedArtifactBlob>,
+    legacy: Option<StagedLegacyArtifact>,
+}
+
+impl ArtifactDeletionStaging {
+    /// Move the artifact's bytes out of the live namespace.
+    ///
+    /// Bytes that are already gone are the end state this call is asked for, so
+    /// they stage nothing and succeed — otherwise a row whose file an operator
+    /// removed by hand could never be deleted at all. Anything else fails here,
+    /// before the metadata is touched.
+    pub(crate) async fn prepare(
+        state: &AppState,
+        artifact_id: i64,
+        storage_path: &str,
+    ) -> anyhow::Result<Self> {
+        let deletion_id = Uuid::new_v4().simple().to_string();
+        let mut staging = Self {
+            artifact_id,
+            blob: None,
+            legacy: None,
+        };
+
+        match rg_core::blob_storage::BlobKey::new(storage_path) {
+            Ok(live) => {
+                let staged = rg_core::blob_storage::BlobKey::from_segments([
+                    "_deleted",
+                    "artifact-deletions",
+                    artifact_id.to_string().as_str(),
+                    deletion_id.as_str(),
+                ])?;
+                match state.blob_storage.move_prefix(&live, &staged).await {
+                    Ok(true) => staging.blob = Some(StagedArtifactBlob { live, staged }),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error).context(format!(
+                            "failed to stage CI artifact blob {live} at {staged}"
+                        )));
+                    }
                 }
-                anyhow::bail!(
-                    "stored path {} is outside managed artifact storage",
-                    file_path.display()
+            }
+            Err(_) => {
+                let live = PathBuf::from(storage_path);
+                if !is_path_under(&live, &artifact_root(state)) {
+                    // Nothing to unlink is a success, not a refusal — otherwise
+                    // the row outlives its file and every retention sweep fails
+                    // on it.
+                    if legacy_artifact_is_gone(&live, &artifact_root(state)) {
+                        return Ok(staging);
+                    }
+                    anyhow::bail!(
+                        "stored path {} is outside managed artifact storage",
+                        live.display()
+                    );
+                }
+                let staged = match live.file_name() {
+                    Some(name) => live.with_file_name(format!(
+                        "{}.deleted-{deletion_id}",
+                        name.to_string_lossy()
+                    )),
+                    None => anyhow::bail!(
+                        "stored path {} does not name a legacy artifact file",
+                        live.display()
+                    ),
+                };
+                match tokio::fs::rename(&live, &staged).await {
+                    Ok(()) => staging.legacy = Some(StagedLegacyArtifact { live, staged }),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(artifact_path_error(
+                            "legacy CI artifact",
+                            &live,
+                            &error
+                        ))
+                        .context(format!(
+                            "failed to stage legacy CI artifact at {}",
+                            staged.display()
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(staging)
+    }
+
+    /// Put the bytes back where the surviving row expects them.
+    ///
+    /// Compensation on an error path: the caller must still see the original
+    /// failure, so a failed restore can only be reported. When it fails the row
+    /// is live again while its bytes sit under a name nothing else records —
+    /// which is exactly what the log line has to say.
+    pub(crate) async fn restore(&self, state: &AppState) {
+        if let Some(legacy) = &self.legacy {
+            if let Err(error) = tokio::fs::rename(&legacy.staged, &legacy.live).await {
+                tracing::warn!(
+                    artifact_id = self.artifact_id,
+                    staged_at = %legacy.staged.display(),
+                    belongs_at = %legacy.live.display(),
+                    %error,
+                    "failed to restore a legacy CI artifact after deletion aborted — the surviving row now points at missing bytes until the file is moved back by hand"
                 );
             }
-            if tokio::fs::try_exists(&file_path).await.map_err(|error| {
-                anyhow::anyhow!(artifact_path_error(
-                    "legacy CI artifact",
-                    &file_path,
-                    &error
-                ))
-            })? {
-                tokio::fs::remove_file(&file_path).await.map_err(|error| {
-                    anyhow::anyhow!(artifact_path_error(
-                        "legacy CI artifact",
-                        &file_path,
-                        &error
-                    ))
-                })?;
+        }
+        if let Some(blob) = &self.blob {
+            match state
+                .blob_storage
+                .move_prefix(&blob.staged, &blob.live)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    artifact_id = self.artifact_id,
+                    staged_key = %blob.staged,
+                    live_key = %blob.live,
+                    "failed to restore a CI artifact blob after deletion aborted — the staged object disappeared and the surviving row now points at missing bytes"
+                ),
+                Err(error) => tracing::warn!(
+                    artifact_id = self.artifact_id,
+                    staged_key = %blob.staged,
+                    live_key = %blob.live,
+                    %error,
+                    "failed to restore a CI artifact blob after deletion aborted — the surviving row cannot reach it until the object is moved back by hand"
+                ),
             }
         }
     }
-    Ok(())
+
+    /// Destroy the tombstone, once the metadata row is gone.
+    ///
+    /// After the commit there is nothing left to roll back — the live name is
+    /// already free — so a failure here is cleanup debt, not a lost deletion. It
+    /// is still returned: answering `204` while bytes remain parked under a
+    /// private key is the silent half of the same failure.
+    pub(crate) async fn retire(self, state: &AppState) -> anyhow::Result<()> {
+        let mut cleanup_error = None;
+
+        if let Some(legacy) = self.legacy {
+            match tokio::fs::remove_file(&legacy.staged).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        artifact_id = self.artifact_id,
+                        staged_at = %legacy.staged.display(),
+                        %error,
+                        "CI artifact metadata is deleted, but its staged legacy file remains and must be removed by hand"
+                    );
+                    cleanup_error = Some(
+                        anyhow::anyhow!(artifact_path_error(
+                            "staged legacy CI artifact",
+                            &legacy.staged,
+                            &error
+                        ))
+                        .context("failed to retire a deleted legacy CI artifact"),
+                    );
+                }
+            }
+        }
+
+        if let Some(blob) = self.blob {
+            if let Err(error) = state.blob_storage.delete_prefix(&blob.staged).await {
+                tracing::warn!(
+                    artifact_id = self.artifact_id,
+                    staged_key = %blob.staged,
+                    live_key = %blob.live,
+                    %error,
+                    "CI artifact metadata is deleted and its live key is free, but the staged object remains and must be removed by hand"
+                );
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(anyhow::Error::new(error).context(format!(
+                        "failed to retire a staged CI artifact blob at {}",
+                        blob.staged
+                    )));
+                }
+            }
+        }
+
+        cleanup_error.map_or(Ok(()), Err)
+    }
 }
 
 fn artifact_root(state: &AppState) -> PathBuf {

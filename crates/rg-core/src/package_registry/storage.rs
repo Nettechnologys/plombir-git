@@ -134,20 +134,87 @@ impl PackageStorage {
         }
     }
 
-    /// Delete a version directory and all its files.
-    pub async fn delete_version(
+    /// Move a version's whole object prefix out of the live namespace.
+    ///
+    /// Deleting the objects one by one is not a deletion boundary: a backend
+    /// failure halfway through leaves a still-published version whose files are
+    /// partly destroyed, and a metadata failure after the loop finished leaves
+    /// the full metadata on bytes that no longer exist. Neither is reversible.
+    /// One atomic prefix move is, and a backend that cannot provide one refuses
+    /// here — before the live version has changed at all.
+    ///
+    /// `legacy_paths` are the absolute paths of rows written before the
+    /// blob-storage migration; they sit outside the prefix, so they are renamed
+    /// beside themselves and travel with the same tombstone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_version_deletion(
         &self,
         owner: &str,
         repo: &str,
         package_type: &str,
         name: &str,
         version: &str,
-    ) -> Result<()> {
-        let prefix = self.version_key(owner, repo, package_type, name, version)?;
-        for object in self.backend.list(Some(&prefix)).await? {
-            self.backend.delete(&object.key).await?;
+        legacy_paths: &[String],
+        deletion_id: &str,
+    ) -> Result<StagedPackageVersion> {
+        let live = self.version_key(owner, repo, package_type, name, version)?;
+        let staged = BlobKey::from_segments([
+            "_deleted",
+            "package-deletions",
+            owner,
+            repo,
+            package_type,
+            name,
+            version,
+            deletion_id,
+        ])?;
+
+        let mut staging = StagedPackageVersion {
+            live: live.clone(),
+            staged: staged.clone(),
+            moved: false,
+            legacy: Vec::new(),
+        };
+
+        match self.backend.move_prefix(&live, &staged).await {
+            Ok(true) => staging.moved = true,
+            // A version whose objects are already gone still owns its metadata,
+            // and removing that is the end state this call is asked for.
+            Ok(false) => {}
+            Err(error) => {
+                return Err(Error::new(error).context(format!(
+                    "failed to stage package version prefix {live} at {staged}"
+                )));
+            }
         }
-        Ok(())
+
+        for path in legacy_paths {
+            let live = PathBuf::from(path);
+            let Some(file_name) = live.file_name() else {
+                continue;
+            };
+            let staged_path = live.with_file_name(format!(
+                "{}.deleted-{deletion_id}",
+                file_name.to_string_lossy()
+            ));
+            match tokio::fs::rename(&live, &staged_path).await {
+                Ok(()) => staging.legacy.push(StagedLegacyPackageFile {
+                    live,
+                    staged: staged_path,
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    let failure = legacy_path_error("package file", path, &error);
+                    staging.restore(self).await;
+                    return Err(failure.context(format!(
+                        "failed to stage legacy package file at {}",
+                        staged_path.display()
+                    )));
+                }
+            }
+        }
+
+        Ok(staging)
     }
 
     /// Delete a file by storage path.
@@ -194,6 +261,121 @@ impl std::fmt::Debug for PackageStorage {
             .debug_struct("PackageStorage")
             .field("backend", &self.backend.backend_name())
             .finish()
+    }
+}
+
+/// A pre-migration package file, renamed beside itself.
+#[derive(Debug)]
+struct StagedLegacyPackageFile {
+    live: PathBuf,
+    staged: PathBuf,
+}
+
+/// A package version's objects, parked under a private prefix.
+///
+/// Produced by [`PackageStorage::stage_version_deletion`] and consumed exactly
+/// once: [`restore`](Self::restore) puts the version back when the metadata
+/// delete fails, [`retire`](Self::retire) destroys the tombstone after it
+/// commits. Everything the version owns — the portable prefix and any legacy
+/// absolute paths — travels together, so a rollback restores a whole version
+/// rather than the part that happened to be reached first.
+#[derive(Debug)]
+pub struct StagedPackageVersion {
+    live: BlobKey,
+    staged: BlobKey,
+    moved: bool,
+    legacy: Vec<StagedLegacyPackageFile>,
+}
+
+impl StagedPackageVersion {
+    /// Put every staged representation back where the surviving metadata
+    /// expects it.
+    ///
+    /// Compensation on an error path: the caller must still see the original
+    /// failure, so a failed restore can only be reported — and it has to be,
+    /// because the outcome it leaves is a published version pointing at bytes
+    /// parked under a name nothing else records.
+    pub async fn restore(&self, storage: &PackageStorage) {
+        for file in self.legacy.iter().rev() {
+            if let Err(error) = tokio::fs::rename(&file.staged, &file.live).await {
+                tracing::warn!(
+                    staged_at = %file.staged.display(),
+                    belongs_at = %file.live.display(),
+                    %error,
+                    "failed to restore a legacy package file after deletion aborted — the surviving version now points at missing bytes until the file is moved back by hand"
+                );
+            }
+        }
+        if !self.moved {
+            return;
+        }
+        match storage.backend.move_prefix(&self.staged, &self.live).await {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                staged_prefix = %self.staged,
+                live_prefix = %self.live,
+                "failed to restore a package version prefix after deletion aborted — the staged prefix disappeared and the surviving version now points at missing bytes"
+            ),
+            Err(error) => tracing::warn!(
+                staged_prefix = %self.staged,
+                live_prefix = %self.live,
+                %error,
+                "failed to restore a package version prefix after deletion aborted — the surviving version cannot reach it until the prefix is moved back by hand"
+            ),
+        }
+    }
+
+    /// Destroy the tombstone, once the metadata is gone.
+    ///
+    /// There is nothing left to roll back at this point — the live prefix is
+    /// already free — so a failure here is cleanup debt rather than a lost
+    /// deletion. It is still returned: reporting `204` while a version's bytes
+    /// remain parked under a private prefix is the silent half of the failure.
+    pub async fn retire(self, storage: &PackageStorage) -> Result<()> {
+        let mut cleanup_error = None;
+
+        for file in self.legacy {
+            match tokio::fs::remove_file(&file.staged).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        staged_at = %file.staged.display(),
+                        %error,
+                        "package version metadata is deleted, but a staged legacy file remains and must be removed by hand"
+                    );
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(
+                            legacy_path_error(
+                                "staged package file",
+                                &file.staged.to_string_lossy(),
+                                &error,
+                            )
+                            .context("failed to retire a deleted legacy package file"),
+                        );
+                    }
+                }
+            }
+        }
+
+        if self.moved {
+            if let Err(error) = storage.backend.delete_prefix(&self.staged).await {
+                tracing::warn!(
+                    staged_prefix = %self.staged,
+                    live_prefix = %self.live,
+                    %error,
+                    "package version metadata is deleted and its live prefix is free, but the staged objects remain and must be removed by hand"
+                );
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(Error::new(error).context(format!(
+                        "failed to retire a staged package version prefix at {}",
+                        self.staged
+                    )));
+                }
+            }
+        }
+
+        cleanup_error.map_or(Ok(()), Err)
     }
 }
 
@@ -283,14 +465,135 @@ mod tests {
                 .await
         );
 
-        storage
-            .delete_version("alice", "demo", "npm", "@scope/pkg", "1.0.0")
+        let staged = storage
+            .stage_version_deletion("alice", "demo", "npm", "@scope/pkg", "1.0.0", &[], "abc123")
             .await
             .unwrap();
+        // Staging alone frees the live prefix — that is what makes the metadata
+        // delete safe to attempt — but the bytes are still recoverable.
         assert!(
             !storage
                 .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
                 .await
+        );
+        staged.restore(&storage).await;
+        assert_eq!(
+            storage.read_file(&stored.storage_path).await.unwrap(),
+            b"package"
+        );
+
+        let staged = storage
+            .stage_version_deletion("alice", "demo", "npm", "@scope/pkg", "1.0.0", &[], "def456")
+            .await
+            .unwrap();
+        staged.retire(&storage).await.unwrap();
+        assert!(
+            !storage
+                .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
+                .await
+        );
+        assert!(
+            !directory
+                .path()
+                .join("_deleted/package-deletions/alice/demo/npm/%40scope%2Fpkg/1.0.0/def456")
+                .exists(),
+            "retirement left the private tombstone behind"
+        );
+    }
+
+    /// A backend that cannot move a namespace atomically has no safe way to
+    /// take a version out of the live namespace, so it must refuse *before*
+    /// touching it — never fall back to deleting the objects one by one, which
+    /// is the unreversible order this staging exists to replace.
+    #[tokio::test]
+    async fn a_backend_without_atomic_prefix_move_refuses_before_touching_the_version() {
+        use crate::blob_storage::{BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage};
+        use futures::future::BoxFuture;
+        use std::path::Path as StdPath;
+
+        /// Everything `LocalBlobStorage` does, minus the atomic prefix move —
+        /// the shape of an object store that only speaks per-key operations.
+        struct NoPrefixMove(LocalBlobStorage);
+
+        impl BlobStorage for NoPrefixMove {
+            fn backend_name(&self) -> &'static str {
+                "no-prefix-move"
+            }
+            fn put<'a>(
+                &'a self,
+                key: &'a BlobKey,
+                data: &'a [u8],
+            ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+                self.0.put(key, data)
+            }
+            fn put_file<'a>(
+                &'a self,
+                key: &'a BlobKey,
+                source: &'a StdPath,
+            ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+                self.0.put_file(key, source)
+            }
+            fn get<'a>(
+                &'a self,
+                key: &'a BlobKey,
+            ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<u8>>> {
+                self.0.get(key)
+            }
+            fn metadata<'a>(
+                &'a self,
+                key: &'a BlobKey,
+            ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+                self.0.metadata(key)
+            }
+            fn exists<'a>(
+                &'a self,
+                key: &'a BlobKey,
+            ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+                self.0.exists(key)
+            }
+            fn delete<'a>(
+                &'a self,
+                key: &'a BlobKey,
+            ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+                self.0.delete(key)
+            }
+            fn list<'a>(
+                &'a self,
+                prefix: Option<&'a BlobKey>,
+            ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<BlobMetadata>>> {
+                self.0.list(prefix)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = PackageStorage::from_backend(std::sync::Arc::new(NoPrefixMove(
+            LocalBlobStorage::new(directory.path()),
+        )));
+        let stored = storage
+            .store_file(
+                "alice",
+                "demo",
+                "npm",
+                "pkg",
+                "1.0.0",
+                "package.tgz",
+                b"bytes",
+            )
+            .await
+            .unwrap();
+
+        let refusal = storage
+            .stage_version_deletion("alice", "demo", "npm", "pkg", "1.0.0", &[], "abc123")
+            .await
+            .expect_err("a backend with no atomic prefix move must refuse");
+        assert!(
+            format!("{refusal:#}").contains("atomic prefix move"),
+            "{refusal:#}"
+        );
+        assert_eq!(
+            storage.read_file(&stored.storage_path).await.unwrap(),
+            b"bytes",
+            "a refused staging destroyed part of the live version"
         );
     }
 

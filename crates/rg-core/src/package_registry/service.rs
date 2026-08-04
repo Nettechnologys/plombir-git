@@ -3,6 +3,7 @@
 //! Provides generic package publish/download/list/delete operations,
 //! coordinating the DB ops and the storage layer.
 
+use anyhow::Context as _;
 use sea_orm::{DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 
 use crate::error::not_found;
@@ -780,23 +781,80 @@ pub async fn delete_version(
 ) -> Result<()> {
     let v = get_version(db, owner, repo, package_type, name, version_str).await?;
 
-    // Delete files from storage
-    storage
-        .delete_version(owner, repo, package_type, name, version_str)
+    // Rows written before the blob-storage migration hold an absolute path
+    // instead of a key, so they sit outside the version prefix and the prefix
+    // move cannot reach them. They are staged by path alongside it.
+    let legacy_paths: Vec<String> = rg_db::ops::package_file_ops::list_by_version(db, v.id)
+        .await?
+        .into_iter()
+        .filter(|file| crate::blob_storage::BlobKey::new(&file.storage_path).is_err())
+        .map(|file| file.storage_path)
+        .collect();
+
+    // Bytes leave the live namespace reversibly and *before* the metadata: the
+    // storage half is the one that cannot be undone once it has run, so it is
+    // the half that must be undoable while the metadata write can still fail.
+    let deletion_id = uuid::Uuid::new_v4().simple().to_string();
+    let staging = storage
+        .stage_version_deletion(
+            owner,
+            repo,
+            package_type,
+            name,
+            version_str,
+            &legacy_paths,
+            &deletion_id,
+        )
         .await?;
 
-    // Delete DB records. The file rows are a bulk cascade — a version carrying
-    // no files legitimately matches zero of them. The version row is the single
-    // row this call claims to have deleted, and `get_version` above ran as a
-    // separate statement, so a concurrent delete can take it in between:
-    // reporting `Ok(())` for zero rows would answer 204 for a deletion this
-    // request never performed.
-    rg_db::ops::package_file_ops::delete_by_version(db, v.id).await?;
-    if rg_db::ops::package_version_ops::delete_by_id(db, v.id).await? == 0 {
-        return Err(not_found("package version"));
+    // Both metadata deletes are one statement pair. The file rows are a bulk
+    // cascade — a version carrying no files legitimately matches zero of them —
+    // but a failure between the two used to leave a live version whose files
+    // had already been removed, which no rollback of the bytes could repair.
+    match delete_version_metadata(db, v.id).await {
+        // `get_version` above ran as a separate statement, so a concurrent
+        // delete can take the row in between. That request owns the deletion, so
+        // this one must not answer 204 for it — the staged bytes are still
+        // retired rather than restored, since the metadata is gone either way.
+        Ok(false) => {
+            staging.retire(storage).await?;
+            return Err(not_found("package version"));
+        }
+        Ok(true) => {}
+        Err(error) => {
+            staging.restore(storage).await;
+            return Err(error).context("failed to delete package version metadata");
+        }
     }
 
-    Ok(())
+    staging.retire(storage).await
+}
+
+/// Remove a version's file rows and the version row as one transaction.
+///
+/// Returns whether the version row itself was still there. A zero-row version
+/// delete rolls the whole thing back: the concurrent request that took the row
+/// owns its file rows too, and committing a partial delete on top of it would
+/// destroy rows this call was never entitled to.
+async fn delete_version_metadata(db: &DatabaseConnection, version_id: i64) -> Result<bool> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin package version delete")?;
+    rg_db::ops::package_file_ops::delete_by_version(&transaction, version_id).await?;
+    let deleted = rg_db::ops::package_version_ops::delete_by_id(&transaction, version_id).await?;
+    if deleted == 0 {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back package version delete")?;
+        return Ok(false);
+    }
+    transaction
+        .commit()
+        .await
+        .context("db: commit package version delete")?;
+    Ok(true)
 }
 
 /// Yank a version (soft delete — mark as pulled).

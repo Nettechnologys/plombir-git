@@ -96,11 +96,20 @@ pub async fn cleanup_expired_storage(
                 continue;
             }
         }
-        match crate::api::artifacts::delete_artifact_blob(state, &artifact.file_path).await {
-            Ok(()) => {
-                rg_db::ops::artifact_ops::delete_by_id(&state.db, artifact.id).await?;
-                summary.artifacts_deleted += 1;
-            }
+        // An expired artifact is deleted the same reversible way the routed
+        // DELETE deletes one: bytes out of the live namespace first, metadata
+        // second, tombstone last. A sweep is where the unreversible order hurts
+        // most — nobody is watching the response, so a metadata failure after a
+        // successful unlink would leave a row advertising bytes this loop
+        // destroyed, and the next pass would report the same artifact again.
+        let staging = match crate::api::artifacts::ArtifactDeletionStaging::prepare(
+            state,
+            artifact.id,
+            &artifact.file_path,
+        )
+        .await
+        {
+            Ok(staging) => staging,
             Err(error) => {
                 summary.failures += 1;
                 tracing::error!(
@@ -108,7 +117,37 @@ pub async fn cleanup_expired_storage(
                     error = %format!("{error:#}"),
                     "refused to clean expired artifact"
                 );
+                continue;
             }
+        };
+
+        let deleted = match rg_db::ops::artifact_ops::delete_by_id(&state.db, artifact.id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                staging.restore(state).await;
+                summary.failures += 1;
+                tracing::error!(
+                    artifact_id = artifact.id,
+                    error = %format!("{error:#}"),
+                    "expired artifact kept: deleting its metadata failed, so its bytes were put back"
+                );
+                continue;
+            }
+        };
+
+        // Retirement is what makes the artifact deleted. Counting it before the
+        // tombstone is gone would report a cleanup that freed no space.
+        if let Err(error) = staging.retire(state).await {
+            summary.failures += 1;
+            tracing::error!(
+                artifact_id = artifact.id,
+                error = %format!("{error:#}"),
+                "expired artifact metadata is deleted, but its staged bytes remain"
+            );
+            continue;
+        }
+        if deleted {
+            summary.artifacts_deleted += 1;
         }
     }
     for cache in rg_db::ops::ci_retention_ops::list_expired_cache(&state.db).await? {

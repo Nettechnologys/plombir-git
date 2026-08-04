@@ -66,7 +66,11 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<u64, DbErr
 }
 
 /// Delete all files for a version.
-pub async fn delete_by_version(db: &DatabaseConnection, version_id: i64) -> Result<u64, DbErr> {
+///
+/// Takes any connection, not just the pool: a version delete has to remove the
+/// file rows and the version row as one statement pair, or a failure between
+/// them leaves a live version whose files are gone.
+pub async fn delete_by_version(db: &impl ConnectionTrait, version_id: i64) -> Result<u64, DbErr> {
     let result = PackageFile::delete_many()
         .filter(package_file::Column::VersionId.eq(version_id))
         .exec(db)

@@ -117,7 +117,10 @@ pub async fn set_yanked(db: &DatabaseConnection, id: i64, yanked: bool) -> Resul
 }
 
 /// Delete a version by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<u64, DbErr> {
+///
+/// Takes any connection so the caller can pair it with the file-row delete
+/// inside one transaction — see [`super::package_file_ops::delete_by_version`].
+pub async fn delete_by_id(db: &impl ConnectionTrait, id: i64) -> Result<u64, DbErr> {
     let result = PackageVersion::delete_by_id(id).exec(db).await?;
     Ok(result.rows_affected)
 }
