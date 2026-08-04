@@ -20,6 +20,8 @@ pub struct Model {
     pub author_id: Option<i64>,
     /// Git blob SHA of this revision
     pub sha: Option<String>,
+    /// Monotonic token used to serialize revision snapshots with page updates.
+    pub edit_version: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

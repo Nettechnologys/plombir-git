@@ -3,8 +3,8 @@
 //! `update_page` snapshots the pre-edit content under the next free version
 //! number. The first defect treated a failed `latest_version` query as version
 //! zero. The second let two successful lookups race and store the same next
-//! number. The schema now makes `(wiki_page_id, version)` unique and the loser
-//! re-reads before retrying.
+//! number. The page now carries that number as a CAS token, and the snapshot
+//! plus page overwrite commit or roll back together.
 //!
 //! These tests pin all three parts: ordinary numbering, concurrent allocation,
 //! and what happens when the revision table cannot be read at all.
@@ -154,8 +154,8 @@ async fn an_unreadable_revision_table_fails_the_edit_instead_of_reusing_a_versio
         .expect_err("an unanswerable revision lookup is a failed edit, not version 1 again");
     let chain = format!("{error:#}");
     assert!(
-        chain.contains("find latest wiki revision version"),
-        "the failure should name the lookup that could not be answered, got: {chain}"
+        chain.contains("snapshot wiki page before update"),
+        "the failure should name the history write that could not be completed, got: {chain}"
     );
 
     // And the page still holds what it held before the refused edit.

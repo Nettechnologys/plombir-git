@@ -6,7 +6,10 @@ use sea_orm::*;
 use crate::entities::wiki_revision::{self, ActiveModel, Entity as WikiRevisionEntity, Model};
 
 /// Create a new wiki revision.
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
+pub async fn create<C>(db: &C, model: ActiveModel) -> Result<Model>
+where
+    C: ConnectionTrait,
+{
     model.insert(db).await.context("db: create wiki revision")
 }
 

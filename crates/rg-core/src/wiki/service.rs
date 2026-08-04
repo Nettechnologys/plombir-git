@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 
 use rg_db::entities::wiki_page;
 use rg_db::entities::wiki_revision;
@@ -54,6 +54,7 @@ pub async fn create_page(
         message: sea_orm::Set(message.map(|s| s.to_string())),
         author_id: sea_orm::Set(author_id),
         sha: sea_orm::Set(None),
+        edit_version: sea_orm::Set(0),
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
     };
@@ -111,86 +112,11 @@ pub async fn update_page(
     message: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<wiki_page::Model> {
-    let existing = wiki_page_ops::find_by_repo_and_title(db, repo_id, title)
-        .await
-        .context("find wiki page for update")?
-        .ok_or_else(|| crate::error::not_found("wiki page"))?;
-
-    // Save the current content as a revision before overwriting. The database
-    // makes (wiki_page_id, version) unique; if another editor wins between our
-    // lookup and insert, re-read the winner and try the next number. Every
-    // UNIQUE loss therefore records someone else's progress instead of either
-    // duplicating a number or silently dropping this snapshot.
-    //
-    // A failed lookup remains fatal: `Ok(0)` already represents an empty
-    // history, so an error means the next number is unknowable. Unexpected
-    // insert failures retain the existing non-fatal policy below, but a stream
-    // of genuine allocation conflicts is bounded so a saturated page cannot
-    // keep one request alive forever.
-    const MAX_VERSION_INSERT_ATTEMPTS: usize = 32;
-    let mut next_version = wiki_revision_ops::latest_version(db, existing.id)
-        .await
-        .context("find latest wiki revision version")?
-        .checked_add(1)
-        .context("wiki revision version exhausted")?;
-
-    for attempt in 1..=MAX_VERSION_INSERT_ATTEMPTS {
-        let rev = wiki_revision::ActiveModel {
-            id: sea_orm::NotSet,
-            wiki_page_id: sea_orm::Set(existing.id),
-            content: sea_orm::Set(existing.content.clone()),
-            message: sea_orm::Set(existing.message.clone()),
-            author_id: sea_orm::Set(existing.author_id),
-            version: sea_orm::Set(next_version),
-            created_at: sea_orm::Set(Utc::now()),
-        };
-
-        match wiki_revision_ops::create(db, rev).await {
-            Ok(_) => break,
-            Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
-                if attempt == MAX_VERSION_INSERT_ATTEMPTS {
-                    return Err(error).context(format!(
-                        "allocate a unique wiki revision version after \
-                         {MAX_VERSION_INSERT_ATTEMPTS} concurrent conflicts"
-                    ));
-                }
-                next_version = wiki_revision_ops::latest_version(db, existing.id)
-                    .await
-                    .context("re-read latest wiki revision after a concurrent edit")?
-                    .checked_add(1)
-                    .context("wiki revision version exhausted")?;
-            }
-            Err(error) => {
-                // Non-fatal: a lost revision must not block the edit the user
-                // asked for. It is still a lost revision — the pre-edit
-                // content becomes unrecoverable the moment the page below is
-                // overwritten, so say which one went missing.
-                tracing::warn!(
-                    wiki_page_id = existing.id,
-                    repo_id,
-                    title = %existing.title,
-                    version = next_version,
-                    error = %format!("{error:#}"),
-                    "wiki revision not saved — the page is still being updated, so its previous content is lost from the history"
-                );
-                break;
-            }
-        }
-    }
-
-    let model = wiki_page::ActiveModel {
-        id: sea_orm::Set(existing.id),
-        repo_id: sea_orm::Set(existing.repo_id),
-        title: sea_orm::Set(existing.title),
-        content: sea_orm::Set(content.to_string()),
-        message: sea_orm::Set(message.map(|s| s.to_string())),
-        author_id: sea_orm::Set(author_id.or(existing.author_id)),
-        sha: sea_orm::Set(None),
-        created_at: sea_orm::Set(existing.created_at),
-        updated_at: sea_orm::Set(Utc::now()),
-    };
-
-    let updated = wiki_page_ops::update(db, model).await?;
+    let updated =
+        update_page_transactionally(db, repo_id, title, content, message, author_id, |_| {
+            std::future::ready(())
+        })
+        .await?;
 
     // Update the cross-backend metadata FTS index (non-fatal).
     let page_id = updated.id;
@@ -210,6 +136,129 @@ pub async fn update_page(
     }
 
     Ok(updated)
+}
+
+/// Serialize `read page -> snapshot -> overwrite` through the page's monotonic
+/// edit token. The callback is a private test seam: production supplies a
+/// ready future, while the regression test can stop both first attempts after
+/// they have read the same token without depending on scheduler timing.
+async fn update_page_transactionally<F, Fut>(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    title: &str,
+    content: &str,
+    message: Option<&str>,
+    author_id: Option<i64>,
+    after_read: F,
+) -> Result<wiki_page::Model>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    const MAX_UPDATE_ATTEMPTS: usize = 32;
+
+    for attempt in 1..=MAX_UPDATE_ATTEMPTS {
+        let transaction = match db.begin().await {
+            Ok(transaction) => transaction,
+            Err(error)
+                if attempt < MAX_UPDATE_ATTEMPTS
+                    && rg_db::is_retryable_transaction_error(&error) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).context("begin wiki page update transaction"),
+        };
+
+        let write_result: Result<Option<wiki_page::Model>> = async {
+            let existing = wiki_page_ops::find_by_repo_and_title(&transaction, repo_id, title)
+                .await
+                .context("find wiki page for update")?
+                .ok_or_else(|| crate::error::not_found("wiki page"))?;
+            after_read(attempt).await;
+
+            let next_version = existing
+                .edit_version
+                .checked_add(1)
+                .context("wiki edit version exhausted")?;
+            let revision = wiki_revision::ActiveModel {
+                id: sea_orm::NotSet,
+                wiki_page_id: sea_orm::Set(existing.id),
+                content: sea_orm::Set(existing.content.clone()),
+                message: sea_orm::Set(existing.message.clone()),
+                author_id: sea_orm::Set(existing.author_id),
+                version: sea_orm::Set(next_version),
+                created_at: sea_orm::Set(Utc::now()),
+            };
+            wiki_revision_ops::create(&transaction, revision)
+                .await
+                .context("snapshot wiki page before update")?;
+
+            wiki_page_ops::update_if_version(
+                &transaction,
+                &existing,
+                content,
+                message,
+                author_id.or(existing.author_id),
+                next_version,
+                Utc::now(),
+            )
+            .await
+        }
+        .await;
+
+        let updated = match write_result {
+            Ok(Some(updated)) => updated,
+            Ok(None) => {
+                transaction
+                    .rollback()
+                    .await
+                    .context("rollback stale wiki page update")?;
+                if attempt == MAX_UPDATE_ATTEMPTS {
+                    anyhow::bail!(
+                        "serialize wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
+                    );
+                }
+                continue;
+            }
+            Err(error) => {
+                let retryable = rg_db::is_unique_violation_anyhow(&error)
+                    || rg_db::is_retryable_transaction_error_anyhow(&error);
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "wiki page update failed and its transaction could not be rolled back: \
+                         {rollback_error}"
+                    ));
+                }
+                if retryable && attempt < MAX_UPDATE_ATTEMPTS {
+                    continue;
+                }
+                if retryable {
+                    return Err(error).context(format!(
+                        "serialize wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
+                    ));
+                }
+                return Err(error);
+            }
+        };
+
+        match transaction.commit().await {
+            Ok(()) => return Ok(updated),
+            Err(error)
+                if attempt < MAX_UPDATE_ATTEMPTS
+                    && rg_db::is_retryable_transaction_error(&error) =>
+            {
+                continue;
+            }
+            Err(error) if rg_db::is_retryable_transaction_error(&error) => {
+                return Err(error).context(format!(
+                    "commit wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
+                ));
+            }
+            Err(error) => return Err(error).context("commit wiki page update transaction"),
+        }
+    }
+
+    unreachable!("the bounded wiki update loop returns or continues on every attempt")
 }
 
 /// List all revisions for a wiki page (newest first).
@@ -286,5 +335,113 @@ pub async fn delete_page(db: &DatabaseConnection, repo_id: i64, title: &str) -> 
         Ok(())
     } else {
         Err(crate::error::not_found("wiki page"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_snapshot_edits_form_a_complete_history_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("wiki-lost-update.db");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", db_path.display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            2,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "wikicas",
+            "wikicas@example.invalid",
+            "",
+            "Wiki CAS",
+        )
+        .await
+        .expect("create user");
+        let repo = crate::repo::service::create_repo(
+            &db,
+            user.id,
+            "wiki-cas",
+            None,
+            false,
+            &dir.path().join("repos"),
+            None,
+        )
+        .await
+        .expect("create repo");
+        create_page(&db, repo.id, "Home", "v0", None, Some(user.id))
+            .await
+            .expect("create page");
+
+        let after_same_read = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let first_gate = after_same_read.clone();
+        let first = update_page_transactionally(
+            &db,
+            repo.id,
+            "Home",
+            "A",
+            None,
+            Some(user.id),
+            move |attempt| {
+                let gate = first_gate.clone();
+                async move {
+                    if attempt == 1 {
+                        gate.wait().await;
+                    }
+                }
+            },
+        );
+        let second_gate = after_same_read.clone();
+        let second = update_page_transactionally(
+            &db,
+            repo.id,
+            "Home",
+            "B",
+            None,
+            Some(user.id),
+            move |attempt| {
+                let gate = second_gate.clone();
+                async move {
+                    if attempt == 1 {
+                        gate.wait().await;
+                    }
+                }
+            },
+        );
+
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first same-snapshot edit succeeds");
+        second.expect("second same-snapshot edit succeeds");
+
+        let current = get_page(&db, repo.id, "Home")
+            .await
+            .expect("read current page")
+            .expect("page exists");
+        let revisions = list_revisions(&db, repo.id, "Home")
+            .await
+            .expect("read revisions");
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|revision| revision.version)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(current.edit_version, 2);
+
+        let mut preserved_states = revisions
+            .iter()
+            .map(|revision| revision.content.as_str())
+            .chain(std::iter::once(current.content.as_str()))
+            .collect::<Vec<_>>();
+        preserved_states.sort_unstable();
+        assert_eq!(preserved_states, vec!["A", "B", "v0"]);
     }
 }

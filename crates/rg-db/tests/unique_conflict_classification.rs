@@ -277,6 +277,7 @@ async fn a_duplicate_wiki_page_title_in_one_repository_is_classifiable() {
         message: Set(None),
         author_id: Set(Some(user_id)),
         sha: Set(None),
+        edit_version: Set(0),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
     };

@@ -187,11 +187,12 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
              `deleted_at IS NULL`, so recreating it surfaced as an anonymous 5xx",
         );
 
+    let initial_wiki_content = format!("This page contains {wiki_term} for full text search.");
     let page = rg_core::wiki::service::create_page(
         &db,
         repo.id,
         "Home",
-        &format!("This page contains {wiki_term} for full text search."),
+        &initial_wiki_content,
         Some("initial page"),
         Some(user.id),
     )
@@ -242,6 +243,26 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .collect::<Vec<_>>(),
         vec![2, 1],
         "parallel edits must leave one uniquely numbered revision each"
+    );
+    let current = rg_core::wiki::service::get_page(&db, repo.id, "Home")
+        .await
+        .expect("read current wiki page after concurrent edits")
+        .expect("wiki page still exists");
+    let mut preserved_states = revisions
+        .iter()
+        .map(|revision| revision.content.as_str())
+        .chain(std::iter::once(current.content.as_str()))
+        .collect::<Vec<_>>();
+    preserved_states.sort_unstable();
+    let mut expected_states = vec![
+        initial_wiki_content.as_str(),
+        "first concurrent server edit",
+        "second concurrent server edit",
+    ];
+    expected_states.sort_unstable();
+    assert_eq!(
+        preserved_states, expected_states,
+        "both successful edit texts must survive in current state or history"
     );
 
     let (repo_results, repo_total) = rg_core::search::service::search(

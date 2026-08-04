@@ -127,6 +127,46 @@ pub fn is_unique_violation_anyhow(error: &anyhow::Error) -> bool {
     })
 }
 
+/// True when the backend reports that an entire transaction may be retried.
+///
+/// These are concurrency outcomes, not connection failures: SQLite could not
+/// promote/hold a WAL write lock, PostgreSQL aborted on serialization/deadlock,
+/// or MySQL chose a deadlock/lock-wait victim. Callers must restart the *whole*
+/// transaction from a fresh read; retrying only the failed statement can reuse
+/// stale decisions.
+pub fn is_retryable_transaction_error(error: &sea_orm::DbErr) -> bool {
+    use sea_orm::{RuntimeErr, SqlxError};
+
+    let runtime = match error {
+        sea_orm::DbErr::Conn(runtime)
+        | sea_orm::DbErr::Exec(runtime)
+        | sea_orm::DbErr::Query(runtime) => runtime,
+        _ => return false,
+    };
+    let RuntimeErr::SqlxError(SqlxError::Database(database_error)) = runtime else {
+        return false;
+    };
+
+    matches!(
+        database_error.code().as_deref(),
+        // SQLite: BUSY, LOCKED and their WAL/shared-cache/timeout variants.
+        Some("5" | "6" | "261" | "262" | "517" | "518" | "773")
+            // PostgreSQL: serialization failure and deadlock detected.
+            | Some("40001" | "40P01")
+            // MySQL/MariaDB: lock wait timeout and deadlock victim.
+            | Some("1205" | "1213")
+    )
+}
+
+/// [`is_retryable_transaction_error`] for a `DbErr` wrapped in `anyhow` context.
+pub fn is_retryable_transaction_error_anyhow(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sea_orm::DbErr>()
+            .is_some_and(is_retryable_transaction_error)
+    })
+}
+
 /// Convert portable `?` bind markers in raw SQL to the backend's syntax.
 ///
 /// SeaORM does not rewrite placeholders in `Statement::from_sql_and_values`:
