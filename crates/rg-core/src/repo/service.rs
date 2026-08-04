@@ -3583,6 +3583,17 @@ mod repository_deletion_tests {
             !storage.exists(&old_lfs).await.expect("probe old LFS key"),
             "the replacement repository inherited the transferred LFS object"
         );
+        let old_package_prefix =
+            BlobKey::from_segments(["packages", "transfer-source", "portable"])
+                .expect("valid source package prefix");
+        assert!(
+            storage
+                .list(Some(&old_package_prefix))
+                .await
+                .expect("inventory old package namespace")
+                .is_empty(),
+            "the replacement repository inherited the transferred package bytes"
+        );
         assert!(
             !oci_storage
                 .blob_exists("transfer-source", "portable", &digest)
