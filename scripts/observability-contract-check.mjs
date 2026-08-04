@@ -103,11 +103,65 @@ for (const [, label] of (prometheusYml.match(/external_labels:[\s\S]*?(?=\n\w)/)
 // Metric families that come from somewhere other than ForgeKeep's exporter.
 const FOREIGN_METRIC = /^(up|node_|prometheus_|go_|process_|alertmanager_|grafana_)/;
 
+// PromQL aggregation operators. `topk`/`bottomk` (and the experimental
+// sampling aggregators) retain the original series labels; the others drop
+// every label unless a `by` or `without` modifier says otherwise.
+const AGGREGATION = /\b(sum|avg|min|max|count|stddev|stdvar|group|count_values|topk|bottomk|quantile|limitk|limit_ratio)\b\s*(?:(by|without)\s*\(([^)]*)\)\s*)?\(/g;
+const LABEL_PRESERVING_AGGREGATIONS = new Set(['topk', 'bottomk', 'limitk', 'limit_ratio']);
+
 // PromQL identifiers that are syntax, not series.
 const PROMQL_KEYWORDS = new Set([
   'and', 'or', 'unless', 'by', 'without', 'on', 'ignoring', 'group_left', 'group_right',
   'offset', 'bool', 'start', 'end', 'inf', 'nan',
 ]);
+
+function closingParen(expr, open) {
+  let depth = 0;
+  for (let i = open; i < expr.length; i += 1) {
+    if (expr[i] === '(') depth += 1;
+    else if (expr[i] === ')') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function labelsIn(list) {
+  return new Set([...list.matchAll(/[a-z_][a-z0-9_]*/gi)].map((m) => m[0]));
+}
+
+/** Parse aggregation modifiers while keeping their expression boundaries. */
+function aggregations(expr) {
+  const found = [];
+  for (const match of expr.matchAll(AGGREGATION)) {
+    const open = match.index + match[0].length - 1;
+    const close = closingParen(expr, open);
+    if (close === -1) continue;
+
+    const trailing = expr.slice(close + 1).match(/^\s*(by|without)\s*\(([^)]*)\)/);
+    const modifier = match[2] ?? trailing?.[1];
+    const list = match[3] ?? trailing?.[2];
+    found.push({
+      operator: match[1],
+      modifier,
+      labels: list === undefined ? new Set() : labelsIn(list),
+      open,
+      close,
+    });
+  }
+  return found;
+}
+
+/** Whether every aggregation in an alert expression leaves a label available. */
+function alertExpressionKeepsLabel(expr, label) {
+  return aggregations(expr).every(({ operator, modifier, labels }) => {
+    if (LABEL_PRESERVING_AGGREGATIONS.has(operator)) return true;
+    if (modifier === 'by') return labels.has(label);
+    if (modifier === 'without') return !labels.has(label);
+    return false;
+  });
+}
 
 /**
  * Metric references in one PromQL expression, each with the labels the
@@ -123,30 +177,10 @@ function metricReferences(expr) {
   // to, not to the whole expression: `sum by (le, route) (rate(x[5m])) / sum(y)`
   // must not claim `y` is grouped by route. Both spellings PromQL accepts are
   // handled — `sum by (L) (...)` and `sum(...) by (L)`.
-  const AGGREGATION = /\b(sum|avg|min|max|count|stddev|stdvar|topk|bottomk|quantile|group)\s*(?:by\s*\(([^)]*)\)\s*)?\(/g;
-  for (const agg of [...expr.matchAll(AGGREGATION)]) {
-    const open = agg.index + agg[0].length - 1;
-    let depth = 0;
-    let close = -1;
-    for (let i = open; i < expr.length; i += 1) {
-      if (expr[i] === '(') depth += 1;
-      else if (expr[i] === ')') {
-        depth -= 1;
-        if (depth === 0) {
-          close = i;
-          break;
-        }
-      }
-    }
-    if (close === -1) continue;
-
-    const trailing = expr.slice(close + 1).match(/^\s*by\s*\(([^)]*)\)/);
-    const labelList = agg[2] ?? trailing?.[1];
-    if (labelList === undefined) continue;
-
-    const labels = new Set([...labelList.matchAll(/[a-z_][a-z0-9_]*/gi)].map((m) => m[0]));
-    for (let i = open; i < close; i += 1) {
-      groupingAt.set(i, new Set([...(groupingAt.get(i) ?? []), ...labels]));
+  for (const aggregation of aggregations(expr)) {
+    if (aggregation.modifier !== 'by') continue;
+    for (let i = aggregation.open; i < aggregation.close; i += 1) {
+      groupingAt.set(i, new Set([...(groupingAt.get(i) ?? []), ...aggregation.labels]));
     }
   }
 
@@ -240,19 +274,19 @@ for (const [, , name, body] of rules) {
     failures.push(`alerts.yml: rule ${name} has no readable expr`);
     continue;
   }
-  alertReferences += checkExpression(expr[2] ?? expr[3], `alerts.yml: ${name}`);
+  const expression = expr[2] ?? expr[3];
+  alertReferences += checkExpression(expression, `alerts.yml: ${name}`);
 
   // An annotation interpolating `$labels.x` is a promise that x is on the
-  // alert — which means the expression must both keep and group by it.
-  const grouped = new Set(
-    [...(expr[2] ?? expr[3]).matchAll(/\bby\s*\(([^)]*)\)/g)].flatMap((m) =>
-      [...m[1].matchAll(/[a-z_][a-z0-9_]*/gi)].map((l) => l[0]),
-    ),
-  );
+  // alert. A raw vector retains its labels, `by` retains only its list, and
+  // `without` retains everything except its list. We cannot know labels from
+  // a foreign exporter, so do not make a false claim about an all-foreign rule.
+  const references = metricReferences(expression);
+  const allMetricsForeign = references.length > 0 && references.every(({ metric }) => FOREIGN_METRIC.test(metric));
   for (const [, label] of body.matchAll(/\$labels\.([a-z_][a-z0-9_]*)/g)) {
-    if (targetLabels.has(label) || grouped.has(label)) continue;
+    if (allMetricsForeign || targetLabels.has(label) || alertExpressionKeepsLabel(expression, label)) continue;
     failures.push(
-      `alerts.yml: ${name} interpolates {{ $labels.${label} }}, but its expr never groups by ` +
+      `alerts.yml: ${name} interpolates {{ $labels.${label} }}, but its expr does not retain ` +
         `\`${label}\` — the alert would fire with that placeholder empty`,
     );
   }
