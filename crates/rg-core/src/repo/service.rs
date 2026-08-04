@@ -1206,6 +1206,195 @@ fn artifact_blob_prefixes(
         .collect()
 }
 
+/// One repository-shaped blob namespace moved between two live owners.
+struct TransferredBlobPrefix {
+    source: BlobKey,
+    destination: BlobKey,
+}
+
+/// The blob namespaces whose location changes when a repository is transferred.
+///
+/// Attachments are deliberately absent: they are keyed by immutable repository
+/// id, not by the owner/repository spelling. OCI has its own transfer primitive
+/// because it may be configured on a dedicated backend and also owns upload and
+/// legacy-directory trees that are not `BlobKey`s.
+fn repository_transfer_blob_prefixes(
+    source_namespace: &str,
+    destination_namespace: &str,
+    repo_name: &str,
+) -> Result<Vec<TransferredBlobPrefix>> {
+    ["packages", "lfs", "releases"]
+        .into_iter()
+        .map(|kind| {
+            Ok(TransferredBlobPrefix {
+                source: BlobKey::from_segments([kind, source_namespace, repo_name])?,
+                destination: BlobKey::from_segments([kind, destination_namespace, repo_name])?,
+            })
+        })
+        .collect()
+}
+
+async fn restore_transferred_blob_prefixes(
+    storage: &dyn BlobStorage,
+    prefixes: &[TransferredBlobPrefix],
+    repo_id: i64,
+) {
+    for prefix in prefixes.iter().rev() {
+        match storage
+            .move_prefix(&prefix.destination, &prefix.source)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                repo_id,
+                moved_to = %prefix.destination,
+                belongs_at = %prefix.source,
+                "failed to restore a repository blob prefix after transfer aborted — the active repository can no longer reach these blobs until the prefix is moved back by hand"
+            ),
+            Err(error) => tracing::warn!(
+                repo_id,
+                moved_to = %prefix.destination,
+                belongs_at = %prefix.source,
+                %error,
+                "failed to restore a repository blob prefix after transfer aborted — the active repository can no longer reach these blobs until the prefix is moved back by hand"
+            ),
+        }
+    }
+}
+
+async fn transfer_blob_prefixes(
+    storage: &dyn BlobStorage,
+    prefixes: Vec<TransferredBlobPrefix>,
+    repo_id: i64,
+) -> Result<Vec<TransferredBlobPrefix>> {
+    let mut moved = Vec::new();
+    for prefix in prefixes {
+        match storage
+            .move_prefix(&prefix.source, &prefix.destination)
+            .await
+        {
+            Ok(true) => moved.push(prefix),
+            Ok(false) => {}
+            Err(error) => {
+                restore_transferred_blob_prefixes(storage, &moved, repo_id).await;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to move repository blob prefix {} to {}",
+                        prefix.source, prefix.destination
+                    )
+                });
+            }
+        }
+    }
+    Ok(moved)
+}
+
+/// An optional, historical on-disk namespace moved between two live owners.
+struct TransferredRepositoryDirectory {
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    kind: &'static str,
+}
+
+fn transfer_optional_repository_directory(
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    kind: &'static str,
+) -> Result<Option<TransferredRepositoryDirectory>> {
+    match source.try_exists() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(crate::platform::fs::path_error(
+                kind,
+                &source,
+                &error,
+                crate::platform::fs::BLOB_STORAGE_HINT,
+            ));
+        }
+    }
+    match destination.try_exists() {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(crate::platform::fs::path_error(
+                kind,
+                &destination,
+                &std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination directory already exists",
+                ),
+                crate::platform::fs::BLOB_STORAGE_HINT,
+            ));
+        }
+        Err(error) => {
+            return Err(crate::platform::fs::path_error(
+                kind,
+                &destination,
+                &error,
+                crate::platform::fs::BLOB_STORAGE_HINT,
+            ));
+        }
+    }
+    let parent = destination
+        .parent()
+        .context("repository transfer destination has no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        crate::platform::fs::path_error(
+            kind,
+            parent,
+            &error,
+            crate::platform::fs::BLOB_STORAGE_HINT,
+        )
+    })?;
+    std::fs::rename(&source, &destination).map_err(|error| {
+        crate::platform::fs::path_error(
+            kind,
+            &source,
+            &error,
+            crate::platform::fs::BLOB_STORAGE_HINT,
+        )
+    })?;
+    Ok(Some(TransferredRepositoryDirectory {
+        source,
+        destination,
+        kind,
+    }))
+}
+
+fn restore_transferred_repository_directories(
+    directories: &[TransferredRepositoryDirectory],
+    repo_id: i64,
+) {
+    for directory in directories.iter().rev() {
+        if let Err(error) = std::fs::rename(&directory.destination, &directory.source) {
+            tracing::warn!(
+                repo_id,
+                storage = directory.kind,
+                moved_to = %directory.destination.display(),
+                belongs_at = %directory.source.display(),
+                %error,
+                "failed to restore a historical repository storage directory after transfer aborted — the active repository can no longer reach these bytes until the directory is moved back by hand"
+            );
+        }
+    }
+}
+
+fn restore_transferred_repository_directory(
+    moved_path: &std::path::Path,
+    source_path: &std::path::Path,
+    repo_id: i64,
+) {
+    if let Err(error) = std::fs::rename(moved_path, source_path) {
+        tracing::warn!(
+            repo_id,
+            moved_to = %moved_path.display(),
+            belongs_at = %source_path.display(),
+            %error,
+            "failed to restore a repository directory after transfer aborted — the active repository is unreachable until the directory is moved back by hand"
+        );
+    }
+}
+
 async fn restore_blob_prefixes(
     storage: &dyn BlobStorage,
     prefixes: &[StagedBlobPrefix],
@@ -1645,6 +1834,10 @@ pub async fn list_forks(
 /// namespace's question, and it is answered by the route's `NamespaceCreate`
 /// gate in `rg-http` — the same rule `create_repo` applies to its `org` field,
 /// stated once there rather than a second time here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the service boundary receives the explicit database, source and destination namespaces, Git root, and independently configured blob and OCI backends so callers cannot accidentally transfer only one storage domain"
+)]
 pub async fn transfer_repo(
     db: &DatabaseConnection,
     user_id: i64,
@@ -1652,6 +1845,8 @@ pub async fn transfer_repo(
     repo_name: &str,
     new_owner: &str,
     repo_root: &std::path::Path,
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
 ) -> Result<rg_db::entities::repository::Model> {
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
@@ -1676,6 +1871,10 @@ pub async fn transfer_repo(
     )
     .await?;
 
+    // Build every BlobKey before moving Git. A malformed historical namespace
+    // must fail as one untouched transfer, not after the repository directory
+    // has already left its owner.
+    let blob_prefixes = repository_transfer_blob_prefixes(owner, &new_owner_name, repo_name)?;
     let old_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
     let new_path = repo_root.join(format!("{}/{}.git", new_owner_name, repo_name));
     std::fs::create_dir_all(
@@ -1691,22 +1890,70 @@ pub async fn transfer_repo(
         )
     })?;
 
-    if let Err(error) = repo_ops::update_owner(db, repo.id, new_owner_id, new_org_id).await {
-        // The directory has already moved, so a row left pointing at the old
-        // owner breaks the repository for *both* sides: the old owner has a row
-        // whose tree is gone, the new owner a tree no row names. Move it back,
-        // and if even that fails say so — nothing else will ever repair it.
-        if let Err(cleanup_error) = std::fs::rename(&new_path, &old_path) {
-            tracing::warn!(
-                repo_id = repo.id,
-                moved_to = %new_path.display(),
-                belongs_at = %old_path.display(),
-                error = %cleanup_error,
-                "failed to move a repository back after its ownership update failed — it is now \
-                 unreachable for both the old and the new owner until the directory is moved back \
-                 by hand"
-            );
+    let moved_blobs = match transfer_blob_prefixes(blob_storage, blob_prefixes, repo.id).await {
+        Ok(moved) => moved,
+        Err(error) => {
+            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            return Err(error);
         }
+    };
+
+    // New backend-neutral keys replaced the two paths below, but installations
+    // that predate that migration can still read these directories. They are
+    // just as namespace-bound as their blob counterparts and must move too.
+    let legacy_paths = [
+        (
+            crate::lfs::service::lfs_root(repo_root, owner, repo_name),
+            crate::lfs::service::lfs_root(repo_root, &new_owner_name, repo_name),
+            "legacy LFS directory",
+        ),
+        (
+            repo_root.join(format!("{owner}/{repo_name}.releases")),
+            repo_root.join(format!("{new_owner_name}/{repo_name}.releases")),
+            "legacy release asset directory",
+        ),
+    ];
+    let mut moved_directories = Vec::new();
+    for (source, destination, kind) in legacy_paths {
+        match transfer_optional_repository_directory(source, destination, kind) {
+            Ok(Some(moved)) => moved_directories.push(moved),
+            Ok(None) => {}
+            Err(error) => {
+                restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+                restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+                return Err(error);
+            }
+        }
+    }
+
+    let moved_oci = match oci_storage
+        .transfer_repository(owner, repo_name, &new_owner_name, repo_name)
+        .await
+    {
+        Ok(moved) => moved,
+        Err(error) => {
+            restore_transferred_repository_directories(&moved_directories, repo.id);
+            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = repo_ops::transfer_owner(
+        db,
+        repo.id,
+        new_owner_id,
+        new_org_id,
+        owner,
+        &new_owner_name,
+        repo_name,
+    )
+    .await
+    {
+        oci_storage.restore_repository_transfer(moved_oci).await;
+        restore_transferred_repository_directories(&moved_directories, repo.id);
+        restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+        restore_transferred_repository_directory(&new_path, &old_path, repo.id);
         // Same race as the create paths, one statement later: the free-name
         // check above passed, and someone else claimed the destination name
         // before this update landed. That is the caller's answer in the words
@@ -3119,6 +3366,315 @@ mod repository_deletion_tests {
                 .expect("inventory tombstones")
                 .is_empty(),
             "the rollback restored the live blob prefix but left staged objects"
+        );
+    }
+
+    /// A transfer changes the namespace in every read key, not just the Git
+    /// directory. Package rows and OCI rows retain portable paths too, so the
+    /// test reads them through their production services after the move rather
+    /// than only checking that a directory happened to be renamed.
+    #[tokio::test]
+    async fn transferring_a_repository_keeps_lfs_packages_and_oci_readable_and_frees_the_old_name()
+    {
+        use sha2::Digest;
+
+        let db = setup_db().await;
+        let source_owner = user_ops::create_user(
+            &db,
+            "transfer-source",
+            "transfer-source@example.invalid",
+            "unused",
+            "Transfer Source",
+        )
+        .await
+        .expect("create source owner");
+        let destination_owner = user_ops::create_user(
+            &db,
+            "transfer-destination",
+            "transfer-destination@example.invalid",
+            "unused",
+            "Transfer Destination",
+        )
+        .await
+        .expect("create destination owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let storage: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(&repo_root));
+        let oci_storage = OciStorage::from_backend(storage.clone(), repo_root.join("_oci_uploads"));
+        let repository = create_repo(
+            &db,
+            source_owner.id,
+            "portable",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create repository");
+        let git_marker = repo_root.join("transfer-source/portable.git/transfer-marker");
+        std::fs::write(&git_marker, b"git bytes").expect("seed bare repository");
+
+        let lfs_payload = b"LFS bytes follow the repository";
+        let oid = hex::encode(sha2::Sha256::digest(lfs_payload));
+        let old_lfs =
+            crate::lfs::service::lfs_object_key("transfer-source", "portable", &oid, false)
+                .expect("valid LFS key");
+        storage
+            .put(&old_lfs, lfs_payload)
+            .await
+            .expect("seed LFS object");
+
+        let package_storage =
+            crate::package_registry::PackageStorage::from_backend(storage.clone());
+        crate::package_registry::service::publish(
+            &db,
+            &package_storage,
+            crate::package_registry::PublishInfo {
+                owner: "transfer-source".to_string(),
+                repo: "portable".to_string(),
+                package_type: "generic".to_string(),
+                name: "widget".to_string(),
+                version: "1.0.0".to_string(),
+                semver: Some("1.0.0".to_string()),
+                metadata: None,
+                description: None,
+                homepage: None,
+                repository_url: None,
+                author_id: source_owner.id,
+                files: vec![("widget.bin".to_string(), b"package bytes".to_vec())],
+            },
+        )
+        .await
+        .expect("publish package before transfer");
+
+        let oci_payload = b"OCI layer follows the repository";
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(oci_payload)));
+        let old_oci_path = oci_storage
+            .store_blob("transfer-source", "portable", &digest, oci_payload)
+            .await
+            .expect("store OCI layer");
+        let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(
+            &db,
+            repository.id,
+            "transfer-source/portable",
+            source_owner.id,
+        )
+        .await
+        .expect("create OCI metadata");
+        rg_db::ops::oci_ops::insert_blob(
+            &db,
+            oci_repo.id,
+            &digest,
+            "application/vnd.oci.image.layer.v1.tar",
+            oci_payload.len() as i64,
+            &old_oci_path,
+        )
+        .await
+        .expect("record OCI layer");
+        let (upload_id, old_upload) = oci_storage
+            .create_upload("transfer-source", "portable")
+            .await
+            .expect("start an OCI upload");
+
+        transfer_repo(
+            &db,
+            source_owner.id,
+            "transfer-source",
+            "portable",
+            "transfer-destination",
+            &repo_root,
+            storage.as_ref(),
+            &oci_storage,
+        )
+        .await
+        .expect("transfer repository");
+
+        assert_eq!(
+            std::fs::read(repo_root.join("transfer-destination/portable.git/transfer-marker"))
+                .expect("Git directory moved"),
+            b"git bytes"
+        );
+        assert!(
+            !git_marker.exists(),
+            "old Git directory still owns the marker"
+        );
+
+        let lfs = crate::lfs::service::read_object_source(
+            storage.as_ref(),
+            &crate::lfs::service::lfs_root(&repo_root, "transfer-destination", "portable"),
+            "transfer-destination",
+            "portable",
+            &oid,
+        )
+        .await
+        .expect("read LFS object at destination");
+        let lfs_bytes = match lfs {
+            crate::lfs::service::LfsObjectSource::Local { path, .. } => {
+                std::fs::read(path).expect("read local LFS object")
+            }
+            crate::lfs::service::LfsObjectSource::Bytes { data, .. } => data,
+        };
+        assert_eq!(lfs_bytes, lfs_payload);
+
+        let (package, _, _) = crate::package_registry::service::download_file(
+            &db,
+            &package_storage,
+            "transfer-destination",
+            "portable",
+            "generic",
+            "widget",
+            "1.0.0",
+            "widget.bin",
+        )
+        .await
+        .expect("read package at destination");
+        assert_eq!(package, b"package bytes");
+
+        assert_eq!(
+            oci_storage
+                .read_blob("transfer-destination", "portable", &digest)
+                .await
+                .expect("read OCI layer at destination"),
+            oci_payload
+        );
+        let moved_oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, repository.id)
+            .await
+            .expect("read OCI repository")
+            .expect("OCI repository survives transfer");
+        assert_eq!(moved_oci_repo.namespace, "transfer-destination/portable");
+        assert_eq!(moved_oci_repo.owner_id, destination_owner.id);
+        let moved_blob = rg_db::ops::oci_ops::find_blob(&db, moved_oci_repo.id, &digest)
+            .await
+            .expect("read OCI blob")
+            .expect("OCI blob row survives transfer");
+        assert!(
+            moved_blob
+                .storage_path
+                .starts_with("oci/transfer-destination/portable/"),
+            "OCI metadata still names the source path: {}",
+            moved_blob.storage_path
+        );
+        let new_upload = repo_root
+            .join("_oci_uploads/oci-uploads/transfer-destination/portable")
+            .join(&upload_id)
+            .join("data");
+        assert!(
+            new_upload.is_file(),
+            "OCI upload did not move to destination"
+        );
+        assert!(
+            !std::path::Path::new(&old_upload).exists(),
+            "old OCI upload still occupies source namespace"
+        );
+
+        create_repo(
+            &db,
+            source_owner.id,
+            "portable",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("the old owner may create a repository with the released name");
+        assert!(
+            !storage.exists(&old_lfs).await.expect("probe old LFS key"),
+            "the replacement repository inherited the transferred LFS object"
+        );
+        assert!(
+            !oci_storage
+                .blob_exists("transfer-source", "portable", &digest)
+                .await
+                .expect("probe old OCI key"),
+            "the replacement repository inherited the transferred OCI layer"
+        );
+    }
+
+    /// `move_prefix` is the storage prepare boundary. A backend that refuses it
+    /// must leave both the database owner and the Git directory at the source;
+    /// returning success here would detach every later LFS/package/OCI read.
+    #[tokio::test]
+    async fn a_storage_transfer_failure_keeps_the_repository_at_its_source_owner() {
+        let db = setup_db().await;
+        let source_owner = user_ops::create_user(
+            &db,
+            "transfer-failure-source",
+            "transfer-failure-source@example.invalid",
+            "unused",
+            "Transfer Failure Source",
+        )
+        .await
+        .expect("create source owner");
+        let _destination_owner = user_ops::create_user(
+            &db,
+            "transfer-failure-destination",
+            "transfer-failure-destination@example.invalid",
+            "unused",
+            "Transfer Failure Destination",
+        )
+        .await
+        .expect("create destination owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let storage = Arc::new(RestoreFailingStorage {
+            inner: LocalBlobStorage::new(&repo_root),
+        });
+        let oci_storage = OciStorage::from_backend(storage.clone(), repo_root.join("_oci_uploads"));
+        create_repo(
+            &db,
+            source_owner.id,
+            "must-stay",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create repository");
+        let marker = repo_root.join("transfer-failure-source/must-stay.git/marker");
+        std::fs::write(&marker, b"must remain at source").expect("seed Git marker");
+
+        let error = transfer_repo(
+            &db,
+            source_owner.id,
+            "transfer-failure-source",
+            "must-stay",
+            "transfer-failure-destination",
+            &repo_root,
+            storage.as_ref(),
+            &oci_storage,
+        )
+        .await
+        .expect_err("the injected prefix-move failure must reject the transfer");
+        assert!(
+            format!("{error:#}").contains("failed to move repository blob prefix"),
+            "unexpected storage failure: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("Git directory restored to source"),
+            b"must remain at source"
+        );
+        assert!(
+            !repo_root
+                .join("transfer-failure-destination/must-stay.git")
+                .exists(),
+            "the rejected transfer left Git under the destination owner"
+        );
+        assert!(
+            find_repo_by_owner_name(&db, "transfer-failure-source", "must-stay")
+                .await
+                .expect("read source repository")
+                .is_some(),
+            "the rejected transfer rewrote the source owner in the database"
+        );
+        assert!(
+            find_repo_by_owner_name(&db, "transfer-failure-destination", "must-stay")
+                .await
+                .expect("read destination repository")
+                .is_none(),
+            "the rejected transfer created a destination-owned row"
         );
     }
 

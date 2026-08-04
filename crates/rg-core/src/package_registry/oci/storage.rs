@@ -90,6 +90,22 @@ pub struct StagedOciRepository {
     directories: Option<PathBuf>,
 }
 
+/// Everything one repository owns in the registry, moved to another live
+/// namespace while its ForgeKeep repository row is being transferred.
+///
+/// The database and both registry backends cannot share a transaction.  Keep
+/// each successful move so the caller can put it back if a later storage move
+/// or the database update fails.
+#[derive(Debug, Default)]
+pub struct TransferredOciRepository {
+    /// Content-addressed blobs and manifests: `(source, destination)` backend keys.
+    blobs: Option<(BlobKey, BlobKey)>,
+    /// The chunked-upload tree: `(source, destination)` filesystem paths.
+    uploads: Option<(PathBuf, PathBuf)>,
+    /// The pre-[`BlobStorage`] on-disk layout: `(source, destination)` paths.
+    legacy: Option<(PathBuf, PathBuf)>,
+}
+
 /// One actionable error for a filesystem failure on an OCI upload path.
 fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
     crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
@@ -118,6 +134,43 @@ async fn stage_directory(what: &str, live: &Path, aside: &Path) -> anyhow::Resul
     tokio::fs::rename(live, aside)
         .await
         .map_err(|error| registry_path_error(what, live, &error))?;
+    Ok(true)
+}
+
+/// Move one optional registry directory to another live namespace.
+///
+/// Unlike deletion staging, the destination is not a fresh UUID tree.  Refuse
+/// to replace anything already there: a database row saying the namespace is
+/// free is not permission to merge a prior orphan into the transferred
+/// repository.
+async fn move_directory(what: &str, source: &Path, destination: &Path) -> anyhow::Result<bool> {
+    match tokio::fs::try_exists(source).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) => return Err(registry_path_error(what, source, &error)),
+    }
+    match tokio::fs::try_exists(destination).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(registry_path_error(
+                what,
+                destination,
+                &std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination directory already exists",
+                ),
+            ));
+        }
+        Err(error) => return Err(registry_path_error(what, destination, &error)),
+    }
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| registry_path_error(what, parent, &error))?;
+    }
+    tokio::fs::rename(source, destination)
+        .await
+        .map_err(|error| registry_path_error(what, source, &error))?;
     Ok(true)
 }
 
@@ -275,6 +328,106 @@ impl OciStorage {
     fn legacy_repository_dir(&self, owner: &str, repo: &str) -> Option<PathBuf> {
         let root = self.legacy_root.as_ref()?;
         Some(root.join(owner).join(repo).join("oci"))
+    }
+
+    /// Move every registry object that belongs to `source_owner/source_repo`
+    /// into `destination_owner/destination_repo`.
+    ///
+    /// A repository transfer changes the namespace used by every OCI read, but
+    /// it keeps the same repository id and therefore the same OCI metadata.
+    /// Moving only the bare Git directory would leave layers, manifests and
+    /// chunked uploads behind under a name that another repository can claim.
+    /// Each successful move is retained for [`Self::restore_repository_transfer`]
+    /// until the caller has committed the database update.
+    pub async fn transfer_repository(
+        &self,
+        source_owner: &str,
+        source_repo: &str,
+        destination_owner: &str,
+        destination_repo: &str,
+    ) -> anyhow::Result<TransferredOciRepository> {
+        let mut moved = TransferredOciRepository::default();
+
+        let source = Self::repository_blob_prefix(source_owner, source_repo)?;
+        let destination = Self::repository_blob_prefix(destination_owner, destination_repo)?;
+        match self.backend.move_prefix(&source, &destination).await {
+            Ok(true) => moved.blobs = Some((source, destination)),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to move OCI registry data from {source_owner}/{source_repo} to \
+                     {destination_owner}/{destination_repo}"
+                )));
+            }
+        }
+
+        let source = self.repository_upload_dir(source_owner, source_repo);
+        let destination = self.repository_upload_dir(destination_owner, destination_repo);
+        match move_directory("OCI upload directory", &source, &destination).await {
+            Ok(true) => moved.uploads = Some((source, destination)),
+            Ok(false) => {}
+            Err(error) => {
+                self.restore_repository_transfer(moved).await;
+                return Err(error);
+            }
+        }
+
+        if let Some(source) = self.legacy_repository_dir(source_owner, source_repo) {
+            let destination = self
+                .legacy_repository_dir(destination_owner, destination_repo)
+                .expect("legacy OCI root is present for both transfer paths");
+            match move_directory("legacy OCI repository directory", &source, &destination).await {
+                Ok(true) => moved.legacy = Some((source, destination)),
+                Ok(false) => {}
+                Err(error) => {
+                    self.restore_repository_transfer(moved).await;
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(moved)
+    }
+
+    /// Put a registry moved by [`Self::transfer_repository`] back under its
+    /// source namespace after the repository transfer aborts.
+    pub async fn restore_repository_transfer(&self, moved: TransferredOciRepository) {
+        if let Some((source, destination)) = moved.legacy {
+            if let Err(error) = tokio::fs::rename(&destination, &source).await {
+                tracing::warn!(
+                    moved_to = %destination.display(),
+                    belongs_at = %source.display(),
+                    %error,
+                    "failed to restore the legacy OCI directory after a repository transfer aborted — the active repository can no longer reach these blobs until the directory is moved back by hand"
+                );
+            }
+        }
+        if let Some((source, destination)) = moved.uploads {
+            if let Err(error) = tokio::fs::rename(&destination, &source).await {
+                tracing::warn!(
+                    moved_to = %destination.display(),
+                    belongs_at = %source.display(),
+                    %error,
+                    "failed to restore the OCI upload directory after a repository transfer aborted — uploads in flight will report a session the registry can no longer write to"
+                );
+            }
+        }
+        if let Some((source, destination)) = moved.blobs {
+            match self.backend.move_prefix(&destination, &source).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    moved_to = %destination,
+                    belongs_at = %source,
+                    "failed to restore the OCI blob namespace after a repository transfer aborted — the active repository can no longer reach these layers until the prefix is moved back by hand"
+                ),
+                Err(error) => tracing::warn!(
+                    moved_to = %destination,
+                    belongs_at = %source,
+                    %error,
+                    "failed to restore the OCI blob namespace after a repository transfer aborted — the active repository can no longer reach these layers until the prefix is moved back by hand"
+                ),
+            }
+        }
     }
 
     /// Move everything `owner/repo` owns in the registry out of the live

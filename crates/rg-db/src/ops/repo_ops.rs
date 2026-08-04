@@ -9,6 +9,9 @@ use crate::entities::repo_collaborator::{self, Entity as RepoCollaboratorEntity}
 use crate::entities::repository::{
     self, ActiveModel as RepoActiveModel, Entity as RepoEntity, Model as Repo,
 };
+use crate::entities::{
+    oci_blob, oci_repository, package, package_file, package_registry, package_version,
+};
 
 /// Count non-deleted repositories — backs the `forgekeep_repositories` gauge.
 pub async fn count_non_deleted(db: &DatabaseConnection) -> Result<u64> {
@@ -338,5 +341,120 @@ pub async fn update_owner(
     active.org_id = Set(org_id);
     active.updated_at = Set(Utc::now());
     active.update(db).await.context("db: update repo owner")?;
+    Ok(())
+}
+
+/// Move a repository row and the namespace-bearing metadata of its registries
+/// in one database transaction.
+///
+/// Package and OCI objects are addressed by `owner/repository` even though the
+/// rows that describe them hang off the stable repository id.  Their bytes are
+/// moved by `rg-core` before this transaction; rewriting only `repositories`
+/// would leave the metadata reading the old keys.  Conversely, a failed
+/// metadata rewrite must roll the repository-row update back so `rg-core` can
+/// safely return every storage namespace to its source.
+#[allow(clippy::too_many_arguments)]
+pub async fn transfer_owner(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    owner_id: i64,
+    org_id: Option<i64>,
+    source_namespace: &str,
+    destination_namespace: &str,
+    repo_name: &str,
+) -> Result<()> {
+    let transaction = db.begin().await.context("db: begin repository transfer")?;
+
+    let repo = RepoEntity::find_by_id(repo_id)
+        .one(&transaction)
+        .await?
+        .context("repo not found")?;
+    let mut active: RepoActiveModel = repo.into();
+    active.owner_id = Set(owner_id);
+    active.org_id = Set(org_id);
+    active.updated_at = Set(Utc::now());
+    active
+        .update(&transaction)
+        .await
+        .context("db: update repo owner")?;
+
+    let source_package_prefix = format!("packages/{source_namespace}/{repo_name}/");
+    let destination_package_prefix = format!("packages/{destination_namespace}/{repo_name}/");
+    let registries = package_registry::Entity::find()
+        .filter(package_registry::Column::RepoId.eq(repo_id))
+        .all(&transaction)
+        .await?;
+    for registry in registries {
+        let packages = package::Entity::find()
+            .filter(package::Column::PackageRegistryId.eq(registry.id))
+            .all(&transaction)
+            .await?;
+        for package_model in packages {
+            let package_id = package_model.id;
+            let mut active: package::ActiveModel = package_model.into();
+            active.owner_id = Set(owner_id);
+            active.update(&transaction).await?;
+
+            let versions = package_version::Entity::find()
+                .filter(package_version::Column::PackageId.eq(package_id))
+                .all(&transaction)
+                .await?;
+            for version in versions {
+                let files = package_file::Entity::find()
+                    .filter(package_file::Column::VersionId.eq(version.id))
+                    .all(&transaction)
+                    .await?;
+                for file in files {
+                    let Some(suffix) = file
+                        .storage_path
+                        .strip_prefix(&source_package_prefix)
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let mut active: package_file::ActiveModel = file.into();
+                    active.storage_path = Set(format!("{destination_package_prefix}{suffix}"));
+                    active.update(&transaction).await?;
+                }
+            }
+        }
+    }
+
+    if let Some(oci_repo) = oci_repository::Entity::find()
+        .filter(oci_repository::Column::RepoId.eq(repo_id))
+        .one(&transaction)
+        .await?
+    {
+        let source_oci_prefix = format!("oci/{source_namespace}/{repo_name}/");
+        let destination_oci_prefix = format!("oci/{destination_namespace}/{repo_name}/");
+        let oci_repo_id = oci_repo.id;
+        let mut active: oci_repository::ActiveModel = oci_repo.into();
+        active.namespace = Set(format!("{destination_namespace}/{repo_name}"));
+        active.owner_id = Set(owner_id);
+        active.updated_at = Set(Utc::now());
+        active.update(&transaction).await?;
+
+        let blobs = oci_blob::Entity::find()
+            .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+            .all(&transaction)
+            .await?;
+        for blob in blobs {
+            let Some(suffix) = blob
+                .storage_path
+                .strip_prefix(&source_oci_prefix)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let mut active: oci_blob::ActiveModel = blob.into();
+            active.storage_path = Set(format!("{destination_oci_prefix}{suffix}"));
+            active.update(&transaction).await?;
+        }
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("db: commit repository transfer")?;
     Ok(())
 }

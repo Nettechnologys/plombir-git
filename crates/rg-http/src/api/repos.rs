@@ -892,6 +892,8 @@ pub async fn transfer_repo_handler(
         &name,
         &body.new_owner,
         &state.repo_root,
+        state.blob_storage.as_ref(),
+        state.oci_storage.as_ref(),
     )
     .await
     {
