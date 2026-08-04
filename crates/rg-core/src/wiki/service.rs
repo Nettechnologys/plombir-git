@@ -6,14 +6,12 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
+use sea_orm::{DatabaseConnection, TransactionTrait};
 
 use rg_db::entities::wiki_page;
 use rg_db::entities::wiki_revision;
 use rg_db::ops::wiki_page_ops;
 use rg_db::ops::wiki_revision_ops;
-
-use crate::search::dialect::metadata_fts_upsert_sql;
 
 /// Create a new wiki page.
 pub async fn create_page(
@@ -24,6 +22,28 @@ pub async fn create_page(
     message: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<wiki_page::Model> {
+    create_page_with_post_commit(db, repo_id, title, content, message, author_id, || {
+        std::future::ready(())
+    })
+    .await
+}
+
+/// Create the source row, then expose the historical post-commit window to a
+/// deterministic regression test. Production has no work in that window: the
+/// source-table trigger is the sole writer of `wiki_pages_fts`.
+async fn create_page_with_post_commit<F, Fut>(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    title: &str,
+    content: &str,
+    message: Option<&str>,
+    author_id: Option<i64>,
+    after_source_commit: F,
+) -> Result<wiki_page::Model>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     // The one answer both the pre-read and a losing insert give, so a caller
     // cannot tell which of the two noticed — and so no constraint text leaks.
     // `Conflict`, not `InvalidRequest`: an existing page refuses the title, and
@@ -68,23 +88,7 @@ pub async fn create_page(
         Err(error) => return Err(error),
     };
 
-    // Keep the metadata FTS table in sync (non-fatal). Database triggers also
-    // maintain it; the upsert makes the explicit write safe on every backend.
-    let page_id = page.id;
-    let page_title = page.title.clone();
-    let page_content = page.content.clone();
-    let backend = db.get_database_backend();
-    let sql = metadata_fts_upsert_sql(backend, "wiki_pages_fts", "title, content");
-    if let Err(e) = db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            rg_db::prepare_sql(backend, &sql),
-            [page_id.into(), page_title.into(), page_content.into()],
-        ))
-        .await
-    {
-        tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to update wiki_pages_fts index");
-    }
+    after_source_commit().await;
 
     Ok(page)
 }
@@ -112,28 +116,35 @@ pub async fn update_page(
     message: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<wiki_page::Model> {
+    update_page_with_post_commit(db, repo_id, title, content, message, author_id, || {
+        std::future::ready(())
+    })
+    .await
+}
+
+/// Commit the source-row update before exposing the old explicit-index-writer
+/// window to a test callback. Nothing may write metadata FTS after this point:
+/// doing so could replay this call's snapshot over a newer trigger result.
+async fn update_page_with_post_commit<F, Fut>(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    title: &str,
+    content: &str,
+    message: Option<&str>,
+    author_id: Option<i64>,
+    after_source_commit: F,
+) -> Result<wiki_page::Model>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let updated =
         update_page_transactionally(db, repo_id, title, content, message, author_id, |_| {
             std::future::ready(())
         })
         .await?;
 
-    // Update the cross-backend metadata FTS index (non-fatal).
-    let page_id = updated.id;
-    let page_title = updated.title.clone();
-    let page_content = updated.content.clone();
-    let backend = db.get_database_backend();
-    let sql = metadata_fts_upsert_sql(backend, "wiki_pages_fts", "title, content");
-    if let Err(e) = db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            rg_db::prepare_sql(backend, &sql),
-            [page_id.into(), page_title.into(), page_content.into()],
-        ))
-        .await
-    {
-        tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to update wiki_pages_fts index");
-    }
+    after_source_commit().await;
 
     Ok(updated)
 }
@@ -315,19 +326,6 @@ pub async fn delete_page(db: &DatabaseConnection, repo_id: i64, title: &str) -> 
 
     let page_id = existing.id;
 
-    // Delete from the cross-backend metadata FTS index (non-fatal).
-    let backend = db.get_database_backend();
-    if let Err(e) = db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            rg_db::prepare_sql(backend, "DELETE FROM wiki_pages_fts WHERE rowid = ?"),
-            [page_id.into()],
-        ))
-        .await
-    {
-        tracing::warn!(error = %format!("{e:#}"), page_id = %page_id, "failed to delete from wiki_pages_fts index");
-    }
-
     // The lookup above and this `DELETE` are two statements, so a concurrent
     // delete can empty the row out from under it; zero rows reports `not_found`
     // rather than confirming a deletion this call did not perform.
@@ -341,11 +339,11 @@ pub async fn delete_page(db: &DatabaseConnection, repo_id: i64, title: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn same_snapshot_edits_form_a_complete_history_chain() {
+    async fn wiki_repo_fixture(name: &str) -> (tempfile::TempDir, DatabaseConnection, i64, i64) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("wiki-lost-update.db");
+        let db_path = dir.path().join(format!("{name}.db"));
         let db = rg_db::connect_with_pool(
             &format!("sqlite://{}?mode=rwc", db_path.display()),
             rg_db::TEST_CONNECT_TIMEOUT_SECS,
@@ -358,17 +356,17 @@ mod tests {
 
         let user = rg_db::ops::user_ops::create_user(
             &db,
-            "wikicas",
-            "wikicas@example.invalid",
+            name,
+            &format!("{name}@example.invalid"),
             "",
-            "Wiki CAS",
+            name,
         )
         .await
         .expect("create user");
         let repo = crate::repo::service::create_repo(
             &db,
             user.id,
-            "wiki-cas",
+            name,
             None,
             false,
             &dir.path().join("repos"),
@@ -376,7 +374,28 @@ mod tests {
         )
         .await
         .expect("create repo");
-        create_page(&db, repo.id, "Home", "v0", None, Some(user.id))
+
+        (dir, db, user.id, repo.id)
+    }
+
+    async fn wiki_fts_content(db: &DatabaseConnection, page_id: i64) -> Option<String> {
+        db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT content FROM wiki_pages_fts WHERE rowid = ?",
+            [page_id.into()],
+        ))
+        .await
+        .expect("read wiki FTS row")
+        .map(|row| {
+            row.try_get::<String>("", "content")
+                .expect("decode wiki FTS content")
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_snapshot_edits_form_a_complete_history_chain() {
+        let (_dir, db, user_id, repo_id) = wiki_repo_fixture("wikicas").await;
+        create_page(&db, repo_id, "Home", "v0", None, Some(user_id))
             .await
             .expect("create page");
 
@@ -384,11 +403,11 @@ mod tests {
         let first_gate = after_same_read.clone();
         let first = update_page_transactionally(
             &db,
-            repo.id,
+            repo_id,
             "Home",
             "A",
             None,
-            Some(user.id),
+            Some(user_id),
             move |attempt| {
                 let gate = first_gate.clone();
                 async move {
@@ -401,11 +420,11 @@ mod tests {
         let second_gate = after_same_read.clone();
         let second = update_page_transactionally(
             &db,
-            repo.id,
+            repo_id,
             "Home",
             "B",
             None,
-            Some(user.id),
+            Some(user_id),
             move |attempt| {
                 let gate = second_gate.clone();
                 async move {
@@ -420,11 +439,11 @@ mod tests {
         first.expect("first same-snapshot edit succeeds");
         second.expect("second same-snapshot edit succeeds");
 
-        let current = get_page(&db, repo.id, "Home")
+        let current = get_page(&db, repo_id, "Home")
             .await
             .expect("read current page")
             .expect("page exists");
-        let revisions = list_revisions(&db, repo.id, "Home")
+        let revisions = list_revisions(&db, repo_id, "Home")
             .await
             .expect("read revisions");
         assert_eq!(
@@ -443,5 +462,177 @@ mod tests {
             .collect::<Vec<_>>();
         preserved_states.sort_unstable();
         assert_eq!(preserved_states, vec!["A", "B", "v0"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_update_completion_cannot_overwrite_newer_fts_content() {
+        let (_dir, db, user_id, repo_id) = wiki_repo_fixture("wikiupdaterace").await;
+        let page = create_page(
+            &db,
+            repo_id,
+            "Home",
+            "initial wiki payload",
+            None,
+            Some(user_id),
+        )
+        .await
+        .expect("create page");
+
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_db = db.clone();
+        let first = tokio::spawn(async move {
+            update_page_with_post_commit(
+                &first_db,
+                repo_id,
+                "Home",
+                "stale alpha payload",
+                None,
+                Some(user_id),
+                move || async move {
+                    committed_tx.send(()).expect("announce source commit");
+                    release_rx.await.expect("release late update");
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), committed_rx)
+            .await
+            .expect("first update did not commit in time")
+            .expect("first update dropped its commit signal");
+        let second = update_page(
+            &db,
+            repo_id,
+            "Home",
+            "fresh beta payload",
+            None,
+            Some(user_id),
+        )
+        .await;
+        let indexed_before_release = wiki_fts_content(&db, page.id).await;
+        release_tx.send(()).expect("release first update");
+        first
+            .await
+            .expect("first update task panicked")
+            .expect("first update succeeds");
+        second.expect("newer update succeeds");
+
+        assert_eq!(
+            indexed_before_release.as_deref(),
+            Some("fresh beta payload")
+        );
+        assert_eq!(
+            wiki_fts_content(&db, page.id).await.as_deref(),
+            Some("fresh beta payload"),
+            "a caller returning late replayed its stale snapshot into FTS"
+        );
+        assert_eq!(
+            get_page(&db, repo_id, "Home")
+                .await
+                .expect("read current page")
+                .expect("page exists")
+                .content,
+            "fresh beta payload"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_update_completion_cannot_resurrect_deleted_fts_row() {
+        let (_dir, db, user_id, repo_id) = wiki_repo_fixture("wikiupdatedelete").await;
+        let page = create_page(
+            &db,
+            repo_id,
+            "Home",
+            "initial wiki payload",
+            None,
+            Some(user_id),
+        )
+        .await
+        .expect("create page");
+
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_db = db.clone();
+        let first = tokio::spawn(async move {
+            update_page_with_post_commit(
+                &first_db,
+                repo_id,
+                "Home",
+                "stale deleted payload",
+                None,
+                Some(user_id),
+                move || async move {
+                    committed_tx.send(()).expect("announce source commit");
+                    release_rx.await.expect("release late update");
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), committed_rx)
+            .await
+            .expect("update did not commit in time")
+            .expect("update dropped its commit signal");
+        let deleted = delete_page(&db, repo_id, "Home").await;
+        release_tx.send(()).expect("release late update");
+        first
+            .await
+            .expect("update task panicked")
+            .expect("update succeeds");
+        deleted.expect("delete succeeds");
+
+        assert!(
+            wiki_fts_content(&db, page.id).await.is_none(),
+            "a late update resurrected the deleted FTS row"
+        );
+        assert!(get_page(&db, repo_id, "Home")
+            .await
+            .expect("read deleted page")
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_create_completion_cannot_resurrect_deleted_fts_row() {
+        let (_dir, db, user_id, repo_id) = wiki_repo_fixture("wikicreatedelete").await;
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_db = db.clone();
+        let first = tokio::spawn(async move {
+            create_page_with_post_commit(
+                &first_db,
+                repo_id,
+                "Home",
+                "created then deleted payload",
+                None,
+                Some(user_id),
+                move || async move {
+                    committed_tx.send(()).expect("announce source commit");
+                    release_rx.await.expect("release late create");
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), committed_rx)
+            .await
+            .expect("create did not commit in time")
+            .expect("create dropped its commit signal");
+        let page = get_page(&db, repo_id, "Home")
+            .await
+            .expect("read committed page")
+            .expect("page exists before delete");
+        let deleted = delete_page(&db, repo_id, "Home").await;
+        release_tx.send(()).expect("release late create");
+        first
+            .await
+            .expect("create task panicked")
+            .expect("create succeeds");
+        deleted.expect("delete succeeds");
+
+        assert!(
+            wiki_fts_content(&db, page.id).await.is_none(),
+            "a late create resurrected the deleted FTS row"
+        );
     }
 }

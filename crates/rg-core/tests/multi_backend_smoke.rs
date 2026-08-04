@@ -45,6 +45,10 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let username = format!("dbsmoke{suffix}");
     let repo_name = format!("crossbackendrepo{suffix}");
     let wiki_term = format!("crossbackendneedle{suffix}");
+    let first_wiki_edit_term = format!("firstwikiedit{suffix}");
+    let second_wiki_edit_term = format!("secondwikiedit{suffix}");
+    let first_wiki_edit_content = format!("first concurrent server edit {first_wiki_edit_term}");
+    let second_wiki_edit_content = format!("second concurrent server edit {second_wiki_edit_term}");
 
     let user = rg_db::ops::user_ops::create_user(
         &db,
@@ -217,7 +221,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             &db,
             repo.id,
             "Home",
-            "first concurrent server edit",
+            &first_wiki_edit_content,
             None,
             Some(user.id),
         ),
@@ -225,7 +229,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             &db,
             repo.id,
             "Home",
-            "second concurrent server edit",
+            &second_wiki_edit_content,
             None,
             Some(user.id),
         ),
@@ -256,13 +260,51 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     preserved_states.sort_unstable();
     let mut expected_states = vec![
         initial_wiki_content.as_str(),
-        "first concurrent server edit",
-        "second concurrent server edit",
+        first_wiki_edit_content.as_str(),
+        second_wiki_edit_content.as_str(),
     ];
     expected_states.sort_unstable();
     assert_eq!(
         preserved_states, expected_states,
         "both successful edit texts must survive in current state or history"
+    );
+
+    let (current_wiki_term, superseded_wiki_term) = if current.content == first_wiki_edit_content {
+        (&first_wiki_edit_term, &second_wiki_edit_term)
+    } else if current.content == second_wiki_edit_content {
+        (&second_wiki_edit_term, &first_wiki_edit_term)
+    } else {
+        panic!("concurrent updates left an unexpected current wiki state")
+    };
+    let (current_wiki_results, current_wiki_total) = rg_core::search::service::search(
+        &db,
+        &format!("{current_wiki_term} repo:{username}/{repo_name}"),
+        "wiki",
+        Some(user.id),
+        1,
+        20,
+    )
+    .await
+    .expect("search the current concurrent wiki edit");
+    assert_eq!(current_wiki_total, 1);
+    assert_eq!(
+        current_wiki_results.first().map(|result| result.id),
+        Some(page.id),
+        "FTS does not reflect the current source row"
+    );
+    let (_, superseded_wiki_total) = rg_core::search::service::search(
+        &db,
+        &format!("{superseded_wiki_term} repo:{username}/{repo_name}"),
+        "wiki",
+        Some(user.id),
+        1,
+        20,
+    )
+    .await
+    .expect("search the superseded concurrent wiki edit");
+    assert_eq!(
+        superseded_wiki_total, 0,
+        "FTS retained the superseded concurrent wiki content"
     );
 
     let (repo_results, repo_total) = rg_core::search::service::search(
@@ -283,7 +325,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         .expect("delete wiki page and FTS row");
     let (_, wiki_total_after_delete) = rg_core::search::service::search(
         &db,
-        &format!("{wiki_term} repo:{username}/{repo_name}"),
+        &format!("{current_wiki_term} repo:{username}/{repo_name}"),
         "wiki",
         Some(user.id),
         1,
