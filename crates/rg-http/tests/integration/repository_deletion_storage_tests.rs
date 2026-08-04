@@ -48,14 +48,61 @@ fn live_prefixes(owner: &str, repo: &str, repo_id: i64) -> Vec<BlobKey> {
     ]
 }
 
+async fn seed_terminal_job(db: &rg_db::DatabaseConnection, repo_id: i64) -> i64 {
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        "1234567890123456789012345678901234567890",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .expect("create historical pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+        .await
+        .expect("create historical stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("create historical job");
+    let finished_at = chrono::Utc::now().naive_utc();
+    rg_db::ops::pipeline_ops::update_job_result(
+        db,
+        job.id,
+        "success",
+        Some(0),
+        None,
+        None,
+        Some(finished_at),
+    )
+    .await
+    .expect("settle historical job");
+    rg_db::ops::pipeline_ops::update_stage_status(db, stage.id, "success", None, Some(finished_at))
+        .await
+        .expect("settle historical stage");
+    rg_db::ops::pipeline_ops::update_pipeline_status(
+        db,
+        pipeline.id,
+        "success",
+        None,
+        Some(finished_at),
+    )
+    .await
+    .expect("settle historical pipeline");
+    job.id
+}
+
 /// card_c01839965406: the routed DELETE covers the production Git path and all
 /// four secondary managed namespaces named by the card. Recreating the name
 /// starts with a new repository id and no inherited bytes.
 #[tokio::test]
 async fn delete_repository_retires_git_and_secondary_blob_namespaces() {
-    let (base, _db, state) = spawn_test_app_with_state().await;
+    let (base, db, state) = spawn_test_app_with_state().await;
     let (token, _) = register_full(&base, "delete-blobs", "delete-blobs@example.com").await;
     let repo_id = create_repo(&base, &token, "recycled").await;
+    let job_id = seed_terminal_job(&db, repo_id).await;
     let keys = representative_keys("delete-blobs", "recycled", repo_id);
     for (index, key) in keys.iter().enumerate() {
         state
@@ -66,6 +113,22 @@ async fn delete_repository_retires_git_and_secondary_blob_namespaces() {
     }
 
     let bare = state.repo_root.join("delete-blobs/recycled.git");
+    let filesystem_directories = [
+        state.repo_root.join("delete-blobs.lfs/recycled"),
+        state.repo_root.join("_ci_cache").join(repo_id.to_string()),
+        state
+            .repo_root
+            .join("_artifacts/jobs")
+            .join(job_id.to_string()),
+    ];
+    for (index, directory) in filesystem_directories.iter().enumerate() {
+        std::fs::create_dir_all(directory).expect("create repository filesystem namespace");
+        std::fs::write(
+            directory.join(format!("marker-{index}")),
+            format!("filesystem payload {index}"),
+        )
+        .expect("seed repository filesystem namespace");
+    }
     assert!(
         bare.exists(),
         "repository creation did not seed Git storage"
@@ -84,6 +147,30 @@ async fn delete_repository_retires_git_and_secondary_blob_namespaces() {
     );
 
     assert!(!bare.exists(), "DELETE left the canonical Git tree behind");
+    for directory in filesystem_directories {
+        assert!(
+            !directory.exists(),
+            "DELETE left a repository filesystem namespace at {}",
+            directory.display()
+        );
+        let file_name = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let tombstones: Vec<_> = std::fs::read_dir(directory.parent().unwrap())
+            .expect("read filesystem namespace parent")
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy()
+                    .starts_with(&format!("{file_name}.deleted-{repo_id}-"))
+            })
+            .collect();
+        assert!(
+            tombstones.is_empty(),
+            "DELETE returned success while filesystem tombstones remained: {tombstones:?}"
+        );
+    }
     for prefix in live_prefixes("delete-blobs", "recycled", repo_id) {
         assert!(
             state

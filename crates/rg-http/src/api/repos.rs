@@ -642,6 +642,7 @@ pub async fn unwatch_repo(
     responses(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "Repository still has active CI pipelines", body = serde_json::Value),
     ),
 )]
 pub async fn delete_repo_handler(

@@ -1460,6 +1460,232 @@ fn restore_repository_directory(
     }
 }
 
+/// A repository-owned directory that does not belong to a [`BlobStorage`]
+/// backend and therefore has to participate in deletion through ordinary
+/// filesystem renames.
+struct RepositoryFilesystemDirectory {
+    live: std::path::PathBuf,
+    kind: &'static str,
+    hint: &'static str,
+}
+
+/// One filesystem directory moved out of its live namespace before the
+/// repository row is soft-deleted.
+struct StagedRepositoryFilesystemDirectory {
+    live: std::path::PathBuf,
+    staged: std::path::PathBuf,
+    kind: &'static str,
+    hint: &'static str,
+}
+
+fn repository_filesystem_directories(
+    repo_root: &std::path::Path,
+    namespace: &str,
+    repo: &rg_db::entities::repository::Model,
+    job_ids: &[i64],
+) -> Vec<RepositoryFilesystemDirectory> {
+    let mut directories = vec![
+        RepositoryFilesystemDirectory {
+            live: crate::lfs::service::lfs_root(repo_root, namespace, &repo.name),
+            kind: "legacy LFS directory",
+            hint: crate::platform::fs::LFS_STORAGE_HINT,
+        },
+        RepositoryFilesystemDirectory {
+            live: repo_root.join("_ci_cache").join(repo.id.to_string()),
+            kind: "CI cache directory",
+            hint: crate::platform::fs::CI_CACHE_DIR_HINT,
+        },
+    ];
+    directories.extend(job_ids.iter().map(|job_id| {
+        RepositoryFilesystemDirectory {
+            live: repo_root
+                .join("_artifacts")
+                .join("jobs")
+                .join(job_id.to_string()),
+            kind: "legacy CI artifact directory",
+            hint: crate::platform::fs::BLOB_STORAGE_HINT,
+        }
+    }));
+    directories
+}
+
+fn restore_repository_filesystem_directories(
+    directories: &[StagedRepositoryFilesystemDirectory],
+    repo_id: i64,
+) {
+    for directory in directories.iter().rev() {
+        if let Err(error) = std::fs::rename(&directory.staged, &directory.live) {
+            tracing::warn!(
+                repo_id,
+                storage = directory.kind,
+                staged_at = %directory.staged.display(),
+                belongs_at = %directory.live.display(),
+                %error,
+                "failed to restore a repository filesystem directory after deletion aborted — the active repository can no longer reach these bytes until the directory is moved back by hand"
+            );
+        }
+    }
+}
+
+fn stage_repository_filesystem_directories(
+    directories: Vec<RepositoryFilesystemDirectory>,
+    repo_id: i64,
+    deletion_id: &str,
+) -> Result<Vec<StagedRepositoryFilesystemDirectory>> {
+    let directories = directories
+        .into_iter()
+        .map(|directory| {
+            let file_name = directory
+                .live
+                .file_name()
+                .context("repository filesystem path has no final component")?;
+            let staged = directory.live.with_file_name(format!(
+                "{}.deleted-{repo_id}-{deletion_id}",
+                file_name.to_string_lossy()
+            ));
+            Ok((directory, staged))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut staged_directories = Vec::new();
+    for (directory, staged) in directories {
+        match std::fs::symlink_metadata(&directory.live) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                restore_repository_filesystem_directories(&staged_directories, repo_id);
+                return Err(crate::platform::fs::path_error(
+                    directory.kind,
+                    &directory.live,
+                    &error,
+                    directory.hint,
+                ))
+                .with_context(|| {
+                    format!(
+                        "failed to inspect repository filesystem storage at {}",
+                        directory.live.display()
+                    )
+                });
+            }
+        }
+
+        match std::fs::symlink_metadata(&staged) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                restore_repository_filesystem_directories(&staged_directories, repo_id);
+                return Err(crate::platform::fs::path_error(
+                    directory.kind,
+                    &staged,
+                    &std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "repository deletion staging path already exists",
+                    ),
+                    directory.hint,
+                ));
+            }
+            Err(error) => {
+                restore_repository_filesystem_directories(&staged_directories, repo_id);
+                return Err(crate::platform::fs::path_error(
+                    directory.kind,
+                    &staged,
+                    &error,
+                    directory.hint,
+                ))
+                .with_context(|| {
+                    format!(
+                        "failed to inspect repository deletion staging path {}",
+                        staged.display()
+                    )
+                });
+            }
+        }
+
+        if let Err(error) = std::fs::rename(&directory.live, &staged) {
+            restore_repository_filesystem_directories(&staged_directories, repo_id);
+            return Err(crate::platform::fs::path_error(
+                directory.kind,
+                &directory.live,
+                &error,
+                directory.hint,
+            ))
+            .with_context(|| {
+                format!(
+                    "failed to stage repository filesystem storage at {}",
+                    staged.display()
+                )
+            });
+        }
+        staged_directories.push(StagedRepositoryFilesystemDirectory {
+            live: directory.live,
+            staged,
+            kind: directory.kind,
+            hint: directory.hint,
+        });
+    }
+    Ok(staged_directories)
+}
+
+fn retire_repository_filesystem_directories(
+    directories: Vec<StagedRepositoryFilesystemDirectory>,
+    repo_id: i64,
+) -> Result<()> {
+    let mut cleanup_error = None;
+    for directory in directories {
+        let removal = match std::fs::symlink_metadata(&directory.staged) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                std::fs::remove_dir_all(&directory.staged)
+            }
+            Ok(_) => std::fs::remove_file(&directory.staged),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => Err(error),
+        };
+        match removal {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    repo_id,
+                    storage = directory.kind,
+                    staged_at = %directory.staged.display(),
+                    live_path = %directory.live.display(),
+                    %error,
+                    "repository is deleted and the live filesystem path is free, but its staged data remains and must be removed by hand"
+                );
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(
+                        crate::platform::fs::path_error(
+                            directory.kind,
+                            &directory.staged,
+                            &error,
+                            directory.hint,
+                        )
+                        .context(format!(
+                            "failed to retire repository filesystem storage staged at {} from live path {}",
+                            directory.staged.display(),
+                            directory.live.display()
+                        )),
+                    );
+                }
+            }
+        }
+    }
+    cleanup_error.map_or(Ok(()), Err)
+}
+
+async fn ensure_repository_deletion_is_quiescent(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> Result<()> {
+    let active = rg_db::ops::pipeline_ops::count_active_pipelines(db, repo_id)
+        .await
+        .context("failed to check active CI pipelines before repository deletion")?;
+    if active > 0 {
+        return Err(crate::error::conflict(format!(
+            "repository has {active} active CI pipeline(s); cancel them or wait for them to finish before deleting the repository"
+        )));
+    }
+    Ok(())
+}
+
 /// Delete a repository's Git/blob data and soft-delete its metadata row.
 ///
 /// The filesystems and database cannot share a transaction. Rename every live
@@ -1492,6 +1718,10 @@ pub async fn delete_repo(
     oci_storage: &crate::package_registry::oci::storage::OciStorage,
     repo: &rg_db::entities::repository::Model,
 ) -> Result<()> {
+    // `_ci_cache/<repo_id>` and `_artifacts/jobs/<job_id>` are writable by CI
+    // workers outside this function. Refuse before the first rename rather
+    // than moving a directory while a live job can immediately recreate it.
+    ensure_repository_deletion_is_quiescent(db, repo.id).await?;
     let namespace = repository_namespace_name(db, repo.owner_id, repo.org_id).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repo.name));
     let deletion_id = uuid::Uuid::new_v4().simple().to_string();
@@ -1511,6 +1741,8 @@ pub async fn delete_repo(
             )
         })?;
     prefixes.extend(artifact_blob_prefixes(&job_ids, repo.id, &deletion_id)?);
+    let filesystem_directories =
+        repository_filesystem_directories(repo_root, &namespace, repo, &job_ids);
     let staged_path = repo_path.with_file_name(format!(
         "{}.deleted-{}-{}",
         repo_path
@@ -1564,11 +1796,12 @@ pub async fn delete_repo(
         }
     };
 
-    let staged_oci = match oci_storage
-        .stage_repository_deletion(&namespace, &repo.name, repo.id, &deletion_id)
-        .await
-    {
-        Ok(staged_oci) => staged_oci,
+    let staged_directories = match stage_repository_filesystem_directories(
+        filesystem_directories,
+        repo.id,
+        &deletion_id,
+    ) {
+        Ok(staged_directories) => staged_directories,
         Err(error) => {
             restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
             if staged {
@@ -1578,8 +1811,38 @@ pub async fn delete_repo(
         }
     };
 
+    let staged_oci = match oci_storage
+        .stage_repository_deletion(&namespace, &repo.name, repo.id, &deletion_id)
+        .await
+    {
+        Ok(staged_oci) => staged_oci,
+        Err(error) => {
+            restore_repository_filesystem_directories(&staged_directories, repo.id);
+            restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
+            if staged {
+                restore_repository_directory(&staged_path, &repo_path, repo.id);
+            }
+            return Err(error);
+        }
+    };
+
+    // A trigger already past its repository lookup can race the first check.
+    // Recheck after every storage namespace is staged; if it published work in
+    // that window, restore everything and make the caller retry only after the
+    // pipeline has settled.
+    if let Err(error) = ensure_repository_deletion_is_quiescent(db, repo.id).await {
+        oci_storage.restore_repository(staged_oci).await;
+        restore_repository_filesystem_directories(&staged_directories, repo.id);
+        restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
+        if staged {
+            restore_repository_directory(&staged_path, &repo_path, repo.id);
+        }
+        return Err(error);
+    }
+
     if let Err(error) = rg_db::ops::repo_ops::soft_delete(db, repo.id).await {
         oci_storage.restore_repository(staged_oci).await;
+        restore_repository_filesystem_directories(&staged_directories, repo.id);
         restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
         if staged {
             restore_repository_directory(&staged_path, &repo_path, repo.id);
@@ -1625,6 +1888,12 @@ pub async fn delete_repo(
                     .context("failed to retire deleted repository Git data"),
                 );
             }
+        }
+    }
+
+    if let Err(error) = retire_repository_filesystem_directories(staged_directories, repo.id) {
+        if cleanup_error.is_none() {
+            cleanup_error = Some(error);
         }
     }
 
@@ -2966,7 +3235,7 @@ mod repository_deletion_tests {
         storage: &LocalBlobStorage,
         repo_id: i64,
         payload: &[u8],
-    ) -> BlobKey {
+    ) -> (BlobKey, i64) {
         let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
             db,
             repo_id,
@@ -3007,7 +3276,37 @@ mod repository_deletion_tests {
         )
         .await
         .expect("create artifact row");
-        key
+        let finished_at = chrono::Utc::now().naive_utc();
+        rg_db::ops::pipeline_ops::update_job_result(
+            db,
+            job.id,
+            "success",
+            Some(0),
+            None,
+            None,
+            Some(finished_at),
+        )
+        .await
+        .expect("settle artifact job");
+        rg_db::ops::pipeline_ops::update_stage_status(
+            db,
+            stage.id,
+            "success",
+            None,
+            Some(finished_at),
+        )
+        .await
+        .expect("settle artifact stage");
+        rg_db::ops::pipeline_ops::update_pipeline_status(
+            db,
+            pipeline.id,
+            "success",
+            None,
+            Some(finished_at),
+        )
+        .await
+        .expect("settle artifact pipeline");
+        (key, job.id)
     }
 
     /// One pushed layer and the manifest that references it, stored the way a
@@ -3079,8 +3378,9 @@ mod repository_deletion_tests {
         let neighbour = create_repo(&db, owner.id, "kept", None, false, &repo_root, None)
             .await
             .expect("create neighbouring repository");
-        let doomed_artifact = seed_job_artifact(&db, &blob_storage, doomed.id, b"job output").await;
-        let kept_artifact =
+        let (doomed_artifact, _) =
+            seed_job_artifact(&db, &blob_storage, doomed.id, b"job output").await;
+        let (kept_artifact, _) =
             seed_job_artifact(&db, &blob_storage, neighbour.id, b"other output").await;
 
         assert_eq!(
@@ -3125,6 +3425,214 @@ mod repository_deletion_tests {
                 .await
                 .expect("another repository's artifact must survive this deletion"),
             b"other output"
+        );
+    }
+
+    /// card_0ea3381a4f91: these directories sit under `repo_root`, but outside
+    /// every BlobStorage namespace. A successful repository deletion owns all
+    /// three and must leave neither their live names nor adjacent tombstones.
+    #[tokio::test]
+    async fn deleting_a_repository_retires_legacy_lfs_ci_cache_and_artifact_directories() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "filesystem-delete-owner",
+            "filesystem-delete@example.invalid",
+            "unused",
+            "Filesystem Delete",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let repo = create_repo(
+            &db,
+            owner.id,
+            "with-local-storage",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create repository");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let (_, job_id) =
+            seed_job_artifact(&db, &blob_storage, repo.id, b"portable artifact").await;
+        let directories = [
+            crate::lfs::service::lfs_root(
+                &repo_root,
+                "filesystem-delete-owner",
+                "with-local-storage",
+            ),
+            repo_root.join("_ci_cache").join(repo.id.to_string()),
+            repo_root
+                .join("_artifacts")
+                .join("jobs")
+                .join(job_id.to_string()),
+        ];
+        for (index, directory) in directories.iter().enumerate() {
+            std::fs::create_dir_all(directory).expect("create repository-owned directory");
+            std::fs::write(
+                directory.join(format!("marker-{index}")),
+                format!("local payload {index}"),
+            )
+            .expect("seed repository-owned directory");
+        }
+
+        delete_repo(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            &repo,
+        )
+        .await
+        .expect("delete repository with local filesystem storage");
+
+        for directory in directories {
+            assert!(
+                !directory.exists(),
+                "DELETE left repository-owned storage at {}",
+                directory.display()
+            );
+            let file_name = directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let tombstones: Vec<_> = std::fs::read_dir(directory.parent().unwrap())
+                .expect("read local storage parent")
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| {
+                    name.to_string_lossy()
+                        .starts_with(&format!("{file_name}.deleted-{}-", repo.id))
+                })
+                .collect();
+            assert!(
+                tombstones.is_empty(),
+                "DELETE retired the live path but left tombstones beside it: {tombstones:?}"
+            );
+        }
+    }
+
+    /// CI may recreate cache/artifact directories while a job is alive. The
+    /// deletion path refuses before its first rename instead of reporting a
+    /// completed delete over bytes a runner can still publish concurrently.
+    #[tokio::test]
+    async fn an_active_pipeline_blocks_repository_storage_staging() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "active-delete-owner",
+            "active-delete@example.invalid",
+            "unused",
+            "Active Delete",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let repo = create_repo(&db, owner.id, "busy", None, false, &repo_root, None)
+            .await
+            .expect("create repository");
+        rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            "1234567890123456789012345678901234567890",
+            "refs/heads/main",
+            "push",
+            Some(owner.id),
+        )
+        .await
+        .expect("create active pipeline");
+        let bare = repo_root.join("active-delete-owner/busy.git");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+
+        let error = delete_repo(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            &repo,
+        )
+        .await
+        .expect_err("active CI must make repository deletion retryable later");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("1 active CI pipeline"), "{rendered}");
+        assert!(rendered.contains("cancel them or wait"), "{rendered}");
+        assert!(bare.is_dir(), "the refused delete moved the Git directory");
+        assert!(
+            find_repo_by_owner_name(&db, "active-delete-owner", "busy")
+                .await
+                .expect("read repository after refused deletion")
+                .is_some(),
+            "the refused delete hid the repository row"
+        );
+    }
+
+    /// A failure in a later plain-filesystem prepare step must restore the
+    /// directories already renamed and the Git/blob namespaces staged before
+    /// them. ENOTDIR is deterministic even when tests run as root.
+    #[tokio::test]
+    async fn a_filesystem_staging_failure_restores_git_blobs_and_earlier_directories() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "filesystem-rollback-owner",
+            "filesystem-rollback@example.invalid",
+            "unused",
+            "Filesystem Rollback",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let repo = create_repo(&db, owner.id, "keep-me", None, false, &repo_root, None)
+            .await
+            .expect("create repository");
+        let bare_marker = repo_root.join("filesystem-rollback-owner/keep-me.git/marker");
+        std::fs::write(&bare_marker, b"git survives").expect("seed Git marker");
+        let lfs = crate::lfs::service::lfs_root(&repo_root, "filesystem-rollback-owner", "keep-me");
+        std::fs::create_dir_all(&lfs).expect("create legacy LFS directory");
+        let lfs_marker = lfs.join("marker");
+        std::fs::write(&lfs_marker, b"LFS survives").expect("seed LFS marker");
+        std::fs::create_dir_all(&repo_root).expect("create repository root");
+        std::fs::write(repo_root.join("_ci_cache"), b"not a directory")
+            .expect("install deterministic cache-path blocker");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let blob = BlobKey::new(
+            "packages/filesystem-rollback-owner/keep-me/generic/demo/1/objects/one/payload.bin",
+        )
+        .expect("valid package key");
+        blob_storage
+            .put(&blob, b"blob survives")
+            .await
+            .expect("seed package blob");
+
+        let error = delete_repo(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            &repo,
+        )
+        .await
+        .expect_err("the cache path blocker must reject filesystem staging");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("_ci_cache"), "{rendered}");
+        assert_eq!(std::fs::read(&bare_marker).unwrap(), b"git survives");
+        assert_eq!(std::fs::read(&lfs_marker).unwrap(), b"LFS survives");
+        assert_eq!(
+            blob_storage.get(&blob).await.expect("blob prefix restored"),
+            b"blob survives"
+        );
+        assert!(
+            find_repo_by_owner_name(&db, "filesystem-rollback-owner", "keep-me")
+                .await
+                .expect("read repository after failed staging")
+                .is_some(),
+            "the failed prepare hid the repository row"
         );
     }
 
@@ -3273,7 +3781,24 @@ mod repository_deletion_tests {
         // Staged last, restored first: the artifact prefixes are the tail of
         // the staged set, so a rollback that walked it in the wrong order — or
         // skipped the part the database had to name — shows up here.
-        let artifact = seed_job_artifact(&db, &blob_storage, repo.id, b"and so must this").await;
+        let (artifact, job_id) =
+            seed_job_artifact(&db, &blob_storage, repo.id, b"and so must this").await;
+        let legacy_lfs =
+            crate::lfs::service::lfs_root(&repo_root, "delete-rollback-owner", "keep-me");
+        let cache = repo_root.join("_ci_cache").join(repo.id.to_string());
+        let legacy_artifacts = repo_root
+            .join("_artifacts")
+            .join("jobs")
+            .join(job_id.to_string());
+        for (directory, payload) in [
+            (&legacy_lfs, b"legacy LFS survives".as_slice()),
+            (&cache, b"CI cache survives".as_slice()),
+            (&legacy_artifacts, b"legacy artifact survives".as_slice()),
+        ] {
+            std::fs::create_dir_all(directory).expect("create local rollback directory");
+            std::fs::write(directory.join("rollback-marker"), payload)
+                .expect("seed local rollback directory");
+        }
         // The registry is staged after every blob prefix, so it is restored
         // first — and it is the only part whose staging touches both a backend
         // key and a plain directory.
@@ -3325,6 +3850,17 @@ mod repository_deletion_tests {
                 .expect("the CI artifact prefix must be restored too"),
             b"and so must this"
         );
+        for (directory, payload) in [
+            (&legacy_lfs, b"legacy LFS survives".as_slice()),
+            (&cache, b"CI cache survives".as_slice()),
+            (&legacy_artifacts, b"legacy artifact survives".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(directory.join("rollback-marker"))
+                    .expect("repository filesystem directory must be restored"),
+                payload
+            );
+        }
         assert_eq!(
             blob_storage
                 .get(&layer)
@@ -3724,6 +4260,59 @@ mod repository_deletion_tests {
         assert!(
             rendered.contains("active repository can no longer reach these blobs"),
             "{rendered}"
+        );
+    }
+
+    /// Post-commit cleanup cannot be rolled back, so its 5xx and warning are
+    /// the only operator-facing evidence. Both the staged and formerly-live
+    /// paths must be present in that evidence.
+    #[test]
+    fn failed_filesystem_retirement_names_staged_and_live_paths() {
+        let sandbox = tempfile::tempdir().expect("create filesystem root");
+        let blocker = sandbox.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("create ENOTDIR blocker");
+        let staged = blocker.join("7.deleted-id");
+        let live = sandbox.path().join("_ci_cache/7");
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = retire_repository_filesystem_directories(
+            vec![StagedRepositoryFilesystemDirectory {
+                live: live.clone(),
+                staged: staged.clone(),
+                kind: "CI cache directory",
+                hint: crate::platform::fs::CI_CACHE_DIR_HINT,
+            }],
+            7,
+        )
+        .expect_err("ENOTDIR must make post-commit cleanup fail closed");
+
+        let rendered_error = format!("{error:#}");
+        assert!(
+            rendered_error.contains(&staged.display().to_string()),
+            "{rendered_error}"
+        );
+        assert!(
+            rendered_error.contains(&live.display().to_string()),
+            "{rendered_error}"
+        );
+        let rendered_log = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(
+            rendered_log.contains(&staged.display().to_string()),
+            "{rendered_log}"
+        );
+        assert!(
+            rendered_log.contains(&live.display().to_string()),
+            "{rendered_log}"
+        );
+        assert!(
+            rendered_log.contains("staged data remains and must be removed by hand"),
+            "{rendered_log}"
         );
     }
 }
