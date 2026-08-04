@@ -14,6 +14,8 @@
 pub mod entities;
 #[cfg(test)]
 mod entity_schema_guard;
+#[cfg(test)]
+mod fts_rebuild_tests;
 pub mod migrations;
 pub mod ops;
 
@@ -523,46 +525,7 @@ pub async fn rebuild_fts_indexes(db: &DatabaseConnection) -> Result<()> {
 
     match backend {
         DatabaseBackend::Sqlite => {
-            tracing::info!("  Rebuilding repos_fts...");
-            db.execute(Statement::from_sql_and_values(
-                backend,
-                "DELETE FROM repos_fts",
-                [],
-            ))
-            .await?;
-            db.execute(Statement::from_sql_and_values(
-                backend,
-                "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, description FROM repositories WHERE deleted_at IS NULL",
-                [],
-            )).await?;
-
-            tracing::info!("  Rebuilding issues_fts...");
-            db.execute(Statement::from_sql_and_values(
-                backend,
-                "DELETE FROM issues_fts",
-                [],
-            ))
-            .await?;
-            db.execute(Statement::from_sql_and_values(
-                backend,
-                "INSERT INTO issues_fts(rowid, title, body) SELECT id, title, COALESCE(body, '') FROM issues",
-                [],
-            )).await?;
-
-            tracing::info!("  Rebuilding wiki_pages_fts...");
-            db.execute(Statement::from_sql_and_values(
-                backend,
-                "DELETE FROM wiki_pages_fts",
-                [],
-            ))
-            .await?;
-            db.execute(Statement::from_sql_and_values(
-                backend,
-                "INSERT INTO wiki_pages_fts(rowid, title, content) SELECT id, title, content FROM wiki_pages",
-                [],
-            )).await?;
-
-            tracing::info!("FTS5 indexes rebuilt successfully");
+            rebuild_sqlite_fts_indexes(db, |_| async { Ok(()) }).await?;
         }
         DatabaseBackend::Postgres => {
             for t in ["repos_fts", "issues_fts", "wiki_pages_fts"] {
@@ -583,6 +546,116 @@ pub async fn rebuild_fts_indexes(db: &DatabaseConnection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteFtsTable {
+    Repositories,
+    Issues,
+    WikiPages,
+}
+
+/// Rebuild every SQLite FTS table under one write transaction.
+///
+/// The first `DELETE` acquires SQLite's single-writer lock. Source-table
+/// writers (and therefore their FTS triggers) wait until the complete rebuild
+/// commits, while readers keep seeing the previous committed snapshot. The
+/// callback is a private test seam used to pause or fail after a clear without
+/// relying on scheduler timing in the regression tests.
+async fn rebuild_sqlite_fts_indexes<F, Fut>(db: &DatabaseConnection, after_clear: F) -> Result<()>
+where
+    F: Fn(SqliteFtsTable) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
+
+    let backend = DatabaseBackend::Sqlite;
+    let transaction = db
+        .begin()
+        .await
+        .context("begin atomic SQLite FTS rebuild")?;
+
+    let rebuild_result: Result<()> = async {
+        tracing::info!("  Rebuilding repos_fts...");
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM repos_fts",
+                [],
+            ))
+            .await
+            .context("clear repos_fts")?;
+        after_clear(SqliteFtsTable::Repositories).await?;
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, description FROM repositories WHERE deleted_at IS NULL",
+                [],
+            ))
+            .await
+            .context("repopulate repos_fts")?;
+
+        tracing::info!("  Rebuilding issues_fts...");
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM issues_fts",
+                [],
+            ))
+            .await
+            .context("clear issues_fts")?;
+        after_clear(SqliteFtsTable::Issues).await?;
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO issues_fts(rowid, title, body) SELECT id, title, COALESCE(body, '') FROM issues",
+                [],
+            ))
+            .await
+            .context("repopulate issues_fts")?;
+
+        tracing::info!("  Rebuilding wiki_pages_fts...");
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM wiki_pages_fts",
+                [],
+            ))
+            .await
+            .context("clear wiki_pages_fts")?;
+        after_clear(SqliteFtsTable::WikiPages).await?;
+        transaction
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO wiki_pages_fts(rowid, title, content) SELECT id, title, content FROM wiki_pages",
+                [],
+            ))
+            .await
+            .context("repopulate wiki_pages_fts")?;
+
+        Ok(())
+    }
+    .await;
+
+    match rebuild_result {
+        Ok(()) => {
+            transaction
+                .commit()
+                .await
+                .context("commit atomic SQLite FTS rebuild")?;
+            tracing::info!("FTS5 indexes rebuilt successfully");
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error).context(format!(
+                    "SQLite FTS rebuild failed and its transaction could not be rolled back: \
+                     {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
