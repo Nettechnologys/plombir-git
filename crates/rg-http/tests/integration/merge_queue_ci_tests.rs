@@ -461,13 +461,11 @@ async fn a_queue_pass_adopts_the_merge_group_pipeline_instead_of_triggering_anot
     );
 }
 
-/// card_a997f30c142c: the reason a merge-queue entry failed is persisted into
-/// `failure_reason` and rendered in the UI — it is the whole answer to "why
-/// didn't my PR merge". `error.to_string()` printed only the outermost
-/// `.context(...)` ("failed to resolve merge ref 'feature'") and dropped the
-/// gix error under it, so the operator saw a restatement of the question.
+/// A merge-queue failure must persist the reason a PR can no longer merge.
+/// A deleted head branch is now detected before the gix merge path, so the
+/// stored answer must name that missing branch rather than a later git failure.
 #[tokio::test]
-async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
+async fn a_failed_merge_persists_the_missing_head_branch_reason() {
     let (db, app_dir) = setup_test_db().await;
     let repo_root = app_dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
@@ -599,9 +597,8 @@ async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
     .unwrap();
 
     // Drop the branch the merge will need. The merge-group CI step only reads
-    // the base ref and the stored head SHA, so it still reports Ready and the
-    // failure lands where we want it: inside `gix_merge_no_ff`, which wraps the
-    // gix error in a `.context(...)` — exactly the two-layer chain at issue.
+    // the base ref and the stored head SHA, so it still reports Ready; the
+    // merge itself must then persist the early head-branch validation failure.
     git.run(&["update-ref", "-d", "refs/heads/feature"], Some(&bare))
         .unwrap()
         .ensure_success()
@@ -630,12 +627,7 @@ async fn a_failed_merge_persists_the_inner_cause_not_just_the_outer_context() {
         .failure_reason
         .expect("a failed entry must carry a reason");
     assert!(
-        reason.contains("failed to resolve merge ref"),
-        "the outer context must survive: {reason}"
-    );
-    assert!(
-        reason.len() > "failed to resolve merge ref 'feature'".len(),
-        "the reason must carry the cause underneath the context, not just the \
-         context itself: {reason}"
+        reason.contains("pull request head branch 'feature' no longer exists"),
+        "the persisted reason must name the deleted head branch: {reason}"
     );
 }
