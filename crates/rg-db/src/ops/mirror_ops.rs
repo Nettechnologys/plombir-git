@@ -47,10 +47,17 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
 }
 
 /// List mirrors that are due for sync.
+///
+/// "Not switched off", not "healthy": the sweep that consumes this list is also
+/// what writes [`mirror::STATUS_ERROR`] into `status` when a pass fails, so
+/// selecting `status = "active"` here would mean every mirror leaves its own
+/// retry queue the first time the network, the credential or the SSRF guard
+/// says no — and nothing else ever picks it back up (card_770723efaa96). The
+/// operator's off switch is the one thing this filter is allowed to read.
 pub async fn list_due_sync(db: &DatabaseConnection, limit: u64) -> Result<Vec<Model>> {
     let now = Utc::now();
     MirrorEntity::find()
-        .filter(mirror::Column::Status.eq("active"))
+        .filter(mirror::Column::Status.ne(mirror::STATUS_INACTIVE))
         .filter(
             mirror::Column::NextSyncAt
                 .is_null()

@@ -32,7 +32,9 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rg_db::entities::mirror::{ActiveModel, Model as Mirror};
+use rg_db::entities::mirror::{
+    ActiveModel, Model as Mirror, STATUS_ACTIVE, STATUS_ERROR, STATUS_INACTIVE,
+};
 use rg_db::entities::repository;
 use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::{credential_invocation, GitCredentials};
@@ -105,7 +107,7 @@ pub async fn create_mirror(
         next_sync_at: Set(Some(next_sync)),
         last_sync_at: Set(None),
         last_sync_error: Set(None),
-        status: Set("active".to_string()),
+        status: Set(STATUS_ACTIVE.to_string()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -188,6 +190,20 @@ pub async fn update_mirror(
         model.sync_interval_seconds = Set(v);
     }
     if let Some(v) = status {
+        // The half of `status` a caller owns is the switch, and a switch has
+        // two positions. `error` is the sweep's to write and `last_sync_error`
+        // is where the reason lives, so accepting it here would let a caller
+        // describe a pass that never happened; anything else is a typo that
+        // would otherwise be stored verbatim and silently read as "switched
+        // on" by every later sweep.
+        if v != STATUS_ACTIVE && v != STATUS_INACTIVE {
+            return Err(crate::error::invalid_request(format!(
+                "`status` is the mirror's on/off switch and accepts \
+                 `{STATUS_ACTIVE}` or `{STATUS_INACTIVE}`; the outcome of the \
+                 last sync is reported in `status`/`last_sync_error` and is not \
+                 settable"
+            )));
+        }
         model.status = Set(v);
     }
     model.updated_at = Set(Utc::now());
@@ -213,14 +229,22 @@ pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64) -> Result<()> 
 
 /// Sync a single mirror: clone (first time) or fetch (subsequent).
 ///
-/// Returns Ok(true) if synced successfully, Ok(false) if mirror is inactive.
+/// Returns `Ok(true)` if a pass ran (successful or not — the outcome is on the
+/// row), `Ok(false)` if the operator has this mirror switched off.
+///
+/// The guard tests for *switched off* and nothing else. It used to require
+/// `status == "active"`, which made it refuse exactly the mirrors this function
+/// had itself marked [`STATUS_ERROR`] on the previous pass — a broken mirror
+/// could then never be repaired by a later sync, because no later sync would
+/// run (card_770723efaa96). A failed pass is a reason to retry, not a reason to
+/// stop.
 pub async fn sync_mirror(
     db: &DatabaseConnection,
     mirror: &Mirror,
     repo_root: &Path,
     encryption_key: &str,
 ) -> Result<bool> {
-    if mirror.status != "active" {
+    if mirror.status == STATUS_INACTIVE {
         return Ok(false);
     }
 
@@ -269,7 +293,7 @@ pub async fn sync_mirror(
     match result {
         Ok(()) => {
             model.last_sync_error = Set(None);
-            model.status = Set("active".to_string());
+            model.status = Set(STATUS_ACTIVE.to_string());
         }
         Err(e) => {
             // `{e}` printed the outermost `.context(...)` only, both in the
@@ -284,7 +308,7 @@ pub async fn sync_mirror(
             // holding.
             let reason = mask_credential(&format!("{e:#}"), credentials.as_ref().ok());
             model.last_sync_error = Set(Some(reason.clone()));
-            model.status = Set("error".to_string());
+            model.status = Set(STATUS_ERROR.to_string());
             tracing::error!(repo_id = mirror.repo_id, error = %reason, "mirror sync failed");
         }
     }
@@ -315,6 +339,13 @@ pub async fn sync_due_mirrors(
 }
 
 /// Manually trigger a sync for a mirror.
+///
+/// A mirror the operator has switched off is a refusal, not a quiet no-op: this
+/// is the "Sync now" button, and answering it with the same success the real
+/// thing gets is how a mirror that never moves looks like one that just synced
+/// (card_770723efaa96). `409`, because nothing about the request is malformed —
+/// the mirror's own state is what makes it unanswerable, and flipping `status`
+/// back is what fixes it.
 pub async fn trigger_sync(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -324,7 +355,11 @@ pub async fn trigger_sync(
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
-    sync_mirror(db, &mirror, repo_root, encryption_key).await?;
+    if !sync_mirror(db, &mirror, repo_root, encryption_key).await? {
+        return Err(crate::error::conflict(
+            "this mirror is switched off — set its status to `active` before syncing it",
+        ));
+    }
     Ok(())
 }
 

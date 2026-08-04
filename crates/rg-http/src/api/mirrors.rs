@@ -41,6 +41,9 @@ pub struct MirrorResponse {
     pub next_sync_at: Option<DateTime<Utc>>,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
+    /// `active` / `inactive` is the operator's switch; `error` means the last
+    /// pass failed — the mirror is still scheduled, and `last_sync_error` says
+    /// why.
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -103,6 +106,10 @@ pub struct UpdateMirrorRequest {
     pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_interval_seconds: Option<i64>,
+    /// The mirror's on/off switch: `active` or `inactive`. Only `inactive`
+    /// stops the scheduled sweep from picking the mirror up — a mirror whose
+    /// last pass failed reads back as `error` here and keeps being retried, so
+    /// `error` is reported, never accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
@@ -194,7 +201,9 @@ pub async fn get_mirror(
     request_body = UpdateMirrorRequest,
     responses(
         (status = 200, description = "Updated", body = MirrorResponse),
+        (status = 400, description = "Unknown `status` value", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No mirror configured", body = serde_json::Value),
     ),
 )]
 pub async fn update_mirror(
@@ -259,6 +268,8 @@ pub async fn delete_mirror(
     responses(
         (status = 200, description = "Sync triggered", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No mirror configured", body = serde_json::Value),
+        (status = 409, description = "The mirror is switched off", body = serde_json::Value),
     ),
 )]
 pub async fn trigger_mirror_sync(

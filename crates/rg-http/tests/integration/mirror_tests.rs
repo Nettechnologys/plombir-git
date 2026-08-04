@@ -670,3 +670,307 @@ async fn a_second_mirror_for_the_same_repo_is_refused_as_a_conflict() {
         "a remote the caller can fix by editing it is still a bad request"
     );
 }
+
+/// card_770723efaa96: a failed pass must not take the mirror out of the sweep
+/// that is supposed to retry it.
+///
+/// `sync_mirror` records a failure by writing `status = "error"`, and
+/// `list_due_sync` used to select `status = "active"` — so the sweep's own
+/// bookkeeping deleted the row from its own queue. Not for a while: forever.
+/// Nothing else re-selects mirrors, `last_sync_at` froze at the failure, and
+/// the only way back was a hand-written `PATCH` the UI has no field for.
+///
+/// The pass is failed on the credential (a value the server cannot decrypt),
+/// the same way the two tests above do it: that failure lands before the SSRF
+/// guard and before `git`, so the test needs no network and no clock-length
+/// timeout. Both passes go through `sync_due_mirrors` — the function the
+/// scheduler tick calls, and which
+/// `a_due_mirror_is_synced_by_the_scheduler_with_no_manual_trigger` already
+/// ties to the tick — so "the next tick" is exercised without sleeping through
+/// one.
+#[tokio::test]
+async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, _user_id) = register_full(&base, "mirror-retry", "mirror-retry@example.com").await;
+    create_repo(&base, &token, "keeps-trying").await;
+    create_repo(&base, &token, "switched-off").await;
+
+    let client = reqwest::Client::new();
+    let retry_url = format!("{base}/api/v1/repos/mirror-retry/keeps-trying/mirror");
+    let off_url = format!("{base}/api/v1/repos/mirror-retry/switched-off/mirror");
+
+    let mut ids = Vec::new();
+    for url in [&retry_url, &off_url] {
+        let resp = client
+            .post(url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "url": REMOTE,
+                "username": "sync-bot",
+                "password": "hunter2",
+                "sync_interval_seconds": 3600,
+            }))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), 201, "baseline create");
+        let created: serde_json::Value = resp.json().await.expect("json body");
+        ids.push(created["repo_id"].as_i64().expect("repo_id"));
+    }
+    let (retry_repo_id, off_repo_id) = (ids[0], ids[1]);
+
+    // The mirror under test: due now, and holding a credential the server
+    // cannot read, so its pass fails.
+    make_due(&db, retry_repo_id, true).await;
+
+    // The control: due now as well, but switched off by the operator. It is
+    // what keeps this test from passing on a "sweep everything" fix — the off
+    // switch is the one thing the selection is still allowed to obey.
+    make_due(&db, off_repo_id, true).await;
+    let resp = client
+        .patch(&off_url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"status": "inactive"}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "switching the control mirror off");
+
+    // Pass one: the failure that used to be terminal.
+    let synced =
+        rg_core::mirror::service::sync_due_mirrors(&db, &repo_root, 10, TEST_ENCRYPTION_KEY)
+            .await
+            .expect("the sweep itself must not fail");
+    assert_eq!(synced, 1, "the sweep skipped the mirror that was due");
+
+    let after_first = rg_db::ops::mirror_ops::find_by_repo_id(&db, retry_repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert_eq!(
+        after_first.status, "error",
+        "the failed pass was not recorded, so this test proves nothing: {after_first:?}"
+    );
+    let first_sync_at = after_first.last_sync_at.expect("the pass ran");
+
+    // The clock is the only thing between the mirror and its retry: wind
+    // `next_sync_at` back the way an hour of real time would.
+    make_due(&db, retry_repo_id, false).await;
+
+    // Pass two — the whole point. Before the fix this returned 0: the row had
+    // written itself out of `list_due_sync`.
+    let synced =
+        rg_core::mirror::service::sync_due_mirrors(&db, &repo_root, 10, TEST_ENCRYPTION_KEY)
+            .await
+            .expect("the sweep itself must not fail");
+    assert_eq!(
+        synced, 1,
+        "a mirror whose last pass failed was never looked at again — the sweep \
+         disabled itself on the first error"
+    );
+
+    let after_second = rg_db::ops::mirror_ops::find_by_repo_id(&db, retry_repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert!(
+        after_second
+            .last_sync_at
+            .is_some_and(|at| at > first_sync_at),
+        "the second sweep counted the mirror but never touched it: {after_second:?}"
+    );
+    assert!(
+        after_second
+            .next_sync_at
+            .is_some_and(|next| next > chrono::Utc::now()),
+        "the retry did not reschedule itself, so it would spin every tick: {after_second:?}"
+    );
+
+    // …and the operator's switch still means what it says.
+    let off = rg_db::ops::mirror_ops::find_by_repo_id(&db, off_repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert!(
+        off.last_sync_at.is_none(),
+        "a mirror the operator switched off was synced anyway: {off:?}"
+    );
+}
+
+/// Make a mirror due right now, optionally planting a credential the server
+/// cannot decrypt so its pass fails before the SSRF guard and before `git`.
+async fn make_due(db: &sea_orm::DatabaseConnection, repo_id: i64, break_credential: bool) {
+    let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    let mut model: rg_db::entities::mirror::ActiveModel = mirror.into();
+    model.next_sync_at =
+        sea_orm::ActiveValue::Set(Some(chrono::Utc::now() - chrono::Duration::seconds(60)));
+    if break_credential {
+        model.password_encrypted = sea_orm::ActiveValue::Set(Some("hunter2".to_string()));
+    }
+    rg_db::ops::mirror_ops::update(db, model)
+        .await
+        .expect("make the mirror due");
+}
+
+/// The other half of card_770723efaa96: "Sync now" reported success on a mirror
+/// it had not synced.
+///
+/// `sync_mirror` returns `Ok(false)` when it declines, `trigger_sync` dropped
+/// that `false`, and the handler answered `200 {"status": "sync_triggered"}` —
+/// so the one button an operator has said "done" for a mirror that never moved.
+/// A switched-off mirror is now a refusal; a *failed* one is a real sync, which
+/// is the case that used to be silently declined.
+#[tokio::test]
+async fn sync_now_refuses_a_switched_off_mirror_instead_of_reporting_success() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "mirror-button", "mirror-btn@example.com").await;
+    create_repo(&base, &token, "off").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/mirror-button/off/mirror");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": REMOTE,
+            "username": "sync-bot",
+            "password": "hunter2",
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "baseline create");
+    let created: serde_json::Value = resp.json().await.expect("json body");
+    let repo_id = created["repo_id"].as_i64().expect("repo_id");
+
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"status": "inactive"}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "switching the mirror off");
+
+    let resp = client
+        .post(format!("{url}/sync"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_ne!(
+        status, 200,
+        "the button reported a sync it did not perform: {body}"
+    );
+    assert_eq!(
+        status, 409,
+        "a mirror the operator switched off is the resource's state, not a \
+         malformed request and not a server failure: {body}"
+    );
+    assert_ne!(
+        body["status"], "sync_triggered",
+        "the refusal still claims a sync was triggered: {body}"
+    );
+
+    // And the refusal is honest: nothing was synced.
+    let untouched = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert!(
+        untouched.last_sync_at.is_none(),
+        "the mirror was synced despite being switched off: {untouched:?}"
+    );
+
+    // The button must still work on the state that used to be terminal: a
+    // mirror whose last pass failed is exactly the one an operator presses it
+    // on. It fails again here (the credential is unreadable), but it *runs* —
+    // which is what "200" is allowed to mean.
+    let mut model: rg_db::entities::mirror::ActiveModel = untouched.into();
+    model.status = sea_orm::ActiveValue::Set("error".to_string());
+    model.password_encrypted = sea_orm::ActiveValue::Set(Some("hunter2".to_string()));
+    rg_db::ops::mirror_ops::update(&db, model)
+        .await
+        .expect("plant a failed mirror");
+
+    let resp = client
+        .post(format!("{url}/sync"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        200,
+        "a mirror that failed its last pass could not be retried by hand either"
+    );
+    let retried = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert!(
+        retried.last_sync_at.is_some(),
+        "the manual retry answered 200 without running: {retried:?}"
+    );
+}
+
+/// The `status` column carries the operator's switch *and* the last outcome, so
+/// the write side has to stay narrower than the read side: a caller may set the
+/// switch, not describe a pass. Without this, `PATCH {"status": "erorr"}` was
+/// stored verbatim and every later sweep read the typo as "switched on".
+#[tokio::test]
+async fn an_unknown_mirror_status_is_refused_rather_than_stored() {
+    let base = spawn_test_app().await;
+    let (token, _user_id) =
+        register_full(&base, "mirror-status", "mirror-status@example.com").await;
+    create_repo(&base, &token, "switch").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/mirror-status/switch/mirror");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"url": REMOTE, "sync_interval_seconds": 3600}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "baseline create");
+
+    for rejected in ["erorr", "error", "paused"] {
+        let resp = client
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"status": rejected}))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status(),
+            400,
+            "`status: {rejected}` was accepted as the mirror's switch position"
+        );
+    }
+
+    // Both switch positions stay settable, or the guard above is just an outage.
+    for accepted in ["inactive", "active"] {
+        let resp = client
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"status": accepted}))
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(status, 200, "`status: {accepted}` was refused: {body}");
+        assert_eq!(body["status"], accepted);
+    }
+}
