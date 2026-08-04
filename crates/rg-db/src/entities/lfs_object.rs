@@ -21,6 +21,16 @@ pub struct Model {
     /// Compressed size in bytes (for compressed objects)
     pub compressed_size: Option<i64>,
     pub created_at: DateTimeUtc,
+    /// Token of the request currently publishing this object's blob, if any.
+    ///
+    /// Publication writes a stable content-addressed key, so two concurrent
+    /// first uploads of one `oid` are indistinguishable at the storage layer.
+    /// Holding this token is what lets a failed publication prove the bytes
+    /// under that key are its own before rolling them back.
+    pub publisher_token: Option<String>,
+    /// When the current publisher took the lease — the basis for taking over
+    /// a lease left behind by a process that died mid-publication.
+    pub publisher_since: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

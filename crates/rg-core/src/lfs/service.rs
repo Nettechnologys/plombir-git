@@ -408,19 +408,11 @@ async fn handle_upload(
         }
     }
 
-    // Register object if not yet tracked
+    // Register object if not yet tracked. Two clients batching the same new
+    // object at once both see `existing == None`; the unique index lets exactly
+    // one insert land, and the loser wants that row rather than a failed batch.
     if existing.is_none() {
-        let model = lfs_object::ActiveModel {
-            id: sea_orm::NotSet,
-            repo_id: sea_orm::Set(repo_id),
-            oid: sea_orm::Set(oid.to_string()),
-            size: sea_orm::Set(size),
-            uploaded: sea_orm::Set(false),
-            compression: sea_orm::Set(None),
-            compressed_size: sea_orm::Set(None),
-            created_at: sea_orm::Set(Utc::now()),
-        };
-        lfs_object_ops::create(db, model).await?;
+        find_or_register_object(db, repo_id, oid, size).await?;
     }
 
     // Return upload URL
@@ -542,31 +534,31 @@ pub async fn store_object(
     data: &[u8],
 ) -> Result<()> {
     // Find or create the DB record first
-    let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
-    let _obj_id = if let Some(obj) = existing {
-        obj.id
-    } else {
-        let model = lfs_object::ActiveModel {
-            id: sea_orm::NotSet,
-            repo_id: sea_orm::Set(repo_id),
-            oid: sea_orm::Set(oid.to_string()),
-            size: sea_orm::Set(data.len() as i64),
-            uploaded: sea_orm::Set(false),
-            compression: sea_orm::Set(None),
-            compressed_size: sea_orm::Set(None),
-            created_at: sea_orm::Set(Utc::now()),
-        };
-        let new_obj = lfs_object_ops::create(db, model).await?;
-        new_obj.id
-    };
+    let object = find_or_register_object(db, repo_id, oid, data.len() as i64).await?;
 
     // Compress data with zstd
     let compressed = compress_data(data)?;
     let compressed_size = compressed.len() as i64;
 
     let key = lfs_object_key(owner, repo, oid, true)?;
-    let publication = publish_blob(storage, &key, &compressed).await?;
 
+    publish_object(
+        db,
+        storage,
+        PublicationRequest {
+            object_id: object.id,
+            repo_id,
+            oid,
+            key: &key,
+            compressed_size,
+            source: PublicationSource::Buffered(&compressed),
+        },
+    )
+    .await?;
+
+    // After the publication, not before it: the line says the object is stored,
+    // and a request that waits for a lease or rolls its blob back never got
+    // there.
     tracing::info!(
         oid = %oid,
         original_size = data.len(),
@@ -574,17 +566,47 @@ pub async fn store_object(
         ratio = format!("{:.1}%", (compressed_size as f64 / data.len() as f64) * 100.0),
         "LFS object compressed and stored"
     );
+    Ok(())
+}
 
-    mark_uploaded(
-        db,
-        storage,
-        repo_id,
-        oid,
-        &key,
-        compressed_size,
-        publication,
-    )
-    .await
+/// Fetch the object's row, registering it if this is the first anyone hears of
+/// it.
+///
+/// The unique index on `(repo_id, oid)` makes exactly one of two racing first
+/// uploads lose the insert. Losing the insert is not losing the upload: the row
+/// the winner created is the row this request wanted, so re-read it instead of
+/// failing an upload that has nothing wrong with it. Matching on the driver's
+/// constraint-violation error would tie this to one backend, so the retry is
+/// the plain "look again" that every backend agrees on.
+async fn find_or_register_object(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    oid: &str,
+    size: i64,
+) -> Result<lfs_object::Model> {
+    if let Some(obj) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? {
+        return Ok(obj);
+    }
+
+    let model = lfs_object::ActiveModel {
+        id: sea_orm::NotSet,
+        repo_id: sea_orm::Set(repo_id),
+        oid: sea_orm::Set(oid.to_string()),
+        size: sea_orm::Set(size),
+        uploaded: sea_orm::Set(false),
+        compression: sea_orm::Set(None),
+        compressed_size: sea_orm::Set(None),
+        created_at: sea_orm::Set(Utc::now()),
+        publisher_token: sea_orm::Set(None),
+        publisher_since: sea_orm::Set(None),
+    };
+    match lfs_object_ops::create(db, model).await {
+        Ok(obj) => Ok(obj),
+        Err(error) => match lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? {
+            Some(obj) => Ok(obj),
+            None => Err(error),
+        },
+    }
 }
 
 /// Whether this call put new bytes under the content-addressed key.
@@ -598,28 +620,172 @@ enum BlobPublication {
     Reused,
 }
 
-async fn publish_blob(
-    storage: &dyn BlobStorage,
-    key: &BlobKey,
-    compressed: &[u8],
-) -> Result<BlobPublication> {
-    if storage.exists(key).await? {
-        return Ok(BlobPublication::Reused);
-    }
-    storage.put(key, compressed).await?;
-    Ok(BlobPublication::Published)
+/// Where the compressed bytes of a publication come from.
+enum PublicationSource<'a> {
+    Buffered(&'a [u8]),
+    File(&'a std::path::Path),
 }
 
-async fn publish_blob_from_file(
+/// Everything one publication of one LFS object needs to know about itself.
+struct PublicationRequest<'a> {
+    object_id: i64,
+    repo_id: i64,
+    oid: &'a str,
+    key: &'a BlobKey,
+    compressed_size: i64,
+    source: PublicationSource<'a>,
+}
+
+/// How long a publication lease stays valid before another request may take it
+/// over.
+///
+/// The ceiling has to clear the longest legitimate hold — one `put` of an
+/// already-compressed object plus one row update — because taking over the
+/// lease of a holder that is merely slow, rather than dead, is precisely the
+/// case where two requests both believe they own the same bytes.
+const PUBLICATION_LEASE_TTL_SECONDS: i64 = 15 * 60;
+
+/// How long a request waits for a competing publication of the same object.
+///
+/// Waiting is the cheap outcome: the holder is writing the very bytes this
+/// request wants under the very key it would use, so the waiter usually
+/// inherits a finished object and does nothing.
+const PUBLICATION_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+const PUBLICATION_LEASE_POLL_MIN: std::time::Duration = std::time::Duration::from_millis(25);
+const PUBLICATION_LEASE_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Another request is publishing this object's blob and did not let go in time.
+///
+/// A distinct type rather than a bare message because the distinction matters
+/// to the caller: nothing is wrong with the request and nothing is wrong with
+/// the server, so answering `500` would tell a client to stop when what it
+/// should do is come back. See `rg_http::error::AppError`, which downcasts to
+/// this and answers `503`.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("another upload of LFS object {oid} is still publishing after {waited_seconds}s")]
+pub struct LfsPublicationBusy {
+    pub oid: String,
+    pub waited_seconds: u64,
+}
+
+/// The right to publish one LFS object's content-addressed key.
+///
+/// Held from before the `exists` probe until after the metadata commit, so the
+/// whole decision — reuse or publish, commit or roll back — happens with no
+/// other publisher able to interleave.
+struct PublicationLease {
+    object_id: i64,
+    token: String,
+    /// Whether this lease was granted rather than taken over from an expired
+    /// holder. A taken-over lease cannot prove the previous holder is gone, so
+    /// bytes found under the key may still be theirs.
+    exclusive: bool,
+}
+
+/// Publish the compressed bytes and commit the metadata under an exclusive
+/// lease on the object's key.
+async fn publish_object(
+    db: &DatabaseConnection,
     storage: &dyn BlobStorage,
-    key: &BlobKey,
-    compressed_path: &std::path::Path,
-) -> Result<BlobPublication> {
-    if storage.exists(key).await? {
-        return Ok(BlobPublication::Reused);
+    request: PublicationRequest<'_>,
+) -> Result<()> {
+    let lease = acquire_publication_lease(db, request.object_id, request.oid).await?;
+    let published = publish_under_lease(db, storage, &request, &lease).await;
+    release_publication_lease(db, &lease, request.oid).await;
+    published
+}
+
+/// Wait for, then take, the object's publication lease.
+///
+/// Polling rather than blocking a database transaction is deliberate: the lease
+/// is held across a blob write that can take as long as the object is large,
+/// and holding a connection open for that would starve the pool long before it
+/// protected anything.
+async fn acquire_publication_lease(
+    db: &DatabaseConnection,
+    object_id: i64,
+    oid: &str,
+) -> Result<PublicationLease> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let deadline = std::time::Instant::now() + PUBLICATION_LEASE_WAIT;
+    let mut backoff = PUBLICATION_LEASE_POLL_MIN;
+
+    loop {
+        let stale_before = Utc::now() - chrono::Duration::seconds(PUBLICATION_LEASE_TTL_SECONDS);
+        match lfs_object_ops::bid_for_publication_lease(db, object_id, &token, stale_before).await?
+        {
+            lfs_object_ops::PublicationLeaseBid::Granted => {
+                return Ok(PublicationLease {
+                    object_id,
+                    token,
+                    exclusive: true,
+                })
+            }
+            lfs_object_ops::PublicationLeaseBid::TakenOver => {
+                tracing::warn!(
+                    oid = %oid,
+                    object_id,
+                    "took over an expired LFS publication lease — the previous publisher never released it, so this request will keep any blob it cannot prove is its own"
+                );
+                return Ok(PublicationLease {
+                    object_id,
+                    token,
+                    exclusive: false,
+                });
+            }
+            lfs_object_ops::PublicationLeaseBid::Busy => {}
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(LfsPublicationBusy {
+                oid: oid.to_string(),
+                waited_seconds: PUBLICATION_LEASE_WAIT.as_secs(),
+            }
+            .into());
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(PUBLICATION_LEASE_POLL_MAX);
     }
-    storage.put_file(key, compressed_path).await?;
-    Ok(BlobPublication::Published)
+}
+
+/// Give the lease back. A release that finds nothing to release means the lease
+/// had already been taken over, which is worth saying out loud — the request
+/// that took it over may have published bytes this one still believes are its.
+async fn release_publication_lease(db: &DatabaseConnection, lease: &PublicationLease, oid: &str) {
+    match lfs_object_ops::release_publication_lease(db, lease.object_id, &lease.token).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            oid = %oid,
+            object_id = lease.object_id,
+            "LFS publication lease was taken over before this request released it"
+        ),
+        Err(error) => tracing::warn!(
+            oid = %oid,
+            object_id = lease.object_id,
+            error = %format!("{error:#}"),
+            "failed to release the LFS publication lease — concurrent uploads of this object wait until it expires"
+        ),
+    }
+}
+
+async fn publish_under_lease(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    request: &PublicationRequest<'_>,
+    lease: &PublicationLease,
+) -> Result<()> {
+    let publication = if storage.exists(request.key).await? {
+        BlobPublication::Reused
+    } else {
+        match request.source {
+            PublicationSource::Buffered(bytes) => storage.put(request.key, bytes).await?,
+            PublicationSource::File(path) => storage.put_file(request.key, path).await?,
+        };
+        BlobPublication::Published
+    };
+
+    mark_uploaded(db, storage, request, publication, lease).await
 }
 
 /// Mark a stored LFS object uploaded, rolling back only bytes this call owns.
@@ -632,20 +798,18 @@ async fn publish_blob_from_file(
 async fn mark_uploaded(
     db: &DatabaseConnection,
     storage: &dyn BlobStorage,
-    repo_id: i64,
-    oid: &str,
-    key: &BlobKey,
-    compressed_size: i64,
+    request: &PublicationRequest<'_>,
     publication: BlobPublication,
+    lease: &PublicationLease,
 ) -> Result<()> {
-    let obj = match lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await {
+    let obj = match lfs_object_ops::find_by_repo_and_oid(db, request.repo_id, request.oid).await {
         Ok(Some(obj)) => obj,
         Ok(None) => {
-            discard_stored_blob(storage, key, repo_id, oid, publication).await;
-            anyhow::bail!("LFS object {} not found after create", oid);
+            discard_stored_blob(db, storage, request, publication, lease).await;
+            anyhow::bail!("LFS object {} not found after create", request.oid);
         }
         Err(error) => {
-            discard_stored_blob(storage, key, repo_id, oid, publication).await;
+            discard_stored_blob(db, storage, request, publication, lease).await;
             return Err(error).context("db: reload LFS object after store");
         }
     };
@@ -657,10 +821,10 @@ async fn mark_uploaded(
     // A not-yet-uploaded row may still reuse bytes won by a concurrent publisher.
     if publication == BlobPublication::Published || !already_uploaded {
         model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
-        model.compressed_size = sea_orm::Set(Some(compressed_size));
+        model.compressed_size = sea_orm::Set(Some(request.compressed_size));
     }
     if let Err(error) = model.update(db).await {
-        discard_stored_blob(storage, key, repo_id, oid, publication).await;
+        discard_stored_blob(db, storage, request, publication, lease).await;
         return Err(error).context("db: update LFS object after store");
     }
 
@@ -669,28 +833,75 @@ async fn mark_uploaded(
 
 /// Roll back a blob whose row will never claim it as uploaded.
 ///
-/// The caller must still report the failure that got us here, so a failed
-/// rollback can only be logged, never returned: if the delete does not land,
-/// the bytes stay in storage with nothing pointing at them.
+/// Three things have to hold before the delete is safe, and each of them is a
+/// way an earlier version of this code lost live data:
+///
+/// * the bytes were published by *this* request, not reused from an earlier one;
+/// * the lease was granted, not taken over — a taken-over lease means another
+///   process may still be publishing under the same key;
+/// * no row currently claims the object as uploaded.
+///
+/// Anything short of all three leaves the blob in place. An orphan costs disk
+/// and is collectable; deleting an object a live row points at is not
+/// recoverable at all. The caller must still report the failure that got us
+/// here, so a failed rollback can only be logged, never returned.
 async fn discard_stored_blob(
+    db: &DatabaseConnection,
     storage: &dyn BlobStorage,
-    key: &BlobKey,
-    repo_id: i64,
-    oid: &str,
+    request: &PublicationRequest<'_>,
     publication: BlobPublication,
+    lease: &PublicationLease,
 ) {
     if publication == BlobPublication::Reused {
         return;
     }
-    if let Err(cleanup_error) = storage.delete(key).await {
+    if !lease.exclusive {
         tracing::warn!(
-            oid = %oid,
-            repo_id,
-            blob_key = %key,
+            oid = %request.oid,
+            repo_id = request.repo_id,
+            blob_key = %request.key,
+            "orphaned LFS blob: this request published under a taken-over lease and cannot prove the stored bytes are its own — the blob stays in storage rather than risk deleting a live object"
+        );
+        return;
+    }
+    match object_claims_upload(db, request.repo_id, request.oid).await {
+        Ok(false) => {}
+        Ok(true) => {
+            tracing::warn!(
+                oid = %request.oid,
+                repo_id = request.repo_id,
+                blob_key = %request.key,
+                "kept the LFS blob after a failed metadata commit: the object's row already reads uploaded=true, so these bytes are serving a live publication"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                oid = %request.oid,
+                repo_id = request.repo_id,
+                blob_key = %request.key,
+                error = %format!("{error:#}"),
+                "orphaned LFS blob: the rollback could not read the object's row to check for a live publication, so the blob stays in storage"
+            );
+            return;
+        }
+    }
+    if let Err(cleanup_error) = storage.delete(request.key).await {
+        tracing::warn!(
+            oid = %request.oid,
+            repo_id = request.repo_id,
+            blob_key = %request.key,
             error = %cleanup_error,
             "orphaned LFS blob: marking the object uploaded failed and the rollback delete failed too — the blob stays in storage while its row still reads uploaded=false"
         );
     }
+}
+
+/// Whether a row currently points at the object's blob as a live upload.
+async fn object_claims_upload(db: &DatabaseConnection, repo_id: i64, oid: &str) -> Result<bool> {
+    Ok(lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid)
+        .await?
+        .is_some_and(|obj| obj.uploaded))
 }
 
 /// Store an LFS object from an uncompressed file on disk.
@@ -747,23 +958,7 @@ async fn stream_compress_and_store(
     original_size: i64,
 ) -> Result<()> {
     // Find or create the DB record first
-    let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
-    let _obj_id = if let Some(_obj) = existing {
-        None
-    } else {
-        let model = lfs_object::ActiveModel {
-            id: sea_orm::NotSet,
-            repo_id: sea_orm::Set(repo_id),
-            oid: sea_orm::Set(oid.to_string()),
-            size: sea_orm::Set(original_size),
-            uploaded: sea_orm::Set(false),
-            compression: sea_orm::Set(None),
-            compressed_size: sea_orm::Set(None),
-            created_at: sea_orm::Set(Utc::now()),
-        };
-        let new_obj = lfs_object_ops::create(db, model).await?;
-        Some(new_obj.id)
-    };
+    let object = find_or_register_object(db, repo_id, oid, original_size).await?;
 
     // Stream-compress from file (uses chunked I/O, not full file read)
     let src_file = std::fs::File::open(uncompressed_path)
@@ -782,8 +977,22 @@ async fn stream_compress_and_store(
     let compressed_size = finished.metadata().map(|m| m.len() as i64).unwrap_or(0);
 
     let key = lfs_object_key(owner, repo, oid, true)?;
-    let publication = publish_blob_from_file(storage, &key, compressed_path).await?;
 
+    publish_object(
+        db,
+        storage,
+        PublicationRequest {
+            object_id: object.id,
+            repo_id,
+            oid,
+            key: &key,
+            compressed_size,
+            source: PublicationSource::File(compressed_path),
+        },
+    )
+    .await?;
+
+    // After the publication, for the same reason as the buffered path.
     tracing::info!(
         oid = %oid,
         original_size = original_size,
@@ -791,17 +1000,7 @@ async fn stream_compress_and_store(
         ratio = format!("{:.1}%", if original_size > 0 { (compressed_size as f64 / original_size as f64) * 100.0 } else { 0.0 }),
         "LFS object stream-compressed and stored"
     );
-
-    mark_uploaded(
-        db,
-        storage,
-        repo_id,
-        oid,
-        &key,
-        compressed_size,
-        publication,
-    )
-    .await
+    Ok(())
 }
 
 /// Read an LFS object from disk.
@@ -1075,7 +1274,8 @@ pub async fn delete_object_from_storage(
 #[cfg(test)]
 mod blob_publication_tests {
     use super::{
-        compress_data, lfs_object_key, store_object, store_object_from_file, COMPRESSION_ALGO,
+        compress_data, decompress_data, lfs_object_key, store_object, store_object_from_file,
+        COMPRESSION_ALGO,
     };
     use crate::blob_storage::{
         BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage, Result as BlobResult,
@@ -1083,6 +1283,98 @@ mod blob_publication_tests {
     use futures::future::BoxFuture;
     use rg_db::entities::lfs_object;
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, NotSet, Set};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// A rendezvous point a request can be held at, and the test can observe.
+    ///
+    /// Two semaphores rather than a `Notify` because both edges have to survive
+    /// being signalled before anyone waits: the test must be able to ask "has it
+    /// parked yet?" without racing the answer.
+    #[derive(Clone)]
+    struct Gate {
+        reached: Arc<Semaphore>,
+        resume: Arc<Semaphore>,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                reached: Arc::new(Semaphore::new(0)),
+                resume: Arc::new(Semaphore::new(0)),
+            }
+        }
+
+        /// Announce arrival, then wait to be let go.
+        async fn park(&self) {
+            self.reached.add_permits(1);
+            self.resume
+                .acquire()
+                .await
+                .expect("the gate outlives the parked request")
+                .forget();
+        }
+
+        fn has_parked(&self) -> bool {
+            self.reached.available_permits() > 0
+        }
+
+        /// Wait for the request to arrive. Returns false on timeout so a broken
+        /// protocol fails an assertion instead of hanging the suite.
+        async fn await_arrival(&self) -> bool {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), self.reached.acquire())
+                .await
+            {
+                Ok(permit) => {
+                    permit
+                        .expect("the gate outlives the parked request")
+                        .forget();
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        fn release(&self) {
+            self.resume.add_permits(1);
+        }
+    }
+
+    /// What a storage backend does once the bytes are on the shared key but the
+    /// metadata commit has not run yet — the window every concurrent-publication
+    /// hazard lives in.
+    enum PutHook {
+        None,
+        /// Hold the request there so the test can drive a second one into the
+        /// same window.
+        Park(Gate),
+        /// Stand in for a concurrent publisher that reused these very bytes and
+        /// got its own commit in first.
+        ClaimRow {
+            db: DatabaseConnection,
+            oid: String,
+        },
+    }
+
+    impl PutHook {
+        async fn run(&self) {
+            match self {
+                PutHook::None => {}
+                PutHook::Park(gate) => gate.park().await,
+                PutHook::ClaimRow { db, oid } => {
+                    // The stand-in is a different request, so the fault injected
+                    // into *this* one must not swallow its commit.
+                    set_lfs_metadata_commits(db, false).await;
+                    db.execute_unprepared(&format!(
+                        "UPDATE lfs_objects SET uploaded = 1 WHERE oid = '{oid}'"
+                    ))
+                    .await
+                    .expect("the stand-in publisher commits");
+                    set_lfs_metadata_commits(db, true).await;
+                }
+            }
+        }
+    }
 
     /// Backend-shaped proxy with no `local_path` shortcut. The production tree
     /// currently ships a local backend, but LFS ownership must use only the
@@ -1090,12 +1382,21 @@ mod blob_publication_tests {
     /// compensation semantics.
     struct RemoteBlobStorage {
         inner: LocalBlobStorage,
+        after_put: PutHook,
     }
 
     impl RemoteBlobStorage {
         fn new(root: &std::path::Path) -> Self {
             Self {
                 inner: LocalBlobStorage::new(root),
+                after_put: PutHook::None,
+            }
+        }
+
+        fn with_hook(root: &std::path::Path, after_put: PutHook) -> Self {
+            Self {
+                inner: LocalBlobStorage::new(root),
+                after_put,
             }
         }
     }
@@ -1110,7 +1411,11 @@ mod blob_publication_tests {
             key: &'a BlobKey,
             data: &'a [u8],
         ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
-            self.inner.put(key, data)
+            Box::pin(async move {
+                let metadata = self.inner.put(key, data).await?;
+                self.after_put.run().await;
+                Ok(metadata)
+            })
         }
 
         fn put_file<'a>(
@@ -1118,7 +1423,11 @@ mod blob_publication_tests {
             key: &'a BlobKey,
             source: &'a std::path::Path,
         ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
-            self.inner.put_file(key, source)
+            Box::pin(async move {
+                let metadata = self.inner.put_file(key, source).await?;
+                self.after_put.run().await;
+                Ok(metadata)
+            })
         }
 
         fn get<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<Vec<u8>>> {
@@ -1153,12 +1462,34 @@ mod blob_publication_tests {
         db
     }
 
-    async fn fail_lfs_updates(db: &DatabaseConnection) {
+    /// Break the metadata commit and nothing else, from now until told otherwise.
+    ///
+    /// `UPDATE OF uploaded` is the point of the injection: the fault under test
+    /// is "the row never records the upload", not "no statement may touch this
+    /// table". A blanket trigger would also break the publication lease's own
+    /// bookkeeping, and the rollback would then be exercised in a state no
+    /// production failure produces.
+    ///
+    /// The switch table exists so a test can let exactly one of two racing
+    /// commits through — the shape the concurrency hazard needs.
+    async fn fail_lfs_metadata_commits(db: &DatabaseConnection) {
         db.execute_unprepared(
-            "CREATE TRIGGER fail_lfs_updates \
-             BEFORE UPDATE ON lfs_objects \
+            "CREATE TABLE lfs_commit_switch (fail INTEGER NOT NULL); \
+             INSERT INTO lfs_commit_switch (fail) VALUES (1); \
+             CREATE TRIGGER fail_lfs_updates \
+             BEFORE UPDATE OF uploaded ON lfs_objects \
+             WHEN (SELECT fail FROM lfs_commit_switch) = 1 \
              BEGIN SELECT RAISE(FAIL, 'injected lfs update failure'); END",
         )
+        .await
+        .unwrap();
+    }
+
+    async fn set_lfs_metadata_commits(db: &DatabaseConnection, fail: bool) {
+        db.execute_unprepared(&format!(
+            "UPDATE lfs_commit_switch SET fail = {}",
+            i32::from(fail)
+        ))
         .await
         .unwrap();
     }
@@ -1185,6 +1516,8 @@ mod blob_publication_tests {
                 compression: Set(Some(COMPRESSION_ALGO.to_string())),
                 compressed_size: Set(Some(compressed_size as i64)),
                 created_at: Set(chrono::Utc::now()),
+                publisher_token: Set(None),
+                publisher_since: Set(None),
             },
         )
         .await
@@ -1225,7 +1558,7 @@ mod blob_publication_tests {
         storage.put(&file_key, &file_compressed).await.unwrap();
         insert_uploaded_object(&db, 1, &file_oid, file_payload, file_compressed.len()).await;
 
-        fail_lfs_updates(&db).await;
+        fail_lfs_metadata_commits(&db).await;
 
         let buffered_error = store_object(
             &db,
@@ -1270,7 +1603,7 @@ mod blob_publication_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = setup_db().await;
         let storage = RemoteBlobStorage::new(&dir.path().join("remote"));
-        fail_lfs_updates(&db).await;
+        fail_lfs_metadata_commits(&db).await;
 
         let buffered_payload = b"new buffered LFS object";
         let buffered_oid = oid(buffered_payload);
@@ -1306,6 +1639,181 @@ mod blob_publication_tests {
         .await
         .expect_err("the injected file metadata failure must land");
         assert!(!storage.exists(&file_key).await.unwrap());
+    }
+
+    /// A database with a real connection pool: two racing publications have to
+    /// contend over separate connections, or the serialisation being tested is
+    /// the pool's rather than the protocol's.
+    async fn pooled_db(dir: &std::path::Path) -> DatabaseConnection {
+        let url = format!("sqlite://{}?mode=rwc", dir.join("lfs.db").display());
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        db
+    }
+
+    /// Two first publications of one `oid`, one commit landing and one failing,
+    /// must leave the object downloadable.
+    ///
+    /// The dangerous interleaving is the one this test makes impossible: a
+    /// second request observing the first request's not-yet-committed bytes,
+    /// adopting them, committing — and then watching the first request's
+    /// rollback delete the object its own row now points at. The publication
+    /// lease is what keeps the second request out of that window, so it finds
+    /// either a finished object or a clean slate and never an ambiguous one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_publications_leave_the_object_downloadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = pooled_db(dir.path()).await;
+        fail_lfs_metadata_commits(&db).await;
+
+        let payload = b"two clients push the same LFS object at the same moment";
+        let oid = oid(payload);
+        let key = lfs_object_key("owner", "repo", &oid, true).unwrap();
+        let root = dir.path().join("remote");
+        let observer = RemoteBlobStorage::new(&root);
+
+        let first_gate = Gate::new();
+        let second_gate = Gate::new();
+        let first_storage = Arc::new(RemoteBlobStorage::with_hook(
+            &root,
+            PutHook::Park(first_gate.clone()),
+        ));
+        let second_storage = Arc::new(RemoteBlobStorage::with_hook(
+            &root,
+            PutHook::Park(second_gate.clone()),
+        ));
+
+        let first = tokio::spawn({
+            let db = db.clone();
+            let storage = Arc::clone(&first_storage);
+            let oid = oid.clone();
+            async move { store_object(&db, 1, storage.as_ref(), "owner", "repo", &oid, payload).await }
+        });
+        assert!(
+            first_gate.await_arrival().await,
+            "the first request must reach the window between its blob write and its commit"
+        );
+
+        // Only now does the second request start, with the first one holding the
+        // lease and its bytes already under the shared key.
+        let source = dir.path().join("second.upload");
+        std::fs::write(&source, payload).unwrap();
+        let second = tokio::spawn({
+            let db = db.clone();
+            let storage = Arc::clone(&second_storage);
+            let oid = oid.clone();
+            let source = source.clone();
+            async move {
+                store_object_from_file(
+                    &db,
+                    1,
+                    storage.as_ref(),
+                    "owner",
+                    "repo",
+                    &oid,
+                    &source,
+                    payload.len() as i64,
+                )
+                .await
+            }
+        });
+
+        // It must not get as far as writing bytes while the first request still
+        // owns the key — adopting those bytes is the whole hazard.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !second_gate.has_parked(),
+            "the second publication reached the shared key while the first still held the lease"
+        );
+
+        first_gate.release();
+        let first_error = first
+            .await
+            .unwrap()
+            .expect_err("the injected metadata failure must land on the first publication");
+        assert!(first_error.to_string().contains("update LFS object"));
+
+        // The second request now owns the key. Let its commit through.
+        assert!(
+            second_gate.await_arrival().await,
+            "the second publication never wrote its own bytes: it either adopted the first request's \
+             withdrawn blob or gave up on the lease"
+        );
+        set_lfs_metadata_commits(&db, false).await;
+        second_gate.release();
+        second
+            .await
+            .unwrap()
+            .expect("the second publication owns the key and must succeed");
+
+        let row = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&db, 1, &oid)
+            .await
+            .unwrap()
+            .expect("the object is registered");
+        assert!(row.uploaded, "the surviving publication must be recorded");
+        assert!(
+            row.publisher_token.is_none(),
+            "both publications must have released their lease"
+        );
+        assert!(
+            observer.exists(&key).await.unwrap(),
+            "a rollback deleted the blob the surviving row points at"
+        );
+        assert_eq!(
+            decompress_data(&observer.get(&key).await.unwrap()).unwrap(),
+            payload,
+            "the row points at a blob that is missing or corrupt"
+        );
+    }
+
+    /// A rollback must never delete bytes a live row already claims, whatever
+    /// ordering produced that row.
+    ///
+    /// The lease keeps two publishers apart, but a lease taken over from a
+    /// process that only *looked* dead does not, so the compensation carries its
+    /// own proof: it re-reads the row and refuses to delete bytes an upload is
+    /// already being served from. Losing disk to an orphan is recoverable;
+    /// deleting a live object is not.
+    #[tokio::test]
+    async fn a_rollback_keeps_bytes_a_live_row_already_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db().await;
+        fail_lfs_metadata_commits(&db).await;
+
+        let payload = b"a competing publication got its commit in first";
+        let oid = oid(payload);
+        let key = lfs_object_key("owner", "repo", &oid, true).unwrap();
+        let root = dir.path().join("remote");
+        let observer = RemoteBlobStorage::new(&root);
+        let storage = RemoteBlobStorage::with_hook(
+            &root,
+            PutHook::ClaimRow {
+                db: db.clone(),
+                oid: oid.clone(),
+            },
+        );
+
+        let error = store_object(&db, 1, &storage, "owner", "repo", &oid, payload)
+            .await
+            .expect_err("the injected metadata failure must land");
+        assert!(error.to_string().contains("update LFS object"));
+
+        let row = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&db, 1, &oid)
+            .await
+            .unwrap()
+            .expect("the object is registered");
+        assert!(row.uploaded, "the competing publication stays recorded");
+        assert!(
+            observer.exists(&key).await.unwrap(),
+            "a rollback deleted the blob the surviving row points at"
+        );
+        assert_eq!(
+            decompress_data(&observer.get(&key).await.unwrap()).unwrap(),
+            payload,
+            "the rollback deleted bytes a live row points at"
+        );
     }
 }
 
@@ -1368,6 +1876,8 @@ mod compress_existing_log_tests {
                 compression: sea_orm::Set(None),
                 compressed_size: sea_orm::Set(None),
                 created_at: sea_orm::Set(chrono::Utc::now()),
+                publisher_token: sea_orm::Set(None),
+                publisher_since: sea_orm::Set(None),
             },
         )
         .await

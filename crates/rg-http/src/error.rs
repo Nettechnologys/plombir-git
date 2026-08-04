@@ -219,6 +219,17 @@ impl From<anyhow::Error> for AppError {
             }
         }
 
+        // A concurrent upload of the same LFS object still holds its publication
+        // lease. Nothing is wrong with this request and nothing is wrong with the
+        // server — the object is simply being written by somebody else right now,
+        // and the caller should come back rather than give up. `503` says that;
+        // the `500` this would otherwise be says the opposite.
+        if let Some(busy) = e.downcast_ref::<rg_core::lfs::service::LfsPublicationBusy>() {
+            let full_msg = format!("{e:#}");
+            tracing::warn!(oid = %busy.oid, waited_seconds = busy.waited_seconds, error = %full_msg, "LFS object is being published by a concurrent upload, returning 503");
+            return Self::ServiceUnavailable(full_msg);
+        }
+
         // A host we do not own failed to answer. Sits above the four
         // client-fault branches below for the same reason the outage branch
         // does: a call that never completed must not be reported as an absent
@@ -399,6 +410,19 @@ mod tests {
         assert_eq!(err.code(), "DB_UNAVAILABLE");
 
         let err: AppError = DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed).into();
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Losing a race for an object nobody has done anything wrong with is a
+    /// "come back", not a "we broke". `500` would tell git-lfs to give up on an
+    /// upload that succeeds the moment the other publisher lets go.
+    #[test]
+    fn a_contended_lfs_publication_maps_to_503() {
+        let busy = rg_core::lfs::service::LfsPublicationBusy {
+            oid: "b".repeat(64),
+            waited_seconds: 120,
+        };
+        let err: AppError = anyhow::Error::from(busy).context("store LFS object").into();
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
