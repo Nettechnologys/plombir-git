@@ -138,11 +138,13 @@ const SQLITE_NAMESPACE_KEY: &str = r#""namespace_key" text GENERATED ALWAYS AS (
              WHEN "org_id" IS NULL THEN 'u' || "owner_id"
              ELSE 'o' || "org_id" END) STORED"#;
 
-/// The three FTS triggers on `repositories`, verbatim from
-/// `m20260511_000003_fix_fts5_triggers` — the rebuild drops and recreates them,
-/// and they have to come back exactly as that migration left them.
+/// The three FTS triggers on `repositories`. The rebuild drops and recreates
+/// them, so this copy must retain the live-row semantics installed by
+/// `m20260804_000006_repo_fts_soft_delete` even when the namespace migration is
+/// rolled back later.
 const SQLITE_FTS_TRIGGERS: &str = r#"
-    CREATE TRIGGER IF NOT EXISTS repos_fts_insert AFTER INSERT ON repositories BEGIN
+    CREATE TRIGGER IF NOT EXISTS repos_fts_insert AFTER INSERT ON repositories
+    WHEN new.deleted_at IS NULL BEGIN
         INSERT INTO repos_fts(rowid, name, description)
         VALUES (new.id, new.name, COALESCE(new.description, ''));
     END;
@@ -154,7 +156,8 @@ const SQLITE_FTS_TRIGGERS: &str = r#"
     CREATE TRIGGER IF NOT EXISTS repos_fts_update AFTER UPDATE ON repositories BEGIN
         DELETE FROM repos_fts WHERE rowid = old.id;
         INSERT INTO repos_fts(rowid, name, description)
-        VALUES (new.id, new.name, COALESCE(new.description, ''));
+        SELECT new.id, new.name, COALESCE(new.description, '')
+        WHERE new.deleted_at IS NULL;
     END;
 "#;
 

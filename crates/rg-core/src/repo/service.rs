@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection};
+use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -532,6 +532,22 @@ pub async fn create_repo_with_opts(
     opts: CreateRepoOptions,
     repo_root: &std::path::Path,
 ) -> Result<rg_db::entities::repository::Model> {
+    create_repo_with_post_commit(db, opts, repo_root, || std::future::ready(())).await
+}
+
+/// Create the source row, then expose the historical post-commit FTS window to
+/// a deterministic regression test. Production has no index write in that
+/// window: source-table triggers are the sole owner of `repos_fts`.
+async fn create_repo_with_post_commit<F, Fut>(
+    db: &DatabaseConnection,
+    opts: CreateRepoOptions,
+    repo_root: &std::path::Path,
+    after_source_commit: F,
+) -> Result<rg_db::entities::repository::Model>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let default_branch = opts.default_branch.as_deref().unwrap_or("main");
     let owner_id = opts.owner_id;
     let name = &opts.name;
@@ -699,26 +715,7 @@ pub async fn create_repo_with_opts(
         }
     };
 
-    // Keep the metadata FTS table in sync. Triggers also maintain it; use an
-    // upsert so the explicit write is safe on SQLite, PostgreSQL and MySQL.
-    let backend = db.get_database_backend();
-    let fts_sql =
-        crate::search::dialect::metadata_fts_upsert_sql(backend, "repos_fts", "name, description");
-    let description = repo.description.as_deref().unwrap_or("");
-    if let Err(e) = db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            rg_db::prepare_sql(backend, &fts_sql),
-            [
-                repo.id.into(),
-                repo.name.as_str().into(),
-                description.into(),
-            ],
-        ))
-        .await
-    {
-        tracing::warn!(repo_id = repo.id, error = %format!("{e:#}"), "failed to update repos_fts index");
-    }
+    after_source_commit().await;
 
     // Create default issue labels if requested
     if let Some(ref label_set) = opts.issue_labels {
@@ -1848,19 +1845,6 @@ pub async fn delete_repo(
             restore_repository_directory(&staged_path, &repo_path, repo.id);
         }
         return Err(error);
-    }
-
-    // Manually remove from the metadata FTS table as a defensive fallback.
-    let backend = db.get_database_backend();
-    if let Err(e) = db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            rg_db::prepare_sql(backend, "DELETE FROM repos_fts WHERE rowid = ?"),
-            [repo.id.into()],
-        ))
-        .await
-    {
-        tracing::warn!(repo_id = repo.id, error = %format!("{e:#}"), "failed to remove repo from repos_fts index");
     }
 
     invalidate_perm_cache_repo(db, repo.id);
@@ -3104,6 +3088,185 @@ mod path_diagnostic_tests {
 }
 
 #[cfg(test)]
+mod repository_fts_tests {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
+
+    async fn fixture(name: &str) -> (tempfile::TempDir, DatabaseConnection, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!("{name}.db"));
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", db_path.display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            2,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            name,
+            &format!("{name}@example.invalid"),
+            "",
+            name,
+        )
+        .await
+        .expect("create user");
+        (dir, db, user.id)
+    }
+
+    fn create_options(owner_id: i64, name: &str, description: &str) -> CreateRepoOptions {
+        CreateRepoOptions {
+            owner_id,
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            is_private: false,
+            org_id: None,
+            default_branch: Some("main".to_string()),
+            auto_init: false,
+            gitignores: None,
+            license: None,
+            readme: None,
+            issue_labels: None,
+            owner_display_name: String::new(),
+            git_author_name: None,
+            git_author_email: None,
+        }
+    }
+
+    async fn repo_fts_snapshot(db: &DatabaseConnection, repo_id: i64) -> Option<(String, String)> {
+        db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT name, description FROM repos_fts WHERE rowid = ?",
+            [repo_id.into()],
+        ))
+        .await
+        .expect("read repository FTS row")
+        .map(|row| {
+            (
+                row.try_get("", "name").expect("decode FTS name"),
+                row.try_get("", "description")
+                    .expect("decode FTS description"),
+            )
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_create_completion_cannot_overwrite_newer_repository_fts_snapshot() {
+        let (dir, db, owner_id) = fixture("repoftsrace").await;
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_db = db.clone();
+        let repo_root = dir.path().join("repos");
+        let first = tokio::spawn(async move {
+            create_repo_with_post_commit(
+                &first_db,
+                create_options(owner_id, "stale-repo", "stale alpha description"),
+                &repo_root,
+                move || async move {
+                    committed_tx.send(()).expect("announce source commit");
+                    release_rx.await.expect("release late create");
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), committed_rx)
+            .await
+            .expect("repository create did not commit in time")
+            .expect("repository create dropped its commit signal");
+        let committed = repo_ops::find_personal_by_owner_and_name(&db, owner_id, "stale-repo")
+            .await
+            .expect("read committed repository")
+            .expect("repository exists before rename");
+        let repo_id = committed.id;
+        let mut renamed: RepoActiveModel = committed.into();
+        renamed.name = Set("fresh-repo".to_string());
+        renamed.description = Set(Some("fresh beta description".to_string()));
+        renamed.updated_at = Set(Utc::now());
+        renamed
+            .update(&db)
+            .await
+            .expect("rename repository source row");
+
+        assert_eq!(
+            repo_fts_snapshot(&db, repo_id).await,
+            Some((
+                "fresh-repo".to_string(),
+                "fresh beta description".to_string()
+            ))
+        );
+        release_tx.send(()).expect("release late repository create");
+        first
+            .await
+            .expect("repository create task panicked")
+            .expect("repository create succeeds");
+
+        assert_eq!(
+            repo_fts_snapshot(&db, repo_id).await,
+            Some((
+                "fresh-repo".to_string(),
+                "fresh beta description".to_string()
+            )),
+            "a late create replayed its stale source snapshot into repository FTS"
+        );
+        assert!(
+            repo_ops::find_personal_by_owner_and_name(&db, owner_id, "fresh-repo")
+                .await
+                .expect("read renamed repository")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_and_restore_are_owned_by_the_repository_trigger() {
+        let (dir, db, owner_id) = fixture("repoftsdelete").await;
+        let repo = create_repo_with_opts(
+            &db,
+            create_options(owner_id, "live-repo", "live description"),
+            &dir.path().join("repos"),
+        )
+        .await
+        .expect("create repository");
+        assert!(repo_fts_snapshot(&db, repo.id).await.is_some());
+
+        repo_ops::soft_delete(&db, repo.id)
+            .await
+            .expect("soft-delete repository source row");
+        assert_eq!(
+            repo_fts_snapshot(&db, repo.id).await,
+            None,
+            "soft-delete left the trigger-owned FTS row behind"
+        );
+
+        let deleted = rg_db::entities::repository::Entity::find_by_id(repo.id)
+            .one(&db)
+            .await
+            .expect("read raw soft-deleted row")
+            .expect("soft-deleted row still exists");
+        let mut restored: RepoActiveModel = deleted.into();
+        restored.deleted_at = Set(None);
+        restored.name = Set("restored-repo".to_string());
+        restored.description = Set(Some("restored description".to_string()));
+        restored.updated_at = Set(Utc::now());
+        restored
+            .update(&db)
+            .await
+            .expect("restore repository source row");
+
+        assert_eq!(
+            repo_fts_snapshot(&db, repo.id).await,
+            Some((
+                "restored-repo".to_string(),
+                "restored description".to_string()
+            )),
+            "restoring the source row did not recreate its FTS snapshot"
+        );
+    }
+}
+
+#[cfg(test)]
 mod repository_deletion_tests {
     use super::*;
     use crate::blob_storage::{
@@ -3111,7 +3274,7 @@ mod repository_deletion_tests {
     };
     use crate::package_registry::oci::storage::OciStorage;
     use futures::future::BoxFuture;
-    use sea_orm::{ConnectOptions, Database};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]

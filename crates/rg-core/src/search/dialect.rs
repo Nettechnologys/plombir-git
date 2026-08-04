@@ -91,61 +91,6 @@ pub fn code_fts_snippet_expr(backend: DatabaseBackend, table: &str, has_query: b
     }
 }
 
-/// Build an upsert (insert-or-update) statement for the *metadata* FTS tables
-/// (`repos_fts` / `issues_fts` / `wiki_pages_fts`), which are keyed on `rowid`
-/// and maintained both by DB triggers and by explicit writes in service code.
-///
-/// `non_key_cols` is a comma-separated list of the remaining columns, e.g.
-/// `"name, description"`. The bound-parameter order must be: `rowid` first,
-/// then each non-key column in the same order.
-///
-/// * SQLite uses `INSERT OR REPLACE`.
-/// * Postgres uses `INSERT ... ON CONFLICT (rowid) DO UPDATE`.
-/// * MySQL uses `INSERT ... ON DUPLICATE KEY UPDATE`.
-///
-/// Using an upsert (instead of a plain `INSERT`) is what keeps the explicit
-/// writes coexisting safely with the DB triggers across all three backends:
-/// the trigger already inserted the row, so the explicit write must not fail
-/// with a duplicate-key error.
-pub fn metadata_fts_upsert_sql(
-    backend: DatabaseBackend,
-    table: &str,
-    non_key_cols: &str,
-) -> String {
-    let placeholders = vec!["?"; non_key_cols.split(',').count() + 1].join(", ");
-    match backend {
-        DatabaseBackend::Sqlite => {
-            format!("INSERT OR REPLACE INTO {table}(rowid, {non_key_cols}) VALUES ({placeholders})")
-        }
-        DatabaseBackend::Postgres => {
-            let set = non_key_cols
-                .split(',')
-                .map(|c| {
-                    let c = c.trim();
-                    format!("{c} = EXCLUDED.{c}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "INSERT INTO {table}(rowid, {non_key_cols}) VALUES ({placeholders}) ON CONFLICT (rowid) DO UPDATE SET {set}"
-            )
-        }
-        DatabaseBackend::MySql => {
-            let set = non_key_cols
-                .split(',')
-                .map(|c| {
-                    let c = c.trim();
-                    format!("{c} = VALUES({c})")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "INSERT INTO {table}(rowid, {non_key_cols}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {set}"
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

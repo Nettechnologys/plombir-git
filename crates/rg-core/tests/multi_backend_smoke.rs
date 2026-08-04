@@ -3,7 +3,9 @@
 //! Run with:
 //! `FORGEKEEP_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
 
-use sea_orm::{NotSet, Set};
+use sea_orm::{
+    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, NotSet, Set, Statement,
+};
 
 /// A repository row in the namespace given by `org_id` (`None` = personal).
 fn namespace_repo(
@@ -30,6 +32,27 @@ fn namespace_repo(
     }
 }
 
+async fn repo_fts_snapshot(db: &DatabaseConnection, repo_id: i64) -> Option<(String, String)> {
+    let backend = db.get_database_backend();
+    db.query_one(Statement::from_sql_and_values(
+        backend,
+        rg_db::prepare_sql(
+            backend,
+            "SELECT name, description FROM repos_fts WHERE rowid = ?",
+        ),
+        [repo_id.into()],
+    ))
+    .await
+    .expect("read repository FTS row")
+    .map(|row| {
+        (
+            row.try_get("", "name").expect("decode FTS name"),
+            row.try_get("", "description")
+                .expect("decode FTS description"),
+        )
+    })
+}
+
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
@@ -44,6 +67,8 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let suffix = &suffix[..10];
     let username = format!("dbsmoke{suffix}");
     let repo_name = format!("crossbackendrepo{suffix}");
+    let repo_update_term = format!("repoupdatedneedle{suffix}");
+    let repo_restore_term = format!("reporestoredneedle{suffix}");
     let wiki_term = format!("crossbackendneedle{suffix}");
     let first_wiki_edit_term = format!("firstwikiedit{suffix}");
     let second_wiki_edit_term = format!("secondwikiedit{suffix}");
@@ -102,6 +127,27 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create repository");
+    assert_eq!(
+        repo_fts_snapshot(&db, repo.id).await,
+        Some((
+            repo_name.clone(),
+            "cross backend repository search".to_string()
+        )),
+        "the repository INSERT trigger did not publish the source snapshot"
+    );
+
+    let mut updated_repo: rg_db::entities::repository::ActiveModel = repo.clone().into();
+    updated_repo.description = Set(Some(repo_update_term.clone()));
+    updated_repo.updated_at = Set(chrono::Utc::now());
+    let repo = updated_repo
+        .update(&db)
+        .await
+        .expect("update repository metadata through the source row");
+    assert_eq!(
+        repo_fts_snapshot(&db, repo.id).await,
+        Some((repo_name.clone(), repo_update_term.clone())),
+        "the repository UPDATE trigger did not replace the FTS snapshot"
+    );
 
     assert!(
         rg_db::ops::repo_star_ops::toggle_star(&db, user.id, repo.id)
@@ -335,6 +381,49 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     .expect("verify wiki FTS deletion");
     assert_eq!(wiki_total_after_delete, 0);
 
+    rg_db::ops::repo_ops::soft_delete(&db, repo.id)
+        .await
+        .expect("soft-delete the repository through the source row");
+    assert_eq!(
+        repo_fts_snapshot(&db, repo.id).await,
+        None,
+        "the repository UPDATE trigger left a soft-deleted row searchable"
+    );
+
+    let deleted_repo = rg_db::entities::repository::Entity::find_by_id(repo.id)
+        .one(&db)
+        .await
+        .expect("read the raw soft-deleted repository")
+        .expect("soft-deleted repository row still exists");
+    let mut restored_repo: rg_db::entities::repository::ActiveModel = deleted_repo.into();
+    restored_repo.deleted_at = Set(None);
+    restored_repo.description = Set(Some(repo_restore_term.clone()));
+    restored_repo.updated_at = Set(chrono::Utc::now());
+    restored_repo
+        .update(&db)
+        .await
+        .expect("restore repository through the source row");
+    assert_eq!(
+        repo_fts_snapshot(&db, repo.id).await,
+        Some((repo_name.clone(), repo_restore_term.clone())),
+        "restoring the repository did not recreate its current FTS snapshot"
+    );
+    let (restored_results, restored_total) = rg_core::search::service::search(
+        &db,
+        &format!("{repo_restore_term} author:{username}"),
+        "repos",
+        Some(user.id),
+        1,
+        20,
+    )
+    .await
+    .expect("search the restored repository metadata");
+    assert_eq!(restored_total, 1);
+    assert_eq!(
+        restored_results.first().map(|result| result.id),
+        Some(repo.id)
+    );
+
     assert!(
         !rg_db::ops::repo_star_ops::toggle_star(&db, user.id, repo.id)
             .await
@@ -349,6 +438,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     rg_db::ops::repo_ops::delete_by_id(&db, repo.id)
         .await
         .expect("delete smoke-test repository");
+    assert_eq!(repo_fts_snapshot(&db, repo.id).await, None);
     // `organizations.owner_id` carries no foreign key, so deleting the user
     // below would leave this row behind.
     assert!(
