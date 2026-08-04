@@ -290,27 +290,61 @@ pub async fn update_stars_count(db: &DatabaseConnection, id: i64) -> Result<()> 
     Ok(())
 }
 
-/// Update forks_count for a repository based on actual fork count (atomic).
-pub async fn update_forks_count(db: &DatabaseConnection, id: i64) -> Result<()> {
-    use crate::entities::repository::Column;
-    let count = RepoEntity::find()
-        .filter(Column::OriginRepoId.eq(Some(id)))
-        .filter(Column::DeletedAt.is_null())
-        .count(db)
-        .await
-        .context("db: count forks")? as i64;
+fn forks_count_refresh_sql(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        // MySQL rejects a single-table UPDATE that reads its target table in a
+        // subquery (error 1093). GROUP BY makes this derived table
+        // non-mergeable, so the multi-table UPDATE reads a materialized count.
+        // LEFT JOIN is deliberate: with no live forks there is no grouped row,
+        // and the cached count still has to be reset to zero.
+        DatabaseBackend::MySql => {
+            "UPDATE repositories AS target \
+             LEFT JOIN ( \
+                 SELECT origin_repo_id, COUNT(*) AS fork_count \
+                 FROM repositories \
+                 WHERE origin_repo_id = ? AND deleted_at IS NULL \
+                 GROUP BY origin_repo_id \
+             ) AS counts ON counts.origin_repo_id = target.id \
+             SET target.forks_count = COALESCE(counts.fork_count, 0) \
+             WHERE target.id = ?"
+        }
+        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+            "UPDATE repositories \
+             SET forks_count = ( \
+                 SELECT COUNT(*) \
+                 FROM repositories AS forks \
+                 WHERE forks.origin_repo_id = ? AND forks.deleted_at IS NULL \
+             ) \
+             WHERE id = ?"
+        }
+    }
+}
+
+async fn update_forks_count_after<F>(
+    db: &DatabaseConnection,
+    id: i64,
+    before_statement: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
     let backend = db.get_database_backend();
+    // Production passes a ready future. The controlled race test stops here:
+    // this is the last instant before the statement reads and writes the count.
+    before_statement.await;
     db.execute(Statement::from_sql_and_values(
         backend,
-        crate::prepare_sql(
-            backend,
-            "UPDATE repositories SET forks_count = ? WHERE id = ?",
-        ),
-        [count.into(), id.into()],
+        crate::prepare_sql(backend, forks_count_refresh_sql(backend)),
+        [id.into(), id.into()],
     ))
     .await
     .context("db: update forks count")?;
     Ok(())
+}
+
+/// Refresh `forks_count` from the live fork rows in one database statement.
+pub async fn update_forks_count(db: &DatabaseConnection, id: i64) -> Result<()> {
+    update_forks_count_after(db, id, std::future::ready(())).await
 }
 
 /// List all forks of a repo.
@@ -467,4 +501,136 @@ pub async fn transfer_owner(
         .await
         .context("db: commit repository transfer")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod forks_count_tests {
+    use super::*;
+
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "forgekeep-forks-count-race-{}.db",
+                    uuid::Uuid::new_v4().simple()
+                )),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("sqlite://{}?mode=rwc", self.path.display())
+        }
+    }
+
+    impl Drop for TempDb {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "cleanup must not mask the assertion that failed the test"
+        )]
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            }
+        }
+    }
+
+    async fn setup() -> (DatabaseConnection, TempDb) {
+        let temp = TempDb::new();
+        let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .expect("connect to throwaway database");
+        crate::run_migrations(&db).await.expect("run migrations");
+        (db, temp)
+    }
+
+    fn repo(owner_id: i64, name: &str, origin_repo_id: Option<i64>) -> RepoActiveModel {
+        let now = Utc::now();
+        RepoActiveModel {
+            id: NotSet,
+            owner_id: Set(owner_id),
+            name: Set(name.to_string()),
+            description: Set(None),
+            is_private: Set(false),
+            default_branch: Set("main".to_string()),
+            fork_id: Set(None),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            org_id: Set(None),
+            origin_repo_id: Set(origin_repo_id),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_started_first_can_write_last_without_restoring_its_old_snapshot() {
+        let (db, _temp) = setup().await;
+        let owner = crate::ops::user_ops::create_user(
+            &db,
+            "fork-owner",
+            "fork-owner@example.invalid",
+            "",
+            "Fork Owner",
+        )
+        .await
+        .expect("create owner");
+        let source = create(&db, repo(owner.id, "source", None))
+            .await
+            .expect("create source repository");
+        create(&db, repo(owner.id, "fork-one", Some(source.id)))
+            .await
+            .expect("create first fork");
+
+        let (at_statement_tx, at_statement_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_db = db.clone();
+        let source_id = source.id;
+        let first = tokio::spawn(async move {
+            update_forks_count_after(&first_db, source_id, async move {
+                at_statement_tx
+                    .send(())
+                    .expect("test still waits for the first refresh");
+                release_rx.await.expect("release the first refresh");
+            })
+            .await
+        });
+
+        at_statement_rx
+            .await
+            .expect("the first refresh reached its statement");
+        create(&db, repo(owner.id, "fork-two", Some(source.id)))
+            .await
+            .expect("create second fork while the first refresh waits");
+        update_forks_count(&db, source.id)
+            .await
+            .expect("the newer refresh writes two");
+
+        release_tx.send(()).expect("the first refresh still waits");
+        first
+            .await
+            .expect("first refresh task did not panic")
+            .expect("the first refresh writes last");
+
+        let source = find_by_id(&db, source.id)
+            .await
+            .expect("read source repository")
+            .expect("source repository exists");
+        let live_forks = RepoEntity::find()
+            .filter(repository::Column::OriginRepoId.eq(Some(source.id)))
+            .filter(repository::Column::DeletedAt.is_null())
+            .count(&db)
+            .await
+            .expect("count live forks") as i64;
+        assert_eq!(live_forks, 2);
+        assert_eq!(
+            source.forks_count, live_forks,
+            "the refresh that started first also writes last; if it holds COUNT(*) \
+             in application memory while waiting, it restores 1 over the newer 2"
+        );
+    }
 }

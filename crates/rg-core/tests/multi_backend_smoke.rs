@@ -114,6 +114,33 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .expect("repository exists");
     assert_eq!(counted_repo.stars_count, 1);
 
+    let mut live_fork = namespace_repo(user.id, None, &format!("forklive{suffix}"));
+    live_fork.origin_repo_id = Set(Some(repo.id));
+    let live_fork = rg_db::ops::repo_ops::create(&db, live_fork)
+        .await
+        .expect("create live fork row");
+
+    let mut deleted_fork = namespace_repo(user.id, None, &format!("forkgone{suffix}"));
+    deleted_fork.origin_repo_id = Set(Some(repo.id));
+    let deleted_fork = rg_db::ops::repo_ops::create(&db, deleted_fork)
+        .await
+        .expect("create deleted fork row");
+    rg_db::ops::repo_ops::soft_delete(&db, deleted_fork.id)
+        .await
+        .expect("soft-delete one fork before refreshing the count");
+
+    rg_db::ops::repo_ops::update_forks_count(&db, repo.id)
+        .await
+        .expect("refresh fork counter with backend-specific atomic SQL");
+    let counted_repo = rg_db::ops::repo_ops::find_by_id(&db, repo.id)
+        .await
+        .expect("read source after fork count refresh")
+        .expect("source repository exists");
+    assert_eq!(
+        counted_repo.forks_count, 1,
+        "only the live fork row contributes to forks_count"
+    );
+
     // card_615e00843297: `repositories` used to hold one name per *account*, so
     // a personal repository and one in an organization the same account owns
     // could not share a name. The replacement — a `namespace_key` generated
@@ -217,6 +244,12 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .await
             .expect("remove smoke-test star")
     );
+    rg_db::ops::repo_ops::delete_by_id(&db, live_fork.id)
+        .await
+        .expect("delete live fork row");
+    rg_db::ops::repo_ops::delete_by_id(&db, deleted_fork.id)
+        .await
+        .expect("delete soft-deleted fork row");
     rg_db::ops::repo_ops::delete_by_id(&db, repo.id)
         .await
         .expect("delete smoke-test repository");
