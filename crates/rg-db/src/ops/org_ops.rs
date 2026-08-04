@@ -63,6 +63,7 @@ pub async fn list_all_orgs(
 ) -> Result<(Vec<organization::Model>, i64)> {
     let paginator = organization::Entity::find()
         .order_by_desc(organization::Column::CreatedAt)
+        .order_by_desc(organization::Column::Id)
         .paginate(db, limit);
 
     let total = paginator.num_items().await.context("db: count orgs")?;

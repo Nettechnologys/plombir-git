@@ -121,6 +121,7 @@ pub async fn list_users(
 ) -> Result<(Vec<User>, i64)> {
     let paginator = UserEntity::find()
         .order_by_desc(user::Column::CreatedAt)
+        .order_by_desc(user::Column::Id)
         .paginate(db, per_page);
 
     let total = paginator.num_items().await.context("db: count users")?;

@@ -64,6 +64,11 @@ pub async fn is_starred(db: &DatabaseConnection, user_id: i64, repo_id: i64) -> 
 }
 
 /// List stargazers of a repo with pagination.
+///
+/// The `id` tiebreaker is what makes the walk total: a repository that trends
+/// collects stars faster than the timestamp's resolution, and paging over an
+/// order the engine may resolve differently between requests lists one
+/// stargazer twice while dropping the next.
 pub async fn list_stargazers(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -72,7 +77,8 @@ pub async fn list_stargazers(
 ) -> Result<(Vec<Model>, i64)> {
     let base = RepoStarEntity::find()
         .filter(repo_star::Column::RepoId.eq(repo_id))
-        .order_by_desc(repo_star::Column::CreatedAt);
+        .order_by_desc(repo_star::Column::CreatedAt)
+        .order_by_desc(repo_star::Column::Id);
 
     let total = base
         .clone()

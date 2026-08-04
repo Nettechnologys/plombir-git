@@ -27,7 +27,8 @@ pub async fn list_by_issue(
 ) -> Result<(Vec<Model>, i64)> {
     let base = TimeEntryEntity::find()
         .filter(time_entry::Column::IssueId.eq(issue_id))
-        .order_by_desc(time_entry::Column::CreatedAt);
+        .order_by_desc(time_entry::Column::CreatedAt)
+        .order_by_desc(time_entry::Column::Id);
 
     let total = base
         .clone()

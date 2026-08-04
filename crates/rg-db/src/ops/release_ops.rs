@@ -41,7 +41,8 @@ pub async fn list_by_repo(
 ) -> Result<(Vec<ReleaseModel>, i64)> {
     let base = ReleaseEntity::find()
         .filter(release::Column::RepoId.eq(repo_id))
-        .order_by_desc(release::Column::CreatedAt);
+        .order_by_desc(release::Column::CreatedAt)
+        .order_by_desc(release::Column::Id);
 
     let total = base.clone().count(db).await.context("db: count releases")? as i64;
 

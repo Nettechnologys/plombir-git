@@ -136,7 +136,8 @@ pub async fn list_personal_by_owner_visible_to(
         .filter(repository::Column::OrgId.is_null())
         .filter(repository::Column::DeletedAt.is_null())
         .filter(visible_to(viewer_id))
-        .order_by_asc(repository::Column::Name);
+        .order_by_asc(repository::Column::Name)
+        .order_by_asc(repository::Column::Id);
 
     let total = base
         .clone()
@@ -191,7 +192,8 @@ pub async fn list_by_org_visible_to(
         .filter(repository::Column::OrgId.eq(org_id))
         .filter(repository::Column::DeletedAt.is_null())
         .filter(visible_to(viewer_id))
-        .order_by_asc(repository::Column::Name);
+        .order_by_asc(repository::Column::Name)
+        .order_by_asc(repository::Column::Id);
 
     let total = base
         .clone()
@@ -209,6 +211,12 @@ pub async fn list_by_org_visible_to(
 }
 
 /// Paginated list of public, non-deleted repos — ordered by recently updated.
+///
+/// `updated_at` is the loosest sort key in this file: a bulk import or a
+/// migration touches many repositories in the same instant, so the `/explore`
+/// feed is exactly where ties cluster. Without the `id` tiebreaker the two
+/// halves of a tie are ordered however the engine scans, and paging over that
+/// shows one repository on two pages while another appears on none.
 pub async fn list_public_paginated(
     db: &DatabaseConnection,
     offset: u64,
@@ -217,7 +225,8 @@ pub async fn list_public_paginated(
     let base = RepoEntity::find()
         .filter(repository::Column::IsPrivate.eq(false))
         .filter(repository::Column::DeletedAt.is_null())
-        .order_by_desc(repository::Column::UpdatedAt);
+        .order_by_desc(repository::Column::UpdatedAt)
+        .order_by_desc(repository::Column::Id);
 
     let total = base
         .clone()
@@ -314,7 +323,8 @@ pub async fn list_forks(
     let base = RepoEntity::find()
         .filter(repository::Column::OriginRepoId.eq(Some(origin_repo_id)))
         .filter(repository::Column::DeletedAt.is_null())
-        .order_by_asc(repository::Column::CreatedAt);
+        .order_by_asc(repository::Column::CreatedAt)
+        .order_by_asc(repository::Column::Id);
     let total = base.clone().count(db).await.context("db: count forks")? as i64;
     let repos = base
         .offset(offset)

@@ -44,6 +44,7 @@ pub async fn list_paginated(
     let total = query.clone().count(db).await?;
     let logs = query
         .order_by_desc(Column::CreatedAt)
+        .order_by_desc(Column::Id)
         .paginate(db, page_size)
         .fetch_page(page)
         .await?;

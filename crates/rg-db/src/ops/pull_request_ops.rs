@@ -46,6 +46,11 @@ pub async fn list_by_repo(
 }
 
 /// Paginated list of PRs for a repo. Returns (data, total).
+///
+/// Ordered by `created_at` **and** `id`. Imported pull requests carry the
+/// upstream timestamp at second precision, so equal keys are ordinary rather
+/// than exotic, and a page cut out of an order the database is free to change
+/// between requests repeats one PR and hides another.
 pub async fn list_by_repo_paginated(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -57,7 +62,9 @@ pub async fn list_by_repo_paginated(
     if let Some(s) = state {
         base = base.filter(pull_request::Column::State.eq(s));
     }
-    let query = base.order_by_desc(pull_request::Column::CreatedAt);
+    let query = base
+        .order_by_desc(pull_request::Column::CreatedAt)
+        .order_by_desc(pull_request::Column::Id);
 
     let total = query
         .clone()

@@ -59,6 +59,13 @@ pub async fn list_by_repo(
 
 /// Paginated list of issues for a repo.
 /// Returns (data, total) — SQL LIMIT/OFFSET pushed to the database.
+///
+/// `created_at` alone is not a total order: importing a repository copies the
+/// upstream timestamps, and those carry second precision, so a batch filed by
+/// a bot shares one value. Ties are then resolved however the engine happens to
+/// scan, and `LIMIT/OFFSET` over an order that may differ between two requests
+/// serves one issue on two pages and another on none. The primary key breaks
+/// every remaining tie.
 pub async fn list_by_repo_paginated(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -70,7 +77,9 @@ pub async fn list_by_repo_paginated(
     if let Some(s) = state {
         base = base.filter(issue::Column::State.eq(s));
     }
-    let query = base.order_by_desc(issue::Column::CreatedAt);
+    let query = base
+        .order_by_desc(issue::Column::CreatedAt)
+        .order_by_desc(issue::Column::Id);
 
     let total = query
         .clone()

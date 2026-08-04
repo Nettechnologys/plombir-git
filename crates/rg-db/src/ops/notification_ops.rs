@@ -47,6 +47,11 @@ pub async fn list_notifications(
 }
 
 /// Paginated list of notifications for a user. Returns (data, total).
+///
+/// Ordered by `created_at` **and** `id`: the timestamp alone leaves ties for
+/// the engine to resolve however it scans, and a `LIMIT/OFFSET` walk over an
+/// order that may change between two requests hands the same notification out
+/// twice while the one beside it is never delivered.
 pub async fn list_notifications_paginated(
     db: &DatabaseConnection,
     user_id: i64,
@@ -60,7 +65,9 @@ pub async fn list_notifications_paginated(
         base = base.filter(notification::Column::IsRead.eq(false));
     }
 
-    let query = base.order_by_desc(notification::Column::CreatedAt);
+    let query = base
+        .order_by_desc(notification::Column::CreatedAt)
+        .order_by_desc(notification::Column::Id);
 
     let total = query
         .clone()

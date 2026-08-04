@@ -70,7 +70,8 @@ pub async fn list_pipelines_by_repo_paginated(
 ) -> Result<(Vec<pipeline::Model>, i64)> {
     let base = pipeline::Entity::find()
         .filter(pipeline::Column::RepoId.eq(repo_id))
-        .order_by_desc(pipeline::Column::CreatedAt);
+        .order_by_desc(pipeline::Column::CreatedAt)
+        .order_by_desc(pipeline::Column::Id);
 
     let total = base
         .clone()
