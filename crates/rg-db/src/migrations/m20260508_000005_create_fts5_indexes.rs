@@ -1,6 +1,8 @@
 use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
+use super::fts_safety;
+
 pub struct Migration;
 
 impl MigrationName for Migration {
@@ -18,6 +20,9 @@ impl MigrationTrait for Migration {
             DatabaseBackend::Postgres => postgres_stmts(),
             DatabaseBackend::MySql => mysql_stmts(),
         };
+        if backend == DatabaseBackend::Sqlite {
+            return fts_safety::sqlite_fts_maintenance(manager, &stmts).await;
+        }
         for s in stmts {
             manager.get_connection().execute_unprepared(&s).await?;
         }
@@ -70,6 +75,9 @@ impl MigrationTrait for Migration {
                 "DROP TABLE IF EXISTS wiki_pages_fts".into(),
             ],
         };
+        if backend == DatabaseBackend::Sqlite {
+            return fts_safety::sqlite_fts_maintenance(manager, &stmts).await;
+        }
         for s in stmts {
             manager.get_connection().execute_unprepared(&s).await?;
         }
@@ -77,9 +85,14 @@ impl MigrationTrait for Migration {
     }
 }
 
-/// SQLite: FTS5 virtual tables + triggers (unchanged from original).
-fn sqlite_stmts() -> Vec<String> {
-    vec![r#"
+/// SQLite: FTS5 virtual tables + triggers.
+///
+/// The stages are deliberately separate so the shared transaction boundary can
+/// be fault-injected after destructive DDL and after a clear.  Do not collapse
+/// them back into one autocommit batch.
+pub(super) fn sqlite_stmts() -> Vec<String> {
+    vec![
+        r#"
         -- Clean up any previous partial state
         DROP TRIGGER IF EXISTS repos_fts_update;
         DROP TRIGGER IF EXISTS repos_fts_delete;
@@ -93,11 +106,17 @@ fn sqlite_stmts() -> Vec<String> {
         DROP TABLE IF EXISTS repos_fts;
         DROP TABLE IF EXISTS issues_fts;
         DROP TABLE IF EXISTS wiki_pages_fts;
+        "#
+        .into(),
+        r#"
 
         -- Recreate FTS5 tables (no content= mode; we sync via triggers)
         CREATE VIRTUAL TABLE repos_fts USING fts5(name, description);
         CREATE VIRTUAL TABLE issues_fts USING fts5(title, body);
         CREATE VIRTUAL TABLE wiki_pages_fts USING fts5(title, content);
+        "#
+        .into(),
+        r#"
 
         -- Triggers for repos_fts
         CREATE TRIGGER IF NOT EXISTS repos_fts_insert AFTER INSERT ON repositories BEGIN
@@ -106,13 +125,11 @@ fn sqlite_stmts() -> Vec<String> {
         END;
 
         CREATE TRIGGER IF NOT EXISTS repos_fts_delete AFTER DELETE ON repositories BEGIN
-            INSERT INTO repos_fts(repos_fts, rowid, name, description)
-            VALUES('delete', old.id, old.name, COALESCE(old.description, ''));
+            DELETE FROM repos_fts WHERE rowid = old.id;
         END;
 
         CREATE TRIGGER IF NOT EXISTS repos_fts_update AFTER UPDATE ON repositories BEGIN
-            INSERT INTO repos_fts(repos_fts, rowid, name, description)
-            VALUES('delete', old.id, old.name, COALESCE(old.description, ''));
+            DELETE FROM repos_fts WHERE rowid = old.id;
             INSERT INTO repos_fts(rowid, name, description)
             VALUES (new.id, new.name, COALESCE(new.description, ''));
         END;
@@ -124,13 +141,11 @@ fn sqlite_stmts() -> Vec<String> {
         END;
 
         CREATE TRIGGER IF NOT EXISTS issues_fts_delete AFTER DELETE ON issues BEGIN
-            INSERT INTO issues_fts(issues_fts, rowid, title, body)
-            VALUES('delete', old.id, old.title, COALESCE(old.body, ''));
+            DELETE FROM issues_fts WHERE rowid = old.id;
         END;
 
         CREATE TRIGGER IF NOT EXISTS issues_fts_update AFTER UPDATE ON issues BEGIN
-            INSERT INTO issues_fts(issues_fts, rowid, title, body)
-            VALUES('delete', old.id, old.title, COALESCE(old.body, ''));
+            DELETE FROM issues_fts WHERE rowid = old.id;
             INSERT INTO issues_fts(rowid, title, body)
             VALUES (new.id, new.title, COALESCE(new.body, ''));
         END;
@@ -142,23 +157,29 @@ fn sqlite_stmts() -> Vec<String> {
         END;
 
         CREATE TRIGGER IF NOT EXISTS wiki_pages_fts_delete AFTER DELETE ON wiki_pages BEGIN
-            INSERT INTO wiki_pages_fts(wiki_pages_fts, rowid, title, content)
-            VALUES('delete', old.id, old.title, COALESCE(old.content, ''));
+            DELETE FROM wiki_pages_fts WHERE rowid = old.id;
         END;
 
         CREATE TRIGGER IF NOT EXISTS wiki_pages_fts_update AFTER UPDATE ON wiki_pages BEGIN
-            INSERT INTO wiki_pages_fts(wiki_pages_fts, rowid, title, content)
-            VALUES('delete', old.id, old.title, COALESCE(old.content, ''));
+            DELETE FROM wiki_pages_fts WHERE rowid = old.id;
             INSERT INTO wiki_pages_fts(rowid, title, content)
             VALUES (new.id, new.title, COALESCE(new.content, ''));
         END;
+        "#
+        .into(),
+        r#"
 
-        -- Rebuild FTS indexes from existing data
-        INSERT INTO repos_fts(repos_fts) VALUES('rebuild');
-        INSERT INTO issues_fts(issues_fts) VALUES('rebuild');
-        INSERT INTO wiki_pages_fts(wiki_pages_fts) VALUES('rebuild');
-    "#
-    .into()]
+        -- These are contentless FTS5 tables.  The special 'rebuild' command has
+        -- no source table to read, so copy the authoritative rows explicitly.
+        INSERT INTO repos_fts(rowid, name, description)
+        SELECT id, name, COALESCE(description, '') FROM repositories;
+        INSERT INTO issues_fts(rowid, title, body)
+        SELECT id, title, COALESCE(body, '') FROM issues;
+        INSERT INTO wiki_pages_fts(rowid, title, content)
+        SELECT id, title, COALESCE(content, '') FROM wiki_pages;
+        "#
+        .into(),
+    ]
 }
 
 /// Postgres: regular tables with a `tsvector` generated column + GIN index,

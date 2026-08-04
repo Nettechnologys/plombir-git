@@ -277,8 +277,17 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Allow the migration account to create triggers with binary logging
+        run: >-
+          docker exec "${{ job.services.mysql.id }}"
+          mysql -uroot -proot
+          -e "SET GLOBAL log_bin_trust_function_creators = 1"
+
+      - name: Prove MySQL FTS migration maintenance boundary
+        run: cargo test -p rg-db -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture
+
       - name: Run MySQL runtime smoke
-        run: cargo test -p rg-core --test multi_backend_smoke -- --ignored --nocapture
+        run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
   contract-checks:
     name: Frontend/backend contract checks

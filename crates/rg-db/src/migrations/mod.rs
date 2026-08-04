@@ -1,3 +1,4 @@
+mod fts_safety;
 pub mod m20260424_000001_create_users;
 pub mod m20260424_000002_create_repositories;
 pub mod m20260424_000003_create_keys_tokens;

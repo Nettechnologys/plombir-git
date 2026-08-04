@@ -3,6 +3,8 @@
 use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
+use super::fts_safety;
+
 pub struct Migration;
 
 impl MigrationName for Migration {
@@ -14,13 +16,29 @@ impl MigrationName for Migration {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for statement in statements(manager.get_database_backend()) {
-            manager
-                .get_connection()
-                .execute_unprepared(statement)
-                .await?;
+        match manager.get_database_backend() {
+            DatabaseBackend::Sqlite => {
+                fts_safety::sqlite_fts_maintenance(manager, &sqlite_statements()).await
+            }
+            DatabaseBackend::Postgres => {
+                for statement in postgres_statements() {
+                    manager
+                        .get_connection()
+                        .execute_unprepared(statement)
+                        .await?;
+                }
+                Ok(())
+            }
+            DatabaseBackend::MySql => {
+                fts_safety::mysql_fts_maintenance(
+                    manager,
+                    "repositories WRITE, repos_fts WRITE",
+                    &mysql_ddl_statements(),
+                    &mysql_reconcile_statements(),
+                )
+                .await
+            }
         }
-        Ok(())
     }
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
@@ -31,12 +49,9 @@ impl MigrationTrait for Migration {
     }
 }
 
-fn statements(backend: DatabaseBackend) -> Vec<&'static str> {
-    match backend {
-        // Keep the trigger replacement in one SQLite batch. Sending each DDL
-        // statement separately through a pooled connection intermittently let
-        // CREATE observe the pre-DROP schema during parallel test migrations.
-        DatabaseBackend::Sqlite => vec![r#"
+pub(super) fn sqlite_statements() -> Vec<String> {
+    vec![
+        r#"
             DROP TRIGGER IF EXISTS repos_fts_insert;
             DROP TRIGGER IF EXISTS repos_fts_update;
             DROP TRIGGER IF EXISTS repos_fts_delete;
@@ -60,63 +75,120 @@ fn statements(backend: DatabaseBackend) -> Vec<&'static str> {
             BEGIN
               DELETE FROM repos_fts WHERE rowid = OLD.id;
             END;
-
-            DELETE FROM repos_fts;
+        "#
+        .into(),
+        "DELETE FROM repos_fts".into(),
+        r#"
             INSERT INTO repos_fts(rowid, name, description)
             SELECT id, name, COALESCE(description, '')
             FROM repositories
             WHERE deleted_at IS NULL;
-        "#],
-        DatabaseBackend::Postgres => vec![
-            r#"CREATE OR REPLACE FUNCTION forgekeep_sync_repos_fts() RETURNS TRIGGER AS $$
-               BEGIN
-                 IF TG_OP = 'DELETE' THEN
-                   DELETE FROM repos_fts WHERE rowid = OLD.id;
-                 ELSIF NEW.deleted_at IS NOT NULL THEN
-                   DELETE FROM repos_fts WHERE rowid = NEW.id;
-                 ELSE
-                   INSERT INTO repos_fts(rowid, name, description)
-                   VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
-                   ON CONFLICT (rowid) DO UPDATE
-                   SET name = EXCLUDED.name, description = EXCLUDED.description;
-                 END IF;
-                 RETURN NULL;
-               END;
-               $$ LANGUAGE plpgsql"#,
-            "DROP TRIGGER IF EXISTS repos_fts_ai ON repositories",
-            "DROP TRIGGER IF EXISTS repos_fts_ad ON repositories",
-            "CREATE TRIGGER repos_fts_ai AFTER INSERT OR UPDATE ON repositories FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_repos_fts()",
-            "CREATE TRIGGER repos_fts_ad AFTER DELETE ON repositories FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_repos_fts()",
-            "DELETE FROM repos_fts",
-            "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, COALESCE(description, '') FROM repositories WHERE deleted_at IS NULL",
-        ],
-        DatabaseBackend::MySql => vec![
-            "DROP TRIGGER IF EXISTS repos_fts_ai",
-            "DROP TRIGGER IF EXISTS repos_fts_au",
-            "DROP TRIGGER IF EXISTS repos_fts_ad",
-            r#"CREATE TRIGGER repos_fts_ai AFTER INSERT ON repositories FOR EACH ROW
-               BEGIN
-                 IF NEW.deleted_at IS NULL THEN
-                   INSERT INTO repos_fts(rowid, name, description)
-                   VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
-                   ON DUPLICATE KEY UPDATE
-                   name = NEW.name, description = COALESCE(NEW.description, '');
-                 END IF;
-               END"#,
-            r#"CREATE TRIGGER repos_fts_au AFTER UPDATE ON repositories FOR EACH ROW
-               BEGIN
-                 DELETE FROM repos_fts WHERE rowid = OLD.id;
-                 IF NEW.deleted_at IS NULL THEN
-                   INSERT INTO repos_fts(rowid, name, description)
-                   VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
-                   ON DUPLICATE KEY UPDATE
-                   name = NEW.name, description = COALESCE(NEW.description, '');
-                 END IF;
-               END"#,
-            "CREATE TRIGGER repos_fts_ad AFTER DELETE ON repositories FOR EACH ROW DELETE FROM repos_fts WHERE rowid = OLD.id",
-            "DELETE FROM repos_fts",
-            "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, COALESCE(description, '') FROM repositories WHERE deleted_at IS NULL ON DUPLICATE KEY UPDATE name = VALUES(name), description = VALUES(description)",
-        ],
+        "#
+        .into(),
+    ]
+}
+
+fn postgres_statements() -> Vec<&'static str> {
+    vec![
+        r#"CREATE OR REPLACE FUNCTION forgekeep_sync_repos_fts() RETURNS TRIGGER AS $$
+           BEGIN
+             IF TG_OP = 'DELETE' THEN
+               DELETE FROM repos_fts WHERE rowid = OLD.id;
+             ELSIF NEW.deleted_at IS NOT NULL THEN
+               DELETE FROM repos_fts WHERE rowid = NEW.id;
+             ELSE
+               INSERT INTO repos_fts(rowid, name, description)
+               VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
+               ON CONFLICT (rowid) DO UPDATE
+               SET name = EXCLUDED.name, description = EXCLUDED.description;
+             END IF;
+             RETURN NULL;
+           END;
+           $$ LANGUAGE plpgsql"#,
+        "DROP TRIGGER IF EXISTS repos_fts_ai ON repositories",
+        "DROP TRIGGER IF EXISTS repos_fts_ad ON repositories",
+        "CREATE TRIGGER repos_fts_ai AFTER INSERT OR UPDATE ON repositories FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_repos_fts()",
+        "CREATE TRIGGER repos_fts_ad AFTER DELETE ON repositories FOR EACH ROW EXECUTE FUNCTION forgekeep_sync_repos_fts()",
+        "DELETE FROM repos_fts",
+        "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, COALESCE(description, '') FROM repositories WHERE deleted_at IS NULL",
+    ]
+}
+
+fn mysql_ddl_statements() -> Vec<String> {
+    vec![
+        r#"CREATE TRIGGER IF NOT EXISTS fk_mig_repos_ai_guard AFTER INSERT ON repositories FOR EACH ROW
+           BEGIN
+             IF NEW.deleted_at IS NULL THEN
+               INSERT INTO repos_fts(rowid, name, description)
+               VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
+               ON DUPLICATE KEY UPDATE
+               name = NEW.name, description = COALESCE(NEW.description, '');
+             END IF;
+           END"#
+            .into(),
+        "DROP TRIGGER IF EXISTS repos_fts_ai".into(),
+        r#"CREATE TRIGGER repos_fts_ai AFTER INSERT ON repositories FOR EACH ROW
+           BEGIN
+             IF NEW.deleted_at IS NULL THEN
+               INSERT INTO repos_fts(rowid, name, description)
+               VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
+               ON DUPLICATE KEY UPDATE
+               name = NEW.name, description = COALESCE(NEW.description, '');
+             END IF;
+           END"#
+            .into(),
+        "DROP TRIGGER IF EXISTS fk_mig_repos_ai_guard".into(),
+        r#"CREATE TRIGGER IF NOT EXISTS fk_mig_repos_au_guard AFTER UPDATE ON repositories FOR EACH ROW
+           BEGIN
+             DELETE FROM repos_fts WHERE rowid = OLD.id;
+             IF NEW.deleted_at IS NULL THEN
+               INSERT INTO repos_fts(rowid, name, description)
+               VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
+               ON DUPLICATE KEY UPDATE
+               name = NEW.name, description = COALESCE(NEW.description, '');
+             END IF;
+           END"#
+            .into(),
+        "DROP TRIGGER IF EXISTS repos_fts_au".into(),
+        r#"CREATE TRIGGER repos_fts_au AFTER UPDATE ON repositories FOR EACH ROW
+           BEGIN
+             DELETE FROM repos_fts WHERE rowid = OLD.id;
+             IF NEW.deleted_at IS NULL THEN
+               INSERT INTO repos_fts(rowid, name, description)
+               VALUES (NEW.id, NEW.name, COALESCE(NEW.description, ''))
+               ON DUPLICATE KEY UPDATE
+               name = NEW.name, description = COALESCE(NEW.description, '');
+             END IF;
+           END"#
+            .into(),
+        "DROP TRIGGER IF EXISTS fk_mig_repos_au_guard".into(),
+        "CREATE TRIGGER IF NOT EXISTS fk_mig_repos_ad_guard AFTER DELETE ON repositories FOR EACH ROW DELETE FROM repos_fts WHERE rowid = OLD.id".into(),
+        "DROP TRIGGER IF EXISTS repos_fts_ad".into(),
+        "CREATE TRIGGER repos_fts_ad AFTER DELETE ON repositories FOR EACH ROW DELETE FROM repos_fts WHERE rowid = OLD.id".into(),
+        "DROP TRIGGER IF EXISTS fk_mig_repos_ad_guard".into(),
+    ]
+}
+
+fn mysql_reconcile_statements() -> Vec<String> {
+    vec![
+        "DELETE FROM repos_fts WHERE NOT EXISTS (SELECT 1 FROM repositories WHERE repositories.id = repos_fts.rowid AND repositories.deleted_at IS NULL)".into(),
+        "INSERT INTO repos_fts(rowid, name, description) SELECT id, name, COALESCE(description, '') FROM repositories WHERE deleted_at IS NULL ON DUPLICATE KEY UPDATE name = VALUES(name), description = VALUES(description)".into(),
+    ]
+}
+
+#[cfg(test)]
+fn statements(backend: DatabaseBackend) -> Vec<String> {
+    match backend {
+        DatabaseBackend::Sqlite => sqlite_statements(),
+        DatabaseBackend::Postgres => postgres_statements()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        DatabaseBackend::MySql => {
+            let mut statements = mysql_ddl_statements();
+            statements.extend(mysql_reconcile_statements());
+            statements
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
+use super::fts_safety;
+
 /// Fix FTS5 triggers: the 'delete' command in FTS5 only accepts (rowid),
 /// not content columns. The original triggers incorrectly passed column values
 /// like VALUES('delete', old.id, old.name, ...) which causes "SQL logic error".
@@ -26,7 +28,18 @@ impl MigrationTrait for Migration {
             return Ok(());
         }
 
-        let sql = r#"
+        fts_safety::sqlite_fts_maintenance(manager, &sqlite_stmts()).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Same as up — restore the corrected triggers and an exact index.
+        self.up(manager).await
+    }
+}
+
+pub(super) fn sqlite_stmts() -> Vec<String> {
+    vec![
+        r#"
             -- Drop all existing FTS triggers (old triggers used FTS5 'delete' command
             -- which requires special VALUES syntax that doesn't work reliably)
             DROP TRIGGER IF EXISTS repos_fts_update;
@@ -86,20 +99,22 @@ impl MigrationTrait for Migration {
                 INSERT INTO wiki_pages_fts(rowid, title, content)
                 VALUES (new.id, new.title, COALESCE(new.content, ''));
             END;
-
-            -- Rebuild FTS indexes
-            INSERT INTO repos_fts(repos_fts) VALUES('rebuild');
-            INSERT INTO issues_fts(issues_fts) VALUES('rebuild');
-            INSERT INTO wiki_pages_fts(wiki_pages_fts) VALUES('rebuild');
-        "#;
-
-        manager.get_connection().execute_unprepared(sql).await?;
-
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // Same as up — restore original triggers
-        self.up(manager).await
-    }
+        "#
+        .into(),
+        r#"
+            DELETE FROM repos_fts;
+            DELETE FROM issues_fts;
+            DELETE FROM wiki_pages_fts;
+        "#
+        .into(),
+        r#"
+            INSERT INTO repos_fts(rowid, name, description)
+            SELECT id, name, COALESCE(description, '') FROM repositories;
+            INSERT INTO issues_fts(rowid, title, body)
+            SELECT id, title, COALESCE(body, '') FROM issues;
+            INSERT INTO wiki_pages_fts(rowid, title, content)
+            SELECT id, title, COALESCE(content, '') FROM wiki_pages;
+        "#
+        .into(),
+    ]
 }
