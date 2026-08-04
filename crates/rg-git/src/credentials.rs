@@ -65,20 +65,41 @@ impl GitCredentials {
 /// - it never appears in the remote URL, which git copies verbatim into
 ///   `.git/config` — an on-disk plaintext copy that outlives the operation.
 ///
-/// The empty `credential.helper=` in front resets the helper list, so a helper
-/// configured system- or user-wide on the host can neither answer first nor be
-/// handed this credential to store.
+/// Everything below the credential itself is set on **both** branches — with a
+/// credential and without one — because the anonymous branch is the one that
+/// needs it most: there the remote is whatever address the user typed, and the
+/// authority git would reach for is the host's, not ours.
 ///
-/// `GIT_TERMINAL_PROMPT=0` is set whether or not a credential exists: nothing
-/// here runs with a terminal behind it, so a remote that asks for
-/// authentication must fail fast instead of blocking until the gateway's
-/// timeout.
+/// - the empty `credential.helper=` in front resets the helper list, so a helper
+///   configured system- or user-wide on the host can neither answer first nor be
+///   handed this credential to store;
+/// - `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` pointed at nothing drop
+///   `/etc/gitconfig` and `~/.gitconfig`, which carry more than helpers: a
+///   `url.<base>.insteadOf` there rewrites the remote *after* the SSRF guard has
+///   already approved the URL the user supplied;
+/// - `GIT_TERMINAL_PROMPT=0`, because nothing here runs with a terminal behind
+///   it: a remote that asks for authentication must fail fast instead of
+///   blocking until the gateway's timeout.
+///
+/// `/dev/null` is git's documented way to say "no global config"; on a platform
+/// without it the path simply fails to open, which git treats as an empty
+/// config — the same outcome by a different route.
+///
+/// What this does **not** cover: `~/.netrc`, which the HTTP transport reads
+/// through curl no matter how the helper list is configured, and the ssh key of
+/// whoever the server runs as. Both hang off `HOME`, which this function
+/// deliberately leaves alone — see `card_4ee296c4a0d6` / `card_d37d1fef2ac2`.
 pub fn credential_invocation(
     credentials: Option<&GitCredentials>,
 ) -> (Vec<String>, Vec<(String, String)>) {
-    let mut env = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let mut args = vec!["-c".to_string(), "credential.helper=".to_string()];
+    let mut env = vec![
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+    ];
     let Some(credentials) = credentials else {
-        return (Vec::new(), env);
+        return (args, env);
     };
 
     // git runs a `!`-prefixed helper through `sh -c '<value> "$@"' <value> get`,
@@ -89,12 +110,8 @@ pub fn credential_invocation(
     }
     helper.push_str(&format!("echo password=\"${PASSWORD_ENV}\"; }}; f"));
 
-    let args = vec![
-        "-c".to_string(),
-        "credential.helper=".to_string(),
-        "-c".to_string(),
-        format!("credential.helper={helper}"),
-    ];
+    args.push("-c".to_string());
+    args.push(format!("credential.helper={helper}"));
     if let Some(username) = &credentials.username {
         env.push((USERNAME_ENV.to_string(), username.clone()));
     }
@@ -136,20 +153,59 @@ mod tests {
         );
     }
 
-    /// With no credential there is nothing to hand over — but prompting still
-    /// has to be off, or an authenticating remote hangs the caller until the
-    /// gateway's timeout instead of failing with "authentication required".
+    /// With no credential there is nothing to hand over — and that is precisely
+    /// the branch that must still disarm the host: the remote is an address the
+    /// user chose, so a helper (or an `insteadOf` rewrite) sitting in the
+    /// server's own git config would be answering on their behalf.
+    ///
+    /// Prompting stays off for the older reason: an authenticating remote would
+    /// otherwise hang the caller until the gateway's timeout instead of failing
+    /// with "authentication required".
     #[test]
-    fn an_anonymous_remote_installs_no_helper_but_still_cannot_prompt() {
+    fn an_anonymous_remote_disarms_the_host_config_too() {
         let (args, env) = credential_invocation(None);
-        assert!(
-            args.is_empty(),
-            "an anonymous invocation configured a credential helper"
+        assert_eq!(
+            args,
+            vec!["-c".to_string(), "credential.helper=".to_string()],
+            "an anonymous invocation left the host's helper list in place"
+        );
+        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
         );
         assert_eq!(
-            env,
-            vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]
+            env.get("GIT_CONFIG_NOSYSTEM").map(String::as_str),
+            Some("1")
         );
+        assert_eq!(
+            env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
+            Some("/dev/null")
+        );
+        // Nothing else: no credential means no secret in the environment.
+        assert!(!env.contains_key(USERNAME_ENV) && !env.contains_key(PASSWORD_ENV));
+    }
+
+    /// The two branches must leave with the same disarmed environment, or the
+    /// invariant is one refactor away from being true on one of them only —
+    /// which is exactly how it was lost the first time.
+    #[test]
+    fn both_branches_disarm_the_host_identically() {
+        let credentials = GitCredentials::token("sync-bot", "hunter2");
+        let (with_args, with_env) = credential_invocation(Some(&credentials));
+        let (without_args, without_env) = credential_invocation(None);
+
+        assert_eq!(
+            with_args[..2],
+            without_args[..2],
+            "the helper reset differs between the two branches"
+        );
+        let ambient = |env: Vec<(String, String)>| -> Vec<(String, String)> {
+            env.into_iter()
+                .filter(|(key, _)| key != USERNAME_ENV && key != PASSWORD_ENV)
+                .collect()
+        };
+        assert_eq!(ambient(with_env), ambient(without_env));
     }
 
     /// A username the caller left empty is not a username: the helper must
