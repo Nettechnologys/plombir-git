@@ -262,10 +262,17 @@ let alertReferences = 0;
 
 // `expr:` is either inline or a `|` block; both end at the next key at or above
 // the rule's indentation.
-const ALERT_RULE = /^(\s*)- alert:\s*(\S+)([\s\S]*?)(?=^\1- alert:|^\s{0,4}- name:|\Z)/gm;
+// `(?![\s\S])` is JavaScript's end-of-input assertion. `\Z` is a literal
+// `Z` in JavaScript, and `$` would also match every line ending under `m`.
+const ALERT_RULE = /^([ \t]*)- alert:\s*(\S+)([\s\S]*?)(?=^\1- alert:|^[ \t]{0,4}- name:|(?![\s\S]))/gm;
+const declaredAlertRules = [...alerts.matchAll(/^[ \t]*- alert:\s*\S+/gm)];
 const rules = [...alerts.matchAll(ALERT_RULE)];
 if (rules.length === 0) {
   failures.push(`No alert rules parsed out of ${path.relative(root, alertsPath)}`);
+} else if (rules.length !== declaredAlertRules.length) {
+  failures.push(
+    `Parsed ${rules.length} of ${declaredAlertRules.length} alert rules from ${path.relative(root, alertsPath)}`,
+  );
 }
 
 for (const [, , name, body] of rules) {

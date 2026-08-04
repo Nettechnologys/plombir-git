@@ -24,14 +24,17 @@ function fixtureRoot() {
   return fixture;
 }
 
-function runFixture(name, rule, expectedStatus, expectedOutput = '') {
+function runFixture(name, rule, expectedStatus, expectedOutput = '', appendLast = false) {
   const fixture = fixtureRoot();
   try {
     const alertsPath = join(fixture, 'deploy', 'prometheus', 'alerts.yml');
     const alerts = readFileSync(alertsPath, 'utf8');
     const nextRule = '      # Slow requests';
     if (!alerts.includes(nextRule)) throw new Error('fixture anchor for the next alert rule disappeared');
-    writeFileSync(alertsPath, alerts.replace(nextRule, `${rule}\n\n${nextRule}`));
+    const fixtureAlerts = appendLast
+      ? `${alerts.trimEnd()}\n\n${rule}\n`
+      : alerts.replace(nextRule, `${rule}\n\n${nextRule}`);
+    writeFileSync(alertsPath, fixtureAlerts);
 
     const result = spawnSync(process.execPath, [join(fixture, check)], {
       cwd: fixture,
@@ -76,4 +79,15 @@ runFixture(
           summary: "Route {{ $labels.route }} disappeared"`,
   1,
   'alerts.yml: GroupingDropsRoute interpolates {{ $labels.route }}, but its expr does not retain `route`',
+);
+
+runFixture(
+  'last alert rule with a lost label fails the contract',
+  `      - alert: FinalGroupingDropsRoute
+        expr: sum by (instance) (http_requests_total)
+        annotations:
+          summary: "Route {{ $labels.route }} disappeared"`,
+  1,
+  'alerts.yml: FinalGroupingDropsRoute interpolates {{ $labels.route }}, but its expr does not retain `route`',
+  true,
 );
