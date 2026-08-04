@@ -2,6 +2,7 @@
 //! files and purges them from the database only after durable file creation.
 
 use crate::platform::fs::{discard_file, discard_file_async};
+use crate::task_tracker::wait_optional_shutdown;
 use chrono::{Duration, Utc};
 use sea_orm::DatabaseConnection;
 use std::io::Cursor;
@@ -155,19 +156,6 @@ pub fn spawn_archiver_with_shutdown(
             }
         }
     }))
-}
-
-/// Await a shutdown signal if present, otherwise never resolve. Lets a
-/// `tokio::select!` arm be conditionally armed on an `Option<Receiver>`.
-async fn wait_optional_shutdown(shutdown_rx: &mut Option<watch::Receiver<bool>>) {
-    match shutdown_rx {
-        Some(rx) => {
-            if rx.changed().await.is_err() {
-                // Sender dropped: treat it the same as an explicit shutdown.
-            }
-        }
-        None => std::future::pending::<()>().await,
-    }
 }
 
 /// Archive one bounded batch. Returns `None` when no eligible entries exist.

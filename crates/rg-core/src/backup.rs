@@ -15,6 +15,7 @@
 //! freshly-created empty file and reports success.
 
 use crate::platform::fs::{discard_file, discard_file_async};
+use crate::task_tracker::wait_optional_shutdown;
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use std::path::{Path, PathBuf};
@@ -397,19 +398,6 @@ fn is_temp_snapshot(name: &str) -> bool {
 
 fn temporary_path(dir: &Path, snapshot_id: uuid::Uuid) -> PathBuf {
     dir.join(format!(".forgekeep-backup-{snapshot_id}.tmp"))
-}
-
-/// Await a shutdown signal if present, otherwise never resolve. Lets a
-/// `tokio::select!` arm be conditionally armed on an `Option<Receiver>`.
-async fn wait_optional_shutdown(shutdown_rx: &mut Option<watch::Receiver<bool>>) {
-    match shutdown_rx {
-        Some(rx) => {
-            if rx.changed().await.is_err() {
-                // Sender dropped: treat it the same as an explicit shutdown.
-            }
-        }
-        None => std::future::pending::<()>().await,
-    }
 }
 
 #[cfg(test)]

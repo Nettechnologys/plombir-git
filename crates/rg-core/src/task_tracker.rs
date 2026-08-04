@@ -39,6 +39,24 @@ pub fn delivery_tracker() -> &'static TaskTracker {
     DELIVERY_TRACKER.get_or_init(TaskTracker::new)
 }
 
+/// Await a shutdown signal if present, otherwise never resolve.
+///
+/// Lets a `tokio::select!` arm be conditionally armed on an `Option<Receiver>`,
+/// which is what every long-lived loop worker here needs: the same loop runs
+/// under a server that fans out a `SIGTERM` and under a test that has no
+/// coordinator at all. It lives next to the tracker because both are the same
+/// concern — how background work learns that the process is going down.
+pub async fn wait_optional_shutdown(shutdown_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match shutdown_rx {
+        Some(rx) => {
+            if rx.changed().await.is_err() {
+                // Sender dropped: treat it the same as an explicit shutdown.
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

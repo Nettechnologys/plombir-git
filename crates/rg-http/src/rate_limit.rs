@@ -8,6 +8,7 @@ use axum::extract::Request;
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use rg_core::task_tracker::wait_optional_shutdown;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -294,19 +295,6 @@ impl RateLimiter {
             .last_sweep = now;
         self.clock = Clock::Manual(clock.0);
         self
-    }
-}
-
-/// Await a shutdown signal if present, otherwise never resolve. Lets a
-/// `tokio::select!` arm be conditionally armed on an `Option<Receiver>`.
-async fn wait_optional_shutdown(shutdown_rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
-    match shutdown_rx {
-        Some(rx) => {
-            if rx.changed().await.is_err() {
-                // Sender dropped: treat it the same as an explicit shutdown.
-            }
-        }
-        None => std::future::pending::<()>().await,
     }
 }
 

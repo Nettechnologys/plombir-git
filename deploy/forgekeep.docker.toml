@@ -98,3 +98,12 @@ interval_hours = 24
 keep_last = 7
 # This does NOT back up /data/repos. Snapshot the whole /data volume for that
 # (or accept that bare repos are recoverable from developer clones).
+
+[mirror]
+# The sweep that refreshes repository mirrors on the interval each mirror was
+# configured with. On by default; set false if this instance should only refresh
+# a mirror when someone presses "Sync now" — which also stops the container
+# making outbound git calls to operator-supplied remotes on a timer.
+enabled = true
+poll_interval_secs = 60
+batch_size = 10

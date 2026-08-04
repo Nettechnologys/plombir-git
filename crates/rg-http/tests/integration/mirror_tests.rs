@@ -13,7 +13,8 @@
 //! thing that was never exercised.
 
 use crate::common::{
-    create_repo, register_full, spawn_test_app, spawn_test_app_with_db, TEST_ENCRYPTION_KEY,
+    create_repo, register_full, spawn_test_app, spawn_test_app_with_db,
+    spawn_test_app_with_db_and_repo_root, TEST_ENCRYPTION_KEY,
 };
 
 const REMOTE: &str = "https://example.com/upstream.git";
@@ -398,6 +399,131 @@ async fn a_sync_reports_a_credential_it_cannot_decrypt() {
     assert!(
         !mirror.to_string().contains("hunter2"),
         "the sync echoed the stored credential back: {mirror}"
+    );
+}
+
+/// The acceptance check of card_d2fd29942436: a mirror whose `next_sync_at` has
+/// passed is refreshed **without anyone triggering it**.
+///
+/// `sync_due_mirrors` had no caller in the process, so `sync_interval_seconds`
+/// and `next_sync_at` — both accepted by the API and both rendered in the
+/// settings UI as a schedule — described something that never happened. Only
+/// the "Sync now" button ever refreshed a mirror, and it was also the only
+/// thing that ever moved `next_sync_at` forward.
+///
+/// The sync here is made to fail on the *credential*, the way
+/// `a_sync_reports_a_credential_it_cannot_decrypt` does: that failure happens
+/// before the SSRF guard and before `git`, so the test proves the scheduler
+/// reached `sync_mirror` without going near a network or a clock-length git
+/// timeout. Reaching the credential at all is the evidence — a mirror nothing
+/// picked up keeps `last_sync_at = NULL` forever, which is exactly what the
+/// second mirror below asserts.
+#[tokio::test]
+async fn a_due_mirror_is_synced_by_the_scheduler_with_no_manual_trigger() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (token, _user_id) = register_full(&base, "mirror-cron", "mirror-cron@example.com").await;
+    create_repo(&base, &token, "due").await;
+    create_repo(&base, &token, "not-due").await;
+
+    let client = reqwest::Client::new();
+    let due_url = format!("{base}/api/v1/repos/mirror-cron/due/mirror");
+    let pending_url = format!("{base}/api/v1/repos/mirror-cron/not-due/mirror");
+
+    let mut ids = Vec::new();
+    for url in [&due_url, &pending_url] {
+        let resp = client
+            .post(url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "url": REMOTE,
+                "username": "sync-bot",
+                "password": "hunter2",
+                "sync_interval_seconds": 3600,
+            }))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), 201, "baseline create");
+        let created: serde_json::Value = resp.json().await.expect("json body");
+        ids.push(created["repo_id"].as_i64().expect("repo_id"));
+    }
+    let (due_repo_id, pending_repo_id) = (ids[0], ids[1]);
+
+    // Wind the first mirror's schedule into the past — the one state change a
+    // test cannot get by waiting an hour — and plant a credential the server
+    // cannot read, so the sync fails at the decrypt step instead of reaching
+    // out to the remote.
+    let due = rg_db::ops::mirror_ops::find_by_repo_id(&db, due_repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    let mut model: rg_db::entities::mirror::ActiveModel = due.into();
+    model.next_sync_at =
+        sea_orm::ActiveValue::Set(Some(chrono::Utc::now() - chrono::Duration::seconds(60)));
+    model.password_encrypted = sea_orm::ActiveValue::Set(Some("hunter2".to_string()));
+    rg_db::ops::mirror_ops::update(&db, model)
+        .await
+        .expect("make the mirror due");
+
+    // The scheduler under test: the production spawn path, only with a poll
+    // interval a test can sit through.
+    let _handle = rg_core::mirror::scheduler::spawn_mirror_sync_with_shutdown(
+        db.clone(),
+        repo_root.clone(),
+        TEST_ENCRYPTION_KEY.to_string(),
+        rg_core::mirror::scheduler::MirrorSyncConfig {
+            poll_interval_secs: 1,
+            batch_size: 10,
+        },
+        None,
+    )
+    .expect("the scheduler starts with valid knobs");
+
+    // Hang-guard, not a deadline: the first pass is one poll interval in, so a
+    // working scheduler lands in ~1s and a dead one fails at any finite bound.
+    let synced = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let mirror = rg_db::ops::mirror_ops::find_by_repo_id(&db, due_repo_id)
+                .await
+                .expect("query")
+                .expect("the mirror row");
+            if mirror.last_sync_at.is_some() {
+                return mirror;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a due mirror was never picked up — nothing is running the schedule");
+
+    assert_eq!(
+        synced.status, "error",
+        "the scheduled sync did not record its outcome: {synced:?}"
+    );
+    assert!(
+        synced
+            .last_sync_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("could not be decrypted"),
+        "the scheduled pass never reached the credential: {synced:?}"
+    );
+    assert!(
+        synced
+            .next_sync_at
+            .is_some_and(|next| next > chrono::Utc::now()),
+        "`next_sync_at` was not moved forward, so the row stays due forever: {synced:?}"
+    );
+
+    // The other half of "due": a mirror an hour out is left alone, or the sweep
+    // is just syncing everything on every tick.
+    let untouched = rg_db::ops::mirror_ops::find_by_repo_id(&db, pending_repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert!(
+        untouched.last_sync_at.is_none(),
+        "a mirror that is not due yet was synced anyway: {untouched:?}"
     );
 }
 

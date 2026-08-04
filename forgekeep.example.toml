@@ -161,6 +161,29 @@ keep_last = 7
 # and is not is the failure worth being loud about) — schedule pg_dump /
 # mysqldump instead and leave this off.
 
+[mirror]
+# The background schedule that refreshes repository mirrors. A mirror is
+# configured per repository (Settings → Mirror) with its own interval; this
+# section is only about the sweep that acts on those intervals.
+#
+# Defaults to true in code, unlike [backup]: a mirror only exists because an
+# operator asked for one, and its settings page shows a next-sync time. Turning
+# this off is the honest way to say "mirrors are refreshed by hand here" — it
+# also stops the server making outbound git calls to operator-supplied remotes
+# on a timer, which is the reason to decide it in this file rather than per
+# repository.
+enabled = true
+# How often the server looks for mirrors whose next sync is due. This is polling
+# granularity, not a mirror's schedule — a pass only touches mirrors that are
+# already due, so lowering it does not sync anything more often than its own
+# interval says.
+poll_interval_secs = 60
+# Upper bound on mirrors refreshed in one pass. A pass is sequential and every
+# mirror means a git subprocess against a third-party remote, so this is what
+# keeps a hundred simultaneously-due mirrors from turning one tick into an hour
+# of back-to-back fetches. Whatever is left over is still due on the next pass.
+batch_size = 10
+
 [observability]
 # OpenTelemetry distributed tracing (OTLP/HTTP export). Prometheus metrics at
 # /metrics are always on and independent of this section — these knobs only add

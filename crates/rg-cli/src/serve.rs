@@ -893,6 +893,52 @@ pub(crate) async fn run_serve(
         None
     };
 
+    // ── Scheduled mirror sync ─────────────────────────────────────
+    // The periodic half of the mirror feature. `POST .../mirror` has always
+    // taken a `sync_interval_seconds` and written a `next_sync_at` that the
+    // settings UI renders as "next sync at …", but nothing in the process ever
+    // called `sync_due_mirrors`: only the manual "Sync now" button refreshed a
+    // mirror, and it was also the only thing that ever moved `next_sync_at`
+    // (card_d2fd29942436).
+    let mirror_config = cfg.as_ref().map(|config| &config.mirror);
+    let _mirror_sync_handle = if mirror_config
+        .and_then(|config| config.enabled)
+        .unwrap_or(true)
+    {
+        let sync_config = rg_core::mirror::scheduler::MirrorSyncConfig {
+            poll_interval_secs: mirror_config
+                .and_then(|config| config.poll_interval_secs)
+                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS),
+            batch_size: mirror_config
+                .and_then(|config| config.batch_size)
+                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
+        };
+        tracing::info!(
+            poll_interval_secs = sync_config.poll_interval_secs,
+            batch_size = sync_config.batch_size,
+            "Scheduled mirror sync enabled"
+        );
+        // The secret is `encryption_key`, never `jwt_secret`: the mirror's
+        // stored remote credential is encrypted at rest with the former, and
+        // the two stopped being the same value in card_d740512de0a8.
+        Some(rg_core::mirror::scheduler::spawn_mirror_sync_with_shutdown(
+            db.clone(),
+            repo_root.clone(),
+            resolved_auth_secrets.encryption_key.clone(),
+            sync_config,
+            Some(shutdown_rx.clone()),
+        )?)
+    } else {
+        // Said out loud for the same reason as the backup line below it: an
+        // operator whose mirror shows a next-sync time must be able to find out
+        // from the log that nothing is going to act on it.
+        tracing::info!(
+            "Scheduled mirror sync is OFF ([mirror].enabled): configured mirrors are only \
+             refreshed when someone triggers a sync from the repository's mirror settings."
+        );
+        None
+    };
+
     // ── HTTP server ───────────────────────────────────────────────
     let smtp_config = match (
         resolved_smtp_host,
@@ -1067,6 +1113,26 @@ mod serve_tests {
             config.auth.key_file.as_deref(),
             Some("/srv/forgekeep/encryption_key")
         );
+    }
+
+    /// `[mirror]` is documented in `forgekeep.example.toml`, and the config
+    /// model carries `deny_unknown_fields` — a section that exists in the
+    /// documentation but not in the struct turns every config file that uses it
+    /// into a hard startup failure.
+    #[test]
+    fn the_mirror_schedule_is_a_real_config_section() {
+        let config: ConfigFile =
+            toml::from_str("[mirror]\nenabled = false\npoll_interval_secs = 120\nbatch_size = 4\n")
+                .expect("[mirror] must be part of the config model");
+        assert_eq!(config.mirror.enabled, Some(false));
+        assert_eq!(config.mirror.poll_interval_secs, Some(120));
+        assert_eq!(config.mirror.batch_size, Some(4));
+
+        // Absent means "use the defaults", not "off": a mirror created through
+        // the UI has to be refreshed on an instance whose config predates this
+        // section.
+        let bare: ConfigFile = toml::from_str("").expect("an empty config still parses");
+        assert_eq!(bare.mirror.enabled, None);
     }
 
     /// `[auth].registration` has to reach the model for the same

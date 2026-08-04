@@ -42,6 +42,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) backup: BackupConfig,
     #[serde(default)]
+    pub(crate) mirror: MirrorConfig,
+    #[serde(default)]
     pub(crate) timeouts: TimeoutConfig,
     #[serde(default)]
     pub(crate) webhooks: WebhooksConfig,
@@ -218,6 +220,27 @@ pub(crate) struct BackupConfig {
     pub(crate) dir: Option<String>,
     pub(crate) interval_hours: Option<u64>,
     pub(crate) keep_last: Option<usize>,
+}
+
+/// `[mirror]` — the in-process schedule that refreshes repository mirrors.
+///
+/// On by default (`enabled` defaults to **true**), unlike `[backup]`: a mirror
+/// is only ever created by an operator who asked for one, and the create form
+/// takes a sync interval and reports a next-sync time. A server that silently
+/// never acts on either is the defect this section was added to close
+/// (card_d2fd29942436), so the honest off switch is an explicit
+/// `enabled = false` — which also stops the server making outbound `git` calls
+/// to operator-supplied remotes on a timer, for the deployments that want that
+/// decided in the config file rather than per repository.
+///
+/// `poll_interval_secs` is *polling* granularity, not a mirror's schedule: each
+/// mirror carries its own `sync_interval_seconds` and a pass only touches rows
+/// whose `next_sync_at` has passed.
+#[derive(Debug, serde::Deserialize, Default)]
+pub(crate) struct MirrorConfig {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) poll_interval_secs: Option<u64>,
+    pub(crate) batch_size: Option<u64>,
 }
 
 /// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
