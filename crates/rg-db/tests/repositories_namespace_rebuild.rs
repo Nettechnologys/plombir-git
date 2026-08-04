@@ -19,10 +19,14 @@
 //! * **Uniqueness is still the database's job.** The point of the change is to
 //!   *narrow* the constraint, not to move it into the service layer.
 
-use rg_db::entities::repository;
-use rg_db::sea_orm::{ActiveValue::NotSet, ActiveValue::Set, ConnectionTrait, DatabaseBackend};
-use rg_db::sea_orm::{DatabaseConnection, Statement};
+use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
+
+const OWNER_ID: i64 = 1;
+const ORG_ID: i64 = 1;
+const PERSONAL_REPO_ID: i64 = 1;
+const ORG_REPO_ID: i64 = 2;
+const REUSED_REPO_ID: i64 = 3;
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
 struct TempDb {
@@ -55,24 +59,66 @@ impl Drop for TempDb {
     }
 }
 
-fn repo_row(owner_id: i64, org_id: Option<i64>, name: &str) -> repository::ActiveModel {
-    let now = chrono::Utc::now();
-    repository::ActiveModel {
-        id: NotSet,
-        owner_id: Set(owner_id),
-        name: Set(name.to_string()),
-        description: Set(None),
-        is_private: Set(false),
-        default_branch: Set("main".to_string()),
-        fork_id: Set(None),
-        stars_count: Set(0),
-        forks_count: Set(0),
-        org_id: Set(org_id),
-        created_at: Set(now),
-        updated_at: Set(now),
-        deleted_at: Set(None),
-        origin_repo_id: Set(None),
-    }
+/// Run raw SQL against the schema pinned by this upgrade test.
+///
+/// The fixture must not use `ops::*`: those helpers describe HEAD and can start
+/// writing a column that did not exist when the migration under test runs.
+async fn execute(db: &DatabaseConnection, sql: &str) -> Result<(), DbErr> {
+    db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        sql.to_string(),
+    ))
+    .await
+    .map(|_| ())
+}
+
+async fn insert_user(db: &DatabaseConnection) -> Result<(), DbErr> {
+    execute(
+        db,
+        "INSERT INTO users \
+         (id, username, email, password_hash, created_at, updated_at) \
+         VALUES (1, 'nsrebuild', 'nsrebuild@example.invalid', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .await
+}
+
+async fn insert_org(db: &DatabaseConnection) -> Result<(), DbErr> {
+    execute(
+        db,
+        "INSERT INTO organizations \
+         (id, name, owner_id, created_at, updated_at) \
+         VALUES (1, 'nsrebuildcorp', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .await
+}
+
+async fn insert_repo(
+    db: &DatabaseConnection,
+    id: i64,
+    org_id: Option<i64>,
+    name: &str,
+) -> Result<(), DbErr> {
+    let org_id = org_id.map_or_else(|| "NULL".to_string(), |id| id.to_string());
+    execute(
+        db,
+        &format!(
+            "INSERT INTO repositories \
+             (id, owner_id, name, org_id, created_at, updated_at) \
+             VALUES ({id}, {OWNER_ID}, '{name}', {org_id}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+    )
+    .await
+}
+
+async fn insert_star(db: &DatabaseConnection, repo_id: i64) -> Result<(), DbErr> {
+    execute(
+        db,
+        &format!(
+            "INSERT INTO repo_stars (user_id, repo_id, created_at) \
+             VALUES ({OWNER_ID}, {repo_id}, CURRENT_TIMESTAMP)"
+        ),
+    )
+    .await
 }
 
 /// `CREATE TABLE` text of `repositories` as SQLite currently holds it.
@@ -126,36 +172,25 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
     );
 
     // ── Data that the rebuild has to carry across ────────────────────────────
-    let owner = rg_db::ops::user_ops::create_user(
-        &db,
-        "nsrebuild",
-        "nsrebuild@example.invalid",
-        "unused",
-        "Namespace Rebuild",
-    )
-    .await
-    .expect("create user");
-
-    let org = rg_db::ops::org_ops::create_org(&db, "nsrebuildcorp", None, None, owner.id, "public")
+    insert_user(&db)
         .await
-        .expect("create org owned by the same account");
-
-    let repo = rg_db::ops::repo_ops::create(&db, repo_row(owner.id, None, "twin"))
+        .expect("seed a user valid for the pre-rebuild schema");
+    insert_org(&db)
         .await
-        .expect("create personal repository");
+        .expect("seed an organization valid for the pre-rebuild schema");
+    insert_repo(&db, PERSONAL_REPO_ID, None, "twin")
+        .await
+        .expect("seed a personal repository valid for the pre-rebuild schema");
 
-    assert!(
-        rg_db::ops::repo_star_ops::toggle_star(&db, owner.id, repo.id)
-            .await
-            .expect("star the repository"),
-        "baseline: a child row exists behind ON DELETE CASCADE"
-    );
+    insert_star(&db, PERSONAL_REPO_ID)
+        .await
+        .expect("seed a child row behind ON DELETE CASCADE");
     assert_eq!(
         scalar(
             &db,
             &format!(
                 "SELECT count(*) AS n FROM repos_fts WHERE rowid = {}",
-                repo.id
+                PERSONAL_REPO_ID
             )
         )
         .await,
@@ -194,7 +229,7 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
             &db,
             &format!(
                 "SELECT count(*) AS n FROM repo_stars WHERE repo_id = {}",
-                repo.id
+                PERSONAL_REPO_ID
             )
         )
         .await,
@@ -207,7 +242,7 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
             &db,
             &format!(
                 "SELECT count(*) AS n FROM repos_fts WHERE rowid = {}",
-                repo.id
+                PERSONAL_REPO_ID
             )
         )
         .await,
@@ -226,7 +261,7 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
     );
 
     // ── What the change was for: the two namespaces hold the same name ───────
-    let org_twin = rg_db::ops::repo_ops::create(&db, repo_row(owner.id, Some(org.id), "twin"))
+    insert_repo(&db, ORG_REPO_ID, Some(ORG_ID), "twin")
         .await
         .expect("an organization repository may share a name with its owner's personal one");
     assert_eq!(
@@ -234,7 +269,7 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
             &db,
             &format!(
                 "SELECT count(*) AS n FROM repos_fts WHERE rowid = {}",
-                org_twin.id
+                ORG_REPO_ID
             )
         )
         .await,
@@ -244,38 +279,36 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
 
     // ── And uniqueness is still the database's, not the service layer's ──────
     assert!(
-        rg_db::ops::repo_ops::create(&db, repo_row(owner.id, None, "twin"))
+        insert_repo(&db, ORG_REPO_ID + 1, None, "twin")
             .await
             .is_err(),
         "a second personal repository called `twin` was accepted — inside one namespace \
          the name must still be unique, and enforced here rather than upstream"
     );
     assert!(
-        rg_db::ops::repo_ops::create(&db, repo_row(owner.id, Some(org.id), "twin"))
+        insert_repo(&db, ORG_REPO_ID + 1, Some(ORG_ID), "twin")
             .await
             .is_err(),
         "a second `twin` in the same organization was accepted"
     );
 
     // ── A soft-deleted repository holds no name ──────────────────────────────
-    rg_db::ops::repo_ops::soft_delete(&db, repo.id)
-        .await
-        .expect("soft-delete the personal repository");
-    let reused = rg_db::ops::repo_ops::create(&db, repo_row(owner.id, None, "twin"))
-        .await
-        .expect(
-            "the name of a soft-deleted repository is still reserved: every lookup filters \
+    execute(
+        &db,
+        "UPDATE repositories SET deleted_at = CURRENT_TIMESTAMP WHERE id = 1",
+    )
+    .await
+    .expect("soft-delete the personal repository");
+    insert_repo(&db, REUSED_REPO_ID, None, "twin").await.expect(
+        "the name of a soft-deleted repository is still reserved: every lookup filters \
              `deleted_at IS NULL`, so this came back as an anonymous 5xx from the constraint",
-        );
+    );
 
     // ── Cascade still cascades, in the direction it is supposed to ───────────
-    assert!(
-        rg_db::ops::repo_star_ops::toggle_star(&db, owner.id, reused.id)
-            .await
-            .expect("star the reused repository"),
-        "baseline: the repository about to be hard-deleted has a child row"
-    );
-    rg_db::ops::repo_ops::delete_by_id(&db, reused.id)
+    insert_star(&db, REUSED_REPO_ID)
+        .await
+        .expect("star the reused repository");
+    execute(&db, "DELETE FROM repositories WHERE id = 3")
         .await
         .expect("hard-delete the repository");
     assert_eq!(
@@ -283,7 +316,7 @@ async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_
             &db,
             &format!(
                 "SELECT count(*) AS n FROM repo_stars WHERE repo_id = {}",
-                reused.id
+                REUSED_REPO_ID
             )
         )
         .await,
