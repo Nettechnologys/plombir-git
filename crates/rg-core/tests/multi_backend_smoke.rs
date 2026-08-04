@@ -211,6 +211,39 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     assert_eq!(wiki_total, 1);
     assert_eq!(wiki_results.first().map(|result| result.id), Some(page.id));
 
+    let (first_edit, second_edit) = tokio::join!(
+        rg_core::wiki::service::update_page(
+            &db,
+            repo.id,
+            "Home",
+            "first concurrent server edit",
+            None,
+            Some(user.id),
+        ),
+        rg_core::wiki::service::update_page(
+            &db,
+            repo.id,
+            "Home",
+            "second concurrent server edit",
+            None,
+            Some(user.id),
+        ),
+    );
+    first_edit.expect("store the first concurrent wiki edit");
+    second_edit.expect("store the second concurrent wiki edit");
+
+    let revisions = rg_core::wiki::service::list_revisions(&db, repo.id, "Home")
+        .await
+        .expect("read concurrent wiki revisions");
+    assert_eq!(
+        revisions
+            .iter()
+            .map(|revision| revision.version)
+            .collect::<Vec<_>>(),
+        vec![2, 1],
+        "parallel edits must leave one uniquely numbered revision each"
+    );
+
     let (repo_results, repo_total) = rg_core::search::service::search(
         &db,
         &format!("{repo_name} author:{username}"),

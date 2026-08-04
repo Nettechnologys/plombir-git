@@ -1,15 +1,13 @@
-//! Wiki revision numbering (card_e087c0f31f2e).
+//! Wiki revision numbering (card_e087c0f31f2e, card_48ed7f2e8380).
 //!
 //! `update_page` snapshots the pre-edit content under the next free version
-//! number. That number came from `latest_version(...).unwrap_or(0)`, and since
-//! "no revisions yet" is already `Ok(0)`, the fallback caught exactly one
-//! thing: the query failing. The snapshot was then filed as version 1 on top of
-//! the version 1 already there — and `wiki_revisions` has no unique key on
-//! (wiki_page_id, version) to stop it, so the history list and "restore this
-//! version" pick between the duplicates arbitrarily.
+//! number. The first defect treated a failed `latest_version` query as version
+//! zero. The second let two successful lookups race and store the same next
+//! number. The schema now makes `(wiki_page_id, version)` unique and the loser
+//! re-reads before retrying.
 //!
-//! These two pin both halves: the numbers a healthy database hands out, and
-//! what happens when the revision table cannot be read at all.
+//! These tests pin all three parts: ordinary numbering, concurrent allocation,
+//! and what happens when the revision table cannot be read at all.
 
 use sea_orm::ConnectionTrait;
 
@@ -84,6 +82,56 @@ async fn every_edit_files_its_snapshot_under_the_next_free_version() {
             .collect::<Vec<_>>(),
         vec![(3, "third"), (2, "second"), (1, "first")],
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_edits_file_one_uniquely_numbered_revision_each() {
+    const EDITS: usize = 8;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, repo) = wiki_fixture(dir.path(), "wikirace").await;
+    let repo_id = repo.id;
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(EDITS));
+    let mut edits = Vec::with_capacity(EDITS);
+
+    for i in 0..EDITS {
+        let db = db.clone();
+        let start = start.clone();
+        edits.push(tokio::spawn(async move {
+            start.wait().await;
+            rg_core::wiki::service::update_page(
+                &db,
+                repo_id,
+                "Home",
+                &format!("concurrent edit {i}"),
+                None,
+                None,
+            )
+            .await
+        }));
+    }
+
+    for (i, edit) in edits.into_iter().enumerate() {
+        edit.await
+            .unwrap_or_else(|error| panic!("concurrent edit task {i} panicked: {error}"))
+            .unwrap_or_else(|error| panic!("concurrent edit {i} failed: {error:#}"));
+    }
+
+    let revisions = rg_core::wiki::service::list_revisions(&db, repo_id, "Home")
+        .await
+        .expect("list revisions after concurrent edits");
+    assert_eq!(
+        revisions.len(),
+        EDITS,
+        "every successful edit must leave one history row"
+    );
+
+    let mut versions = revisions
+        .into_iter()
+        .map(|revision| revision.version)
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    assert_eq!(versions, (1..=EDITS as i32).collect::<Vec<_>>());
 }
 
 #[tokio::test]

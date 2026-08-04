@@ -116,45 +116,66 @@ pub async fn update_page(
         .context("find wiki page for update")?
         .ok_or_else(|| crate::error::not_found("wiki page"))?;
 
-    // Save the current content as a revision before overwriting.
+    // Save the current content as a revision before overwriting. The database
+    // makes (wiki_page_id, version) unique; if another editor wins between our
+    // lookup and insert, re-read the winner and try the next number. Every
+    // UNIQUE loss therefore records someone else's progress instead of either
+    // duplicating a number or silently dropping this snapshot.
     //
-    // A failed lookup is not "this page has no history": `latest_version`
-    // already says that with `Ok(0)`, so the only thing `unwrap_or(0)` ever
-    // caught was the query failing — and it filed the snapshot as version 1 on
-    // top of the version 1 that was already there. Nothing downstream can tell
-    // the two apart: `wiki_revisions` is indexed by page alone, with no unique
-    // key on (wiki_page_id, version), so the history list and "restore this
-    // version" then pick between duplicates arbitrarily.
-    //
-    // A revision that fails to *insert* is still non-fatal below — we know
-    // where it belonged, we just could not store it. Not knowing the number is
-    // different, and it costs the caller only a retry: the page has not been
-    // overwritten yet, so nothing is lost by refusing here.
-    let next_version = wiki_revision_ops::latest_version(db, existing.id)
+    // A failed lookup remains fatal: `Ok(0)` already represents an empty
+    // history, so an error means the next number is unknowable. Unexpected
+    // insert failures retain the existing non-fatal policy below, but a stream
+    // of genuine allocation conflicts is bounded so a saturated page cannot
+    // keep one request alive forever.
+    const MAX_VERSION_INSERT_ATTEMPTS: usize = 32;
+    let mut next_version = wiki_revision_ops::latest_version(db, existing.id)
         .await
         .context("find latest wiki revision version")?
-        + 1;
-    let rev = wiki_revision::ActiveModel {
-        id: sea_orm::NotSet,
-        wiki_page_id: sea_orm::Set(existing.id),
-        content: sea_orm::Set(existing.content.clone()),
-        message: sea_orm::Set(existing.message.clone()),
-        author_id: sea_orm::Set(existing.author_id),
-        version: sea_orm::Set(next_version),
-        created_at: sea_orm::Set(Utc::now()),
-    };
-    // Non-fatal: a lost revision must not block the edit the user asked for.
-    // It is still a lost revision — the pre-edit content becomes unrecoverable
-    // the moment the page below is overwritten, so say which one went missing.
-    if let Err(error) = wiki_revision_ops::create(db, rev).await {
-        tracing::warn!(
-            wiki_page_id = existing.id,
-            repo_id,
-            title = %existing.title,
-            version = next_version,
-            error = %format!("{error:#}"),
-            "wiki revision not saved — the page is still being updated, so its previous content is lost from the history"
-        );
+        .checked_add(1)
+        .context("wiki revision version exhausted")?;
+
+    for attempt in 1..=MAX_VERSION_INSERT_ATTEMPTS {
+        let rev = wiki_revision::ActiveModel {
+            id: sea_orm::NotSet,
+            wiki_page_id: sea_orm::Set(existing.id),
+            content: sea_orm::Set(existing.content.clone()),
+            message: sea_orm::Set(existing.message.clone()),
+            author_id: sea_orm::Set(existing.author_id),
+            version: sea_orm::Set(next_version),
+            created_at: sea_orm::Set(Utc::now()),
+        };
+
+        match wiki_revision_ops::create(db, rev).await {
+            Ok(_) => break,
+            Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
+                if attempt == MAX_VERSION_INSERT_ATTEMPTS {
+                    return Err(error).context(format!(
+                        "allocate a unique wiki revision version after \
+                         {MAX_VERSION_INSERT_ATTEMPTS} concurrent conflicts"
+                    ));
+                }
+                next_version = wiki_revision_ops::latest_version(db, existing.id)
+                    .await
+                    .context("re-read latest wiki revision after a concurrent edit")?
+                    .checked_add(1)
+                    .context("wiki revision version exhausted")?;
+            }
+            Err(error) => {
+                // Non-fatal: a lost revision must not block the edit the user
+                // asked for. It is still a lost revision — the pre-edit
+                // content becomes unrecoverable the moment the page below is
+                // overwritten, so say which one went missing.
+                tracing::warn!(
+                    wiki_page_id = existing.id,
+                    repo_id,
+                    title = %existing.title,
+                    version = next_version,
+                    error = %format!("{error:#}"),
+                    "wiki revision not saved — the page is still being updated, so its previous content is lost from the history"
+                );
+                break;
+            }
+        }
     }
 
     let model = wiki_page::ActiveModel {
