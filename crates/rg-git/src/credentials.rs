@@ -15,6 +15,14 @@
 pub const USERNAME_ENV: &str = "FORGEKEEP_GIT_USERNAME";
 pub const PASSWORD_ENV: &str = "FORGEKEEP_GIT_PASSWORD";
 
+/// A path which cannot contain user configuration or credential files.
+///
+/// Outbound git only needs a home directory to discover ambient authority. A
+/// real directory under `/tmp` would be both unnecessary and open to planting
+/// if its ownership ever drifted; `/dev/null` is stable, root-owned, and makes
+/// every attempted child path fail closed with `ENOTDIR`.
+const DISARMED_HOME: &str = "/dev/null";
+
 /// A remote's credential, in plaintext, for the duration of a single git
 /// invocation.
 ///
@@ -77,6 +85,8 @@ impl GitCredentials {
 ///   `/etc/gitconfig` and `~/.gitconfig`, which carry more than helpers: a
 ///   `url.<base>.insteadOf` there rewrites the remote *after* the SSRF guard has
 ///   already approved the URL the user supplied;
+/// - `HOME` and `XDG_CONFIG_HOME` pointed at `/dev/null` put `~/.netrc`,
+///   `~/.gitconfig`, and other per-user files outside the subprocess's reach;
 /// - `GIT_TERMINAL_PROMPT=0`, because nothing here runs with a terminal behind
 ///   it: a remote that asks for authentication must fail fast instead of
 ///   blocking until the gateway's timeout.
@@ -85,15 +95,17 @@ impl GitCredentials {
 /// without it the path simply fails to open, which git treats as an empty
 /// config — the same outcome by a different route.
 ///
-/// What this does **not** cover: `~/.netrc`, which the HTTP transport reads
-/// through curl no matter how the helper list is configured, and the ssh key of
-/// whoever the server runs as. Both hang off `HOME`, which this function
-/// deliberately leaves alone — see `card_4ee296c4a0d6` / `card_d37d1fef2ac2`.
+/// SSH and scp-like remotes are rejected by `rg_core::net::check_git_url_static`:
+/// an isolated home would hide `~/.ssh`, but an inherited ssh-agent would remain
+/// ambient authority. Supporting private SSH remotes therefore needs a future
+/// explicit identity contract rather than another process-wide default.
 pub fn credential_invocation(
     credentials: Option<&GitCredentials>,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let mut args = vec!["-c".to_string(), "credential.helper=".to_string()];
     let mut env = vec![
+        ("HOME".to_string(), DISARMED_HOME.to_string()),
+        ("XDG_CONFIG_HOME".to_string(), DISARMED_HOME.to_string()),
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
         ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
@@ -181,6 +193,11 @@ mod tests {
         assert_eq!(
             env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
             Some("/dev/null")
+        );
+        assert_eq!(env.get("HOME").map(String::as_str), Some(DISARMED_HOME));
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some(DISARMED_HOME)
         );
         // Nothing else: no credential means no secret in the environment.
         assert!(!env.contains_key(USERNAME_ENV) && !env.contains_key(PASSWORD_ENV));

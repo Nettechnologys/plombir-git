@@ -3,10 +3,11 @@
 //! [`credential_invocation`] is used for remotes the **user** named — mirror
 //! sync and repository import. The address is theirs; the ambient authority git
 //! would otherwise reach for is the server's. A credential helper in
-//! `/etc/gitconfig`, or an `insteadOf` rewrite in the operator's `~/.gitconfig`,
-//! turns "clone this public repo" into "clone it with the server's credentials"
-//! or "clone something else entirely" — without a single row of ours leaking,
-//! which is why nothing on the storage side catches it.
+//! `/etc/gitconfig`, credentials in the operator's `~/.netrc`, or an `insteadOf`
+//! rewrite in `~/.gitconfig` turn "clone this public repo" into "clone it with
+//! the server's credentials" or "clone something else entirely" — without a
+//! single row of ours leaking, which is why nothing on the storage side catches
+//! it.
 //!
 //! Every test here runs the real `git` binary twice against the same stub
 //! remote: once with the ambient config in reach (the control — it proves the
@@ -177,6 +178,55 @@ fn authorizations(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<String> {
         .iter()
         .filter_map(|request| request.authorization.clone())
         .collect()
+}
+
+/// The acceptance check of `card_4ee296c4a0d6`: curl reads `~/.netrc` below
+/// git's credential-helper layer, so resetting `credential.helper` alone cannot
+/// stop it from answering for a user-supplied remote.
+#[test]
+fn netrc_credentials_in_the_server_home_never_reach_the_remote() {
+    let (address, seen) = spawn_recording_remote();
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        home.path().join(".netrc"),
+        "machine 127.0.0.1 login netrc-user password netrc-password\n",
+    )
+    .expect("write .netrc");
+    let url = format!("http://{address}/upstream.git");
+
+    clone_attempt(
+        &url,
+        home.path(),
+        &home.path().join("control.git"),
+        Reach::Ambient,
+        None,
+    );
+    let leaked = authorizations(&seen);
+    assert!(
+        leaked.iter().any(|value| value.starts_with("Basic ")),
+        "the control never leaked, so this test cannot detect the fix: {leaked:?}"
+    );
+
+    seen.lock().expect("lock").clear();
+    clone_attempt(
+        &url,
+        home.path(),
+        &home.path().join("hardened.git"),
+        Reach::Hardened,
+        None,
+    );
+
+    let requests = seen.lock().expect("lock").clone();
+    assert!(
+        !requests.is_empty(),
+        "the hardened clone never reached the remote at all: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.authorization.is_none()),
+        "credentials from the server's .netrc reached a user-supplied remote: {requests:?}"
+    );
 }
 
 /// The acceptance check of `card_29bad91a931e`: a helper configured in the

@@ -211,14 +211,19 @@ pub async fn guard_outbound_url(raw: &str) -> Result<()> {
 /// **user-supplied** remote. Everything else — `file://` (local-disk read),
 /// `ext::` (arbitrary transport-helper command), `ftp://`, … — is rejected so a
 /// remote URL can neither read local files nor execute a helper binary.
-pub const ALLOWED_GIT_URL_SCHEMES: &[&str] = &["https", "http", "git", "ssh"];
+///
+/// SSH is deliberately absent. Outbound git runs with an isolated `HOME`, so
+/// host keys and `~/.ssh` identities are unavailable, but an inherited agent can
+/// still answer for any host the user names. SSH can return only with a separate
+/// explicitly configured identity and `IdentitiesOnly=yes` contract.
+pub const ALLOWED_GIT_URL_SCHEMES: &[&str] = &["https", "http", "git"];
 
 /// Split a git remote into `(scheme, host)`.
 ///
-/// Handles both the URL forms git understands (`https://`, `http://`, `git://`,
-/// `ssh://`) and the scp-like shorthand `[user@]host:path`, which git treats as
-/// ssh. A bare local path (no scheme, no `host:` prefix) yields no host and is
-/// rejected by the caller.
+/// Handles both the allowed URL forms (`https://`, `http://`, `git://`) and SSH
+/// forms (`ssh://`, `[user@]host:path`) so the latter receive the same explicit
+/// scheme rejection. A bare local path yields no host and is rejected by the
+/// caller.
 fn split_git_remote(raw: &str) -> Result<(String, String)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -249,7 +254,7 @@ fn split_git_remote(raw: &str) -> Result<(String, String)> {
     // remote that failed to parse can still have carried a credential, and this
     // message reaches both the client and the log.
     Err(crate::error::invalid_request(format!(
-        "'{}' is not a valid git remote (expected an https/http/git/ssh URL or scp-like host:path)",
+        "'{}' is not a valid git remote (expected an https/http/git URL)",
         mask_url_credentials(raw)
     )))
 }
@@ -267,7 +272,7 @@ pub fn check_git_url_static(raw: &str) -> Result<()> {
     let (scheme, host) = split_git_remote(raw)?;
     if !ALLOWED_GIT_URL_SCHEMES.contains(&scheme.as_str()) {
         return Err(crate::error::invalid_request(format!(
-            "git remote scheme '{scheme}' not allowed (only https/http/git/ssh) — \
+            "git remote scheme '{scheme}' not allowed (only https/http/git) — \
              file://, ext:: and other transports are refused"
         )));
     }
@@ -640,22 +645,25 @@ mod tests {
             "https://github.com/owner/repo.git",
             "http://example.com/repo.git",
             "git://example.com/repo.git",
-            "ssh://git@example.com:22/owner/repo.git",
-            "git@github.com:owner/repo.git", // scp-like → ssh
-            "https://1.1.1.1/repo.git",      // public IP literal
+            "https://1.1.1.1/repo.git", // public IP literal
         ] {
             assert!(check_git_url_static(s).is_ok(), "{s} should be allowed");
         }
     }
 
     #[test]
-    fn git_url_scp_shorthand_parses_to_ssh_host() {
-        assert_eq!(
-            split_git_remote("git@github.com:owner/repo.git").unwrap(),
-            ("ssh".to_string(), "github.com".to_string())
-        );
-        // scp-like pointing at an internal literal is caught statically.
-        assert!(check_git_url_static("git@127.0.0.1:owner/repo.git").is_err());
+    fn git_url_rejects_ssh_and_scp_like_remotes_explicitly() {
+        for remote in [
+            "ssh://git@example.com:22/owner/repo.git",
+            "git@github.com:owner/repo.git",
+        ] {
+            let error = check_git_url_static(remote).expect_err("ssh must be disabled");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("scheme 'ssh' not allowed"),
+                "the rejection did not explain the disabled transport: {rendered}"
+            );
+        }
     }
 
     // ── Credentials inside the URL ──────────────────────────────────────────
