@@ -166,7 +166,9 @@ async fn resolve_collaborator_user_id(
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
-        ("id" = i64, Path, description = "id"),
+        ("id" = i64, Path, description = "repo_collaborators row id of the membership to \
+          update (repo_collaborators.id — unlike DELETE on this path, which takes the \
+          collaborator's users.id)"),
     ),
     request_body(content = serde_json::Value),
     responses(

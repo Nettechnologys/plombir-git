@@ -53,6 +53,43 @@ failures.push(
   ]),
 );
 
+// One URL, two verbs, two different id spaces: PATCH addresses the
+// `repo_collaborators` row, DELETE addresses the collaborator's `users.id`. The
+// asymmetry is intentional, which is exactly why neither annotation may leave it
+// unsaid — a client generated from the spec reads `description = "id"` as "the
+// same id as the sibling operation" and gets a 404 on a live collaborator. The
+// spec is the only place a consumer can learn this, so the gate is here.
+const idParamDescription = (verb) => {
+  const block = backend
+    .split('#[utoipa::path(')
+    .find((chunk) => new RegExp(`^\\s*${verb},`).test(chunk)
+      && /path = "\/repos\/\{owner\}\/\{name\}\/collaborators\/\{id\}"/.test(chunk));
+  if (!block) return null;
+  const match = /\("id" = i64, Path, description = ([\s\S]*?)\),\n/.exec(block);
+  return match ? match[1] : null;
+};
+
+for (const [verb, space, sibling] of [
+  ['patch', 'repo_collaborators.id', 'users.id'],
+  ['delete', 'users.id', 'repo_collaborators row id'],
+]) {
+  const description = idParamDescription(verb);
+  if (description === null) {
+    failures.push(`${verb.toUpperCase()} /collaborators/{id} must document its {id} path parameter`);
+    continue;
+  }
+  if (!description.includes(space)) {
+    failures.push(
+      `${verb.toUpperCase()} /collaborators/{id} must name the id space it takes (${space})`,
+    );
+  }
+  if (!description.includes(sibling)) {
+    failures.push(
+      `${verb.toUpperCase()} /collaborators/{id} must say how its {id} differs from the sibling verb (${sibling})`,
+    );
+  }
+}
+
 // Any method on the legacy path, not just POST: the point is that the path is gone.
 if (routes.some((route) => route.path === '/repos/{owner}/{name}/collaborators/{user_id}/remove')) {
   failures.push('Backend router must not expose legacy POST /collaborators/{user_id}/remove');
