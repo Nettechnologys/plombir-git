@@ -1,6 +1,7 @@
 //! Database operations for repository stars.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::OnConflict;
 use sea_orm::*;
 
 use crate::entities::repo_star::{self, ActiveModel, Entity as RepoStarEntity, Model};
@@ -9,10 +10,9 @@ use crate::entities::repo_star::{self, ActiveModel, Entity as RepoStarEntity, Mo
 /// If not starred, star (insert) and return true.
 ///
 /// `(user_id, repo_id)` is UNIQUE. Two simultaneous requests can both observe
-/// no row and race to insert it. The loser does not undo the winner's star:
-/// its requested end state now exists, so it returns `true` too. A UNIQUE error
-/// is accepted only after re-reading this exact key; every other write failure,
-/// and a collision that did not leave this star row behind, remains an error.
+/// no row and race to insert it. The conflict-targeted insert makes that branch
+/// idempotent: the loser does not undo the winner's star and returns `true` too.
+/// A foreign-key or database failure still remains an error.
 pub async fn toggle_star(db: &DatabaseConnection, user_id: i64, repo_id: i64) -> Result<bool> {
     // Check if already starred
     let existing = RepoStarEntity::find()
@@ -38,17 +38,19 @@ pub async fn toggle_star(db: &DatabaseConnection, user_id: i64, repo_id: i64) ->
             created_at: Set(now),
             ..Default::default()
         };
-        match model.insert(db).await {
-            Ok(_) => Ok(true),
-            Err(error) if crate::is_unique_violation(&error) => {
-                if is_starred(db, user_id, repo_id).await? {
-                    Ok(true)
-                } else {
-                    Err(error).context("db: insert star")
-                }
-            }
-            Err(error) => Err(error).context("db: insert star"),
-        }
+        RepoStarEntity::insert(model)
+            .on_conflict(
+                OnConflict::columns([repo_star::Column::UserId, repo_star::Column::RepoId])
+                    // MySQL needs a harmless assignment for its DO NOTHING
+                    // polyfill; PostgreSQL and SQLite emit DO NOTHING.
+                    .do_nothing_on([repo_star::Column::Id])
+                    .to_owned(),
+            )
+            .do_nothing()
+            .exec(db)
+            .await
+            .context("db: insert star")?;
+        Ok(true)
     }
 }
 
