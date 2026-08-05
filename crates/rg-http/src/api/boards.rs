@@ -621,14 +621,17 @@ pub async fn reorder_cards(
     };
     // Every card id arrives in the body, and the whole batch is rejected if one
     // of them belongs elsewhere — a partial reorder would leave the caller's
-    // own board half-applied.
+    // own board half-applied. This loop answers the ordinary case with the same
+    // 404 as every other card route; the binding check is repeated inside the
+    // reorder transaction, which is what a card leaving the board *after* this
+    // point runs into.
     for (card_id, _) in &body.positions {
         if let Err(e) = card_in_board(&state, board.id, *card_id).await {
             return e.into_response();
         }
     }
 
-    match rg_core::board::service::reorder_cards(&state.db, body.positions).await {
+    match rg_core::board::service::reorder_cards(&state.db, board.id, body.positions).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

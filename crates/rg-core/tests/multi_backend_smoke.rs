@@ -381,6 +381,121 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     .expect("verify wiki FTS deletion");
     assert_eq!(wiki_total_after_delete, 0);
 
+    // card_04054a87159b: a board reorder is published as one serialized
+    // transaction. The three backends refuse an overtaken writer in three
+    // different ways — a lost WAL snapshot, a serialization failure, a deadlock
+    // victim — so the external promise (both callers succeed, and the board
+    // holds one submitted order in full) has to be checked on the server
+    // databases too, not only on SQLite.
+    let board_now = chrono::Utc::now();
+    let board = rg_db::ops::board_ops::create_board(
+        &db,
+        rg_db::entities::board::ActiveModel {
+            id: NotSet,
+            repo_id: Set(Some(repo.id)),
+            org_id: Set(None),
+            name: Set("Smoke".to_string()),
+            description: Set(None),
+            created_by: Set(user.id),
+            created_at: Set(board_now),
+            updated_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test board");
+    let board_column = rg_db::ops::board_ops::create_column(
+        &db,
+        rg_db::entities::board_column::ActiveModel {
+            id: NotSet,
+            board_id: Set(board.id),
+            name: Set("Todo".to_string()),
+            color: Set(None),
+            position: Set(0),
+            created_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test board column");
+    let mut card_ids = Vec::with_capacity(3);
+    for index in 0..3 {
+        let card = rg_db::ops::board_ops::create_card(
+            &db,
+            rg_db::entities::board_card::ActiveModel {
+                id: NotSet,
+                column_id: Set(board_column.id),
+                issue_id: Set(None),
+                note: Set(Some(format!("smoke card {index}"))),
+                position: Set(index),
+                created_at: Set(board_now),
+                updated_at: Set(board_now),
+            },
+        )
+        .await
+        .expect("create smoke-test board card");
+        card_ids.push(card.id);
+    }
+
+    let reversed_order: Vec<(i64, i32)> =
+        vec![(card_ids[0], 2), (card_ids[1], 1), (card_ids[2], 0)];
+    let shifted_order: Vec<(i64, i32)> =
+        vec![(card_ids[0], 10), (card_ids[1], 11), (card_ids[2], 12)];
+    let (first_reorder, second_reorder) = tokio::join!(
+        rg_db::ops::board_ops::update_card_positions(&db, board.id, &reversed_order),
+        rg_db::ops::board_ops::update_card_positions(&db, board.id, &shifted_order),
+    );
+    assert_eq!(
+        first_reorder.expect("store the first concurrent reorder"),
+        rg_db::ops::board_ops::ReorderOutcome::Applied
+    );
+    assert_eq!(
+        second_reorder.expect("store the second concurrent reorder"),
+        rg_db::ops::board_ops::ReorderOutcome::Applied
+    );
+
+    let mut stored_positions = Vec::with_capacity(card_ids.len());
+    for card_id in &card_ids {
+        stored_positions.push(
+            rg_db::ops::board_ops::find_card_by_id(&db, *card_id)
+                .await
+                .expect("read reordered board card")
+                .expect("board card still exists")
+                .position,
+        );
+    }
+    assert!(
+        stored_positions == vec![2, 1, 0] || stored_positions == vec![10, 11, 12],
+        "concurrent reorders left a blended order: {stored_positions:?}"
+    );
+
+    let absent_card = card_ids.iter().copied().max().unwrap_or_default() + 10_000;
+    let refused = rg_db::ops::board_ops::update_card_positions(
+        &db,
+        board.id,
+        &[(card_ids[0], 30), (absent_card, 31)],
+    )
+    .await
+    .expect("a card this board does not own is an answer, not a failure");
+    assert_eq!(
+        refused,
+        rg_db::ops::board_ops::ReorderOutcome::NotOnBoard(vec![absent_card])
+    );
+    let refused_positions = rg_db::ops::board_ops::find_card_by_id(&db, card_ids[0])
+        .await
+        .expect("read the in-scope card of a refused batch")
+        .expect("board card still exists")
+        .position;
+    assert_eq!(
+        refused_positions, stored_positions[0],
+        "a refused batch wrote the card that was in scope"
+    );
+
+    assert!(
+        rg_db::ops::board_ops::delete_board_by_id(&db, board.id)
+            .await
+            .expect("delete smoke-test board"),
+        "deleting the smoke-test board removed no row"
+    );
+
     rg_db::ops::repo_ops::soft_delete(&db, repo.id)
         .await
         .expect("soft-delete the repository through the source row");

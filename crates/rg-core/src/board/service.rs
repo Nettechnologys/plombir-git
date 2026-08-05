@@ -246,9 +246,22 @@ pub async fn move_card(
     rg_db::ops::board_ops::update_card(db, model).await
 }
 
-/// Reorder cards within a column.
-pub async fn reorder_cards(db: &DatabaseConnection, positions: Vec<(i64, i32)>) -> Result<()> {
-    rg_db::ops::board_ops::update_card_positions(db, &positions).await
+/// Reorder cards within a column, as one serialized publication.
+///
+/// The whole batch commits or none of it does, and a card that left `board_id`
+/// between the caller's scope check and the write is the same answer as no such
+/// card — not a batch that applied the positions it managed to reach first.
+pub async fn reorder_cards(
+    db: &DatabaseConnection,
+    board_id: i64,
+    positions: Vec<(i64, i32)>,
+) -> Result<()> {
+    match rg_db::ops::board_ops::update_card_positions(db, board_id, &positions).await? {
+        rg_db::ops::board_ops::ReorderOutcome::Applied => Ok(()),
+        rg_db::ops::board_ops::ReorderOutcome::NotOnBoard(_) => {
+            Err(crate::error::not_found("board card"))
+        }
+    }
 }
 
 /// Delete a card. `false` means the row was already gone.
