@@ -16,6 +16,7 @@
 
 mod common;
 
+mod account_deletion_storage_tests;
 mod admin_org_tests;
 mod admin_settings_tests;
 mod admin_sso_audit_tests;

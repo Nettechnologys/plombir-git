@@ -850,8 +850,107 @@ pub async fn update_user_admin(
     Ok(updated.into())
 }
 
-/// Delete a user (admin only).
-pub async fn delete_user(db: &DatabaseConnection, user_id: i64) -> Result<()> {
+/// Delete a user (admin only), together with the storage of every repository
+/// they own.
+///
+/// This used to be one `DELETE FROM users`, which was not the harmless row
+/// removal it looked like: `repositories.owner_id` is declared
+/// `REFERENCES users(id) ON DELETE CASCADE` and foreign keys are enforced on
+/// every backend, so that statement *destroyed* the repository rows — while
+/// every byte they named stayed live in Git storage, in the `packages` / `lfs`
+/// / `releases` / `attachments` prefixes, in the CI cache and artifact trees
+/// and in the OCI registry, with no row left to reach them and no sweep left to
+/// collect them. The bytes have to be retired first, through the same staged,
+/// compensated contract a routed repository deletion uses.
+///
+/// Two ownerships are refused rather than cascaded, because absorbing them here
+/// would repeat the same mistake one level up:
+///
+/// * **Organizations owned by this account.** `organizations.owner_id` carries
+///   no foreign key at all, so the row survives the delete pointing at a user
+///   id nothing resolves — while the cascade above still takes its
+///   repositories. Deleting or transferring the organization is its own
+///   operation and its own decision.
+/// * **Repositories in an organization's namespace that still name this account
+///   as `owner_id`.** They are reached by the same cascade even though they are
+///   not this user's to delete.
+///
+/// The repositories are retired one at a time, and each one is individually
+/// atomic. A failure part-way through leaves the already-retired ones retired
+/// and the user row untouched, so re-running the request resumes where it
+/// stopped. What it never does is answer `2xx` with bytes still live.
+pub async fn delete_user(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn crate::blob_storage::BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    user_id: i64,
+) -> Result<()> {
+    let owned_orgs = rg_db::ops::org_ops::list_orgs_owned_by(db, user_id)
+        .await
+        .context(
+            "failed to inventory the organizations owned by this account — it cannot be deleted \
+             without them",
+        )?;
+    if !owned_orgs.is_empty() {
+        let names = owned_orgs
+            .iter()
+            .map(|org| org.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(crate::error::conflict(format!(
+            "account still owns the organization(s) {names}; delete or transfer them before \
+             deleting the account"
+        )));
+    }
+
+    // Before anything is moved, and covering both namespaces: a database that
+    // cannot answer "which repositories does this account own" aborts the
+    // deletion instead of reporting a success that leaves their bytes live.
+    let owned = rg_db::ops::repo_ops::list_active_by_owner_id(db, user_id)
+        .await
+        .context(
+            "failed to inventory the repositories of this account — its storage cannot be retired \
+             without them",
+        )?;
+
+    let organization_scoped = owned
+        .iter()
+        .filter(|repo| repo.org_id.is_some())
+        .map(|repo| repo.name.as_str())
+        .collect::<Vec<_>>();
+    if !organization_scoped.is_empty() {
+        return Err(crate::error::conflict(format!(
+            "account is still recorded as the owner of the organization repositor{} {}; \
+             transfer them before deleting the account",
+            if organization_scoped.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            organization_scoped.join(", ")
+        )));
+    }
+
+    for repo in &owned {
+        if let Err(error) =
+            crate::repo::service::delete_repo(db, repo_root, blob_storage, oci_storage, repo).await
+        {
+            tracing::error!(
+                user_id,
+                repo_id = repo.id,
+                repo = %repo.name,
+                error = %format!("{error:#}"),
+                "account deletion stopped: this repository's storage could not be retired, so the \
+                 account row was left in place and the request can be retried"
+            );
+            return Err(error.context(format!(
+                "failed to retire repository '{}' (id {}) while deleting its owner",
+                repo.name, repo.id
+            )));
+        }
+    }
+
     // `rg-db` cannot depend on this crate's domain error types, so absence
     // crosses that boundary as a value and becomes a typed 404 here.
     if !user_ops::delete_by_id(db, user_id).await? {

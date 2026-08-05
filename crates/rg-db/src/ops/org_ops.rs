@@ -99,6 +99,25 @@ pub async fn list_user_orgs(
         .context("db: list user orgs")
 }
 
+/// List the organizations this user **owns**, as opposed to belongs to.
+///
+/// [`list_user_orgs`] answers membership, which is the wrong question when an
+/// account is about to disappear: `organizations.owner_id` carries no foreign
+/// key at all, so deleting the owner leaves the organization row alive pointing
+/// at a user id nothing resolves. The caller needs the owned set to refuse
+/// before that happens.
+pub async fn list_orgs_owned_by(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<Vec<organization::Model>> {
+    organization::Entity::find()
+        .filter(organization::Column::OwnerId.eq(user_id))
+        .order_by_asc(organization::Column::Name)
+        .all(db)
+        .await
+        .context("db: list orgs owned by user")
+}
+
 /// Update an organization.
 pub async fn update_org(
     db: &DatabaseConnection,

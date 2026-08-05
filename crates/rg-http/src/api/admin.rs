@@ -322,6 +322,7 @@ pub async fn unlock_user(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Admin required", body = serde_json::Value),
         (status = 404, description = "User not found", body = serde_json::Value),
+        (status = 409, description = "Account still owns organizations or organization repositories", body = serde_json::Value),
     ),
 )]
 pub async fn delete_user(
@@ -333,7 +334,18 @@ pub async fn delete_user(
     if current_id == user_id {
         return AppError::bad_request("cannot delete your own account").into_response();
     }
-    match rg_core::user::service::delete_user(&state.db, user_id).await {
+    // The account's repositories are deleted with it, so this needs the same
+    // three storage handles a routed repository deletion does — the row alone
+    // is not what the account owns.
+    match rg_core::user::service::delete_user(
+        &state.db,
+        &state.repo_root,
+        state.blob_storage.as_ref(),
+        state.oci_storage.as_ref(),
+        user_id,
+    )
+    .await
+    {
         Ok(()) => {
             let details = serde_json::json!({"deleted_user_id": user_id});
             record_audit(
