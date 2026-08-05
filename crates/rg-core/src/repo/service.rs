@@ -223,8 +223,11 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
         return Ok((user.id, None, user.username.clone()));
     }
 
-    // Try organization
-    if let Some(org) = rg_db::ops::org_ops::get_org_by_name(db, owner).await? {
+    // Try organization. An organization already claimed for retirement is not a
+    // namespace anything may still enter, so it resolves like a name that is
+    // not there — the alternative is admitting a repository whose owner is
+    // being deleted out from under it (card_b6dd1fb60659).
+    if let Some(org) = rg_db::ops::org_ops::find_active_org_by_name(db, owner).await? {
         return Ok((org.owner_id, Some(org.id), org.name.clone()));
     }
 
@@ -714,6 +717,47 @@ where
             });
         }
     };
+
+    // The organization was resolved several statements ago, and nothing since
+    // then has been holding it: a `DELETE /orgs/{name}` could have claimed it
+    // for retirement, inventoried its repositories and found none — all while
+    // this request was initialising Git — and the row above would then be a
+    // live repository whose owner is on its way out, with bytes no collector
+    // ever walks (card_b6dd1fb60659).
+    //
+    // Re-reading the claim *after* the row is committed is what closes that: if
+    // the claim landed before this read, this request lost and undoes itself
+    // here; if it lands after, the deleter's own re-inventory necessarily sees
+    // this committed row and retires it. One of the two always happens, and the
+    // argument rests on nothing stronger than "a committed write is visible to
+    // a read that starts later", which every supported backend gives.
+    if let Some(org_id) = opts.org_id {
+        match rg_db::ops::org_ops::org_is_active(db, org_id).await {
+            Ok(true) => {}
+            // Undo in the order that leaves nothing dangling: the row first, so
+            // the directory it named is unreferenced before it is discarded.
+            outcome => {
+                if let Err(error) = repo_ops::delete_by_id(db, repo.id).await {
+                    tracing::error!(
+                        repo_id = repo.id,
+                        org_id,
+                        error = %format!("{error:#}"),
+                        "repository was created into an organization that is being deleted, and \
+                         removing the row failed — it now names an organization that is gone"
+                    );
+                    return Err(error);
+                }
+                discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+                return match outcome {
+                    Ok(_) => Err(crate::error::conflict(format!(
+                        "organization '{path_prefix}' is being deleted; repository '{name}' was \
+                         not created"
+                    ))),
+                    Err(error) => Err(error),
+                };
+            }
+        }
+    }
 
     after_source_commit().await;
 

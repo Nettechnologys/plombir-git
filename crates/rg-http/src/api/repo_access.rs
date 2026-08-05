@@ -508,7 +508,12 @@ pub(crate) async fn require_namespace_create(
         };
     }
 
-    if let Some(org) = rg_db::ops::org_ops::get_org_by_name(&state.db, owner)
+    // An organization claimed for retirement is not a namespace anything may
+    // still enter, so it denies exactly like a name nobody has taken — the same
+    // one text, keeping the gate free of a retiring/absent oracle. The
+    // authoritative refusal is the one `create_repo` makes against the same
+    // marker; this only saves the caller a Git init it would lose anyway.
+    if let Some(org) = rg_db::ops::org_ops::find_active_org_by_name(&state.db, owner)
         .await
         .map_err(AppError::from)?
     {

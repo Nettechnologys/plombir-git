@@ -1,6 +1,7 @@
 //! Database operations for organizations, teams, and org/team membership.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::{organization, organization_member, team, team_member};
@@ -161,6 +162,83 @@ pub async fn delete_org(db: &DatabaseConnection, id: i64) -> Result<bool> {
         .await
         .context("db: delete org")?;
     Ok(result.rows_affected > 0)
+}
+
+/// Claim an organization for retirement, reporting whether this call claimed it.
+///
+/// `deleted_at` is the organization's retirement marker: set while its
+/// repositories are being retired, and gone together with the row itself once
+/// they are. Deleting an organization spans storage that no database
+/// transaction can hold, so the row cannot simply disappear at the end of one —
+/// something has to say "this namespace is closing" for the whole span, and
+/// this is it.
+///
+/// One conditional statement, and the row count is the answer: `false` means
+/// the organization is already being retired by somebody else (or is already
+/// gone), so this caller does not own the deletion and must not start retiring
+/// storage a concurrent deleter is also retiring.
+pub async fn begin_org_retirement(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let now = chrono::Utc::now();
+    let result = organization::Entity::update_many()
+        .col_expr(organization::Column::DeletedAt, Expr::value(Some(now)))
+        .col_expr(organization::Column::UpdatedAt, Expr::value(now))
+        .filter(organization::Column::Id.eq(id))
+        .filter(organization::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: begin org retirement")?;
+    Ok(result.rows_affected > 0)
+}
+
+/// Release a retirement claim whose deletion could not finish.
+///
+/// A deletion that fails half-way leaves the organization and its unretired
+/// repositories exactly where they were, so the marker has to come off too —
+/// otherwise a retryable failure would leave a namespace nobody can create in
+/// and no request can reopen.
+pub async fn abort_org_retirement(db: &DatabaseConnection, id: i64) -> Result<()> {
+    organization::Entity::update_many()
+        .col_expr(
+            organization::Column::DeletedAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(organization::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: abort org retirement")?;
+    Ok(())
+}
+
+/// Get an organization by name, ignoring one already claimed for retirement.
+///
+/// The lookup that decides whether a *new* thing may join the organization's
+/// namespace — creating a repository, above all — has to use this one rather
+/// than [`get_org_by_name`]: an organization whose storage is being retired is
+/// no longer a namespace anything may enter.
+pub async fn find_active_org_by_name(
+    db: &DatabaseConnection,
+    name: &str,
+) -> Result<Option<organization::Model>> {
+    organization::Entity::find()
+        .filter(organization::Column::Name.eq(name))
+        .filter(organization::Column::DeletedAt.is_null())
+        .one(db)
+        .await
+        .context("db: get active org by name")
+}
+
+/// Whether an organization is still open for new members of its namespace.
+///
+/// `false` covers both "claimed for retirement" and "already gone": to anything
+/// asking whether it may still join this namespace the two are the same answer.
+pub async fn org_is_active(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let count = organization::Entity::find()
+        .filter(organization::Column::Id.eq(id))
+        .filter(organization::Column::DeletedAt.is_null())
+        .count(db)
+        .await
+        .context("db: check org retirement state")?;
+    Ok(count > 0)
 }
 
 // ── Organization Member ops ──────────────────────────────────

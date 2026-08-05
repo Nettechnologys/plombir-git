@@ -132,41 +132,133 @@ pub async fn delete_org(
         OrgDeleteActor::Owner(_) | OrgDeleteActor::InstanceAdmin => {}
     }
 
-    // Inventory before the first storage mutation. A database that cannot
-    // answer which repositories belong to this organization must not let the
-    // organization row disappear while their bytes remain live.
-    let repositories = rg_db::ops::repo_ops::list_by_org(db, id).await.context(
-        "failed to inventory the organization's repositories — its storage cannot be retired \
-             without them",
-    )?;
-
-    for repo in &repositories {
-        if let Err(error) =
-            crate::repo::service::delete_repo(db, repo_root, blob_storage, oci_storage, repo).await
-        {
-            tracing::error!(
-                org_id = id,
-                repo_id = repo.id,
-                repo = %repo.name,
-                error = %format!("{error:#}"),
-                "organization deletion stopped: this repository's storage could not be retired, \
-                 so the organization row was left in place and the request can be retried"
-            );
-            return Err(error.context(format!(
-                "failed to retire repository '{}' (id {}) while deleting organization '{}'",
-                repo.name, repo.id, org.name
-            )));
-        }
-    }
-
-    // The ownership check above read the org in a statement of its own. Two
-    // concurrent deletes both pass it, and only one of them removes the row —
+    // Close the namespace before inventorying it. The ownership check above
+    // read the org in a statement of its own, so two concurrent deletes both
+    // pass it; this claim is the one statement only one of them can win, and
     // the loser gets the same 404 as a request for an organization that was
-    // never there, rather than a success it did not cause.
-    if !org_ops::delete_org(db, id).await? {
+    // never there rather than a second retirement of the same storage.
+    //
+    // It is also what makes the inventory below mean something. Without it, a
+    // `POST /repos` that resolved this organization a moment earlier could
+    // commit its repository row after the inventory had already been taken, and
+    // the organization row would then disappear from underneath a live
+    // repository whose bytes nothing would ever collect (card_b6dd1fb60659).
+    if !org_ops::begin_org_retirement(db, id).await? {
         return Err(crate::error::not_found("organization"));
     }
-    Ok(())
+
+    if let Err(error) =
+        retire_org_repositories(db, repo_root, blob_storage, oci_storage, id, &org.name).await
+    {
+        // The failure is retryable — the organization and every repository not
+        // yet retired are exactly where they were — so the namespace has to
+        // reopen with them.
+        release_retirement_claim(db, id).await;
+        return Err(error);
+    }
+
+    // The claim outlives every failure until the row it marks is gone, this one
+    // included: a deletion that retired the storage and then could not remove
+    // the row would otherwise leave a marked organization with no repositories
+    // left, which no retry could ever claim again and no request could reopen.
+    match org_ops::delete_org(db, id).await {
+        // Nothing left to release — the row the marker lived on is gone.
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::error::not_found("organization")),
+        Err(error) => {
+            release_retirement_claim(db, id).await;
+            Err(error)
+        }
+    }
+}
+
+/// How many times the retirement loop re-reads the organization's repositories
+/// before giving up.
+///
+/// The claim stops new requests from resolving this organization at all, so the
+/// only repositories that can still appear are the ones already in flight when
+/// it landed. That set is finite and small; a pass that keeps finding more of
+/// them means something is creating repositories through a path that ignores
+/// the claim, and looping forever would hide that rather than report it.
+const MAX_ORG_RETIREMENT_PASSES: usize = 8;
+
+/// Retire every repository of a claimed organization, until a pass finds none.
+///
+/// One pass is not enough. A repository creation that resolved this
+/// organization before the claim landed can still commit its row afterwards, so
+/// the inventory is re-read until it comes back empty — at which point no row
+/// can appear any more, because every request that could have produced one has
+/// either committed (and been retired here) or will find the claim and refuse.
+async fn retire_org_repositories(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn crate::blob_storage::BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    id: i64,
+    org_name: &str,
+) -> Result<()> {
+    for pass in 0..MAX_ORG_RETIREMENT_PASSES {
+        // A database that cannot answer which repositories belong to this
+        // organization must not let the organization row disappear while their
+        // bytes remain live.
+        let repositories = rg_db::ops::repo_ops::list_by_org(db, id).await.context(
+            "failed to inventory the organization's repositories — its storage cannot be retired \
+             without them",
+        )?;
+        if repositories.is_empty() {
+            return Ok(());
+        }
+        if pass > 0 {
+            tracing::info!(
+                org_id = id,
+                pass,
+                repositories = repositories.len(),
+                "organization deletion found repositories created while it was retiring — \
+                 retiring them too"
+            );
+        }
+        for repo in &repositories {
+            if let Err(error) =
+                crate::repo::service::delete_repo(db, repo_root, blob_storage, oci_storage, repo)
+                    .await
+            {
+                tracing::error!(
+                    org_id = id,
+                    repo_id = repo.id,
+                    repo = %repo.name,
+                    error = %format!("{error:#}"),
+                    "organization deletion stopped: this repository's storage could not be \
+                     retired, so the organization row was left in place and the request can be \
+                     retried"
+                );
+                return Err(error.context(format!(
+                    "failed to retire repository '{}' (id {}) while deleting organization '{org_name}'",
+                    repo.name, repo.id
+                )));
+            }
+        }
+    }
+    Err(crate::error::conflict(format!(
+        "organization '{org_name}' is still gaining repositories after \
+         {MAX_ORG_RETIREMENT_PASSES} retirement passes; it was left in place"
+    )))
+}
+
+/// Reopen a namespace whose retirement could not finish.
+///
+/// The caller is already returning the original failure, so a failed release
+/// can only be reported: the organization stays visible and readable, but no
+/// repository can be created in it until the marker is cleared by hand or by a
+/// retried deletion that succeeds.
+async fn release_retirement_claim(db: &DatabaseConnection, id: i64) {
+    if let Err(error) = org_ops::abort_org_retirement(db, id).await {
+        tracing::error!(
+            org_id = id,
+            error = %format!("{error:#}"),
+            "failed to reopen an organization whose deletion was aborted — no repository can be \
+             created in it until its `deleted_at` marker is cleared"
+        );
+    }
 }
 
 /// Add a member to an organization.
@@ -304,4 +396,360 @@ pub async fn list_team_members(
     team_id: i64,
 ) -> Result<Vec<rg_db::entities::team_member::Model>> {
     org_ops::list_team_members(db, team_id).await
+}
+
+/// card_b6dd1fb60659: an organization's deletion and a repository creation into
+/// its namespace are two multi-statement lifecycles over storage no transaction
+/// can hold. Between them they must never leave a live repository whose
+/// organization is gone, and never leave its bytes where no collector walks.
+#[cfg(test)]
+mod org_retirement_race_tests {
+    use super::*;
+    use crate::blob_storage::LocalBlobStorage;
+    use crate::package_registry::oci::storage::OciStorage;
+    use rg_db::ops::{repo_ops, user_ops};
+    use sea_orm::{ConnectOptions, Database};
+    use std::sync::Arc;
+
+    async fn setup_db() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect in-memory database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    /// A throwaway SQLite file, removed with its WAL siblings on drop.
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempDb {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "cleanup must not mask the assertion that failed the test"
+        )]
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            }
+        }
+    }
+
+    /// A migrated database with more than one pooled connection, so concurrent
+    /// tasks really do run their statements against separate connections.
+    async fn setup_pooled_db(label: &str) -> (DatabaseConnection, TempDb) {
+        let temp = TempDb {
+            path: std::env::temp_dir().join(format!(
+                "forgekeep-org-race-{label}-{}.db",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        let url = format!("sqlite://{}?mode=rwc", temp.path.display());
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .expect("connect to throwaway database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        (db, temp)
+    }
+
+    fn oci_storage_for(repo_root: &std::path::Path) -> OciStorage {
+        OciStorage::from_backend(
+            Arc::new(LocalBlobStorage::new(repo_root)),
+            repo_root.join("_oci_uploads"),
+        )
+    }
+
+    /// A user, an organization they own, and the root their storage lives under.
+    async fn seed_org(
+        db: &DatabaseConnection,
+        login: &str,
+        org_name: &str,
+    ) -> (i64, i64, tempfile::TempDir, std::path::PathBuf) {
+        let owner = user_ops::create_user(
+            db,
+            login,
+            &format!("{login}@example.invalid"),
+            "unused",
+            "Race Owner",
+        )
+        .await
+        .expect("create owner");
+        let org = create_org(db, org_name, None, None, owner.id, "public")
+            .await
+            .expect("create organization");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        (owner.id, org.id, sandbox, repo_root)
+    }
+
+    /// Every repository row of `org_id` whose organization no longer exists.
+    async fn orphaned_repositories(db: &DatabaseConnection, org_id: i64) -> Vec<String> {
+        if org_ops::get_org(db, org_id)
+            .await
+            .expect("read organization")
+            .is_some()
+        {
+            return Vec::new();
+        }
+        repo_ops::list_by_org(db, org_id)
+            .await
+            .expect("inventory organization repositories")
+            .into_iter()
+            .map(|repo| repo.name)
+            .collect()
+    }
+
+    /// The request resolved the organization before the deletion claimed it, so
+    /// nothing on the create path could have refused it up front. It commits
+    /// its row, finds the claim, and takes both the row and the Git tree back
+    /// out — the alternative is a live repository owned by nobody.
+    #[tokio::test]
+    async fn a_repository_that_commits_after_the_retirement_claim_undoes_itself() {
+        let db = setup_db().await;
+        let (owner_id, org_id, _sandbox, repo_root) =
+            seed_org(&db, "late-create-owner", "late-create-org").await;
+
+        // Exactly what `delete_org` does first, and the only state a create that
+        // resolved a moment earlier can still discover.
+        assert!(
+            org_ops::begin_org_retirement(&db, org_id)
+                .await
+                .expect("claim the organization"),
+            "the first claim on an untouched organization must win"
+        );
+
+        let error = crate::repo::service::create_repo(
+            &db,
+            owner_id,
+            "late",
+            None,
+            false,
+            &repo_root,
+            Some(org_id),
+        )
+        .await
+        .expect_err("a repository must not be created into a retiring organization");
+        assert!(
+            format!("{error:#}").contains("being deleted"),
+            "the refusal does not say the organization is going away: {error:#}"
+        );
+
+        assert!(
+            repo_ops::list_by_org(&db, org_id)
+                .await
+                .expect("inventory organization repositories")
+                .is_empty(),
+            "the losing create left a live repository row in a retiring organization"
+        );
+        assert!(
+            !repo_root.join("late-create-org/late.git").exists(),
+            "the losing create left its Git tree behind"
+        );
+    }
+
+    /// A second claim is not a second deletion. Two concurrent deletes must not
+    /// both walk the same repositories' storage.
+    #[tokio::test]
+    async fn only_one_deletion_can_claim_an_organization() {
+        let db = setup_db().await;
+        let (_owner_id, org_id, _sandbox, _repo_root) =
+            seed_org(&db, "claim-owner", "claim-org").await;
+
+        assert!(org_ops::begin_org_retirement(&db, org_id).await.unwrap());
+        assert!(
+            !org_ops::begin_org_retirement(&db, org_id).await.unwrap(),
+            "a second deletion claimed an organization already being retired"
+        );
+
+        // And the namespace reopens exactly once the claim is released.
+        org_ops::abort_org_retirement(&db, org_id).await.unwrap();
+        assert!(
+            org_ops::begin_org_retirement(&db, org_id).await.unwrap(),
+            "a released claim did not reopen the organization"
+        );
+    }
+
+    /// The claim is what `delete_org` itself takes, not just an op sitting next
+    /// to it: an organization another deletion is already retiring must not have
+    /// its storage walked a second time, and the loser answers like a name that
+    /// is not there.
+    #[tokio::test]
+    async fn a_deletion_refuses_an_organization_another_deletion_already_claimed() {
+        let db = setup_db().await;
+        let (owner_id, org_id, _sandbox, repo_root) =
+            seed_org(&db, "second-delete-owner", "second-delete-org").await;
+        crate::repo::service::create_repo(
+            &db,
+            owner_id,
+            "held",
+            None,
+            false,
+            &repo_root,
+            Some(org_id),
+        )
+        .await
+        .expect("create organization repository");
+
+        assert!(org_ops::begin_org_retirement(&db, org_id).await.unwrap());
+
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let refused = delete_org(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            org_id,
+            OrgDeleteActor::Owner(owner_id),
+        )
+        .await
+        .expect_err("a second deletion retired an organization already being retired");
+        assert!(
+            format!("{refused:#}").contains("organization"),
+            "the loser's refusal does not name the organization: {refused:#}"
+        );
+        assert!(
+            repo_root.join("second-delete-org/held.git").exists(),
+            "the losing deletion walked the storage the first one owns"
+        );
+        assert!(
+            org_ops::get_org(&db, org_id).await.unwrap().is_some(),
+            "the losing deletion removed the organization row the first one claimed"
+        );
+    }
+
+    /// A deletion that cannot retire a repository leaves everything retryable —
+    /// including the namespace. A claim that outlived its failed deletion would
+    /// be a namespace no request can create in and no request can reopen.
+    #[tokio::test]
+    async fn a_failed_deletion_reopens_the_namespace_it_claimed() {
+        let db = setup_db().await;
+        let (owner_id, org_id, _sandbox, repo_root) =
+            seed_org(&db, "reopen-owner", "reopen-org").await;
+        crate::repo::service::create_repo(
+            &db,
+            owner_id,
+            "kept",
+            None,
+            false,
+            &repo_root,
+            Some(org_id),
+        )
+        .await
+        .expect("create organization repository");
+
+        // A repository whose storage cannot be staged fails the deletion: the
+        // blob root is a file, so the OCI upload tree under it cannot be made.
+        let broken_root = repo_root.join("_oci_uploads");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(&broken_root, b"not a directory").unwrap();
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let failed = delete_org(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &OciStorage::from_backend(
+                Arc::new(LocalBlobStorage::new(&repo_root)),
+                broken_root.join("nested"),
+            ),
+            org_id,
+            OrgDeleteActor::Owner(owner_id),
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "a repository whose storage could not be retired was reported as a deleted organization"
+        );
+
+        assert!(
+            org_ops::org_is_active(&db, org_id)
+                .await
+                .expect("read organization retirement state"),
+            "a failed deletion left the organization claimed and its namespace closed"
+        );
+        // Which is only meaningful if a create can actually use it again.
+        crate::repo::service::create_repo(
+            &db,
+            owner_id,
+            "after-retry",
+            None,
+            false,
+            &repo_root,
+            Some(org_id),
+        )
+        .await
+        .expect("the reopened namespace still refuses new repositories");
+    }
+
+    /// The invariant under real concurrency, both orderings included: whichever
+    /// of the two wins, no live repository row may name an organization that is
+    /// gone. The create may lose and undo itself, or commit early enough for the
+    /// deletion's re-inventory to retire it — never neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_create_and_delete_never_orphan_a_repository() {
+        for attempt in 0..12 {
+            // Pooled and file-backed on purpose. `sqlite::memory:` with one
+            // connection makes the two tasks take turns on that connection, so
+            // the interleaving this test exists for never happens and it would
+            // pass against code with no protocol at all.
+            let (db, _temp) = setup_pooled_db(&format!("org-race-{attempt}")).await;
+            let login = format!("race-owner-{attempt}");
+            let org_name = format!("race-org-{attempt}");
+            let (owner_id, org_id, _sandbox, repo_root) = seed_org(&db, &login, &org_name).await;
+            std::fs::create_dir_all(&repo_root).unwrap();
+
+            let create_db = db.clone();
+            let create_root = repo_root.clone();
+            let create = async move {
+                crate::repo::service::create_repo(
+                    &create_db,
+                    owner_id,
+                    "contested",
+                    None,
+                    false,
+                    &create_root,
+                    Some(org_id),
+                )
+                .await
+            };
+            let delete_db = db.clone();
+            let delete_root = repo_root.clone();
+            let delete = async move {
+                let blob_storage = LocalBlobStorage::new(&delete_root);
+                delete_org(
+                    &delete_db,
+                    &delete_root,
+                    &blob_storage,
+                    &oci_storage_for(&delete_root),
+                    org_id,
+                    OrgDeleteActor::Owner(owner_id),
+                )
+                .await
+            };
+            let (created, deleted) = tokio::join!(create, delete);
+
+            let orphans = orphaned_repositories(&db, org_id).await;
+            assert!(
+                orphans.is_empty(),
+                "attempt {attempt}: the organization is gone but these repositories are still \
+                 live: {orphans:?} (create: {:?}, delete: {:?})",
+                created
+                    .as_ref()
+                    .map(|repo| repo.id)
+                    .map_err(|e| format!("{e:#}")),
+                deleted.as_ref().map_err(|e| format!("{e:#}")),
+            );
+            // A deletion that reported success owns the whole namespace: no Git
+            // tree of the losing create may outlive it.
+            if deleted.is_ok() {
+                assert!(
+                    !repo_root.join(format!("{org_name}/contested.git")).exists(),
+                    "attempt {attempt}: the deleted organization left the contested repository's \
+                     Git tree on disk"
+                );
+            }
+        }
+    }
 }
