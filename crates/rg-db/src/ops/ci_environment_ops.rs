@@ -1,7 +1,10 @@
-use crate::entities::{ci_environment, ci_environment_approval, pipeline_job};
+use crate::entities::{
+    ci_environment, ci_environment_approval, pipeline_job,
+    user::{self, Entity as UserEntity},
+};
 use crate::user_grants::{self, Target};
 use anyhow::{Context, Result};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::*;
 
 pub async fn list(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<ci_environment::Model>> {
@@ -223,12 +226,27 @@ pub async fn add_approval(
         Err(error) => Err(error).context("db: add environment approval"),
     }
 }
+/// Count approvals that still carry a current authorization verdict.
+///
+/// Approval rows are durable history and survive account deletion with a null
+/// actor. A missing, deactivated, or retiring approver must not keep a waiting
+/// deployment authorized, even though [`list_approvals`] still returns the row.
 pub async fn count_approvals(db: &DatabaseConnection, job_id: i64) -> Result<u64> {
-    ci_environment_approval::Entity::find()
-        .filter(ci_environment_approval::Column::JobId.eq(job_id))
+    UserEntity::find()
+        .filter(
+            user::Column::Id.in_subquery(
+                Query::select()
+                    .column(ci_environment_approval::Column::ApprovedBy)
+                    .from(ci_environment_approval::Entity)
+                    .and_where(ci_environment_approval::Column::JobId.eq(job_id))
+                    .to_owned(),
+            ),
+        )
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
         .count(db)
         .await
-        .context("db: count environment approvals")
+        .context("db: count live environment approvers")
 }
 pub async fn list_approvals(
     db: &DatabaseConnection,

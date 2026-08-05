@@ -38,6 +38,53 @@ async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
         .expect("registered user must exist");
 }
 
+async fn seed_waiting_environment_job(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    environment: &rg_db::entities::ci_environment::Model,
+    marker: char,
+) -> (i64, i64) {
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        &marker.to_string().repeat(40),
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .expect("create approval pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "deploy", 0)
+        .await
+        .expect("create approval stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        stage.id,
+        "production",
+        "echo deploy",
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create approval job");
+    rg_db::ops::ci_environment_ops::attach_job(db, job.id, Some(environment), "production")
+        .await
+        .expect("attach protected environment");
+    assert!(
+        rg_db::ops::pipeline_ops::try_pause_stage_at_manual(db, stage.id)
+            .await
+            .expect("pause pipeline for environment approval")
+    );
+    (pipeline.id, job.id)
+}
+
 /// A review is durable history, but its approval is a live authorization
 /// verdict. Deactivation, the retirement marker, and final account deletion
 /// must all revoke that verdict without erasing the review from the timeline.
@@ -231,6 +278,200 @@ async fn ghost_review_stays_in_history_but_stops_authorizing_merge() {
             .iter()
             .any(|event| event["kind"] == "review_approve" && event["actor"].is_null()),
         "the approval did not remain as ghost-authored history: {timeline:?}"
+    );
+}
+
+/// Environment approvals are durable deployment history, but only approvals
+/// from currently usable accounts may release a waiting job.
+#[tokio::test]
+async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_release() {
+    let (base, db, _state) = spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+
+    let (admin_token, admin_id) = register_full(&base, "env-admin", "env-admin@example.com").await;
+    promote_user_to_admin(&db, admin_id).await;
+    let (owner_token, _owner_id) = register_full(&base, "env-host", "env-host@example.com").await;
+    let (departing_token, departing_id) = register_full(
+        &base,
+        "departing-approver",
+        "departing-approver@example.com",
+    )
+    .await;
+    let (remaining_token, remaining_id) = register_full(
+        &base,
+        "remaining-approver",
+        "remaining-approver@example.com",
+    )
+    .await;
+    let repo_id = create_repo(&base, &owner_token, "approval-lifecycle").await;
+
+    let environment_response = client
+        .post(format!(
+            "{base}/api/v1/repos/env-host/approval-lifecycle/actions/environments"
+        ))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approver_ids": [departing_id, remaining_id]
+        }))
+        .send()
+        .await
+        .expect("create protected environment");
+    assert_eq!(environment_response.status(), 201);
+    let environment_id = environment_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("environment response body")["id"]
+        .as_i64()
+        .expect("environment id");
+    let environment = rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
+        .await
+        .expect("read environment")
+        .expect("environment disappeared");
+
+    let (baseline_pipeline_id, baseline_job_id) =
+        seed_waiting_environment_job(&db, repo_id, &environment, 'a').await;
+    let baseline_url = format!(
+        "{base}/api/v1/repos/env-host/approval-lifecycle/pipelines/{baseline_pipeline_id}/jobs/{baseline_job_id}/approve"
+    );
+    let first_live = client
+        .post(&baseline_url)
+        .bearer_auth(&departing_token)
+        .send()
+        .await
+        .expect("first live approval");
+    assert_eq!(first_live.status(), 200);
+    let first_live: serde_json::Value = first_live.json().await.expect("first approval body");
+    assert_eq!(first_live["approvals"], 1);
+    assert_eq!(first_live["released"], false);
+    let second_live = client
+        .post(&baseline_url)
+        .bearer_auth(&remaining_token)
+        .send()
+        .await
+        .expect("second live approval");
+    assert_eq!(second_live.status(), 200);
+    let second_live: serde_json::Value = second_live.json().await.expect("second approval body");
+    assert_eq!(second_live["approvals"], 2);
+    assert_eq!(second_live["released"], true);
+
+    let (pipeline_id, job_id) = seed_waiting_environment_job(&db, repo_id, &environment, 'b').await;
+    let approve_url = format!(
+        "{base}/api/v1/repos/env-host/approval-lifecycle/pipelines/{pipeline_id}/jobs/{job_id}/approve"
+    );
+    let initial = client
+        .post(&approve_url)
+        .bearer_auth(&departing_token)
+        .send()
+        .await
+        .expect("approval before account lifecycle changes");
+    assert_eq!(initial.status(), 200);
+    let initial: serde_json::Value = initial.json().await.expect("initial approval body");
+    assert_eq!(initial["approvals"], 1);
+    assert_eq!(initial["released"], false);
+
+    let deactivated = client
+        .patch(format!("{base}/api/v1/admin/users/{departing_id}"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"is_active": false}))
+        .send()
+        .await
+        .expect("deactivate approver");
+    assert_eq!(deactivated.status(), 200);
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+            .await
+            .expect("count after deactivation"),
+        0,
+        "a deactivated approver still contributes a current approval"
+    );
+
+    let reactivated = client
+        .patch(format!("{base}/api/v1/admin/users/{departing_id}"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"is_active": true}))
+        .send()
+        .await
+        .expect("reactivate approver");
+    assert_eq!(reactivated.status(), 200);
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+            .await
+            .expect("count after reactivation"),
+        1,
+        "reactivating the approver did not restore the approval"
+    );
+
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(&db, departing_id)
+            .await
+            .expect("mark approver for retirement")
+    );
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+            .await
+            .expect("count during retirement"),
+        0,
+        "an approver claimed for deletion still contributes a current approval"
+    );
+    rg_db::ops::user_ops::abort_user_retirement(&db, departing_id)
+        .await
+        .expect("release approver retirement marker");
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+            .await
+            .expect("count after retirement abort"),
+        1,
+        "releasing the retirement marker did not restore the approval"
+    );
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/admin/users/{departing_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("delete approver");
+    assert_eq!(
+        deleted.status(),
+        200,
+        "approver deletion failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+            .await
+            .expect("count after deletion"),
+        0,
+        "a deleted approver still contributes a current approval"
+    );
+    let history = rg_db::ops::ci_environment_ops::list_approvals(&db, job_id)
+        .await
+        .expect("read approval history after deletion");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].approved_by, None,
+        "the deleted approver's decision did not remain as ghost history"
+    );
+
+    let remaining = client
+        .post(&approve_url)
+        .bearer_auth(&remaining_token)
+        .send()
+        .await
+        .expect("remaining live approval");
+    assert_eq!(remaining.status(), 200);
+    let remaining: serde_json::Value = remaining.json().await.expect("remaining approval body");
+    assert_eq!(remaining["approvals"], 1);
+    assert_eq!(remaining["released"], false);
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(&db, job_id)
+            .await
+            .expect("read waiting job")
+            .expect("job disappeared")
+            .status,
+        "waiting_approval"
     );
 }
 
