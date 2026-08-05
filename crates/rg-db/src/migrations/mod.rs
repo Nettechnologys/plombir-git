@@ -94,6 +94,7 @@ pub mod m20260804_000005_wiki_page_edit_version;
 pub mod m20260804_000006_repo_fts_soft_delete;
 pub mod m20260805_000001_issue_labels_single_source;
 pub mod m20260805_000002_uploads_outlive_their_uploader;
+pub mod m20260805_000003_create_oci_publication_lease;
 
 use sea_orm_migration::prelude::*;
 
@@ -200,6 +201,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260804_000006_repo_fts_soft_delete::Migration),
             Box::new(m20260805_000001_issue_labels_single_source::Migration),
             Box::new(m20260805_000002_uploads_outlive_their_uploader::Migration),
+            Box::new(m20260805_000003_create_oci_publication_lease::Migration),
         ]
     }
 }

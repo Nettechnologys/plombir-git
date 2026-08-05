@@ -19,8 +19,9 @@ use rg_core::auth::oci_token::{
     build_www_authenticate, generate_oci_token, validate_oci_token, ParsedScope,
 };
 use rg_core::package_registry::oci::{
-    error_codes, is_client_digest_fault, media_types, ErrorDetail, ErrorResponse, FinalizedBlob,
-    ParsedManifest, Reference, StoredManifest, TagListResponse, API_VERSION,
+    acquire_publication_lease, error_codes, is_client_digest_fault, media_types, publish_blob,
+    release_publication_lease, BlobSource, ErrorDetail, ErrorResponse, OciPublicationBusy,
+    ParsedManifest, PublicationLease, Reference, StoredManifest, TagListResponse, API_VERSION,
 };
 
 use crate::api::repo_access;
@@ -114,6 +115,19 @@ impl OciDbStatus for sea_orm::DbErr {
 
 impl OciDbStatus for anyhow::Error {
     fn oci_status(&self) -> StatusCode {
+        // A concurrent push of the same digest still holds its publication
+        // lease. Nothing is wrong with this request and nothing is wrong with
+        // the registry — the key is simply being written by somebody else right
+        // now, and the client should come back. `docker push` retries a `503`
+        // and gives up on the `500` this would otherwise be.
+        if let Some(busy) = self.downcast_ref::<OciPublicationBusy>() {
+            tracing::warn!(
+                storage_key = %busy.key,
+                waited_seconds = busy.waited_seconds,
+                "OCI key is being published by a concurrent push, returning 503"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
         // `downcast_ref` sees through any `.context()` layers to the original
         // `DbErr`, mirroring `From<anyhow::Error> for AppError`.
         match self.downcast_ref::<sea_orm::DbErr>() {
@@ -904,10 +918,67 @@ pub async fn put_manifest(
         }
     }
 
-    // Store manifest on disk
+    // Store manifest on disk, under a lease on the key it is stored at.
+    //
+    // `store_manifest` deduplicates the same way `finalize_upload` does, and
+    // `published` is decided the same non-atomic way — so two concurrent first
+    // pushes of one manifest digest can hand the loser's rollback a key the
+    // winner's row already points at. The lease is what makes `published` mean
+    // what the rollback below reads it as.
+    let manifest_key = match state
+        .oci_storage
+        .manifest_storage_key(&owner, &repo, &parsed.digest)
+    {
+        Ok(key) => key,
+        Err(e) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{e:#}"),
+            );
+        }
+    };
+    let lease = match acquire_publication_lease(&state.db, &manifest_key).await {
+        Ok(lease) => lease,
+        Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+    };
+    let response = put_manifest_under_lease(
+        &state,
+        &owner,
+        &repo,
+        &reference,
+        &parsed,
+        content_type,
+        &body,
+        oci_repo.id,
+        user_id,
+        &referenced_blobs,
+        &lease,
+    )
+    .await;
+    release_publication_lease(&state.db, &lease).await;
+    response
+}
+
+/// Store the manifest object and record the row that publishes it, with this
+/// request holding the lease on the manifest's content-addressed key.
+#[allow(clippy::too_many_arguments)]
+async fn put_manifest_under_lease(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    reference: &str,
+    parsed: &ParsedManifest,
+    content_type: &str,
+    body: &str,
+    oci_repo_id: i64,
+    user_id: Option<i64>,
+    referenced_blobs: &[String],
+    lease: &PublicationLease,
+) -> Response {
     let stored_manifest = match state
         .oci_storage
-        .store_manifest(&owner, &repo, &parsed.digest, body.as_bytes())
+        .store_manifest(owner, repo, &parsed.digest, body.as_bytes())
         .await
     {
         Ok(stored) => stored,
@@ -920,7 +991,7 @@ pub async fn put_manifest(
         }
     };
 
-    let rf = Reference::parse(&reference);
+    let rf = Reference::parse(reference);
     let tag = if rf.is_tag() {
         match &rf {
             Reference::Tag(t) => Some(t.as_str()),
@@ -937,29 +1008,29 @@ pub async fn put_manifest(
     let manifest_write = if let Some(tag) = tag {
         rg_db::ops::oci_ops::upsert_tag_manifest(
             &state.db,
-            oci_repo.id,
+            oci_repo_id,
             tag,
             &parsed.digest,
             content_type,
             parsed.size as i64,
-            &body,
+            body,
             parsed.manifest.schema_version as i32,
             user_id,
-            &referenced_blobs,
+            referenced_blobs,
         )
         .await
         .map(|_| ())
     } else {
         rg_db::ops::oci_ops::insert_digest_manifest(
             &state.db,
-            oci_repo.id,
+            oci_repo_id,
             &parsed.digest,
             content_type,
             parsed.size as i64,
-            &body,
+            body,
             parsed.manifest.schema_version as i32,
             user_id,
-            &referenced_blobs,
+            referenced_blobs,
         )
         .await
         .map(|_| ())
@@ -976,8 +1047,16 @@ pub async fn put_manifest(
                 error = %format!("{e:#}"),
                 "failed to record OCI manifest"
             );
-            rollback_unrecorded_manifest(&state, &owner, &repo, &parsed.digest, &stored_manifest)
-                .await;
+            rollback_unrecorded_manifest(
+                state,
+                owner,
+                repo,
+                oci_repo_id,
+                &parsed.digest,
+                &stored_manifest,
+                lease,
+            )
+            .await;
             return oci_err(oci_status_for(&e), "UNKNOWN", "failed to record manifest");
         }
     }
@@ -1008,40 +1087,44 @@ pub async fn put_manifest(
 
 /// Remove a manifest object published by a request whose database transaction failed.
 ///
-/// A content-addressed retry may find bytes from an earlier successful push.
-/// Those are never ours to delete. A final database recheck also protects the
-/// narrow race where another request committed the same digest while this one
-/// was failing.
+/// Three things have to hold before the delete is safe, and each is a way this
+/// could destroy a live manifest:
+///
+/// * the object was published by *this* request — a content-addressed retry may
+///   find bytes from an earlier successful push, and those are never ours;
+/// * the lease on the key was granted, not taken over from a holder that may
+///   still be running;
+/// * no manifest row currently claims the digest, which covers the request that
+///   committed the same digest while this one was failing.
+///
+/// Anything short of all three keeps the object. An orphan costs disk; deleting
+/// a manifest a live row points at makes an image unpullable with its metadata
+/// intact.
 async fn rollback_unrecorded_manifest(
     state: &AppState,
     owner: &str,
     repo: &str,
+    oci_repo_id: i64,
     digest: &str,
     stored: &StoredManifest,
+    lease: &PublicationLease,
 ) {
     if !stored.published {
         return;
     }
+    if !lease.exclusive() {
+        tracing::warn!(
+            %owner,
+            %repo,
+            %digest,
+            storage_path = %stored.storage_path,
+            "orphaned OCI manifest: this request published under a taken-over lease and cannot prove the stored object is its own — it stays in storage rather than risk deleting a live manifest"
+        );
+        return;
+    }
 
-    match find_oci_repo(&state.db, owner, repo).await {
-        Ok(Some(oci_repo)) => {
-            match rg_db::ops::oci_ops::find_manifest_by_digest(&state.db, oci_repo.id, digest).await
-            {
-                Ok(Some(_)) => return,
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        %owner,
-                        %repo,
-                        %digest,
-                        storage_path = %stored.storage_path,
-                        error = %error,
-                        "possibly orphaned OCI manifest: the database recheck failed, so rollback kept the object"
-                    );
-                    return;
-                }
-            }
-        }
+    match rg_db::ops::oci_ops::find_manifest_by_digest(&state.db, oci_repo_id, digest).await {
+        Ok(Some(_)) => return,
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(
@@ -1049,22 +1132,19 @@ async fn rollback_unrecorded_manifest(
                 %repo,
                 %digest,
                 storage_path = %stored.storage_path,
-                error = %format!("{error:#}"),
-                "possibly orphaned OCI manifest: the repository recheck failed, so rollback kept the object"
+                error = %error,
+                "possibly orphaned OCI manifest: the database recheck failed, so rollback kept the object"
             );
             return;
         }
     }
 
-    let cleanup = match rg_core::blob_storage::BlobKey::new(&stored.storage_path) {
-        Ok(key) => state
-            .blob_storage
-            .delete(&key)
-            .await
-            .err()
-            .map(|error| error.to_string()),
-        Err(error) => Some(error.to_string()),
-    };
+    let cleanup = state
+        .oci_storage
+        .discard_published_object(&stored.storage_path)
+        .await
+        .err()
+        .map(|error| format!("{error:#}"));
     if let Some(reason) = cleanup {
         tracing::warn!(
             %owner,
@@ -1340,38 +1420,26 @@ async fn handle_mount(
         Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
     };
 
-    // Copy blob file via hardlink (or fallback to streaming copy) — avoids memory copy
-    match state
-        .oci_storage
-        .copy_blob_file(from_owner, from_repo, owner, repo, mount_digest)
-        .await
+    // Copy blob file via hardlink (or fallback to streaming copy) — avoids
+    // memory copy. Same publication protocol as a finalized upload: a mount
+    // publishes into the destination repository's content-addressed key, so a
+    // concurrent push of that digest is racing for the same bytes.
+    match publish_blob(
+        &state.db,
+        &state.oci_storage,
+        oci_repo.id,
+        owner,
+        repo,
+        mount_digest,
+        BlobSource::Mount {
+            from_owner,
+            from_repo,
+        },
+    )
+    .await
     {
         Ok(blob) => {
-            let FinalizedBlob {
-                digest,
-                size,
-                storage_path,
-                published,
-            } = blob;
-            if let Err(error) = rg_db::ops::oci_ops::insert_blob(
-                &state.db,
-                oci_repo.id,
-                &digest,
-                "application/octet-stream",
-                size,
-                &storage_path,
-            )
-            .await
-            {
-                rollback_unrecorded_blob(state, owner, repo, &digest, &storage_path, published)
-                    .await;
-                return oci_err(
-                    oci_status_for(&error),
-                    "UNKNOWN",
-                    &format!("failed to record mounted blob {digest}: {error}"),
-                );
-            }
-
+            let digest = blob.digest;
             let location = format!("/v2/{owner}/{repo}/blobs/{digest}");
             (
                 StatusCode::CREATED,
@@ -1383,48 +1451,11 @@ async fn handle_mount(
             )
                 .into_response()
         }
-        Err(e) => oci_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("{e:#}"),
-        ),
-    }
-}
-
-/// Remove bytes published by a request whose database row was not recorded.
-///
-/// A deduplicated publish must never be rolled back: those bytes predate this
-/// request and may already be referenced by a successful push or mount.
-async fn rollback_unrecorded_blob(
-    state: &AppState,
-    owner: &str,
-    repo: &str,
-    digest: &str,
-    storage_path: &str,
-    published: bool,
-) {
-    if !published {
-        return;
-    }
-
-    let cleanup = match rg_core::blob_storage::BlobKey::new(storage_path) {
-        Ok(key) => state
-            .blob_storage
-            .delete(&key)
-            .await
-            .err()
-            .map(|error| error.to_string()),
-        Err(error) => Some(error.to_string()),
-    };
-    if let Some(reason) = cleanup {
-        tracing::warn!(
-            %owner,
-            %repo,
-            %digest,
-            %storage_path,
-            error = %reason,
-            "orphaned OCI blob: the oci_blobs row was not created and the rollback delete failed too"
-        );
+        // A copy that could not run and a row that could not be written are
+        // both the registry's fault, but a database outage and a key another
+        // push is still holding are retryable and a flat `500` says they are
+        // not — ask the error which.
+        Err(e) => oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     }
 }
 
@@ -1616,64 +1647,26 @@ pub async fn complete_upload(
     // could resolve — or create — a different one.
     let oci_repo_id = upload.oci_repository_id;
 
-    // Finalize: stream-read upload file, verify digest, move to blob storage
-    match state
-        .oci_storage
-        .finalize_upload(&owner, &repo, &uuid, &expected_digest)
-        .await
+    // Finalize and publish: hash the staged file, move it to its
+    // content-addressed key, and record the row that makes it reachable — all
+    // under a lease on that key, so a failure here can tell its own bytes from
+    // bytes a concurrent push of the same digest is entitled to. Answering
+    // `201 Created` without the row is how a push "succeeds" into a repository
+    // whose very next `HEAD .../blobs/` returns 404, so the failure has to
+    // reach the client either way.
+    match publish_blob(
+        &state.db,
+        &state.oci_storage,
+        oci_repo_id,
+        &owner,
+        &repo,
+        &expected_digest,
+        BlobSource::Upload { uuid: &uuid },
+    )
+    .await
     {
         Ok(blob) => {
-            let FinalizedBlob {
-                digest,
-                size,
-                storage_path,
-                published,
-            } = blob;
-            // Record blob in DB. `insert_blob` treats the content-addressed
-            // `(repository, digest)` conflict as an idempotent success, so a
-            // retry and two concurrent finalizers both reach the 201 below.
-            //
-            // The bytes are already in blob storage; without this row nothing
-            // can find them. Answering `201 Created` anyway is how a push
-            // "succeeds" into a repository whose very next `HEAD .../blobs/`
-            // returns 404 — the client has no reason to retry something it was
-            // told worked, so the failure has to reach it.
-            if let Err(e) = rg_db::ops::oci_ops::insert_blob(
-                &state.db,
-                oci_repo_id,
-                &digest,
-                "application/octet-stream",
-                size,
-                &storage_path,
-            )
-            .await
-            {
-                // Compensation on the error path, and only where it is ours to
-                // make: `published` means this request is what put the bytes at
-                // that key, so nothing else can be pointing at them. Every way
-                // of reaching an OCI blob for deletion goes through its
-                // `oci_blobs` row, so bytes left without one are unreachable —
-                // a layer-sized object no reclamation, present or future, can
-                // come back for.
-                //
-                // The `false` arm is not an omission. Finalizing deduplicates: a
-                // key that already held these bytes is reused untouched, and an
-                // earlier push has a row for it. Deleting there would answer a
-                // failed push by making somebody else's image unpullable, which
-                // is strictly worse than the leak this compensates.
-                //
-                // Duplicate digests never enter this branch. A real database
-                // failure must still reach the client, so a failed rollback
-                // can only be reported here.
-                rollback_unrecorded_blob(&state, &owner, &repo, &digest, &storage_path, published)
-                    .await;
-                return oci_err(
-                    oci_status_for(&e),
-                    "UNKNOWN",
-                    &format!("failed to record blob {digest}: {e}"),
-                );
-            }
-
+            let digest = blob.digest;
             // Clean up upload session. The blob is committed at this point, so a
             // failure here leaks a session row rather than losing data — worth a
             // warning, not a failed push.

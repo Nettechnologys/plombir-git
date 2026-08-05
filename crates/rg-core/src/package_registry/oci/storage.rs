@@ -254,6 +254,48 @@ impl OciStorage {
             .map_err(Into::into)
     }
 
+    /// The backend key a blob of `digest` lives under, as stored in
+    /// `oci_blobs.storage_path`.
+    ///
+    /// Published so a caller can name the key *before* publishing into it —
+    /// which is what taking a publication lease requires. See
+    /// [`super::publication`].
+    pub fn blob_storage_key(
+        &self,
+        owner: &str,
+        repo: &str,
+        digest: &str,
+    ) -> anyhow::Result<String> {
+        Ok(self.blob_key(owner, repo, digest)?.to_string())
+    }
+
+    /// The backend key a manifest of `digest` lives under.
+    pub fn manifest_storage_key(
+        &self,
+        owner: &str,
+        repo: &str,
+        digest: &str,
+    ) -> anyhow::Result<String> {
+        Ok(self.manifest_key(owner, repo, digest)?.to_string())
+    }
+
+    /// Remove an object this request published but could not record.
+    ///
+    /// The delete goes through the registry's own backend rather than whatever
+    /// other handle the caller happens to hold. With `[server].oci_storage_path`
+    /// configured the registry publishes into a different store than the rest
+    /// of ForgeKeep, and a compensation aimed at the other one deletes nothing
+    /// while reporting that it cleaned up — the layer leaks and nobody hears
+    /// about it.
+    ///
+    /// Callers must satisfy themselves that the bytes are theirs to take back;
+    /// this only performs the delete.
+    pub async fn discard_published_object(&self, storage_path: &str) -> anyhow::Result<()> {
+        let key = BlobKey::new(storage_path)?;
+        self.backend.delete(&key).await?;
+        Ok(())
+    }
+
     fn manifest_key(&self, owner: &str, repo: &str, digest: &str) -> anyhow::Result<BlobKey> {
         let (algorithm, hash) = digest_parts(digest)?;
         BlobKey::from_segments(["oci", owner, repo, "manifests", algorithm, hash])

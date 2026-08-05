@@ -1,9 +1,11 @@
 //! OCI Registry database operations.
 //!
-//! Covers oci_repository, oci_manifest, oci_blob, and oci_upload tables.
+//! Covers oci_repository, oci_manifest, oci_blob, oci_upload and
+//! oci_publication_lease tables.
 
-use crate::entities::{oci_blob, oci_manifest, oci_repository, oci_upload};
+use crate::entities::{oci_blob, oci_manifest, oci_publication_lease, oci_repository, oci_upload};
 use chrono::Utc;
+use sea_orm::prelude::DateTimeUtc;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::*;
 
@@ -590,4 +592,111 @@ pub async fn cleanup_expired_uploads(db: &DatabaseConnection) -> Result<u64, DbE
         .exec(db)
         .await?;
     Ok(result.rows_affected)
+}
+
+// ── OCI publication lease ───────────────────────────────────
+
+/// Outcome of a bid for the publication lease over one storage key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationLeaseBid {
+    /// Nobody held the key; it is now held by the bidding token.
+    Granted,
+    /// The previous holder's lease had expired and was taken over. Expiry is a
+    /// guess about a dead process, not a fact — the old holder may still be
+    /// running, so a taker cannot claim exclusivity over the stored bytes.
+    TakenOver,
+    /// Another request holds a live lease. The caller polls.
+    Busy,
+}
+
+/// Bid for the exclusive right to publish the bytes under one storage key.
+///
+/// The key is content-addressed and stable, so blob storage cannot tell two
+/// concurrent first publications apart — `exists` answers the same for the
+/// request that wrote the bytes and the request that merely found them. This
+/// row is the arbiter instead, and it arbitrates across processes because the
+/// winner is decided by the database.
+///
+/// Claiming is an insert rather than an update: unlike an LFS object, an OCI
+/// blob has no row of its own until the publication it is protecting has
+/// already succeeded. The unique key on `storage_key` makes exactly one
+/// concurrent inserter the holder, and the conflict is resolved inside the
+/// statement so the losers never have to recognise a driver's duplicate-key
+/// error — the same reason [`insert_blob`] handles its conflict this way.
+pub async fn bid_for_publication_lease(
+    db: &DatabaseConnection,
+    storage_key: &str,
+    token: &str,
+    stale_before: DateTimeUtc,
+) -> Result<PublicationLeaseBid, DbErr> {
+    use oci_publication_lease::Entity as Lease;
+    let now = Utc::now();
+
+    Lease::insert(oci_publication_lease::ActiveModel {
+        id: NotSet,
+        storage_key: Set(storage_key.to_string()),
+        token: Set(token.to_string()),
+        since: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(oci_publication_lease::Column::StorageKey)
+            // MySQL has no conflict target and needs a harmless assignment as
+            // its DO NOTHING polyfill. PostgreSQL and SQLite emit DO NOTHING
+            // for the column above.
+            .do_nothing_on([oci_publication_lease::Column::Id])
+            .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await?;
+
+    // Whether the insert above landed is not something every backend will say,
+    // so ask the row who holds it.
+    let Some(held) = Lease::find()
+        .filter(oci_publication_lease::Column::StorageKey.eq(storage_key))
+        .one(db)
+        .await?
+    else {
+        // The holder released between the insert and this read, taking the row
+        // with it. The key is free but this token does not hold it, and saying
+        // otherwise would hand out a lease nothing records — the caller bids
+        // again.
+        return Ok(PublicationLeaseBid::Busy);
+    };
+    if held.token == token {
+        return Ok(PublicationLeaseBid::Granted);
+    }
+
+    // Someone else holds it. Only an expired hold may be taken over, and only
+    // from the exact holder this read saw: filtering on the old token is what
+    // keeps two waiters from both believing they took over the same lease.
+    let taken_over = Lease::update_many()
+        .col_expr(oci_publication_lease::Column::Token, Expr::value(token))
+        .col_expr(oci_publication_lease::Column::Since, Expr::value(now))
+        .filter(oci_publication_lease::Column::StorageKey.eq(storage_key))
+        .filter(oci_publication_lease::Column::Token.eq(held.token))
+        .filter(oci_publication_lease::Column::Since.lt(stale_before))
+        .exec(db)
+        .await?;
+    if taken_over.rows_affected > 0 {
+        return Ok(PublicationLeaseBid::TakenOver);
+    }
+
+    Ok(PublicationLeaseBid::Busy)
+}
+
+/// Release a publication lease. Returns whether this token still held it —
+/// `false` means the lease had already been taken over, which is exactly the
+/// case where the holder must not assume its stored bytes are still its own.
+pub async fn release_publication_lease(
+    db: &DatabaseConnection,
+    storage_key: &str,
+    token: &str,
+) -> Result<bool, DbErr> {
+    use oci_publication_lease::Entity as Lease;
+    let released = Lease::delete_many()
+        .filter(oci_publication_lease::Column::StorageKey.eq(storage_key))
+        .filter(oci_publication_lease::Column::Token.eq(token))
+        .exec(db)
+        .await?;
+    Ok(released.rows_affected > 0)
 }

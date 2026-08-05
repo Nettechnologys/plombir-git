@@ -9,7 +9,8 @@
 use std::time::Duration;
 
 use crate::common::fault::{
-    fail_db_writes, spawn_test_app_with_faults, spawn_test_app_with_two_put_gate, DbWrite,
+    fail_db_writes, spawn_test_app_with_faults, spawn_test_app_with_first_put_gate,
+    spawn_test_app_with_two_put_gate, DbWrite,
 };
 use crate::common::{create_issue, create_repo, register_full, spawn_test_app_with_db};
 use reqwest::multipart::{Form, Part};
@@ -528,9 +529,17 @@ async fn a_second_put_of_the_same_manifest_digest_is_idempotent() {
     );
 }
 
-/// Two manifest PUTs are forced through storage together before either reaches
-/// the unique database key. Both are valid publishes; the database serializes
-/// them without double-counting their blob references.
+/// Two concurrent PUTs of one manifest digest both succeed, and the second one
+/// never enters the storage write while the first owns the key.
+///
+/// It used to rendezvous both writes inside the blob store and assert only the
+/// outcome. That interleaving is the hazard, not the contract: with both
+/// requests holding the same content-addressed key, `published` stops meaning
+/// "these bytes are mine" and the loser's rollback deletes the winner's
+/// manifest. The publication lease keeps the second request outside the storage
+/// layer entirely, so the invariant to state is that it stays there — the
+/// arrival count is what proves it, and the outcome assertions below are the
+/// ones the old test already made.
 #[tokio::test]
 async fn concurrent_puts_of_the_same_manifest_digest_both_succeed() {
     let config = b"{\"architecture\":\"arm64\",\"os\":\"linux\"}";
@@ -545,7 +554,7 @@ async fn concurrent_puts_of_the_same_manifest_digest_both_succeed() {
     );
     let hash = manifest_digest.strip_prefix("sha256:").unwrap();
     let needle = format!("manifests/sha256/{hash}");
-    let (base, db, gate) = spawn_test_app_with_two_put_gate(&needle).await;
+    let (base, db, gate) = spawn_test_app_with_first_put_gate(&needle).await;
     let client = reqwest::Client::new();
     let (token, _user_id) =
         register_full(&base, "manifest_race", "manifest_race@example.com").await;
@@ -574,24 +583,28 @@ async fn concurrent_puts_of_the_same_manifest_digest_both_succeed() {
         })
     };
 
-    let mut left = publish();
-    let mut right = publish();
+    let left = publish();
+    assert!(
+        gate.await_first().await,
+        "the first manifest PUT never reached the storage write"
+    );
+
+    // Only now does the second request start, with the first one holding the
+    // lease and its object already under the shared key.
+    let right = publish();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        gate.arrivals(),
+        1,
+        "the second manifest PUT reached the shared key while the first still held the lease"
+    );
+
+    gate.release_first();
     let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::select! {
-            left_result = &mut left => {
-                let left_result = left_result.unwrap();
-                gate.release_second();
-                (left_result, right.await.unwrap())
-            }
-            right_result = &mut right => {
-                let right_result = right_result.unwrap();
-                gate.release_second();
-                (right_result, left.await.unwrap())
-            }
-        }
+        (left.await.unwrap(), right.await.unwrap())
     })
     .await
-    .expect("both manifest PUTs reached the gated storage write and completed");
+    .expect("both manifest PUTs completed once the lease was released");
 
     for response in [first, second] {
         let status = response.status();

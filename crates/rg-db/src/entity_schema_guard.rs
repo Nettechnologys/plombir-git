@@ -90,6 +90,7 @@ probed_entities!(
     oauth_account,
     oci_blob,
     oci_manifest,
+    oci_publication_lease,
     oci_repository,
     oci_upload,
     organization,

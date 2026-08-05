@@ -438,6 +438,165 @@ impl TwoPutGate {
     }
 }
 
+/// Control for a race whose *second* request must never reach the write.
+///
+/// [`TwoPutGate`] rendezvouses both matching writes before either proceeds, so
+/// it can only express a race the server lets happen. A publication lease makes
+/// the opposite the invariant: while one request owns a content-addressed key,
+/// a second request for that key waits outside the storage layer entirely. This
+/// gate holds the first matching write and counts arrivals, so a test can state
+/// that — "one arrival, and still one after the second request has had time" —
+/// instead of deadlocking against a barrier that will never fill.
+#[derive(Clone)]
+pub struct FirstPutGate {
+    arrivals: Arc<AtomicUsize>,
+    reached: Arc<tokio::sync::Notify>,
+    released: Arc<AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl FirstPutGate {
+    /// How many matching writes have entered the storage layer so far.
+    pub fn arrivals(&self) -> usize {
+        self.arrivals.load(Ordering::SeqCst)
+    }
+
+    /// Wait for the first matching write to reach the gate. Returns false on
+    /// timeout, so a broken protocol fails an assertion instead of hanging.
+    pub async fn await_first(&self) -> bool {
+        for _ in 0..200 {
+            if self.arrivals() > 0 {
+                return true;
+            }
+            let reached = self.reached.notified();
+            if self.arrivals() > 0 {
+                return true;
+            }
+            if tokio::time::timeout(std::time::Duration::from_millis(50), reached)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+        }
+        false
+    }
+
+    pub fn release_first(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+/// Backend decorator behind [`FirstPutGate`].
+struct GateFirstPut {
+    inner: Arc<dyn BlobStorage>,
+    needle: String,
+    gate: FirstPutGate,
+}
+
+impl GateFirstPut {
+    fn wrap(inner: Arc<dyn BlobStorage>, needle: &str) -> (Arc<dyn BlobStorage>, FirstPutGate) {
+        let gate = FirstPutGate {
+            arrivals: Arc::new(AtomicUsize::new(0)),
+            reached: Arc::new(tokio::sync::Notify::new()),
+            released: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let storage = Arc::new(Self {
+            inner,
+            needle: needle.to_string(),
+            gate: gate.clone(),
+        });
+        (storage, gate)
+    }
+
+    async fn pause_first_write(&self, key: &BlobKey) {
+        if !key.as_str().contains(&self.needle) {
+            return;
+        }
+        let arrival = self.gate.arrivals.fetch_add(1, Ordering::SeqCst);
+        self.gate.reached.notify_waiters();
+        if arrival > 0 {
+            return;
+        }
+        loop {
+            let released = self.gate.release.notified();
+            if self.gate.released.load(Ordering::SeqCst) {
+                break;
+            }
+            released.await;
+        }
+    }
+}
+
+impl BlobStorage for GateFirstPut {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a BlobKey,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<BlobMetadata>> {
+        Box::pin(async move {
+            self.pause_first_write(key).await;
+            self.inner.put(key, data).await
+        })
+    }
+
+    fn put_file<'a>(
+        &'a self,
+        key: &'a BlobKey,
+        source: &'a std::path::Path,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<BlobMetadata>> {
+        Box::pin(async move {
+            self.pause_first_write(key).await;
+            self.inner.put_file(key, source).await
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<Vec<u8>>> {
+        self.inner.get(key)
+    }
+
+    fn metadata<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<BlobMetadata>> {
+        self.inner.metadata(key)
+    }
+
+    fn exists<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<bool>> {
+        self.inner.exists(key)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a BlobKey,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<bool>> {
+        self.inner.delete(key)
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: Option<&'a BlobKey>,
+    ) -> BoxFuture<'a, rg_core::blob_storage::Result<Vec<BlobMetadata>>> {
+        self.inner.list(prefix)
+    }
+
+    fn local_path(&self, key: &BlobKey) -> Option<std::path::PathBuf> {
+        self.inner.local_path(key)
+    }
+}
+
 struct GateTwoPuts {
     inner: Arc<dyn BlobStorage>,
     needle: String,
@@ -730,6 +889,37 @@ pub async fn spawn_test_app_with_faults() -> (String, rg_db::DatabaseConnection,
 
 /// Spawn a server whose first two matching blob writes can be sequenced by a
 /// test after both requests have crossed their version-existence reads.
+/// Spawn an app whose first write to a key containing `needle` is held open.
+pub async fn spawn_test_app_with_first_put_gate(
+    needle: &str,
+) -> (String, rg_db::DatabaseConnection, FirstPutGate) {
+    let (db, dir) = super::setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let (blob_storage, gate) = GateFirstPut::wrap(
+        Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root)),
+        needle,
+    );
+    let state = super::build_test_app_state_with(
+        db.clone(),
+        repo_root,
+        super::StateOverrides {
+            blob_storage: Some(blob_storage),
+            ..Default::default()
+        },
+    );
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    super::wait_for_listener(&addr.to_string()).await;
+    (base_url, db, gate)
+}
+
 pub async fn spawn_test_app_with_two_put_gate(
     needle: &str,
 ) -> (String, rg_db::DatabaseConnection, TwoPutGate) {

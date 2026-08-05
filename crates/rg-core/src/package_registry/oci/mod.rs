@@ -6,10 +6,15 @@
 //! - Chunked upload support
 
 pub mod manifest;
+pub mod publication;
 pub mod storage;
 pub mod types;
 
 pub use manifest::{Manifest, ManifestDescriptor, ManifestLayer, ParsedManifest};
+pub use publication::{
+    acquire_publication_lease, publish_blob, release_publication_lease, BlobSource,
+    OciPublicationBusy, PublicationLease,
+};
 pub use storage::{
     is_client_digest_fault, DigestMismatch, FinalizedBlob, InvalidDigest, OciStorage,
     StoredManifest,

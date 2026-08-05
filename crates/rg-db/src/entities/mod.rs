@@ -32,6 +32,7 @@ pub mod notification;
 pub mod oauth_account;
 pub mod oci_blob;
 pub mod oci_manifest;
+pub mod oci_publication_lease;
 pub mod oci_repository;
 pub mod oci_upload;
 pub mod organization;
