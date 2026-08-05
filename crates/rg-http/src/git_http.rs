@@ -262,8 +262,8 @@ async fn check_git_access(
 /// fallible for the same reason, so they are joined here and the call site has
 /// one error to answer rather than two identical arms.
 fn receive_pack_rejected_refs(
-    protection_rules: Vec<rg_db::entities::protected_branch::Model>,
-    tag_protection_rules: Vec<rg_db::entities::protected_tag::Model>,
+    protection_rules: Vec<rg_db::ops::protected_branch_ops::Rule>,
+    tag_protection_rules: Vec<rg_db::ops::protected_tag_ops::Rule>,
     actor_id: Option<i64>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut rejected = branch_protection_rejected_refs(protection_rules, actor_id)?;
@@ -919,22 +919,26 @@ pub(crate) async fn handle_git_receive_pack(
             );
         }
     };
-    let protection_rules =
-        match rg_db::ops::protected_branch_ops::list_by_repo(&state.db, repo_model.id).await {
-            Ok(rules) => rules,
-            Err(e) => {
-                return (
-                    git_db_status(&e),
-                    [(
-                        header::CONTENT_TYPE,
-                        "application/x-git-receive-pack-result",
-                    )],
-                    Body::from(git_failure_body("load branch protections", &e)),
-                );
-            }
-        };
+    let protection_rules = match rg_db::ops::protected_branch_ops::list_rules_by_repo(
+        &state.db,
+        repo_model.id,
+    )
+    .await
+    {
+        Ok(rules) => rules,
+        Err(e) => {
+            return (
+                git_db_status(&e),
+                [(
+                    header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                )],
+                Body::from(git_failure_body("load branch protections", &e)),
+            );
+        }
+    };
     let tag_protection_rules =
-        match rg_db::ops::protected_tag_ops::list_by_repo(&state.db, repo_model.id).await {
+        match rg_db::ops::protected_tag_ops::list_rules_by_repo(&state.db, repo_model.id).await {
             Ok(rules) => rules,
             Err(e) => {
                 return (

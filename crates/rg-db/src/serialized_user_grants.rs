@@ -1,10 +1,10 @@
-//! Referential cleanup for user ids stored inside JSON text columns.
+//! Compatibility-mirror cleanup for user ids stored inside JSON text columns.
 //!
-//! A relational foreign key cannot see an id inside a JSON array. These three
-//! columns are authorization grants, so leaving a deleted id in one is not just
-//! stale display data: an import or manual restore that reuses the number would
-//! give the new account the old account's access. Keep the inventory explicit
-//! and perform every rewrite in the transaction that removes the user row.
+//! Normalized grant rows now carry the enforcing foreign keys, but a cascade
+//! cannot rewrite their historical JSON response mirrors. Leaving a deleted id
+//! in a mirror would make it disagree with authorization state and fail every
+//! verified read. Keep the inventory explicit and perform every rewrite in the
+//! transaction that removes the user row.
 
 use std::collections::HashSet;
 

@@ -15,7 +15,7 @@ async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
 
 async fn seed_push_grants(db: &rg_db::DatabaseConnection, repo_id: i64, user_id: i64) {
     let now = chrono::Utc::now();
-    rg_db::ops::protected_branch_ops::create(
+    rg_db::ops::protected_branch_ops::create_with_push_grants(
         db,
         rg_db::entities::protected_branch::ActiveModel {
             repo_id: Set(repo_id),
@@ -27,24 +27,26 @@ async fn seed_push_grants(db: &rg_db::DatabaseConnection, repo_id: i64, user_id:
             required_approvals: Set(None),
             allow_force_push: Set(false),
             require_signed_commits: Set(false),
-            allowed_push_user_ids: Set(Some(format!("[{user_id}]"))),
+            allowed_push_user_ids: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
         },
+        Some(vec![user_id]),
     )
     .await
     .expect("seed branch grant");
-    rg_db::ops::protected_tag_ops::create(
+    rg_db::ops::protected_tag_ops::create_with_push_grants(
         db,
         rg_db::entities::protected_tag::ActiveModel {
             repo_id: Set(repo_id),
             pattern: Set("v*".to_string()),
-            allowed_user_ids: Set(Some(format!("[{user_id}]"))),
+            allowed_user_ids: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
         },
+        Some(vec![user_id]),
     )
     .await
     .expect("seed tag grant");
@@ -98,8 +100,8 @@ async fn seed_waiting_job(
 }
 
 fn assert_push_grants_allow(
-    branches: Vec<rg_db::entities::protected_branch::Model>,
-    tags: Vec<rg_db::entities::protected_tag::Model>,
+    branches: Vec<rg_db::ops::protected_branch_ops::Rule>,
+    tags: Vec<rg_db::ops::protected_tag_ops::Rule>,
     user_id: i64,
 ) {
     assert!(
@@ -160,10 +162,10 @@ async fn reused_numeric_id_does_not_inherit_deleted_accounts_serialized_grants()
         .unwrap();
 
     assert_push_grants_allow(
-        rg_db::ops::protected_branch_ops::list_by_repo(&db, repo_id)
+        rg_db::ops::protected_branch_ops::list_rules_by_repo(&db, repo_id)
             .await
             .unwrap(),
-        rg_db::ops::protected_tag_ops::list_by_repo(&db, repo_id)
+        rg_db::ops::protected_tag_ops::list_rules_by_repo(&db, repo_id)
             .await
             .unwrap(),
         victim_id,
@@ -221,18 +223,21 @@ async fn reused_numeric_id_does_not_inherit_deleted_accounts_serialized_grants()
     )
     .expect("mint replacement user's test session");
 
-    let branches = rg_db::ops::protected_branch_ops::list_by_repo(&db, repo_id)
+    let branches = rg_db::ops::protected_branch_ops::list_rules_by_repo(&db, repo_id)
         .await
         .unwrap();
-    let tags = rg_db::ops::protected_tag_ops::list_by_repo(&db, repo_id)
+    let tags = rg_db::ops::protected_tag_ops::list_rules_by_repo(&db, repo_id)
         .await
         .unwrap();
     let environment = rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(branches[0].allowed_push_user_ids.as_deref(), Some("[]"));
-    assert_eq!(tags[0].allowed_user_ids.as_deref(), Some("[]"));
+    assert_eq!(
+        branches[0].protection.allowed_push_user_ids.as_deref(),
+        Some("[]")
+    );
+    assert_eq!(tags[0].protection.allowed_user_ids.as_deref(), Some("[]"));
     assert_eq!(environment.allowed_approver_ids.as_deref(), Some("[]"));
     assert_eq!(
         rg_core::branch_protection::push_rules::branch_protection_rejected_refs(

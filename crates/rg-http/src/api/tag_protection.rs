@@ -69,6 +69,13 @@ fn valid_pattern(pattern: &str) -> bool {
         && !pattern.contains("..")
 }
 
+fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
+    match rg_db::user_grants::invalid_principal_message(&error) {
+        Some(message) => AppError::bad_request(message).into_response(),
+        None => AppError::from(error).into_response(),
+    }
+}
+
 #[utoipa::path(get, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [TagProtectionResponse])))]
 pub async fn list(State(state): State<AppState>, RepoRead { repo }: RepoRead) -> impl IntoResponse {
     match rg_db::ops::protected_tag_ops::list_by_repo(&state.db, repo.id).await {
@@ -102,13 +109,17 @@ pub async fn create(
         id: NotSet,
         repo_id: Set(repo.id),
         pattern: Set(pattern.to_owned()),
-        allowed_user_ids: Set(body
-            .allowed_user_ids
-            .map(|v| serde_json::to_string(&v).unwrap_or_default())),
+        allowed_user_ids: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
-    match rg_db::ops::protected_tag_ops::create(&state.db, model).await {
+    match rg_db::ops::protected_tag_ops::create_with_push_grants(
+        &state.db,
+        model,
+        body.allowed_user_ids,
+    )
+    .await
+    {
         Ok(v) => match response(v) {
             Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
             Err(e) => e.into_response(),
@@ -118,7 +129,7 @@ pub async fn create(
         Err(e) if rg_db::is_unique_violation_anyhow(&e) => {
             AppError::conflict("tag protection pattern already exists").into_response()
         }
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => grant_write_error(e),
     }
 }
 
@@ -134,16 +145,19 @@ pub async fn update(
         Err(e) => return e.into_response(),
     };
     let mut active: rg_db::entities::protected_tag::ActiveModel = model.into();
-    active.allowed_user_ids = Set(Some(
-        serde_json::to_string(&body.allowed_user_ids).unwrap_or_default(),
-    ));
     active.updated_at = Set(chrono::Utc::now());
-    match rg_db::ops::protected_tag_ops::update(&state.db, active).await {
+    match rg_db::ops::protected_tag_ops::update_with_push_grants(
+        &state.db,
+        active,
+        body.allowed_user_ids,
+    )
+    .await
+    {
         Ok(v) => match response(v) {
             Ok(body) => (StatusCode::OK, Json(body)).into_response(),
             Err(e) => e.into_response(),
         },
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => grant_write_error(e),
     }
 }
 

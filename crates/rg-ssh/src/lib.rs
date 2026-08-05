@@ -356,8 +356,8 @@ struct SshHandler {
 /// the protection rules enforced before the refs move, and the `owner`/`repo`
 /// the post-push hooks are keyed on.
 struct ReceivePackContext {
-    protection_rules: Vec<rg_db::entities::protected_branch::Model>,
-    tag_protection_rules: Vec<rg_db::entities::protected_tag::Model>,
+    protection_rules: Vec<rg_db::ops::protected_branch_ops::Rule>,
+    tag_protection_rules: Vec<rg_db::ops::protected_tag_ops::Rule>,
     /// Pusher's user id, or `None` for a deploy key (protection rules treat an
     /// unidentified actor as "not on any allow-list").
     actor_id: Option<i64>,
@@ -1180,10 +1180,10 @@ async fn load_receive_pack_context(
         .await
         .map_err(GitServiceError::ServerUnavailable)?
         .ok_or(GitServiceError::RepositoryNotFound)?;
-    let protection_rules = rg_db::ops::protected_branch_ops::list_by_repo(db, repo.id)
+    let protection_rules = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo.id)
         .await
         .map_err(GitServiceError::ServerUnavailable)?;
-    let tag_protection_rules = rg_db::ops::protected_tag_ops::list_by_repo(db, repo.id)
+    let tag_protection_rules = rg_db::ops::protected_tag_ops::list_rules_by_repo(db, repo.id)
         .await
         .map_err(GitServiceError::ServerUnavailable)?;
 

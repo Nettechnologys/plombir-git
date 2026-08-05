@@ -38,6 +38,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the account's own credential",
     ),
     (
+        "ci_environment_approver_grants",
+        "user_id",
+        "CASCADE",
+        "card_04db226ae9b3: the row is this account's authorization grant for one environment",
+    ),
+    (
         "import_tasks",
         "user_id",
         "CASCADE",
@@ -85,6 +91,18 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "CASCADE",
         "the row asks this specific person for a review, and nothing can be asked of a ghost \
          (weighed with card_a2123e31ee6e and deliberately left cascading)",
+    ),
+    (
+        "protected_branch_push_grants",
+        "user_id",
+        "CASCADE",
+        "card_04db226ae9b3: the row is this account's direct-push grant for one branch rule",
+    ),
+    (
+        "protected_tag_push_grants",
+        "user_id",
+        "CASCADE",
+        "card_04db226ae9b3: the row is this account's push grant for one tag rule",
     ),
     (
         "repo_collaborators",

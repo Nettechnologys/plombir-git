@@ -1,4 +1,5 @@
 use crate::entities::{ci_environment, ci_environment_approval, pipeline_job};
+use crate::user_grants::{self, Target};
 use anyhow::{Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
@@ -37,11 +38,114 @@ pub async fn create(
 ) -> Result<ci_environment::Model> {
     model.insert(db).await.context("db: create CI environment")
 }
+pub async fn create_with_approvers(
+    db: &DatabaseConnection,
+    model: ci_environment::ActiveModel,
+    allowed_approver_ids: Vec<i64>,
+) -> Result<ci_environment::Model> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin CI environment grant write")?;
+    let result: Result<ci_environment::Model> = async {
+        let created = model
+            .insert(&transaction)
+            .await
+            .context("db: create CI environment")?;
+        user_grants::replace(
+            &transaction,
+            Target::CiEnvironment(created.id),
+            Some(&allowed_approver_ids),
+        )
+        .await?;
+        ci_environment::Entity::find_by_id(created.id)
+            .one(&transaction)
+            .await
+            .context("db: reload CI environment after grant write")?
+            .context("db: CI environment disappeared during grant write")
+    }
+    .await;
+    match result {
+        Ok(created) => {
+            transaction
+                .commit()
+                .await
+                .context("db: commit CI environment grant write")?;
+            Ok(created)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error).context(format!(
+                    "db: roll back CI environment grant write: {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
 pub async fn update(
     db: &DatabaseConnection,
     model: ci_environment::ActiveModel,
 ) -> Result<ci_environment::Model> {
     model.update(db).await.context("db: update CI environment")
+}
+pub async fn update_with_approvers(
+    db: &DatabaseConnection,
+    model: ci_environment::ActiveModel,
+    allowed_approver_ids: Vec<i64>,
+) -> Result<ci_environment::Model> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin CI environment grant update")?;
+    let result: Result<ci_environment::Model> = async {
+        let updated = model
+            .update(&transaction)
+            .await
+            .context("db: update CI environment")?;
+        user_grants::replace(
+            &transaction,
+            Target::CiEnvironment(updated.id),
+            Some(&allowed_approver_ids),
+        )
+        .await?;
+        ci_environment::Entity::find_by_id(updated.id)
+            .one(&transaction)
+            .await
+            .context("db: reload CI environment after grant update")?
+            .context("db: CI environment disappeared during grant update")
+    }
+    .await;
+    match result {
+        Ok(updated) => {
+            transaction
+                .commit()
+                .await
+                .context("db: commit CI environment grant update")?;
+            Ok(updated)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error).context(format!(
+                    "db: roll back CI environment grant update: {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Read the normalized approver list and verify its JSON wire mirror.
+pub async fn allowed_approver_ids(
+    db: &DatabaseConnection,
+    environment: &ci_environment::Model,
+) -> Result<Vec<i64>> {
+    user_grants::load_verified(
+        db,
+        Target::CiEnvironment(environment.id),
+        environment.allowed_approver_ids.as_deref(),
+    )
+    .await
 }
 /// Delete an environment, reporting whether this call is the one that removed it.
 ///

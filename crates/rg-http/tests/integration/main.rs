@@ -154,6 +154,7 @@ mod undecodable_status_check_tests;
 mod undecodable_stored_blob_tests;
 mod unmatched_route_tests;
 mod upload_failure_status_tests;
+mod user_grant_writer_tests;
 mod user_scoped_id_scope_sweep_tests;
 mod user_scoped_id_scope_tests;
 mod web_editor_push_hook_tests;

@@ -5,6 +5,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, NotSet, Set, Statement,
+    TransactionTrait,
 };
 
 /// A repository row in the namespace given by `org_id` (`None` = personal).
@@ -134,6 +135,153 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             "cross backend repository search".to_string()
         )),
         "the repository INSERT trigger did not publish the source snapshot"
+    );
+
+    // card_04db226ae9b3: the same normalized grant writer and lock sequence must
+    // behave identically on PostgreSQL and MySQL. CI invokes this ignored smoke
+    // once per disposable server database; SQLite has a dedicated deterministic
+    // integration test in rg-db.
+    let branch = rg_db::ops::protected_branch_ops::create_with_push_grants(
+        &db,
+        rg_db::entities::protected_branch::ActiveModel {
+            repo_id: Set(repo.id),
+            branch_name: Set(format!("grant-{suffix}")),
+            require_pr: Set(true),
+            require_status_check: Set(false),
+            required_status_checks: Set(None),
+            require_approval: Set(false),
+            required_approvals: Set(None),
+            allow_force_push: Set(false),
+            require_signed_commits: Set(false),
+            allowed_push_user_ids: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        Some(vec![user.id]),
+    )
+    .await
+    .expect("create cross-backend branch grant");
+    let tag = rg_db::ops::protected_tag_ops::create_with_push_grants(
+        &db,
+        rg_db::entities::protected_tag::ActiveModel {
+            repo_id: Set(repo.id),
+            pattern: Set(format!("grant-{suffix}-*")),
+            allowed_user_ids: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        Some(vec![user.id]),
+    )
+    .await
+    .expect("create cross-backend tag grant");
+    let environment = rg_db::ops::ci_environment_ops::create_with_approvers(
+        &db,
+        rg_db::entities::ci_environment::ActiveModel {
+            repo_id: Set(repo.id),
+            name: Set(format!("grant-{suffix}")),
+            protected: Set(true),
+            required_approvals: Set(1),
+            allowed_approver_ids: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        vec![user.id],
+    )
+    .await
+    .expect("create cross-backend environment grant");
+    let grant_targets = [
+        rg_db::user_grants::Target::ProtectedBranch(branch.id),
+        rg_db::user_grants::Target::ProtectedTag(tag.id),
+        rg_db::user_grants::Target::CiEnvironment(environment.id),
+    ];
+
+    let inactive = rg_db::ops::user_ops::create_user(
+        &db,
+        &format!("inactive{suffix}"),
+        &format!("inactive{suffix}@example.invalid"),
+        "unused",
+        "Inactive Grant Principal",
+    )
+    .await
+    .expect("create inactive grant principal");
+    rg_db::ops::user_ops::update_by_id(&db, inactive.id, None, None, None, Some(false))
+        .await
+        .expect("deactivate grant principal")
+        .expect("inactive grant principal exists");
+    let retiring = rg_db::ops::user_ops::create_user(
+        &db,
+        &format!("retiring{suffix}"),
+        &format!("retiring{suffix}@example.invalid"),
+        "unused",
+        "Retiring Grant Principal",
+    )
+    .await
+    .expect("create retiring grant principal");
+    assert!(rg_db::ops::user_ops::find_by_id(&db, retiring.id)
+        .await
+        .expect("preflight retiring principal")
+        .is_some());
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(&db, retiring.id)
+            .await
+            .expect("begin grant principal retirement")
+    );
+
+    for (invalid_id, expected) in [
+        (i64::MAX, format!("grant user {} does not exist", i64::MAX)),
+        (
+            inactive.id,
+            format!("grant user {} is inactive", inactive.id),
+        ),
+        (
+            retiring.id,
+            format!("grant user {} is being retired", retiring.id),
+        ),
+    ] {
+        for target in grant_targets {
+            let transaction = db.begin().await.expect("begin invalid grant write");
+            let error = rg_db::user_grants::replace(&transaction, target, Some(&[invalid_id]))
+                .await
+                .expect_err("cross-backend invalid principal must be rejected");
+            assert_eq!(
+                rg_db::user_grants::invalid_principal_message(&error).as_deref(),
+                Some(expected.as_str()),
+                "different cross-backend semantic for {target:?}: {error:#}"
+            );
+            transaction
+                .rollback()
+                .await
+                .expect("roll back invalid cross-backend grant write");
+        }
+    }
+    assert_eq!(
+        rg_db::user_grants::load_verified(
+            &db,
+            grant_targets[0],
+            branch.allowed_push_user_ids.as_deref(),
+        )
+        .await
+        .expect("load cross-backend branch grants"),
+        vec![user.id]
+    );
+    assert_eq!(
+        rg_db::user_grants::load_verified(&db, grant_targets[1], tag.allowed_user_ids.as_deref(),)
+            .await
+            .expect("load cross-backend tag grants"),
+        vec![user.id]
+    );
+    assert_eq!(
+        rg_db::user_grants::load_verified(
+            &db,
+            grant_targets[2],
+            environment.allowed_approver_ids.as_deref(),
+        )
+        .await
+        .expect("load cross-backend environment grants"),
+        vec![user.id]
     );
 
     let mut updated_repo: rg_db::entities::repository::ActiveModel = repo.clone().into();
@@ -694,6 +842,12 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     rg_db::ops::user_ops::delete_by_id(&db, user.id)
         .await
         .expect("delete smoke-test user");
+    rg_db::ops::user_ops::delete_by_id(&db, inactive.id)
+        .await
+        .expect("delete inactive smoke-test user");
+    rg_db::ops::user_ops::delete_by_id(&db, retiring.id)
+        .await
+        .expect("delete retiring smoke-test user");
     assert!(rg_db::ops::user_ops::find_by_id(&db, user.id)
         .await
         .expect("verify smoke-test user cleanup")

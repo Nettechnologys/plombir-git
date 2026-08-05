@@ -8,6 +8,13 @@ use rg_db::entities::protected_branch::{self, Model as ProtectedBranch};
 use rg_db::entities::pull_request;
 use rg_db::ops::{pipeline_ops, pr_review_ops, protected_branch_ops};
 
+fn classify_grant_write_error(error: anyhow::Error) -> anyhow::Error {
+    match rg_db::user_grants::invalid_principal_message(&error) {
+        Some(message) => crate::error::invalid_request(message),
+        None => error,
+    }
+}
+
 /// Create a branch protection rule.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_protection(
@@ -65,23 +72,20 @@ pub async fn create_protection(
         required_approvals: Set(required_approvals),
         allow_force_push: Set(allow_force_push),
         require_signed_commits: Set(require_signed_commits),
-        // Same reasoning: `check_push_allowed` and `push_rules.rs` both `?` on
-        // this column, so `""` here would lock every pusher out of the branch.
-        allowed_push_user_ids: Set(allowed_push_user_ids
-            .map(|v| serde_json::to_string(&v))
-            .transpose()
-            .context("serialize allowed_push_user_ids")?),
+        // The common grant writer below fills this compatibility mirror and
+        // the normalized FK rows in the same transaction.
+        allowed_push_user_ids: Set(None),
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
     };
 
-    protected_branch_ops::create(db, model)
+    protected_branch_ops::create_with_push_grants(db, model, allowed_push_user_ids)
         .await
         .map_err(|error| {
             if rg_db::is_unique_violation_anyhow(&error) {
                 duplicate
             } else {
-                error
+                classify_grant_write_error(error)
             }
         })
 }
@@ -178,14 +182,11 @@ async fn update_protection(
     if let Some(v) = require_signed_commits {
         active.require_signed_commits = Set(v);
     }
-    if let Some(v) = allowed_push_user_ids {
-        active.allowed_push_user_ids = Set(Some(
-            serde_json::to_string(&v).context("serialize allowed_push_user_ids")?,
-        ));
-    }
     active.updated_at = Set(Utc::now());
 
-    protected_branch_ops::update(db, active).await
+    protected_branch_ops::update_with_push_grants(db, active, allowed_push_user_ids)
+        .await
+        .map_err(classify_grant_write_error)
 }
 
 /// Update a branch protection rule, scoped to a repository route.
@@ -253,26 +254,18 @@ pub async fn check_push_allowed(
     user_id: Option<i64>,
 ) -> Result<()> {
     let protection =
-        protected_branch_ops::find_by_repo_and_branch(db, repo_id, branch_name).await?;
+        protected_branch_ops::find_rule_by_repo_and_branch(db, repo_id, branch_name).await?;
 
     let Some(protection) = protection else {
         // Not protected, push is allowed
         return Ok(());
     };
 
-    // Check if user is in the allowed list. A column that does not decode is a
-    // broken row, not an empty allow-list — reporting "push is not allowed"
-    // would pin a storage fault on the pusher.
-    if let Some(allowed_json) = &protection.allowed_push_user_ids {
-        let allowed_ids: Vec<i64> = serde_json::from_str(allowed_json).with_context(|| {
-            format!(
-                "stored allowed_push_user_ids of protected branch '{branch_name}' is not a JSON array of user ids"
-            )
-        })?;
-        if user_id.is_some_and(|uid| allowed_ids.contains(&uid)) {
-            return Ok(());
-        }
+    if user_id.is_some_and(|uid| protection.allowed_push_user_ids.contains(&uid)) {
+        return Ok(());
     }
+
+    let protection = protection.protection;
 
     if protection.require_pr {
         bail!(

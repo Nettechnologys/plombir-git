@@ -83,7 +83,7 @@ async fn seed_repo(db: &DatabaseConnection, owner_id: i64) -> i64 {
 
 async fn seed_grants(db: &DatabaseConnection, repo_id: i64, victim: i64, host: i64) {
     let now = chrono::Utc::now();
-    rg_db::ops::protected_branch_ops::create(
+    rg_db::ops::protected_branch_ops::create_with_push_grants(
         db,
         rg_db::entities::protected_branch::ActiveModel {
             repo_id: Set(repo_id),
@@ -95,39 +95,42 @@ async fn seed_grants(db: &DatabaseConnection, repo_id: i64, victim: i64, host: i
             required_approvals: Set(None),
             allow_force_push: Set(false),
             require_signed_commits: Set(false),
-            allowed_push_user_ids: Set(Some(format!("[{victim},{host},{victim}]"))),
+            allowed_push_user_ids: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
         },
+        Some(vec![victim, host]),
     )
     .await
     .expect("seed protected branch grant");
-    rg_db::ops::protected_tag_ops::create(
+    rg_db::ops::protected_tag_ops::create_with_push_grants(
         db,
         rg_db::entities::protected_tag::ActiveModel {
             repo_id: Set(repo_id),
             pattern: Set("v*".to_string()),
-            allowed_user_ids: Set(Some(format!("[{host},{victim}]"))),
+            allowed_user_ids: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
         },
+        Some(vec![host, victim]),
     )
     .await
     .expect("seed protected tag grant");
-    rg_db::ops::ci_environment_ops::create(
+    rg_db::ops::ci_environment_ops::create_with_approvers(
         db,
         rg_db::entities::ci_environment::ActiveModel {
             repo_id: Set(repo_id),
             name: Set("production".to_string()),
             protected: Set(true),
             required_approvals: Set(1),
-            allowed_approver_ids: Set(Some(format!("[{victim},{host}]"))),
+            allowed_approver_ids: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
         },
+        vec![victim, host],
     )
     .await
     .expect("seed environment grant");

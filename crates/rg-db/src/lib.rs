@@ -19,6 +19,7 @@ mod fts_rebuild_tests;
 pub mod migrations;
 pub mod ops;
 mod serialized_user_grants;
+pub mod user_grants;
 
 use std::any::Any;
 use std::collections::HashMap;

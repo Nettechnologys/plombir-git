@@ -1,6 +1,27 @@
 use crate::entities::protected_tag::{self, ActiveModel, Entity, Model};
+use crate::user_grants::{self, Target};
 use anyhow::{Context, Result};
 use sea_orm::*;
+
+/// A tag rule paired with the normalized, mirror-verified push allow-list.
+#[derive(Clone, Debug)]
+pub struct Rule {
+    pub protection: Model,
+    pub allowed_user_ids: Vec<i64>,
+}
+
+async fn with_grants(db: &impl ConnectionTrait, protection: Model) -> Result<Rule> {
+    let allowed_user_ids = user_grants::load_verified(
+        db,
+        Target::ProtectedTag(protection.id),
+        protection.allowed_user_ids.as_deref(),
+    )
+    .await?;
+    Ok(Rule {
+        protection,
+        allowed_user_ids,
+    })
+}
 
 pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<Model>> {
     Entity::find()
@@ -9,6 +30,14 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<M
         .all(db)
         .await
         .context("db: list protected tags")
+}
+pub async fn list_rules_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<Rule>> {
+    let protections = list_by_repo(db, repo_id).await?;
+    let mut rules = Vec::with_capacity(protections.len());
+    for protection in protections {
+        rules.push(with_grants(db, protection).await?);
+    }
+    Ok(rules)
 }
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Model>> {
     Entity::find_by_id(id)
@@ -19,8 +48,98 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Model
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     model.insert(db).await.context("db: create protected tag")
 }
+pub async fn create_with_push_grants(
+    db: &DatabaseConnection,
+    model: ActiveModel,
+    allowed_user_ids: Option<Vec<i64>>,
+) -> Result<Model> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin protected tag grant write")?;
+    let result: Result<Model> = async {
+        let created = model
+            .insert(&transaction)
+            .await
+            .context("db: create protected tag")?;
+        user_grants::replace(
+            &transaction,
+            Target::ProtectedTag(created.id),
+            allowed_user_ids.as_deref(),
+        )
+        .await?;
+        Entity::find_by_id(created.id)
+            .one(&transaction)
+            .await
+            .context("db: reload protected tag after grant write")?
+            .context("db: protected tag disappeared during grant write")
+    }
+    .await;
+    match result {
+        Ok(created) => {
+            transaction
+                .commit()
+                .await
+                .context("db: commit protected tag grant write")?;
+            Ok(created)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error).context(format!(
+                    "db: roll back protected tag grant write: {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
 pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     model.update(db).await.context("db: update protected tag")
+}
+pub async fn update_with_push_grants(
+    db: &DatabaseConnection,
+    model: ActiveModel,
+    allowed_user_ids: Vec<i64>,
+) -> Result<Model> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin protected tag grant update")?;
+    let result: Result<Model> = async {
+        let updated = model
+            .update(&transaction)
+            .await
+            .context("db: update protected tag")?;
+        user_grants::replace(
+            &transaction,
+            Target::ProtectedTag(updated.id),
+            Some(&allowed_user_ids),
+        )
+        .await?;
+        Entity::find_by_id(updated.id)
+            .one(&transaction)
+            .await
+            .context("db: reload protected tag after grant update")?
+            .context("db: protected tag disappeared during grant update")
+    }
+    .await;
+    match result {
+        Ok(updated) => {
+            transaction
+                .commit()
+                .await
+                .context("db: commit protected tag grant update")?;
+            Ok(updated)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error).context(format!(
+                    "db: roll back protected tag grant update: {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 /// Delete a tag protection rule by id. `Ok(false)` means no such row.
 ///

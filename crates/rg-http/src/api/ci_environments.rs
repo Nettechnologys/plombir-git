@@ -73,7 +73,7 @@ fn response(
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && !name.chars().any(char::is_control)
 }
-async fn validate_request(state: &AppState, body: &EnvironmentRequest) -> Result<(), AppError> {
+fn validate_request(body: &EnvironmentRequest) -> Result<(), AppError> {
     if !valid_name(body.name.trim()) {
         return Err(AppError::bad_request(
             "environment name must contain 1-255 printable characters",
@@ -87,28 +87,19 @@ async fn validate_request(state: &AppState, body: &EnvironmentRequest) -> Result
     let mut unique = body.allowed_approver_ids.clone();
     unique.sort_unstable();
     unique.dedup();
-    if unique.len() != body.allowed_approver_ids.len() {
-        return Err(AppError::bad_request(
-            "allowed_approver_ids must not contain duplicates",
-        ));
-    }
     if body.protected && !unique.is_empty() && body.required_approvals as usize > unique.len() {
         return Err(AppError::bad_request(
             "required approvals exceed the approver list",
         ));
     }
-    for user_id in unique {
-        if rg_db::ops::user_ops::find_by_id(&state.db, user_id)
-            .await
-            .map_err(AppError::from)?
-            .is_none()
-        {
-            return Err(AppError::bad_request(format!(
-                "approver user {user_id} does not exist"
-            )));
-        }
-    }
     Ok(())
+}
+
+fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
+    match rg_db::user_grants::invalid_principal_message(&error) {
+        Some(message) => AppError::bad_request(message).into_response(),
+        None => AppError::from(error).into_response(),
+    }
 }
 
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/environments", tag = "CI/CD", responses((status = 200, body = [EnvironmentResponse])))]
@@ -137,7 +128,7 @@ pub async fn create(
     RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_request(&state, &body).await {
+    if let Err(error) = validate_request(&body) {
         return error.into_response();
     }
     let now = chrono::Utc::now();
@@ -147,13 +138,17 @@ pub async fn create(
         name: Set(body.name.trim().to_string()),
         protected: Set(body.protected),
         required_approvals: Set(body.required_approvals),
-        allowed_approver_ids: Set(Some(
-            serde_json::to_string(&body.allowed_approver_ids).unwrap_or_default(),
-        )),
+        allowed_approver_ids: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
-    match rg_db::ops::ci_environment_ops::create(&state.db, model).await {
+    match rg_db::ops::ci_environment_ops::create_with_approvers(
+        &state.db,
+        model,
+        body.allowed_approver_ids,
+    )
+    .await
+    {
         Ok(model) => match response(model) {
             Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
             Err(error) => error.into_response(),
@@ -164,7 +159,7 @@ pub async fn create(
         Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("environment already exists").into_response()
         }
-        Err(error) => AppError::from(error).into_response(),
+        Err(error) => grant_write_error(error),
     }
 }
 
@@ -175,7 +170,7 @@ pub async fn update(
     RepoAdmin { repo, .. }: RepoAdmin,
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_request(&state, &body).await {
+    if let Err(error) = validate_request(&body) {
         return error.into_response();
     }
     let model = match environment_in_repo(&state, repo.id, id).await {
@@ -186,11 +181,14 @@ pub async fn update(
     active.name = Set(body.name.trim().to_string());
     active.protected = Set(body.protected);
     active.required_approvals = Set(body.required_approvals);
-    active.allowed_approver_ids = Set(Some(
-        serde_json::to_string(&body.allowed_approver_ids).unwrap_or_default(),
-    ));
     active.updated_at = Set(chrono::Utc::now());
-    match rg_db::ops::ci_environment_ops::update(&state.db, active).await {
+    match rg_db::ops::ci_environment_ops::update_with_approvers(
+        &state.db,
+        active,
+        body.allowed_approver_ids,
+    )
+    .await
+    {
         Ok(model) => match response(model) {
             Ok(body) => Json(body).into_response(),
             Err(error) => error.into_response(),
@@ -199,7 +197,7 @@ pub async fn update(
         Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
             AppError::conflict("environment already exists").into_response()
         }
-        Err(error) => AppError::from(error).into_response(),
+        Err(error) => grant_write_error(error),
     }
 }
 
@@ -379,10 +377,13 @@ async fn authorize_approval(
     // `403 user is not an allowed environment approver` would tell an approver
     // who *is* listed that they are not.
     if !is_admin {
-        let allowed = match decode_allowed_approver_ids(&environment) {
-            Ok(allowed) => allowed,
-            Err(error) => return Err(error.into_response()),
-        };
+        let allowed =
+            match rg_db::ops::ci_environment_ops::allowed_approver_ids(&state.db, &environment)
+                .await
+            {
+                Ok(allowed) => allowed,
+                Err(error) => return Err(AppError::from(error).into_response()),
+            };
         if !allowed.contains(&actor_id) {
             return Err(
                 AppError::forbidden("user is not an allowed environment approver").into_response(),

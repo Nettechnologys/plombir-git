@@ -36,7 +36,8 @@ async fn corrupt(db: &rg_db::DatabaseConnection, table: &str, column: &str, id: 
 #[tokio::test]
 async fn an_undecodable_tag_allow_list_is_not_served_as_an_empty_one() {
     let (base, db) = spawn_test_app_with_db().await;
-    let (token, _) = register_full(&base, "tagjson-owner", "tagjson-owner@example.test").await;
+    let (token, user_id) =
+        register_full(&base, "tagjson-owner", "tagjson-owner@example.test").await;
     create_repo(&base, &token, "releases").await;
     let client = reqwest::Client::new();
     let endpoint = format!("{base}/api/v1/repos/tagjson-owner/releases/tags/protection");
@@ -44,14 +45,14 @@ async fn an_undecodable_tag_allow_list_is_not_served_as_an_empty_one() {
     let created = client
         .post(&endpoint)
         .bearer_auth(&token)
-        .json(&serde_json::json!({"pattern": "v*", "allowed_user_ids": [7]}))
+        .json(&serde_json::json!({"pattern": "v*", "allowed_user_ids": [user_id]}))
         .send()
         .await
         .expect("create the rule");
     assert_eq!(created.status(), StatusCode::CREATED);
     let created: serde_json::Value = created.json().await.expect("created rule body");
     let rule_id = created["id"].as_i64().expect("created rule carries an id");
-    assert_eq!(created["allowed_user_ids"], serde_json::json!([7]));
+    assert_eq!(created["allowed_user_ids"], serde_json::json!([user_id]));
 
     corrupt(&db, "protected_tags", "allowed_user_ids", rule_id).await;
 

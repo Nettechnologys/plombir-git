@@ -99,6 +99,7 @@ pub mod m20260805_000003_create_oci_publication_lease;
 pub mod m20260805_000004_repo_config_outlives_its_author;
 pub mod m20260805_000005_account_owned_rows_follow_their_parent;
 pub mod m20260805_000006_clean_serialized_user_grants;
+pub mod m20260806_000001_normalize_user_grants;
 
 use sea_orm_migration::prelude::*;
 
@@ -209,6 +210,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000004_repo_config_outlives_its_author::Migration),
             Box::new(m20260805_000005_account_owned_rows_follow_their_parent::Migration),
             Box::new(m20260805_000006_clean_serialized_user_grants::Migration),
+            Box::new(m20260806_000001_normalize_user_grants::Migration),
         ]
     }
 }
