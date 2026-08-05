@@ -1,6 +1,6 @@
 //! Organization service — business logic for org/team management.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 use rg_db::ops::org_ops;
@@ -103,8 +103,22 @@ pub enum OrgDeleteActor {
     InstanceAdmin,
 }
 
-/// Delete an organization (only its owner, or an instance admin, can do this).
-pub async fn delete_org(db: &DatabaseConnection, id: i64, actor: OrgDeleteActor) -> Result<()> {
+/// Delete an organization and every repository in its namespace.
+///
+/// Repository metadata is not linked to `organizations` by a foreign key, and
+/// its Git/blob storage cannot participate in the database delete. Retire each
+/// repository through the same staged, compensated lifecycle as routed
+/// repository deletion before removing the organization row. Each repository
+/// is individually atomic; if a later one fails, the organization and every
+/// repository not yet retired remain retryable and the request is an error.
+pub async fn delete_org(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn crate::blob_storage::BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    id: i64,
+    actor: OrgDeleteActor,
+) -> Result<()> {
     let org = org_ops::get_org(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("organization"))?;
@@ -116,6 +130,33 @@ pub async fn delete_org(db: &DatabaseConnection, id: i64, actor: OrgDeleteActor)
             ));
         }
         OrgDeleteActor::Owner(_) | OrgDeleteActor::InstanceAdmin => {}
+    }
+
+    // Inventory before the first storage mutation. A database that cannot
+    // answer which repositories belong to this organization must not let the
+    // organization row disappear while their bytes remain live.
+    let repositories = rg_db::ops::repo_ops::list_by_org(db, id).await.context(
+        "failed to inventory the organization's repositories — its storage cannot be retired \
+             without them",
+    )?;
+
+    for repo in &repositories {
+        if let Err(error) =
+            crate::repo::service::delete_repo(db, repo_root, blob_storage, oci_storage, repo).await
+        {
+            tracing::error!(
+                org_id = id,
+                repo_id = repo.id,
+                repo = %repo.name,
+                error = %format!("{error:#}"),
+                "organization deletion stopped: this repository's storage could not be retired, \
+                 so the organization row was left in place and the request can be retried"
+            );
+            return Err(error.context(format!(
+                "failed to retire repository '{}' (id {}) while deleting organization '{}'",
+                repo.name, repo.id, org.name
+            )));
+        }
     }
 
     // The ownership check above read the org in a statement of its own. Two

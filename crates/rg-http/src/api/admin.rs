@@ -451,6 +451,9 @@ pub async fn delete_org(
         // match.
         Ok(Some(org)) => match rg_core::org::delete_org(
             &state.db,
+            &state.repo_root,
+            state.blob_storage.as_ref(),
+            state.oci_storage.as_ref(),
             org.id,
             rg_core::org::OrgDeleteActor::InstanceAdmin,
         )
