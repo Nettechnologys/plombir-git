@@ -683,6 +683,100 @@ mod org_retirement_race_tests {
         .expect("the reopened namespace still refuses new repositories");
     }
 
+    /// card_9323f8041cef: the same invariant with the other entrance into the
+    /// namespace. A transfer that lands after the deletion's last empty pass is
+    /// not undone as cheaply as a creation — its Git tree, blob prefixes and
+    /// registry data have already moved — so what is under test is that it
+    /// moves all of that back rather than leaving a repository in a namespace
+    /// that no longer exists.
+    ///
+    /// What this guards is the ordering, not the post-commit read: the window
+    /// a transfer can land in is the one between the deletion's last empty pass
+    /// and its final statement, which is too narrow to hit by racing. The read
+    /// itself is pinned deterministically by
+    /// `repo::service`'s `a_transfer_that_commits_after_the_destination_is_claimed_moves_back`,
+    /// which lands the claim from a trigger on the transfer's own statement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_transfer_and_delete_never_orphan_a_repository() {
+        for attempt in 0..6 {
+            let (db, _temp) = setup_pooled_db(&format!("org-transfer-{attempt}")).await;
+            let login = format!("transfer-race-owner-{attempt}");
+            let org_name = format!("transfer-race-org-{attempt}");
+            let (owner_id, org_id, _sandbox, repo_root) = seed_org(&db, &login, &org_name).await;
+            std::fs::create_dir_all(&repo_root).unwrap();
+            crate::repo::service::create_repo(
+                &db, owner_id, "moving", None, false, &repo_root, None,
+            )
+            .await
+            .expect("create the repository at its source");
+
+            let transfer_db = db.clone();
+            let transfer_root = repo_root.clone();
+            let transfer_target = org_name.clone();
+            let transfer_login = login.clone();
+            let transfer = async move {
+                let blob_storage = LocalBlobStorage::new(&transfer_root);
+                crate::repo::service::transfer_repo(
+                    &transfer_db,
+                    owner_id,
+                    &transfer_login,
+                    "moving",
+                    &transfer_target,
+                    &transfer_root,
+                    &blob_storage,
+                    &oci_storage_for(&transfer_root),
+                )
+                .await
+            };
+            let delete_db = db.clone();
+            let delete_root = repo_root.clone();
+            let delete = async move {
+                let blob_storage = LocalBlobStorage::new(&delete_root);
+                delete_org(
+                    &delete_db,
+                    &delete_root,
+                    &blob_storage,
+                    &oci_storage_for(&delete_root),
+                    org_id,
+                    OrgDeleteActor::Owner(owner_id),
+                )
+                .await
+            };
+            let (transferred, deleted) = tokio::join!(transfer, delete);
+
+            let orphans = orphaned_repositories(&db, org_id).await;
+            assert!(
+                orphans.is_empty(),
+                "attempt {attempt}: the organization is gone but these repositories are still \
+                 live: {orphans:?} (transfer: {:?}, delete: {:?})",
+                transferred
+                    .as_ref()
+                    .map(|repo| repo.id)
+                    .map_err(|e| format!("{e:#}")),
+                deleted.as_ref().map_err(|e| format!("{e:#}")),
+            );
+            // A deletion that reported success owns the whole namespace: a
+            // transfer that lost may leave nothing of itself in it.
+            if deleted.is_ok() {
+                assert!(
+                    !repo_root.join(format!("{org_name}/moving.git")).exists(),
+                    "attempt {attempt}: the deleted organization left the transferred \
+                     repository's Git tree on disk"
+                );
+            }
+            // And a transfer that lost must have put the repository back where
+            // it came from, bytes included.
+            if transferred.is_err() {
+                assert!(
+                    repo_root.join(format!("{login}/moving.git")).exists(),
+                    "attempt {attempt}: the refused transfer left the source namespace without \
+                     its Git tree (delete: {:?})",
+                    deleted.as_ref().map_err(|e| format!("{e:#}")),
+                );
+            }
+        }
+    }
+
     /// The invariant under real concurrency, both orderings included: whichever
     /// of the two wins, no live repository row may name an organization that is
     /// gone. The create may lose and undo itself, or commit early enough for the

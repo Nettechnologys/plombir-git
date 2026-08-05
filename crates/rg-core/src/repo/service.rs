@@ -258,23 +258,27 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
 /// answer. An unanswerable read is deliberately not treated as "still open":
 /// the whole point of the check is that guessing here costs bytes nothing can
 /// reach.
+///
+/// `undone` names what the caller took back, so the two entrances into a
+/// namespace — a creation and a transfer — say what actually happened to the
+/// repository instead of one of them borrowing the other's word for it.
 async fn namespace_still_accepts_repository(
     db: &DatabaseConnection,
     owner_id: i64,
     org_id: Option<i64>,
     path_prefix: &str,
     name: &str,
+    undone: &str,
 ) -> Result<()> {
     if !user_ops::user_namespace_is_open(db, owner_id).await? {
         return Err(crate::error::conflict(format!(
-            "the account owning '{path_prefix}' is being deleted; repository '{name}' was not \
-             created"
+            "the account owning '{path_prefix}' is being deleted; repository '{name}' was {undone}"
         )));
     }
     if let Some(org_id) = org_id {
         if !rg_db::ops::org_ops::org_is_active(db, org_id).await? {
             return Err(crate::error::conflict(format!(
-                "organization '{path_prefix}' is being deleted; repository '{name}' was not created"
+                "organization '{path_prefix}' is being deleted; repository '{name}' was {undone}"
             )));
         }
     }
@@ -775,8 +779,15 @@ where
     // this committed row and retires it. One of the two always happens, and the
     // argument rests on nothing stronger than "a committed write is visible to
     // a read that starts later", which every supported backend gives.
-    if let Err(error) =
-        namespace_still_accepts_repository(db, owner_id, opts.org_id, &path_prefix, name).await
+    if let Err(error) = namespace_still_accepts_repository(
+        db,
+        owner_id,
+        opts.org_id,
+        &path_prefix,
+        name,
+        "not created",
+    )
+    .await
     {
         // Undo in the order that leaves nothing dangling: the row first, so the
         // directory it named is unreferenced before it is discarded.
@@ -2217,6 +2228,38 @@ pub async fn fork_repo(
         }
     };
 
+    // The third entrance into a namespace, and the same re-read the other two
+    // make. A fork lands in the forker's own account, which an admin can be
+    // deleting: the claim closes every door this request came through, but a
+    // fork already past them can still commit its row after the deletion's last
+    // empty inventory pass — and `owner_id` cascades, so what is left is a bare
+    // clone with no row at all (card_da1abc6074ac, card_9323f8041cef).
+    if let Err(error) = namespace_still_accepts_repository(
+        db,
+        user_id,
+        None,
+        &forker.username,
+        repo_name,
+        "not forked",
+    )
+    .await
+    {
+        // Row first, so the directory it named is unreferenced before it goes.
+        if let Err(rollback_error) = repo_ops::delete_by_id(db, forked.id).await {
+            tracing::error!(
+                repo_id = forked.id,
+                owner_id = user_id,
+                reason = %format!("{error:#}"),
+                error = %format!("{rollback_error:#}"),
+                "a repository was forked into an account that is being deleted, and removing the \
+                 row failed — it now names an owner that is gone"
+            );
+            return Err(rollback_error);
+        }
+        discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
+        return Err(error);
+    }
+
     // A counter, not the fork: the row and the clone are both in place by now,
     // so failing the request here would report a fork that actually happened as
     // a server error — and the retry would be refused as a duplicate.
@@ -2390,6 +2433,62 @@ pub async fn transfer_repo(
     }
     // Ownership (and thus who can read/write) changed — drop cached decisions.
     invalidate_perm_cache_repo(db, repo.id);
+
+    // The destination was resolved before any byte moved, and nothing since has
+    // been holding it. `resolve_owner` refuses a namespace already claimed for
+    // retirement, but that is a pre-check: a deletion that claims the
+    // destination *after* it — and whose re-inventory has already made its last
+    // empty pass — would take the namespace out from under this row. For an
+    // organization the row is left pointing at an id nothing resolves; for an
+    // account it is not left at all, because `owner_id` cascades
+    // (card_9323f8041cef, card_da1abc6074ac).
+    //
+    // A transfer cannot undo itself as cheaply as a creation, which only has to
+    // drop a row and a directory it made moments ago: everything has already
+    // moved. So it moves back, in the reverse of the order it came — the row
+    // first, so no byte is put anywhere the metadata does not already say it
+    // is.
+    if let Err(error) = namespace_still_accepts_repository(
+        db,
+        new_owner_id,
+        new_org_id,
+        &new_owner_name,
+        repo_name,
+        "moved back to its previous owner",
+    )
+    .await
+    {
+        if let Err(rollback_error) = repo_ops::transfer_owner(
+            db,
+            repo.id,
+            repo.owner_id,
+            repo.org_id,
+            &new_owner_name,
+            owner,
+            repo_name,
+        )
+        .await
+        {
+            // The row still names the destination, so the bytes stay with it:
+            // moving them back now would put them where nothing says they are.
+            tracing::error!(
+                repo_id = repo.id,
+                from = %new_owner_name,
+                to = %owner,
+                reason = %format!("{error:#}"),
+                error = %format!("{rollback_error:#}"),
+                "a repository was transferred into a namespace that is being deleted and could \
+                 not be moved back — it now belongs to an owner that is going away"
+            );
+            return Err(rollback_error);
+        }
+        invalidate_perm_cache_repo(db, repo.id);
+        oci_storage.restore_repository_transfer(moved_oci).await;
+        restore_transferred_repository_directories(&moved_directories, repo.id);
+        restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+        restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+        return Err(error);
+    }
 
     // Read the moved row back from the namespace it landed in — the same
     // `(owner_id, org_id)` pair `update_owner` just wrote.
@@ -4701,6 +4800,215 @@ mod repository_deletion_tests {
                 .is_none(),
             "the rejected transfer created a destination-owned row"
         );
+    }
+
+    /// The third entrance, and the same rule. A fork's row commits into the
+    /// forker's own account, which an admin can be deleting: the claim closes
+    /// the doors, but a request already past them still has to undo itself.
+    #[tokio::test]
+    async fn a_fork_that_commits_after_the_account_is_claimed_undoes_itself() {
+        let db = setup_db().await;
+        let source = user_ops::create_user(
+            &db,
+            "fork-claim-source",
+            "fork-claim-source@example.invalid",
+            "unused",
+            "Fork Claim Source",
+        )
+        .await
+        .expect("create source owner");
+        let forker = user_ops::create_user(
+            &db,
+            "fork-claim-forker",
+            "fork-claim-forker@example.invalid",
+            "unused",
+            "Fork Claim Forker",
+        )
+        .await
+        .expect("create forker");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let upstream = create_repo(&db, source.id, "forkable", None, false, &repo_root, None)
+            .await
+            .expect("create the upstream repository");
+
+        // Landed on the forker's own statement, which is the only interleaving
+        // the doors cannot produce: after the fork was admitted, before its own
+        // post-commit read.
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER claim_forker_on_insert \
+             AFTER INSERT ON repositories \
+             WHEN NEW.owner_id = {} \
+             BEGIN UPDATE users SET deleted_at = NEW.updated_at WHERE id = {}; END",
+            forker.id, forker.id
+        ))
+        .await
+        .expect("install the forker claim trigger");
+
+        let error = fork_repo(&db, forker.id, "fork-claim-source", &upstream, &repo_root)
+            .await
+            .map(|forked| forked.repo.id)
+            .expect_err("a fork into an account being deleted must not stand");
+        assert!(
+            format!("{error:#}").contains("being deleted"),
+            "the refusal does not say the account is going away: {error:#}"
+        );
+        assert!(
+            repo_ops::list_active_by_owner_id(&db, forker.id)
+                .await
+                .expect("inventory the forker's repositories")
+                .is_empty(),
+            "the losing fork left a live repository row in a retiring account"
+        );
+        assert!(
+            !repo_root.join("fork-claim-forker/forkable.git").exists(),
+            "the losing fork left its bare clone behind"
+        );
+    }
+
+    /// card_9323f8041cef: a transfer is the second entrance into a namespace,
+    /// and `resolve_owner` only guards its doorway. A deletion that claims the
+    /// destination *after* that resolve — and whose re-inventory has already
+    /// made its last empty pass — would take the namespace out from under the
+    /// moved row. The transfer has to re-read the claim once its own row is
+    /// committed, and move everything back if it lost.
+    ///
+    /// The claim is landed by a trigger on the very statement `transfer_owner`
+    /// runs, which is exactly the interleaving that cannot be produced from
+    /// outside: after the destination resolved, before the transfer's own
+    /// post-commit read. `NEW.updated_at` is copied rather than a literal
+    /// written, so the marker carries the same timestamp encoding sea-orm
+    /// itself writes and the row stays readable.
+    #[tokio::test]
+    async fn a_transfer_that_commits_after_the_destination_is_claimed_moves_back() {
+        for destination_is_an_organization in [false, true] {
+            let db = setup_db().await;
+            let source = user_ops::create_user(
+                &db,
+                "transfer-claim-source",
+                "transfer-claim-source@example.invalid",
+                "unused",
+                "Transfer Claim Source",
+            )
+            .await
+            .expect("create source owner");
+            let destination_owner = user_ops::create_user(
+                &db,
+                "transfer-claim-destination",
+                "transfer-claim-destination@example.invalid",
+                "unused",
+                "Transfer Claim Destination",
+            )
+            .await
+            .expect("create destination owner");
+            let sandbox = tempfile::tempdir().expect("create repository root");
+            let repo_root = sandbox.path().join("repos");
+            let blob_storage = LocalBlobStorage::new(&repo_root);
+            let oci_storage = oci_storage_for(&repo_root);
+
+            let (destination_name, claim_statement) = if destination_is_an_organization {
+                let org = crate::org::create_org(
+                    &db,
+                    "transfer-claim-org",
+                    None,
+                    None,
+                    destination_owner.id,
+                    "public",
+                )
+                .await
+                .expect("create destination organization");
+                (
+                    org.name.clone(),
+                    format!(
+                        "UPDATE organizations SET deleted_at = NEW.updated_at WHERE id = {}",
+                        org.id
+                    ),
+                )
+            } else {
+                (
+                    destination_owner.username.clone(),
+                    format!(
+                        "UPDATE users SET deleted_at = NEW.updated_at WHERE id = {}",
+                        destination_owner.id
+                    ),
+                )
+            };
+
+            let repo = create_repo(&db, source.id, "contested", None, false, &repo_root, None)
+                .await
+                .expect("create repository");
+            let marker = repo_root.join("transfer-claim-source/contested.git/marker");
+            std::fs::write(&marker, b"must return to source").expect("seed Git marker");
+            let source_blob = BlobKey::from_segments([
+                "packages",
+                "transfer-claim-source",
+                "contested",
+                "generic",
+                "demo",
+                "1",
+                "payload.bin",
+            ])
+            .expect("valid package key");
+            blob_storage
+                .put(&source_blob, b"must return too")
+                .await
+                .expect("seed package blob");
+
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER claim_destination_on_transfer \
+                 AFTER UPDATE OF owner_id ON repositories \
+                 WHEN NEW.id = {} \
+                 BEGIN {claim_statement}; END",
+                repo.id
+            ))
+            .await
+            .expect("install the destination claim trigger");
+
+            let error = transfer_repo(
+                &db,
+                source.id,
+                "transfer-claim-source",
+                "contested",
+                &destination_name,
+                &repo_root,
+                &blob_storage,
+                &oci_storage,
+            )
+            .await
+            .expect_err("a transfer into a namespace being deleted must not stand");
+            assert!(
+                format!("{error:#}").contains("being deleted"),
+                "the refusal does not say the destination is going away: {error:#}"
+            );
+
+            let row = repo_ops::find_by_id(&db, repo.id)
+                .await
+                .expect("read the repository row")
+                .expect("the refused transfer destroyed the repository row");
+            assert_eq!(
+                (row.owner_id, row.org_id),
+                (source.id, None),
+                "the refused transfer left the row in the namespace that is being deleted \
+                 (destination_is_an_organization = {destination_is_an_organization})"
+            );
+            assert_eq!(
+                std::fs::read(&marker).expect("the Git tree must return to the source"),
+                b"must return to source"
+            );
+            assert!(
+                !repo_root
+                    .join(format!("{destination_name}/contested.git"))
+                    .exists(),
+                "the refused transfer left Git under the destination"
+            );
+            assert_eq!(
+                blob_storage
+                    .get(&source_blob)
+                    .await
+                    .expect("the package prefix must return to the source"),
+                b"must return too"
+            );
+        }
     }
 
     /// A failed rollback cannot replace the original storage/DB error, so its
