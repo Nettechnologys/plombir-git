@@ -38,6 +38,202 @@ async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
         .expect("registered user must exist");
 }
 
+/// A review is durable history, but its approval is a live authorization
+/// verdict. Deactivation, the retirement marker, and final account deletion
+/// must all revoke that verdict without erasing the review from the timeline.
+#[tokio::test]
+async fn ghost_review_stays_in_history_but_stops_authorizing_merge() {
+    let (base, db, _state) = spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+
+    let (admin_token, admin_id) =
+        register_full(&base, "review-admin", "review-admin@example.com").await;
+    promote_user_to_admin(&db, admin_id).await;
+    let (host_token, host_id) =
+        register_full(&base, "review-host", "review-host@example.com").await;
+    let (_reviewer_token, reviewer_id) = register_full(
+        &base,
+        "departing-reviewer",
+        "departing-reviewer@example.com",
+    )
+    .await;
+    let repo_id = create_repo(&base, &host_token, "review-lifecycle").await;
+    let now = chrono::Utc::now();
+    let head_sha = "1".repeat(40);
+
+    let pull = rg_db::ops::pull_request_ops::create(
+        &db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(1),
+            title: Set("Approval must follow its reviewer".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(host_id),
+            reviewer_id: Set(Some(reviewer_id)),
+            head_branch: Set("review-lifecycle".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some(head_sha.clone())),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed pull request");
+    let review = rg_db::ops::pr_review_ops::create(
+        &db,
+        rg_db::entities::pr_review::ActiveModel {
+            id: NotSet,
+            pr_id: Set(pull.id),
+            repo_id: Set(repo_id),
+            reviewer_id: Set(reviewer_id),
+            action: Set("approve".to_string()),
+            body: Set(Some("Approved while the reviewer was active".to_string())),
+            commit_id: Set(Some(head_sha)),
+            created_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed approval");
+
+    let protection = client
+        .post(format!(
+            "{base}/api/v1/repos/review-host/review-lifecycle/branches/protection"
+        ))
+        .bearer_auth(&host_token)
+        .json(&serde_json::json!({
+            "branch_name": "main",
+            "require_approval": true,
+            "required_approvals": 1
+        }))
+        .send()
+        .await
+        .expect("create branch protection");
+    assert_eq!(
+        protection.status(),
+        201,
+        "branch protection setup failed: {}",
+        protection.text().await.unwrap_or_default()
+    );
+
+    assert!(
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pull.id,)
+            .await
+            .is_ok(),
+        "an active reviewer's current approval must satisfy the gate"
+    );
+
+    let deactivated = client
+        .patch(format!("{base}/api/v1/admin/users/{reviewer_id}"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"is_active": false}))
+        .send()
+        .await
+        .expect("deactivate reviewer");
+    assert_eq!(deactivated.status(), 200);
+    assert!(
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pull.id,)
+            .await
+            .is_err(),
+        "a deactivated reviewer still authorizes a merge"
+    );
+
+    let reactivated = client
+        .patch(format!("{base}/api/v1/admin/users/{reviewer_id}"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"is_active": true}))
+        .send()
+        .await
+        .expect("reactivate reviewer");
+    assert_eq!(reactivated.status(), 200);
+    assert!(
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pull.id,)
+            .await
+            .is_ok(),
+        "reactivating the reviewer did not restore the live approval"
+    );
+
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(&db, reviewer_id)
+            .await
+            .expect("mark reviewer for retirement")
+    );
+    assert!(
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pull.id,)
+            .await
+            .is_err(),
+        "a reviewer already claimed for deletion still authorizes a merge"
+    );
+    rg_db::ops::user_ops::abort_user_retirement(&db, reviewer_id)
+        .await
+        .expect("release reviewer retirement marker");
+    assert!(
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pull.id,)
+            .await
+            .is_ok(),
+        "releasing the retirement marker did not restore the live approval"
+    );
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/admin/users/{reviewer_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("delete reviewer");
+    assert_eq!(
+        deleted.status(),
+        200,
+        "reviewer deletion failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+    let merge_error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pull.id)
+            .await
+            .expect_err("a deleted reviewer still authorizes a merge");
+    assert!(
+        format!("{merge_error:#}").contains("requires at least 1 approval(s), got 0"),
+        "unexpected merge-gate error: {merge_error:#}"
+    );
+    assert_eq!(
+        rg_db::ops::pr_review_ops::find_by_id(&db, review.id)
+            .await
+            .expect("read review after reviewer deletion")
+            .expect("review disappeared with its reviewer")
+            .reviewer_id,
+        reviewer_id
+    );
+
+    let timeline = client
+        .get(format!(
+            "{base}/api/v1/repos/review-host/review-lifecycle/pulls/1/timeline"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read timeline after reviewer deletion");
+    assert_eq!(timeline.status(), 200);
+    let timeline: Vec<serde_json::Value> = timeline.json().await.expect("timeline body");
+    assert!(
+        timeline
+            .iter()
+            .any(|event| event["kind"] == "review_approve" && event["actor"].is_null()),
+        "the approval did not remain as ghost-authored history: {timeline:?}"
+    );
+}
+
 fn representative_keys(owner: &str, repo: &str, repo_id: i64) -> Vec<BlobKey> {
     let repo_id = repo_id.to_string();
     vec![

@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use sea_orm::*;
 
-use crate::entities::pr_review::{self, ActiveModel, Entity as ReviewEntity, Model as PrReview};
+use crate::entities::{
+    pr_review::{self, ActiveModel, Entity as ReviewEntity, Model as PrReview},
+    user::{self, Entity as UserEntity},
+};
 
 /// Find a review by ID.
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<PrReview>> {
@@ -43,8 +46,10 @@ pub async fn count_approvals(db: &DatabaseConnection, pr_id: i64) -> Result<i64>
     count_current_approvals(db, pr_id, None).await
 }
 
-/// Count at most one latest approval per reviewer for the current head commit.
+/// Count at most one latest approval per live reviewer for the current head commit.
 /// A later `request_changes` from the same reviewer supersedes their approval.
+/// Historical reviews outlive their authors, but a missing, deactivated, or
+/// retiring account no longer contributes a current authorization verdict.
 pub async fn count_current_approvals(
     db: &DatabaseConnection,
     pr_id: i64,
@@ -57,7 +62,7 @@ pub async fn count_current_approvals(
             latest.insert(review.reviewer_id, review);
         }
     }
-    Ok(latest
+    let candidate_reviewers = latest
         .values()
         .filter(|review| {
             review.action == "approve"
@@ -66,7 +71,20 @@ pub async fn count_current_approvals(
                     None => review.commit_id.is_none(),
                 }
         })
-        .count() as i64)
+        .map(|review| review.reviewer_id)
+        .collect::<Vec<_>>();
+    if candidate_reviewers.is_empty() {
+        return Ok(0);
+    }
+
+    let count = UserEntity::find()
+        .filter(user::Column::Id.is_in(candidate_reviewers))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
+        .count(db)
+        .await
+        .context("db: count live PR reviewers")?;
+    Ok(count as i64)
 }
 
 /// Create a new review.
