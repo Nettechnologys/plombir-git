@@ -22,8 +22,6 @@ pub struct Model {
     pub assignee_id: Option<i64>,
     /// Milestone id (nullable)
     pub milestone_id: Option<i64>,
-    /// Label names stored as JSON array: ["bug","help-wanted"]
-    pub labels: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub closed_at: Option<DateTimeUtc>,

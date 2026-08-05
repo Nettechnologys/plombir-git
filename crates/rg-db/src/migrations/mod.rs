@@ -92,6 +92,7 @@ pub mod m20260804_000003_rename_webhook_secret_encrypted;
 pub mod m20260804_000004_wiki_revision_version_unique;
 pub mod m20260804_000005_wiki_page_edit_version;
 pub mod m20260804_000006_repo_fts_soft_delete;
+pub mod m20260805_000001_issue_labels_single_source;
 
 use sea_orm_migration::prelude::*;
 
@@ -196,6 +197,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260804_000004_wiki_revision_version_unique::Migration),
             Box::new(m20260804_000005_wiki_page_edit_version::Migration),
             Box::new(m20260804_000006_repo_fts_soft_delete::Migration),
+            Box::new(m20260805_000001_issue_labels_single_source::Migration),
         ]
     }
 }

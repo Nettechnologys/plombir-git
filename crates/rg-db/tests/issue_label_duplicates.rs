@@ -93,7 +93,6 @@ async fn setup(name: &str) -> (DatabaseConnection, TempDb, i64, Vec<i64>) {
             author_id: Set(user.id),
             assignee_id: Set(None),
             milestone_id: Set(None),
-            labels: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             closed_at: Set(None),

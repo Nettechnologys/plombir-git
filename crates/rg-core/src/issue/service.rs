@@ -10,6 +10,53 @@ use rg_db::ops::{issue_comment_ops, issue_label_ops, issue_ops};
 
 // ── Issue CRUD ──────────────────────────────────────────────────────────
 
+/// Public issue view: the row itself plus label names read from their one
+/// normalized owner (`issue_labels` → `labels`).
+///
+/// `labels` intentionally keeps the historic JSON-string wire shape. The web
+/// client already normalizes that string to an array, and removing the storage
+/// duplicate is not permission to break API consumers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IssueWithLabels {
+    #[serde(flatten)]
+    pub issue: Issue,
+    pub labels: Option<String>,
+}
+
+fn serialize_label_names(names: Vec<String>) -> Result<Option<String>> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&names)
+        .map(Some)
+        .context("serialize canonical issue label names")
+}
+
+pub async fn issues_with_labels(
+    db: &DatabaseConnection,
+    issues: Vec<Issue>,
+) -> Result<Vec<IssueWithLabels>> {
+    let issue_ids = issues.iter().map(|issue| issue.id).collect::<Vec<_>>();
+    let mut names_by_issue = issue_label_ops::get_label_names_by_issue_ids(db, &issue_ids).await?;
+    issues
+        .into_iter()
+        .map(|issue| {
+            let names = names_by_issue.remove(&issue.id).unwrap_or_default();
+            Ok(IssueWithLabels {
+                issue,
+                labels: serialize_label_names(names)?,
+            })
+        })
+        .collect()
+}
+
+pub async fn issue_with_labels(db: &DatabaseConnection, issue: Issue) -> Result<IssueWithLabels> {
+    issues_with_labels(db, vec![issue])
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("label enrichment lost the issue row"))
+}
+
 /// Create a new issue in the given repo.
 pub async fn create_issue(
     db: &DatabaseConnection,
@@ -28,19 +75,14 @@ pub async fn create_issue(
     }
 
     // Resolved before anything is written: an unknown name is the caller's
-    // mistake and must not leave a half-labelled issue behind. The denormalised
-    // JSON column and the junction table are filled from the same resolution
-    // below, so the response cannot list a label the issue does not carry.
+    // mistake and must not leave a half-labelled issue behind. The junction is
+    // the only stored owner; response views read the names back through it.
     let label_ids = match labels.as_deref() {
         Some(names) => Some(crate::label::service::resolve_label_ids(db, repo_id, names).await?),
         None => None,
     };
 
     let number = issue_ops::next_number(db, repo_id).await?;
-    let labels_json = labels
-        .as_ref()
-        .map(|l| serde_json::to_string(l).unwrap_or_else(|_| "[]".into()));
-
     let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -51,7 +93,6 @@ pub async fn create_issue(
         author_id: Set(author_id),
         assignee_id: Set(None),
         milestone_id: Set(milestone_id),
-        labels: Set(labels_json),
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
         closed_at: Set(None),
@@ -63,12 +104,7 @@ pub async fn create_issue(
 
     let issue = model.insert(&txn).await.context("db: create issue")?;
 
-    // Dual-write: the labels JSON column and the issue_labels junction table
-    // are two views of one decision, so they commit together. Written outside
-    // the transaction — and with the failure downgraded to a `warn` — the two
-    // drifted apart on any error, and the client still got a `201` listing
-    // labels that `GET /issues?labels=…` (which reads the junction) would never
-    // match.
+    // The issue and its canonical junction rows commit together.
     if let Some(ids) = label_ids {
         issue_label_ops::set_labels(&txn, issue.id, ids).await?;
     }
@@ -248,9 +284,6 @@ pub async fn update_issue(
     let mut label_ids: Option<Vec<i64>> = None;
     if let Some(l) = labels {
         label_ids = Some(crate::label::service::resolve_label_ids(db, issue_repo_id, &l).await?);
-        active.labels = Set(Some(
-            serde_json::to_string(&l).unwrap_or_else(|_| "[]".into()),
-        ));
     }
     if let Some(a) = assignee_id {
         active.assignee_id = Set(a);

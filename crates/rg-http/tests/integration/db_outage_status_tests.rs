@@ -735,7 +735,6 @@ async fn artifact_and_attachment_db_outages_return_503_after_healthy_baselines()
             author_id: Set(repo.owner_id),
             assignee_id: Set(None),
             milestone_id: Set(None),
-            labels: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             closed_at: Set(None),

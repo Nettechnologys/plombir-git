@@ -9,7 +9,6 @@ use chrono::Utc;
 use rg_db::entities::board::{ActiveModel as BoardAM, Model as Board};
 use rg_db::entities::board_card::{ActiveModel as CardAM, Model as Card};
 use rg_db::entities::board_column::{ActiveModel as ColumnAM, Model as Column};
-use rg_db::entities::issue::Model as Issue;
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 
 // ── Board CRUD ───────────────────────────────────────────────────────────
@@ -70,7 +69,10 @@ pub async fn get_board(db: &DatabaseConnection, id: i64) -> Result<Option<BoardF
         let mut cards_full = Vec::with_capacity(cards.len());
         for card in cards {
             let issue = match card.issue_id {
-                Some(issue_id) => rg_db::ops::issue_ops::find_by_id(db, issue_id).await?,
+                Some(issue_id) => match rg_db::ops::issue_ops::find_by_id(db, issue_id).await? {
+                    Some(issue) => Some(crate::issue::issue_with_labels(db, issue).await?),
+                    None => None,
+                },
                 None => None,
             };
             cards_full.push(CardFull { card, issue });
@@ -290,5 +292,5 @@ pub struct ColumnFull {
 pub struct CardFull {
     #[serde(flatten)]
     pub card: Card,
-    pub issue: Option<Issue>,
+    pub issue: Option<crate::issue::IssueWithLabels>,
 }

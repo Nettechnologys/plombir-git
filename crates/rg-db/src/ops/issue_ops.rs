@@ -173,7 +173,6 @@ mod tests {
             author_id: Set(1),
             assignee_id: Set(None),
             milestone_id: Set(None),
-            labels: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             closed_at: Set(None),

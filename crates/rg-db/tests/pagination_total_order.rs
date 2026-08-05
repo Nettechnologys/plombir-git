@@ -192,7 +192,6 @@ async fn issue_pages_partition_a_batch_filed_in_one_instant() {
                 author_id: Set(user_id),
                 assignee_id: Set(None),
                 milestone_id: Set(None),
-                labels: Set(None),
                 created_at: Set(at),
                 updated_at: Set(at),
                 closed_at: Set(None),

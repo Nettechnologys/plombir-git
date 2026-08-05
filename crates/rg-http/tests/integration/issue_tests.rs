@@ -555,6 +555,88 @@ async fn writing_an_unknown_label_is_refused_instead_of_dropped() {
     );
 }
 
+/// The issue response must be projected from the junction. If it ever reads a
+/// stored name copy again, rename leaves the old badge behind and delete leaves
+/// a ghost badge even though the label filter follows the normalized rows.
+#[tokio::test]
+async fn issue_responses_follow_label_rename_and_delete() {
+    let (base, token, owner, repo) = setup("10").await;
+    let client = reqwest::Client::new();
+
+    let label: serde_json::Value = client
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/labels"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "old-name", "color": "#ee0701"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let label_id = label["id"].as_i64().unwrap();
+
+    let issue: serde_json::Value = client
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/issues"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"title": "rename me", "labels": ["old-name"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let number = issue["number"].as_i64().unwrap();
+
+    let rename = client
+        .patch(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/labels/{label_id}"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "new-name"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rename.status(), 200);
+
+    let renamed: serde_json::Value = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{number}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let labels: Vec<String> = serde_json::from_str(renamed["labels"].as_str().unwrap()).unwrap();
+    assert_eq!(labels, vec!["new-name"]);
+
+    let delete = client
+        .delete(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/labels/{label_id}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 204);
+
+    let deleted: serde_json::Value = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{number}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        deleted["labels"].is_null(),
+        "deleted label survived in issue response: {deleted}"
+    );
+}
+
 // ── Milestones ────────────────────────────────────────────────────────────────
 
 #[tokio::test]

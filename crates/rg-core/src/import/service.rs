@@ -47,15 +47,15 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::{credential_invocation, GitCredentials};
-use sea_orm::{ActiveValue::Set, DatabaseConnection};
-use std::collections::HashMap;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, TransactionTrait};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rg_db::entities::import_task::{self, Model as ImportTask};
-use rg_db::entities::{label, milestone};
+use rg_db::entities::{issue, label, milestone};
 use rg_db::ops::{
-    import_task_ops, issue_comment_ops, issue_ops, label_ops, milestone_ops, org_ops,
-    pr_review_ops, pull_request_ops, user_ops,
+    import_task_ops, issue_comment_ops, issue_label_ops, issue_ops, label_ops, milestone_ops,
+    org_ops, pr_review_ops, pull_request_ops, user_ops,
 };
 
 use crate::import::github_client::{
@@ -155,6 +155,58 @@ async fn load_milestone_map(db: &DatabaseConnection, repo_id: i64) -> Result<Has
     Ok(map)
 }
 
+async fn load_label_map(db: &DatabaseConnection, repo_id: i64) -> Result<HashMap<String, i64>> {
+    let existing = label_ops::list_by_repo(db, repo_id).await?;
+    Ok(existing
+        .into_iter()
+        .map(|label| (label.name, label.id))
+        .collect())
+}
+
+fn resolve_imported_label_ids(
+    label_map: Option<&HashMap<String, i64>>,
+    names: &[String],
+) -> Result<Vec<i64>> {
+    // `import_labels = false` means exactly that: issue import must not smuggle
+    // label metadata back in through a denormalized field.
+    let Some(label_map) = label_map else {
+        return Ok(Vec::new());
+    };
+
+    let mut seen = HashSet::new();
+    names
+        .iter()
+        .filter(|name| seen.insert((*name).clone()))
+        .map(|name| {
+            label_map.get(name).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source issue references label {name:?}, but that label was not imported"
+                )
+            })
+        })
+        .collect()
+}
+
+async fn create_imported_issue(
+    db: &DatabaseConnection,
+    model: issue::ActiveModel,
+    label_ids: Vec<i64>,
+) -> Result<issue::Model> {
+    let txn = db
+        .begin()
+        .await
+        .context("db: begin imported issue transaction")?;
+    let saved = model
+        .insert(&txn)
+        .await
+        .context("db: create imported issue")?;
+    issue_label_ops::set_labels(&txn, saved.id, label_ids).await?;
+    txn.commit()
+        .await
+        .context("db: commit imported issue transaction")?;
+    Ok(saved)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // GitHub import
 // ═══════════════════════════════════════════════════════════════════════
@@ -216,6 +268,12 @@ async fn run_github_import(
         .await?;
     }
 
+    let label_map = if task.import_labels {
+        Some(load_label_map(db, repo_id).await?)
+    } else {
+        None
+    };
+
     // Step 3: Milestones
     if task.import_milestones {
         update_stage(db, task.id, "importing", 25, "Importing milestones...").await?;
@@ -251,6 +309,7 @@ async fn run_github_import(
                 &comments,
                 &user_map,
                 &milestone_map,
+                label_map.as_ref(),
             )
             .await?;
             stats.issues_imported += 1;
@@ -388,6 +447,12 @@ async fn run_gitlab_import(
         .await?;
     }
 
+    let label_map = if task.import_labels {
+        Some(load_label_map(db, repo_id).await?)
+    } else {
+        None
+    };
+
     // Step 3: Milestones
     if task.import_milestones {
         update_stage(db, task.id, "importing", 25, "Importing milestones...").await?;
@@ -424,6 +489,7 @@ async fn run_gitlab_import(
                 &notes,
                 &user_map,
                 &milestone_map,
+                label_map.as_ref(),
             )
             .await?;
             stats.issues_imported += 1;
@@ -843,6 +909,7 @@ async fn import_github_issue(
     comments: &[GitHubComment],
     user_map: &HashMap<String, i64>,
     milestone_map: &HashMap<String, i64>,
+    label_map: Option<&HashMap<String, i64>>,
 ) -> Result<()> {
     // Resolve author
     let author_id = issue
@@ -854,11 +921,7 @@ async fn import_github_issue(
 
     // Collect label names
     let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
-    let labels_json = if label_names.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&label_names).unwrap_or_else(|_| "[]".into()))
-    };
+    let label_ids = resolve_imported_label_ids(label_map, &label_names)?;
 
     // Resolve milestone
     let milestone_id = issue
@@ -876,7 +939,7 @@ async fn import_github_issue(
         "open"
     };
 
-    let model = rg_db::entities::issue::ActiveModel {
+    let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
         number: Set(number),
@@ -886,14 +949,13 @@ async fn import_github_issue(
         author_id: Set(author_id),
         assignee_id: Set(None),
         milestone_id: Set(milestone_id),
-        labels: Set(labels_json),
         created_at: Set(created_at),
         updated_at: Set(parse_datetime_or_now(&issue.updated_at)),
         closed_at: Set(closed_at),
         deleted_at: Set(None),
     };
 
-    let saved = issue_ops::create(db, model).await?;
+    let saved = create_imported_issue(db, model, label_ids).await?;
 
     // Import comments
     for comment in comments {
@@ -1197,6 +1259,7 @@ async fn import_gitlab_issue(
     notes: &[GitLabNote],
     user_map: &HashMap<String, i64>,
     milestone_map: &HashMap<String, i64>,
+    label_map: Option<&HashMap<String, i64>>,
 ) -> Result<()> {
     let author_id = issue
         .author
@@ -1205,12 +1268,8 @@ async fn import_gitlab_issue(
         .copied()
         .unwrap_or(1);
 
-    // GitLab labels are plain strings
-    let labels_json = if issue.labels.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&issue.labels).unwrap_or_else(|_| "[]".into()))
-    };
+    // GitLab labels are plain strings.
+    let label_ids = resolve_imported_label_ids(label_map, &issue.labels)?;
 
     let milestone_id = issue
         .milestone
@@ -1225,7 +1284,7 @@ async fn import_gitlab_issue(
         "open"
     };
 
-    let model = rg_db::entities::issue::ActiveModel {
+    let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
         number: Set(number),
@@ -1235,14 +1294,13 @@ async fn import_gitlab_issue(
         author_id: Set(author_id),
         assignee_id: Set(None),
         milestone_id: Set(milestone_id),
-        labels: Set(labels_json),
         created_at: Set(parse_datetime_or_now(&issue.created_at)),
         updated_at: Set(parse_datetime_or_now(&issue.updated_at)),
         closed_at: Set(parse_opt_datetime(&issue.closed_at)),
         deleted_at: Set(None),
     };
 
-    let saved = issue_ops::create(db, model).await?;
+    let saved = create_imported_issue(db, model, label_ids).await?;
 
     // Import notes (skip system notes)
     for note in notes {
@@ -1616,6 +1674,186 @@ pub async fn strip_legacy_source_url_credentials(db: &DatabaseConnection) -> Res
         tracing::info!(count = stripped, "removed tokens from import source URLs");
     }
     Ok(stripped)
+}
+
+#[cfg(test)]
+mod imported_issue_label_tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    async fn test_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(1, 'importer', 'importer@example.com', 'x', 1, 1, '2024-01-01', '2024-01-01')"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(1, 1, 'imported', 0, 'main', 0, 0, '2024-01-01', '2024-01-01')"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn create_label(db: &DatabaseConnection, id: i64, name: &str) -> label::Model {
+        label_ops::create(
+            db,
+            label::ActiveModel {
+                id: Set(id),
+                repo_id: Set(1),
+                name: Set(name.to_string()),
+                color: Set("#ee0701".to_string()),
+                description: Set(None),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn github_issue(label: GitHubLabel) -> GitHubIssue {
+        GitHubIssue {
+            number: 41,
+            title: "GitHub labelled issue".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![label],
+            milestone: None,
+            user: None,
+            assignees: Vec::new(),
+            comments: 0,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            pull_request: None,
+        }
+    }
+
+    fn gitlab_issue(label: &str) -> GitLabIssue {
+        GitLabIssue {
+            id: 52,
+            iid: 52,
+            title: "GitLab labelled issue".to_string(),
+            description: None,
+            state: "opened".to_string(),
+            labels: vec![label.to_string()],
+            milestone: None,
+            author: None,
+            assignees: Vec::new(),
+            user_notes_count: 0,
+            created_at: "2024-01-02T00:00:00Z".to_string(),
+            updated_at: "2024-01-02T00:00:00Z".to_string(),
+            closed_at: None,
+            merge_request_count: None,
+            has_tasks: None,
+        }
+    }
+
+    /// Both platform paths must populate the store read by label filtering and
+    /// by `GET /issues/{number}/labels`, not a response-only copy.
+    #[tokio::test]
+    async fn github_and_gitlab_imports_write_the_canonical_label_junction() {
+        let db = test_db().await;
+        let bug = create_label(&db, 10, "bug").await;
+        let triage = create_label(&db, 11, "triage").await;
+        let label_map = load_label_map(&db, 1).await.unwrap();
+        let empty_users = HashMap::new();
+        let empty_milestones = HashMap::new();
+
+        import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &github_issue(GitHubLabel {
+                id: 10,
+                name: bug.name.clone(),
+                color: "ee0701".to_string(),
+                description: None,
+            }),
+            &[],
+            &empty_users,
+            &empty_milestones,
+            Some(&label_map),
+        )
+        .await
+        .unwrap();
+        import_gitlab_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &gitlab_issue(&triage.name),
+            &[],
+            &empty_users,
+            &empty_milestones,
+            Some(&label_map),
+        )
+        .await
+        .unwrap();
+
+        for label in [&bug, &triage] {
+            let (issue_ids, total) =
+                issue_label_ops::find_issues_with_all_labels(&db, 1, &[label.id], None, 0, 10)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                total, 1,
+                "filter did not find imported label {}",
+                label.name
+            );
+            assert_eq!(issue_ids.len(), 1);
+
+            let labels = crate::label::service::get_issue_labels(&db, issue_ids[0])
+                .await
+                .unwrap();
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels[0].name, label.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabling_label_import_does_not_smuggle_labels_in_through_issues() {
+        let db = test_db().await;
+        let bug = create_label(&db, 10, "bug").await;
+
+        import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &github_issue(GitHubLabel {
+                id: 10,
+                name: bug.name,
+                color: "ee0701".to_string(),
+                description: None,
+            }),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let imported = issue_ops::find_by_repo_and_number(&db, 1, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::label::service::get_issue_labels(&db, imported.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }
 
 #[cfg(test)]

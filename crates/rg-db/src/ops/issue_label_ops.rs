@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, *};
+use std::collections::HashMap;
 
 use crate::entities::issue_label::{
     self, ActiveModel, Entity as IssueLabelEntity, Model as IssueLabel,
@@ -84,6 +85,53 @@ pub async fn get_labels(db: &DatabaseConnection, issue_id: i64) -> Result<Vec<Is
         .all(db)
         .await
         .context("db: get issue labels")
+}
+
+/// Load the canonical label names for a batch of issues.
+///
+/// The names come from `labels`, through `issue_labels`; the removed
+/// `issues.labels` JSON column is never consulted. Ordering follows junction
+/// insertion order, which is the order `set_labels` preserves from a request.
+pub async fn get_label_names_by_issue_ids(
+    db: &DatabaseConnection,
+    issue_ids: &[i64],
+) -> Result<HashMap<i64, Vec<String>>> {
+    if issue_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // IDs originate from loaded issue rows, not request text. Keeping this
+    // variadic IN list as integers avoids backend-specific bind-marker
+    // construction while remaining injection-safe.
+    let ids = issue_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(Statement::from_string(
+            backend,
+            format!(
+                "SELECT il.issue_id, l.name FROM issue_labels il \
+                 JOIN labels l ON l.id = il.label_id \
+                 WHERE il.issue_id IN ({ids}) ORDER BY il.id"
+            ),
+        ))
+        .await
+        .context("db: get issue label names")?;
+
+    let mut names = HashMap::new();
+    for row in rows {
+        let issue_id: i64 = row
+            .try_get("", "issue_id")
+            .context("db: decode issue id for label name")?;
+        let name: String = row
+            .try_get("", "name")
+            .context("db: decode issue label name")?;
+        names.entry(issue_id).or_insert_with(Vec::new).push(name);
+    }
+    Ok(names)
 }
 
 /// Delete all issue labels for a label ID (used when deleting a label).

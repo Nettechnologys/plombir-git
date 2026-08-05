@@ -60,7 +60,7 @@ pub struct ListQuery {
 #[derive(Serialize)]
 pub struct IssueResponse {
     #[serde(flatten)]
-    pub issue: rg_db::entities::issue::Model,
+    pub issue: rg_core::issue::IssueWithLabels,
     pub author: Option<String>,
 }
 
@@ -651,6 +651,9 @@ async fn issue_with_author(
 ) -> Result<IssueResponse, AppError> {
     let mut cache = HashMap::new();
     let author = author_name(db, &mut cache, issue.author_id).await?;
+    let issue = rg_core::issue::issue_with_labels(db, issue)
+        .await
+        .map_err(AppError::from)?;
     Ok(IssueResponse { issue, author })
 }
 
@@ -660,8 +663,11 @@ async fn issues_with_authors(
 ) -> Result<Vec<IssueResponse>, AppError> {
     let mut cache = HashMap::new();
     let mut responses = Vec::with_capacity(issues.len());
+    let issues = rg_core::issue::issues_with_labels(db, issues)
+        .await
+        .map_err(AppError::from)?;
     for issue in issues {
-        let author = author_name(db, &mut cache, issue.author_id).await?;
+        let author = author_name(db, &mut cache, issue.issue.author_id).await?;
         responses.push(IssueResponse { issue, author });
     }
     Ok(responses)
@@ -973,7 +979,6 @@ mod author_enrichment_tests {
             author_id,
             assignee_id: None,
             milestone_id: None,
-            labels: None,
             created_at: now,
             updated_at: now,
             closed_at: None,
@@ -1010,6 +1015,7 @@ mod author_enrichment_tests {
             .await
             .expect("existing author lookup");
         assert_eq!(enriched.author.as_deref(), Some("enrichment-author"));
+        assert_eq!(enriched.issue.labels, None);
 
         let enriched = comment_with_author(&db, comment(1, i64::MAX))
             .await

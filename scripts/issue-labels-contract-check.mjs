@@ -13,6 +13,8 @@ function check(condition, message) {
 }
 
 const backendIssueEntity = read('crates/rg-db/src/entities/issue.rs');
+const backendIssueService = read('crates/rg-core/src/issue/service.rs');
+const issueHttpApi = read('crates/rg-http/src/api/issues.rs');
 const splitClient = read('web/src/lib/api/issues.ts');
 const issuesListPage = read('web/src/routes/[owner]/[repo]/issues/+page.svelte');
 const issueDetailPage = read('web/src/routes/[owner]/[repo]/issues/[number]/+page.svelte');
@@ -20,8 +22,18 @@ const enTranslations = JSON.parse(read('web/src/lib/i18n/translations/en.json'))
 const zhTranslations = JSON.parse(read('web/src/lib/i18n/translations/zh-CN.json'));
 
 check(
-  /pub labels:\s*Option<String>/.test(backendIssueEntity),
-  'backend issue entity stores labels as an optional JSON string',
+  !/pub labels:\s*Option<String>/.test(backendIssueEntity),
+  'issue entity does not map a denormalized labels column',
+);
+check(
+  /struct IssueWithLabels/.test(backendIssueService)
+    && /get_label_names_by_issue_ids/.test(backendIssueService)
+    && /pub labels:\s*Option<String>/.test(backendIssueService),
+  'issue response labels come from the canonical junction and retain the JSON-string wire shape',
+);
+check(
+  /rg_core::issue::issues_with_labels/.test(issueHttpApi),
+  'list and detail responses use the canonical label projection',
 );
 
 for (const [name, source] of [
