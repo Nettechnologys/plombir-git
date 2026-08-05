@@ -596,6 +596,76 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
     }
 }
 
+const OPEN_PR_HEAD_REFRESH_ATTEMPTS: usize = 4;
+
+struct OpenPrHeadSync {
+    open_prs: Vec<rg_db::entities::pull_request::Model>,
+    head_sha: Option<String>,
+}
+
+/// Reconcile the PR rows with the branch ref that exists *now*, not merely the
+/// ref move that caused this hook task.
+///
+/// Hook tasks are detached from the push response and can finish out of order.
+/// The database primitive protects each stale snapshot with CAS; this loop then
+/// re-reads the Git ref so the newer transition retries when an older transition
+/// happened to win the first write. Conversely, a delayed older hook observes
+/// the newer ref and converges on it instead of retrying its obsolete SHA.
+async fn synchronize_open_pr_heads(
+    params: &PostPushParams<'_>,
+    target: &HookTarget,
+    branch_name: &str,
+) -> anyhow::Result<OpenPrHeadSync> {
+    for attempt in 1..=OPEN_PR_HEAD_REFRESH_ATTEMPTS {
+        let head_before = crate::repo::service::try_get_branch_sha(&target.path, branch_name)?;
+        let refreshed = rg_db::ops::pull_request_ops::update_open_head_sha(
+            params.db,
+            target.repo_id,
+            branch_name,
+            head_before.as_deref(),
+        )
+        .await?;
+        let head_after = crate::repo::service::try_get_branch_sha(&target.path, branch_name)?;
+        let mismatched_rows = refreshed
+            .open_prs
+            .iter()
+            .filter(|pr| pr.head_sha.as_deref() != head_after.as_deref())
+            .count();
+
+        if refreshed.stale_rows > 0 {
+            tracing::warn!(
+                repo_id = target.repo_id,
+                branch = %branch_name,
+                attempt,
+                stale_rows = refreshed.stale_rows,
+                "post-push PR head refresh lost a compare-and-swap"
+            );
+        }
+
+        if head_before == head_after && mismatched_rows == 0 {
+            return Ok(OpenPrHeadSync {
+                open_prs: refreshed.open_prs,
+                head_sha: head_after,
+            });
+        }
+
+        tracing::debug!(
+            repo_id = target.repo_id,
+            branch = %branch_name,
+            attempt,
+            mismatched_rows,
+            head_before = ?head_before,
+            head_after = ?head_after,
+            "post-push PR head refresh observed concurrent movement; retrying"
+        );
+    }
+
+    anyhow::bail!(
+        "open PR heads for branch '{branch_name}' did not converge after \
+         {OPEN_PR_HEAD_REFRESH_ATTEMPTS} compare-and-swap attempts"
+    )
+}
+
 /// Section 0 of the post-push hook (branch updates only): refresh open-PR head
 /// SHAs, run the auto-merge / merge-queue evaluations for the new commit, and
 /// emit the protected-branch acceptance audit log.
@@ -609,16 +679,21 @@ async fn post_push_branch_maintenance(
     update: &RefUpdate,
 ) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
-    if !update.new_sha.chars().all(|character| character == '0') {
-        match rg_db::ops::pull_request_ops::update_open_head_sha(
-            params.db,
-            target.repo_id,
-            branch_name,
-            &update.new_sha,
-        )
-        .await
-        {
-            Ok(open_prs) => {
+    match synchronize_open_pr_heads(params, target, branch_name).await {
+        Ok(synchronized) => {
+            let protocol_head = (!update.new_sha.chars().all(|character| character == '0'))
+                .then_some(update.new_sha.as_str());
+            if protocol_head != synchronized.head_sha.as_deref() {
+                tracing::warn!(
+                    repo_id = target.repo_id,
+                    branch = %branch_name,
+                    hook_head = ?protocol_head,
+                    current_head = ?synchronized.head_sha,
+                    "post-push PR maintenance reconciled a delayed ref move to the current branch head"
+                );
+            }
+
+            if let Some(head_sha) = synchronized.head_sha.as_deref() {
                 // The `pull_request` half of the event pair a forge emits for a
                 // branch that has an open PR on it: the push gets its own `push`
                 // pipeline below, and every PR this branch heads has been
@@ -634,7 +709,7 @@ async fn post_push_branch_maintenance(
                 // are bounded by the cascade's own `seen` set, which drops a
                 // `(repo, refname, new_sha)` it has already handled.
                 if update.old_sha != update.new_sha {
-                    for pr in &open_prs {
+                    for pr in &synchronized.open_prs {
                         crate::pull_request::trigger_pull_request_ci_best_effort(
                             params.db,
                             params.repo_root,
@@ -649,14 +724,14 @@ async fn post_push_branch_maintenance(
                     params.db,
                     params.repo_root,
                     target.repo_id,
-                    &update.new_sha,
+                    head_sha,
                     &params.pipeline_ci(),
                 )
                 .await;
             }
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "failed to refresh PR head SHA after push")
-            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "failed to refresh PR head SHA after push")
         }
     }
     match rg_db::ops::protected_branch_ops::find_by_repo_and_branch(
@@ -910,6 +985,9 @@ async fn trigger_push_webhooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{migrated_memory_database, CapturedLogs};
+    use sea_orm::{NotSet, Set};
+    use std::sync::Mutex;
 
     fn moved(refname: &str, new_sha: &str) -> RefUpdate {
         RefUpdate {
@@ -929,6 +1007,218 @@ mod tests {
             name: format!("repo-{repo_id}"),
             path: PathBuf::from(format!("/repos/owner/repo-{repo_id}.git")),
         })
+    }
+
+    struct RecordingPrCi {
+        checked_commits: Mutex<Vec<String>>,
+    }
+
+    impl RecordingPrCi {
+        fn new() -> Self {
+            Self {
+                checked_commits: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CiTrigger for RecordingPrCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            false
+        }
+
+        fn has_workflow_for_event(
+            &self,
+            _repo_path: &Path,
+            commit_sha: &str,
+            _event: &str,
+            _ref_name: &str,
+            _base_branch: Option<&str>,
+        ) -> bool {
+            self.checked_commits
+                .lock()
+                .expect("CI recorder lock")
+                .push(commit_sha.to_string());
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
+        {
+            unreachable!("the test CI engine reports no pull_request workflow")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    fn git(args: &[&str], cwd: Option<&Path>) -> String {
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, cwd)
+            .expect("run git");
+        output.ensure_success().expect("git command succeeds");
+        output.stdout_str().trim().to_string()
+    }
+
+    /// A delayed hook for A→B must reconcile the PR to the branch's current C,
+    /// and the pull_request CI consumer must receive C rather than being dropped
+    /// with the stale writer or triggered on B.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_hook_reconciles_to_the_live_ref_and_keeps_pr_ci() {
+        let db = migrated_memory_database().await;
+        let sandbox = tempfile::tempdir().expect("create hook sandbox");
+        let repo_root = sandbox.path().join("repos");
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "headsync",
+            "headsync@example.invalid",
+            "",
+            "Head Sync",
+        )
+        .await
+        .expect("create repository owner");
+        let repo = crate::repo::service::create_repo(
+            &db,
+            owner.id,
+            "head-sync",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create repository");
+        let repo_path = repo_root.join("headsync/head-sync.git");
+
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let worktree_arg = worktree.path().to_str().expect("UTF-8 worktree");
+        let bare_arg = repo_path.to_str().expect("UTF-8 bare repository");
+        git(&["init", "-q", "-b", "feature", worktree_arg], None);
+        git(
+            &["config", "user.name", "PR head refresh test"],
+            Some(worktree.path()),
+        );
+        git(
+            &["config", "user.email", "head-refresh@example.invalid"],
+            Some(worktree.path()),
+        );
+        std::fs::write(worktree.path().join("state.txt"), "A\n").expect("write A");
+        git(&["add", "."], Some(worktree.path()));
+        git(&["commit", "-qm", "A"], Some(worktree.path()));
+        let initial = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        std::fs::write(worktree.path().join("state.txt"), "B\n").expect("write B");
+        git(&["commit", "-qam", "B"], Some(worktree.path()));
+        let delayed = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        std::fs::write(worktree.path().join("state.txt"), "C\n").expect("write C");
+        git(&["commit", "-qam", "C"], Some(worktree.path()));
+        let current = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        git(
+            &["remote", "add", "origin", bare_arg],
+            Some(worktree.path()),
+        );
+        git(&["push", "-q", "origin", "feature"], Some(worktree.path()));
+
+        let now = chrono::Utc::now();
+        let pr = rg_db::ops::pull_request_ops::create(
+            &db,
+            rg_db::entities::pull_request::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                number: Set(1),
+                title: Set("delayed hook".to_string()),
+                body: Set(None),
+                state: Set("open".to_string()),
+                is_draft: Set(false),
+                auto_merge_enabled: Set(false),
+                auto_merge_strategy: Set(None),
+                auto_merge_enabled_by_id: Set(None),
+                auto_merge_enabled_at: Set(None),
+                author_id: Set(owner.id),
+                reviewer_id: Set(None),
+                head_branch: Set("feature".to_string()),
+                base_branch: Set("main".to_string()),
+                head_sha: Set(Some(initial.clone())),
+                merge_strategy: Set(None),
+                merge_commit_sha: Set(None),
+                head_repo_id: Set(None),
+                milestone_id: Set(None),
+                labels: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                closed_at: Set(None),
+                merged_at: Set(None),
+            },
+        )
+        .await
+        .expect("create open PR");
+
+        let ci = RecordingPrCi::new();
+        let smtp = None;
+        let tracker = crate::task_tracker::TaskTracker::new();
+        let params = PostPushParams {
+            db: &db,
+            repo_path: &repo_path,
+            repo_root: &repo_root,
+            owner: "headsync",
+            repo_name: "head-sync",
+            pusher_id: Some(owner.id),
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            notifier: None,
+            smtp_config: &smtp,
+            ci_engine: &ci,
+            external_url: None,
+            delivery_tracker: &tracker,
+        };
+        let target = HookTarget {
+            repo_id: repo.id,
+            owner_id: owner.id,
+            owner: "headsync".to_string(),
+            name: "head-sync".to_string(),
+            path: repo_path.clone(),
+        };
+        let stale_update = RefUpdate {
+            old_sha: initial,
+            new_sha: delayed,
+            refname: "refs/heads/feature".to_string(),
+            status: "ok".to_string(),
+            message: String::new(),
+        };
+        let (logs, _guard) = CapturedLogs::capture();
+
+        let merged = post_push_branch_maintenance(&params, &target, "feature", &stale_update).await;
+        assert!(merged.is_empty());
+
+        let stored = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
+            .await
+            .expect("reload PR")
+            .expect("PR still exists");
+        assert_eq!(stored.head_sha.as_deref(), Some(current.as_str()));
+        assert_eq!(
+            ci.checked_commits
+                .lock()
+                .expect("CI recorder lock")
+                .as_slice(),
+            [current.as_str()],
+            "the delayed hook must keep pull_request CI and point it at the live head"
+        );
+        assert!(
+            logs.rendered()
+                .contains("reconciled a delayed ref move to the current branch head"),
+            "the stale hook must be visible to operators: {}",
+            logs.rendered()
+        );
     }
 
     /// The hooks run auto-merge, auto-merge moves a branch, and that move is fed

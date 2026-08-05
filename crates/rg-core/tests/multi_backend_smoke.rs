@@ -149,6 +149,101 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         "the repository UPDATE trigger did not replace the FTS snapshot"
     );
 
+    // card_9d3b68368396: open-PR head refresh uses the same snapshot CAS on
+    // SQLite, PostgreSQL and MySQL, including the nullable state of a deleted
+    // branch. The deterministic overtaken-writer interleaving lives beside the
+    // primitive in rg-db; this server smoke proves the generated predicates and
+    // NULL transition have the same external result on both server dialects.
+    let pr_now = chrono::Utc::now();
+    let initial_pr_head = "1111111111111111111111111111111111111111";
+    let refreshed_pr_head = "2222222222222222222222222222222222222222";
+    let recreated_pr_head = "3333333333333333333333333333333333333333";
+    let head_pr = rg_db::ops::pull_request_ops::create(
+        &db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            number: Set(1),
+            title: Set("cross-backend head refresh".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(user.id),
+            reviewer_id: Set(None),
+            head_branch: Set("feature".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some(initial_pr_head.to_string())),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(pr_now),
+            updated_at: Set(pr_now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .expect("create cross-backend PR head fixture");
+    let refreshed = rg_db::ops::pull_request_ops::update_open_head_sha(
+        &db,
+        repo.id,
+        "feature",
+        Some(refreshed_pr_head),
+    )
+    .await
+    .expect("CAS-refresh the PR head");
+    assert_eq!(refreshed.stale_rows, 0);
+    assert_eq!(
+        refreshed.open_prs[0].head_sha.as_deref(),
+        Some(refreshed_pr_head)
+    );
+    let stale_swap = rg_db::ops::pull_request_ops::compare_and_swap_open_head_sha(
+        &db,
+        head_pr.id,
+        Some(initial_pr_head),
+        Some(recreated_pr_head),
+    )
+    .await
+    .expect("run a stale PR-head compare-and-swap");
+    assert!(
+        !stale_swap,
+        "a stale expected head must lose on every database backend"
+    );
+    let after_stale_swap = rg_db::ops::pull_request_ops::find_by_id(&db, head_pr.id)
+        .await
+        .expect("reload PR after stale compare-and-swap")
+        .expect("cross-backend PR still exists");
+    assert_eq!(
+        after_stale_swap.head_sha.as_deref(),
+        Some(refreshed_pr_head),
+        "the losing writer must not roll the PR head back"
+    );
+    let deleted = rg_db::ops::pull_request_ops::update_open_head_sha(&db, repo.id, "feature", None)
+        .await
+        .expect("clear the PR head for a deleted branch");
+    assert_eq!(deleted.stale_rows, 0);
+    assert_eq!(deleted.open_prs[0].head_sha, None);
+    let recreated = rg_db::ops::pull_request_ops::update_open_head_sha(
+        &db,
+        repo.id,
+        "feature",
+        Some(recreated_pr_head),
+    )
+    .await
+    .expect("restore the PR head after branch recreation");
+    assert_eq!(recreated.stale_rows, 0);
+    assert_eq!(
+        recreated.open_prs[0].head_sha.as_deref(),
+        Some(recreated_pr_head)
+    );
+    assert_eq!(recreated.open_prs[0].id, head_pr.id);
+
     assert!(
         rg_db::ops::repo_star_ops::toggle_star(&db, user.id, repo.id)
             .await

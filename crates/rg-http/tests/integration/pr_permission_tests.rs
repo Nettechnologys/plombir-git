@@ -786,10 +786,15 @@ async fn creating_pr_requests_matching_codeowner_user() {
         .stdout_str()
         .trim()
         .to_string();
-    let updated_prs =
-        rg_db::ops::pull_request_ops::update_open_head_sha(&db, repo_id, "feature", &new_head)
-            .await
-            .unwrap();
+    let updated_prs = rg_db::ops::pull_request_ops::update_open_head_sha(
+        &db,
+        repo_id,
+        "feature",
+        Some(&new_head),
+    )
+    .await
+    .unwrap()
+    .open_prs;
     assert_eq!(updated_prs.len(), 1);
     let pr_id = updated_prs[0].id;
     assert!(
