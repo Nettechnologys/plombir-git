@@ -9,7 +9,12 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub repo_id: i64,
-    pub created_by_id: i64,
+    /// The account that added the key, or `None` once that account has been
+    /// deleted. A deploy key is the repository's access, not the credential of
+    /// whoever configured it, so the column is `ON DELETE SET NULL` — deleting
+    /// an account must not silently disable somebody else's deployments
+    /// (`m20260805_000004_repo_config_outlives_its_author`).
+    pub created_by_id: Option<i64>,
     pub title: String,
     pub public_key: String,
     pub fingerprint: String,

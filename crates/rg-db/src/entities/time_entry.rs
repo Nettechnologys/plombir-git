@@ -9,7 +9,13 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub issue_id: i64,
-    pub user_id: i64,
+    /// The account that logged the time, or `None` once that account has been
+    /// deleted. The entry is also read as a property of the issue —
+    /// `time_entry_ops::total_minutes_by_issue` sums it — so the column is
+    /// `ON DELETE SET NULL`: deleting an account must not silently lower the
+    /// hours recorded against an issue in somebody else's repository
+    /// (`m20260805_000004_repo_config_outlives_its_author`).
+    pub user_id: Option<i64>,
     pub duration_minutes: i64,
     pub description: Option<String>,
     pub created_at: DateTimeUtc,

@@ -14,7 +14,12 @@ pub struct Model {
     pub context: String,
     pub description: Option<String>,
     pub target_url: Option<String>,
-    pub creator_id: i64,
+    /// The account that reported the check result, or `None` once that account
+    /// has been deleted. The status is a fact about a commit in its repository,
+    /// so the column is `ON DELETE SET NULL` — deleting an account must not
+    /// rewrite the check history of merged pull requests
+    /// (`m20260805_000004_repo_config_outlives_its_author`).
+    pub creator_id: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

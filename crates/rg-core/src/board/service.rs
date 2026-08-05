@@ -28,7 +28,7 @@ pub async fn create_board(
         description: Set(description),
         repo_id: Set(repo_id),
         org_id: Set(org_id),
-        created_by: Set(created_by),
+        created_by: Set(Some(created_by)),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()

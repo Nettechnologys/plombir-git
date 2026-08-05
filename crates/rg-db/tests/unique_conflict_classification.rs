@@ -187,7 +187,7 @@ async fn a_duplicate_deploy_key_is_classifiable_through_the_context_the_op_attac
     let key = |title: &str| deploy_key::ActiveModel {
         id: NotSet,
         repo_id: Set(repo_id),
-        created_by_id: Set(user_id),
+        created_by_id: Set(Some(user_id)),
         title: Set(title.to_string()),
         public_key: Set("ssh-ed25519 AAAAC3Nz".to_string()),
         fingerprint: Set("SHA256:duplicate".to_string()),

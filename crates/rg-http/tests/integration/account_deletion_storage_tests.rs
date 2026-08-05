@@ -411,6 +411,186 @@ async fn deleting_an_account_keeps_what_it_uploaded_into_another_repository() {
     );
 }
 
+const GUEST_DEPLOY_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA guest";
+
+/// The same `DELETE`, on what the guest *configured* rather than uploaded: the
+/// host's CI secret, deploy key, commit status, board and logged hours all stay,
+/// carrying a ghost author — and every endpoint that reads them still answers
+/// `200`, which is the half a schema-level test cannot see.
+///
+/// Before `m20260805_000004_repo_config_outlives_its_author` this endpoint
+/// answered `200` while `ON DELETE CASCADE` quietly took all five out of a
+/// repository the guest did not own: the host's pipelines would start failing on
+/// an empty variable, its deployments lose their key, and nobody would have a
+/// reason to connect that to a collaborator's account going away
+/// (card_a2123e31ee6e).
+#[tokio::test]
+async fn deleting_an_account_keeps_what_it_configured_in_another_repository() {
+    let (base, db, _state) = spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+
+    let (admin_token, admin_id) = register_full(&base, "cfg-admin", "cfg-admin@example.com").await;
+    promote_user_to_admin(&db, admin_id).await;
+    let (host_token, _host_id) = register_full(&base, "cfg-host", "cfg-host@example.com").await;
+    let (guest_token, guest_id) = register_full(&base, "cfg-guest", "cfg-guest@example.com").await;
+
+    let repo_id = create_repo(&base, &host_token, "shared").await;
+    let added = client
+        .post(format!("{base}/api/v1/repos/cfg-host/shared/collaborators"))
+        .bearer_auth(&host_token)
+        .json(&serde_json::json!({"username": "cfg-guest", "permission": "admin"}))
+        .send()
+        .await
+        .expect("add the guest as an administering collaborator");
+    assert_eq!(added.status(), 201);
+
+    let secret = client
+        .put(format!(
+            "{base}/api/v1/repos/cfg-host/shared/actions/secrets/DEPLOY_TOKEN"
+        ))
+        .bearer_auth(&guest_token)
+        .json(&serde_json::json!({"value": "s3cr3t"}))
+        .send()
+        .await
+        .expect("set a CI secret on the host's repository");
+    assert_eq!(
+        secret.status(),
+        201,
+        "setting the secret failed: {}",
+        secret.text().await.unwrap_or_default()
+    );
+
+    let key = client
+        .post(format!("{base}/api/v1/repos/cfg-host/shared/keys"))
+        .bearer_auth(&guest_token)
+        .json(&serde_json::json!({
+            "title": "deployer",
+            "key": GUEST_DEPLOY_KEY,
+            "read_only": true
+        }))
+        .send()
+        .await
+        .expect("add a deploy key to the host's repository");
+    assert_eq!(
+        key.status(),
+        201,
+        "adding the deploy key failed: {}",
+        key.text().await.unwrap_or_default()
+    );
+
+    let status = client
+        .post(format!(
+            "{base}/api/v1/repos/cfg-host/shared/statuses/c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"
+        ))
+        .bearer_auth(&guest_token)
+        .json(&serde_json::json!({"state": "success", "context": "ci/build"}))
+        .send()
+        .await
+        .expect("report a commit status on the host's repository");
+    assert_eq!(
+        status.status(),
+        201,
+        "reporting the commit status failed: {}",
+        status.text().await.unwrap_or_default()
+    );
+
+    let board = client
+        .post(format!("{base}/api/v1/repos/cfg-host/shared/boards"))
+        .bearer_auth(&guest_token)
+        .json(&serde_json::json!({"name": "Roadmap"}))
+        .send()
+        .await
+        .expect("create a board in the host's repository");
+    assert_eq!(
+        board.status(),
+        201,
+        "creating the board failed: {}",
+        board.text().await.unwrap_or_default()
+    );
+
+    let (_issue_id, issue_number) =
+        create_issue(&base, &host_token, "cfg-host", "shared", "Needs work").await;
+    let logged = client
+        .post(format!(
+            "{base}/api/v1/repos/cfg-host/shared/issues/{issue_number}/time"
+        ))
+        .bearer_auth(&guest_token)
+        .json(&serde_json::json!({"duration_minutes": 180}))
+        .send()
+        .await
+        .expect("log time on the host's issue");
+    assert_eq!(
+        logged.status(),
+        201,
+        "logging time failed: {}",
+        logged.text().await.unwrap_or_default()
+    );
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/admin/users/{guest_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("delete the guest account");
+    assert_eq!(
+        deleted.status(),
+        200,
+        "account deletion failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+
+    // The rows the cascade used to take, straight off the database.
+    assert_eq!(
+        rg_db::ops::ci_secret_ops::list_by_repo(&db, repo_id)
+            .await
+            .expect("read the repository's CI secrets")
+            .len(),
+        1,
+        "the repository's CI secret died with the collaborator who set it"
+    );
+    assert_eq!(
+        rg_db::ops::deploy_key_ops::list_by_repo(&db, repo_id)
+            .await
+            .expect("read the repository's deploy keys")
+            .len(),
+        1,
+        "the repository's deploy key died with the collaborator who added it"
+    );
+    assert_eq!(
+        rg_db::ops::board_ops::list_boards_by_repo(&db, repo_id)
+            .await
+            .expect("read the repository's boards")
+            .len(),
+        1,
+        "the repository's board died with the collaborator who created it"
+    );
+
+    // And every reader of a ghosted row still answers, which is what the owner
+    // of the repository actually meets.
+    for path in [
+        "actions/secrets".to_string(),
+        "keys".to_string(),
+        "boards".to_string(),
+        "commits/c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff/statuses".to_string(),
+        format!("issues/{issue_number}/time"),
+        format!("issues/{issue_number}/time/total"),
+    ] {
+        let response = client
+            .get(format!("{base}/api/v1/repos/cfg-host/shared/{path}"))
+            .bearer_auth(&host_token)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("read {path} after the author was deleted: {error}"));
+        assert_eq!(
+            response.status(),
+            200,
+            "GET {path} failed once its rows carried a ghost author: {}",
+            response.text().await.unwrap_or_default()
+        );
+    }
+}
+
 /// The organization is the ownership the account cannot take with it:
 /// `organizations.owner_id` has no foreign key, so the row would survive
 /// pointing at nothing — while the cascade on `repositories.owner_id` still

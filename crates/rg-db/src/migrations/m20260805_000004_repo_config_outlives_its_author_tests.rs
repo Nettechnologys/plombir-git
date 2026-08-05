@@ -4,9 +4,9 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use super::super::ghost_author::{Shape, SqliteRebuildPoint};
 use super::REBUILD;
 
-/// A release asset that is hard-deleted before the rebuild, so the table's
+/// A commit status that is hard-deleted before the rebuild, so the table's
 /// `AUTOINCREMENT` high-water mark sits above its highest surviving row.
-const HIGH_WATER_ASSET_ID: i64 = 50;
+const HIGH_WATER_STATUS_ID: i64 = 50;
 
 struct TempDb {
     path: std::path::PathBuf,
@@ -16,7 +16,7 @@ impl TempDb {
     fn new(label: &str) -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-ghost-uploader-{label}-{}.db",
+                "forgekeep-ghost-config-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }
@@ -39,13 +39,14 @@ impl Drop for TempDb {
     }
 }
 
-/// A database at the schema immediately before this migration, holding a
-/// release with two assets and an issue attachment — the shapes the rebuild has
-/// to carry across, including the child rows that `DROP TABLE "releases"` would
-/// cascade away if the pragmas failed.
+/// A database at the schema immediately before this migration, holding one of
+/// each row the rebuild has to carry across: the guest's CI secret, deploy key,
+/// commit status, board and environment approval, all inside the *host's*
+/// repository — plus the board's column and card, which `DROP TABLE "boards"`
+/// would cascade away if the pragmas failed.
 async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
-    // One pooled connection on purpose. A rebuild swaps three tables out from
+    // One pooled connection on purpose. A rebuild swaps five tables out from
     // under every *other* connection of the pool, and SQLite lets the first
     // statement one of them runs afterwards fail once with a bare
     // `no such table: users` before it reloads its schema (card_a28a7004b108) —
@@ -55,7 +56,7 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
         .await
         .expect("connect to throwaway SQLite database");
 
-    const NAME: &str = "m20260805_000002_uploads_outlive_their_uploader";
+    const NAME: &str = "m20260805_000004_repo_config_outlives_its_author";
     let before_rebuild = crate::migrations::Migrator::migrations()
         .iter()
         .position(|migration| migration.name() == NAME)
@@ -69,42 +70,65 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
         r#"
         INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
         VALUES
-            (1, 'ghost-host', 'ghost-host@example.invalid', '',
+            (1, 'config-host', 'config-host@example.invalid', '',
              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-            (2, 'ghost-guest', 'ghost-guest@example.invalid', '',
+            (2, 'config-guest', 'config-guest@example.invalid', '',
              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
         INSERT INTO repositories (id, owner_id, name, created_at, updated_at)
         VALUES (1, 1, 'shared', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
-        INSERT INTO releases
-            (id, repo_id, tag_name, target_commitish, title, author_id, created_at, updated_at)
-        VALUES (1, 1, 'v1.0.0', 'main', 'First', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
-        INSERT INTO release_assets
-            (id, release_id, filename, size, content_type, download_count, uploader_id, created_at)
+
+        INSERT INTO ci_secrets
+            (id, repo_id, name, encrypted_value, created_by_id, created_at, updated_at)
+        VALUES (1, 1, 'DEPLOY_TOKEN', 'ciphertext', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+        INSERT INTO deploy_keys
+            (id, repo_id, created_by_id, title, public_key, fingerprint, read_only, created_at)
+        VALUES (1, 1, 2, 'ci', 'ssh-ed25519 AAAA', 'SHA256:deadbeef', TRUE, CURRENT_TIMESTAMP);
+
+        INSERT INTO commit_statuses
+            (id, repo_id, sha, state, context, creator_id, created_at, updated_at)
         VALUES
-            (1, 1, 'binary.tar.gz', 3, 'application/gzip', 0, 2, CURRENT_TIMESTAMP),
-            (2, 1, 'checksums.txt', 4, 'text/plain', 0, 1, CURRENT_TIMESTAMP),
-            ({HIGH_WATER_ASSET_ID}, 1, 'gone.bin', 1, 'application/octet-stream', 0, 2,
-             CURRENT_TIMESTAMP);
+            (1, 1, 'c0ffee', 'success', 'ci/build', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+            ({HIGH_WATER_STATUS_ID}, 1, 'c0ffee', 'success', 'ci/gone', 2,
+             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+        INSERT INTO boards (id, repo_id, name, created_by, created_at, updated_at)
+        VALUES
+            (1, 1, 'Guest board', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+            (2, 1, 'Host board', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+        INSERT INTO board_columns (id, board_id, name, position, created_at)
+        VALUES (1, 1, 'To do', 0, CURRENT_TIMESTAMP);
+        INSERT INTO board_cards (id, column_id, note, position, created_at, updated_at)
+        VALUES (1, 1, 'a card', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+        INSERT INTO ci_environments
+            (id, repo_id, name, protected, required_approvals, created_at, updated_at)
+        VALUES (1, 1, 'production', TRUE, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+        INSERT INTO pipeline_jobs (id, stage_id, name, script, status)
+        VALUES (1, 1, 'deploy', 'make deploy', 'success');
+        INSERT INTO ci_environment_approvals
+            (id, job_id, environment_id, approved_by, created_at)
+        VALUES (1, 1, 1, 2, CURRENT_TIMESTAMP);
+
         INSERT INTO issues (id, repo_id, number, title, author_id, created_at, updated_at)
         VALUES (1, 1, 1, 'A bug', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
-        INSERT INTO attachments
-            (id, uuid, repo_id, uploader_id, issue_id, filename, blob_key, content_type, size,
-             download_count, created_at)
-        VALUES (1, 'a1b2c3', 1, 2, 1, 'trace.log', 'attachments/1/a1b2c3/trace.log',
-                'text/plain', 5, 0, CURRENT_TIMESTAMP);
-        DELETE FROM release_assets WHERE id = {HIGH_WATER_ASSET_ID};
+        INSERT INTO time_entries
+            (id, issue_id, user_id, duration_minutes, description, created_at)
+        VALUES (1, 1, 2, 180, 'debugging', CURRENT_TIMESTAMP);
+
+        DELETE FROM commit_statuses WHERE id = {HIGH_WATER_STATUS_ID};
         "#
     ))
     .await
-    .expect("seed the release, its assets and an attachment");
+    .expect("seed the guest's configuration inside the host's repository");
 
     assert_eq!(
         scalar(
             &db,
-            "SELECT seq FROM sqlite_sequence WHERE name = 'release_assets'",
+            "SELECT seq FROM sqlite_sequence WHERE name = 'commit_statuses'",
         )
         .await,
-        HIGH_WATER_ASSET_ID
+        HIGH_WATER_STATUS_ID
     );
     (db, temp)
 }
@@ -135,42 +159,43 @@ async fn table_sql(db: &DatabaseConnection, table: &str) -> String {
 
 /// Everything the rebuild must not lose, whichever shape it produced.
 async fn assert_rebuild_invariants(db: &DatabaseConnection) {
-    assert_eq!(
-        scalar(db, "SELECT count(*) FROM releases WHERE id = 1").await,
-        1,
-        "the rebuild lost the release row"
-    );
-    assert_eq!(
-        scalar(db, "SELECT count(*) FROM release_assets").await,
-        2,
-        "the rebuild lost release assets — a `DROP TABLE releases` cascaded into its children"
-    );
-    assert_eq!(
-        scalar(db, "SELECT count(*) FROM attachments WHERE id = 1").await,
-        1,
-        "the rebuild lost the attachment row"
-    );
+    for (table, expected) in [
+        ("ci_secrets", 1),
+        ("deploy_keys", 1),
+        ("commit_statuses", 1),
+        ("boards", 2),
+        ("ci_environment_approvals", 1),
+        ("time_entries", 1),
+        // The children of `boards`: a rebuild whose `DROP TABLE` cascaded would
+        // empty these while leaving the boards themselves intact.
+        ("board_columns", 1),
+        ("board_cards", 1),
+    ] {
+        assert_eq!(
+            scalar(db, &format!("SELECT count(*) FROM {table}")).await,
+            expected,
+            "the rebuild lost rows from {table}"
+        );
+    }
     assert_eq!(
         scalar(
             db,
-            "SELECT seq FROM sqlite_sequence WHERE name = 'release_assets'",
+            "SELECT seq FROM sqlite_sequence WHERE name = 'commit_statuses'",
         )
         .await,
-        HIGH_WATER_ASSET_ID,
-        "the rebuild lowered the AUTOINCREMENT high-water mark, so a new asset would reuse an \
-         id that is part of a previous asset's blob key"
+        HIGH_WATER_STATUS_ID,
+        "the rebuild lowered the AUTOINCREMENT high-water mark, so a new row would reuse an id \
+         an API caller already stored"
     );
     assert_eq!(
         scalar(
             db,
             "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN \
-             ('idx_releases_repo_id', 'idx_release_assets_release_id', \
-              'idx_attachments_blob_key', 'idx_attachments_repo', 'idx_attachments_issue', \
-              'idx_attachments_pr', 'idx_attachments_issue_comment', \
-              'idx_attachments_review_comment')",
+             ('idx_deploy_keys_repo_created', 'idx_commit_statuses_repo_sha', \
+              'idx_time_entries_issue', 'idx_time_entries_user')",
         )
         .await,
-        8,
+        4,
         "the rebuild did not restore every named index"
     );
     assert_eq!(
@@ -212,91 +237,114 @@ async fn assert_shape(db: &DatabaseConnection, shape: Shape) {
     }
 }
 
-/// The whole point: with the account gone, the file it left in somebody else's
-/// repository is still there, and the row that names its bytes is still
-/// readable.
+/// The whole point: with the account gone, the configuration it left in
+/// somebody else's repository still works, and only its author is missing.
 #[tokio::test]
-async fn deleting_the_uploader_ghosts_the_row_instead_of_destroying_it() {
-    let (db, _temp) = fixture("ghosted-uploader").await;
+async fn deleting_the_author_ghosts_the_configuration_instead_of_destroying_it() {
+    let (db, _temp) = fixture("ghosted-author").await;
     let manager = SchemaManager::new(&db);
     REBUILD
         .sqlite(&manager, Shape::Ghost)
         .await
-        .expect("rebuild the upload tables");
+        .expect("rebuild the configuration tables");
     assert_shape(&db, Shape::Ghost).await;
     assert_rebuild_invariants(&db).await;
 
     db.execute_unprepared("DELETE FROM users WHERE id = 2")
         .await
-        .expect("delete the account that uploaded into somebody else's repository");
+        .expect("delete the account that configured somebody else's repository");
+
+    for (table, column, lost) in [
+        (
+            "ci_secrets",
+            "created_by_id",
+            "the repository's CI secret died with the account that set it — its pipelines now \
+             fail on an empty variable",
+        ),
+        (
+            "deploy_keys",
+            "created_by_id",
+            "the repository's deploy key died with the account that added it — its deployments \
+             now silently have no access",
+        ),
+        (
+            "commit_statuses",
+            "creator_id",
+            "the commit's check result died with the account that reported it",
+        ),
+        (
+            "boards",
+            "created_by",
+            "the board died with the account that created it",
+        ),
+        (
+            "ci_environment_approvals",
+            "approved_by",
+            "the record of who approved the protected deployment died with the approver, so \
+             nothing says it was ever approved",
+        ),
+        (
+            "time_entries",
+            "user_id",
+            "the hours logged against the host's issue died with the account that logged them, \
+             lowering the issue's total",
+        ),
+    ] {
+        assert_eq!(
+            scalar(&db, &format!("SELECT count(*) FROM {table} WHERE id = 1")).await,
+            1,
+            "{lost}"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                &format!("SELECT count(*) FROM {table} WHERE id = 1 AND {column} IS NULL"),
+            )
+            .await,
+            1,
+            "{table}.{column} was not ghosted"
+        );
+    }
 
     assert_eq!(
-        scalar(&db, "SELECT count(*) FROM releases WHERE id = 1").await,
+        scalar(&db, "SELECT count(*) FROM board_columns").await,
         1,
-        "the release of a live repository died with the account that published it"
+        "the board's columns died with the account that created the board"
     );
     assert_eq!(
-        scalar(&db, "SELECT count(*) FROM release_assets").await,
-        2,
-        "release assets died with the account that published their release"
-    );
-    assert_eq!(
-        scalar(&db, "SELECT count(*) FROM attachments WHERE id = 1").await,
+        scalar(&db, "SELECT count(*) FROM board_cards").await,
         1,
-        "the attachment died with the account that uploaded it"
+        "the board's cards died with the account that created the board"
     );
     assert_eq!(
         scalar(
             &db,
-            "SELECT count(*) FROM releases WHERE id = 1 AND author_id IS NULL",
+            "SELECT count(*) FROM boards WHERE id = 2 AND created_by = 1"
         )
         .await,
         1,
-        "the departed author was not ghosted"
+        "a board created by somebody else lost its author"
     );
     assert_eq!(
-        scalar(
-            &db,
-            "SELECT count(*) FROM release_assets WHERE id = 1 AND uploader_id IS NULL",
-        )
-        .await,
+        scalar(&db, "SELECT count(*) FROM repositories WHERE id = 1").await,
         1,
-        "the departed uploader was not ghosted"
-    );
-    assert_eq!(
-        scalar(
-            &db,
-            "SELECT count(*) FROM release_assets WHERE id = 2 AND uploader_id = 1",
-        )
-        .await,
-        1,
-        "an asset uploaded by somebody else lost its uploader"
-    );
-    assert_eq!(
-        scalar(
-            &db,
-            "SELECT count(*) FROM attachments WHERE id = 1 AND uploader_id IS NULL",
-        )
-        .await,
-        1,
-        "the attachment's departed uploader was not ghosted"
+        "deleting the guest reached the host's repository"
     );
 }
 
-/// A failure part-way through leaves all three tables, their rows and their
-/// sequences exactly as they were — and the same migration can simply be run
-/// again.
+/// A failure part-way through leaves every table, row and sequence exactly as it
+/// was — and the same migration can simply be run again.
 #[tokio::test]
 async fn failure_mid_rebuild_rolls_back_and_the_same_rebuild_can_retry() {
     let (db, _temp) = fixture("rollback-retry").await;
-    let old_releases = table_sql(&db, "releases").await;
+    let old_ci_secrets = table_sql(&db, "ci_secrets").await;
     let manager = SchemaManager::new(&db);
 
     let error = REBUILD
         .sqlite_with_hook(&manager, Shape::Ghost, |point| async move {
-            if point == SqliteRebuildPoint::TableRebuilt("releases") {
+            if point == SqliteRebuildPoint::TableRebuilt("ci_secrets") {
                 Err(sea_orm::DbErr::Custom(
-                    "injected failure after rebuilding releases".to_string(),
+                    "injected failure after rebuilding ci_secrets".to_string(),
                 ))
             } else {
                 Ok(())
@@ -307,17 +355,18 @@ async fn failure_mid_rebuild_rolls_back_and_the_same_rebuild_can_retry() {
     assert!(error.to_string().contains("injected failure"));
 
     assert_eq!(
-        table_sql(&db, "releases").await,
-        old_releases,
-        "the rolled-back rebuild left the replacement `releases` table behind"
+        table_sql(&db, "ci_secrets").await,
+        old_ci_secrets,
+        "the rolled-back rebuild left the replacement `ci_secrets` table behind"
     );
     assert_shape(&db, Shape::Owned).await;
     assert_rebuild_invariants(&db).await;
 
     db.execute_unprepared(
-        "INSERT INTO release_assets
-             (release_id, filename, size, content_type, download_count, uploader_id, created_at)
-         VALUES (1, 'after-failure.bin', 1, 'application/octet-stream', 0, 2, CURRENT_TIMESTAMP)",
+        "INSERT INTO commit_statuses
+             (repo_id, sha, state, context, creator_id, created_at, updated_at)
+         VALUES (1, 'c0ffee', 'failure', 'ci/after-failure', 2,
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .await
     .expect("the rolled-back tables remain writable");
@@ -328,14 +377,14 @@ async fn failure_mid_rebuild_rolls_back_and_the_same_rebuild_can_retry() {
         .expect("the same migration can be retried after a rollback");
     assert_shape(&db, Shape::Ghost).await;
     assert_eq!(
-        scalar(&db, "SELECT count(*) FROM release_assets").await,
-        3,
+        scalar(&db, "SELECT count(*) FROM commit_statuses").await,
+        2,
         "the retried rebuild lost the row written between the two attempts"
     );
 }
 
 /// `down` is a real reversal, and it refuses rather than deleting other
-/// people's files to make `NOT NULL` fit again.
+/// people's configuration to make `NOT NULL` fit again.
 #[tokio::test]
 async fn down_restores_the_cascade_and_refuses_once_a_row_is_ghosted() {
     let (db, _temp) = fixture("reversal").await;
@@ -343,7 +392,7 @@ async fn down_restores_the_cascade_and_refuses_once_a_row_is_ghosted() {
     REBUILD
         .sqlite(&manager, Shape::Ghost)
         .await
-        .expect("rebuild the upload tables");
+        .expect("rebuild the configuration tables");
 
     REBUILD
         .sqlite(&manager, Shape::Owned)
@@ -355,15 +404,15 @@ async fn down_restores_the_cascade_and_refuses_once_a_row_is_ghosted() {
     REBUILD
         .sqlite(&manager, Shape::Ghost)
         .await
-        .expect("rebuild the upload tables again");
+        .expect("rebuild the configuration tables again");
     db.execute_unprepared("DELETE FROM users WHERE id = 2")
         .await
-        .expect("ghost the uploader");
+        .expect("ghost the author");
 
     let error = REBUILD
         .sqlite(&manager, Shape::Owned)
         .await
-        .expect_err("a ghosted row has no uploader to restore, so the reversal must fail");
+        .expect_err("a ghosted row has no author to restore, so the reversal must fail");
     assert!(
         error.to_string().contains("NOT NULL"),
         "the reversal failed for the wrong reason: {error}"

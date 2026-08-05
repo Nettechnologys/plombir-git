@@ -1,4 +1,5 @@
 mod fts_safety;
+pub(crate) mod ghost_author;
 pub mod m20260424_000001_create_users;
 pub mod m20260424_000002_create_repositories;
 pub mod m20260424_000003_create_keys_tokens;
@@ -95,6 +96,7 @@ pub mod m20260804_000006_repo_fts_soft_delete;
 pub mod m20260805_000001_issue_labels_single_source;
 pub mod m20260805_000002_uploads_outlive_their_uploader;
 pub mod m20260805_000003_create_oci_publication_lease;
+pub mod m20260805_000004_repo_config_outlives_its_author;
 
 use sea_orm_migration::prelude::*;
 
@@ -202,6 +204,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000001_issue_labels_single_source::Migration),
             Box::new(m20260805_000002_uploads_outlive_their_uploader::Migration),
             Box::new(m20260805_000003_create_oci_publication_lease::Migration),
+            Box::new(m20260805_000004_repo_config_outlives_its_author::Migration),
         ]
     }
 }

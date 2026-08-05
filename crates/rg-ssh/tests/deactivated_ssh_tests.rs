@@ -390,7 +390,7 @@ async fn deleting_a_deploy_key_stops_execs_on_the_connection_it_opened() {
         rg_db::entities::deploy_key::ActiveModel {
             id: sea_orm::NotSet,
             repo_id: Set(repo.id),
-            created_by_id: Set(h.user_id),
+            created_by_id: Set(Some(h.user_id)),
             title: Set("integration test".to_string()),
             public_key: Set(openssh),
             fingerprint: Set(fingerprint),

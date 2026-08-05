@@ -10,7 +10,12 @@ pub struct Model {
     pub name: String,
     #[serde(skip_serializing)]
     pub encrypted_value: String,
-    pub created_by_id: i64,
+    /// The account that introduced the secret, or `None` once that account has
+    /// been deleted. The secret belongs to its repository — routinely somebody
+    /// else's — so the column is `ON DELETE SET NULL`: the value CI reads
+    /// outlives the collaborator who set it
+    /// (`m20260805_000004_repo_config_outlives_its_author`).
+    pub created_by_id: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

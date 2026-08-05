@@ -6,7 +6,8 @@ export interface DeployKey {
   public_key: string;
   fingerprint: string;
   read_only: boolean;
-  created_by_id: number;
+  /** `null` once the account that added the key has been deleted. */
+  created_by_id: number | null;
   created_at: string;
   last_used_at?: string | null;
 }

@@ -12,7 +12,12 @@ pub struct Model {
     pub org_id: Option<i64>,
     pub name: String,
     pub description: Option<String>,
-    pub created_by: i64,
+    /// The account that created the board, or `None` once that account has been
+    /// deleted. The board belongs to its repository or organization, so the
+    /// column is `ON DELETE SET NULL` — otherwise one departing collaborator
+    /// took an entire organization's board, its columns and every card on it
+    /// (`m20260805_000004_repo_config_outlives_its_author`).
+    pub created_by: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

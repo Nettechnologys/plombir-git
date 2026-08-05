@@ -104,7 +104,7 @@ pub async fn add_approval(
     let model = ci_environment_approval::ActiveModel {
         job_id: Set(job_id),
         environment_id: Set(environment_id),
-        approved_by: Set(approved_by),
+        approved_by: Set(Some(approved_by)),
         created_at: Set(chrono::Utc::now()),
         ..Default::default()
     };

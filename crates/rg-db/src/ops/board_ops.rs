@@ -410,7 +410,7 @@ mod reorder_tests {
                 org_id: Set(None),
                 name: Set(name.to_string()),
                 description: Set(None),
-                created_by: Set(user_id),
+                created_by: Set(Some(user_id)),
                 created_at: Set(now),
                 updated_at: Set(now),
             },

@@ -396,7 +396,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             org_id: Set(None),
             name: Set("Smoke".to_string()),
             description: Set(None),
-            created_by: Set(user.id),
+            created_by: Set(Some(user.id)),
             created_at: Set(board_now),
             updated_at: Set(board_now),
         },

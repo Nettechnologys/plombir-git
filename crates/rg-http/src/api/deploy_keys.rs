@@ -33,7 +33,10 @@ pub struct DeployKeyResponse {
     pub public_key: String,
     pub fingerprint: String,
     pub read_only: bool,
-    pub created_by_id: i64,
+    /// `null` once the account that added the key has been deleted. The key
+    /// itself is the repository's and keeps working
+    /// (`m20260805_000004_repo_config_outlives_its_author`).
+    pub created_by_id: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -129,7 +132,7 @@ pub async fn create_deploy_key(
     let model = rg_db::entities::deploy_key::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo.id),
-        created_by_id: Set(actor_id),
+        created_by_id: Set(Some(actor_id)),
         title: Set(title.to_string()),
         public_key: Set(public_key.to_string()),
         fingerprint: Set(fingerprint),

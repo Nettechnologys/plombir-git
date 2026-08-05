@@ -166,7 +166,7 @@ pub async fn external_ci_webhook(
             state: sea_orm::Set(state_val),
             description: sea_orm::Set(description),
             target_url: sea_orm::Set(target_url),
-            creator_id: sea_orm::Set(actor_id),
+            creator_id: sea_orm::Set(Some(actor_id)),
             created_at: sea_orm::Set(chrono::Utc::now()),
             updated_at: sea_orm::Set(chrono::Utc::now()),
         },

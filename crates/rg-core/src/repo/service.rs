@@ -2529,7 +2529,7 @@ pub async fn create_commit_status(
         context: sea_orm::Set(context.to_string()),
         description: sea_orm::Set(description.map(str::to_string)),
         target_url: sea_orm::Set(target_url.map(str::to_string)),
-        creator_id: sea_orm::Set(creator_id),
+        creator_id: sea_orm::Set(Some(creator_id)),
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
         ..Default::default()

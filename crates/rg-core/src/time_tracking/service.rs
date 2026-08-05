@@ -20,7 +20,7 @@ pub async fn add_time(
     let now = Utc::now();
     let model = ActiveModel {
         issue_id: Set(issue_id),
-        user_id: Set(user_id),
+        user_id: Set(Some(user_id)),
         duration_minutes: Set(duration_minutes),
         description: Set(description),
         created_at: Set(now),

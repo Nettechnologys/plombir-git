@@ -57,7 +57,7 @@ pub async fn upsert(
         repo_id: Set(repo_id),
         name: Set(name.to_owned()),
         encrypted_value: Set(encrypted_value.to_owned()),
-        created_by_id: Set(actor_id),
+        created_by_id: Set(Some(actor_id)),
         created_at: Set(now),
         updated_at: Set(now),
     }
