@@ -97,6 +97,7 @@ pub mod m20260805_000001_issue_labels_single_source;
 pub mod m20260805_000002_uploads_outlive_their_uploader;
 pub mod m20260805_000003_create_oci_publication_lease;
 pub mod m20260805_000004_repo_config_outlives_its_author;
+pub mod m20260805_000005_account_owned_rows_follow_their_parent;
 
 use sea_orm_migration::prelude::*;
 
@@ -205,6 +206,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000002_uploads_outlive_their_uploader::Migration),
             Box::new(m20260805_000003_create_oci_publication_lease::Migration),
             Box::new(m20260805_000004_repo_config_outlives_its_author::Migration),
+            Box::new(m20260805_000005_account_owned_rows_follow_their_parent::Migration),
         ]
     }
 }

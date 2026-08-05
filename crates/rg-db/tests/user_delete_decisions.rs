@@ -1,4 +1,4 @@
-//! Every foreign key into `users` carries a decision, and it is written down.
+//! Every scalar column that names a user carries a decision, and it is written down.
 //!
 //! `DELETE FROM users` reaches whatever the schema says it reaches. Twice now a
 //! column naming the account that *produced* a row turned out to cascade into a
@@ -6,10 +6,11 @@
 //! that own bytes, card_a2123e31ee6e for the six that own a repository's
 //! configuration and history. Both were found by sweeping the schema by hand.
 //!
-//! This test is that sweep, kept. It reads every `REFERENCES users(id)` off the
-//! live migrated database and matches it against the decisions below. A new
-//! foreign key into `users` fails it until somebody writes down which of the two
-//! rules it follows and why:
+//! This test is that sweep, kept. It reads both every `REFERENCES users(id)` and
+//! every conventionally named scalar user-reference column off the live
+//! migrated database, then matches them against the decisions below. A new
+//! `user_id`, `author_id`, `*_by_id`, or other name from the vocabulary fails it
+//! even when its migration forgot the foreign key entirely.
 //!
 //! * **`CASCADE`** — the row is meaningless without the account *and* lives in
 //!   the account's own namespace: its credentials, sessions, subscriptions, the
@@ -17,13 +18,15 @@
 //! * **`SET NULL`** — the row lives in somebody else's namespace and stays
 //!   useful without its author, who becomes a ghost.
 //!
-//! Deciding is the point; either answer passes. What must not happen again is a
-//! column arriving with `ON DELETE CASCADE` because that is what the previous
-//! `create_table` migration happened to say.
+//! `NO FOREIGN KEY` is not an endorsement. It is an explicit, searchable state:
+//! `organizations.owner_id` is enforced by a service refusal, while the author
+//! columns remain the open work in card_7e4a56345094. Deciding is the point;
+//! what must not happen again is a column arriving with an accidental cascade
+//! or no database rule at all and escaping the inventory.
 
 use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 
-/// `(table, column, on_delete, why)` for every foreign key into `users(id)`.
+/// `(table, column, on_delete-or-absence, why)` for every scalar user reference.
 const DECISIONS: &[(&str, &str, &str, &str)] = &[
     // ── The account's own namespace: it goes when the account goes ──────────
     (
@@ -45,10 +48,22 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the account's own second factor",
     ),
     (
+        "notifications",
+        "user_id",
+        "CASCADE",
+        "card_dd3f86fde48e: an inbox row is meaningless without its recipient",
+    ),
+    (
         "oauth_accounts",
         "user_id",
         "CASCADE",
         "the account's own external identity link",
+    ),
+    (
+        "organization_members",
+        "user_id",
+        "CASCADE",
+        "card_dd3f86fde48e: the membership is the account's grant into the organization",
     ),
     (
         "passkey_credentials",
@@ -69,6 +84,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the row asks this specific person for a review, and nothing can be asked of a ghost \
          (weighed with card_a2123e31ee6e and deliberately left cascading)",
     ),
+    (
+        "repo_collaborators",
+        "user_id",
+        "CASCADE",
+        "card_dd3f86fde48e: the collaborator row is the account's repository grant",
+    ),
     ("repo_stars", "user_id", "CASCADE", "the account's own star"),
     (
         "repo_watches",
@@ -84,6 +105,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
          storage first, see user_delete_cascades_repositories.rs",
     ),
     ("ssh_keys", "user_id", "CASCADE", "the account's own key"),
+    (
+        "team_members",
+        "user_id",
+        "CASCADE",
+        "card_dd3f86fde48e: the membership is the account's grant into the team",
+    ),
     // ── Somebody else's namespace: the row outlives its author ─────────────
     (
         "attachments",
@@ -155,6 +182,164 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "card_a2123e31ee6e: the hours are summed into the issue's total by \
          time_entry_ops::total_minutes_by_issue",
     ),
+    // ── User-like columns without a database reference ─────────────────────
+    // `organizations.owner_id` has a complete service-level decision. The
+    // author/action columns are intentionally visible here while
+    // card_7e4a56345094 remains open; changing them to SET NULL later must
+    // update this row in the same patch.
+    (
+        "organizations",
+        "owner_id",
+        "NO FOREIGN KEY",
+        "account deletion refuses while this account owns an organization; see \
+         refuse_ownerships_this_deletion_may_not_cascade",
+    ),
+    (
+        "audit_log",
+        "user_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "issue_comments",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "issues",
+        "assignee_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "issues",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "merge_queue_entries",
+        "enqueued_by_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "oci_manifest",
+        "push_by",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "oci_repository",
+        "owner_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit ownership decision",
+    ),
+    (
+        "package_versions",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "packages",
+        "owner_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit ownership decision",
+    ),
+    (
+        "pipelines",
+        "triggered_by",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "pr_reviewer_requests",
+        "requested_by_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "pr_reviews",
+        "reviewer_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "pull_requests",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "pull_requests",
+        "auto_merge_enabled_by_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "pull_requests",
+        "reviewer_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "review_comments",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "review_comments",
+        "resolved_by_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "review_comments",
+        "suggestion_applied_by_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "wiki_pages",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+    (
+        "wiki_revisions",
+        "author_id",
+        "NO FOREIGN KEY",
+        "card_7e4a56345094: pending an explicit durable-ghost decision",
+    ),
+];
+
+/// Scalar column names which mean "this row stores a users.id" in ForgeKeep.
+///
+/// Serialized arrays are deliberately not pretended into this scalar guard;
+/// card_ce8b75ca7ed2 tracks the three JSON allow-lists and their own source
+/// belt.
+const USER_REFERENCE_COLUMN_NAMES: &[&str] = &[
+    "actor_id",
+    "approved_by",
+    "assignee_id",
+    "author_id",
+    "auto_merge_enabled_by_id",
+    "created_by",
+    "created_by_id",
+    "creator_id",
+    "enqueued_by_id",
+    "owner_id",
+    "push_by",
+    "requested_by_id",
+    "resolved_by_id",
+    "reviewer_id",
+    "suggestion_applied_by_id",
+    "triggered_by",
+    "uploader_id",
+    "user_id",
 ];
 
 struct TempDb {
@@ -188,22 +373,36 @@ impl Drop for TempDb {
     }
 }
 
-/// Every `(table, column, on_delete)` pointing at `users(id)`, off the live
-/// schema rather than off the migrations that were meant to produce it.
-async fn live_user_foreign_keys(db: &DatabaseConnection) -> Vec<(String, String, String)> {
+/// Every scalar column whose name says it stores a `users.id`, with its actual
+/// `ON DELETE` action or the explicit `NO FOREIGN KEY` state.
+async fn live_user_references(db: &DatabaseConnection) -> Vec<(String, String, String)> {
+    let names = USER_REFERENCE_COLUMN_NAMES
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let rows = db
         .query_all(Statement::from_string(
             DatabaseBackend::Sqlite,
-            r#"
-            SELECT m.name AS child, f."from" AS column_name, f."on_delete" AS on_delete
+            format!(
+                r#"
+            SELECT m.name AS child,
+                   p.name AS column_name,
+                   COALESCE(f."on_delete", 'NO FOREIGN KEY') AS on_delete
             FROM sqlite_master m
-            JOIN pragma_foreign_key_list(m.name) f
-            WHERE m.type = 'table' AND f."table" = 'users'
-            ORDER BY m.name, f."from"
-            "#,
+            JOIN pragma_table_info(m.name) p
+            LEFT JOIN pragma_foreign_key_list(m.name) f
+              ON f."from" = p.name AND f."table" = 'users' AND f."to" = 'id'
+            WHERE m.type = 'table'
+              AND m.name <> 'users'
+              AND m.name NOT LIKE 'sqlite_%'
+              AND p.name IN ({names})
+            ORDER BY m.name, p.name
+            "#
+            ),
         ))
         .await
-        .expect("read the foreign keys pointing at users");
+        .expect("read scalar columns that name users");
 
     rows.iter()
         .map(|row| {
@@ -218,51 +417,82 @@ async fn live_user_foreign_keys(db: &DatabaseConnection) -> Vec<(String, String,
         .collect()
 }
 
+fn decision_drift(live: &[(String, String, String)]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut undeclared = Vec::new();
+    let mut disagreeing = Vec::new();
+    for (table, column, on_delete) in live {
+        match DECISIONS
+            .iter()
+            .find(|(t, c, _, _)| t == table && c == column)
+        {
+            None => undeclared.push(format!("{table}.{column} -> {on_delete}")),
+            Some((_, _, decided, _)) if decided != on_delete => disagreeing.push(format!(
+                "{table}.{column}: the schema says {on_delete}, the decision says {decided}"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    let stale = DECISIONS
+        .iter()
+        .filter(|(table, column, _, _)| !live.iter().any(|(t, c, _)| t == table && c == column))
+        .map(|(table, column, _, _)| format!("{table}.{column}"))
+        .collect();
+    (undeclared, disagreeing, stale)
+}
+
 #[tokio::test]
-async fn every_users_foreign_key_carries_a_written_down_decision() {
+async fn every_scalar_user_reference_carries_a_written_down_decision() {
     let temp = TempDb::new();
     let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to throwaway database");
     rg_db::run_migrations(&db).await.expect("run migrations");
 
-    let live = live_user_foreign_keys(&db).await;
-
-    let mut undeclared = Vec::new();
-    let mut disagreeing = Vec::new();
-    for (table, column, on_delete) in &live {
-        match DECISIONS
-            .iter()
-            .find(|(t, c, _, _)| t == table && c == column)
-        {
-            None => undeclared.push(format!("{table}.{column} -> ON DELETE {on_delete}")),
-            Some((_, _, decided, _)) if decided != on_delete => disagreeing.push(format!(
-                "{table}.{column}: the schema says ON DELETE {on_delete}, the decision says \
-                 {decided}"
-            )),
-            Some(_) => {}
-        }
-    }
+    let live = live_user_references(&db).await;
+    let (undeclared, disagreeing, stale) = decision_drift(&live);
 
     assert!(
         undeclared.is_empty(),
-        "a foreign key into `users` arrived with no decision recorded in this test. Deciding is \
-         the point — write down whether the row belongs to the account (CASCADE) or lives in \
-         somebody else's namespace and should outlive it (SET NULL), and why: {undeclared:?}"
+        "a scalar user-reference column arrived with no decision recorded in this test. Deciding \
+         is the point — write down whether the row belongs to the account (CASCADE), lives in \
+         somebody else's namespace (SET NULL), or temporarily has no FK and which card owns that \
+         debt: {undeclared:?}"
     );
     assert!(
         disagreeing.is_empty(),
         "the schema no longer matches the decision recorded for it: {disagreeing:?}"
     );
 
-    let stale: Vec<_> = DECISIONS
-        .iter()
-        .filter(|(table, column, _, _)| !live.iter().any(|(t, c, _)| t == table && c == column))
-        .map(|(table, column, _, _)| format!("{table}.{column}"))
-        .collect();
     assert!(
         stale.is_empty(),
-        "a decision is recorded for a foreign key the schema no longer has — drop it so this \
+        "a decision is recorded for a user-like column the schema no longer has — drop it so this \
          list stays readable: {stale:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_new_user_like_column_without_a_foreign_key_is_not_invisible() {
+    let temp = TempDb::new();
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to throwaway database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+    db.execute_unprepared(
+        "CREATE TABLE accidental_grants (
+             id integer NOT NULL PRIMARY KEY AUTOINCREMENT,
+             user_id bigint NOT NULL
+         )",
+    )
+    .await
+    .expect("mutate the live schema with an undecided user-like column");
+
+    let live = live_user_references(&db).await;
+    let (undeclared, _, _) = decision_drift(&live);
+    assert!(
+        undeclared
+            .iter()
+            .any(|entry| entry == "accidental_grants.user_id -> NO FOREIGN KEY"),
+        "the guard failed to discover the undecided no-FK column: {undeclared:?}"
     );
 }

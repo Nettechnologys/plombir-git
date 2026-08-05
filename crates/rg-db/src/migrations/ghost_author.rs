@@ -119,6 +119,33 @@ pub(crate) struct GhostAuthorRebuild {
     pub cascade_warning: &'static str,
 }
 
+/// One foreign key that makes a row or grant meaningless without its parent.
+///
+/// Unlike [`GhostAuthorRebuild`], this shape starts with no foreign key at all:
+/// `up` installs `ON DELETE CASCADE`, while `down` removes the reference again.
+pub(crate) struct RequiredReference {
+    pub table: &'static str,
+    pub column: &'static str,
+    pub parent_table: &'static str,
+    pub parent_column: &'static str,
+    pub constraint: &'static str,
+}
+
+/// Add required ownership references to existing tables on every backend.
+///
+/// SQLite still needs the same guarded table rebuild as a ghost-author change.
+/// Existing orphan rows are deliberately omitted while copying: they already
+/// name no live owner and would otherwise make the new constraint impossible to
+/// install. PostgreSQL and MySQL perform the equivalent cleanup before adding
+/// the constraints.
+pub(crate) struct RequiredReferenceRebuild {
+    pub migration: &'static str,
+    pub staging_suffix: &'static str,
+    pub references: &'static [RequiredReference],
+    pub sqlite_tables: &'static [SqliteTable],
+    pub cascade_warning: &'static str,
+}
+
 impl GhostAuthorRebuild {
     pub(crate) async fn apply(
         &self,
@@ -162,6 +189,31 @@ impl GhostAuthorRebuild {
     where
         F: Fn(SqliteRebuildPoint) -> Fut,
         Fut: Future<Output = Result<(), DbErr>>,
+    {
+        self.sqlite_rendered_with_hook(
+            manager,
+            |table| Ok(table.body.replace("{rule}", shape.nullability())),
+            |table| Ok(table.foreign_keys.replace("{on_delete}", shape.on_delete())),
+            |_| Ok(String::new()),
+            after_step,
+        )
+        .await
+    }
+
+    async fn sqlite_rendered_with_hook<F, Fut, B, K, W>(
+        &self,
+        manager: &SchemaManager<'_>,
+        body_for: B,
+        foreign_keys_for: K,
+        copy_filter_for: W,
+        after_step: F,
+    ) -> Result<(), DbErr>
+    where
+        F: Fn(SqliteRebuildPoint) -> Fut,
+        Fut: Future<Output = Result<(), DbErr>>,
+        B: Fn(&SqliteTable) -> Result<String, DbErr>,
+        K: Fn(&SqliteTable) -> Result<String, DbErr>,
+        W: Fn(&SqliteTable) -> Result<String, DbErr>,
     {
         let migration = self.migration;
         let pool = match manager.get_connection() {
@@ -209,8 +261,18 @@ impl GhostAuthorRebuild {
         let work_result = async {
             after_step(SqliteRebuildPoint::WriteBoundary).await?;
             for (table, sequence) in self.sqlite_tables.iter().zip(sequences) {
-                self.rebuild_one_table(&mut connection, table, shape, sequence)
-                    .await?;
+                let body = body_for(table)?;
+                let foreign_keys = foreign_keys_for(table)?;
+                let copy_filter = copy_filter_for(table)?;
+                self.rebuild_one_table(
+                    &mut connection,
+                    table,
+                    &body,
+                    &foreign_keys,
+                    &copy_filter,
+                    sequence,
+                )
+                .await?;
                 after_step(SqliteRebuildPoint::TableRebuilt(table.name)).await?;
             }
             self.assert_referential_integrity(&mut connection).await?;
@@ -227,7 +289,9 @@ impl GhostAuthorRebuild {
         &self,
         connection: &mut SqlitePoolConnection,
         table: &SqliteTable,
-        shape: Shape,
+        body: &str,
+        foreign_keys: &str,
+        copy_filter: &str,
         sequence: Option<i64>,
     ) -> Result<(), DbErr> {
         let name = table.name;
@@ -238,8 +302,12 @@ impl GhostAuthorRebuild {
             .map(|column| format!("\"{column}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let body = table.body.replace("{rule}", shape.nullability());
-        let foreign_keys = table.foreign_keys.replace("{on_delete}", shape.on_delete());
+        let foreign_key_separator = if foreign_keys.trim().is_empty() {
+            ""
+        } else {
+            ","
+        };
+        let copy_filter = copy_filter.replace("{source}", &format!("\"{staging}\""));
 
         let drop_indexes = table
             .indexes
@@ -260,10 +328,11 @@ impl GhostAuthorRebuild {
                 r#"
             ALTER TABLE "{name}" RENAME TO "{staging}";
 
-            CREATE TABLE "{name}" ({body},{foreign_keys}
+            CREATE TABLE "{name}" ({body}{foreign_key_separator}{foreign_keys}
             );
 
-            INSERT INTO "{name}" ({columns}) SELECT {columns} FROM "{staging}";
+            INSERT INTO "{name}" ({columns})
+            SELECT {columns} FROM "{staging}" {copy_filter};
 
             DROP TABLE "{staging}";
             "#
@@ -640,7 +709,10 @@ impl GhostAuthorRebuild {
             // Named rather than server-generated, so the reversal can find it by
             // the same route this call created it.
             let constraint = format!("fk_{table}_{column}_users");
-            if let Some(existing) = self.postgres_foreign_key(manager, table, column).await? {
+            if let Some(existing) = self
+                .postgres_foreign_key(manager, table, column, "users")
+                .await?
+            {
                 db.execute_unprepared(&format!(
                     r#"ALTER TABLE "{table}" DROP CONSTRAINT "{existing}""#
                 ))
@@ -676,6 +748,7 @@ impl GhostAuthorRebuild {
         manager: &SchemaManager<'_>,
         table: &str,
         column: &str,
+        parent_table: &str,
     ) -> Result<Option<String>, DbErr> {
         let row = manager
             .get_connection()
@@ -690,7 +763,7 @@ impl GhostAuthorRebuild {
             WHERE rel.relname = $1
               AND ns.nspname = current_schema()
               AND con.contype = 'f'
-              AND ref.relname = 'users'
+              AND ref.relname = $3
               AND (
                 SELECT string_agg(att.attname::text, ',' ORDER BY att.attname)
                 FROM unnest(con.conkey) AS k(attnum)
@@ -699,7 +772,7 @@ impl GhostAuthorRebuild {
               ) = $2
             LIMIT 1
             "#,
-                [table.into(), column.into()],
+                [table.into(), column.into(), parent_table.into()],
             ))
             .await?;
 
@@ -716,7 +789,10 @@ impl GhostAuthorRebuild {
 
         for (table, column) in self.columns {
             let constraint = format!("fk_{table}_{column}_users");
-            if let Some(existing) = self.mysql_foreign_key(manager, table, column).await? {
+            if let Some(existing) = self
+                .mysql_foreign_key(manager, table, column, "users")
+                .await?
+            {
                 db.execute_unprepared(&format!(
                     "ALTER TABLE `{table}` DROP FOREIGN KEY `{existing}`"
                 ))
@@ -752,6 +828,7 @@ impl GhostAuthorRebuild {
         manager: &SchemaManager<'_>,
         table: &str,
         column: &str,
+        parent_table: &str,
     ) -> Result<Option<String>, DbErr> {
         let row = manager
             .get_connection()
@@ -762,9 +839,9 @@ impl GhostAuthorRebuild {
              WHERE k.TABLE_SCHEMA = DATABASE()
                AND k.TABLE_NAME = ?
                AND k.COLUMN_NAME = ?
-               AND k.REFERENCED_TABLE_NAME = 'users'
+               AND k.REFERENCED_TABLE_NAME = ?
              LIMIT 1",
-                [table.into(), column.into()],
+                [table.into(), column.into(), parent_table.into()],
             ))
             .await?;
 
@@ -772,6 +849,243 @@ impl GhostAuthorRebuild {
             Some(row) => Ok(Some(row.try_get::<String>("", "name")?)),
             None => Ok(None),
         }
+    }
+}
+
+impl RequiredReferenceRebuild {
+    pub(crate) async fn apply(
+        &self,
+        manager: &SchemaManager<'_>,
+        with_references: bool,
+    ) -> Result<(), DbErr> {
+        match manager.get_database_backend() {
+            DatabaseBackend::Sqlite => self.sqlite(manager, with_references).await,
+            DatabaseBackend::Postgres => self.postgres(manager, with_references).await,
+            DatabaseBackend::MySql => self.mysql(manager, with_references).await,
+        }
+    }
+
+    pub(crate) async fn sqlite(
+        &self,
+        manager: &SchemaManager<'_>,
+        with_references: bool,
+    ) -> Result<(), DbErr> {
+        self.sqlite_with_hook(manager, with_references, |_| async { Ok(()) })
+            .await
+    }
+
+    pub(crate) async fn sqlite_with_hook<F, Fut>(
+        &self,
+        manager: &SchemaManager<'_>,
+        with_references: bool,
+        after_step: F,
+    ) -> Result<(), DbErr>
+    where
+        F: Fn(SqliteRebuildPoint) -> Fut,
+        Fut: Future<Output = Result<(), DbErr>>,
+    {
+        let runner = GhostAuthorRebuild {
+            migration: self.migration,
+            staging_suffix: self.staging_suffix,
+            columns: &[],
+            sqlite_tables: self.sqlite_tables,
+            cascade_warning: self.cascade_warning,
+        };
+
+        runner
+            .sqlite_rendered_with_hook(
+                manager,
+                |table| Ok(table.body.to_string()),
+                |table| self.sqlite_foreign_keys(table, with_references),
+                |table| self.sqlite_copy_filter(table, with_references),
+                after_step,
+            )
+            .await
+    }
+
+    fn sqlite_foreign_keys(
+        &self,
+        table: &SqliteTable,
+        with_references: bool,
+    ) -> Result<String, DbErr> {
+        let mut clauses = Vec::new();
+        if !table.foreign_keys.trim().is_empty() {
+            clauses.push(table.foreign_keys.trim().to_string());
+        }
+        if with_references {
+            clauses.extend(
+                self.references
+                    .iter()
+                    .filter(|reference| reference.table == table.name)
+                    .map(|reference| {
+                        format!(
+                            "FOREIGN KEY (\"{}\") REFERENCES \"{}\" (\"{}\") ON DELETE CASCADE",
+                            reference.column, reference.parent_table, reference.parent_column
+                        )
+                    }),
+            );
+        }
+        Ok(clauses.join(",\n            "))
+    }
+
+    fn sqlite_copy_filter(
+        &self,
+        table: &SqliteTable,
+        with_references: bool,
+    ) -> Result<String, DbErr> {
+        if !with_references {
+            return Ok(String::new());
+        }
+        let conditions = self
+            .references
+            .iter()
+            .filter(|reference| reference.table == table.name)
+            .enumerate()
+            .map(|(index, reference)| {
+                format!(
+                    "EXISTS (SELECT 1 FROM \"{}\" AS \"_forgekeep_fk_parent_{index}\" \
+                     WHERE \"_forgekeep_fk_parent_{index}\".\"{}\" = \
+                     {{source}}.\"{}\")",
+                    reference.parent_table, reference.parent_column, reference.column
+                )
+            })
+            .collect::<Vec<_>>();
+        if conditions.is_empty() {
+            return Err(DbErr::Migration(format!(
+                "{}: SQLite rebuild recipe for `{}` has no required references",
+                self.migration, table.name
+            )));
+        }
+        Ok(format!("WHERE {}", conditions.join(" AND ")))
+    }
+
+    async fn postgres(
+        &self,
+        manager: &SchemaManager<'_>,
+        with_references: bool,
+    ) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        let lookup = GhostAuthorRebuild {
+            migration: self.migration,
+            staging_suffix: self.staging_suffix,
+            columns: &[],
+            sqlite_tables: &[],
+            cascade_warning: self.cascade_warning,
+        };
+
+        if with_references {
+            self.cleanup_orphans(db, '"').await?;
+        }
+        for reference in self.references {
+            if let Some(existing) = lookup
+                .postgres_foreign_key(
+                    manager,
+                    reference.table,
+                    reference.column,
+                    reference.parent_table,
+                )
+                .await?
+            {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{}\" DROP CONSTRAINT \"{existing}\"",
+                    reference.table
+                ))
+                .await?;
+            }
+            if with_references {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{}\" ADD CONSTRAINT \"{}\" FOREIGN KEY (\"{}\") \
+                     REFERENCES \"{}\" (\"{}\") ON DELETE CASCADE",
+                    reference.table,
+                    reference.constraint,
+                    reference.column,
+                    reference.parent_table,
+                    reference.parent_column
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn mysql(&self, manager: &SchemaManager<'_>, with_references: bool) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        let lookup = GhostAuthorRebuild {
+            migration: self.migration,
+            staging_suffix: self.staging_suffix,
+            columns: &[],
+            sqlite_tables: &[],
+            cascade_warning: self.cascade_warning,
+        };
+
+        if with_references {
+            self.cleanup_orphans(db, '`').await?;
+        }
+        for reference in self.references {
+            if let Some(existing) = lookup
+                .mysql_foreign_key(
+                    manager,
+                    reference.table,
+                    reference.column,
+                    reference.parent_table,
+                )
+                .await?
+            {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE `{}` DROP FOREIGN KEY `{existing}`",
+                    reference.table
+                ))
+                .await?;
+            }
+            if with_references {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY (`{}`) \
+                     REFERENCES `{}` (`{}`) ON DELETE CASCADE",
+                    reference.table,
+                    reference.constraint,
+                    reference.column,
+                    reference.parent_table,
+                    reference.parent_column
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_orphans(&self, db: &impl ConnectionTrait, quote: char) -> Result<(), DbErr> {
+        let mut tables = Vec::new();
+        for reference in self.references {
+            if !tables.contains(&reference.table) {
+                tables.push(reference.table);
+            }
+        }
+
+        for table in tables {
+            let quoted_table = format!("{quote}{table}{quote}");
+            let conditions = self
+                .references
+                .iter()
+                .filter(|reference| reference.table == table)
+                .map(|reference| {
+                    format!(
+                        "NOT EXISTS (SELECT 1 FROM {quote}{}{quote} WHERE \
+                         {quote}{}{quote}.{quote}{}{quote} = \
+                         {quoted_table}.{quote}{}{quote})",
+                        reference.parent_table,
+                        reference.parent_table,
+                        reference.parent_column,
+                        reference.column
+                    )
+                })
+                .collect::<Vec<_>>();
+            db.execute_unprepared(&format!(
+                "DELETE FROM {quoted_table} WHERE {}",
+                conditions.join(" OR ")
+            ))
+            .await?;
+        }
+        Ok(())
     }
 }
 
