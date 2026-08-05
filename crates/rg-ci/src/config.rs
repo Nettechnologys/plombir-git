@@ -75,9 +75,17 @@ pub struct JobConfig {
     #[serde(default)]
     pub allow_failure: Option<bool>,
 
-    /// Per-job timeout in seconds.
+    /// Per-job timeout in seconds. Accepted range: `1..=86_400`.
+    ///
+    /// Deliberately signed even though a negative timeout is meaningless. As a
+    /// `u64` the range was enforced in two unrelated places with two unrelated
+    /// answers: `-1` died inside `serde_yaml` with `invalid value: integer -1,
+    /// expected u64` and no job name (`#[serde(flatten)]` on the job map drops
+    /// the span), while `0` and `86_401` got the validator's message naming the
+    /// job and the rule. Taking the value in and letting
+    /// `validate_execution_semantics` judge it puts every rejection on one path.
     #[serde(default)]
-    pub timeout_seconds: Option<u64>,
+    pub timeout_seconds: Option<i64>,
 
     /// Runner tags/labels required for this job.
     /// Jobs with tags will only be picked up by runners matching those tags.

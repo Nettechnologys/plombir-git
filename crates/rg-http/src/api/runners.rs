@@ -511,16 +511,21 @@ pub async fn poll_job(
                     variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
                     variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
                     variables.insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
+                    // One resolution for both the token's lifetime and the
+                    // deadline the runner is handed, sharing the range the
+                    // config validator enforces.
+                    let timeout_secs = rg_core::ci::resolve_job_timeout_secs(
+                        job.id,
+                        job.timeout_seconds,
+                        state.job_timeout_secs,
+                    );
                     match rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
                         pipeline.repo_id,
                         pipeline.id,
                         job.id,
                         "repo:read packages:read",
                         &state.jwt_secret,
-                        job.timeout_seconds
-                            .unwrap_or(state.job_timeout_secs as i64)
-                            .clamp(60, 86_400)
-                            + 300,
+                        rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
                     ) {
                         Ok(token) => {
                             variables.insert("CI_JOB_TOKEN".into(), serde_json::json!(token));
@@ -556,10 +561,7 @@ pub async fn poll_job(
                         variables: Some(serde_json::Value::Object(variables)),
                         cache_key: job.cache_key,
                         cache_paths,
-                        timeout: job
-                            .timeout_seconds
-                            .unwrap_or(state.job_timeout_secs as i64)
-                            .clamp(1, 86_400),
+                        timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
                     };
                     return Ok((StatusCode::OK, Json(resp)));
                 }

@@ -565,6 +565,12 @@ impl PipelineRunner {
 
         tracing::info!(job_id, "Running job");
 
+        // Resolved once, so the token this job carries and the wall-clock it is
+        // actually given come from the same number. They used to be derived
+        // separately from the same column and could disagree.
+        let timeout_secs =
+            rg_core::ci::resolve_job_timeout_secs(job_id, timeout_seconds, self.job_timeout_secs);
+
         // Generate CI_JOB_TOKEN if we have the secret and repo_id
         let ci_job_token = if let Some(ref secret) = self.jwt_secret {
             if self.repo_id > 0 {
@@ -574,10 +580,7 @@ impl PipelineRunner {
                     job_id,
                     DEFAULT_CI_TOKEN_SCOPES,
                     secret,
-                    timeout_seconds
-                        .unwrap_or(self.job_timeout_secs as i64)
-                        .clamp(60, 86_400)
-                        + 300,
+                    rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
                 )
                 .ok()
             } else {
@@ -638,10 +641,6 @@ impl PipelineRunner {
             return Err(anyhow::anyhow!("{}", msg));
         }
 
-        let timeout_secs = timeout_seconds
-            .and_then(|seconds| u64::try_from(seconds).ok())
-            .unwrap_or(self.job_timeout_secs)
-            .min(86_400);
         let exec_future = async {
             if let Some(img) = image {
                 self.run_job_docker(job_id, script, img, &job_environment)

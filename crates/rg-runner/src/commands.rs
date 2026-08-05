@@ -19,6 +19,36 @@ use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_loc
 /// pin registration or the heartbeat task on the connect phase forever.
 const RUNNER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Bounds of the job deadline the server may hand out, mirroring
+/// `rg_core::ci::JOB_TIMEOUT_{MIN,MAX}_SECS`. Duplicated rather than imported:
+/// the agent is a standalone binary that talks to the server over HTTP only and
+/// deliberately does not link the server's crates.
+const POLLED_TIMEOUT_MIN_SECS: i64 = 1;
+const POLLED_TIMEOUT_MAX_SECS: i64 = 86_400;
+
+/// Fallback deadline for a `timeout` field the server should never have sent.
+const POLLED_TIMEOUT_FALLBACK_SECS: u64 = 3600;
+
+/// Turn the polled `timeout` field into the deadline this job runs under.
+///
+/// The server resolves and range-checks the value before it goes on the wire,
+/// so the fallback is a guard against a server that is broken or not the version
+/// this agent expects — and it says so, instead of quietly running the job for a
+/// different length of time than the pipeline asked for.
+fn resolve_polled_timeout(job_id: i64, polled: i64) -> u64 {
+    if (POLLED_TIMEOUT_MIN_SECS..=POLLED_TIMEOUT_MAX_SECS).contains(&polled) {
+        u64::try_from(polled).unwrap_or(POLLED_TIMEOUT_FALLBACK_SECS)
+    } else {
+        tracing::warn!(
+            job_id,
+            polled_timeout_seconds = polled,
+            effective_timeout_seconds = POLLED_TIMEOUT_FALLBACK_SECS,
+            "server sent a job timeout outside {POLLED_TIMEOUT_MIN_SECS}..={POLLED_TIMEOUT_MAX_SECS} seconds; using the agent default"
+        );
+        POLLED_TIMEOUT_FALLBACK_SECS
+    }
+}
+
 /// Build the runner's HTTP client.
 ///
 /// It sets **only** `connect_timeout`, deliberately NOT a global request
@@ -324,7 +354,7 @@ pub async fn cmd_run(
                         run_job_local(&script_str, &variables, &workspace).await
                     }
                 };
-                let timeout_seconds = u64::try_from(job.timeout).unwrap_or(3600).clamp(1, 86_400);
+                let timeout_seconds = resolve_polled_timeout(job.job_id, job.timeout);
                 let (exit_code, log) = match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_seconds),
                     execution,

@@ -423,7 +423,7 @@ impl PipelineGraph<'_> {
                     job_config.cache.as_ref().map(|cache| cache.key.as_str()),
                     cache_paths_json.as_deref(),
                     job_config.allow_failure.unwrap_or(false),
-                    job_config.timeout_seconds.map(|seconds| seconds as i64),
+                    job_config.timeout_seconds,
                     job_config.when.as_deref(),
                     job_config.condition.as_deref(),
                 )
@@ -598,11 +598,18 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
                 )));
             }
         }
-        if job.timeout_seconds == Some(0) || job.timeout_seconds.is_some_and(|value| value > 86_400)
-        {
-            return Err(rg_core::error::invalid_request(format!(
-                "job '{name}' timeout_seconds must be between 1 and 86400"
-            )));
+        if let Some(timeout) = job.timeout_seconds {
+            // The whole range, not just its upper end and zero: a negative
+            // value is as unrunnable as `0`, and letting it through meant the
+            // job was created with a timeout no runner could honour — each one
+            // silently substituted a different number of its own.
+            if !rg_core::ci::job_timeout_in_range(timeout) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' timeout_seconds must be between {} and {} (got {timeout})",
+                    rg_core::ci::JOB_TIMEOUT_MIN_SECS,
+                    rg_core::ci::JOB_TIMEOUT_MAX_SECS
+                )));
+            }
         }
         if let Some(environment) = job.environment.as_deref() {
             if environment.is_empty()
@@ -2581,5 +2588,68 @@ mod matrix_tests {
             jobs: HashMap::from([("deploy".into(), job)]),
         };
         assert!(validate_execution_semantics(&config).is_err());
+    }
+
+    fn config_with_timeout(timeout: Option<i64>) -> CiConfig {
+        let mut job = config(BTreeMap::new());
+        job.timeout_seconds = timeout;
+        CiConfig {
+            stages: Some(vec!["test".into()]),
+            concurrency: None,
+            jobs: HashMap::from([("deploy".into(), job)]),
+        }
+    }
+
+    /// The whole `1..=86400` range is one rule with one answer. The upper end
+    /// and `0` were already refused; a negative value was not — it left
+    /// validation as an accepted job whose timeout no runner could honour, and
+    /// each runner then substituted a different number of its own (the embedded
+    /// one an hour, the external one a second).
+    #[test]
+    fn a_job_timeout_outside_the_accepted_range_is_refused_by_name() {
+        for accepted in [1, 60, 86_400] {
+            validate_execution_semantics(&config_with_timeout(Some(accepted)))
+                .unwrap_or_else(|error| panic!("{accepted}s must be accepted: {error:#}"));
+        }
+        validate_execution_semantics(&config_with_timeout(None))
+            .expect("an absent timeout means 'use the server default'");
+
+        for refused in [-1, 0, 86_401, i64::MIN] {
+            let error = validate_execution_semantics(&config_with_timeout(Some(refused)))
+                .expect_err(&format!("{refused}s must be refused"));
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("deploy") && message.contains("timeout_seconds"),
+                "the rejection must name the job and the field: {message}"
+            );
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a broken config is the client's to fix, so it must not become a 500: {message}"
+            );
+        }
+    }
+
+    /// The rejection has to survive the actual YAML front door: with the field
+    /// typed `u64`, `-1` died inside `serde_yaml` before the validator ran, and
+    /// the client was told `invalid value: integer -1, expected u64` with no job
+    /// name anywhere in it.
+    #[test]
+    fn a_negative_timeout_in_the_committed_yaml_is_rejected_with_the_job_name() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"stages:\n  - test\n\ndeploy:\n  stage: test\n  timeout_seconds: -1\n  script:\n    - echo ok\n",
+        )]);
+
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+            .expect("a negative timeout must reach the validator, not die in the parser");
+        let error = validate_execution_semantics(&config)
+            .expect_err("a negative timeout must not produce a runnable pipeline");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("deploy") && message.contains("-1"),
+            "the rejection must name the job and the offending value: {message}"
+        );
     }
 }

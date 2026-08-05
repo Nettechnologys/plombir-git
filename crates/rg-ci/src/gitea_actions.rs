@@ -428,9 +428,14 @@ impl GiteaWorkflow {
                     condition: job.condition.clone(),
                     environment: job.environment.as_ref().and_then(environment_name),
                     allow_failure: Some(job.continue_on_error),
-                    timeout_seconds: job
-                        .timeout_minutes
-                        .map(|minutes| minutes.saturating_mul(60)),
+                    // Saturating on both hops on purpose: an absurd
+                    // `timeout-minutes` has to arrive at the validator as an
+                    // absurd number of seconds and be refused by name. A
+                    // wrapping `as i64` would have turned it negative, i.e.
+                    // into a value the validator used to wave through.
+                    timeout_seconds: job.timeout_minutes.map(|minutes| {
+                        i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX)
+                    }),
                     tags: runs_on_tags(&job.runs_on),
                     matrix: job.strategy.as_ref().map(|strategy| {
                         strategy

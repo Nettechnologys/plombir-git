@@ -8,6 +8,93 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
+/// Smallest per-job CI timeout a config may declare, in seconds.
+pub const JOB_TIMEOUT_MIN_SECS: i64 = 1;
+
+/// Largest per-job CI timeout a config may declare, in seconds (24 hours).
+pub const JOB_TIMEOUT_MAX_SECS: i64 = 86_400;
+
+/// Grace window added to a job's execution timeout when minting its
+/// `CI_JOB_TOKEN`, so the token outlives the run it was issued for.
+const CI_JOB_TOKEN_GRACE_SECS: i64 = 300;
+
+/// Floor for a `CI_JOB_TOKEN` lifetime: a one-second job still has to fetch its
+/// sources and report back.
+const CI_JOB_TOKEN_MIN_LIFETIME_SECS: i64 = 60;
+
+/// Whether a declared per-job timeout falls inside the accepted range.
+///
+/// The single authority for that range. It used to be spelled out separately in
+/// the validator, in both runner paths and in both token-minting call sites —
+/// five copies that disagreed on what an out-of-range value means, which is how
+/// the same persisted number could become "one hour" in one runner and "one
+/// second" in the other.
+pub fn job_timeout_in_range(secs: i64) -> bool {
+    (JOB_TIMEOUT_MIN_SECS..=JOB_TIMEOUT_MAX_SECS).contains(&secs)
+}
+
+/// Resolve the execution timeout of a single job, in seconds (`0` = unbounded,
+/// the documented meaning of `timeouts.job_secs = 0`).
+///
+/// `declared` is the value persisted on the job row. `validate_execution_semantics`
+/// refuses to create a job outside [`job_timeout_in_range`], so the out-of-range
+/// arm is unreachable from any accepted config — but it is what a corrupt or
+/// hand-edited row hits, and it must not pass silently: swapping a declared
+/// timeout for the server default changes how long the job may run, which is
+/// exactly the kind of substitution that used to leave no trace anywhere.
+pub fn resolve_job_timeout_secs(job_id: i64, declared: Option<i64>, default_secs: u64) -> u64 {
+    let fallback = default_secs.min(JOB_TIMEOUT_MAX_SECS as u64);
+    match declared {
+        None => fallback,
+        Some(secs) if job_timeout_in_range(secs) => u64::try_from(secs).unwrap_or(fallback),
+        Some(secs) => {
+            tracing::warn!(
+                job_id,
+                declared_timeout_seconds = secs,
+                effective_timeout_seconds = fallback,
+                "persisted CI job timeout is outside {}..={} seconds; falling back to the server default",
+                JOB_TIMEOUT_MIN_SECS,
+                JOB_TIMEOUT_MAX_SECS
+            );
+            fallback
+        }
+    }
+}
+
+/// The deadline handed to an out-of-process runner, which has no notion of an
+/// unbounded job: the wire field is always a positive number of seconds.
+///
+/// `timeouts.job_secs = 0` documents "no timeout" for the embedded runner. The
+/// dispatch path used to push that zero through a `clamp(1, …)`, so on such an
+/// instance every job sent to an external runner was killed one second in —
+/// "unlimited" read as its exact opposite. Unbounded maps to the same 24h
+/// ceiling a job may declare for itself.
+pub fn dispatched_job_timeout_secs(execution_timeout_secs: u64) -> i64 {
+    if execution_timeout_secs == 0 {
+        return JOB_TIMEOUT_MAX_SECS;
+    }
+    i64::try_from(execution_timeout_secs)
+        .unwrap_or(JOB_TIMEOUT_MAX_SECS)
+        .clamp(JOB_TIMEOUT_MIN_SECS, JOB_TIMEOUT_MAX_SECS)
+}
+
+/// Lifetime for the `CI_JOB_TOKEN` handed to a job whose execution timeout is
+/// `execution_timeout_secs` (`0` = unbounded).
+///
+/// An unbounded job used to mint a token good for six minutes, because `0` was
+/// pushed through a `clamp(60, …)` that read it as "one minute" rather than as
+/// "no limit". The ceiling is the same 24 hours a declared timeout may ask for.
+pub fn ci_job_token_ttl_secs(execution_timeout_secs: u64) -> i64 {
+    let execution = if execution_timeout_secs == 0 {
+        JOB_TIMEOUT_MAX_SECS
+    } else {
+        i64::try_from(execution_timeout_secs)
+            .unwrap_or(JOB_TIMEOUT_MAX_SECS)
+            .min(JOB_TIMEOUT_MAX_SECS)
+    };
+    execution.max(CI_JOB_TOKEN_MIN_LIFETIME_SECS) + CI_JOB_TOKEN_GRACE_SECS
+}
+
 /// Parameters for triggering a CI pipeline.
 ///
 /// M-14: Moved from `rg-ci` to `rg-core` so that `rg-http` can depend
@@ -185,6 +272,79 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::{
+        ci_job_token_ttl_secs, dispatched_job_timeout_secs, resolve_job_timeout_secs,
+        JOB_TIMEOUT_MAX_SECS, JOB_TIMEOUT_MIN_SECS,
+    };
+
+    #[test]
+    fn a_declared_timeout_inside_the_range_is_used_verbatim() {
+        for declared in [JOB_TIMEOUT_MIN_SECS, 900, JOB_TIMEOUT_MAX_SECS] {
+            assert_eq!(
+                resolve_job_timeout_secs(1, Some(declared), 3600),
+                declared as u64
+            );
+        }
+    }
+
+    /// No declared timeout is the ordinary "use the instance default" case,
+    /// including the documented `0` = unbounded.
+    #[test]
+    fn an_absent_timeout_takes_the_server_default() {
+        assert_eq!(resolve_job_timeout_secs(1, None, 3600), 3600);
+        assert_eq!(resolve_job_timeout_secs(1, None, 0), 0);
+        assert_eq!(
+            resolve_job_timeout_secs(1, None, u64::MAX),
+            JOB_TIMEOUT_MAX_SECS as u64
+        );
+    }
+
+    /// A persisted value the validator would have refused cannot be honoured,
+    /// so it falls back — but to one number shared by every consumer, not to
+    /// whatever each call site happened to clamp or `unwrap_or` its way to.
+    #[test]
+    fn an_out_of_range_persisted_timeout_falls_back_to_one_shared_answer() {
+        for declared in [-1, 0, JOB_TIMEOUT_MAX_SECS + 1, i64::MIN] {
+            assert_eq!(resolve_job_timeout_secs(1, Some(declared), 3600), 3600);
+        }
+    }
+
+    /// The token has to outlive the run it was issued for. An unbounded job
+    /// used to mint a six-minute token, because `0` went through a
+    /// `clamp(60, …)` that read it as one minute rather than as "no limit".
+    #[test]
+    fn the_job_token_outlives_the_run_it_was_issued_for() {
+        assert!(ci_job_token_ttl_secs(900) > 900);
+        assert!(
+            ci_job_token_ttl_secs(1) >= 360,
+            "a one-second job still has to fetch sources and report back"
+        );
+        assert_eq!(
+            ci_job_token_ttl_secs(0),
+            ci_job_token_ttl_secs(JOB_TIMEOUT_MAX_SECS as u64),
+            "unbounded is the ceiling, not the floor"
+        );
+        assert!(ci_job_token_ttl_secs(u64::MAX) > JOB_TIMEOUT_MAX_SECS);
+    }
+
+    /// The regression this seam exists for: `timeouts.job_secs = 0` means "no
+    /// timeout", and dispatching it as `1` killed every externally-run job a
+    /// second after it started.
+    #[test]
+    fn an_unbounded_job_is_dispatched_as_the_ceiling_not_as_one_second() {
+        assert_eq!(dispatched_job_timeout_secs(0), JOB_TIMEOUT_MAX_SECS);
+        assert_eq!(dispatched_job_timeout_secs(900), 900);
+        assert_eq!(dispatched_job_timeout_secs(1), JOB_TIMEOUT_MIN_SECS);
+        assert_eq!(
+            dispatched_job_timeout_secs(u64::MAX),
+            JOB_TIMEOUT_MAX_SECS,
+            "the wire field never carries a value the agent would refuse"
+        );
+    }
 }
 
 #[cfg(test)]
