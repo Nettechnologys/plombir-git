@@ -19,6 +19,45 @@ use rg_db::ops::pipeline_ops;
 /// Default maximum execution time per job: 1 hour.
 const DEFAULT_JOB_TIMEOUT_SECS: u64 = 3600;
 
+/// A healthy embedded job must report liveness well inside the HTTP watchdog's
+/// ten-minute stale window. External runners do the same through their 30s
+/// runner heartbeat.
+const JOB_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll an execution future and a scoped heartbeat loop together. The loop is
+/// canceled as soon as execution completes, so no detached task can keep a
+/// settled job alive. The callback seam keeps the timing contract directly
+/// testable without a real 30-second wait.
+async fn with_job_heartbeat<T, Execution, Heartbeat, HeartbeatFuture>(
+    execution: Execution,
+    interval: std::time::Duration,
+    mut heartbeat: Heartbeat,
+) -> T
+where
+    Execution: std::future::Future<Output = T>,
+    Heartbeat: FnMut() -> HeartbeatFuture,
+    HeartbeatFuture: std::future::Future<Output = ()>,
+{
+    let heartbeat_loop = async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` ticks immediately once; the start transition already
+        // stamped liveness, so the first refresh belongs one full period later.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            heartbeat().await;
+        }
+    };
+
+    tokio::pin!(execution);
+    tokio::pin!(heartbeat_loop);
+    tokio::select! {
+        output = &mut execution => output,
+        () = &mut heartbeat_loop => unreachable!("job heartbeat loop is infinite"),
+    }
+}
+
 /// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
 const DOCKER_PIDS_LIMIT: &str = "512";
 /// Default memory ceiling for a job container.
@@ -612,21 +651,43 @@ impl PipelineRunner {
             }
         };
 
-        // Apply timeout if configured
-        let result = if timeout_secs > 0 {
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), exec_future)
+        // Apply the execution timeout while independently refreshing the
+        // watchdog liveness timestamp. The heartbeat future is scoped to this
+        // await and disappears before the job is settled below.
+        let execution = async {
+            if timeout_secs > 0 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    exec_future,
+                )
                 .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    let msg = format!("Job timed out after {} seconds", timeout_secs);
-                    tracing::warn!(job_id, "{}", msg);
-                    Ok((-1, msg))
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        let msg = format!("Job timed out after {} seconds", timeout_secs);
+                        tracing::warn!(job_id, "{}", msg);
+                        Ok((-1, msg))
+                    }
                 }
+            } else {
+                exec_future.await
             }
-        } else {
-            exec_future.await
         };
+        let result = with_job_heartbeat(execution, JOB_HEARTBEAT_INTERVAL, || async {
+            match pipeline_ops::touch_running_job(&self.db, job_id).await {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    job_id,
+                    "job heartbeat skipped because execution is no longer running"
+                ),
+                Err(error) => tracing::warn!(
+                    job_id,
+                    error = %format!("{error:#}"),
+                    "failed to refresh embedded job heartbeat"
+                ),
+            }
+        })
+        .await;
         if let (Ok((0, _)), Some((key, paths))) = (&result, &cache) {
             if let Err(error) = self.save_cache(key, paths).await {
                 tracing::warn!(job_id, error = %format!("{error:#}"), "CI cache save failed; job remains successful");
@@ -1329,6 +1390,33 @@ fn is_reserved_ci_variable(name: &str) -> bool {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, NotSet, Set};
+
+    #[tokio::test]
+    async fn execution_waits_for_and_drives_its_scoped_heartbeat() {
+        let (heartbeat_sent, heartbeat_received) = tokio::sync::oneshot::channel();
+        let mut heartbeat_sent = Some(heartbeat_sent);
+        let execution = async {
+            heartbeat_received
+                .await
+                .expect("the heartbeat loop must stay live with the execution");
+            42
+        };
+
+        let output =
+            with_job_heartbeat(execution, std::time::Duration::from_millis(1), move || {
+                let heartbeat_sent = heartbeat_sent.take();
+                async move {
+                    if let Some(heartbeat_sent) = heartbeat_sent {
+                        heartbeat_sent
+                            .send(())
+                            .expect("execution must still be waiting for heartbeat");
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(output, 42);
+    }
 
     #[test]
     fn validates_environment_names_and_protects_runner_variables() {

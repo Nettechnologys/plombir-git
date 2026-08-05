@@ -49,18 +49,26 @@ pub async fn register_runner(
     Ok((runner, token))
 }
 
-/// Update runner heartbeat (last_seen_at).
+/// Update runner heartbeat and the liveness of its executing job atomically.
+///
+/// Runner authentication refreshes this on every authenticated request, and
+/// the external runner also calls `/heartbeat` every 30 seconds while a job is
+/// executing. The job timestamp is part of the same fact: committing only the
+/// runner half would let the job watchdog reclaim healthy work.
 pub async fn update_heartbeat(db: &DatabaseConnection, runner_id: i64) -> Result<()> {
     let now = Utc::now();
+    let txn = db.begin().await.context("db: begin runner heartbeat")?;
 
     RunnerEntity::update_many()
         .col_expr(Column::LastSeenAt, Expr::value(now))
         .col_expr(Column::UpdatedAt, Expr::value(now))
         .filter(Column::Id.eq(runner_id))
-        .exec(db)
+        .exec(&txn)
         .await
         .context("db: update runner heartbeat")?;
 
+    crate::ops::pipeline_ops::touch_running_jobs_for_runner(&txn, runner_id).await?;
+    txn.commit().await.context("db: commit runner heartbeat")?;
     Ok(())
 }
 

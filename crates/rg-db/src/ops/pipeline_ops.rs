@@ -365,7 +365,11 @@ pub async fn get_job(db: &DatabaseConnection, id: i64) -> Result<Option<pipeline
         .context("db: get job")
 }
 
-/// Update just the log field of a job (lightweight, used by log write queue).
+/// Update the log and the watchdog liveness timestamp of a job.
+///
+/// A log chunk is direct evidence that the owning runner is still executing
+/// this job. Keeping `updated_at` in the same write prevents the watchdog from
+/// handing a healthy, long-running job to a second runner.
 pub async fn update_job_log(db: &DatabaseConnection, id: i64, log: &str) -> Result<()> {
     use sea_orm::ActiveModelTrait;
     let model = pipeline_job::Entity::find_by_id(id)
@@ -376,6 +380,7 @@ pub async fn update_job_log(db: &DatabaseConnection, id: i64, log: &str) -> Resu
 
     let mut active: pipeline_job::ActiveModel = model.into();
     active.log = Set(Some(log.to_string()));
+    active.updated_at = Set(Some(chrono::Utc::now().naive_utc()));
     active.update(db).await.context("db: update job log")?;
     Ok(())
 }
@@ -428,6 +433,7 @@ pub async fn update_job_result(
     let mut active: pipeline_job::ActiveModel = model.into();
     active.status = Set(status.to_string());
     active.exit_code = Set(exit_code);
+    active.updated_at = Set(Some(chrono::Utc::now().naive_utc()));
     if log.is_some() {
         active.log = Set(log.map(|s| s.to_string()));
     }
@@ -789,6 +795,46 @@ pub async fn find_stuck_jobs(
         .all(db)
         .await
         .context("db: find stuck jobs")
+}
+
+/// Refresh watchdog liveness for one job while it is still executing.
+///
+/// The status filter is intentional: a late heartbeat must not make a
+/// canceled or otherwise settled job look active again. Returns whether the
+/// job was still running and therefore touched.
+pub async fn touch_running_job(db: &impl ConnectionTrait, job_id: i64) -> Result<bool> {
+    let result = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .filter(pipeline_job::Column::Status.eq("running"))
+        .col_expr(
+            pipeline_job::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now().naive_utc()),
+        )
+        .exec(db)
+        .await
+        .context("db: touch running job")?;
+    Ok(result.rows_affected == 1)
+}
+
+/// Refresh every running job owned by a runner that just heartbeated.
+///
+/// `assigned` is deliberately excluded: a live runner that accepted work but
+/// never started it must still hit the watchdog's assignment deadline.
+pub async fn touch_running_jobs_for_runner(
+    db: &impl ConnectionTrait,
+    runner_id: i64,
+) -> Result<u64> {
+    let result = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::RunnerId.eq(Some(runner_id)))
+        .filter(pipeline_job::Column::Status.eq("running"))
+        .col_expr(
+            pipeline_job::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now().naive_utc()),
+        )
+        .exec(db)
+        .await
+        .context("db: touch runner jobs")?;
+    Ok(result.rows_affected)
 }
 
 /// Reset a stuck job back to pending, unassigning the runner.
