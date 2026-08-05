@@ -24,6 +24,7 @@
 //!   stayed live is gone (card_1cfc81035e92).
 
 use rg_core::blob_storage::BlobKey;
+use rg_db::sea_orm::{NotSet, Set};
 
 use crate::common::{
     create_issue, create_repo, fault::spawn_test_app_for_fault_sweep, register_full,
@@ -589,6 +590,533 @@ async fn deleting_an_account_keeps_what_it_configured_in_another_repository() {
             response.text().await.unwrap_or_default()
         );
     }
+}
+
+/// Author/action columns without a foreign key deliberately keep a durable
+/// numeric snapshot. The contract is therefore two-sided: every authored row
+/// stays in the repository, and every routed reader treats the now-unresolvable
+/// id as a ghost instead of failing or filtering the row out
+/// (card_7e4a56345094).
+///
+/// The PR fixture covers all of that subsystem's no-FK actor columns in one
+/// timeline read: PR author/reviewer/auto-merge actor, review author, inline
+/// comment author/resolver/suggestion actor, reviewer-request actor and merge
+/// queue enqueuer. The other reads are one representative for each remaining
+/// externally visible family named by the card.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
+    let (base, db, _state) = spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+
+    let (admin_token, admin_id) =
+        register_full(&base, "history-admin", "history-admin@example.com").await;
+    promote_user_to_admin(&db, admin_id).await;
+    let (host_token, host_id) =
+        register_full(&base, "history-host", "history-host@example.com").await;
+    let (_guest_token, guest_id) =
+        register_full(&base, "history-guest", "history-guest@example.com").await;
+    let repo_id = create_repo(&base, &host_token, "shared-history").await;
+    let now = chrono::Utc::now();
+
+    let issue = rg_db::ops::issue_ops::create(
+        &db,
+        rg_db::entities::issue::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(1),
+            title: Set("The author may leave".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            author_id: Set(guest_id),
+            assignee_id: Set(Some(guest_id)),
+            milestone_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            deleted_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed issue authored by the guest");
+    let issue_comment = rg_db::ops::issue_comment_ops::create(
+        &db,
+        rg_db::entities::issue_comment::ActiveModel {
+            id: NotSet,
+            issue_id: Set(issue.id),
+            author_id: Set(guest_id),
+            body: Set("This context must stay".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed issue comment authored by the guest");
+
+    let pull = rg_db::ops::pull_request_ops::create(
+        &db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(1),
+            title: Set("Keep the review history".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(true),
+            auto_merge_strategy: Set(Some("merge".to_string())),
+            auto_merge_enabled_by_id: Set(Some(guest_id)),
+            auto_merge_enabled_at: Set(Some(now)),
+            author_id: Set(guest_id),
+            reviewer_id: Set(Some(guest_id)),
+            head_branch: Set("history".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some("1".repeat(40))),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed pull request authored by the guest");
+    let review = rg_db::ops::pr_review_ops::create(
+        &db,
+        rg_db::entities::pr_review::ActiveModel {
+            id: NotSet,
+            pr_id: Set(pull.id),
+            repo_id: Set(repo_id),
+            reviewer_id: Set(guest_id),
+            action: Set("comment".to_string()),
+            body: Set(Some("Historical review".to_string())),
+            commit_id: Set(pull.head_sha.clone()),
+            created_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed review authored by the guest");
+    let review_comment = rg_db::ops::review_comment_ops::create(
+        &db,
+        rg_db::entities::review_comment::ActiveModel {
+            id: NotSet,
+            review_id: Set(review.id),
+            pr_id: Set(pull.id),
+            author_id: Set(guest_id),
+            path: Set("src/lib.rs".to_string()),
+            position: Set(None),
+            line: Set(Some(1)),
+            start_line: Set(None),
+            side: Set(Some("RIGHT".to_string())),
+            start_side: Set(None),
+            body: Set("Keep this thread".to_string()),
+            suggestion: Set(Some("replacement".to_string())),
+            suggestion_applied_at: Set(Some(now)),
+            suggestion_applied_by_id: Set(Some(guest_id)),
+            suggestion_commit_sha: Set(Some("2".repeat(40))),
+            commit_id: Set(pull.head_sha.clone()),
+            reply_to_id: Set(None),
+            resolved_at: Set(Some(now)),
+            resolved_by_id: Set(Some(guest_id)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed review comment authored and resolved by the guest");
+    let reviewer_request = rg_db::ops::pr_reviewer_request_ops::create(
+        &db,
+        rg_db::entities::pr_reviewer_request::ActiveModel {
+            id: NotSet,
+            pr_id: Set(pull.id),
+            // The reviewer stays live so the row is not removed by its separate,
+            // deliberate reviewer_id CASCADE. This fixture is about the no-FK
+            // requested_by_id actor.
+            reviewer_id: Set(host_id),
+            requested_by_id: Set(guest_id),
+            created_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed reviewer request made by the guest");
+    let queue_entry =
+        rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pull.id, guest_id, "merge")
+            .await
+            .expect("seed merge queue entry made by the guest");
+
+    let wiki_page = rg_db::ops::wiki_page_ops::create(
+        &db,
+        rg_db::entities::wiki_page::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            title: Set("Ghosts".to_string()),
+            content: Set("Authored content stays".to_string()),
+            message: Set(Some("Initial page".to_string())),
+            author_id: Set(Some(guest_id)),
+            sha: Set(None),
+            edit_version: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed wiki page authored by the guest");
+    let wiki_revision = rg_db::ops::wiki_revision_ops::create(
+        &db,
+        rg_db::entities::wiki_revision::ActiveModel {
+            id: NotSet,
+            wiki_page_id: Set(wiki_page.id),
+            content: Set(wiki_page.content.clone()),
+            message: Set(wiki_page.message.clone()),
+            author_id: Set(Some(guest_id)),
+            version: Set(1),
+            created_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed wiki revision authored by the guest");
+
+    let registry = rg_db::ops::package_registry_ops::find_or_create(&db, repo_id, "generic")
+        .await
+        .expect("seed generic package registry");
+    let package = rg_db::ops::package_ops::create(
+        &db,
+        registry.id,
+        guest_id,
+        "ghost-package",
+        Some("survives its first publisher"),
+        None,
+        None,
+    )
+    .await
+    .expect("seed package first published by the guest");
+    let package_version = rg_db::ops::package_version_ops::create(
+        &db,
+        package.id,
+        "1.0.0",
+        Some("1.0.0"),
+        None,
+        0,
+        None,
+        Some(guest_id),
+    )
+    .await
+    .expect("seed package version authored by the guest");
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        &"3".repeat(40),
+        "refs/heads/main",
+        "manual",
+        Some(guest_id),
+    )
+    .await
+    .expect("seed pipeline triggered by the guest");
+
+    let audit = rg_db::ops::audit_log_ops::insert(
+        &db,
+        rg_db::entities::audit_log::ActiveModel {
+            id: NotSet,
+            user_id: Set(Some(guest_id)),
+            username: Set(Some("history-guest".to_string())),
+            action: Set("history.seed".to_string()),
+            resource_type: Set(Some("repository".to_string())),
+            resource_id: Set(Some(repo_id)),
+            resource_name: Set(Some("history-host/shared-history".to_string())),
+            ip_address: Set(None),
+            user_agent: Set(None),
+            details: Set(None),
+            created_at: Set(now),
+        },
+    )
+    .await
+    .expect("seed durable audit actor snapshot");
+    let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(
+        &db,
+        repo_id,
+        "history-host/shared-history",
+        host_id,
+    )
+    .await
+    .expect("seed OCI repository owned by the host namespace");
+    let manifest = rg_db::ops::oci_ops::insert_manifest(
+        &db,
+        oci_repo.id,
+        &format!("sha256:{}", "4".repeat(64)),
+        Some("latest"),
+        "application/vnd.oci.image.manifest.v1+json",
+        2,
+        "{}",
+        2,
+        Some(guest_id),
+    )
+    .await
+    .expect("seed OCI manifest pushed by the guest");
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/admin/users/{guest_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("delete the guest account");
+    assert_eq!(
+        deleted.status(),
+        200,
+        "account deletion failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+    assert!(
+        rg_db::ops::user_ops::find_by_id(&db, guest_id)
+            .await
+            .expect("read deleted guest")
+            .is_none(),
+        "the fixture did not create a ghost: the account row still exists"
+    );
+
+    // The no-FK ids are durable snapshots: deleting the referenced user must
+    // neither null them nor remove their rows.
+    assert_eq!(
+        rg_db::ops::issue_ops::find_by_id(&db, issue.id)
+            .await
+            .expect("read issue after author deletion")
+            .expect("issue disappeared with its author")
+            .author_id,
+        guest_id
+    );
+    assert_eq!(
+        rg_db::ops::issue_comment_ops::find_by_id(&db, issue_comment.id)
+            .await
+            .expect("read issue comment after author deletion")
+            .expect("issue comment disappeared with its author")
+            .author_id,
+        guest_id
+    );
+    let pull_after = rg_db::ops::pull_request_ops::find_by_id(&db, pull.id)
+        .await
+        .expect("read pull request after author deletion")
+        .expect("pull request disappeared with its author");
+    assert_eq!(pull_after.author_id, guest_id);
+    assert_eq!(pull_after.reviewer_id, Some(guest_id));
+    assert_eq!(pull_after.auto_merge_enabled_by_id, Some(guest_id));
+    assert_eq!(
+        rg_db::ops::pr_review_ops::find_by_id(&db, review.id)
+            .await
+            .expect("read review after reviewer deletion")
+            .expect("review disappeared with its reviewer")
+            .reviewer_id,
+        guest_id
+    );
+    let comment_after = rg_db::ops::review_comment_ops::find_by_id(&db, review_comment.id)
+        .await
+        .expect("read review comment after author deletion")
+        .expect("review comment disappeared with its author");
+    assert_eq!(comment_after.author_id, guest_id);
+    assert_eq!(comment_after.suggestion_applied_by_id, Some(guest_id));
+    assert_eq!(comment_after.resolved_by_id, Some(guest_id));
+    assert_eq!(
+        rg_db::ops::pr_reviewer_request_ops::find(&db, pull.id, host_id)
+            .await
+            .expect("read reviewer request after requester deletion")
+            .expect("reviewer request disappeared with its requester")
+            .id,
+        reviewer_request.id
+    );
+    assert_eq!(
+        rg_db::ops::merge_queue_ops::find_by_pr(&db, pull.id)
+            .await
+            .expect("read queue entry after enqueuer deletion")
+            .expect("queue entry disappeared with its enqueuer")
+            .id,
+        queue_entry.id
+    );
+    assert_eq!(
+        rg_db::ops::wiki_page_ops::find_by_repo_and_title(&db, repo_id, "Ghosts")
+            .await
+            .expect("read wiki page after author deletion")
+            .expect("wiki page disappeared with its author")
+            .author_id,
+        Some(guest_id)
+    );
+    assert_eq!(
+        rg_db::ops::wiki_revision_ops::find_by_id(&db, wiki_revision.id)
+            .await
+            .expect("read wiki revision after author deletion")
+            .expect("wiki revision disappeared with its author")
+            .author_id,
+        Some(guest_id)
+    );
+    assert_eq!(
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "ghost-package")
+            .await
+            .expect("read package after publisher deletion")
+            .expect("package disappeared with its publisher")
+            .owner_id,
+        guest_id
+    );
+    assert_eq!(
+        rg_db::ops::package_version_ops::find_by_package_and_version(&db, package.id, "1.0.0",)
+            .await
+            .expect("read package version after author deletion")
+            .expect("package version disappeared with its author")
+            .id,
+        package_version.id
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline.id)
+            .await
+            .expect("read pipeline after trigger actor deletion")
+            .expect("pipeline disappeared with its trigger actor")
+            .triggered_by,
+        Some(guest_id)
+    );
+    assert_eq!(
+        rg_db::ops::audit_log_ops::find_by_id(&db, audit.id)
+            .await
+            .expect("read audit row after actor deletion")
+            .expect("audit history disappeared with its actor")
+            .username
+            .as_deref(),
+        Some("history-guest")
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::find_manifest_by_digest(&db, oci_repo.id, &manifest.digest)
+            .await
+            .expect("read OCI manifest after pusher deletion")
+            .expect("OCI manifest disappeared with its pusher")
+            .push_by,
+        Some(guest_id)
+    );
+
+    // Routed readers: no 500, no empty collection, and the surfaces that
+    // enrich users explicitly render the missing account as `null`.
+    let issue_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/issues/1"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read issue with a ghost author");
+    assert_eq!(issue_response.status(), 200);
+    let issue_body: serde_json::Value = issue_response.json().await.expect("issue body");
+    assert!(
+        issue_body["author"].is_null(),
+        "issue author is not a ghost: {issue_body}"
+    );
+    assert_eq!(issue_body["assignee_id"], guest_id);
+
+    let comments_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/issues/1/comments"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read issue comments with a ghost author");
+    assert_eq!(comments_response.status(), 200);
+    let comments: serde_json::Value = comments_response.json().await.expect("comments body");
+    assert_eq!(comments.as_array().map(Vec::len), Some(1));
+    assert!(
+        comments[0]["author"].is_null(),
+        "comment author is not a ghost: {comments}"
+    );
+
+    let pull_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/pulls/1"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read pull request with a ghost author");
+    assert_eq!(pull_response.status(), 200);
+    let pull_body: serde_json::Value = pull_response.json().await.expect("pull request body");
+    assert_eq!(pull_body["author_id"], guest_id);
+
+    let timeline_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/pulls/1/timeline"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read pull request timeline with ghost actors");
+    assert_eq!(timeline_response.status(), 200);
+    let timeline: Vec<serde_json::Value> = timeline_response.json().await.expect("timeline body");
+    assert!(
+        timeline.len() >= 5,
+        "authored PR history was filtered out: {timeline:?}"
+    );
+    assert!(
+        timeline
+            .iter()
+            .filter(|event| event["actor"].is_null())
+            .count()
+            >= 5,
+        "deleted PR actors were not rendered as ghosts: {timeline:?}"
+    );
+
+    let wiki_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/wiki/Ghosts"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read wiki page with a ghost author");
+    assert_eq!(wiki_response.status(), 200);
+    let wiki_body: serde_json::Value = wiki_response.json().await.expect("wiki body");
+    assert_eq!(wiki_body["author_id"], guest_id);
+
+    let wiki_history_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/wiki/Ghosts/history"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read wiki history with a ghost author");
+    assert_eq!(wiki_history_response.status(), 200);
+    let wiki_history: serde_json::Value = wiki_history_response
+        .json()
+        .await
+        .expect("wiki history body");
+    assert_eq!(wiki_history.as_array().map(Vec::len), Some(1));
+    assert_eq!(wiki_history[0]["author_id"], guest_id);
+
+    let packages_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/packages/generic/list"
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read package list after publisher deletion");
+    assert_eq!(packages_response.status(), 200);
+    let packages: serde_json::Value = packages_response.json().await.expect("packages body");
+    assert!(
+        packages["packages"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["name"] == "ghost-package")),
+        "the ghost-authored package was filtered out: {packages}"
+    );
+
+    let pipeline_response = client
+        .get(format!(
+            "{base}/api/v1/repos/history-host/shared-history/pipelines/{}",
+            pipeline.id
+        ))
+        .bearer_auth(&host_token)
+        .send()
+        .await
+        .expect("read pipeline after trigger actor deletion");
+    assert_eq!(pipeline_response.status(), 200);
+    let pipeline_body: serde_json::Value = pipeline_response.json().await.expect("pipeline body");
+    assert_eq!(pipeline_body["pipeline"]["triggered_by"], guest_id);
 }
 
 /// The organization is the ownership the account cannot take with it:

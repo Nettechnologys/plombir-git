@@ -18,11 +18,13 @@
 //! * **`SET NULL`** — the row lives in somebody else's namespace and stays
 //!   useful without its author, who becomes a ghost.
 //!
-//! `NO FOREIGN KEY` is not an endorsement. It is an explicit, searchable state:
-//! `organizations.owner_id` is enforced by a service refusal, while the author
-//! columns remain the open work in card_7e4a56345094. Deciding is the point;
-//! what must not happen again is a column arriving with an accidental cascade
-//! or no database rule at all and escaping the inventory.
+//! `NO FOREIGN KEY` is not an accidental omission. It is an explicit,
+//! searchable contract: `organizations.owner_id` is enforced by a service
+//! refusal, while author/action ids are durable snapshots. Their rows outlive
+//! the account, the id stays available for audit/history, and every reader must
+//! treat a missing `users` row as a ghost (card_7e4a56345094). Deciding is the
+//! point; what must not happen again is a column arriving with an accidental
+//! cascade or no declared rule and escaping the inventory.
 
 use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 
@@ -184,9 +186,9 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
     ),
     // ── User-like columns without a database reference ─────────────────────
     // `organizations.owner_id` has a complete service-level decision. The
-    // author/action columns are intentionally visible here while
-    // card_7e4a56345094 remains open; changing them to SET NULL later must
-    // update this row in the same patch.
+    // remaining columns deliberately keep a durable numeric snapshot after the
+    // user row is gone; routed account-deletion coverage proves their readers
+    // expose a ghost instead of failing or filtering the authored row out.
     (
         "organizations",
         "owner_id",
@@ -198,121 +200,136 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "audit_log",
         "user_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: append-only audit history keeps the actor id and denormalized username \
+         as a durable ghost snapshot",
     ),
     (
         "issue_comments",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the comment belongs to its issue; readers render a missing author as a \
+         ghost",
     ),
     (
         "issues",
         "assignee_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the issue survives and its last assignment remains a ghost snapshot",
     ),
     (
         "issues",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the issue belongs to its repository; readers render a missing author as \
+         a ghost",
     ),
     (
         "merge_queue_entries",
         "enqueued_by_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the queue attempt belongs to its pull request and keeps its enqueuer as \
+         a ghost",
     ),
     (
         "oci_manifest",
         "push_by",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the manifest belongs to the OCI repository and keeps its pusher as a \
+         ghost",
     ),
     (
         "oci_repository",
         "owner_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit ownership decision",
+        "the value mirrors repositories.owner_id; repository deletion owns the OCI row, while \
+         account deletion refuses foreign namespace ownership before the user row is removed",
     ),
     (
         "package_versions",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: a published version belongs to its repository registry and keeps the \
+         publisher as a ghost",
     ),
     (
         "packages",
         "owner_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit ownership decision",
+        "card_7e4a56345094: this is the first publisher, not namespace ownership; the package \
+         belongs to its repository registry and outlives that publisher",
     ),
     (
         "pipelines",
         "triggered_by",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the run is repository history and keeps its trigger actor as a ghost",
     ),
     (
         "pr_reviewer_requests",
         "requested_by_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the request belongs to the pull request and keeps its requester as a \
+         ghost",
     ),
     (
         "pr_reviews",
         "reviewer_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the review is immutable pull-request history and keeps its reviewer as \
+         a ghost",
     ),
     (
         "pull_requests",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the pull request belongs to its repository and keeps its author as a \
+         ghost",
     ),
     (
         "pull_requests",
         "auto_merge_enabled_by_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the pull request keeps who enabled auto-merge as a ghost audit \
+         snapshot",
     ),
     (
         "pull_requests",
         "reviewer_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the last assigned reviewer remains visible as a ghost on the pull \
+         request",
     ),
     (
         "review_comments",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the inline comment belongs to its review and keeps its author as a \
+         ghost",
     ),
     (
         "review_comments",
         "resolved_by_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: thread resolution is history and keeps its resolver as a ghost",
     ),
     (
         "review_comments",
         "suggestion_applied_by_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: applying a suggestion is history and keeps its actor as a ghost",
     ),
     (
         "wiki_pages",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the page belongs to its repository and keeps its last editor as a \
+         ghost",
     ),
     (
         "wiki_revisions",
         "author_id",
         "NO FOREIGN KEY",
-        "card_7e4a56345094: pending an explicit durable-ghost decision",
+        "card_7e4a56345094: the immutable revision keeps its author as a ghost",
     ),
 ];
 
