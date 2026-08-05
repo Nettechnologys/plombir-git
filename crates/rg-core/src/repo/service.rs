@@ -1170,6 +1170,11 @@ struct StagedBlobPrefix {
 /// [`OciStorage::stage_repository_deletion`](crate::package_registry::oci::storage::OciStorage::stage_repository_deletion),
 /// which also reaches the two things no `BlobKey` names — the chunked-upload
 /// tree and the legacy on-disk layout.
+///
+/// The `packages` prefix likewise covers only the file rows whose
+/// `storage_path` is a key: rows inherited from before the blob-storage
+/// migration hold an absolute path and are retired by
+/// [`legacy_package_file_paths`] instead.
 fn repository_blob_prefixes(
     namespace: &str,
     repo: &rg_db::entities::repository::Model,
@@ -1519,11 +1524,62 @@ struct StagedRepositoryFilesystemDirectory {
     hint: &'static str,
 }
 
+/// The absolute paths of this repository's pre-migration package files.
+///
+/// `package_files.storage_path` holds a [`BlobKey`] for everything ForgeKeep
+/// itself writes, but rows inherited from before the blob-storage migration
+/// hold an absolute filesystem path instead. Those bytes sit outside
+/// `packages/<owner>/<repo>`, so the prefix move cannot reach them — and every
+/// other door treats them as live storage: `PackageStorage::read_file`,
+/// `file_path` and `delete_file` all carry a legacy branch, and a single
+/// version delete already stages them by path. Left out of the repository
+/// deletion they outlive the rows that named them, in the live namespace, with
+/// no tombstone and no sweep that would ever find them again.
+///
+/// Ownership is read from the database rather than inferred from the shape of
+/// the key, for the same reason CI artifacts are: a failed inventory has to be
+/// a failed deletion, not a deletion that quietly keeps the files.
+async fn legacy_package_file_paths(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> Result<Vec<std::path::PathBuf>> {
+    let storage_paths = rg_db::ops::package_file_ops::list_storage_paths_by_repo(db, repo_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inventory the package files of repository {repo_id} — its \
+                 pre-migration package storage cannot be retired without them"
+            )
+        })?;
+    let mut paths = std::collections::BTreeSet::new();
+    for storage_path in storage_paths {
+        if BlobKey::new(storage_path.as_str()).is_ok() {
+            continue;
+        }
+        let path = std::path::PathBuf::from(&storage_path);
+        // A path with no final component names no file, so there is nothing to
+        // rename beside itself. Skipping it keeps a nonsense row from making
+        // the repository undeletable, but it is a row an operator has to see.
+        if path.file_name().is_none() {
+            tracing::warn!(
+                repo_id,
+                storage_path,
+                "package file row holds neither a blob key nor a path with a final component; \
+                 repository deletion cannot stage it"
+            );
+            continue;
+        }
+        paths.insert(path);
+    }
+    Ok(paths.into_iter().collect())
+}
+
 fn repository_filesystem_directories(
     repo_root: &std::path::Path,
     namespace: &str,
     repo: &rg_db::entities::repository::Model,
     job_ids: &[i64],
+    legacy_package_files: &[std::path::PathBuf],
 ) -> Vec<RepositoryFilesystemDirectory> {
     let mut directories = vec![
         RepositoryFilesystemDirectory {
@@ -1557,6 +1613,15 @@ fn repository_filesystem_directories(
             hint: crate::platform::fs::BLOB_STORAGE_HINT,
         }
     }));
+    directories.extend(
+        legacy_package_files
+            .iter()
+            .map(|path| RepositoryFilesystemDirectory {
+                live: path.clone(),
+                kind: "legacy package file",
+                hint: crate::platform::fs::BLOB_STORAGE_HINT,
+            }),
+    );
     directories
 }
 
@@ -1756,6 +1821,10 @@ async fn ensure_repository_deletion_is_quiescent(
 /// [`BlobStorage::delete`](crate::blob_storage::BlobStorage::delete) reports as
 /// `Ok(false)`, not as a failure.
 ///
+/// Pre-migration package files join it the same way and for the same reason
+/// (see [`legacy_package_file_paths`]): their rows hold an absolute path, not a
+/// key, so the `packages/<owner>/<repo>` prefix move passes them by.
+///
 /// The OCI registry joins the set through its own storage rather than through
 /// `blob_storage`, because it may be configured onto a different backend and
 /// because two of the three things it owns — the chunked-upload tree and the
@@ -1792,8 +1861,17 @@ pub async fn delete_repo(
             )
         })?;
     prefixes.extend(artifact_blob_prefixes(&job_ids, repo.id, &deletion_id)?);
-    let filesystem_directories =
-        repository_filesystem_directories(repo_root, &namespace, repo, &job_ids);
+    // Pre-migration package files are the third namespace the database has to
+    // name: they are absolute paths, so no prefix over the storage keys reaches
+    // them. Same rule again — inventory before the first rename.
+    let legacy_package_files = legacy_package_file_paths(db, repo.id).await?;
+    let filesystem_directories = repository_filesystem_directories(
+        repo_root,
+        &namespace,
+        repo,
+        &job_ids,
+        &legacy_package_files,
+    );
     let staged_path = repo_path.with_file_name(format!(
         "{}.deleted-{}-{}",
         repo_path
@@ -3645,6 +3723,125 @@ mod repository_deletion_tests {
         );
     }
 
+    /// One published package file of `repo_id` whose row holds an absolute
+    /// path instead of a [`BlobKey`] — the shape rows written before the
+    /// blob-storage migration still have.
+    ///
+    /// The file is seeded outside `repo_root` on purpose: that is exactly what
+    /// makes it unreachable from the `packages/<owner>/<repo>` prefix, so a
+    /// deletion that only moves prefixes leaves it behind.
+    async fn seed_legacy_package_file(
+        db: &DatabaseConnection,
+        repo_id: i64,
+        owner_id: i64,
+        name: &str,
+        storage_path: &std::path::Path,
+    ) {
+        let registry =
+            match rg_db::ops::package_registry_ops::find_by_repo_and_type(db, repo_id, "generic")
+                .await
+                .expect("look up package registry")
+            {
+                Some(registry) => registry,
+                None => rg_db::ops::package_registry_ops::create(db, repo_id, "generic")
+                    .await
+                    .expect("create package registry"),
+            };
+        let package =
+            rg_db::ops::package_ops::create(db, registry.id, owner_id, name, None, None, None)
+                .await
+                .expect("create package");
+        let version = rg_db::ops::package_version_ops::create(
+            db, package.id, "1.0.0", None, None, 0, None, None,
+        )
+        .await
+        .expect("create package version");
+        rg_db::ops::package_file_ops::create(
+            db,
+            version.id,
+            "payload.bin",
+            0,
+            rg_db::ops::package_file_ops::FileDigests::default(),
+            &storage_path.to_string_lossy(),
+        )
+        .await
+        .expect("create package file row");
+    }
+
+    /// card_3a9cfaf53d62: a `package_files` row written before the blob-storage
+    /// migration holds an absolute path, so it sits outside every prefix the
+    /// deletion moves — while `PackageStorage` still reads, serves and deletes
+    /// through it. The repository deletion has to reach it through the database
+    /// and stage it like every other repository-owned path, and a row whose
+    /// file is already gone is the end state, not a refusal.
+    #[tokio::test]
+    async fn deleting_a_repository_retires_legacy_package_files() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "legacy-package-owner",
+            "legacy-package@example.invalid",
+            "unused",
+            "Legacy Package",
+        )
+        .await
+        .expect("create owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let repo = create_repo(
+            &db,
+            owner.id,
+            "with-legacy-packages",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create repository");
+        let legacy_root = sandbox.path().join("legacy-packages");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy package root");
+        let legacy_file = legacy_root.join("payload.bin");
+        std::fs::write(&legacy_file, b"pre-migration package bytes")
+            .expect("seed legacy package file");
+        seed_legacy_package_file(&db, repo.id, owner.id, "demo", &legacy_file).await;
+        // A row whose bytes an operator already removed by hand: the requested
+        // end state is true for it, so it must not fail the deletion.
+        seed_legacy_package_file(
+            &db,
+            repo.id,
+            owner.id,
+            "vanished",
+            &legacy_root.join("already-gone.bin"),
+        )
+        .await;
+
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        delete_repo(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            &repo,
+        )
+        .await
+        .expect("delete repository owning legacy package files");
+
+        assert!(
+            !legacy_file.exists(),
+            "DELETE left a pre-migration package file live at {}",
+            legacy_file.display()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&legacy_root)
+            .expect("read the legacy package directory")
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "DELETE retired the live path but left the legacy package tombstone: {leftovers:?}"
+        );
+    }
+
     /// card_0ea3381a4f91, extended by card_ed203feab041 with the historical
     /// release-asset root: these directories sit under `repo_root`, but outside
     /// every BlobStorage namespace. A successful repository deletion owns all
@@ -4022,6 +4219,15 @@ mod repository_deletion_tests {
             std::fs::write(directory.join("rollback-marker"), payload)
                 .expect("seed local rollback directory");
         }
+        // Pre-migration package files are the tail of the filesystem set, so a
+        // restore that stops at the directories it could name from `repo_root`
+        // leaves this one staged aside while its row is still published.
+        let legacy_package_root = sandbox.path().join("legacy-packages");
+        std::fs::create_dir_all(&legacy_package_root).expect("create legacy package root");
+        let legacy_package = legacy_package_root.join("payload.bin");
+        std::fs::write(&legacy_package, b"legacy package survives")
+            .expect("seed legacy package file");
+        seed_legacy_package_file(&db, repo.id, owner.id, "demo", &legacy_package).await;
         // The registry is staged after every blob prefix, so it is restored
         // first — and it is the only part whose staging touches both a backend
         // key and a plain directory.
@@ -4084,6 +4290,18 @@ mod repository_deletion_tests {
                 payload
             );
         }
+        assert_eq!(
+            std::fs::read(&legacy_package)
+                .expect("the legacy package file must be restored to its published path"),
+            b"legacy package survives"
+        );
+        assert_eq!(
+            rg_db::ops::package_file_ops::list_storage_paths_by_repo(&db, repo.id)
+                .await
+                .expect("read package file rows after rollback"),
+            vec![legacy_package.to_string_lossy().into_owned()],
+            "the failed deletion changed the rows that name the restored bytes"
+        );
         assert_eq!(
             blob_storage
                 .get(&layer)

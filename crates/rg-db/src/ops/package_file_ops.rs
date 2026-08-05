@@ -1,4 +1,6 @@
-use crate::entities::{package_file, package_file::Entity as PackageFile};
+use crate::entities::{
+    package, package_file, package_file::Entity as PackageFile, package_registry, package_version,
+};
 use sea_orm::*;
 
 /// The digests of a stored file, as the package protocols ask for them.
@@ -47,6 +49,66 @@ pub async fn list_by_version(
 ) -> Result<Vec<package_file::Model>, DbErr> {
     PackageFile::find()
         .filter(package_file::Column::VersionId.eq(version_id))
+        .all(db)
+        .await
+}
+
+/// Every package-file storage path owned by `repo_id`, walked
+/// repo → package_registry → packages → package_versions → package_files.
+///
+/// Repository deletion needs this because rows written before the blob-storage
+/// migration hold an absolute filesystem path instead of a key: those bytes sit
+/// outside the `packages/<owner>/<repo>` prefix the deletion moves, so the only
+/// way from a repository to them is through the database. Ownership is read out
+/// of the rows rather than guessed from the shape of the path — the caller
+/// decides which of the returned paths are pre-migration ones.
+///
+/// Returns bare paths through four id-only statements for the same reason
+/// [`crate::ops::pipeline_ops::list_job_ids_by_repo`] does: a repository with
+/// many published versions would otherwise cost one query per version, and the
+/// caller has no use for the rows themselves.
+pub async fn list_storage_paths_by_repo(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> Result<Vec<String>, DbErr> {
+    let registry_ids: Vec<i64> = package_registry::Entity::find()
+        .select_only()
+        .column(package_registry::Column::Id)
+        .filter(package_registry::Column::RepoId.eq(repo_id))
+        .into_tuple()
+        .all(db)
+        .await?;
+    if registry_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let package_ids: Vec<i64> = package::Entity::find()
+        .select_only()
+        .column(package::Column::Id)
+        .filter(package::Column::PackageRegistryId.is_in(registry_ids))
+        .into_tuple()
+        .all(db)
+        .await?;
+    if package_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let version_ids: Vec<i64> = package_version::Entity::find()
+        .select_only()
+        .column(package_version::Column::Id)
+        .filter(package_version::Column::PackageId.is_in(package_ids))
+        .into_tuple()
+        .all(db)
+        .await?;
+    if version_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    PackageFile::find()
+        .select_only()
+        .column(package_file::Column::StoragePath)
+        .filter(package_file::Column::VersionId.is_in(version_ids))
+        .into_tuple()
         .all(db)
         .await
 }
