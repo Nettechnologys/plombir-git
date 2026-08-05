@@ -97,7 +97,20 @@ pub async fn list_by_repo_paginated(
 }
 
 /// Get the next issue number for a repo (max + 1, or 1 if no issues).
-pub async fn next_number(db: &DatabaseConnection, repo_id: i64) -> Result<i64> {
+///
+/// The answer stops being true the moment anyone else inserts: this read and
+/// the write that uses it are separate statements, and `(repo_id, number)` is
+/// UNIQUE (`idx_issues_repo_number`). A caller that inserts under this number
+/// must therefore treat a backend-confirmed UNIQUE violation as "someone took
+/// it, re-read and take the next one" rather than as a failed create — see
+/// `rg_core::issue::service::insert_with_repo_number`.
+///
+/// Generic over the connection so the read can be made inside the same
+/// transaction as the insert it feeds.
+pub async fn next_number<C>(db: &C, repo_id: i64) -> Result<i64>
+where
+    C: ConnectionTrait,
+{
     let max = IssueEntity::find()
         .filter(issue::Column::RepoId.eq(repo_id))
         .order_by_desc(issue::Column::Number)

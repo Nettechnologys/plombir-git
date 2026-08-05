@@ -47,8 +47,6 @@ pub async fn create_pr(
         ));
     }
 
-    let number = pull_request_ops::next_number(db, repo_id).await?;
-
     let target_repo = repo_entity::Entity::find_by_id(repo_id)
         .one(db)
         .await?
@@ -80,7 +78,9 @@ pub async fn create_pr(
     let model = pull_request::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
-        number: Set(number),
+        // Allocated against the UNIQUE key by the insert below, not here: the
+        // number is only free until someone else's insert takes it.
+        number: sea_orm::NotSet,
         title: Set(title),
         body: Set(body),
         state: Set("open".to_string()),
@@ -105,7 +105,7 @@ pub async fn create_pr(
         merged_at: Set(None),
     };
 
-    let pr = pull_request_ops::create(db, model).await?;
+    let pr = insert_with_repo_number(db, repo_id, model).await?;
     rg_db::ops::pr_event_ops::record(
         db,
         pr.repo_id,
@@ -151,6 +151,85 @@ pub async fn create_pr(
     );
 
     Ok(pr)
+}
+
+/// How many times one create may lose the repository-local number to a
+/// concurrent create before it gives up. Every attempt re-reads the maximum, so
+/// this is a runaway guard, not a concurrency budget.
+const MAX_NUMBER_ATTEMPTS: usize = 32;
+
+/// Insert one pull request under a freshly allocated repository-local number.
+///
+/// [`pull_request_ops::next_number`] answers `MAX(number) + 1` in a statement of
+/// its own, so two creates in the same repository can read the same answer and
+/// the UNIQUE index on `(repo_id, number)` refuses the second insert. That
+/// collision is a race this server opened between its own read and its own
+/// write, not a malformed request: the loser re-reads the maximum and takes the
+/// next free number instead of handing a correct caller a 500 to retry by hand.
+///
+/// Only a backend-confirmed UNIQUE violation (plus the backend's own
+/// retryable-transaction outcomes) is retried. A foreign key, a check
+/// constraint or a dead connection stays an error — otherwise the loop would
+/// spin on a failure that re-reading cannot fix.
+///
+/// `model.number` is set here; whatever the caller left in it is overwritten.
+pub(crate) async fn insert_with_repo_number(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    model: pull_request::ActiveModel,
+) -> Result<PullRequest> {
+    insert_with_repo_number_gated(db, repo_id, model, |_| std::future::ready(())).await
+}
+
+/// The bounded allocate-then-insert loop behind [`insert_with_repo_number`].
+///
+/// `after_allocate` is a private test seam, called with the attempt number once
+/// the number has been read but before it is written: production supplies a
+/// ready future, while the regression test can hold two creates on the same
+/// read without depending on scheduler timing.
+async fn insert_with_repo_number_gated<F, Fut>(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    model: pull_request::ActiveModel,
+    after_allocate: F,
+) -> Result<PullRequest>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for attempt in 1..=MAX_NUMBER_ATTEMPTS {
+        // The read is classified with the write: a backend that refuses the
+        // lookup because someone else is mid-write has said "ask again", not
+        // "this create is impossible".
+        let numbered: Result<PullRequest> = async {
+            let number = pull_request_ops::next_number(db, repo_id).await?;
+            after_allocate(attempt).await;
+
+            let mut candidate = model.clone();
+            candidate.number = Set(number);
+            pull_request_ops::create(db, candidate).await
+        }
+        .await;
+
+        match numbered {
+            Ok(pr) => return Ok(pr),
+            Err(error) => {
+                let retryable = rg_db::is_unique_violation_anyhow(&error)
+                    || rg_db::is_retryable_transaction_error_anyhow(&error);
+                if retryable && attempt < MAX_NUMBER_ATTEMPTS {
+                    continue;
+                }
+                if retryable {
+                    return Err(error).context(format!(
+                        "allocate a PR number after {MAX_NUMBER_ATTEMPTS} concurrent conflicts"
+                    ));
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    unreachable!("the bounded PR number loop returns or continues on every attempt")
 }
 
 /// Resolve a head reference in `owner:branch` format to (head_branch, head_repo_id).
@@ -2113,4 +2192,206 @@ async fn resolve_repo(
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| NotFound::new("repository").into())
+}
+
+#[cfg(test)]
+mod number_allocation_tests {
+    use super::*;
+
+    /// A file-backed database with a pool: two creates have to be able to reach
+    /// their inserts at the same time, which one shared in-memory connection
+    /// cannot do.
+    async fn repo_fixture(name: &str) -> (tempfile::TempDir, DatabaseConnection, i64, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", dir.path().join("t.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            name,
+            &format!("{name}@example.invalid"),
+            "",
+            name,
+        )
+        .await
+        .expect("create user");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: sea_orm::NotSet,
+                owner_id: Set(user.id),
+                name: Set(name.to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repo row");
+
+        (dir, db, user.id, repo.id)
+    }
+
+    fn pr_model(repo_id: i64, author_id: i64, title: &str) -> pull_request::ActiveModel {
+        let now = Utc::now();
+        pull_request::ActiveModel {
+            id: sea_orm::NotSet,
+            repo_id: Set(repo_id),
+            number: sea_orm::NotSet,
+            title: Set(title.to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(author_id),
+            reviewer_id: Set(None),
+            head_branch: Set(format!("{title}-head")),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(None),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        }
+    }
+
+    /// Both creates read the same `MAX(number) + 1` before either writes — the
+    /// exact interleaving the UNIQUE index used to turn into a 500 for whoever
+    /// was second. Held open by a barrier rather than by timing, so the window
+    /// is opened on every run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_creates_on_one_read_take_two_numbers() {
+        let (_dir, db, user_id, repo_id) = repo_fixture("prrace").await;
+
+        let same_read = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let gate = |barrier: std::sync::Arc<tokio::sync::Barrier>| {
+            move |attempt: usize| {
+                let barrier = barrier.clone();
+                async move {
+                    if attempt == 1 {
+                        barrier.wait().await;
+                    }
+                }
+            }
+        };
+
+        let first = insert_with_repo_number_gated(
+            &db,
+            repo_id,
+            pr_model(repo_id, user_id, "first"),
+            gate(same_read.clone()),
+        );
+        let second = insert_with_repo_number_gated(
+            &db,
+            repo_id,
+            pr_model(repo_id, user_id, "second"),
+            gate(same_read.clone()),
+        );
+
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("the first create of a same-read pair succeeds");
+        let second = second.expect("losing the number is not the caller's failure");
+
+        let mut numbers = [first.number, second.number];
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            [1, 2],
+            "both correct creates keep a number, and the numbers are consecutive"
+        );
+    }
+
+    /// The loss itself, on every run rather than only when the scheduler
+    /// arranges it: the seam commits a competing row under the number this
+    /// create just read, before the create writes. The insert is not inside a
+    /// transaction here, so what meets it is the UNIQUE index itself on every
+    /// backend.
+    #[tokio::test]
+    async fn a_number_taken_between_read_and_write_is_re_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, db, user_id, repo_id) = repo_fixture("prthief").await;
+        let planted = std::sync::Arc::new(AtomicBool::new(false));
+
+        let pr = insert_with_repo_number_gated(
+            &db,
+            repo_id,
+            pr_model(repo_id, user_id, "mine"),
+            |attempt| {
+                let db = db.clone();
+                let planted = planted.clone();
+                async move {
+                    // Once: the second attempt must find the number gone and
+                    // settle on the next one, not lose it again forever.
+                    if attempt == 1 && !planted.swap(true, Ordering::SeqCst) {
+                        sea_orm::ConnectionTrait::execute_unprepared(
+                            &db,
+                            "INSERT INTO pull_requests (repo_id, number, title, state, is_draft, \
+                             auto_merge_enabled, author_id, head_branch, base_branch, created_at, \
+                             updated_at) VALUES (1, 1, 'taken first', 'open', 0, 0, 1, 'thief', \
+                             'main', '2026-01-01 00:00:00+00:00', '2026-01-01 00:00:00+00:00')",
+                        )
+                        .await
+                        .expect("someone else takes the number");
+                    }
+                }
+            },
+        )
+        .await
+        .expect("losing the number is not the caller's failure");
+
+        assert_eq!(
+            pr.number, 2,
+            "the loser re-reads the maximum instead of reporting a failed create"
+        );
+        assert_eq!(pr.title, "mine", "and it is this call's row that survives");
+    }
+
+    /// The retry is for one specific loss. A create that fails for a reason
+    /// re-reading cannot fix must come back as an error on the first attempt,
+    /// not be spun on until the attempt budget runs out.
+    #[tokio::test]
+    async fn a_broken_pull_requests_table_is_still_an_error() {
+        let (_dir, db, user_id, repo_id) = repo_fixture("prbroken").await;
+        sea_orm::ConnectionTrait::execute_unprepared(&db, "DROP TABLE pull_requests")
+            .await
+            .expect("take the pull_requests table away");
+
+        let error = insert_with_repo_number(&db, repo_id, pr_model(repo_id, user_id, "x"))
+            .await
+            .expect_err("an unusable pull_requests table is a failed create");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("no such table: pull_requests"),
+            "the backend's own reason must survive, got: {chain}"
+        );
+        assert!(
+            !chain.contains("concurrent conflicts"),
+            "a missing table is not a lost race, got: {chain}"
+        );
+    }
 }

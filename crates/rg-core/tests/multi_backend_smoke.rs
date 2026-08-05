@@ -353,6 +353,40 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         "FTS retained the superseded concurrent wiki content"
     );
 
+    // Repository-local issue numbers under the same treatment. On a server
+    // backend the losing insert reaches the UNIQUE index and comes back as a
+    // duplicate key — the primitive SQLite rarely produces here, because it
+    // refuses the write on the snapshot first.
+    let (first_issue, second_issue) = tokio::join!(
+        rg_core::issue::service::create_issue(
+            &db,
+            repo.id,
+            user.id,
+            "first concurrent issue".to_string(),
+            None,
+            None,
+            None,
+        ),
+        rg_core::issue::service::create_issue(
+            &db,
+            repo.id,
+            user.id,
+            "second concurrent issue".to_string(),
+            None,
+            None,
+            None,
+        )
+    );
+    let first_issue = first_issue.expect("store the first concurrent issue");
+    let second_issue = second_issue.expect("store the second concurrent issue");
+    let mut issue_numbers = [first_issue.number, second_issue.number];
+    issue_numbers.sort_unstable();
+    assert_eq!(
+        issue_numbers,
+        [1, 2],
+        "parallel issue creates must each keep a distinct consecutive number"
+    );
+
     let (repo_results, repo_total) = rg_core::search::service::search(
         &db,
         &format!("{repo_name} author:{username}"),

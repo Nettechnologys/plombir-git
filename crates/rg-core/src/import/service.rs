@@ -47,15 +47,14 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::{credential_invocation, GitCredentials};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, TransactionTrait};
+use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rg_db::entities::import_task::{self, Model as ImportTask};
 use rg_db::entities::{issue, label, milestone};
 use rg_db::ops::{
-    import_task_ops, issue_comment_ops, issue_label_ops, issue_ops, label_ops, milestone_ops,
-    org_ops, pr_review_ops, pull_request_ops, user_ops,
+    import_task_ops, issue_comment_ops, label_ops, milestone_ops, org_ops, pr_review_ops, user_ops,
 };
 
 use crate::import::github_client::{
@@ -189,22 +188,15 @@ fn resolve_imported_label_ids(
 
 async fn create_imported_issue(
     db: &DatabaseConnection,
+    repo_id: i64,
     model: issue::ActiveModel,
     label_ids: Vec<i64>,
 ) -> Result<issue::Model> {
-    let txn = db
-        .begin()
-        .await
-        .context("db: begin imported issue transaction")?;
-    let saved = model
-        .insert(&txn)
-        .await
-        .context("db: create imported issue")?;
-    issue_label_ops::set_labels(&txn, saved.id, label_ids).await?;
-    txn.commit()
-        .await
-        .context("db: commit imported issue transaction")?;
-    Ok(saved)
+    // The same allocator as an ordinary create: an import running next to live
+    // traffic (or next to a second import of the same repository) must not lose
+    // a correct row to a number someone else took between the read and the
+    // write.
+    crate::issue::service::insert_with_repo_number(db, repo_id, model, Some(label_ids)).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -930,7 +922,6 @@ async fn import_github_issue(
         .and_then(|m| milestone_map.get(&m.title))
         .copied();
 
-    let number = issue_ops::next_number(db, repo_id).await?;
     let created_at = parse_datetime_or_now(&issue.created_at);
     let closed_at = parse_opt_datetime(&issue.closed_at);
     let state = if issue.state == "closed" {
@@ -942,7 +933,8 @@ async fn import_github_issue(
     let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
-        number: Set(number),
+        // Allocated against the UNIQUE key by `create_imported_issue`.
+        number: sea_orm::NotSet,
         title: Set(issue.title.clone()),
         body: Set(issue.body.clone()),
         state: Set(state.to_string()),
@@ -955,7 +947,7 @@ async fn import_github_issue(
         deleted_at: Set(None),
     };
 
-    let saved = create_imported_issue(db, model, label_ids).await?;
+    let saved = create_imported_issue(db, repo_id, model, label_ids).await?;
 
     // Import comments
     for comment in comments {
@@ -1012,7 +1004,6 @@ async fn import_github_pr(
         .and_then(|m| milestone_map.get(&m.title))
         .copied();
 
-    let number = pull_request_ops::next_number(db, repo_id).await?;
     let state = if pr.merged.unwrap_or(false) {
         "merged"
     } else if pr.state == "closed" {
@@ -1024,7 +1015,8 @@ async fn import_github_pr(
     let model = rg_db::entities::pull_request::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
-        number: Set(number),
+        // Allocated against the UNIQUE key by the insert below.
+        number: sea_orm::NotSet,
         title: Set(pr.title.clone()),
         body: Set(pr.body.clone()),
         state: Set(state.to_string()),
@@ -1049,7 +1041,7 @@ async fn import_github_pr(
         merged_at: Set(parse_opt_datetime(&pr.merged_at)),
     };
 
-    let saved = pull_request_ops::create(db, model).await?;
+    let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
 
     // Import PR comments (general discussion)
     for comment in comments {
@@ -1277,7 +1269,6 @@ async fn import_gitlab_issue(
         .and_then(|m| milestone_map.get(&m.title))
         .copied();
 
-    let number = issue_ops::next_number(db, repo_id).await?;
     let state = if issue.state == "closed" {
         "closed"
     } else {
@@ -1287,7 +1278,8 @@ async fn import_gitlab_issue(
     let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
-        number: Set(number),
+        // Allocated against the UNIQUE key by `create_imported_issue`.
+        number: sea_orm::NotSet,
         title: Set(issue.title.clone()),
         body: Set(issue.description.clone()),
         state: Set(state.to_string()),
@@ -1300,7 +1292,7 @@ async fn import_gitlab_issue(
         deleted_at: Set(None),
     };
 
-    let saved = create_imported_issue(db, model, label_ids).await?;
+    let saved = create_imported_issue(db, repo_id, model, label_ids).await?;
 
     // Import notes (skip system notes)
     for note in notes {
@@ -1358,7 +1350,6 @@ async fn import_gitlab_mr(
         .and_then(|m| milestone_map.get(&m.title))
         .copied();
 
-    let number = pull_request_ops::next_number(db, repo_id).await?;
     let state = if mr.merged_at.is_some() {
         "merged"
     } else if mr.state == "closed" {
@@ -1370,7 +1361,8 @@ async fn import_gitlab_mr(
     let model = rg_db::entities::pull_request::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
-        number: Set(number),
+        // Allocated against the UNIQUE key by the insert below.
+        number: sea_orm::NotSet,
         title: Set(mr.title.clone()),
         body: Set(mr.description.clone()),
         state: Set(state.to_string()),
@@ -1395,7 +1387,7 @@ async fn import_gitlab_mr(
         merged_at: Set(parse_opt_datetime(&mr.merged_at)),
     };
 
-    let saved = pull_request_ops::create(db, model).await?;
+    let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
 
     // Import MR notes (skip system notes)
     for note in notes {
@@ -1679,6 +1671,7 @@ pub async fn strip_legacy_source_url_credentials(db: &DatabaseConnection) -> Res
 #[cfg(test)]
 mod imported_issue_label_tests {
     use super::*;
+    use rg_db::ops::{issue_label_ops, issue_ops};
     use sea_orm::{ConnectionTrait, Database, Statement};
 
     async fn test_db() -> DatabaseConnection {
