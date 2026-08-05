@@ -531,14 +531,27 @@ pub async fn record_failed_login(
 
 /// Delete a user by ID, returning whether a row existed.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let transaction = db.begin().await.context("db: begin user delete")?;
     let Some(model) = UserEntity::find_by_id(id)
-        .one(db)
+        .one(&transaction)
         .await
         .context("db: find user for delete")?
     else {
+        transaction
+            .commit()
+            .await
+            .context("db: commit absent user delete")?;
         return Ok(false);
     };
 
-    model.delete(db).await.context("db: delete user")?;
+    crate::serialized_user_grants::remove_user(&transaction, id).await?;
+    model
+        .delete(&transaction)
+        .await
+        .context("db: delete user")?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit user delete")?;
     Ok(true)
 }
