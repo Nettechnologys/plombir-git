@@ -6,7 +6,9 @@
 use rg_core::blob_storage::BlobKey;
 
 use crate::common::{
-    create_repo, fault::spawn_test_app_for_fault_sweep, register_full, spawn_test_app_with_state,
+    create_repo,
+    fault::{fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite},
+    register_full, spawn_test_app_with_state,
 };
 
 fn representative_keys(owner: &str, repo: &str, repo_id: i64) -> Vec<BlobKey> {
@@ -115,6 +117,9 @@ async fn delete_repository_retires_git_and_secondary_blob_namespaces() {
     let bare = state.repo_root.join("delete-blobs/recycled.git");
     let filesystem_directories = [
         state.repo_root.join("delete-blobs.lfs/recycled"),
+        // Pre-migration release assets: still a live read fallback, and a
+        // transfer already moves it, so a deletion has to take it too.
+        state.repo_root.join("delete-blobs/recycled.releases"),
         state.repo_root.join("_ci_cache").join(repo_id.to_string()),
         state
             .repo_root
@@ -337,5 +342,75 @@ async fn failed_tombstone_cleanup_is_not_reported_as_a_completed_delete() {
         visible.status(),
         404,
         "soft-delete did not commit before cleanup"
+    );
+}
+
+/// card_ed203feab041: the historical `<owner>/<repo>.releases` directory is
+/// repository-owned storage — `read_asset_bytes` falls back to it whenever the
+/// blob store reports the key missing, and a transfer already moves it — so the
+/// deletion has to stage it like every other namespace-bound directory. Staged
+/// but uncommitted, it must come back: the row is still live and still serving
+/// those assets.
+#[tokio::test]
+async fn a_failed_metadata_delete_restores_the_legacy_release_directory() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let (token, _) = register_full(
+        &app.base,
+        "delete-release-fault",
+        "delete-release-fault@example.com",
+    )
+    .await;
+    create_repo(&app.base, &token, "assets").await;
+
+    let releases = app.repo_root.join("delete-release-fault/assets.releases");
+    let asset = releases.join("assets/1/payload.bin");
+    std::fs::create_dir_all(asset.parent().unwrap()).expect("seed legacy release assets");
+    std::fs::write(&asset, b"legacy release asset").expect("write legacy release asset");
+
+    let db_fault = fail_db_writes(&app.db, "repositories", DbWrite::Update).await;
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{}/api/v1/repos/delete-release-fault/assets",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete repository with a failing metadata write");
+    assert_eq!(
+        response.status(),
+        500,
+        "a failed metadata delete was reported as success"
+    );
+    db_fault.clear().await;
+
+    assert_eq!(
+        std::fs::read(&asset).expect("the staged legacy release directory was not put back"),
+        b"legacy release asset",
+        "the restored directory does not hold the asset it was staged with"
+    );
+    let tombstones: Vec<_> = std::fs::read_dir(releases.parent().unwrap())
+        .expect("read the repository namespace directory")
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().contains(".releases.deleted-"))
+        .collect();
+    assert!(
+        tombstones.is_empty(),
+        "the failed deletion left the legacy release directory staged aside: {tombstones:?}"
+    );
+
+    let visible = reqwest::Client::new()
+        .get(format!(
+            "{}/api/v1/repos/delete-release-fault/assets",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("read repository after failed deletion");
+    assert_eq!(
+        visible.status(),
+        200,
+        "failed DELETE hid the repository row"
     );
 }

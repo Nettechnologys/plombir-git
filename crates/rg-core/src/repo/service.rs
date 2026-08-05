@@ -1487,6 +1487,16 @@ fn repository_filesystem_directories(
             kind: "legacy LFS directory",
             hint: crate::platform::fs::LFS_STORAGE_HINT,
         },
+        // Pre-migration release assets are still a live read path — the blob
+        // store reporting the key missing is what sends `read_asset_bytes` to
+        // this directory — and a transfer already moves it with the repository.
+        // Left out of the deletion it outlives the row that owned it, with no
+        // sweep anywhere that walks the filesystem to find it again.
+        RepositoryFilesystemDirectory {
+            live: crate::release::service::legacy_asset_root(repo_root, namespace, &repo.name),
+            kind: "legacy release asset directory",
+            hint: crate::platform::fs::REPO_ROOT_HINT,
+        },
         RepositoryFilesystemDirectory {
             live: repo_root.join("_ci_cache").join(repo.id.to_string()),
             kind: "CI cache directory",
@@ -2161,8 +2171,8 @@ pub async fn transfer_repo(
             "legacy LFS directory",
         ),
         (
-            repo_root.join(format!("{owner}/{repo_name}.releases")),
-            repo_root.join(format!("{new_owner_name}/{repo_name}.releases")),
+            crate::release::service::legacy_asset_root(repo_root, owner, repo_name),
+            crate::release::service::legacy_asset_root(repo_root, &new_owner_name, repo_name),
             "legacy release asset directory",
         ),
     ];
@@ -3591,11 +3601,12 @@ mod repository_deletion_tests {
         );
     }
 
-    /// card_0ea3381a4f91: these directories sit under `repo_root`, but outside
+    /// card_0ea3381a4f91, extended by card_ed203feab041 with the historical
+    /// release-asset root: these directories sit under `repo_root`, but outside
     /// every BlobStorage namespace. A successful repository deletion owns all
-    /// three and must leave neither their live names nor adjacent tombstones.
+    /// four and must leave neither their live names nor adjacent tombstones.
     #[tokio::test]
-    async fn deleting_a_repository_retires_legacy_lfs_ci_cache_and_artifact_directories() {
+    async fn deleting_a_repository_retires_legacy_lfs_release_cache_and_artifact_directories() {
         let db = setup_db().await;
         let owner = user_ops::create_user(
             &db,
@@ -3624,6 +3635,11 @@ mod repository_deletion_tests {
             seed_job_artifact(&db, &blob_storage, repo.id, b"portable artifact").await;
         let directories = [
             crate::lfs::service::lfs_root(
+                &repo_root,
+                "filesystem-delete-owner",
+                "with-local-storage",
+            ),
+            crate::release::service::legacy_asset_root(
                 &repo_root,
                 "filesystem-delete-owner",
                 "with-local-storage",

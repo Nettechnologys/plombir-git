@@ -750,9 +750,23 @@ pub async fn delete_asset(
     staging.retire(storage, "release asset", asset.id).await
 }
 
+/// The historical on-disk root of one repository's release assets.
+///
+/// Backend-neutral keys replaced this layout, but installations that predate
+/// the migration still serve from it — [`read_asset_bytes`] falls back to it
+/// whenever the blob store reports the key missing. That makes it
+/// repository-owned storage bound to the `<owner>/<repo>` pair, so it has to
+/// move with a transfer and be staged by a deletion like every other
+/// namespace-bound directory. Both of those callers live in `repo::service`;
+/// the path is spelled here once so a third copy cannot drift away from the
+/// one the reader actually uses.
+pub(crate) fn legacy_asset_root(repo_root: &Path, owner: &str, repo_name: &str) -> PathBuf {
+    repo_root.join(format!("{owner}/{repo_name}.releases"))
+}
+
 /// Get the storage directory for release assets.
 fn asset_storage_dir(repo_root: &Path, owner: &str, repo_name: &str) -> PathBuf {
-    repo_root.join(format!("{}/{}.releases/assets", owner, repo_name))
+    legacy_asset_root(repo_root, owner, repo_name).join("assets")
 }
 
 /// Get the file path for a specific asset.
