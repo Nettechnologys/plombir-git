@@ -246,6 +246,9 @@ jobs:
       - name: Prove PostgreSQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
+      - name: Prove PostgreSQL code index refresh boundary
+        run: cargo test -p rg-core -j 6 server_code_index_refresh_is_failure_atomic_and_serialized -- --ignored --nocapture
+
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
@@ -291,6 +294,9 @@ jobs:
 
       - name: Prove MySQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
+
+      - name: Prove MySQL code index refresh boundary
+        run: cargo test -p rg-core -j 6 server_code_index_refresh_is_failure_atomic_and_serialized -- --ignored --nocapture
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture

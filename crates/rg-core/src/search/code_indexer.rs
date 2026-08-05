@@ -13,7 +13,10 @@
 //! ```
 
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, Statement,
+    TransactionTrait, Value,
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -171,6 +174,12 @@ struct IndexEntry {
     language: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexWritePoint {
+    Cleared,
+    BatchInserted(usize),
+}
+
 impl CodeIndexer {
     /// Create a new code indexer.
     pub fn new(db: DatabaseConnection) -> Self {
@@ -228,22 +237,135 @@ impl CodeIndexer {
         // Do not discard a previously healthy index until the complete tree has
         // been read. A corrupt object must fail this refresh, not turn search
         // results into an empty or partial snapshot.
-        self.clear_index_for_repo(repo_id).await?;
-        self.batch_insert_fts(&entries).await?;
+        self.replace_index_entries(repo_id, &entries, |_| std::future::ready(Ok(())))
+            .await?;
 
         Ok(count)
     }
 
-    /// Clear existing index for a repository.
-    async fn clear_index_for_repo(&self, repo_id: i64) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
+    /// Publish one complete repository snapshot.
+    ///
+    /// The transaction is the visibility boundary: a failed clear or batch
+    /// rolls back to the previous snapshot. PostgreSQL and MySQL additionally
+    /// lock the owning repository row before the clear, so two refreshes for
+    /// the same repository cannot interleave their generations. SQLite's first
+    /// DELETE takes its database-wide writer lock and provides the same ordering.
+    async fn replace_index_entries<F, Fut>(
+        &self,
+        repo_id: i64,
+        entries: &[IndexEntry],
+        after_write: F,
+    ) -> Result<()>
+    where
+        F: Fn(IndexWritePoint) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        const MAX_ATTEMPTS: usize = 32;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let transaction = match self.db.begin().await {
+                Ok(transaction) => transaction,
+                Err(error)
+                    if attempt < MAX_ATTEMPTS && rg_db::is_retryable_transaction_error(&error) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error).context("begin atomic code index refresh"),
+            };
+
+            let write_result: Result<()> = async {
+                self.lock_repository_for_refresh(&transaction, repo_id)
+                    .await?;
+                self.clear_index_for_repo(&transaction, repo_id).await?;
+                after_write(IndexWritePoint::Cleared).await?;
+                self.batch_insert_fts(&transaction, entries, &after_write)
+                    .await
+            }
+            .await;
+
+            if let Err(error) = write_result {
+                let retryable = rg_db::is_retryable_transaction_error_anyhow(&error);
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "code index refresh failed and its transaction could not be rolled back: \
+                         {rollback_error}"
+                    ));
+                }
+                if retryable && attempt < MAX_ATTEMPTS {
+                    continue;
+                }
+                if retryable {
+                    return Err(error).context(format!(
+                        "serialize code index refresh after {MAX_ATTEMPTS} concurrent conflicts"
+                    ));
+                }
+                return Err(error);
+            }
+
+            match transaction.commit().await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < MAX_ATTEMPTS && rg_db::is_retryable_transaction_error(&error) =>
+                {
+                    continue;
+                }
+                Err(error) if rg_db::is_retryable_transaction_error(&error) => {
+                    return Err(error).context(format!(
+                        "commit code index refresh after {MAX_ATTEMPTS} concurrent conflicts"
+                    ));
+                }
+                Err(error) => return Err(error).context("commit atomic code index refresh"),
+            }
+        }
+
+        unreachable!("the bounded code index refresh loop returns or continues on every attempt")
+    }
+
+    /// Serialize refreshes on server databases without locking unrelated repos.
+    /// SQLite has one writer for the whole database, acquired by the clear below.
+    async fn lock_repository_for_refresh(
+        &self,
+        transaction: &DatabaseTransaction,
+        repo_id: i64,
+    ) -> Result<()> {
+        let backend = transaction.get_database_backend();
+        if backend == DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+
+        let sql = rg_db::prepare_sql(
+            backend,
+            "SELECT id FROM repositories WHERE id = ? FOR UPDATE",
+        );
+        transaction
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                &sql,
+                [repo_id.into()],
+            ))
+            .await
+            .with_context(|| format!("lock repository {repo_id} for code index refresh"))?
+            .with_context(|| {
+                format!("repository {repo_id} disappeared before code index refresh")
+            })?;
+        Ok(())
+    }
+
+    /// Clear existing index for a repository inside the refresh transaction.
+    async fn clear_index_for_repo(
+        &self,
+        transaction: &DatabaseTransaction,
+        repo_id: i64,
+    ) -> Result<()> {
+        let backend = transaction.get_database_backend();
+        transaction
             .execute(Statement::from_sql_and_values(
                 backend,
                 rg_db::prepare_sql(backend, "DELETE FROM code_fts WHERE repo_id = ?"),
                 [repo_id.into()],
             ))
-            .await?;
+            .await
+            .with_context(|| format!("clear code index for repository {repo_id}"))?;
         Ok(())
     }
 
@@ -358,12 +480,21 @@ impl CodeIndexer {
     /// Batch-insert index entries into the `code_fts` table using a
     /// parameterized multi-row INSERT. `rg_db::prepare_sql` converts portable
     /// bind markers to PostgreSQL's numbered form before execution.
-    async fn batch_insert_fts(&self, entries: &[IndexEntry]) -> Result<()> {
+    async fn batch_insert_fts<F, Fut>(
+        &self,
+        transaction: &DatabaseTransaction,
+        entries: &[IndexEntry],
+        after_write: &F,
+    ) -> Result<()>
+    where
+        F: Fn(IndexWritePoint) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         if entries.is_empty() {
             return Ok(());
         }
-        let backend = self.db.get_database_backend();
-        for chunk in entries.chunks(100) {
+        let backend = transaction.get_database_backend();
+        for (batch_index, chunk) in entries.chunks(100).enumerate() {
             let mut placeholders = String::new();
             let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 5);
             for (i, entry) in chunk.iter().enumerate() {
@@ -384,9 +515,17 @@ impl CodeIndexer {
                 placeholders
             ),
             );
-            self.db
+            transaction
                 .execute(Statement::from_sql_and_values(backend, &sql, params))
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "insert code index batch {} for repository {}",
+                        batch_index + 1,
+                        chunk[0].repo_id
+                    )
+                })?;
+            after_write(IndexWritePoint::BatchInserted(batch_index)).await?;
         }
         Ok(())
     }
@@ -494,9 +633,13 @@ impl CodeIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectOptions, Database};
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
     use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{oneshot, Notify};
 
+    const TEST_OWNER_ID: i64 = 40;
     const TEST_REPO_ID: i64 = 41;
 
     async fn test_indexer() -> CodeIndexer {
@@ -508,7 +651,267 @@ mod tests {
         rg_db::run_migrations(&db)
             .await
             .expect("test database migrations must run");
+        seed_repository(&db, Some(TEST_OWNER_ID), Some(TEST_REPO_ID), "unit").await;
         CodeIndexer::new(db)
+    }
+
+    async fn seed_repository(
+        db: &DatabaseConnection,
+        owner_id: Option<i64>,
+        repo_id: Option<i64>,
+        suffix: &str,
+    ) -> i64 {
+        let now = chrono::Utc::now();
+        let mut owner = rg_db::entities::user::ActiveModel {
+            username: Set(format!("index-owner-{suffix}")),
+            email: Set(format!("index-owner-{suffix}@example.test")),
+            password_hash: Set(String::new()),
+            is_admin: Set(false),
+            is_active: Set(true),
+            auth_provider: Set("local".to_string()),
+            mfa_enabled: Set(false),
+            login_attempts: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        if let Some(owner_id) = owner_id {
+            owner.id = Set(owner_id);
+        }
+        let owner = owner
+            .insert(db)
+            .await
+            .expect("insert code index fixture owner");
+
+        let mut repository = rg_db::entities::repository::ActiveModel {
+            owner_id: Set(owner.id),
+            name: Set(format!("index-repository-{suffix}")),
+            is_private: Set(false),
+            default_branch: Set("main".to_string()),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        if let Some(repo_id) = repo_id {
+            repository.id = Set(repo_id);
+        }
+        repository
+            .insert(db)
+            .await
+            .expect("insert code index fixture repository")
+            .id
+    }
+
+    fn generation_entries(repo_id: i64, generation: &str, count: usize) -> Vec<IndexEntry> {
+        (0..count)
+            .map(|index| {
+                let file_path = format!("{generation}/{index:03}.rs");
+                IndexEntry {
+                    repo_id,
+                    file_name: format!("{index:03}.rs"),
+                    content: format!("fn {generation}_{index}() {{}}"),
+                    language: "Rust".to_string(),
+                    file_path,
+                }
+            })
+            .collect()
+    }
+
+    fn entry_paths(entries: &[IndexEntry]) -> Vec<String> {
+        let mut paths = entries
+            .iter()
+            .map(|entry| entry.file_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    async fn indexed_paths(indexer: &CodeIndexer, repo_id: i64) -> Vec<String> {
+        let (rows, total) = indexer
+            .search_code("", Some(repo_id), 1_000, 0)
+            .await
+            .expect("read code index snapshot");
+        assert_eq!(
+            usize::try_from(total).expect("non-negative code index count"),
+            rows.len(),
+            "the count and rows must describe the same quiescent snapshot"
+        );
+        let mut paths = rows
+            .into_iter()
+            .map(|row| row.file_path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    async fn replace_paused_after_first_batch(
+        db: DatabaseConnection,
+        repo_id: i64,
+        entries: Vec<IndexEntry>,
+        reached_tx: oneshot::Sender<()>,
+        release: Arc<Notify>,
+    ) -> Result<()> {
+        let reached_tx = Arc::new(Mutex::new(Some(reached_tx)));
+        CodeIndexer::new(db)
+            .replace_index_entries(repo_id, &entries, move |point| {
+                let reached_tx = reached_tx.clone();
+                let release = release.clone();
+                async move {
+                    if point == IndexWritePoint::BatchInserted(0) {
+                        let sender = reached_tx.lock().expect("lock refresh pause sender").take();
+                        if let Some(sender) = sender {
+                            sender.send(()).expect("announce paused code index refresh");
+                            release.notified().await;
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .await
+    }
+
+    async fn exercise_atomic_refresh(db: &DatabaseConnection, repo_id: i64) {
+        let indexer = CodeIndexer::new(db.clone());
+        let old_entries = generation_entries(repo_id, "old", 2);
+        let old_paths = entry_paths(&old_entries);
+        indexer
+            .replace_index_entries(repo_id, &old_entries, |_| std::future::ready(Ok(())))
+            .await
+            .expect("seed the old complete index snapshot");
+
+        let replacement = generation_entries(repo_id, "replacement", 205);
+        for fail_at in [
+            IndexWritePoint::Cleared,
+            IndexWritePoint::BatchInserted(0),
+            IndexWritePoint::BatchInserted(1),
+            IndexWritePoint::BatchInserted(2),
+        ] {
+            let error = indexer
+                .replace_index_entries(repo_id, &replacement, move |point| async move {
+                    if point == fail_at {
+                        anyhow::bail!("injected code index failure after {point:?}");
+                    }
+                    Ok(())
+                })
+                .await
+                .expect_err("an injected refresh failure must escape");
+            assert!(format!("{error:#}").contains("injected code index failure"));
+            assert_eq!(
+                indexed_paths(&indexer, repo_id).await,
+                old_paths,
+                "{fail_at:?} published a partial replacement"
+            );
+        }
+
+        // Readers may either keep seeing the old committed generation or wait
+        // for the writer and see the new one. They must never see the first
+        // committed batch while the rest of the transaction is paused. MySQL
+        // can choose the blocking behavior for its FULLTEXT table, so the test
+        // releases the writer after a bounded observation window rather than
+        // waiting for the reader and the writer in a cycle.
+        let reader_writer_entries = generation_entries(repo_id, "reader-writer", 205);
+        let reader_writer_paths = entry_paths(&reader_writer_entries);
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let reader_writer = tokio::spawn(replace_paused_after_first_batch(
+            db.clone(),
+            repo_id,
+            reader_writer_entries,
+            reached_tx,
+            release.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), reached_rx)
+            .await
+            .expect("reader-boundary refresh did not reach its first batch")
+            .expect("reader-boundary refresh dropped its pause signal");
+
+        let reader_indexer = CodeIndexer::new(db.clone());
+        let mut reader = tokio::spawn(async move { indexed_paths(&reader_indexer, repo_id).await });
+        let early_reader = match tokio::time::timeout(Duration::from_millis(200), &mut reader).await
+        {
+            Ok(result) => Some(result.expect("code index reader task panicked")),
+            Err(_) => None,
+        };
+        if let Some(observed) = &early_reader {
+            assert_eq!(
+                observed, &old_paths,
+                "a reader observed an uncommitted batch"
+            );
+        }
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), reader_writer)
+            .await
+            .expect("reader-boundary refresh stayed blocked")
+            .expect("reader-boundary refresh task panicked")
+            .expect("reader-boundary refresh failed");
+        let reader_observation = match early_reader {
+            Some(observed) => observed,
+            None => tokio::time::timeout(Duration::from_secs(10), reader)
+                .await
+                .expect("code index reader stayed blocked after commit")
+                .expect("code index reader task panicked"),
+        };
+        assert!(
+            reader_observation == old_paths || reader_observation == reader_writer_paths,
+            "a reader observed neither complete generation: {reader_observation:?}"
+        );
+        assert_eq!(
+            indexed_paths(&indexer, repo_id).await,
+            reader_writer_paths,
+            "reader-boundary refresh did not publish its complete generation"
+        );
+
+        // Now hold one refresh after its first batch and prove a second refresh
+        // for the same repository cannot complete until the first commits.
+        let first_entries = generation_entries(repo_id, "first", 205);
+        let second_entries = generation_entries(repo_id, "second", 3);
+        let second_paths = entry_paths(&second_entries);
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let first = tokio::spawn(replace_paused_after_first_batch(
+            db.clone(),
+            repo_id,
+            first_entries,
+            reached_tx,
+            release.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), reached_rx)
+            .await
+            .expect("first concurrent refresh did not reach its first batch")
+            .expect("first concurrent refresh dropped its pause signal");
+
+        let second_db = db.clone();
+        let mut second = tokio::spawn(async move {
+            CodeIndexer::new(second_db)
+                .replace_index_entries(repo_id, &second_entries, |_| std::future::ready(Ok(())))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut second)
+                .await
+                .is_err(),
+            "a concurrent refresh crossed the first refresh's repository lock"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("first refresh stayed blocked")
+            .expect("first refresh task panicked")
+            .expect("first refresh failed");
+        tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("second refresh stayed blocked")
+            .expect("second refresh task panicked")
+            .expect("second refresh failed");
+        assert_eq!(
+            indexed_paths(&indexer, repo_id).await,
+            second_paths,
+            "concurrent refreshes published a mixed generation"
+        );
     }
 
     fn committed_repository(files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
@@ -675,6 +1078,49 @@ mod tests {
             .expect("the previous index must remain readable");
         assert_eq!(total, 1);
         assert_eq!(results[0].file_path, "src/main.rs");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_code_index_refresh_is_failure_atomic_and_serialized() {
+        let directory = tempfile::tempdir().expect("create code index database directory");
+        let database_path = directory.path().join("code-index.db");
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .expect("connect to throwaway SQLite database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("run SQLite code index migrations");
+        seed_repository(
+            &db,
+            Some(TEST_OWNER_ID),
+            Some(TEST_REPO_ID),
+            "sqlite-atomic",
+        )
+        .await;
+
+        exercise_atomic_refresh(&db, TEST_REPO_ID).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
+    async fn server_code_index_refresh_is_failure_atomic_and_serialized() {
+        let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+            .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+        assert!(
+            database_url.starts_with("postgres://") || database_url.starts_with("mysql://"),
+            "this proof exercises PostgreSQL or MySQL repository-row locking"
+        );
+        let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .expect("connect to disposable server database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("run server code index migrations");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let repo_id = seed_repository(&db, None, None, &suffix[..12]).await;
+
+        exercise_atomic_refresh(&db, repo_id).await;
     }
 
     #[test]
