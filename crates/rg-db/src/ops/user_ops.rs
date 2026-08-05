@@ -15,6 +15,93 @@ pub async fn find_by_username(db: &DatabaseConnection, username: &str) -> Result
         .context("db: find user by username")
 }
 
+/// Find a user by username, ignoring one already claimed for retirement.
+///
+/// The lookup that decides whether a *new* thing may join the account's
+/// namespace — creating or importing a repository into it, above all — has to
+/// use this one rather than [`find_by_username`]: an account whose storage is
+/// being retired is no longer a namespace anything may enter, and
+/// `repositories.owner_id` is `ON DELETE CASCADE`, so a row that lands there
+/// anyway is not merely orphaned but destroyed.
+///
+/// Deliberately keyed on `deleted_at`, not on `is_active`: deactivation is an
+/// orthogonal toggle that says nothing about whether the namespace still
+/// exists, and an organization whose owner is deactivated still accepts
+/// repositories.
+pub async fn find_active_by_username(
+    db: &DatabaseConnection,
+    username: &str,
+) -> Result<Option<User>> {
+    UserEntity::find()
+        .filter(user::Column::Username.eq(username))
+        .filter(user::Column::DeletedAt.is_null())
+        .one(db)
+        .await
+        .context("db: find active user by username")
+}
+
+/// Claim an account for retirement, reporting whether this call claimed it.
+///
+/// `deleted_at` is the account's retirement marker: set while the storage of
+/// its repositories is being retired, and gone together with the row itself
+/// once it is. Deleting an account spans storage no database transaction can
+/// hold, so the row cannot simply disappear at the end of one — something has
+/// to say "this namespace is closing" for the whole span, and this is it. The
+/// column already denies every credential through
+/// [`Model::is_usable`](crate::entities::user::Model::is_usable), which is the
+/// behaviour a closing account wants anyway.
+///
+/// One conditional statement, and the row count is the answer: `false` means
+/// the account is already being retired by somebody else (or is already gone),
+/// so this caller does not own the deletion and must not start retiring storage
+/// a concurrent deleter is also retiring.
+pub async fn begin_user_retirement(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let now = chrono::Utc::now();
+    let result = UserEntity::update_many()
+        .col_expr(user::Column::DeletedAt, Expr::value(Some(now)))
+        .col_expr(user::Column::UpdatedAt, Expr::value(now))
+        .filter(user::Column::Id.eq(id))
+        .filter(user::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: begin user retirement")?;
+    Ok(result.rows_affected > 0)
+}
+
+/// Release a retirement claim whose deletion could not finish.
+///
+/// A deletion that fails half-way leaves the account and its unretired
+/// repositories exactly where they were, so the marker has to come off too —
+/// otherwise a retryable failure would leave an account nobody can create in,
+/// nobody can log in as, and no request can reopen.
+pub async fn abort_user_retirement(db: &DatabaseConnection, id: i64) -> Result<()> {
+    UserEntity::update_many()
+        .col_expr(
+            user::Column::DeletedAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(user::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: abort user retirement")?;
+    Ok(())
+}
+
+/// Whether an account is still open for new members of its namespace.
+///
+/// `false` covers both "claimed for retirement" and "already gone": to anything
+/// asking whether it may still join this namespace the two are the same answer.
+/// As with [`find_active_by_username`], this is not `is_active`.
+pub async fn user_namespace_is_open(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let count = UserEntity::find()
+        .filter(user::Column::Id.eq(id))
+        .filter(user::Column::DeletedAt.is_null())
+        .count(db)
+        .await
+        .context("db: check user retirement state")?;
+    Ok(count > 0)
+}
+
 /// Find a user by email.
 pub async fn find_by_email(db: &DatabaseConnection, email: &str) -> Result<Option<User>> {
     UserEntity::find()

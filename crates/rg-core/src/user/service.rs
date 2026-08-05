@@ -886,6 +886,146 @@ pub async fn delete_user(
     oci_storage: &crate::package_registry::oci::storage::OciStorage,
     user_id: i64,
 ) -> Result<()> {
+    // Refused before the claim rather than after it, so the common "you still
+    // own an organization" answer never briefly locks an account that is not
+    // going anywhere. The claimed retirement re-reads the same two ownerships
+    // on every pass, which is where they are actually load-bearing.
+    refuse_ownerships_this_deletion_may_not_cascade(db, user_id).await?;
+
+    // Close the namespace before inventorying it. Two concurrent deletes both
+    // pass the checks above, and this claim is the one statement only one of
+    // them can win; the loser gets the same 404 as a request for an account
+    // that was never there rather than a second retirement of the same storage.
+    //
+    // It is also what makes the inventory below mean something. Without it, a
+    // `POST /repos` that resolved this account a moment earlier could commit
+    // its repository row after the inventory had been taken — and the final
+    // `DELETE FROM users` would then *destroy* that row through
+    // `repositories.owner_id ON DELETE CASCADE`, leaving Git, blob, CI and
+    // registry bytes with nothing naming them at all (card_da1abc6074ac).
+    if !user_ops::begin_user_retirement(db, user_id).await? {
+        return Err(crate::error::not_found("user"));
+    }
+
+    if let Err(error) =
+        retire_account_repositories(db, repo_root, blob_storage, oci_storage, user_id).await
+    {
+        // The failure is retryable — the account and every repository not yet
+        // retired are exactly where they were — so the namespace has to reopen
+        // with them.
+        release_user_retirement_claim(db, user_id).await;
+        return Err(error);
+    }
+
+    // The claim outlives every failure until the row it marks is gone, this one
+    // included: a deletion that retired the storage and then could not remove
+    // the row would otherwise leave a marked account with no repositories left,
+    // which no retry could ever claim again and whose owner could never log in.
+    //
+    // `rg-db` cannot depend on this crate's domain error types, so absence
+    // crosses that boundary as a value and becomes a typed 404 here.
+    match user_ops::delete_by_id(db, user_id).await {
+        // Nothing left to release — the row the marker lived on is gone.
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::error::not_found("user")),
+        Err(error) => {
+            release_user_retirement_claim(db, user_id).await;
+            Err(error)
+        }
+    }
+}
+
+/// How many times the retirement loop re-reads the account's repositories
+/// before giving up.
+///
+/// The claim stops new requests from resolving this account at all, so the only
+/// repositories that can still appear are the ones already in flight when it
+/// landed. That set is finite and small; a pass that keeps finding more of them
+/// means something is creating repositories through a path that ignores the
+/// claim, and looping forever would hide that rather than report it.
+const MAX_ACCOUNT_RETIREMENT_PASSES: usize = 8;
+
+/// Retire every repository of a claimed account, until a pass finds none.
+///
+/// One pass is not enough. A repository creation that resolved this account
+/// before the claim landed can still commit its row afterwards, so the
+/// inventory is re-read until it comes back empty — at which point no row can
+/// appear any more, because every request that could have produced one has
+/// either committed (and been retired here) or will find the claim and refuse.
+///
+/// The two ownerships this deletion refuses rather than cascades are re-read on
+/// every pass for the same reason: an organization or an organization-scoped
+/// repository that commits after a single check would be reached by the same
+/// cascade, which is exactly the outcome the check exists to prevent.
+async fn retire_account_repositories(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn crate::blob_storage::BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    user_id: i64,
+) -> Result<()> {
+    for pass in 0..MAX_ACCOUNT_RETIREMENT_PASSES {
+        refuse_ownerships_this_deletion_may_not_cascade(db, user_id).await?;
+
+        // Before anything is moved, and covering both namespaces: a database
+        // that cannot answer "which repositories does this account own" aborts
+        // the deletion instead of reporting a success that leaves their bytes
+        // live.
+        let owned = rg_db::ops::repo_ops::list_active_by_owner_id(db, user_id)
+            .await
+            .context(
+                "failed to inventory the repositories of this account — its storage cannot be \
+                 retired without them",
+            )?;
+        if owned.is_empty() {
+            return Ok(());
+        }
+        if pass > 0 {
+            tracing::info!(
+                user_id,
+                pass,
+                repositories = owned.len(),
+                "account deletion found repositories created while it was retiring — retiring \
+                 them too"
+            );
+        }
+
+        for repo in &owned {
+            if let Err(error) =
+                crate::repo::service::delete_repo(db, repo_root, blob_storage, oci_storage, repo)
+                    .await
+            {
+                tracing::error!(
+                    user_id,
+                    repo_id = repo.id,
+                    repo = %repo.name,
+                    error = %format!("{error:#}"),
+                    "account deletion stopped: this repository's storage could not be retired, so \
+                     the account row was left in place and the request can be retried"
+                );
+                return Err(error.context(format!(
+                    "failed to retire repository '{}' (id {}) while deleting its owner",
+                    repo.name, repo.id
+                )));
+            }
+        }
+    }
+    Err(crate::error::conflict(format!(
+        "account {user_id} is still gaining repositories after \
+         {MAX_ACCOUNT_RETIREMENT_PASSES} retirement passes; it was left in place"
+    )))
+}
+
+/// Refuse the two ownerships this deletion is not entitled to absorb.
+///
+/// Both are reached by `ON DELETE CASCADE` on `repositories.owner_id` — or, for
+/// the organization row itself, by no foreign key at all — so absorbing them
+/// here would repeat one level up the very mistake this deletion exists to
+/// avoid. See [`delete_user`] for what each of them would leave behind.
+async fn refuse_ownerships_this_deletion_may_not_cascade(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<()> {
     let owned_orgs = rg_db::ops::org_ops::list_orgs_owned_by(db, user_id)
         .await
         .context(
@@ -904,20 +1044,15 @@ pub async fn delete_user(
         )));
     }
 
-    // Before anything is moved, and covering both namespaces: a database that
-    // cannot answer "which repositories does this account own" aborts the
-    // deletion instead of reporting a success that leaves their bytes live.
-    let owned = rg_db::ops::repo_ops::list_active_by_owner_id(db, user_id)
+    let organization_scoped = rg_db::ops::repo_ops::list_active_by_owner_id(db, user_id)
         .await
         .context(
             "failed to inventory the repositories of this account — its storage cannot be retired \
              without them",
-        )?;
-
-    let organization_scoped = owned
-        .iter()
+        )?
+        .into_iter()
         .filter(|repo| repo.org_id.is_some())
-        .map(|repo| repo.name.as_str())
+        .map(|repo| repo.name)
         .collect::<Vec<_>>();
     if !organization_scoped.is_empty() {
         return Err(crate::error::conflict(format!(
@@ -931,32 +1066,24 @@ pub async fn delete_user(
             organization_scoped.join(", ")
         )));
     }
-
-    for repo in &owned {
-        if let Err(error) =
-            crate::repo::service::delete_repo(db, repo_root, blob_storage, oci_storage, repo).await
-        {
-            tracing::error!(
-                user_id,
-                repo_id = repo.id,
-                repo = %repo.name,
-                error = %format!("{error:#}"),
-                "account deletion stopped: this repository's storage could not be retired, so the \
-                 account row was left in place and the request can be retried"
-            );
-            return Err(error.context(format!(
-                "failed to retire repository '{}' (id {}) while deleting its owner",
-                repo.name, repo.id
-            )));
-        }
-    }
-
-    // `rg-db` cannot depend on this crate's domain error types, so absence
-    // crosses that boundary as a value and becomes a typed 404 here.
-    if !user_ops::delete_by_id(db, user_id).await? {
-        return Err(crate::error::not_found("user"));
-    }
     Ok(())
+}
+
+/// Reopen an account whose retirement could not finish.
+///
+/// The caller is already returning the original failure, so a failed release
+/// can only be reported: the account stays in the database, but nobody can log
+/// in as it and no repository can be created in its namespace until the marker
+/// is cleared by hand or by a retried deletion that succeeds.
+async fn release_user_retirement_claim(db: &DatabaseConnection, user_id: i64) {
+    if let Err(error) = user_ops::abort_user_retirement(db, user_id).await {
+        tracing::error!(
+            user_id,
+            error = %format!("{error:#}"),
+            "failed to reopen an account whose deletion was aborted — it can neither authenticate \
+             nor receive repositories until its `deleted_at` marker is cleared"
+        );
+    }
 }
 
 /// Get a single user by ID (admin view).
@@ -1622,5 +1749,347 @@ mod tests {
             "expected exactly one reset token to be written before the call returned"
         );
         assert_eq!(tokens[0].user_id, user.id);
+    }
+}
+
+/// card_da1abc6074ac: an account's deletion and a repository creation into its
+/// namespace are two multi-statement lifecycles over storage no transaction can
+/// hold — and `repositories.owner_id` is `ON DELETE CASCADE`, so the losing
+/// order does not orphan a repository row, it destroys it. Between them they
+/// must never leave a Git tree, a blob prefix or a registry namespace that no
+/// row names any more.
+#[cfg(test)]
+mod account_retirement_race_tests {
+    use super::*;
+    use crate::blob_storage::LocalBlobStorage;
+    use crate::package_registry::oci::storage::OciStorage;
+    use rg_db::ops::repo_ops;
+    use sea_orm::{ConnectOptions, Database};
+    use std::sync::Arc;
+
+    async fn setup_db() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect in-memory database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db
+    }
+
+    /// A throwaway SQLite file, removed with its WAL siblings on drop.
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempDb {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "cleanup must not mask the assertion that failed the test"
+        )]
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            }
+        }
+    }
+
+    /// A migrated database with more than one pooled connection, so concurrent
+    /// tasks really do run their statements against separate connections.
+    async fn setup_pooled_db(label: &str) -> (DatabaseConnection, TempDb) {
+        let temp = TempDb {
+            path: std::env::temp_dir().join(format!(
+                "forgekeep-account-race-{label}-{}.db",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        let url = format!("sqlite://{}?mode=rwc", temp.path.display());
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .expect("connect to throwaway database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        (db, temp)
+    }
+
+    fn oci_storage_for(repo_root: &std::path::Path) -> OciStorage {
+        OciStorage::from_backend(
+            Arc::new(LocalBlobStorage::new(repo_root)),
+            repo_root.join("_oci_uploads"),
+        )
+    }
+
+    /// An account and the root its repositories live under.
+    async fn seed_account(
+        db: &DatabaseConnection,
+        login: &str,
+    ) -> (i64, tempfile::TempDir, std::path::PathBuf) {
+        let owner = user_ops::create_user(
+            db,
+            login,
+            &format!("{login}@example.invalid"),
+            "unused",
+            "Race Owner",
+        )
+        .await
+        .expect("create account");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        (owner.id, sandbox, repo_root)
+    }
+
+    /// Everything left under a namespace whose account no longer exists.
+    ///
+    /// This is the shape the account case has to be checked in: the cascade
+    /// takes the rows with the account, so "a live row pointing at nobody" is
+    /// not the residue to look for — bytes with no row at all is. Deliberately
+    /// not filtered to `*.git`: a staging tombstone left behind by a deletion
+    /// that reported success is the same failure wearing a different name.
+    async fn stranded_storage(
+        db: &DatabaseConnection,
+        user_id: i64,
+        repo_root: &std::path::Path,
+        login: &str,
+    ) -> Vec<String> {
+        if user_ops::find_by_id(db, user_id)
+            .await
+            .expect("read account")
+            .is_some()
+        {
+            return Vec::new();
+        }
+        let Ok(entries) = std::fs::read_dir(repo_root.join(login)) else {
+            return Vec::new();
+        };
+        entries
+            .map(|entry| entry.expect("read namespace entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The request resolved the account before the deletion claimed it, so
+    /// nothing on the create path could have refused it up front. It commits
+    /// its row, finds the claim, and takes both the row and the Git tree back
+    /// out — the alternative is a Git tree whose row the cascade is about to
+    /// destroy.
+    #[tokio::test]
+    async fn a_repository_that_commits_after_the_retirement_claim_undoes_itself() {
+        let db = setup_db().await;
+        let (owner_id, _sandbox, repo_root) = seed_account(&db, "late-create-owner").await;
+
+        // Exactly what `delete_user` does first, and the only state a create
+        // that resolved a moment earlier can still discover.
+        assert!(
+            user_ops::begin_user_retirement(&db, owner_id)
+                .await
+                .expect("claim the account"),
+            "the first claim on an untouched account must win"
+        );
+
+        let error =
+            crate::repo::service::create_repo(&db, owner_id, "late", None, false, &repo_root, None)
+                .await
+                .expect_err("a repository must not be created into a retiring account");
+        assert!(
+            format!("{error:#}").contains("being deleted"),
+            "the refusal does not say the account is going away: {error:#}"
+        );
+
+        assert!(
+            repo_ops::list_active_by_owner_id(&db, owner_id)
+                .await
+                .expect("inventory account repositories")
+                .is_empty(),
+            "the losing create left a live repository row in a retiring account"
+        );
+        assert!(
+            !repo_root.join("late-create-owner/late.git").exists(),
+            "the losing create left its Git tree behind"
+        );
+    }
+
+    /// A second claim is not a second deletion. Two concurrent deletes must not
+    /// both walk the same repositories' storage.
+    #[tokio::test]
+    async fn only_one_deletion_can_claim_an_account() {
+        let db = setup_db().await;
+        let (owner_id, _sandbox, _repo_root) = seed_account(&db, "claim-owner").await;
+
+        assert!(user_ops::begin_user_retirement(&db, owner_id)
+            .await
+            .unwrap());
+        assert!(
+            !user_ops::begin_user_retirement(&db, owner_id)
+                .await
+                .unwrap(),
+            "a second deletion claimed an account already being retired"
+        );
+
+        // And the namespace reopens exactly once the claim is released.
+        user_ops::abort_user_retirement(&db, owner_id)
+            .await
+            .unwrap();
+        assert!(
+            user_ops::begin_user_retirement(&db, owner_id)
+                .await
+                .unwrap(),
+            "a released claim did not reopen the account"
+        );
+    }
+
+    /// The claim is what `delete_user` itself takes, not just an op sitting
+    /// next to it: an account another deletion is already retiring must not
+    /// have its storage walked a second time, and the loser answers like a name
+    /// that is not there.
+    #[tokio::test]
+    async fn a_deletion_refuses_an_account_another_deletion_already_claimed() {
+        let db = setup_db().await;
+        let (owner_id, _sandbox, repo_root) = seed_account(&db, "second-delete-owner").await;
+        crate::repo::service::create_repo(&db, owner_id, "held", None, false, &repo_root, None)
+            .await
+            .expect("create account repository");
+
+        assert!(user_ops::begin_user_retirement(&db, owner_id)
+            .await
+            .unwrap());
+
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let refused = delete_user(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage_for(&repo_root),
+            owner_id,
+        )
+        .await
+        .expect_err("a second deletion retired an account already being retired");
+        assert!(
+            format!("{refused:#}").contains("user"),
+            "the loser's refusal does not name the account: {refused:#}"
+        );
+        assert!(
+            repo_root.join("second-delete-owner/held.git").exists(),
+            "the losing deletion walked the storage the first one owns"
+        );
+        assert!(
+            user_ops::find_by_id(&db, owner_id).await.unwrap().is_some(),
+            "the losing deletion removed the account row the first one claimed"
+        );
+    }
+
+    /// A deletion that cannot retire a repository leaves everything retryable —
+    /// including the namespace. A claim that outlived its failed deletion would
+    /// be an account nobody can log in as and no request can reopen.
+    #[tokio::test]
+    async fn a_failed_deletion_reopens_the_namespace_it_claimed() {
+        let db = setup_db().await;
+        let (owner_id, _sandbox, repo_root) = seed_account(&db, "reopen-owner").await;
+        crate::repo::service::create_repo(&db, owner_id, "kept", None, false, &repo_root, None)
+            .await
+            .expect("create account repository");
+
+        // A repository whose storage cannot be staged fails the deletion: the
+        // blob root is a file, so the OCI upload tree under it cannot be made.
+        let broken_root = repo_root.join("_oci_uploads");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(&broken_root, b"not a directory").unwrap();
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let failed = delete_user(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &OciStorage::from_backend(
+                Arc::new(LocalBlobStorage::new(&repo_root)),
+                broken_root.join("nested"),
+            ),
+            owner_id,
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "a repository whose storage could not be retired was reported as a deleted account"
+        );
+
+        assert!(
+            user_ops::user_namespace_is_open(&db, owner_id)
+                .await
+                .expect("read account retirement state"),
+            "a failed deletion left the account claimed and its namespace closed"
+        );
+        // Which is only meaningful if a create can actually use it again.
+        crate::repo::service::create_repo(
+            &db,
+            owner_id,
+            "after-retry",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("the reopened namespace still refuses new repositories");
+    }
+
+    /// The invariant under real concurrency, both orderings included: whichever
+    /// of the two wins, no Git tree may outlive the account row that named it.
+    /// The create may lose and undo itself, or commit early enough for the
+    /// deletion's re-inventory to retire it — never neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_create_and_delete_never_strand_repository_storage() {
+        for attempt in 0..12 {
+            // Pooled and file-backed on purpose. `sqlite::memory:` with one
+            // connection makes the two tasks take turns on that connection, so
+            // the interleaving this test exists for never happens and it would
+            // pass against code with no protocol at all.
+            let (db, _temp) = setup_pooled_db(&format!("account-race-{attempt}")).await;
+            let login = format!("race-owner-{attempt}");
+            let (owner_id, _sandbox, repo_root) = seed_account(&db, &login).await;
+            std::fs::create_dir_all(&repo_root).unwrap();
+
+            let create_db = db.clone();
+            let create_root = repo_root.clone();
+            let create = async move {
+                crate::repo::service::create_repo(
+                    &create_db,
+                    owner_id,
+                    "contested",
+                    None,
+                    false,
+                    &create_root,
+                    None,
+                )
+                .await
+            };
+            let delete_db = db.clone();
+            let delete_root = repo_root.clone();
+            let delete = async move {
+                let blob_storage = LocalBlobStorage::new(&delete_root);
+                delete_user(
+                    &delete_db,
+                    &delete_root,
+                    &blob_storage,
+                    &oci_storage_for(&delete_root),
+                    owner_id,
+                )
+                .await
+            };
+            let (created, deleted) = tokio::join!(create, delete);
+
+            let stranded = stranded_storage(&db, owner_id, &repo_root, &login).await;
+            assert!(
+                stranded.is_empty(),
+                "attempt {attempt}: the account is gone but this storage is still on disk: \
+                 {stranded:?} (create: {:?}, delete: {:?})",
+                created
+                    .as_ref()
+                    .map(|repo| repo.id)
+                    .map_err(|e| format!("{e:#}")),
+                deleted.as_ref().map_err(|e| format!("{e:#}")),
+            );
+            // A create that committed early enough to be seen by the deletion's
+            // re-inventory is retired by it, so a successful create whose row is
+            // gone is the protocol working, not failing — what may never happen
+            // is that row disappearing with its bytes left behind, which is
+            // what the assertion above is about.
+        }
     }
 }

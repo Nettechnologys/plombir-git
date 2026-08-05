@@ -218,8 +218,11 @@ pub fn invalidate_perm_cache_all(db: &DatabaseConnection) {
 /// - If owner is a username: returns (user_id, None, username)
 /// - If owner is an org name: returns (org_owner_id, Some(org_id), org_name)
 async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Option<i64>, String)> {
-    // Try user first
-    if let Some(user) = user_ops::find_by_username(db, owner).await? {
+    // Try user first. An account already claimed for retirement is not a
+    // namespace anything may still enter — and `repositories.owner_id` cascades
+    // on its deletion, so a repository admitted here would be destroyed rather
+    // than orphaned (card_da1abc6074ac).
+    if let Some(user) = user_ops::find_active_by_username(db, owner).await? {
         return Ok((user.id, None, user.username.clone()));
     }
 
@@ -236,6 +239,46 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
     Err(crate::error::invalid_request(format!(
         "owner '{owner}' not found (neither user nor organization)"
     )))
+}
+
+/// Whether a freshly-committed repository row is still allowed to exist in the
+/// namespace it named.
+///
+/// Both claims have to be re-read, not just the organization's. Every
+/// repository row carries a user in `owner_id` — an organization's repositories
+/// keep the organization's owner there — and that column is declared
+/// `REFERENCES users(id) ON DELETE CASCADE`, so an account deletion that
+/// finishes after this row commits does not merely orphan it, it *destroys* it:
+/// the Git tree, the blob prefixes, the CI cache and the registry data stay
+/// live with no row left naming them and no sweep that walks them
+/// (card_da1abc6074ac).
+///
+/// `Err` is the reason the caller must undo itself with — a conflict when a
+/// claim is in place, the read failure itself when the database could not
+/// answer. An unanswerable read is deliberately not treated as "still open":
+/// the whole point of the check is that guessing here costs bytes nothing can
+/// reach.
+async fn namespace_still_accepts_repository(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    org_id: Option<i64>,
+    path_prefix: &str,
+    name: &str,
+) -> Result<()> {
+    if !user_ops::user_namespace_is_open(db, owner_id).await? {
+        return Err(crate::error::conflict(format!(
+            "the account owning '{path_prefix}' is being deleted; repository '{name}' was not \
+             created"
+        )));
+    }
+    if let Some(org_id) = org_id {
+        if !rg_db::ops::org_ops::org_is_active(db, org_id).await? {
+            return Err(crate::error::conflict(format!(
+                "organization '{path_prefix}' is being deleted; repository '{name}' was not created"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the directory name that owns a repository row on disk.
@@ -718,12 +761,13 @@ where
         }
     };
 
-    // The organization was resolved several statements ago, and nothing since
-    // then has been holding it: a `DELETE /orgs/{name}` could have claimed it
-    // for retirement, inventoried its repositories and found none — all while
-    // this request was initialising Git — and the row above would then be a
-    // live repository whose owner is on its way out, with bytes no collector
-    // ever walks (card_b6dd1fb60659).
+    // The namespace was resolved several statements ago, and nothing since then
+    // has been holding it: a `DELETE /orgs/{name}` or a
+    // `DELETE /admin/users/{id}` could have claimed it for retirement,
+    // inventoried its repositories and found none — all while this request was
+    // initialising Git — and the row above would then be a live repository
+    // whose owner is on its way out, with bytes no collector ever walks
+    // (card_b6dd1fb60659, card_da1abc6074ac).
     //
     // Re-reading the claim *after* the row is committed is what closes that: if
     // the claim landed before this read, this request lost and undoes itself
@@ -731,32 +775,25 @@ where
     // this committed row and retires it. One of the two always happens, and the
     // argument rests on nothing stronger than "a committed write is visible to
     // a read that starts later", which every supported backend gives.
-    if let Some(org_id) = opts.org_id {
-        match rg_db::ops::org_ops::org_is_active(db, org_id).await {
-            Ok(true) => {}
-            // Undo in the order that leaves nothing dangling: the row first, so
-            // the directory it named is unreferenced before it is discarded.
-            outcome => {
-                if let Err(error) = repo_ops::delete_by_id(db, repo.id).await {
-                    tracing::error!(
-                        repo_id = repo.id,
-                        org_id,
-                        error = %format!("{error:#}"),
-                        "repository was created into an organization that is being deleted, and \
-                         removing the row failed — it now names an organization that is gone"
-                    );
-                    return Err(error);
-                }
-                discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
-                return match outcome {
-                    Ok(_) => Err(crate::error::conflict(format!(
-                        "organization '{path_prefix}' is being deleted; repository '{name}' was \
-                         not created"
-                    ))),
-                    Err(error) => Err(error),
-                };
-            }
+    if let Err(error) =
+        namespace_still_accepts_repository(db, owner_id, opts.org_id, &path_prefix, name).await
+    {
+        // Undo in the order that leaves nothing dangling: the row first, so the
+        // directory it named is unreferenced before it is discarded.
+        if let Err(rollback_error) = repo_ops::delete_by_id(db, repo.id).await {
+            tracing::error!(
+                repo_id = repo.id,
+                owner_id,
+                org_id = opts.org_id,
+                reason = %format!("{error:#}"),
+                error = %format!("{rollback_error:#}"),
+                "repository was created into a namespace that is being deleted, and removing the \
+                 row failed — it now names an owner that is gone"
+            );
+            return Err(rollback_error);
         }
+        discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+        return Err(error);
     }
 
     after_source_commit().await;

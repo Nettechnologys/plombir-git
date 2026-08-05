@@ -573,7 +573,7 @@ async fn resolve_or_create_target_repo(
 
     // Resolve owner: try user first, then org
     let (owner_id, org_id) =
-        if let Some(user) = user_ops::find_by_username(db, target_owner).await? {
+        if let Some(user) = user_ops::find_active_by_username(db, target_owner).await? {
             (user.id, None)
         } else if let Some(org) = org_ops::find_active_org_by_name(db, target_owner).await? {
             (org.owner_id, Some(org.id))

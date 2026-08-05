@@ -495,7 +495,12 @@ pub(crate) async fn require_namespace_create(
         return Ok(None);
     };
 
-    if let Some(user) = rg_db::ops::user_ops::find_by_username(&state.db, owner)
+    // An account claimed for retirement is not a namespace anything may still
+    // enter either, so it denies with the same one text as the other three
+    // reasons. As with the organization below, the authoritative refusal is the
+    // one `create_repo` makes against the same marker after its row commits;
+    // this only saves the caller a Git init it would lose anyway.
+    if let Some(user) = rg_db::ops::user_ops::find_active_by_username(&state.db, owner)
         .await
         .map_err(AppError::from)?
     {
