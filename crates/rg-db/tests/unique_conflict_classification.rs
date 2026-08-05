@@ -298,7 +298,7 @@ async fn a_duplicate_release_tag_in_one_repository_is_classifiable() {
 
     let release = || rg_db::entities::release::ActiveModel {
         repo_id: Set(repo_id),
-        author_id: Set(user_id),
+        author_id: Set(Some(user_id)),
         tag_name: Set("v1.0.0".to_string()),
         title: Set("First".to_string()),
         body: Set(None),

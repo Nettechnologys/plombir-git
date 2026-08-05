@@ -235,7 +235,7 @@ async fn persist_attachment(
     let model = ActiveModel {
         uuid: Set(uuid),
         repo_id: Set(repo_id),
-        uploader_id: Set(uploader_id),
+        uploader_id: Set(Some(uploader_id)),
         issue_id: Set(issue_id),
         pull_request_id: Set(pull_request_id),
         issue_comment_id: Set(issue_comment_id),

@@ -638,7 +638,7 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
             id: sea_orm::NotSet,
             uuid: Set(uuid::Uuid::new_v4().to_string()),
             repo_id: Set(repo_id),
-            uploader_id: Set(owner_id),
+            uploader_id: Set(Some(owner_id)),
             issue_id: Set(None),
             pull_request_id: Set(Some(pull.id)),
             issue_comment_id: Set(None),

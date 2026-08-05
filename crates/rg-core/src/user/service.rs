@@ -875,6 +875,16 @@ pub async fn update_user_admin(
 ///   as `owner_id`.** They are reached by the same cascade even though they are
 ///   not this user's to delete.
 ///
+/// What the account merely *produced* is the opposite case and is not retired
+/// here at all: an attachment on somebody else's issue, an asset in somebody
+/// else's release, a release published into somebody else's repository. Those
+/// rows live in a namespace that is not going anywhere, and
+/// `m20260805_000002_uploads_outlive_their_uploader` made all three columns
+/// `ON DELETE SET NULL` so the database — not this function — guarantees they
+/// survive their author with a ghost uploader. Retiring them instead would mean
+/// deleting files out of a working repository because an unrelated account
+/// closed (card_1cfc81035e92).
+///
 /// The repositories are retired one at a time, and each one is individually
 /// atomic. A failure part-way through leaves the already-retired ones retired
 /// and the user row untouched, so re-running the request resumes where it

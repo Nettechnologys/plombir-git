@@ -376,7 +376,7 @@ mod tests {
                 size: sea_orm::Set(1),
                 content_type: sea_orm::Set("application/octet-stream".into()),
                 download_count: sea_orm::Set(0),
-                uploader_id: sea_orm::Set(1),
+                uploader_id: sea_orm::Set(Some(1)),
                 created_at: sea_orm::Set(chrono::Utc::now()),
                 sha256: sea_orm::Set(Some("e3b0".into())),
                 attestation: sea_orm::Set(Some(serde_json::to_string(&envelope).unwrap())),

@@ -13,7 +13,9 @@ pub struct Model {
     pub size: i64,
     pub content_type: String,
     pub download_count: i64,
-    pub uploader_id: i64,
+    /// The account that uploaded the asset, or `None` once that account has
+    /// been deleted — see [`super::attachment::Model::uploader_id`].
+    pub uploader_id: Option<i64>,
     pub created_at: DateTimeUtc,
     /// Hex-encoded SHA-256 of the asset bytes, recorded at upload time.
     /// `None` for assets uploaded before digest tracking existed.

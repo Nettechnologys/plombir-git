@@ -15,7 +15,13 @@ pub struct Model {
     pub body: Option<String>,
     pub is_draft: bool,
     pub is_prerelease: bool,
-    pub author_id: i64,
+    /// The account that published the release, or `None` once that account has
+    /// been deleted. A release belongs to its repository, not to its author, so
+    /// the column is `ON DELETE SET NULL` — otherwise deleting the author took
+    /// the whole release, and through `release_assets.release_id`, every asset
+    /// anybody had uploaded to it
+    /// (`m20260805_000002_uploads_outlive_their_uploader`).
+    pub author_id: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

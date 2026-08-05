@@ -10,7 +10,12 @@ pub struct Model {
     pub id: i64,
     pub uuid: String,
     pub repo_id: i64,
-    pub uploader_id: i64,
+    /// The account that uploaded the file, or `None` once that account has been
+    /// deleted. The attachment lives in whichever repository it was uploaded
+    /// into — routinely somebody else's — so the column is
+    /// `ON DELETE SET NULL`: the file outlives its uploader rather than being
+    /// destroyed with them (`m20260805_000002_uploads_outlive_their_uploader`).
+    pub uploader_id: Option<i64>,
     pub issue_id: Option<i64>,
     pub pull_request_id: Option<i64>,
     pub issue_comment_id: Option<i64>,

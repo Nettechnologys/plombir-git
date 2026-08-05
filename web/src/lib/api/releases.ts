@@ -7,7 +7,8 @@ export interface ReleaseAsset {
   size: number;
   content_type: string;
   download_count: number;
-  uploader_id: number;
+  /** `null` once the account that uploaded the asset has been deleted. */
+  uploader_id: number | null;
   created_at: string;
   sha256: string | null;
 }

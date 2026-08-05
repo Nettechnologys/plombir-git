@@ -58,7 +58,7 @@ pub async fn create_release(
     let now = Utc::now();
     let model = ReleaseActiveModel {
         repo_id: Set(repo_id),
-        author_id: Set(author_id),
+        author_id: Set(Some(author_id)),
         tag_name: Set(tag_name.to_string()),
         title: Set(title.to_string()),
         body: Set(body.map(str::to_string)),
@@ -489,7 +489,7 @@ pub async fn upload_asset(
         size: Set(size),
         content_type: Set(content_type.to_string()),
         download_count: Set(0),
-        uploader_id: Set(uploader_id),
+        uploader_id: Set(Some(uploader_id)),
         created_at: Set(Utc::now()),
         sha256: Set(Some(sha256)),
         ..Default::default()
