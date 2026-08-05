@@ -1,4 +1,6 @@
-use crate::common::fault::{fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite};
+use crate::common::fault::{
+    fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite, FaultSweepApp,
+};
 use crate::common::{register_full, spawn_test_app_with_db};
 use sea_orm::{ActiveModelTrait, ConnectionTrait, Set};
 use sha2::{Digest, Sha256};
@@ -424,5 +426,266 @@ async fn a_failed_cache_row_takes_the_uploaded_archive_with_it() {
     assert!(
         leftovers.is_empty(),
         "the failed upload left files behind that no row points at: {leftovers:?}"
+    );
+}
+
+/// Publish one cache archive through the real upload route.
+///
+/// Hands back the owner's token (the retention route is repo-admin only), the
+/// repository the archive belongs to, and the exact path the row now names.
+async fn published_cache(
+    app: &FaultSweepApp,
+    login: &str,
+    repo_name: &str,
+    cache_key: &str,
+) -> (String, i64, std::path::PathBuf) {
+    let (owner_token, _owner_id) =
+        register_full(&app.base, login, &format!("{login}@example.com")).await;
+    let repo_id = create_private_repo(&app.base, &owner_token, repo_name).await;
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &app.db,
+        &format!("cache-runner-{cache_key}"),
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let job_id = create_cached_job(&app.db, repo_id, runner.id, cache_key).await;
+
+    let upload = reqwest::Client::new()
+        .put(format!(
+            "{}/api/v1/runners/{}/jobs/{}/cache",
+            app.base, runner.id, job_id
+        ))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(format!("archive of {cache_key}").into_bytes())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 204, "cache upload failed");
+
+    let entry = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("uploaded cache entry");
+    let archive = std::path::PathBuf::from(&entry.file_path);
+    assert!(archive.exists(), "upload did not write the cache archive");
+    (owner_token, repo_id, archive)
+}
+
+async fn cache_entry(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    cache_key: &str,
+) -> Option<rg_db::entities::ci_cache_entry::Model> {
+    rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, &key_hash(cache_key))
+        .await
+        .unwrap()
+}
+
+/// Age a cache entry out of its retention window without waiting for one.
+async fn expire_cache(db: &rg_db::DatabaseConnection, repo_id: i64, cache_key: &str) -> i64 {
+    let entry = cache_entry(db, repo_id, cache_key)
+        .await
+        .expect("cache entry to expire");
+    let id = entry.id;
+    let mut active: rg_db::entities::ci_cache_entry::ActiveModel = entry.into();
+    active.expires_at = Set(chrono::Utc::now() - chrono::Duration::days(1));
+    active.update(db).await.expect("expire cache entry");
+    id
+}
+
+async fn cleanup_expired(
+    app: &FaultSweepApp,
+    token: &str,
+    owner: &str,
+    repo: &str,
+) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{}/api/v1/repos/{owner}/{repo}/actions/retention/expired",
+            app.base
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("run retention cleanup");
+    assert_eq!(
+        response.status(),
+        200,
+        "one uncleanable cache entry brought the whole sweep down"
+    );
+    response.json().await.unwrap()
+}
+
+/// card_789fa4252b8c: the retention sweep unlinked the archive and only then
+/// deleted the row it belonged to, which is not compensable — a metadata
+/// failure left a live entry naming bytes the sweep had already destroyed, and
+/// every `download_cache` on that key failed until the next pass, an hour
+/// later, came back for the row.
+#[tokio::test]
+async fn expired_cache_cleanup_restores_the_archive_when_the_entry_delete_fails() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let owner = "cache_retention_fault";
+    let repo = "retention-fault";
+    let cache_key = "deps-expired";
+    let (token, repo_id, archive) = published_cache(&app, owner, repo, cache_key).await;
+    expire_cache(&app.db, repo_id, cache_key).await;
+
+    let db_fault = fail_db_writes(&app.db, "ci_cache_entries", DbWrite::Delete).await;
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(
+        summary["caches_deleted"], 0,
+        "a failed entry delete was counted as a cleaned cache"
+    );
+    assert_eq!(summary["failures"], 1, "the failure was not reported");
+    db_fault.clear().await;
+
+    assert!(
+        archive.exists(),
+        "the staged cache archive was not put back"
+    );
+    assert!(
+        cache_entry(&app.db, repo_id, cache_key).await.is_some(),
+        "the cache entry did not survive its failed cleanup"
+    );
+
+    // The same sweep, once the database is healthy again, is what actually
+    // frees the space — and only then is the cache counted.
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(summary["caches_deleted"], 1, "retry did not clean up");
+    assert_eq!(summary["failures"], 0);
+    assert!(!archive.exists(), "cleanup left the cache archive");
+    assert!(
+        cache_entry(&app.db, repo_id, cache_key).await.is_none(),
+        "cleanup left the cache entry"
+    );
+    assert!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)).is_empty(),
+        "cleanup counted a cache whose staged archive was still parked: {:?}",
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id))
+    );
+}
+
+/// One entry that cannot be cleaned is a `failures` line, not a reason to
+/// abandon every entry behind it: the sweep used to propagate the failed delete
+/// with `?`, which dropped the remaining expired caches *and* the counts the
+/// artifact half had already earned.
+#[tokio::test]
+async fn one_uncleanable_cache_entry_does_not_abandon_the_rest_of_the_sweep() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let owner = "cache_retention_partial";
+    let repo = "retention-partial";
+    let (token, repo_id, stuck_archive) = published_cache(&app, owner, repo, "deps-stuck").await;
+    let stuck_id = expire_cache(&app.db, repo_id, "deps-stuck").await;
+
+    // A second archive of the same repository, published through the same
+    // route, so the sweep has something behind the failing entry to reach.
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &app.db,
+        "cache-runner-follower",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let job_id = create_cached_job(&app.db, repo_id, runner.id, "deps-follower").await;
+    let upload = reqwest::Client::new()
+        .put(format!(
+            "{}/api/v1/runners/{}/jobs/{}/cache",
+            app.base, runner.id, job_id
+        ))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", "deps-follower")
+        .body(b"archive of deps-follower".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 204);
+    let follower_archive = std::path::PathBuf::from(
+        &cache_entry(&app.db, repo_id, "deps-follower")
+            .await
+            .expect("follower cache entry")
+            .file_path,
+    );
+    expire_cache(&app.db, repo_id, "deps-follower").await;
+
+    // Only the first entry's delete fails, so the sweep has to survive it and
+    // still reach the second.
+    app.db
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER fk_fault_one_cache_delete BEFORE DELETE ON ci_cache_entries \
+             WHEN OLD.id = {stuck_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected failure: DELETE on ci_cache_entries'); END;"
+        ))
+        .await
+        .expect("arm the single-entry delete fault");
+
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(summary["failures"], 1, "the failure was not reported");
+    assert_eq!(
+        summary["caches_deleted"], 1,
+        "the entry behind the failing one was never reached"
+    );
+    assert!(
+        stuck_archive.exists(),
+        "the staged archive of the failing entry was not put back"
+    );
+    assert!(
+        cache_entry(&app.db, repo_id, "deps-stuck").await.is_some(),
+        "the failing entry's row did not survive"
+    );
+    assert!(
+        !follower_archive.exists(),
+        "the reachable entry's archive was left on disk"
+    );
+    assert!(
+        cache_entry(&app.db, repo_id, "deps-follower")
+            .await
+            .is_none(),
+        "the reachable entry was never cleaned"
+    );
+}
+
+/// After the entry commits there is no rollback left — the live name is already
+/// free — but retained bytes still make `caches_deleted` a lie. The sweep counts
+/// the entry on the failure side and leaves the tombstone where an operator can
+/// find it.
+#[tokio::test]
+async fn expired_cache_cleanup_counts_a_retained_tombstone_as_a_failure() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let owner = "cache_retention_debt";
+    let repo = "retention-debt";
+    let cache_key = "deps-debt";
+    let (token, repo_id, archive) = published_cache(&app, owner, repo, cache_key).await;
+    expire_cache(&app.db, repo_id, cache_key).await;
+
+    // A directory under the archive's name stages fine (a rename moves it) but
+    // cannot be unlinked afterwards, which is exactly the post-commit cleanup
+    // failure this asserts on.
+    std::fs::remove_file(&archive).expect("remove the published archive");
+    std::fs::create_dir(&archive).expect("park a directory under the archive name");
+
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(
+        summary["caches_deleted"], 0,
+        "a cache whose bytes are still staged was counted as cleaned"
+    );
+    assert_eq!(summary["failures"], 1, "the cleanup debt was not reported");
+    assert!(
+        cache_entry(&app.db, repo_id, cache_key).await.is_none(),
+        "the cache entry did not commit before retirement"
+    );
+    assert!(
+        !archive.exists(),
+        "the live archive name outlived a committed delete"
+    );
+    assert!(
+        !leftover_cache_files(&cache_dir(&app.repo_root, repo_id)).is_empty(),
+        "failed cleanup did not leave a discoverable tombstone"
     );
 }

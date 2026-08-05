@@ -154,16 +154,47 @@ pub async fn cleanup_expired_storage(
         if repo_filter.is_some_and(|repo_id| repo_id != cache.repo_id) {
             continue;
         }
-        match safe_remove_file(PathBuf::from(&cache.file_path), &cache_root).await {
-            Ok(()) => {
-                rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, cache.id).await?;
-                summary.caches_deleted += 1;
-            }
+        // The cache half deletes on the same reversible terms as the artifact
+        // half above: archive out of the live namespace first, row second,
+        // tombstone last. Nothing here may be fatal to the sweep either — one
+        // cache entry that cannot be cleaned is a `failures` line, not a reason
+        // to abandon every entry behind it and drop the summary on the floor.
+        let staging = match CacheDeletionStaging::prepare(cache.id, &cache.file_path, &cache_root)
+            .await
+        {
+            Ok(staging) => staging,
             Err(error) => {
                 summary.failures += 1;
                 tracing::error!(cache_id = cache.id, error = %format!("{error:#}"), "refused to clean expired cache");
+                continue;
             }
+        };
+
+        if let Err(error) =
+            rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, cache.id).await
+        {
+            staging.restore().await;
+            summary.failures += 1;
+            tracing::error!(
+                cache_id = cache.id,
+                error = %format!("{error:#}"),
+                "expired cache kept: deleting its entry failed, so its archive was put back"
+            );
+            continue;
         }
+
+        // Retirement is what frees the space. Counting the entry before the
+        // tombstone is gone would report a cleanup that reclaimed nothing.
+        if let Err(error) = staging.retire().await {
+            summary.failures += 1;
+            tracing::error!(
+                cache_id = cache.id,
+                error = %format!("{error:#}"),
+                "expired cache entry is deleted, but its staged archive remains"
+            );
+            continue;
+        }
+        summary.caches_deleted += 1;
     }
     Ok(summary)
 }
@@ -193,27 +224,139 @@ fn cache_cleanup_error(what: &str, path: &FsPath, error: &std::io::Error) -> any
     rg_core::platform::fs::path_error(what, path, error, rg_core::platform::fs::CI_CACHE_DIR_HINT)
 }
 
-async fn safe_remove_file(path: PathBuf, root: &FsPath) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
+/// An expired cache archive, renamed beside itself.
+#[derive(Debug)]
+struct StagedCacheArchive {
+    live: PathBuf,
+    staged: PathBuf,
+}
+
+/// An expired CI cache archive, taken out of the live namespace but not yet
+/// destroyed.
+///
+/// Unlinking the archive first and deleting its row second is not compensable:
+/// a metadata failure after a successful unlink leaves a live entry naming an
+/// archive this sweep already destroyed, and every `download_cache` on that key
+/// fails until the next pass — an hour later — comes back for the row. Cache is
+/// recoverable data, so the damage is a stall rather than a loss, but the
+/// reversible order costs one rename and removes the window entirely, which is
+/// what the artifact half of this same sweep already does.
+#[derive(Debug)]
+struct CacheDeletionStaging {
+    cache_id: i64,
+    archive: Option<StagedCacheArchive>,
+}
+
+impl CacheDeletionStaging {
+    /// Move the archive out of the live namespace.
+    ///
+    /// An archive that is already gone is the end state this call is asked for,
+    /// so it stages nothing and succeeds — otherwise an entry whose file an
+    /// operator removed by hand could never be cleaned at all. A recorded path
+    /// outside the managed cache root, or a filesystem failure, fails here —
+    /// before the entry is touched.
+    async fn prepare(cache_id: i64, recorded: &str, root: &FsPath) -> anyhow::Result<Self> {
+        let mut staging = Self {
+            cache_id,
+            archive: None,
+        };
+        let live = PathBuf::from(recorded);
+        if !live.exists() {
+            return Ok(staging);
+        }
+        let canonical_path = tokio::fs::canonicalize(&live)
+            .await
+            .map_err(|error| cache_cleanup_error("CI cache archive", &live, &error))?;
+        let canonical_root = tokio::fs::canonicalize(root)
+            .await
+            .map_err(|error| cache_cleanup_error("CI cache directory", root, &error))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            anyhow::bail!(
+                "stored path {} is outside managed storage root {}",
+                canonical_path.display(),
+                canonical_root.display()
+            );
+        }
+        let deletion_id = uuid::Uuid::new_v4().simple().to_string();
+        let staged = match canonical_path.file_name() {
+            Some(name) => canonical_path
+                .with_file_name(format!("{}.deleted-{deletion_id}", name.to_string_lossy())),
+            None => anyhow::bail!(
+                "stored path {} does not name a CI cache archive",
+                canonical_path.display()
+            ),
+        };
+        match tokio::fs::rename(&canonical_path, &staged).await {
+            Ok(()) => {
+                staging.archive = Some(StagedCacheArchive {
+                    live: canonical_path,
+                    staged,
+                })
+            }
+            // Removed between the check and the rename: nothing left to stage.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(
+                    cache_cleanup_error("CI cache archive", &canonical_path, &error).context(
+                        format!(
+                            "failed to stage expired CI cache archive at {}",
+                            staged.display()
+                        ),
+                    ),
+                );
+            }
+        }
+        Ok(staging)
     }
-    let canonical_path = tokio::fs::canonicalize(&path)
-        .await
-        .map_err(|error| cache_cleanup_error("CI cache archive", &path, &error))?;
-    let canonical_root = tokio::fs::canonicalize(root)
-        .await
-        .map_err(|error| cache_cleanup_error("CI cache directory", root, &error))?;
-    if !canonical_path.starts_with(&canonical_root) {
-        anyhow::bail!(
-            "stored path {} is outside managed storage root {}",
-            canonical_path.display(),
-            canonical_root.display()
-        );
+
+    /// Put the archive back where the surviving entry expects it.
+    ///
+    /// Compensation on an error path: the sweep still has to report the original
+    /// failure, so a failed restore can only be logged. When it fails the entry
+    /// is live again while its archive sits under a name nothing records — which
+    /// is exactly what the log line has to say.
+    async fn restore(&self) {
+        let Some(archive) = &self.archive else {
+            return;
+        };
+        if let Err(error) = tokio::fs::rename(&archive.staged, &archive.live).await {
+            tracing::warn!(
+                cache_id = self.cache_id,
+                staged_at = %archive.staged.display(),
+                belongs_at = %archive.live.display(),
+                %error,
+                "failed to restore an expired CI cache archive after cleanup aborted — the surviving entry now points at missing bytes until the file is moved back by hand"
+            );
+        }
     }
-    tokio::fs::remove_file(&canonical_path)
-        .await
-        .map_err(|error| cache_cleanup_error("CI cache archive", &canonical_path, &error))?;
-    Ok(())
+
+    /// Destroy the tombstone, once the entry is gone.
+    ///
+    /// After the entry commits there is nothing to roll back — the live name is
+    /// already free — so a failure here is cleanup debt, not a lost deletion. It
+    /// is still returned: counting a cache whose bytes are still parked would
+    /// report space this pass never reclaimed.
+    async fn retire(self) -> anyhow::Result<()> {
+        let Some(archive) = self.archive else {
+            return Ok(());
+        };
+        match tokio::fs::remove_file(&archive.staged).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    cache_id = self.cache_id,
+                    staged_at = %archive.staged.display(),
+                    %error,
+                    "CI cache entry is deleted, but its staged archive remains and must be removed by hand"
+                );
+                Err(
+                    cache_cleanup_error("staged CI cache archive", &archive.staged, &error)
+                        .context("failed to retire a deleted CI cache archive"),
+                )
+            }
+        }
+    }
 }
 
 pub async fn run_cleanup_loop(
