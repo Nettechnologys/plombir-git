@@ -461,6 +461,63 @@ async fn a_missing_ref_on_the_log_endpoint_is_not_an_empty_history() {
     assert_no_internal_detail(&body, &repo_root);
 }
 
+/// card_192c7662a0b9: a signed query value used to survive the upper-only
+/// clamp, then `usize::try_from(...).unwrap_or_default()` silently turned it
+/// into zero. A real history therefore looked empty instead of rejecting the
+/// malformed request.
+#[tokio::test]
+async fn a_non_positive_commit_log_limit_is_a_bad_request_not_an_empty_history() {
+    let (base, _) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "loglimit-owner", "loglimit@example.com").await;
+    create_repo(&base, &token, "loglimit-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "loglimit-owner", "loglimit-repo").await;
+
+    let url = format!("{base}/api/v1/repos/loglimit-owner/loglimit-repo/log");
+
+    for valid in ["1", "200"] {
+        let resp = client
+            .get(&url)
+            .query(&[("limit", valid)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 200,
+            "a valid limit must keep the readable history: {status} (body: {body})"
+        );
+        assert_eq!(
+            body["commits"].as_array().map(Vec::len),
+            Some(1),
+            "a valid limit must not hide the fixture's commit: {body}"
+        );
+    }
+
+    for invalid in ["-1", "0"] {
+        let resp = client
+            .get(&url)
+            .query(&[("limit", invalid)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 400,
+            "limit={invalid} is the client's mistake, not an empty history: \
+             {status} (body: {body})"
+        );
+        assert_eq!(
+            body["error"]["message"], "limit must be greater than zero",
+            "the client must be told which boundary was violated: {body}"
+        );
+    }
+}
+
 /// The legitimate empty result must survive the split above: a newly-created
 /// bare repository has an unborn HEAD, not a server failure.
 #[tokio::test]

@@ -42,6 +42,20 @@ pub struct LogQuery {
     pub limit: Option<i64>,
 }
 
+const DEFAULT_COMMIT_LOG_LIMIT: i64 = 50;
+const MAX_COMMIT_LOG_LIMIT: i64 = 100;
+
+fn commit_log_limit(limit: Option<i64>) -> Result<usize, AppError> {
+    let limit = limit.unwrap_or(DEFAULT_COMMIT_LOG_LIMIT);
+    if limit <= 0 {
+        return Err(AppError::bad_request("limit must be greater than zero"));
+    }
+
+    // The validated value is positive and capped well below usize::MAX on
+    // every supported target, so the conversion is lossless.
+    Ok(limit.min(MAX_COMMIT_LOG_LIMIT) as usize)
+}
+
 /// Request body for creating/updating a file.
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateOrUpdateFileRequest {
@@ -302,11 +316,11 @@ pub async fn get_blob(
         ("name" = String, Path, description = "name"),
         ("ref" = Option<String>, Query, description = "Git ref (branch/tag/sha, default: HEAD)"),
         ("path" = Option<String>, Query, description = "File path filter"),
-        ("limit" = Option<i64>, Query, description = "Max number of commits"),
+        ("limit" = Option<i64>, Query, description = "Max number of commits (1-100, default 50)"),
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
-        (status = 400, description = "Invalid repository path or ambiguous ref", body = serde_json::Value),
+        (status = 400, description = "Invalid repository path, ambiguous ref, or non-positive limit", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 404, description = "Repository or ref not found", body = serde_json::Value),
         (status = 500, description = "Repository storage or commit history could not be read", body = serde_json::Value),
@@ -326,6 +340,11 @@ pub async fn get_log(
         return AppError::bad_request(e.to_string()).into_response();
     }
 
+    let limit = match commit_log_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(error) => return error.into_response(),
+    };
+
     // H-01: Auth check for private repos
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
@@ -334,7 +353,6 @@ pub async fn get_log(
     }
 
     let git_ref = params.r#ref.clone().unwrap_or_else(|| "HEAD".to_string());
-    let limit = params.limit.unwrap_or(50).min(100);
     let file_path = params.path.unwrap_or_default();
 
     match get_commit_log(&repo_path, &git_ref, &file_path, limit) {
@@ -894,7 +912,7 @@ fn get_commit_log(
     repo_path: &std::path::Path,
     git_ref: &str,
     _path: &str,
-    limit: i64,
+    limit: usize,
 ) -> anyhow::Result<Vec<CommitEntry>> {
     let repo = gix::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
@@ -928,7 +946,6 @@ fn get_commit_log(
             repo_path.display()
         )
     })?;
-    let limit = usize::try_from(limit).unwrap_or_default();
     for (count, info) in walk_iter.enumerate() {
         if count >= limit {
             break;
@@ -1553,8 +1570,8 @@ mod tests {
     use rg_git::cli_gateway::GitOutput;
 
     use super::{
-        get_commit_log, gpg_signature_from_output, is_empty_repo, list_branch_names,
-        list_tag_names, list_tree_entries, AppError,
+        commit_log_limit, get_commit_log, gpg_signature_from_output, is_empty_repo,
+        list_branch_names, list_tag_names, list_tree_entries, AppError,
     };
 
     fn overwrite_loose_object(repo_path: &std::path::Path, oid: &str, kind: &str, data: &[u8]) {
@@ -1567,6 +1584,21 @@ mod tests {
             .write_all(data)
             .expect("object payload must compress");
         encoder.finish().expect("object must finish compressing");
+    }
+
+    #[test]
+    fn commit_log_limit_rejects_non_positive_values_and_caps_large_ones() {
+        for invalid in [i64::MIN, -1, 0] {
+            let response = commit_log_limit(Some(invalid))
+                .expect_err("a non-positive limit must be rejected")
+                .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        assert_eq!(commit_log_limit(None).unwrap(), 50);
+        assert_eq!(commit_log_limit(Some(1)).unwrap(), 1);
+        assert_eq!(commit_log_limit(Some(200)).unwrap(), 100);
+        assert_eq!(commit_log_limit(Some(i64::MAX)).unwrap(), 100);
     }
 
     #[test]
