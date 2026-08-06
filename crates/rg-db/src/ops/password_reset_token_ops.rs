@@ -37,14 +37,32 @@ pub async fn find_by_hash(
         .await
 }
 
-/// Mark a token as used.
-pub async fn mark_used(db: &DatabaseConnection, token_id: i64) -> Result<(), sea_orm::DbErr> {
-    password_reset_token::Entity::update_many()
+/// Spend a reset link, reporting whether this call is the one that spent it.
+///
+/// A compare-and-swap, not a write: the `WHERE` names the exact state the
+/// caller believed it was acting on — a live, unspent link — so the database
+/// picks the winner in one statement. The predecessor, `mark_used`, filtered on
+/// the id alone and dropped `rows_affected`, which left the "is it still
+/// unspent?" question answered in application memory a full Argon2 pass before
+/// the answer was acted on. Two requests carrying the same link both read
+/// `used = false`, both wrote a password, and both were answered a session.
+///
+/// The expiry is re-asserted here for the same reason `assign_job` restates its
+/// candidate query: a caller that checked it earlier checked it against a
+/// different instant, and a gate that only holds when every caller remembers to
+/// check first is a convention, not a gate.
+///
+/// `false` is an ordinary outcome — the link is spent, expired or gone — and
+/// belongs to whoever holds a dead link, not to a failure.
+pub async fn consume(db: &DatabaseConnection, token_id: i64) -> Result<bool, sea_orm::DbErr> {
+    let result = password_reset_token::Entity::update_many()
         .col_expr(password_reset_token::Column::Used, Expr::value(true))
         .filter(password_reset_token::Column::Id.eq(token_id))
+        .filter(password_reset_token::Column::Used.eq(false))
+        .filter(password_reset_token::Column::ExpiresAt.gt(Utc::now()))
         .exec(db)
         .await?;
-    Ok(())
+    Ok(result.rows_affected == 1)
 }
 
 /// Invalidate all unused tokens for a user (e.g., after successful reset).
