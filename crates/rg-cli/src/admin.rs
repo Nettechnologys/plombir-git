@@ -63,6 +63,25 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
     }
 
     let target = sqlite_db_path_from_url(db_url)?;
+    if target.try_exists().with_context(|| {
+        format!(
+            "failed to inspect target database path before restore: {}",
+            target.display()
+        )
+    })? && same_file::is_same_file(input, &target).with_context(|| {
+        format!(
+            "failed to compare backup input {} with target database {}",
+            input.display(),
+            target.display()
+        )
+    })? {
+        anyhow::bail!(
+            "refusing to restore: backup input and target database refer to the same file \
+             (input: {}, target: {}); choose a different backup input or target database path",
+            input.display(),
+            target.display()
+        );
+    }
     if target.exists() && !force {
         anyhow::bail!(
             "target database already exists: {} (stop ForgeKeep and use --force to overwrite)",

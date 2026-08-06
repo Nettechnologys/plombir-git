@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use rg_db::sea_orm::{self, ConnectionTrait};
@@ -26,6 +28,171 @@ fn command_output(output: &Output) -> String {
 
 fn bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct MetadataSnapshot {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    nlink: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+#[cfg(unix)]
+impl MetadataSnapshot {
+    fn read(path: &Path, follow_symlink: bool) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = if follow_symlink {
+            std::fs::metadata(path)
+        } else {
+            std::fs::symlink_metadata(path)
+        }
+        .unwrap_or_else(|error| panic!("read metadata for {}: {error}", path.display()));
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    followed: MetadataSnapshot,
+    directory_entry: MetadataSnapshot,
+}
+
+#[cfg(unix)]
+impl FileSnapshot {
+    fn read(path: &Path) -> Self {
+        Self {
+            bytes: bytes(path),
+            followed: MetadataSnapshot::read(path, true),
+            directory_entry: MetadataSnapshot::read(path, false),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum SameFileAlias {
+    Direct,
+    Dot,
+    DotDot,
+    Symlink,
+    Hardlink,
+}
+
+#[cfg(unix)]
+fn same_file_target(alias: SameFileAlias, input: &Path) -> PathBuf {
+    let parent = input.parent().unwrap();
+    match alias {
+        SameFileAlias::Direct => input.to_path_buf(),
+        SameFileAlias::Dot => parent.join(".").join(input.file_name().unwrap()),
+        SameFileAlias::DotDot => {
+            let detour = parent.join("detour");
+            std::fs::create_dir(&detour).unwrap();
+            detour.join("..").join(input.file_name().unwrap())
+        }
+        SameFileAlias::Symlink => {
+            use std::os::unix::fs::symlink;
+
+            let target = parent.join("target-symlink.db");
+            symlink(input, &target).unwrap();
+            target
+        }
+        SameFileAlias::Hardlink => {
+            let target = parent.join("target-hardlink.db");
+            std::fs::hard_link(input, &target).unwrap();
+            target
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_rejects_every_same_file_alias_before_touching_database_files() {
+    for alias in [
+        SameFileAlias::Direct,
+        SameFileAlias::Dot,
+        SameFileAlias::DotDot,
+        SameFileAlias::Symlink,
+        SameFileAlias::Hardlink,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("backup.db");
+        std::fs::write(&input, format!("original database for {alias:?}")).unwrap();
+        let target = same_file_target(alias, &input);
+        let wal = PathBuf::from(format!("{}-wal", target.display()));
+        let shm = PathBuf::from(format!("{}-shm", target.display()));
+        std::fs::write(&wal, format!("WAL for {alias:?}")).unwrap();
+        std::fs::write(&shm, format!("SHM for {alias:?}")).unwrap();
+
+        let canonical_target = target.canonicalize().unwrap();
+        let lock = PathBuf::from(format!("{}.forgekeep.lock", canonical_target.display()));
+        assert!(!lock.exists(), "test precondition failed for {alias:?}");
+
+        let before = [
+            FileSnapshot::read(&input),
+            FileSnapshot::read(&target),
+            FileSnapshot::read(&wal),
+            FileSnapshot::read(&shm),
+        ];
+        let database_url = format!("sqlite://{}?mode=rwc", target.display());
+
+        let rejected = run_restore(&database_url, &input);
+        let rejected_output = command_output(&rejected);
+        assert!(
+            !rejected.status.success(),
+            "{alias:?} unexpectedly restored:\n{rejected_output}"
+        );
+        assert!(
+            rejected_output.contains("backup input and target database refer to the same file")
+                && rejected_output
+                    .contains("choose a different backup input or target database path"),
+            "{alias:?} returned a non-actionable error:\n{rejected_output}"
+        );
+
+        assert_eq!(
+            FileSnapshot::read(&input),
+            before[0],
+            "{alias:?} changed the backup input"
+        );
+        assert_eq!(
+            FileSnapshot::read(&target),
+            before[1],
+            "{alias:?} changed the target entry"
+        );
+        assert_eq!(
+            FileSnapshot::read(&wal),
+            before[2],
+            "{alias:?} changed the WAL"
+        );
+        assert_eq!(
+            FileSnapshot::read(&shm),
+            before[3],
+            "{alias:?} changed the SHM"
+        );
+        assert!(
+            !lock.exists(),
+            "{alias:?} reached the process lease before the identity preflight"
+        );
+    }
 }
 
 #[tokio::test]

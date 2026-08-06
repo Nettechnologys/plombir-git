@@ -5171,6 +5171,7 @@ dependencies = [
  "rg-http",
  "rg-runner",
  "rg-ssh",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",
