@@ -1,5 +1,6 @@
 use crate::common::{
-    create_issue, create_repo, register_full, register_user, spawn_test_app, spawn_test_app_with_db,
+    create_issue, create_repo, register_full, register_user, spawn_test_app,
+    spawn_test_app_with_db, spawn_test_app_with_db_and_repo_root,
 };
 use chrono::Utc;
 use reqwest::multipart::{Form, Part};
@@ -672,4 +673,81 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .contains("quota exceeded"));
 
     assert_eq!(pull.repo_id, repo_id);
+}
+
+/// A blob that no longer hashes to the digest recorded at upload must not be
+/// served as a valid file.
+///
+/// The download path streams the attachment straight off the disk, so the check
+/// cannot happen before the first byte goes out — it runs as the bytes pass and
+/// fails the transfer at the end. The client therefore still sees `200` with the
+/// promised `Content-Length`, but the body ends in a broken read instead of a
+/// complete file, which is the whole difference between "this download failed"
+/// and "here is your silently corrupted attachment".
+#[tokio::test]
+async fn a_tampered_attachment_blob_fails_the_download_instead_of_serving_bad_bytes() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let client = reqwest::Client::new();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("tamper{}", &suffix[..8]);
+    let repo = format!("tampered{}", &suffix[..8]);
+    let token = register_user(&base, &owner, &format!("{owner}@example.com"), PASSWORD).await;
+    create_repo(&base, &token, &repo).await;
+    let (_, issue_number) = create_issue(&base, &token, &owner, &repo, "Tamper test").await;
+
+    let upload = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{issue_number}/assets"
+        ))
+        .bearer_auth(&token)
+        .multipart(
+            Form::new().part(
+                "attachment",
+                Part::bytes(b"original bytes".to_vec())
+                    .file_name("evidence.txt")
+                    .mime_str("text/plain")
+                    .unwrap(),
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), reqwest::StatusCode::CREATED);
+    let attachment: Value = upload.json().await.unwrap();
+    let attachment_id = attachment["id"].as_i64().unwrap();
+
+    let url =
+        format!("{base}/api/v1/repos/{owner}/{repo}/issues/{issue_number}/assets/{attachment_id}");
+    let healthy = client.get(&url).send().await.unwrap();
+    assert_eq!(healthy.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        healthy.bytes().await.unwrap().as_ref(),
+        b"original bytes",
+        "an untampered attachment downloads intact"
+    );
+
+    // Swap the stored bytes for a same-length payload: the row's `size` and the
+    // `Content-Length` still match, so the digest is the only thing that can
+    // tell the difference.
+    let row = rg_db::ops::attachment_ops::find_by_id(&db, attachment_id)
+        .await
+        .unwrap()
+        .expect("attachment row");
+    let blob_path = row
+        .blob_key
+        .split('/')
+        .fold(repo_root, |path, segment| path.join(segment));
+    std::fs::write(&blob_path, b"tampered bytes").expect("overwrite the stored blob");
+
+    let tampered = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        tampered.status(),
+        reqwest::StatusCode::OK,
+        "headers are already on the wire when the mismatch is discovered"
+    );
+    let body = tampered.bytes().await;
+    assert!(
+        body.is_err(),
+        "a digest mismatch must break the transfer, not deliver the tampered bytes: {body:?}"
+    );
 }

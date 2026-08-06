@@ -5,6 +5,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{body::Body, Json};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
@@ -624,7 +625,22 @@ async fn stream_attachment(
             .await
             .map_err(|error| download_path_error(&path, &error))?;
         let stream = ReaderStream::new(file);
-        Response::new(Body::from_stream(stream))
+        // The digest recorded at upload is checked against the bytes actually
+        // leaving the disk — a rotted or swapped blob breaks the transfer
+        // instead of being served as a valid file. Legacy attachments (uploaded
+        // before digest tracking) carry no recorded hash and stream unguarded;
+        // that is the only case where the client's `X-Checksum-SHA256` check is
+        // the sole line of defence.
+        match attachment.sha256.as_deref() {
+            Some(expected) => Response::new(Body::from_stream(
+                crate::http_stream::sha256_verified_stream(
+                    stream,
+                    expected.to_owned(),
+                    format!("attachment {}", attachment.id),
+                ),
+            )),
+            None => Response::new(Body::from_stream(stream)),
+        }
     } else {
         // Remote (non-local) blob backend returns the whole attachment as a
         // `Vec`; the local-path branch above streams from disk. Serve the buffer
@@ -632,6 +648,17 @@ async fn stream_attachment(
         // client can't pin the attachment-sized `Vec` in server memory until the
         // kernel resets the dead connection (card_444e03f1ca15).
         let data = state.blob_storage.get(&key).await?;
+        // Whole payload in hand: verify before a single byte goes out, so a
+        // corrupt blob is a clean error response rather than an aborted body.
+        if let Some(expected) = attachment.sha256.as_deref() {
+            let actual = hex::encode(sha2::Sha256::digest(&data));
+            if actual != expected {
+                anyhow::bail!(
+                    "attachment {} integrity check failed: expected sha256 {expected}, got {actual}",
+                    attachment.id
+                );
+            }
+        }
         Response::new(crate::http_stream::buffered_body_with_idle(
             data,
             state.git_idle_timeout_secs,
@@ -653,9 +680,10 @@ async fn stream_attachment(
             .headers_mut()
             .insert(header::CONTENT_DISPOSITION, value);
     }
-    // Expose the upload-time digest so clients can verify the payload end-to-end.
-    // The body is streamed (never fully buffered here), so verification is the
-    // client's job; the digest recorded at upload is the trust anchor.
+    // Expose the upload-time digest so clients can verify the payload
+    // end-to-end as well. The server-side check above happens as the bytes pass,
+    // so it can only abort a transfer already in flight; this header lets the
+    // client reach the same verdict on its own copy.
     if let Some(sha) = attachment.sha256.as_deref() {
         if let Ok(value) = HeaderValue::from_str(sha) {
             response

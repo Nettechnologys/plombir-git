@@ -94,11 +94,166 @@ pub(crate) fn buffered_body_with_idle(output: Vec<u8>, idle_secs: u64) -> Body {
     Body::new(http_body_util::StreamBody::new(frame_stream))
 }
 
+/// Stream `inner` through, hashing every byte, and **fail the transfer** if the
+/// bytes do not hash to `expected`.
+///
+/// The buffered downloads (release assets, CI artifacts, cache entries) verify
+/// their digest over the complete `Vec` *before* the first byte leaves the
+/// handler, so a corrupted blob is a clean `500` there. A payload served
+/// straight off the disk cannot do that without buffering it — which is exactly
+/// what the streaming path exists to avoid — so the check moves to where the
+/// bytes are: the digest is computed as they pass, and the verdict lands at
+/// end-of-stream.
+///
+/// Landing it there is not enough on its own. The handler declares a
+/// `Content-Length`, and hyper considers the response finished the moment that
+/// many bytes have been written — an error yielded *after* the last chunk is
+/// never looked at, and the client gets a complete, well-formed, corrupt file.
+/// So the last chunk is **withheld**: each chunk is handed on only once its
+/// successor has been read, leaving one chunk in hand when the digest verdict
+/// arrives. A match releases it and the transfer ends normally; a mismatch drops
+/// it and yields an error instead, so the body stops short of the declared
+/// length and the client sees a broken transfer rather than a valid download.
+/// One chunk (a few KiB) is the entire memory cost — the streaming path stays a
+/// streaming path.
+///
+/// Detection is still after the fact for the bytes already on the wire, which is
+/// unavoidable without buffering the whole payload; the mismatch is therefore
+/// also logged with `label`, so an operator learns the blob store is rotting
+/// without waiting for a user to report a bad download.
+pub(crate) fn sha256_verified_stream<S>(
+    inner: S,
+    expected: String,
+    label: String,
+) -> impl futures::Stream<Item = std::io::Result<axum::body::Bytes>>
+where
+    S: futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Unpin,
+{
+    use sha2::{Digest, Sha256};
+
+    // `None` marks the stream as finished (either drained or already failed), so
+    // `unfold` stops instead of polling a spent inner stream. The third element
+    // is the withheld chunk — the one already hashed but not yet handed on.
+    let start = Some((inner, Sha256::new(), None::<axum::body::Bytes>));
+    futures::stream::unfold(start, move |state| {
+        let expected = expected.clone();
+        let label = label.clone();
+        async move {
+            let (mut inner, mut hasher, mut withheld) = state?;
+            loop {
+                match futures::StreamExt::next(&mut inner).await {
+                    Some(Ok(chunk)) => {
+                        hasher.update(&chunk);
+                        // Release the previous chunk now that a successor exists
+                        // — proof this one is not the last. On the very first
+                        // chunk there is nothing to release yet, so read on.
+                        if let Some(ready) = withheld.replace(chunk) {
+                            return Some((Ok(ready), Some((inner, hasher, withheld))));
+                        }
+                    }
+                    Some(Err(error)) => return Some((Err(error), None)),
+                    None => {
+                        let actual = hex::encode(hasher.finalize());
+                        if actual == expected {
+                            // Verified: the withheld tail is safe to hand over.
+                            return withheld.map(|last| (Ok(last), None));
+                        }
+                        tracing::error!(
+                            %label,
+                            %expected,
+                            %actual,
+                            "integrity check failed — stored bytes do not match the digest recorded at upload; aborting the download"
+                        );
+                        return Some((
+                            Err(std::io::Error::other(format!(
+                                "{label} integrity check failed: expected sha256 {expected}, got {actual}"
+                            ))),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{buffered_body_with_idle, RESPONSE_CHUNK_BYTES};
+    use super::{buffered_body_with_idle, sha256_verified_stream, RESPONSE_CHUNK_BYTES};
     use axum::body::Body;
     use std::time::Duration;
+
+    /// Helper: run `chunks` through the verifying stream against `expected`,
+    /// returning the bytes the client would have received and whether the
+    /// transfer was broken by an error.
+    async fn verify_chunks(chunks: &[&[u8]], expected: &str) -> (Vec<u8>, bool) {
+        let inner = futures::stream::iter(
+            chunks
+                .iter()
+                .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>(),
+        );
+        let stream =
+            sha256_verified_stream(inner, expected.to_string(), "test payload".to_string());
+        let mut delivered = Vec::new();
+        let mut failed = false;
+        let mut stream = std::pin::pin!(stream);
+        while let Some(item) = futures::StreamExt::next(&mut stream).await {
+            match item {
+                Ok(chunk) => delivered.extend_from_slice(&chunk),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        (delivered, failed)
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(data))
+    }
+
+    /// The healthy path must be byte-transparent: withholding the tail chunk is
+    /// an ordering trick, not a filter.
+    #[tokio::test]
+    async fn verified_stream_passes_matching_bytes_through_untouched() {
+        let chunks: [&[u8]; 3] = [b"first ", b"second ", b"third"];
+        let expected = sha256_hex(b"first second third");
+        let (delivered, failed) = verify_chunks(&chunks, &expected).await;
+        assert_eq!(delivered, b"first second third");
+        assert!(!failed, "a matching digest must not break the transfer");
+    }
+
+    /// A mismatch must both fail the stream AND hold back the final chunk — a
+    /// complete body plus a trailing error is exactly what hyper discards once
+    /// `Content-Length` bytes are on the wire.
+    #[tokio::test]
+    async fn verified_stream_withholds_the_tail_and_fails_on_mismatch() {
+        let chunks: [&[u8]; 3] = [b"first ", b"second ", b"third"];
+        let expected = sha256_hex(b"what the row claims");
+        let (delivered, failed) = verify_chunks(&chunks, &expected).await;
+        assert!(failed, "a digest mismatch must break the transfer");
+        assert_eq!(
+            delivered, b"first second ",
+            "the last chunk must never reach the client"
+        );
+    }
+
+    /// A payload small enough to arrive in one chunk is the case where the
+    /// withholding pays off most: nothing at all reaches the client.
+    #[tokio::test]
+    async fn verified_stream_delivers_nothing_when_a_single_chunk_mismatches() {
+        let chunks: [&[u8]; 1] = [b"the whole file"];
+        let expected = sha256_hex(b"a different file");
+        let (delivered, failed) = verify_chunks(&chunks, &expected).await;
+        assert!(failed);
+        assert!(
+            delivered.is_empty(),
+            "a one-chunk payload must be withheld entirely: {delivered:?}"
+        );
+    }
 
     /// Helper: drain a response `Body` to completion, returning the bytes seen.
     async fn drain_body(mut body: Body) -> Vec<u8> {

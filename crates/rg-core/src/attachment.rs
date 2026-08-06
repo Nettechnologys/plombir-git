@@ -306,33 +306,14 @@ pub async fn get_attachment(
     Ok(attachment)
 }
 
-pub async fn download_attachment(
-    db: &DatabaseConnection,
-    storage: &dyn BlobStorage,
-    repo_id: i64,
-    target: AttachmentTarget,
-    attachment_id: i64,
-) -> Result<(Attachment, Vec<u8>)> {
-    let attachment = get_attachment(db, repo_id, target, attachment_id).await?;
-    let key = BlobKey::new(attachment.blob_key.clone())?;
-    let data = storage
-        .get(&key)
-        .await
-        .context("failed to read attachment blob")?;
-    // Integrity check: the stored bytes must still hash to the digest recorded
-    // at upload. Legacy attachments (uploaded before digest tracking) carry no
-    // recorded hash and are served without this guard.
-    if let Some(expected) = attachment.sha256.as_deref() {
-        let actual = hex::encode(Sha256::digest(&data));
-        if actual != expected {
-            anyhow::bail!(
-                "attachment integrity check failed: expected sha256 {expected}, got {actual}"
-            );
-        }
-    }
-    rg_db::ops::attachment_ops::increment_download_count(db, attachment.id).await?;
-    Ok((attachment, data))
-}
+// There is deliberately no `download_attachment` here. An in-memory download
+// service existed for a while — it read the whole blob, verified its sha256 and
+// bumped the download counter — but nothing ever called it: the HTTP layer
+// streams the file from disk (`api::attachments::stream_attachment`) precisely
+// so a 100 MiB attachment is never buffered. That left the integrity check on a
+// branch no request could reach, and a second copy of the counter increment free
+// to drift away from the live one. The check now runs on the streaming path,
+// where the bytes actually are.
 
 pub async fn delete_attachment(
     db: &DatabaseConnection,
