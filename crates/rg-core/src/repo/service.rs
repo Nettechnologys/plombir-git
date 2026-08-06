@@ -2032,6 +2032,35 @@ pub async fn delete_repo(
     invalidate_perm_cache_repo(db, repo.id);
 
     let mut cleanup_error = None;
+
+    // The row has left the live set, so the source's `forks_count` — declared to
+    // be `COUNT(*)` over `origin_repo_id = source AND deleted_at IS NULL` — is
+    // now one higher than the rows it claims to count, and nothing else ever
+    // recomputes it. The refresh belongs *after* the soft-delete and not before:
+    // every path above still restores the row, and a counter lowered for a
+    // deletion that then failed would be wrong in the other direction.
+    //
+    // A refresh that fails is reported like the other post-commit failures
+    // rather than swallowed: the repository really is deleted, but the source's
+    // shopfront is stale and only a later fork or unfork would repair it, so the
+    // caller has to hear about it.
+    if let Some(origin_repo_id) = repo.origin_repo_id {
+        if let Err(error) = rg_db::ops::repo_ops::update_forks_count(db, origin_repo_id).await {
+            tracing::warn!(
+                repo_id = repo.id,
+                origin_repo_id,
+                error = %format!("{error:#}"),
+                "fork is deleted, but its source's cached forks_count still counts it and must be \
+                 refreshed by hand"
+            );
+            cleanup_error = Some(error.context(format!(
+                "repository {} is deleted, but the cached forks_count of its source repository {} \
+                 could not be refreshed",
+                repo.id, origin_repo_id
+            )));
+        }
+    }
+
     if staged {
         match std::fs::remove_dir_all(&staged_path) {
             Ok(()) => {}
@@ -2044,15 +2073,17 @@ pub async fn delete_repo(
                 "repository is deleted and its canonical name is free, but its old Git data \
                  remains on disk and must be removed by hand"
                 );
-                cleanup_error = Some(
-                    crate::platform::fs::path_error(
-                        "staged repository directory",
-                        &staged_path,
-                        &error,
-                        crate::platform::fs::REPO_ROOT_HINT,
-                    )
-                    .context("failed to retire deleted repository Git data"),
-                );
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(
+                        crate::platform::fs::path_error(
+                            "staged repository directory",
+                            &staged_path,
+                            &error,
+                            crate::platform::fs::REPO_ROOT_HINT,
+                        )
+                        .context("failed to retire deleted repository Git data"),
+                    );
+                }
             }
         }
     }
@@ -4484,6 +4515,242 @@ mod repository_deletion_tests {
                 .expect("inventory tombstones")
                 .is_empty(),
             "the rollback restored the live blob prefix but left staged objects"
+        );
+    }
+
+    /// What the shopfront claims: the source's cached `forks_count`.
+    async fn cached_forks_count(db: &DatabaseConnection, repo_id: i64) -> i64 {
+        repo_ops::find_by_id(db, repo_id)
+            .await
+            .expect("read the source repository")
+            .expect("the source repository exists")
+            .forks_count
+    }
+
+    /// What it is supposed to equal: the source's live fork rows.
+    async fn live_fork_count(db: &DatabaseConnection, repo_id: i64) -> i64 {
+        repo_ops::list_forks(db, repo_id, 0, 1024)
+            .await
+            .expect("count the live forks")
+            .1
+    }
+
+    /// One source repository and `forkers.len()` forks of it, each in its own
+    /// account — a fork lands under the forker's name, so two forks of the same
+    /// source need two accounts. Returns the source and the forks in order.
+    async fn seed_source_and_forks(
+        db: &DatabaseConnection,
+        repo_root: &std::path::Path,
+        prefix: &str,
+        forkers: &[&str],
+    ) -> (
+        rg_db::entities::repository::Model,
+        Vec<rg_db::entities::repository::Model>,
+    ) {
+        let source_owner = user_ops::create_user(
+            db,
+            &format!("{prefix}-source"),
+            &format!("{prefix}-source@example.invalid"),
+            "unused",
+            "Fork Counter Source",
+        )
+        .await
+        .expect("create the source owner");
+        let source = create_repo(
+            db,
+            source_owner.id,
+            "forkable",
+            None,
+            false,
+            repo_root,
+            None,
+        )
+        .await
+        .expect("create the source repository");
+
+        let mut forks = Vec::new();
+        for forker_name in forkers {
+            let forker = user_ops::create_user(
+                db,
+                forker_name,
+                &format!("{forker_name}@example.invalid"),
+                "unused",
+                "Fork Counter Forker",
+            )
+            .await
+            .expect("create a forker");
+            let forked = fork_repo(
+                db,
+                forker.id,
+                &format!("{prefix}-source"),
+                &source,
+                repo_root,
+            )
+            .await
+            .expect("fork the source repository");
+            forks.push(forked.repo);
+        }
+        (source, forks)
+    }
+
+    /// card_9c09e70c7ed2: `forks_count` is declared to be `COUNT(*)` over the
+    /// source's live forks, so deleting a fork is exactly the event that lowers
+    /// it. Refreshing the counter only when a fork is *created* left the
+    /// shopfront permanently above the rows it claims to count, and nothing
+    /// else ever recomputed it — the next fork writes the count it observes,
+    /// which by then already excludes the deleted row and would silently repair
+    /// a source that happens to gain another fork while leaving every other
+    /// source wrong forever.
+    ///
+    /// The second fork is what makes the assertion mean anything: a refresh
+    /// that reset the counter to zero, and one that still counted the deleted
+    /// row, would both pass against a single fork.
+    #[tokio::test]
+    async fn deleting_a_fork_lowers_the_cached_forks_count_of_its_source() {
+        let db = setup_db().await;
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = crate::blob_storage::LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+        let (source, forks) = seed_source_and_forks(
+            &db,
+            &repo_root,
+            "forks-delete",
+            &["forks-delete-first", "forks-delete-second"],
+        )
+        .await;
+        assert_eq!(
+            cached_forks_count(&db, source.id).await,
+            2,
+            "the fixture did not produce two counted forks"
+        );
+
+        delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &forks[0])
+            .await
+            .expect("delete the first fork");
+
+        let live = live_fork_count(&db, source.id).await;
+        assert_eq!(live, 1, "the deleted fork is still counted as a live row");
+        assert_eq!(
+            cached_forks_count(&db, source.id).await,
+            live,
+            "the source still advertises the fork it no longer has"
+        );
+    }
+
+    /// The refresh is aimed by `origin_repo_id`, so a repository that is nobody's
+    /// fork has no counter to lower — and must not lower somebody else's.
+    #[tokio::test]
+    async fn deleting_a_repository_that_is_not_a_fork_leaves_other_counters_alone() {
+        let db = setup_db().await;
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = crate::blob_storage::LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+        let (source, _forks) =
+            seed_source_and_forks(&db, &repo_root, "plain-delete", &["plain-delete-forker"]).await;
+        let bystander = user_ops::create_user(
+            &db,
+            "plain-delete-bystander",
+            "plain-delete-bystander@example.invalid",
+            "unused",
+            "Plain Delete Bystander",
+        )
+        .await
+        .expect("create the bystander");
+        let unrelated = create_repo(
+            &db,
+            bystander.id,
+            "unrelated",
+            None,
+            false,
+            &repo_root,
+            None,
+        )
+        .await
+        .expect("create an unrelated repository");
+
+        delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &unrelated)
+            .await
+            .expect("delete the unrelated repository");
+
+        assert_eq!(
+            cached_forks_count(&db, source.id).await,
+            live_fork_count(&db, source.id).await,
+            "deleting an unrelated repository moved a counter that is not its own"
+        );
+        assert_eq!(
+            cached_forks_count(&db, source.id).await,
+            1,
+            "the source lost the fork it still has"
+        );
+    }
+
+    /// The soft-delete has committed by the time the counter is refreshed, so a
+    /// failing refresh cannot be turned back into a failed deletion — the row is
+    /// gone and no retry reaches it again, because the route resolves only live
+    /// repositories.
+    ///
+    /// What is left is a choice about what to say, and the deletion says it: the
+    /// stale counter travels back as the request's error, the same way every
+    /// other post-commit repair this function cannot finish does. Swallowing it
+    /// would report an invariant that is measurably broken as held.
+    #[tokio::test]
+    async fn a_forks_count_refresh_that_fails_after_the_soft_delete_is_reported() {
+        let db = setup_db().await;
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = crate::blob_storage::LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+        let (source, forks) = seed_source_and_forks(
+            &db,
+            &repo_root,
+            "forks-refresh-fail",
+            &["forks-refresh-fail-forker"],
+        )
+        .await;
+
+        // Installed after the forks exist: the same statement runs when a fork
+        // is created, and failing that would test the other half of the pair.
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER reject_forks_count_refresh \
+             BEFORE UPDATE OF forks_count ON repositories \
+             WHEN NEW.id = {} \
+             BEGIN SELECT RAISE(ABORT, 'forced forks_count refresh failure'); END",
+            source.id
+        ))
+        .await
+        .expect("install the refresh failure trigger");
+
+        let error = delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &forks[0])
+            .await
+            .expect_err("a refresh that cannot run must not be reported as success");
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("forced forks_count refresh failure"),
+            "the failure the caller sees is not the one that happened: {reported}"
+        );
+        assert!(
+            reported.contains("could not be refreshed"),
+            "the error does not say which invariant is now broken: {reported}"
+        );
+
+        assert!(
+            find_active_repo_by_owner_name(&db, "forks-refresh-fail-forker", "forkable")
+                .await
+                .expect("read the fork after the failed refresh")
+                .is_none(),
+            "the failed refresh was reported as if the deletion had been rolled back"
+        );
+        assert_eq!(
+            live_fork_count(&db, source.id).await,
+            0,
+            "the fork survived a deletion that reported only a counter failure"
+        );
+        assert_eq!(
+            cached_forks_count(&db, source.id).await,
+            1,
+            "the counter repaired itself, so the error above was not the one under test"
         );
     }
 
