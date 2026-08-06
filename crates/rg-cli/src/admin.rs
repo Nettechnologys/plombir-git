@@ -77,6 +77,11 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
         }
     }
 
+    // The lease has to precede the first destructive step and remain alive
+    // through the copy. A live pool otherwise keeps its old database/WAL inode
+    // open while this path starts naming an unrelated restored database.
+    let _process_guard = rg_db::sqlite_process_guard::acquire_restore(db_url)?;
+
     if force {
         remove_sqlite_sidecar_files(&target)?;
     }

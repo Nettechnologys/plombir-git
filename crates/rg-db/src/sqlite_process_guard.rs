@@ -27,6 +27,7 @@ pub struct SqliteProcessGuard {
 enum Purpose {
     Server,
     Migration,
+    Restore,
 }
 
 /// Acquire the lease a ForgeKeep server holds until HTTP and SSH have stopped.
@@ -43,6 +44,15 @@ pub fn acquire_server(database_url: &str) -> Result<Option<SqliteProcessGuard>> 
 /// to wait out while a live server continues accepting requests.
 pub fn acquire_migration(database_url: &str) -> Result<Option<SqliteProcessGuard>> {
     acquire(database_url, Purpose::Migration)
+}
+
+/// Acquire the lease required before replacing a file-backed SQLite database.
+///
+/// The guard must be held across removal of the database/WAL/SHM files and the
+/// backup copy. Otherwise a live server can keep writing through its old open
+/// inode while the restored database already occupies the configured path.
+pub fn acquire_restore(database_url: &str) -> Result<Option<SqliteProcessGuard>> {
+    acquire(database_url, Purpose::Restore)
 }
 
 fn acquire(database_url: &str, purpose: Purpose) -> Result<Option<SqliteProcessGuard>> {
@@ -74,6 +84,11 @@ fn acquire(database_url: &str, purpose: Purpose) -> Result<Option<SqliteProcessG
             ),
             Purpose::Migration => anyhow::bail!(
                 "SQLite migrations require the ForgeKeep server to be stopped; database `{}` is \
+                 held by another ForgeKeep process",
+                database_path.display()
+            ),
+            Purpose::Restore => anyhow::bail!(
+                "SQLite restore requires the ForgeKeep server to be stopped; database `{}` is \
                  held by another ForgeKeep process",
                 database_path.display()
             ),
@@ -170,6 +185,12 @@ mod tests {
                 .is_none()
         );
         assert!(super::acquire_server("postgres://localhost/forgekeep")
+            .unwrap()
+            .is_none());
+        assert!(super::acquire_restore("postgres://localhost/forgekeep")
+            .unwrap()
+            .is_none());
+        assert!(super::acquire_restore("mysql://localhost/forgekeep")
             .unwrap()
             .is_none());
     }
