@@ -371,7 +371,12 @@ where
     }
     .await;
 
-    finish_sqlite_rebuild(&mut connection, work_result, true).await
+    let result = finish_sqlite_rebuild(&mut connection, work_result, true).await;
+    drop(connection);
+    if result.is_ok() {
+        super::refresh_sqlite_pool_after_schema_change(pool, "m20260730_000001").await?;
+    }
+    result
 }
 
 /// Prove, on this database, that the two pragmas the rebuild depends on still do

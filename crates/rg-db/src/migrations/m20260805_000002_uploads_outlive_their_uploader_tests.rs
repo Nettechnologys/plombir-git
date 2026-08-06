@@ -1,3 +1,4 @@
+use sea_orm::sqlx::Executor as _;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TryGetable};
 use sea_orm_migration::{MigratorTrait, SchemaManager};
 
@@ -45,15 +46,10 @@ impl Drop for TempDb {
 /// cascade away if the pragmas failed.
 async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
-    // One pooled connection on purpose. A rebuild swaps three tables out from
-    // under every *other* connection of the pool, and SQLite lets the first
-    // statement one of them runs afterwards fail once with a bare
-    // `no such table: users` before it reloads its schema (card_a28a7004b108) —
-    // which would make these tests flaky for a reason that has nothing to do
-    // with what they assert.
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to throwaway SQLite database");
+    execute_on_every_pool_connection(&db, "SELECT name FROM sqlite_master").await;
 
     const NAME: &str = "m20260805_000002_uploads_outlive_their_uploader";
     let before_rebuild = crate::migrations::Migrator::migrations()
@@ -107,6 +103,27 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
         HIGH_WATER_ASSET_ID
     );
     (db, temp)
+}
+
+/// Hold every physical SQLite connection at once so the pool cannot hand the
+/// same one back repeatedly, then run `sql` on each of them.
+async fn execute_on_every_pool_connection(db: &DatabaseConnection, sql: &str) {
+    let pool = db.get_sqlite_connection_pool();
+    let max_connections = pool.options().get_max_connections();
+    let mut connections = Vec::with_capacity(max_connections as usize);
+    for _ in 0..max_connections {
+        connections.push(
+            pool.acquire()
+                .await
+                .expect("acquire every SQLite pool connection"),
+        );
+    }
+    for connection in &mut connections {
+        (&mut **connection)
+            .execute(sql)
+            .await
+            .expect("statement uses the current SQLite schema");
+    }
 }
 
 async fn scalar(db: &DatabaseConnection, sql: &str) -> i64 {
@@ -281,6 +298,48 @@ async fn deleting_the_uploader_ghosts_the_row_instead_of_destroying_it() {
         1,
         "the attachment's departed uploader was not ghosted"
     );
+}
+
+/// A table rebuild invalidates SQLite's per-connection schema state. Every
+/// already-open pool connection must be usable on its first command after the
+/// replacement tables commit; a retry only hides the false `no such table`.
+#[tokio::test]
+async fn every_prepared_pool_connection_uses_the_rebuilt_schema_immediately() {
+    let (db, _temp) = fixture("pool-schema-refresh").await;
+    db.execute_unprepared(
+        "WITH RECURSIVE ids(id) AS (SELECT 100 UNION ALL SELECT id + 1 FROM ids WHERE id < 119) \
+         INSERT INTO users (id, username, email, password_hash, created_at, updated_at) \
+         SELECT id, 'pool-user-' || id, 'pool-user-' || id || '@example.invalid', '', \
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM ids",
+    )
+    .await
+    .expect("seed twenty users whose deletes exercise foreign-key schema lookup");
+    execute_on_every_pool_connection(&db, "SELECT count(*) FROM releases").await;
+
+    REBUILD
+        .sqlite(&SchemaManager::new(&db), Shape::Ghost)
+        .await
+        .expect("rebuild the upload tables");
+
+    let pool = db.get_sqlite_connection_pool();
+    let max_connections = pool.options().get_max_connections();
+    let mut connections = Vec::with_capacity(max_connections as usize);
+    for _ in 0..max_connections {
+        connections.push(
+            pool.acquire()
+                .await
+                .expect("acquire every post-rebuild SQLite pool connection"),
+        );
+    }
+    for (connection_index, connection) in connections.iter_mut().enumerate() {
+        for offset in 0..5 {
+            let id = 100 + connection_index * 5 + offset;
+            (&mut **connection)
+                .execute(format!("DELETE FROM users WHERE id = {id}").as_str())
+                .await
+                .expect("every pooled connection uses the rebuilt schema immediately");
+        }
+    }
 }
 
 /// A failure part-way through leaves all three tables, their rows and their

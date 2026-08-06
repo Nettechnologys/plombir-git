@@ -282,7 +282,12 @@ impl GhostAuthorRebuild {
         }
         .await;
 
-        self.finish(&mut connection, work_result, true).await
+        let result = self.finish(&mut connection, work_result, true).await;
+        drop(connection);
+        if result.is_ok() {
+            super::refresh_sqlite_pool_after_schema_change(pool, migration).await?;
+        }
+        result
     }
 
     async fn rebuild_one_table(

@@ -508,6 +508,14 @@ pub async fn run_migrations(db: &DatabaseConnection) -> Result<()> {
     migrations::Migrator::up(db, None)
         .await
         .context("migration failed")?;
+    if matches!(db, DatabaseConnection::SqlxSqlitePoolConnection(_)) {
+        migrations::refresh_sqlite_pool_after_schema_change(
+            db.get_sqlite_connection_pool(),
+            "database migrations",
+        )
+        .await
+        .context("failed to refresh SQLite connections after migrations")?;
+    }
     Ok(())
 }
 

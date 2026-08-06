@@ -103,6 +103,85 @@ pub mod m20260806_000001_normalize_user_grants;
 
 use sea_orm_migration::prelude::*;
 
+/// Replace every SQLite connection that predates a committed schema change, so
+/// the next borrower cannot fail once with a false `no such table`.
+///
+/// Waiting until every current connection is idle and acquiring that exact set
+/// at once avoids racing the pool into handing us one physical connection
+/// repeatedly. One old connection remains alive as an anchor until a fresh one
+/// has opened; this preserves `sqlite::memory:` databases, which disappear when
+/// their final physical connection closes. A one-connection pool needs no
+/// replacement — that connection performed the migration itself — but its SQLx
+/// statement cache is still cleared as a future-proof belt.
+pub(crate) async fn refresh_sqlite_pool_after_schema_change(
+    pool: &sea_orm::sqlx::SqlitePool,
+    context: &str,
+) -> Result<(), DbErr> {
+    use sea_orm::sqlx::Connection as _;
+
+    let timeout = pool.options().get_acquire_timeout();
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let existing = pool.size();
+        if pool.num_idle() == existing as usize {
+            let mut connections = Vec::with_capacity(existing as usize);
+            for _ in 0..existing {
+                let Some(connection) = pool.try_acquire() else {
+                    break;
+                };
+                connections.push(connection);
+            }
+
+            if connections.len() == existing as usize {
+                if connections.len() == 1 {
+                    (**connections.first_mut().expect("length checked"))
+                        .clear_cached_statements()
+                        .await
+                        .map_err(|error| {
+                            DbErr::Migration(format!(
+                                "{context}: schema change committed, but a SQLite connection's \
+                                 cached statements could not be cleared: {error}"
+                            ))
+                        })?;
+                } else if let Some(mut anchor) = connections.pop() {
+                    for connection in &mut connections {
+                        connection.close_on_drop();
+                    }
+                    drop(connections);
+
+                    let replacement = pool.acquire().await.map_err(|error| {
+                        DbErr::Migration(format!(
+                            "{context}: schema change committed, but a fresh SQLite connection \
+                             could not be opened while recycling the pool: {error}"
+                        ))
+                    })?;
+                    anchor.close_on_drop();
+                    drop(anchor);
+                    drop(replacement);
+                }
+                tracing::info!(
+                    refreshed_connections = existing,
+                    context,
+                    "Refreshed SQLite connections after a schema change"
+                );
+                return Ok(());
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(DbErr::Migration(format!(
+                "{context}: schema change committed, but the SQLite pool could not be refreshed \
+                 within {timeout:?} ({} of {} connection(s) idle); refusing to continue with \
+                 connections that may report a false `no such table`",
+                pool.num_idle(),
+                pool.size()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
 pub struct Migrator;
 
 #[async_trait::async_trait]
