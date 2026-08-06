@@ -137,21 +137,21 @@ pub async fn create_column(
     name: String,
     color: Option<String>,
 ) -> Result<Column> {
-    // Get the next position
-    let columns = rg_db::ops::board_ops::list_columns_by_board(db, board_id).await?;
-    let pos = columns.len() as i32;
-
     let now = Utc::now();
     let model = ColumnAM {
         board_id: Set(board_id),
         name: Set(name),
         color: Set(color),
-        position: Set(pos),
+        // Overwritten by the append: the position is read and written inside
+        // one transaction, from the stored rows rather than from a count of
+        // them, so removing a column from the middle no longer aims the next
+        // one at a position that is still occupied (card_4a340e38f0e2).
+        position: Set(0),
         created_at: Set(now),
         ..Default::default()
     };
 
-    rg_db::ops::board_ops::create_column(db, model).await
+    rg_db::ops::board_ops::create_column_at_end(db, model).await
 }
 
 /// Update a column.
@@ -189,21 +189,20 @@ pub async fn create_card(
     issue_id: Option<i64>,
     note: Option<String>,
 ) -> Result<Card> {
-    let cards = rg_db::ops::board_ops::list_cards_by_column(db, column_id).await?;
-    let pos = cards.len() as i32;
     let now = Utc::now();
 
     let model = CardAM {
         column_id: Set(column_id),
         issue_id: Set(issue_id),
         note: Set(note),
-        position: Set(pos),
+        // Overwritten by the append — see [`create_column`].
+        position: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
     };
 
-    rg_db::ops::board_ops::create_card(db, model).await
+    rg_db::ops::board_ops::create_card_at_end(db, model).await
 }
 
 /// Update a card's note or issue link.
