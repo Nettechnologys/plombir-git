@@ -14,12 +14,15 @@ use crate::dbconn;
 /// Basic stderr logging used by the one-shot subcommands (and by the deprecated
 /// `runner` alias, whose delegate reports through `tracing`).
 pub(crate) fn init_cli_logging() {
-    tracing_subscriber::fmt()
+    if let Err(error) = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .init();
+        .try_init()
+    {
+        tracing::debug!(%error, "CLI logging subscriber is already initialized");
+    }
 }
 
 /// Resolve `--db-url` against `--config`, applying `CLI arg > config file >
@@ -60,9 +63,9 @@ pub(crate) async fn cmd_migrate(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = dbconn::connect(&db_url).await?;
+    let db = dbconn::connect_offline_migration(&db_url).await?;
     tracing::info!("Running database migrations...");
-    rg_db::run_migrations(&db).await?;
+    rg_db::run_migrations(db.connection()).await?;
     tracing::info!("Migrations complete ✅");
     Ok(())
 }
@@ -714,7 +717,22 @@ pub(crate) async fn cmd_index_repo(
 
 #[cfg(test)]
 mod tests {
-    use super::cmd_rotate_instance_key;
+    use super::{cmd_migrate, cmd_rotate_instance_key};
+
+    #[tokio::test]
+    async fn migrate_refuses_a_file_backed_sqlite_database_held_by_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}/test.db?mode=rwc", dir.path().display());
+        let _server = rg_db::sqlite_process_guard::acquire_server(&db_url)
+            .unwrap()
+            .unwrap();
+
+        let error = cmd_migrate(Some(db_url), None)
+            .await
+            .expect_err("migrate must prove the SQLite server is stopped");
+        let message = format!("{error:#}");
+        assert!(message.contains("server to be stopped"), "{message}");
+    }
 
     #[tokio::test]
     async fn rotate_instance_key_refuses_a_key_that_does_not_open_the_database() {

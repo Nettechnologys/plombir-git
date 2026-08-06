@@ -304,7 +304,7 @@ Beyond `serve`, the `forgekeep` binary offers:
 | Command | Purpose |
 |---------|---------|
 | `serve` | Start the server (HTTP + SSH) |
-| `migrate` | Run database migrations and exit |
+| `migrate` | Run database migrations and exit (file-backed SQLite requires the server to be stopped; this is enforced) |
 | `rebuild-fts` | Rebuild full-text search indexes |
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key |
@@ -323,6 +323,12 @@ config-file deployment, pass `--config` rather than repeating the URL: with
 neither, they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working
 directory, so `migrate` would migrate an empty database and `backup-db` would
 back it up.
+
+For a file-backed SQLite deployment, `migrate` is deliberately offline-only:
+stop every ForgeKeep server using the database, run the command, then restart
+the server. Both processes coordinate through a persistent sidecar lease next
+to the database; a live server makes `migrate` fail before it opens a pool.
+PostgreSQL and MySQL migrations keep their existing online behavior.
 
 That trap is the reason backups are not left to a manual command: enable
 `[backup]` in the config file and the server takes a `VACUUM INTO` snapshot

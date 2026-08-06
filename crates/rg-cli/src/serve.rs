@@ -755,12 +755,13 @@ pub(crate) async fn run_serve(
         "Connecting to database: {}",
         rg_db::redact_database_url(&resolved_db_url)
     );
-    let db = dbconn::connect_with_timeouts(
+    let server_db = dbconn::connect_server_with_timeouts(
         &resolved_db_url,
         resolved_db_connect_timeout,
         resolved_db_idle_timeout,
     )
     .await?;
+    let db = server_db.connection().clone();
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
 
@@ -1121,6 +1122,10 @@ pub(crate) async fn run_serve(
     // Flush the OTLP exporter (and the non-blocking log appender) before exit so
     // the final batch of spans reaches the collector.
     telemetry_guard.shutdown();
+
+    // Release the SQLite process lease only after both transports and their
+    // long-lived pool have stopped using the database.
+    drop(server_db);
 
     Ok(())
 }

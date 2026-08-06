@@ -46,6 +46,11 @@ impl Drop for TempDb {
 /// cascade away if the pragmas failed.
 async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
+    let db = fixture_at(&temp).await;
+    (db, temp)
+}
+
+async fn fixture_at(temp: &TempDb) -> DatabaseConnection {
     let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to throwaway SQLite database");
@@ -102,7 +107,7 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
         .await,
         HIGH_WATER_ASSET_ID
     );
-    (db, temp)
+    db
 }
 
 /// Hold every physical SQLite connection at once so the pool cannot hand the
@@ -338,6 +343,84 @@ async fn every_prepared_pool_connection_uses_the_rebuilt_schema_immediately() {
                 .execute(format!("DELETE FROM users WHERE id = {id}").as_str())
                 .await
                 .expect("every pooled connection uses the rebuilt schema immediately");
+        }
+    }
+}
+
+/// A different process cannot refresh the server's already-open pool, so the
+/// supported file-backed SQLite protocol is deliberately offline. The old
+/// four-connection pool excludes the migrator; after it stops, a one-connection
+/// migration pool rebuilds the tables and a freshly-started four-connection
+/// server performs twenty real deletes without a stale-schema retry.
+#[tokio::test]
+async fn offline_process_lease_keeps_a_separate_migration_out_of_a_live_server_pool() {
+    let temp = TempDb::new("offline-process-lease");
+    let server_guard = crate::sqlite_process_guard::acquire_server(&temp.url())
+        .unwrap()
+        .unwrap();
+    let server_db = fixture_at(&temp).await;
+    server_db
+        .execute_unprepared(
+            "WITH RECURSIVE ids(id) AS (SELECT 100 UNION ALL SELECT id + 1 FROM ids WHERE id < 119) \
+             INSERT INTO users (id, username, email, password_hash, created_at, updated_at) \
+             SELECT id, 'offline-user-' || id, 'offline-user-' || id || '@example.invalid', '', \
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM ids",
+        )
+        .await
+        .expect("seed twenty users before the offline rebuild");
+    execute_on_every_pool_connection(&server_db, "SELECT count(*) FROM releases").await;
+
+    let refusal = format!(
+        "{:#}",
+        crate::sqlite_process_guard::acquire_migration(&temp.url())
+            .expect_err("a separate migration must not cross the live-server lease")
+    );
+    assert!(refusal.contains("server to be stopped"), "{refusal}");
+
+    server_db.close().await.expect("close the old server pool");
+    drop(server_guard);
+
+    let migration_guard = crate::sqlite_process_guard::acquire_migration(&temp.url())
+        .unwrap()
+        .unwrap();
+    let migration_db =
+        crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .expect("open the standalone migration pool");
+    REBUILD
+        .sqlite(&SchemaManager::new(&migration_db), Shape::Ghost)
+        .await
+        .expect("rebuild through the standalone migration pool");
+    migration_db
+        .close()
+        .await
+        .expect("close the standalone migration pool");
+    drop(migration_guard);
+
+    let _restarted_server_guard = crate::sqlite_process_guard::acquire_server(&temp.url())
+        .unwrap()
+        .unwrap();
+    let restarted = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("open a fresh server pool after the migration");
+    execute_on_every_pool_connection(&restarted, "SELECT count(*) FROM releases").await;
+
+    let pool = restarted.get_sqlite_connection_pool();
+    let mut connections = Vec::with_capacity(4);
+    for _ in 0..4 {
+        connections.push(
+            pool.acquire()
+                .await
+                .expect("acquire each restarted connection"),
+        );
+    }
+    for (connection_index, connection) in connections.iter_mut().enumerate() {
+        for offset in 0..5 {
+            let id = 100 + connection_index * 5 + offset;
+            (&mut **connection)
+                .execute(format!("DELETE FROM users WHERE id = {id}").as_str())
+                .await
+                .expect("the restarted server pool must use the rebuilt schema immediately");
         }
     }
 }

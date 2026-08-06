@@ -13,6 +13,19 @@ use std::path::PathBuf;
 
 use rg_db::DatabaseConnection;
 
+/// A database connection paired with the process lease that makes opening it
+/// safe for an offline-only SQLite role.
+pub(crate) struct GuardedDatabaseConnection {
+    connection: DatabaseConnection,
+    _process_guard: Option<rg_db::sqlite_process_guard::SqliteProcessGuard>,
+}
+
+impl GuardedDatabaseConnection {
+    pub(crate) fn connection(&self) -> &DatabaseConnection {
+        &self.connection
+    }
+}
+
 /// Connect to `db_url`, annotating an unwritable-directory SQLite failure.
 pub(crate) async fn connect(db_url: &str) -> anyhow::Result<DatabaseConnection> {
     rg_db::connect(db_url)
@@ -21,14 +34,34 @@ pub(crate) async fn connect(db_url: &str) -> anyhow::Result<DatabaseConnection> 
 }
 
 /// [`connect`] with the `[timeouts]` connect/idle budget the server configures.
-pub(crate) async fn connect_with_timeouts(
+pub(crate) async fn connect_server_with_timeouts(
     db_url: &str,
     connect_secs: u64,
     idle_secs: u64,
-) -> anyhow::Result<DatabaseConnection> {
-    rg_db::connect_with_timeouts(db_url, connect_secs, idle_secs)
+) -> anyhow::Result<GuardedDatabaseConnection> {
+    let process_guard = rg_db::sqlite_process_guard::acquire_server(db_url)?;
+    let connection = rg_db::connect_with_timeouts(db_url, connect_secs, idle_secs)
         .await
-        .map_err(|e| annotate_db_open_error(e, db_url))
+        .map_err(|e| annotate_db_open_error(e, db_url))?;
+    Ok(GuardedDatabaseConnection {
+        connection,
+        _process_guard: process_guard,
+    })
+}
+
+/// Open the pool used by `forgekeep migrate`, after proving a file-backed
+/// SQLite server is not alive against the same database.
+pub(crate) async fn connect_offline_migration(
+    db_url: &str,
+) -> anyhow::Result<GuardedDatabaseConnection> {
+    let process_guard = rg_db::sqlite_process_guard::acquire_migration(db_url)?;
+    let connection = rg_db::connect(db_url)
+        .await
+        .map_err(|e| annotate_db_open_error(e, db_url))?;
+    Ok(GuardedDatabaseConnection {
+        connection,
+        _process_guard: process_guard,
+    })
 }
 
 /// Extract the on-disk file a SQLite URL points at, or `None` for a
@@ -158,6 +191,28 @@ mod tests {
             super::sqlite_file_path("postgres://user:pw@localhost/forgekeep"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn server_connection_holds_the_sqlite_lease_for_its_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", dir.path().display());
+        let server = super::connect_server_with_timeouts(&url, 10, 60)
+            .await
+            .unwrap();
+
+        let message = format!(
+            "{:#}",
+            super::connect_offline_migration(&url)
+                .await
+                .err()
+                .expect("a live server connection must exclude the migrator")
+        );
+        assert!(message.contains("server to be stopped"), "{message}");
+
+        drop(server);
+        let migration = super::connect_offline_migration(&url).await.unwrap();
+        drop(migration);
     }
 
     /// The `/data` bind-mount case: the directory is unwritable, so the opaque

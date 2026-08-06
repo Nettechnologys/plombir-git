@@ -306,6 +306,19 @@ databases. Passing **neither** falls back to `sqlite://./forgekeep.db?mode=rwc`
 relative to the container's `WORKDIR /app` — an empty database that nothing else
 ever opens, which is why the flag matters for `backup-db` in particular.
 
+Standalone migrations against file-backed SQLite use the same offline contract
+as restore. The command enforces it through a process lease, so use:
+
+```bash
+docker compose stop forgekeep
+docker compose run --rm forgekeep migrate --config /app/forgekeep.toml
+docker compose up -d forgekeep
+```
+
+The `.forgekeep.lock` sidecar next to the database is persistent by design; do
+not delete it as a stale PID file. The lock itself is owned by the OS and is
+released automatically when the server or migration process exits.
+
 ### Ports
 | Port | Protocol |
 |------|----------|

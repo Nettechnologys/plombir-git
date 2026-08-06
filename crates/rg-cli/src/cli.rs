@@ -200,7 +200,11 @@ pub(crate) enum Commands {
         log_max_files: Option<usize>,
     },
 
-    /// Run database migrations and exit
+    /// Run database migrations and exit.
+    ///
+    /// File-backed SQLite migrations are offline-only: stop every ForgeKeep
+    /// server using this database first. The command checks that contract
+    /// before opening its pool. PostgreSQL and MySQL are unaffected.
     Migrate {
         /// Database URL (sqlite://, postgres://, or mysql://)
         /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
