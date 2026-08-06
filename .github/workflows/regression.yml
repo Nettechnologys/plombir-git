@@ -243,6 +243,20 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      # First, deliberately: this reproduces the original failure only while the
+      # database is still empty, because that is when concurrent migrators race
+      # inside `CREATE TABLE`. Every step below leaves the schema applied, after
+      # which the same test can only prove that the lock path does not break a
+      # no-op run.
+      - name: Prove concurrent PostgreSQL migrators are serialized
+        run: cargo test -p rg-db -j 6 --test server_migration_serialization -- --ignored --nocapture
+
+      # The claim that the migration lock removed the need for `--test-threads=1`
+      # on a server backend: this file's tests migrate the same database in
+      # parallel, which is exactly what used to collide.
+      - name: Prove a parallel rg-db test file migrates PostgreSQL safely
+        run: cargo test -p rg-db -j 6 --test password_reset_token_single_use -- --nocapture
+
       - name: Prove PostgreSQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
@@ -288,6 +302,14 @@ jobs:
           docker exec "${{ job.services.mysql.id }}"
           mysql -uroot -proot
           -e "SET GLOBAL log_bin_trust_function_creators = 1"
+
+      # First test step, for the same reason as in the PostgreSQL job: concurrent
+      # migrators only collide while the schema is still absent.
+      - name: Prove concurrent MySQL migrators are serialized
+        run: cargo test -p rg-db -j 6 --test server_migration_serialization -- --ignored --nocapture
+
+      - name: Prove a parallel rg-db test file migrates MySQL safely
+        run: cargo test -p rg-db -j 6 --test password_reset_token_single_use -- --nocapture
 
       - name: Prove MySQL FTS migration maintenance boundary
         run: cargo test -p rg-db -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture

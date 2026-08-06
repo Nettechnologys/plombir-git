@@ -321,6 +321,15 @@ The `.forgekeep.lock` sidecar next to the database is persistent by design; do
 not delete it as a stale PID file. The lock itself is owned by the OS and is
 released automatically when the server or migration process exits.
 
+On PostgreSQL and MySQL there is no sidecar and nothing to stop: a server
+backend has no cross-process schema cache, so migrations stay online. They are
+still serialised, in the database rather than the filesystem —
+`pg_advisory_lock` / `GET_LOCK` — because applying two migration runs at once
+makes them collide inside `CREATE TABLE`. Whoever arrives second waits for the
+first (up to five minutes) and then applies whatever is left, which is usually
+nothing. The lock is held by a database session, so a killed migrator releases
+it immediately and the next boot is not blocked by a leftover.
+
 ### Ports
 | Port | Protocol |
 |------|----------|

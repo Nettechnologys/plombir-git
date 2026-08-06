@@ -16,6 +16,7 @@ pub mod entities;
 mod entity_schema_guard;
 #[cfg(test)]
 mod fts_rebuild_tests;
+pub mod migration_lock;
 pub mod migrations;
 pub mod ops;
 mod serialized_user_grants;
@@ -504,7 +505,25 @@ async fn connect_mysql(
 }
 
 /// Run all pending migrations.
+///
+/// Every caller is serialised against every other process migrating the same
+/// database, so the gate cannot be forgotten by the sixth call site the way it
+/// would be if each one took it separately. On file-backed SQLite that
+/// exclusion is the file lease the caller already holds
+/// ([`sqlite_process_guard`]); on PostgreSQL and MySQL it is a lock inside the
+/// database itself ([`migration_lock`]), because `Migrator::up` is not
+/// idempotent with respect to a concurrent copy of itself there.
 pub async fn run_migrations(db: &DatabaseConnection) -> Result<()> {
+    let lock = migration_lock::acquire(db, migration_lock::DEFAULT_WAIT).await?;
+    let outcome = run_migrations_locked(db).await;
+    // Released explicitly on both paths so the next migrator is not left waiting
+    // on a socket that has not been noticed yet.
+    lock.release().await;
+    outcome
+}
+
+/// [`run_migrations`] with the lock already held.
+async fn run_migrations_locked(db: &DatabaseConnection) -> Result<()> {
     tracing::info!("Running database migrations");
     migrations::Migrator::up(db, None)
         .await

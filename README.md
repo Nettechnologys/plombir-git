@@ -329,8 +329,17 @@ migrations (`migrate`, `import`, and `package list`) is deliberately
 offline-only: stop every ForgeKeep server using the database, run the command,
 then restart the server. The processes coordinate through a persistent sidecar
 lease next to the database; a live server makes these commands fail before they
-open a pool. PostgreSQL and MySQL migrations keep their existing online
-behavior.
+open a pool.
+
+PostgreSQL and MySQL migrations stay online — no server has to be stopped — but
+they are no longer unserialised. Every migrator takes a lock inside the database
+itself (`pg_advisory_lock` / `GET_LOCK`) first, so two replicas booting at once,
+a restart overlapping its predecessor, or a `migrate` run alongside a starting
+server queue up instead of racing inside `CREATE TABLE`. A migrator that waits
+more than five minutes for the holder gives up with a message naming ForgeKeep
+and what to do, rather than a PostgreSQL system-index name. The lock belongs to
+a database session, so a crashed migrator releases it without leaving anything
+to clean up.
 
 That trap is the reason backups are not left to a manual command: enable
 `[backup]` in the config file and the server takes a `VACUUM INTO` snapshot
