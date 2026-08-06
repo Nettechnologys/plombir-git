@@ -8,8 +8,12 @@ use rg_core::blob_storage::BlobKey;
 use crate::common::{
     create_repo,
     fault::{fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite},
-    register_full, spawn_test_app_with_state,
+    register_full, spawn_test_app_with_state, TEST_ENCRYPTION_KEY,
 };
+
+/// The upstream a mirror points at. Never reached: every mirror assertion here
+/// is about a pass that must not start.
+const MIRROR_REMOTE: &str = "https://example.com/upstream.git";
 
 fn representative_keys(owner: &str, repo: &str, repo_id: i64) -> Vec<BlobKey> {
     let repo_id = repo_id.to_string();
@@ -212,6 +216,199 @@ async fn delete_repository_retires_git_and_secondary_blob_namespaces() {
             "recreated repository inherited objects below {prefix}"
         );
     }
+}
+
+/// card_374998ffebc1: a mirrored repository owns a second Git tree — the full
+/// clone of its upstream under `<repo_root>/<repo_id>.mirror` — and the deletion
+/// used to answer `2xx` with that copy still on disk. Worse, it came back:
+/// `mirrors` survives the repository's *soft* delete, so the scheduler kept
+/// selecting the row, found no `HEAD`, and re-cloned the whole upstream into the
+/// path the deletion had just cleared.
+///
+/// Three independent claims, one per half of the defect and one for the gap
+/// between them:
+///   * the deletion stages and retires the directory like every other thing the
+///     repository owns;
+///   * `list_due_sync` no longer offers the row to the sweep;
+///   * `sync_mirror` refuses the row even when handed it directly — the sweep
+///     picks up a batch and then spends a `git` subprocess per mirror, so a
+///     repository deleted mid-pass is not a hypothetical window.
+#[tokio::test]
+async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_gone() {
+    let (base, db, state) = spawn_test_app_with_state().await;
+    let (token, _) = register_full(&base, "delete-mirror", "delete-mirror@example.com").await;
+    let repo_id = create_repo(&base, &token, "mirrored").await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base}/api/v1/repos/delete-mirror/mirrored/mirror"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"url": MIRROR_REMOTE, "sync_interval_seconds": 3600}))
+        .send()
+        .await
+        .expect("configure the mirror");
+    assert_eq!(response.status(), 201, "baseline mirror create");
+
+    // Wind the schedule into the past so the row is genuinely due — a mirror an
+    // hour out would leave every assertion below true for the wrong reason — and
+    // plant a credential the server cannot read, so a pass that does start dies
+    // at the decrypt step instead of resolving and dialing a remote.
+    let mirror = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("read the mirror row")
+        .expect("the mirror row");
+    let mut model: rg_db::entities::mirror::ActiveModel = mirror.into();
+    model.next_sync_at =
+        sea_orm::ActiveValue::Set(Some(chrono::Utc::now() - chrono::Duration::seconds(60)));
+    model.password_encrypted = sea_orm::ActiveValue::Set(Some("hunter2".to_string()));
+    rg_db::ops::mirror_ops::update(&db, model)
+        .await
+        .expect("make the mirror due");
+    assert_eq!(
+        rg_db::ops::mirror_ops::list_due_sync(&db, 10)
+            .await
+            .expect("list due mirrors")
+            .len(),
+        1,
+        "the fixture did not make the mirror due, so nothing below is being tested"
+    );
+
+    // What one completed sync leaves behind: a bare clone of the upstream.
+    let clone = state.repo_root.join(format!("{repo_id}.mirror"));
+    std::fs::create_dir_all(clone.join("objects")).expect("seed the mirror clone");
+    std::fs::write(clone.join("HEAD"), b"ref: refs/heads/main\n").expect("seed the mirror HEAD");
+    std::fs::write(clone.join("objects/pack-payload"), b"upstream bytes")
+        .expect("seed the mirror payload");
+
+    let response = client
+        .delete(format!("{base}/api/v1/repos/delete-mirror/mirrored"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete the mirrored repository");
+    assert_eq!(
+        response.status(),
+        200,
+        "repository deletion failed: {}",
+        response.text().await.unwrap_or_default()
+    );
+
+    assert!(
+        !clone.exists(),
+        "DELETE returned success with a full copy of the upstream still at {}",
+        clone.display()
+    );
+    let tombstones: Vec<_> = std::fs::read_dir(&*state.repo_root)
+        .expect("read the repository root")
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| {
+            name.to_string_lossy()
+                .starts_with(&format!("{repo_id}.mirror.deleted-{repo_id}-"))
+        })
+        .collect();
+    assert!(
+        tombstones.is_empty(),
+        "DELETE returned success while the staged mirror clone remained: {tombstones:?}"
+    );
+
+    // The row outlived the soft-delete — that is the point. What must not
+    // outlive it is its place in the sweep's work list.
+    let mirror = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("read the mirror row")
+        .expect("the mirror row survives its repository's soft-delete");
+    assert!(
+        rg_db::ops::mirror_ops::list_due_sync(&db, 10)
+            .await
+            .expect("list due mirrors")
+            .is_empty(),
+        "the scheduler still selects the mirror of a deleted repository"
+    );
+
+    assert!(
+        !rg_core::mirror::service::sync_mirror(&db, &mirror, &state.repo_root, TEST_ENCRYPTION_KEY)
+            .await
+            .expect("sync the mirror of a deleted repository"),
+        "a mirror handed directly to `sync_mirror` after its repository was deleted still ran a pass"
+    );
+    assert_eq!(
+        rg_core::mirror::service::sync_due_mirrors(&db, &state.repo_root, 10, TEST_ENCRYPTION_KEY)
+            .await
+            .expect("run one scheduler pass"),
+        0,
+        "one scheduler interval after the deletion still ran a mirror pass"
+    );
+    assert!(
+        !clone.exists(),
+        "a scheduler pass re-cloned the upstream of a deleted repository into {}",
+        clone.display()
+    );
+
+    // The refusal happens before the credential is decrypted and before the
+    // SSRF guard, so an untouched `last_sync_at` is the evidence that nothing
+    // reached out to the remote on behalf of a repository that no longer exists.
+    let after = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("re-read the mirror row")
+        .expect("the mirror row");
+    assert!(
+        after.last_sync_at.is_none(),
+        "a sync pass ran for a deleted repository: {after:?}"
+    );
+}
+
+/// The other side of the same directory: staged, but the deletion does not
+/// commit. The mirror clone has to come back with everything else, because the
+/// repository is still live and still mirroring.
+#[tokio::test]
+async fn a_failed_metadata_delete_restores_the_mirror_clone() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let (token, _) = register_full(
+        &app.base,
+        "delete-mirror-fault",
+        "delete-mirror-fault@example.com",
+    )
+    .await;
+    let repo_id = create_repo(&app.base, &token, "kept").await;
+
+    let clone = app.repo_root.join(format!("{repo_id}.mirror"));
+    std::fs::create_dir_all(&clone).expect("seed the mirror clone");
+    std::fs::write(clone.join("HEAD"), b"ref: refs/heads/main\n").expect("seed the mirror HEAD");
+
+    let db_fault = fail_db_writes(&app.db, "repositories", DbWrite::Update).await;
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{}/api/v1/repos/delete-mirror-fault/kept",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete repository with a failing metadata write");
+    assert_eq!(
+        response.status(),
+        500,
+        "a failed metadata delete was reported as success"
+    );
+    db_fault.clear().await;
+
+    assert_eq!(
+        std::fs::read(clone.join("HEAD")).expect("the staged mirror clone was not put back"),
+        b"ref: refs/heads/main\n",
+        "the restored mirror clone does not hold what it was staged with"
+    );
+    let tombstones: Vec<_> = std::fs::read_dir(&app.repo_root)
+        .expect("read the repository root")
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| {
+            name.to_string_lossy()
+                .starts_with(&format!("{repo_id}.mirror.deleted-"))
+        })
+        .collect();
+    assert!(
+        tombstones.is_empty(),
+        "the failed deletion left the mirror clone staged aside: {tombstones:?}"
+    );
 }
 
 /// A prefix move is the prepare step. If the backend cannot perform it, DELETE

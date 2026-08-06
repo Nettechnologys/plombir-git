@@ -1652,6 +1652,18 @@ fn repository_filesystem_directories(
             kind: "CI cache directory",
             hint: crate::platform::fs::CI_CACHE_DIR_HINT,
         },
+        // A mirrored repository keeps a full clone of its upstream beside the
+        // Git tree. It is the largest thing a repository owns after the tree
+        // itself, and it was left out of this list entirely: the deletion
+        // answered `2xx` having retired everything else and left a complete
+        // copy of a third-party remote on disk, under a name (`<repo_id>`) no
+        // later namespace can ever collide with and no sweep anywhere walks
+        // (card_374998ffebc1).
+        RepositoryFilesystemDirectory {
+            live: crate::mirror::service::mirror_clone_path(repo_root, repo.id),
+            kind: "mirror clone directory",
+            hint: crate::platform::fs::REPO_ROOT_HINT,
+        },
     ];
     directories.extend(job_ids.iter().map(|job_id| {
         RepositoryFilesystemDirectory {

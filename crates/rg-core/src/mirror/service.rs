@@ -227,10 +227,23 @@ pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64) -> Result<()> 
     }
 }
 
+/// The full clone a mirror keeps on disk, under the repository root.
+///
+/// Keyed by `repo_id` rather than by `<namespace>/<name>`, so it survives a
+/// rename and a transfer without moving. Exported because it is repository-owned
+/// storage exactly like the LFS and legacy release-asset roots: whoever retires
+/// a repository has to retire this directory with it
+/// ([`crate::repo::service::delete_repo`]), and a copy of the `format!` string
+/// in the deletion path is a copy that can drift.
+pub fn mirror_clone_path(repo_root: &Path, repo_id: i64) -> std::path::PathBuf {
+    repo_root.join(format!("{repo_id}.mirror"))
+}
+
 /// Sync a single mirror: clone (first time) or fetch (subsequent).
 ///
 /// Returns `Ok(true)` if a pass ran (successful or not — the outcome is on the
-/// row), `Ok(false)` if the operator has this mirror switched off.
+/// row), `Ok(false)` if the operator has this mirror switched off, or if the
+/// repository that owns the mirror is gone.
 ///
 /// The guard tests for *switched off* and nothing else. It used to require
 /// `status == "active"`, which made it refuse exactly the mirrors this function
@@ -248,7 +261,28 @@ pub async fn sync_mirror(
         return Ok(false);
     }
 
-    let repo_path = repo_root.join(format!("{}.mirror", mirror.repo_id));
+    // The row outlives its repository: `delete_repo` soft-deletes, so nothing
+    // cascades to `mirrors`, and a pass that ran anyway would `git clone` the
+    // whole upstream straight back into the directory the deletion just retired
+    // — bytes nothing owns, with no sweep that walks the filesystem to find
+    // them again (card_374998ffebc1). `list_due_sync` already keeps such rows
+    // out of the sweep's selection; this is the guard for the gap *after* that
+    // selection, which is minutes wide — one pass is a `git` subprocess per
+    // mirror — and for `trigger_sync`, which arrives with a row of its own.
+    if rg_db::ops::repo_ops::find_by_id(db, mirror.repo_id)
+        .await
+        .context("check that the mirror's repository still exists")?
+        .is_none()
+    {
+        tracing::debug!(
+            repo_id = mirror.repo_id,
+            mirror_id = mirror.id,
+            "skipping mirror sync: the repository that owns it is deleted"
+        );
+        return Ok(false);
+    }
+
+    let repo_path = mirror_clone_path(repo_root, mirror.repo_id);
 
     // Decrypt before the guard so a credential that can no longer be read is
     // reported as such, rather than as a plain authentication failure from the
@@ -329,7 +363,7 @@ pub async fn sync_due_mirrors(
     for mirror in &mirrors {
         match sync_mirror(db, mirror, repo_root, encryption_key).await {
             Ok(true) => count += 1,
-            Ok(false) => { /* inactive, skip */ }
+            Ok(false) => { /* switched off, or its repository is gone — skip */ }
             Err(e) => {
                 tracing::error!(mirror_id = %mirror.id, error = %format!("{e:#}"), "mirror sync failed")
             }
@@ -356,8 +390,19 @@ pub async fn trigger_sync(
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
     if !sync_mirror(db, &mirror, repo_root, encryption_key).await? {
+        // Two reasons now decline a pass, and the operator has to be told which
+        // one: a deleted repository is not something flipping `status` repairs.
+        // (Reaching this with a deleted repository takes the row outliving its
+        // repository *and* a caller that resolved it some other way — every HTTP
+        // route here resolves the repository first.)
+        if mirror.status == STATUS_INACTIVE {
+            return Err(crate::error::conflict(
+                "this mirror is switched off — set its status to `active` before syncing it",
+            ));
+        }
         return Err(crate::error::conflict(
-            "this mirror is switched off — set its status to `active` before syncing it",
+            "the repository this mirror belongs to has been deleted; the mirror can no longer be \
+             synced",
         ));
     }
     Ok(())

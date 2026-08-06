@@ -5,6 +5,7 @@ use chrono::Utc;
 use sea_orm::*;
 
 use crate::entities::mirror::{self, ActiveModel, Entity as MirrorEntity, Model};
+use crate::entities::repository;
 
 /// Create a mirror record.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
@@ -54,9 +55,21 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
 /// retry queue the first time the network, the credential or the SSRF guard
 /// says no — and nothing else ever picks it back up (card_770723efaa96). The
 /// operator's off switch is the one thing this filter is allowed to read.
+///
+/// The repository, on the other hand, is not this row's own state: repository
+/// deletion is a *soft* delete, so `mirrors.repo_id ON DELETE CASCADE` never
+/// fires and the row stays due forever. The sweep that consumed it then cloned
+/// the upstream back into `<repo_root>/<repo_id>.mirror` — a directory the
+/// deletion had just retired — so an operator who cleared it by hand got it
+/// back one interval later, and the server kept reaching out to a third-party
+/// remote on behalf of a repository that no longer exists (card_374998ffebc1).
+/// The join is what keeps those rows out; `sync_mirror` re-checks for the gap
+/// between this selection and its own `git` subprocess.
 pub async fn list_due_sync(db: &DatabaseConnection, limit: u64) -> Result<Vec<Model>> {
     let now = Utc::now();
     MirrorEntity::find()
+        .inner_join(repository::Entity)
+        .filter(repository::Column::DeletedAt.is_null())
         .filter(mirror::Column::Status.ne(mirror::STATUS_INACTIVE))
         .filter(
             mirror::Column::NextSyncAt
