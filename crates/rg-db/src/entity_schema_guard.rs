@@ -119,6 +119,7 @@ probed_entities!(
     repo_star,
     repo_watch,
     repository,
+    repository_transfer_lease,
     review_comment,
     runner,
     ssh_key,

@@ -61,6 +61,7 @@ pub mod repo_collaborator;
 pub mod repo_star;
 pub mod repo_watch;
 pub mod repository;
+pub mod repository_transfer_lease;
 pub mod review_comment;
 pub mod runner;
 pub mod ssh_key;

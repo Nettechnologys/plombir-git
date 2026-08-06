@@ -777,6 +777,127 @@ mod org_retirement_race_tests {
         }
     }
 
+    /// card_507ff03ec043: the same race with the organization on the *source*
+    /// side, which is the harder half. A transfer moves its bytes out of the
+    /// namespace before the transaction that rewrites the row, so a deletion
+    /// walking that row finds `<org>/<repo>.git` already gone — and a missing
+    /// directory is documented to read as the end state a deletion asked for.
+    ///
+    /// The invariant under real concurrency is the pair of them: never bytes with
+    /// no live row naming them, and never a live row whose bytes are gone.
+    /// Whichever of the two wins, one of them must have refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_transfer_out_of_an_organization_and_its_deletion_keep_one_owner() {
+        for attempt in 0..6 {
+            let (db, _temp) = setup_pooled_db(&format!("org-source-transfer-{attempt}")).await;
+            let login = format!("source-race-owner-{attempt}");
+            let org_name = format!("source-race-org-{attempt}");
+            let (owner_id, org_id, _sandbox, repo_root) = seed_org(&db, &login, &org_name).await;
+            std::fs::create_dir_all(&repo_root).unwrap();
+            // Lives in the organization and moves out into the owner's personal
+            // namespace — the reverse direction of the destination-side test
+            // above, so the organization is the namespace being retired *and* the
+            // one the bytes are leaving.
+            crate::repo::service::create_repo(
+                &db,
+                owner_id,
+                "moving",
+                None,
+                false,
+                &repo_root,
+                Some(org_id),
+            )
+            .await
+            .expect("create the repository in the organization");
+
+            let transfer_db = db.clone();
+            let transfer_root = repo_root.clone();
+            let transfer_source = org_name.clone();
+            let transfer_target = login.clone();
+            let transfer = async move {
+                let blob_storage = LocalBlobStorage::new(&transfer_root);
+                crate::repo::service::transfer_repo(
+                    &transfer_db,
+                    owner_id,
+                    &transfer_source,
+                    "moving",
+                    &transfer_target,
+                    &transfer_root,
+                    &blob_storage,
+                    &oci_storage_for(&transfer_root),
+                )
+                .await
+            };
+            let delete_db = db.clone();
+            let delete_root = repo_root.clone();
+            let delete = async move {
+                let blob_storage = LocalBlobStorage::new(&delete_root);
+                delete_org(
+                    &delete_db,
+                    &delete_root,
+                    &blob_storage,
+                    &oci_storage_for(&delete_root),
+                    org_id,
+                    OrgDeleteActor::Owner(owner_id),
+                )
+                .await
+            };
+            let (transferred, deleted) = tokio::join!(transfer, delete);
+
+            let outcomes = format!(
+                "transfer: {:?}, delete: {:?}",
+                transferred
+                    .as_ref()
+                    .map(|repo| repo.id)
+                    .map_err(|e| format!("{e:#}")),
+                deleted.as_ref().map_err(|e| format!("{e:#}")),
+            );
+            // Both reporting success is a legitimate outcome and not the bug: it
+            // means the transfer won, the repository really did leave the
+            // organization, and deleting the now-empty organization was correct.
+            // What must never happen is either side consuming what the other
+            // owns, so the invariant is on the state, not on who failed.
+            let orphans = orphaned_repositories(&db, org_id).await;
+            assert!(
+                orphans.is_empty(),
+                "attempt {attempt}: the organization is gone but these repositories still name \
+                 it: {orphans:?} ({outcomes})"
+            );
+
+            // Every live row must have its Git tree, and every Git tree a live
+            // row: the two halves of "nobody lost these bytes and nobody kept
+            // bytes nothing names". The second half is the defect this card was
+            // filed for — a deletion that read the transfer's emptied source path
+            // as "already gone", soft-deleted the row, and left the bytes live
+            // under their new owner with nothing naming them.
+            let source_tree = repo_root.join(format!("{org_name}/moving.git"));
+            let destination_tree = repo_root.join(format!("{login}/moving.git"));
+            let live = repo_ops::find_personal_by_owner_and_name(&db, owner_id, "moving")
+                .await
+                .expect("read the personal row")
+                .or(repo_ops::find_by_org_and_name(&db, org_id, "moving")
+                    .await
+                    .expect("read the organization row"));
+            match live {
+                Some(row) if row.org_id.is_some() => assert!(
+                    source_tree.exists(),
+                    "attempt {attempt}: the repository is still the organization's but its Git \
+                     tree is gone ({outcomes})"
+                ),
+                Some(_) => assert!(
+                    destination_tree.exists(),
+                    "attempt {attempt}: the repository moved to its new owner without its Git \
+                     tree ({outcomes})"
+                ),
+                None => assert!(
+                    !source_tree.exists() && !destination_tree.exists(),
+                    "attempt {attempt}: no live row names this repository, but its Git tree is \
+                     still on disk ({outcomes})"
+                ),
+            }
+        }
+    }
+
     /// The invariant under real concurrency, both orderings included: whichever
     /// of the two wins, no live repository row may name an organization that is
     /// gone. The create may lose and undo itself, or commit early enough for the

@@ -3,7 +3,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{
-    sea_query::{Expr, Query},
+    prelude::DateTimeUtc,
+    sea_query::{Expr, OnConflict, Query},
     ActiveValue::Set,
     *,
 };
@@ -15,7 +16,7 @@ use crate::entities::repository::{
 };
 use crate::entities::{
     oci_blob, oci_repository, organization, package, package_file, package_registry,
-    package_version, user,
+    package_version, repository_transfer_lease, user,
 };
 
 /// Count non-deleted repositories — backs the `forgekeep_repositories` gauge.
@@ -412,13 +413,275 @@ pub async fn update_owner(
     Ok(())
 }
 
-/// Whether the guarded ownership transaction committed or found that its
-/// destination lifecycle had already closed.
+/// How long a transfer lease may go unreleased before another transfer is
+/// allowed to take the repository over.
+///
+/// A transfer that is still moving bytes has not abandoned anything, so this is
+/// not a deadline for the move — it is the point past which a *dead* holder must
+/// stop blocking the repository, and above all must stop making the namespace it
+/// was moving out of impossible to delete. Generous enough that a large
+/// repository on slow storage is never timed out, short enough that a crashed
+/// process is not a permanent obstruction.
+pub const TRANSFER_LEASE_STALE_AFTER: chrono::Duration = chrono::Duration::hours(6);
+
+/// The answer to "may this transfer start moving this repository's storage?".
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransferLeaseBid {
+    /// The caller's token holds the lease and owns the move.
+    Granted,
+    /// Taken over from a holder whose lease had gone stale.
+    TakenOver,
+    /// Another transfer is moving this repository right now.
+    Busy,
+    /// The source account is being retired; its storage is not the caller's to
+    /// move.
+    SourceAccountClosed,
+    /// Likewise for the source organization.
+    SourceOrganizationClosed,
+    /// The repository row is gone or already soft-deleted.
+    RepositoryGone,
+}
+
+/// Take the lease that makes a repository's storage move visible to the
+/// deletion of the namespace it is moving out of.
+///
+/// The window this closes is described in
+/// `m20260806_000002_create_repository_transfer_lease`: between the first
+/// storage move and the ownership commit, the bytes are at the destination while
+/// the row still names the source, and nothing the source's deleter can read
+/// distinguishes that from storage which was already gone.
+///
+/// The source lifecycle is verified under the same transaction that takes the
+/// lease, so the two orders are both decided rather than raced: a retirement
+/// claim that landed first is seen here and the transfer never moves a byte,
+/// while a claim that lands afterwards meets the lease in
+/// `delete_repo`'s quiescence gate and backs off retryably.
+///
+/// The insert comes first deliberately. SQLite has no row-level `FOR UPDATE`, so
+/// `lock_exclusive` below is a no-op there and the transaction's first *write* is
+/// what acquires its single writer slot — the same ordering
+/// [`transfer_owner`] relies on, and for the same reason: a read followed by a
+/// write leaves a lock-upgrade window in which a retirement can become the
+/// writer and then wait on this transaction's read snapshot.
+// Wide by design: the repository, the source lifecycle it verifies, the two
+// namespaces recorded for the operator and the staleness horizon are all inputs
+// to one decision.
+#[allow(clippy::too_many_arguments)]
+pub async fn bid_for_transfer_lease(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    source_owner_id: i64,
+    source_org_id: Option<i64>,
+    source_namespace: &str,
+    destination_namespace: &str,
+    token: &str,
+    stale_before: DateTimeUtc,
+) -> Result<TransferLeaseBid> {
+    use repository_transfer_lease::Entity as Lease;
+    let now = Utc::now();
+
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin repository transfer lease bid")?;
+
+    Lease::insert(repository_transfer_lease::ActiveModel {
+        id: NotSet,
+        repo_id: Set(repo_id),
+        token: Set(token.to_string()),
+        source_namespace: Set(source_namespace.to_string()),
+        destination_namespace: Set(destination_namespace.to_string()),
+        since: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(repository_transfer_lease::Column::RepoId)
+            // MySQL has no conflict target and needs a harmless assignment as
+            // its DO NOTHING polyfill, exactly as `bid_for_publication_lease`
+            // does. PostgreSQL and SQLite emit DO NOTHING for the column above.
+            .do_nothing_on([repository_transfer_lease::Column::Id])
+            .to_owned(),
+    )
+    .exec_without_returning(&transaction)
+    .await
+    .context("db: bid for repository transfer lease")?;
+
+    // Whether that insert landed is not something every backend will say, so ask
+    // the row who holds it.
+    let held = Lease::find()
+        .filter(repository_transfer_lease::Column::RepoId.eq(repo_id))
+        .one(&transaction)
+        .await
+        .context("db: read repository transfer lease holder")?;
+
+    let mut outcome = match held {
+        // The holder released between the insert and this read, taking the row
+        // with it. The repository is free but this token does not hold it, and
+        // saying otherwise would hand out a lease nothing records.
+        None => TransferLeaseBid::Busy,
+        Some(held) if held.token == token => TransferLeaseBid::Granted,
+        Some(held) => {
+            // Someone else holds it. Only a stale hold may be taken over, and
+            // only from the exact holder this read saw: filtering on the old
+            // token is what keeps two waiters from both believing they took over
+            // the same lease.
+            let taken_over = Lease::update_many()
+                .col_expr(repository_transfer_lease::Column::Token, Expr::value(token))
+                .col_expr(repository_transfer_lease::Column::Since, Expr::value(now))
+                .col_expr(
+                    repository_transfer_lease::Column::SourceNamespace,
+                    Expr::value(source_namespace),
+                )
+                .col_expr(
+                    repository_transfer_lease::Column::DestinationNamespace,
+                    Expr::value(destination_namespace),
+                )
+                .filter(repository_transfer_lease::Column::RepoId.eq(repo_id))
+                .filter(repository_transfer_lease::Column::Token.eq(held.token))
+                .filter(repository_transfer_lease::Column::Since.lt(stale_before))
+                .exec(&transaction)
+                .await
+                .context("db: take over a stale repository transfer lease")?;
+            if taken_over.rows_affected > 0 {
+                TransferLeaseBid::TakenOver
+            } else {
+                TransferLeaseBid::Busy
+            }
+        }
+    };
+
+    // Holding the lease is only worth anything if the namespace it is moving out
+    // of still exists and is not being retired.
+    if matches!(
+        outcome,
+        TransferLeaseBid::Granted | TransferLeaseBid::TakenOver
+    ) {
+        match locked_source_verdict(&transaction, source_owner_id, source_org_id).await? {
+            TransferSource::AccountClosed => outcome = TransferLeaseBid::SourceAccountClosed,
+            TransferSource::OrganizationClosed => {
+                outcome = TransferLeaseBid::SourceOrganizationClosed
+            }
+            TransferSource::Open => {}
+        }
+    }
+    // …and only if the row it names is still live. A repository already
+    // soft-deleted has nothing left to move.
+    if matches!(
+        outcome,
+        TransferLeaseBid::Granted | TransferLeaseBid::TakenOver
+    ) && RepoEntity::find_by_id(repo_id)
+        .filter(repository::Column::DeletedAt.is_null())
+        .one(&transaction)
+        .await
+        .context("db: read the repository a transfer lease was taken for")?
+        .is_none()
+    {
+        outcome = TransferLeaseBid::RepositoryGone;
+    }
+
+    match outcome {
+        // A refusal must not leave the lease this transaction inserted behind:
+        // it would block the repository until it went stale, and block the
+        // deletion that refused it for just as long.
+        TransferLeaseBid::Granted | TransferLeaseBid::TakenOver => transaction
+            .commit()
+            .await
+            .context("db: commit repository transfer lease bid")?,
+        _ => transaction
+            .rollback()
+            .await
+            .context("db: roll back a refused repository transfer lease bid")?,
+    }
+    Ok(outcome)
+}
+
+/// Whether the namespace a repository is moving *out of* still admits the move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferSource {
+    Open,
+    AccountClosed,
+    OrganizationClosed,
+}
+
+/// Read the source lifecycle under an exclusive lock.
+///
+/// Deliberately keyed on `deleted_at` alone and not on `is_active`, unlike the
+/// destination: deactivation says nothing about whether the namespace still
+/// exists, and the repositories of a merely deactivated account are not storage
+/// anybody is retiring. Only the retirement claim means "these bytes are being
+/// collected by somebody else".
+async fn locked_source_verdict(
+    transaction: &DatabaseTransaction,
+    owner_id: i64,
+    org_id: Option<i64>,
+) -> Result<TransferSource> {
+    let owner = user::Entity::find_by_id(owner_id)
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .context("db: lock repository transfer source account")?;
+    if owner.is_none_or(|owner| owner.deleted_at.is_some()) {
+        return Ok(TransferSource::AccountClosed);
+    }
+
+    if let Some(org_id) = org_id {
+        let org = organization::Entity::find_by_id(org_id)
+            .lock_exclusive()
+            .one(transaction)
+            .await
+            .context("db: lock repository transfer source organization")?;
+        if org.is_none_or(|org| org.deleted_at.is_some()) {
+            return Ok(TransferSource::OrganizationClosed);
+        }
+    }
+
+    Ok(TransferSource::Open)
+}
+
+/// Release a transfer lease. Returns whether this token still held it — `false`
+/// means it had already been taken over, which is exactly the case where the
+/// holder must not assume the storage it moved is still its own to move back.
+pub async fn release_transfer_lease(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    token: &str,
+) -> Result<bool> {
+    let released = repository_transfer_lease::Entity::delete_many()
+        .filter(repository_transfer_lease::Column::RepoId.eq(repo_id))
+        .filter(repository_transfer_lease::Column::Token.eq(token))
+        .exec(db)
+        .await
+        .context("db: release repository transfer lease")?;
+    Ok(released.rows_affected > 0)
+}
+
+/// Whether a repository's storage is being moved right now.
+///
+/// Read by the deletion path, which must not treat a namespace emptied by a
+/// transfer in flight as a namespace that was already empty. A lease past
+/// `stale_before` is not an answer — its holder is gone, and a dead transfer
+/// must never make a namespace undeletable.
+pub async fn transfer_lease_in_flight(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    stale_before: DateTimeUtc,
+) -> Result<Option<repository_transfer_lease::Model>> {
+    repository_transfer_lease::Entity::find()
+        .filter(repository_transfer_lease::Column::RepoId.eq(repo_id))
+        .filter(repository_transfer_lease::Column::Since.gte(stale_before))
+        .one(db)
+        .await
+        .context("db: read repository transfer lease")
+}
+
+/// Whether the guarded ownership transaction committed or found that one of the
+/// lifecycles it moves between had already closed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransferOwnerOutcome {
     Transferred(Repo),
     DestinationAccountClosed,
     DestinationOrganizationClosed,
+    SourceAccountClosed,
+    SourceOrganizationClosed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,39 +721,83 @@ async fn write_repository_owner(
         .context("repo not found after updating transfer owner")
 }
 
-/// Lock the destination lifecycle row(s) and verify that the transfer may
-/// still enter them.
+/// Lock both lifecycle ends of a transfer and report whether each still admits
+/// it.
 ///
 /// PostgreSQL/MySQL render these reads as `SELECT .. FOR UPDATE`, serializing
 /// them with the retirement claims. SQLite omits that clause, so its caller
 /// first performs the repository update and thereby becomes the database's
 /// sole writer before reaching this check.
-async fn lock_transfer_destination(
+///
+/// Rows are taken in ascending id order, accounts before organizations, and
+/// every row is taken before any verdict is formed. Deciding one end and then
+/// locking the other would let two transfers moving repositories in opposite
+/// directions take the same two account rows in opposite orders and deadlock.
+async fn lock_transfer_lifecycles(
     transaction: &DatabaseTransaction,
-    owner_id: i64,
-    org_id: Option<i64>,
-) -> Result<TransferDestination> {
-    let owner = user::Entity::find_by_id(owner_id)
-        .lock_exclusive()
-        .one(transaction)
-        .await
-        .context("db: lock repository transfer destination account")?;
-    if !owner.is_some_and(|owner| owner.is_active && owner.deleted_at.is_none()) {
-        return Ok(TransferDestination::AccountClosed);
-    }
-
-    if let Some(org_id) = org_id {
-        let org = organization::Entity::find_by_id(org_id)
+    source_owner_id: i64,
+    source_org_id: Option<i64>,
+    destination_owner_id: i64,
+    destination_org_id: Option<i64>,
+) -> Result<(TransferDestination, TransferSource)> {
+    let mut user_ids = vec![source_owner_id, destination_owner_id];
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    let mut users = std::collections::HashMap::new();
+    for id in user_ids {
+        let locked = user::Entity::find_by_id(id)
             .lock_exclusive()
             .one(transaction)
             .await
-            .context("db: lock repository transfer destination organization")?;
-        if !org.is_some_and(|org| org.owner_id == owner_id && org.deleted_at.is_none()) {
-            return Ok(TransferDestination::OrganizationClosed);
-        }
+            .context("db: lock a repository transfer lifecycle account")?;
+        users.insert(id, locked);
     }
 
-    Ok(TransferDestination::Open)
+    let mut org_ids: Vec<i64> = [source_org_id, destination_org_id]
+        .into_iter()
+        .flatten()
+        .collect();
+    org_ids.sort_unstable();
+    org_ids.dedup();
+    let mut orgs = std::collections::HashMap::new();
+    for id in org_ids {
+        let locked = organization::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(transaction)
+            .await
+            .context("db: lock a repository transfer lifecycle organization")?;
+        orgs.insert(id, locked);
+    }
+
+    let account = |id: &i64| users.get(id).and_then(Option::as_ref);
+    let organization = |id: &i64| orgs.get(id).and_then(Option::as_ref);
+
+    let destination = if !account(&destination_owner_id)
+        .is_some_and(|owner| owner.is_active && owner.deleted_at.is_none())
+    {
+        TransferDestination::AccountClosed
+    } else if destination_org_id.is_some_and(|org_id| {
+        !organization(&org_id)
+            .is_some_and(|org| org.owner_id == destination_owner_id && org.deleted_at.is_none())
+    }) {
+        TransferDestination::OrganizationClosed
+    } else {
+        TransferDestination::Open
+    };
+
+    // The source is judged on `deleted_at` alone — see [`locked_source_verdict`]
+    // for why `is_active` is the wrong question on this side.
+    let source = if account(&source_owner_id).is_none_or(|owner| owner.deleted_at.is_some()) {
+        TransferSource::AccountClosed
+    } else if source_org_id
+        .is_some_and(|org_id| organization(&org_id).is_none_or(|org| org.deleted_at.is_some()))
+    {
+        TransferSource::OrganizationClosed
+    } else {
+        TransferSource::Open
+    };
+
+    Ok((destination, source))
 }
 
 /// Move a repository row and the namespace-bearing metadata of its registries
@@ -503,15 +810,27 @@ async fn lock_transfer_destination(
 /// metadata rewrite must roll the repository-row update back so `rg-core` can
 /// safely return every storage namespace to its source.
 ///
-/// The destination account and organization are locked in the same transaction
-/// as the ownership update. That makes transfer and retirement linearisable:
-/// whichever lifecycle gets the lock first is the one the other observes.
+/// Both lifecycle ends are locked in the same transaction as the ownership
+/// update. That makes transfer and retirement linearisable: whichever lifecycle
+/// gets the lock first is the one the other observes.
+///
+/// The source end matters as much as the destination and for a different reason.
+/// The destination check stops a repository landing in a namespace that is being
+/// collected; the source check stops this transaction committing a move whose
+/// bytes the source's own deleter is entitled to have retired
+/// (card_507ff03ec043). It is the second line behind
+/// [`bid_for_transfer_lease`], which is what keeps that deleter from starting at
+/// all — this one covers the retirement claim that lands after the lease was
+/// taken, and turns it into a refusal the service can compensate rather than a
+/// commit nobody can undo.
 #[allow(clippy::too_many_arguments)]
 pub async fn transfer_owner(
     db: &DatabaseConnection,
     repo_id: i64,
     owner_id: i64,
     org_id: Option<i64>,
+    source_owner_id: i64,
+    source_org_id: Option<i64>,
     source_namespace: &str,
     destination_namespace: &str,
     repo_name: &str,
@@ -534,19 +853,35 @@ pub async fn transfer_owner(
     } else {
         None
     };
-    let admission = lock_transfer_destination(&transaction, owner_id, org_id).await?;
-    if admission != TransferDestination::Open {
+    let (admission, source) = lock_transfer_lifecycles(
+        &transaction,
+        source_owner_id,
+        source_org_id,
+        owner_id,
+        org_id,
+    )
+    .await?;
+    let refusal = match (admission, source) {
+        (TransferDestination::AccountClosed, _) => {
+            Some(TransferOwnerOutcome::DestinationAccountClosed)
+        }
+        (TransferDestination::OrganizationClosed, _) => {
+            Some(TransferOwnerOutcome::DestinationOrganizationClosed)
+        }
+        (TransferDestination::Open, TransferSource::AccountClosed) => {
+            Some(TransferOwnerOutcome::SourceAccountClosed)
+        }
+        (TransferDestination::Open, TransferSource::OrganizationClosed) => {
+            Some(TransferOwnerOutcome::SourceOrganizationClosed)
+        }
+        (TransferDestination::Open, TransferSource::Open) => None,
+    };
+    if let Some(refusal) = refusal {
         transaction
             .rollback()
             .await
-            .context("db: roll back repository transfer into a closed namespace")?;
-        return Ok(match admission {
-            TransferDestination::AccountClosed => TransferOwnerOutcome::DestinationAccountClosed,
-            TransferDestination::OrganizationClosed => {
-                TransferOwnerOutcome::DestinationOrganizationClosed
-            }
-            TransferDestination::Open => unreachable!("open destination passed the guard"),
-        });
+            .context("db: roll back repository transfer across a closed namespace")?;
+        return Ok(refusal);
     }
     if !sqlite {
         moved = Some(write_repository_owner(&transaction, repo_id, owner_id, org_id).await?);

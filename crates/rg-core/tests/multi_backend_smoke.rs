@@ -846,6 +846,95 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         "a re-issue that failed after writing its codes revoked the set the owner still holds"
     );
 
+    // ── Repository transfer lease (card_507ff03ec043) ────────────────────────
+    //
+    // The lease is the boundary that keeps a transfer's storage move and the
+    // deletion of the namespace it is moving out of from each other, and both of
+    // its halves are backend-specific: the claim rides an upsert whose DO NOTHING
+    // is a MySQL polyfill, and the source lifecycle is verified through
+    // `lock_exclusive`, which only becomes `FOR UPDATE` on a server database. A
+    // SQLite-only proof says nothing about either.
+    let stale_before = || chrono::Utc::now() - rg_db::ops::repo_ops::TRANSFER_LEASE_STALE_AFTER;
+    let first_holder = format!("holder-a-{suffix}");
+    let second_holder = format!("holder-b-{suffix}");
+    async fn lease_bid(
+        db: &DatabaseConnection,
+        repo_id: i64,
+        owner_id: i64,
+        source: &str,
+        token: &str,
+    ) -> rg_db::ops::repo_ops::TransferLeaseBid {
+        rg_db::ops::repo_ops::bid_for_transfer_lease(
+            db,
+            repo_id,
+            owner_id,
+            None,
+            source,
+            "elsewhere",
+            token,
+            chrono::Utc::now() - rg_db::ops::repo_ops::TRANSFER_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("bid for the repository transfer lease")
+    }
+    assert_eq!(
+        lease_bid(&db, repo.id, user.id, &username, &first_holder).await,
+        rg_db::ops::repo_ops::TransferLeaseBid::Granted,
+        "the first bid on an untouched repository must win"
+    );
+    assert_eq!(
+        lease_bid(&db, repo.id, user.id, &username, &second_holder).await,
+        rg_db::ops::repo_ops::TransferLeaseBid::Busy,
+        "two transfers hold the same repository at once on this backend"
+    );
+    assert!(
+        rg_db::ops::repo_ops::transfer_lease_in_flight(&db, repo.id, stale_before())
+            .await
+            .expect("read the transfer lease")
+            .is_some(),
+        "the deletion path cannot see a lease this backend accepted"
+    );
+    // A losing bid must not release the winner's hold.
+    assert!(
+        !rg_db::ops::repo_ops::release_transfer_lease(&db, repo.id, &second_holder)
+            .await
+            .expect("attempt a release from the wrong holder"),
+        "a token that never held the lease released it"
+    );
+    assert!(
+        rg_db::ops::repo_ops::release_transfer_lease(&db, repo.id, &first_holder)
+            .await
+            .expect("release the transfer lease"),
+        "the holder could not release its own lease"
+    );
+    assert!(
+        rg_db::ops::repo_ops::transfer_lease_in_flight(&db, repo.id, stale_before())
+            .await
+            .expect("read the released transfer lease")
+            .is_none(),
+        "a released lease is still visible to the deletion path"
+    );
+    // And the source lifecycle half: a claimed namespace refuses the bid, under
+    // the row lock a retirement claim contends for on this backend.
+    assert!(rg_db::ops::user_ops::begin_user_retirement(&db, user.id)
+        .await
+        .expect("claim the source account"));
+    assert_eq!(
+        lease_bid(&db, repo.id, user.id, &username, &first_holder).await,
+        rg_db::ops::repo_ops::TransferLeaseBid::SourceAccountClosed,
+        "a transfer was admitted out of a namespace that is being retired"
+    );
+    assert!(
+        rg_db::ops::repo_ops::transfer_lease_in_flight(&db, repo.id, stale_before())
+            .await
+            .expect("read the refused transfer lease")
+            .is_none(),
+        "a refused bid left its lease row behind"
+    );
+    rg_db::ops::user_ops::abort_user_retirement(&db, user.id)
+        .await
+        .expect("reopen the source account");
+
     rg_db::ops::repo_ops::soft_delete(&db, repo.id)
         .await
         .expect("soft-delete the repository through the source row");

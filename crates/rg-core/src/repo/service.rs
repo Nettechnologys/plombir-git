@@ -1849,6 +1849,32 @@ async fn ensure_repository_deletion_is_quiescent(
             "repository has {active} active CI pipeline(s); cancel them or wait for them to finish before deleting the repository"
         )));
     }
+
+    // A transfer in flight has already moved some of this repository's storage
+    // out of the namespace below, and the paths this deletion is about to probe
+    // will therefore be empty. Without this the missing directory reads as "the
+    // end state you asked for is already true", the row gets soft-deleted, and a
+    // transfer that then refuses returns the bytes to a namespace nothing names
+    // any more (card_507ff03ec043).
+    //
+    // Refusing is retryable by construction: the caller is `delete_repo`, whose
+    // every path restores what it staged, and the account/organization deletions
+    // above it reopen their own claim and report an error the request can repeat
+    // once the transfer has finished.
+    if let Some(lease) = rg_db::ops::repo_ops::transfer_lease_in_flight(
+        db,
+        repo_id,
+        Utc::now() - rg_db::ops::repo_ops::TRANSFER_LEASE_STALE_AFTER,
+    )
+    .await
+    .context("failed to check for a repository transfer in flight before deletion")?
+    {
+        return Err(crate::error::conflict(format!(
+            "repository is being transferred from '{}' to '{}'; wait for that transfer to finish \
+             before deleting it",
+            lease.source_namespace, lease.destination_namespace
+        )));
+    }
     Ok(())
 }
 
@@ -2408,19 +2434,129 @@ where
     )
     .await?;
 
-    // Build every BlobKey before moving Git. A malformed historical namespace
-    // must fail as one untouched transfer, not after the repository directory
-    // has already left its owner.
+    // Build every BlobKey before moving Git — and before taking the lease below.
+    // A malformed historical namespace must fail as one untouched transfer that
+    // never claimed anything, not after the repository directory has already left
+    // its owner.
     let blob_prefixes = repository_transfer_blob_prefixes(owner, &new_owner_name, repo_name)?;
     let old_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
     let new_path = repo_root.join(format!("{}/{}.git", new_owner_name, repo_name));
+
+    // From here to the ownership commit the bytes and the row disagree about
+    // which namespace they are in, and the deletion of the source account or
+    // organization walks exactly that row. The lease is what tells it so: see
+    // `repo_ops::bid_for_transfer_lease` and the migration that created the
+    // table. It also verifies, under the same lock a retirement claim contends
+    // for, that the source namespace is still open — so a claim that already
+    // landed refuses this transfer before a single byte moves.
+    let lease_token = uuid::Uuid::new_v4().simple().to_string();
+    match repo_ops::bid_for_transfer_lease(
+        db,
+        repo.id,
+        repo.owner_id,
+        repo.org_id,
+        owner,
+        &new_owner_name,
+        &lease_token,
+        chrono::Utc::now() - repo_ops::TRANSFER_LEASE_STALE_AFTER,
+    )
+    .await?
+    {
+        repo_ops::TransferLeaseBid::Granted | repo_ops::TransferLeaseBid::TakenOver => {}
+        repo_ops::TransferLeaseBid::Busy => {
+            return Err(crate::error::conflict(format!(
+                "repository '{repo_name}' is already being transferred; wait for that transfer to \
+                 finish before starting another"
+            )));
+        }
+        repo_ops::TransferLeaseBid::SourceAccountClosed => {
+            return Err(crate::error::conflict(format!(
+                "the account owning '{owner}' is being deleted; repository '{repo_name}' cannot be \
+                 transferred out of it"
+            )));
+        }
+        repo_ops::TransferLeaseBid::SourceOrganizationClosed => {
+            return Err(crate::error::conflict(format!(
+                "organization '{owner}' is being deleted; repository '{repo_name}' cannot be \
+                 transferred out of it"
+            )));
+        }
+        repo_ops::TransferLeaseBid::RepositoryGone => {
+            return Err(crate::error::not_found("repository"));
+        }
+    }
+
+    let moved = move_repository_storage_and_commit(
+        db,
+        &repo,
+        owner,
+        repo_name,
+        new_owner_id,
+        new_org_id,
+        &new_owner_name,
+        blob_prefixes,
+        blob_storage,
+        oci_storage,
+        repo_root,
+        &old_path,
+        &new_path,
+    )
+    .await;
+
+    // Released before `after_commit` runs and before the caller is answered,
+    // whichever way the move went: a lease outliving its transfer would make the
+    // repository untransferable and its namespace undeletable until it went
+    // stale. `false` means this transfer had already been timed out — it is not
+    // an error here, but it is the one thing an operator would want to see.
+    match repo_ops::release_transfer_lease(db, repo.id, &lease_token).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            repo_id = repo.id,
+            "the repository transfer lease was taken over while this transfer was moving storage"
+        ),
+        Err(error) => tracing::warn!(
+            repo_id = repo.id,
+            error = %format!("{error:#}"),
+            "the repository transfer lease could not be released; it will be reclaimed once stale"
+        ),
+    }
+
+    let moved = moved?;
+    after_commit().await;
+    // Ownership (and thus who can read/write) changed — drop cached decisions.
+    invalidate_perm_cache_repo(db, repo.id);
+    Ok(moved)
+}
+
+/// Move every storage namespace of a repository and commit its new owner.
+///
+/// Split out of [`transfer_repo_with_after_commit`] so the transfer lease has
+/// exactly one acquire and one release around the whole mutating span, however
+/// this returns. Every failure path restores the namespaces it had already
+/// moved, in reverse order.
+#[allow(clippy::too_many_arguments)]
+async fn move_repository_storage_and_commit(
+    db: &DatabaseConnection,
+    repo: &rg_db::entities::repository::Model,
+    owner: &str,
+    repo_name: &str,
+    new_owner_id: i64,
+    new_org_id: Option<i64>,
+    new_owner_name: &str,
+    blob_prefixes: Vec<TransferredBlobPrefix>,
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    repo_root: &std::path::Path,
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+) -> Result<rg_db::entities::repository::Model> {
     std::fs::create_dir_all(
         new_path
             .parent()
             .context("new path has no parent directory")?,
     )
     .with_context(|| format!("failed to create directory: {:?}", new_path.parent()))?;
-    std::fs::rename(&old_path, &new_path).with_context(|| {
+    std::fs::rename(old_path, new_path).with_context(|| {
         format!(
             "failed to move repository from {:?} to {:?}",
             old_path, new_path
@@ -2430,7 +2566,7 @@ where
     let moved_blobs = match transfer_blob_prefixes(blob_storage, blob_prefixes, repo.id).await {
         Ok(moved) => moved,
         Err(error) => {
-            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            restore_transferred_repository_directory(new_path, old_path, repo.id);
             return Err(error);
         }
     };
@@ -2441,12 +2577,12 @@ where
     let legacy_paths = [
         (
             crate::lfs::service::lfs_root(repo_root, owner, repo_name),
-            crate::lfs::service::lfs_root(repo_root, &new_owner_name, repo_name),
+            crate::lfs::service::lfs_root(repo_root, new_owner_name, repo_name),
             "legacy LFS directory",
         ),
         (
             crate::release::service::legacy_asset_root(repo_root, owner, repo_name),
-            crate::release::service::legacy_asset_root(repo_root, &new_owner_name, repo_name),
+            crate::release::service::legacy_asset_root(repo_root, new_owner_name, repo_name),
             "legacy release asset directory",
         ),
     ];
@@ -2457,21 +2593,21 @@ where
             Ok(None) => {}
             Err(error) => {
                 restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-                restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+                restore_transferred_repository_directory(new_path, old_path, repo.id);
                 return Err(error);
             }
         }
     }
 
     let moved_oci = match oci_storage
-        .transfer_repository(owner, repo_name, &new_owner_name, repo_name)
+        .transfer_repository(owner, repo_name, new_owner_name, repo_name)
         .await
     {
         Ok(moved) => moved,
         Err(error) => {
             restore_transferred_repository_directories(&moved_directories, repo.id);
             restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            restore_transferred_repository_directory(new_path, old_path, repo.id);
             return Err(error);
         }
     };
@@ -2481,58 +2617,64 @@ where
         repo.id,
         new_owner_id,
         new_org_id,
+        repo.owner_id,
+        repo.org_id,
         owner,
-        &new_owner_name,
+        new_owner_name,
         repo_name,
     )
     .await;
-    let moved = match transfer {
-        Ok(repo_ops::TransferOwnerOutcome::Transferred(moved)) => moved,
+    // Every refusal below has already had its ownership update rolled back, so
+    // the only thing left is to return each storage namespace to the source in
+    // the reverse order it left.
+    let refusal = match transfer {
+        Ok(repo_ops::TransferOwnerOutcome::Transferred(moved)) => return Ok(moved),
         Ok(repo_ops::TransferOwnerOutcome::DestinationAccountClosed) => {
-            let error = crate::error::conflict(format!(
+            crate::error::conflict(format!(
                 "the account owning '{new_owner_name}' is being deleted; repository \
                  '{repo_name}' was moved back to its previous owner"
-            ));
-            oci_storage.restore_repository_transfer(moved_oci).await;
-            restore_transferred_repository_directories(&moved_directories, repo.id);
-            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
-            return Err(error);
+            ))
         }
         Ok(repo_ops::TransferOwnerOutcome::DestinationOrganizationClosed) => {
-            let error = crate::error::conflict(format!(
+            crate::error::conflict(format!(
                 "organization '{new_owner_name}' is being deleted; repository '{repo_name}' was \
                  moved back to its previous owner"
-            ));
-            oci_storage.restore_repository_transfer(moved_oci).await;
-            restore_transferred_repository_directories(&moved_directories, repo.id);
-            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
-            return Err(error);
+            ))
+        }
+        // The lease this transfer holds keeps the source's deleter out of
+        // `delete_repo` entirely, so reaching here means the retirement claim
+        // landed after the lease was taken: the deleter has refused and backed
+        // off, and this transfer must not commit into a namespace whose storage
+        // somebody is about to collect (card_507ff03ec043).
+        Ok(repo_ops::TransferOwnerOutcome::SourceAccountClosed) => crate::error::conflict(format!(
+            "the account owning '{owner}' is being deleted; repository '{repo_name}' was left \
+                 with its previous owner"
+        )),
+        Ok(repo_ops::TransferOwnerOutcome::SourceOrganizationClosed) => {
+            crate::error::conflict(format!(
+                "organization '{owner}' is being deleted; repository '{repo_name}' was left with \
+                 its previous owner"
+            ))
         }
         Err(error) => {
             // Same race as the create paths, one statement later: the free-name
             // check above passed, and someone else claimed the destination name
             // before this update landed. That is the caller's answer in the
             // words that check uses, not a server fault.
-            let error = if rg_db::is_unique_violation_anyhow(&error) {
+            if rg_db::is_unique_violation_anyhow(&error) {
                 crate::error::conflict(format!(
                     "repository '{repo_name}' already exists at destination"
                 ))
             } else {
                 error
-            };
-            oci_storage.restore_repository_transfer(moved_oci).await;
-            restore_transferred_repository_directories(&moved_directories, repo.id);
-            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
-            return Err(error);
+            }
         }
     };
-    after_commit().await;
-    // Ownership (and thus who can read/write) changed — drop cached decisions.
-    invalidate_perm_cache_repo(db, repo.id);
-    Ok(moved)
+    oci_storage.restore_repository_transfer(moved_oci).await;
+    restore_transferred_repository_directories(&moved_directories, repo.id);
+    restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+    restore_transferred_repository_directory(new_path, old_path, repo.id);
+    Err(refusal)
 }
 
 // ── Commit Status ──────────────────────────────────────────────────────
@@ -5283,6 +5425,642 @@ mod repository_deletion_tests {
                 b"must return too"
             );
         }
+    }
+
+    // ── card_507ff03ec043: the source end of the same boundary ──────────────
+    //
+    // The destination is guarded by an admission inside the ownership
+    // transaction, and it can be: the row is what enters the destination
+    // namespace, and the row and that check share a transaction. The source
+    // cannot be guarded that way. A transfer's bytes leave the source *before*
+    // the transaction opens, so between the first rename and the commit the
+    // storage is at the destination while the row still names the source — and
+    // the deletion of the source account or organization walks exactly that row,
+    // finds `<source>/<repo>.git` missing, and `delete_repo` is documented to
+    // read a missing directory as the end state it was asked for.
+    //
+    // Nothing the deleter can read tells it apart from storage that was already
+    // gone, so the transfer says so out loud: one lease row per repository being
+    // moved, taken before the first byte moves and released after the commit.
+    // What follows pins both orders, for a personal and an organization source,
+    // over all four storage domains a transfer moves.
+
+    /// Everything a transfer moves, seeded at `namespace` and asserted as a set.
+    ///
+    /// Git alone would pass while blob prefixes, the two legacy directories and
+    /// the OCI namespace were silently consumed by the losing side — those are
+    /// four independent moves in `move_repository_storage_and_commit`, and a
+    /// boundary that holds for one of them says nothing about the rest.
+    struct SeededStorage {
+        git_marker: std::path::PathBuf,
+        package_blob: BlobKey,
+        lfs_marker: std::path::PathBuf,
+        release_marker: std::path::PathBuf,
+        oci_layer: BlobKey,
+    }
+
+    impl SeededStorage {
+        async fn seed(
+            repo_root: &std::path::Path,
+            blob_storage: &LocalBlobStorage,
+            oci_storage: &OciStorage,
+            namespace: &str,
+            repo_name: &str,
+        ) -> Self {
+            let git_marker = repo_root.join(format!("{namespace}/{repo_name}.git/marker"));
+            std::fs::write(&git_marker, b"git stays with the source").expect("seed Git marker");
+
+            let package_blob = BlobKey::from_segments([
+                "packages",
+                namespace,
+                repo_name,
+                "generic",
+                "demo",
+                "1",
+                "payload.bin",
+            ])
+            .expect("valid package key");
+            blob_storage
+                .put(&package_blob, b"packages stay with the source")
+                .await
+                .expect("seed package blob");
+
+            let lfs_root = crate::lfs::service::lfs_root(repo_root, namespace, repo_name);
+            std::fs::create_dir_all(&lfs_root).expect("seed legacy LFS directory");
+            let lfs_marker = lfs_root.join("marker");
+            std::fs::write(&lfs_marker, b"legacy LFS stays with the source")
+                .expect("seed legacy LFS marker");
+
+            let release_root =
+                crate::release::service::legacy_asset_root(repo_root, namespace, repo_name);
+            std::fs::create_dir_all(&release_root).expect("seed legacy release directory");
+            let release_marker = release_root.join("marker");
+            std::fs::write(&release_marker, b"legacy releases stay with the source")
+                .expect("seed legacy release marker");
+
+            let oci_layer = seed_oci_repository(
+                oci_storage,
+                namespace,
+                repo_name,
+                b"oci stays with the source",
+            )
+            .await;
+
+            Self {
+                git_marker,
+                package_blob,
+                lfs_marker,
+                release_marker,
+                oci_layer,
+            }
+        }
+
+        /// Assert every seeded namespace is still readable where it was seeded.
+        async fn assert_all_present(&self, blob_storage: &LocalBlobStorage, context: &str) {
+            assert!(
+                self.git_marker.exists(),
+                "{context}: the Git tree left the source namespace"
+            );
+            assert!(
+                blob_storage
+                    .exists(&self.package_blob)
+                    .await
+                    .expect("probe the package prefix"),
+                "{context}: the package prefix left the source namespace"
+            );
+            assert!(
+                self.lfs_marker.exists(),
+                "{context}: the legacy LFS directory left the source namespace"
+            );
+            assert!(
+                self.release_marker.exists(),
+                "{context}: the legacy release directory left the source namespace"
+            );
+            assert!(
+                blob_storage
+                    .exists(&self.oci_layer)
+                    .await
+                    .expect("probe the OCI layer"),
+                "{context}: the OCI namespace left the source namespace"
+            );
+        }
+    }
+
+    /// Take the transfer lease the way `transfer_repo` takes it, and no other
+    /// way: a test that inserted the row by hand would prove the deleter reads
+    /// *a* row, not that the transfer protocol produces the one it reads.
+    async fn hold_transfer_lease(
+        db: &DatabaseConnection,
+        repo: &rg_db::entities::repository::Model,
+        source: &str,
+        destination: &str,
+    ) -> String {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let bid = repo_ops::bid_for_transfer_lease(
+            db,
+            repo.id,
+            repo.owner_id,
+            repo.org_id,
+            source,
+            destination,
+            &token,
+            Utc::now() - repo_ops::TRANSFER_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("bid for the transfer lease");
+        assert_eq!(
+            bid,
+            repo_ops::TransferLeaseBid::Granted,
+            "the first bid on an untouched repository must win"
+        );
+        token
+    }
+
+    /// The deletion of the source account must not walk a repository whose
+    /// storage a transfer is moving right now. Before the lease it read the
+    /// already-emptied source paths as "the end state you asked for", soft-deleted
+    /// the row, and left the transfer free to return the bytes to a namespace with
+    /// nothing naming them.
+    #[tokio::test]
+    async fn a_source_account_deletion_refuses_a_repository_being_transferred() {
+        let db = setup_db().await;
+        let source = user_ops::create_user(
+            &db,
+            "lease-source",
+            "lease-source@example.invalid",
+            "unused",
+            "Lease Source",
+        )
+        .await
+        .expect("create source owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+
+        let repo = create_repo(&db, source.id, "moving", None, false, &repo_root, None)
+            .await
+            .expect("create repository");
+        let seeded = SeededStorage::seed(
+            &repo_root,
+            &blob_storage,
+            &oci_storage,
+            "lease-source",
+            "moving",
+        )
+        .await;
+
+        let _token = hold_transfer_lease(&db, &repo, "lease-source", "elsewhere").await;
+
+        let refused = crate::user::service::delete_user(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage,
+            source.id,
+        )
+        .await
+        .expect_err("an account deletion consumed a repository being transferred");
+        assert!(
+            format!("{refused:#}").contains("being transferred"),
+            "the refusal does not say a transfer is in flight: {refused:#}"
+        );
+
+        seeded
+            .assert_all_present(&blob_storage, "the refused account deletion")
+            .await;
+        let row = repo_ops::find_by_id(&db, repo.id)
+            .await
+            .expect("read the repository row")
+            .expect("the refused deletion destroyed the repository row");
+        assert!(
+            row.deleted_at.is_none(),
+            "the refused deletion soft-deleted a repository whose storage was in flight"
+        );
+        // And the account is retryable rather than stuck behind its own claim.
+        assert!(
+            user_ops::user_namespace_is_open(&db, source.id)
+                .await
+                .expect("read the account retirement state"),
+            "the refused deletion left the account claimed and unable to retry"
+        );
+    }
+
+    /// The same rule with the other source namespace. An organization deletion
+    /// reaches its repositories through `org_id`, so it needs its own proof.
+    #[tokio::test]
+    async fn a_source_organization_deletion_refuses_a_repository_being_transferred() {
+        let db = setup_db().await;
+        let owner = user_ops::create_user(
+            &db,
+            "lease-org-owner",
+            "lease-org-owner@example.invalid",
+            "unused",
+            "Lease Org Owner",
+        )
+        .await
+        .expect("create organization owner");
+        let org = crate::org::create_org(&db, "lease-org", None, None, owner.id, "public")
+            .await
+            .expect("create source organization");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+
+        let repo = create_repo(
+            &db,
+            owner.id,
+            "moving",
+            None,
+            false,
+            &repo_root,
+            Some(org.id),
+        )
+        .await
+        .expect("create organization repository");
+        let seeded = SeededStorage::seed(
+            &repo_root,
+            &blob_storage,
+            &oci_storage,
+            "lease-org",
+            "moving",
+        )
+        .await;
+
+        let _token = hold_transfer_lease(&db, &repo, "lease-org", "elsewhere").await;
+
+        let refused = crate::org::delete_org(
+            &db,
+            &repo_root,
+            &blob_storage,
+            &oci_storage,
+            org.id,
+            crate::org::OrgDeleteActor::Owner(owner.id),
+        )
+        .await
+        .expect_err("an organization deletion consumed a repository being transferred");
+        assert!(
+            format!("{refused:#}").contains("being transferred"),
+            "the refusal does not say a transfer is in flight: {refused:#}"
+        );
+
+        seeded
+            .assert_all_present(&blob_storage, "the refused organization deletion")
+            .await;
+        assert!(
+            rg_db::ops::org_ops::get_org(&db, org.id)
+                .await
+                .expect("read the organization")
+                .is_some(),
+            "the refused deletion removed the organization row"
+        );
+        assert!(
+            rg_db::ops::org_ops::org_is_active(&db, org.id)
+                .await
+                .expect("read the organization retirement state"),
+            "the refused deletion left the organization claimed and unable to retry"
+        );
+    }
+
+    /// The other order, and the cheap one: the retirement claim landed first, so
+    /// the transfer has to refuse before it moves a single byte rather than move
+    /// everything and put it back.
+    #[tokio::test]
+    async fn a_transfer_refuses_a_source_namespace_that_is_already_being_retired() {
+        for source_is_an_organization in [false, true] {
+            let db = setup_db().await;
+            let source_owner = user_ops::create_user(
+                &db,
+                "claimed-source-owner",
+                "claimed-source-owner@example.invalid",
+                "unused",
+                "Claimed Source Owner",
+            )
+            .await
+            .expect("create source owner");
+            let destination = user_ops::create_user(
+                &db,
+                "claimed-source-destination",
+                "claimed-source-destination@example.invalid",
+                "unused",
+                "Claimed Source Destination",
+            )
+            .await
+            .expect("create destination owner");
+            let sandbox = tempfile::tempdir().expect("create repository root");
+            let repo_root = sandbox.path().join("repos");
+            let blob_storage = LocalBlobStorage::new(&repo_root);
+            let oci_storage = oci_storage_for(&repo_root);
+
+            let (source_namespace, org_id) = if source_is_an_organization {
+                let org = crate::org::create_org(
+                    &db,
+                    "claimed-source-org",
+                    None,
+                    None,
+                    source_owner.id,
+                    "public",
+                )
+                .await
+                .expect("create source organization");
+                (org.name.clone(), Some(org.id))
+            } else {
+                (source_owner.username.clone(), None)
+            };
+
+            let repo = create_repo(
+                &db,
+                source_owner.id,
+                "held",
+                None,
+                false,
+                &repo_root,
+                org_id,
+            )
+            .await
+            .expect("create repository");
+            let seeded = SeededStorage::seed(
+                &repo_root,
+                &blob_storage,
+                &oci_storage,
+                &source_namespace,
+                "held",
+            )
+            .await;
+
+            // Exactly what the deletions do first, and the only state a transfer
+            // that resolved a moment earlier can still discover.
+            if let Some(org_id) = org_id {
+                assert!(rg_db::ops::org_ops::begin_org_retirement(&db, org_id)
+                    .await
+                    .expect("claim the organization"));
+            } else {
+                assert!(user_ops::begin_user_retirement(&db, source_owner.id)
+                    .await
+                    .expect("claim the account"));
+            }
+
+            let refused = transfer_repo(
+                &db,
+                source_owner.id,
+                &source_namespace,
+                "held",
+                &destination.username,
+                &repo_root,
+                &blob_storage,
+                &oci_storage,
+            )
+            .await
+            .expect_err("a transfer out of a retiring namespace must be refused");
+            assert!(
+                format!("{refused:#}").contains("being deleted"),
+                "the refusal does not say the source is going away \
+                 (source_is_an_organization = {source_is_an_organization}): {refused:#}"
+            );
+
+            seeded
+                .assert_all_present(&blob_storage, "the refused transfer")
+                .await;
+            // Refused *before* the first move, not compensated after it. The
+            // storage assertions above hold either way — a rollback puts
+            // everything back — so what separates the two is whether the
+            // destination namespace was ever touched at all: the first thing
+            // `move_repository_storage_and_commit` does is create this directory,
+            // and nothing removes it again.
+            assert!(
+                !repo_root.join(&destination.username).exists(),
+                "the transfer started moving storage into a namespace it should have refused up \
+                 front (source_is_an_organization = {source_is_an_organization})"
+            );
+            assert!(
+                !repo_root
+                    .join(format!("{}/held.git", destination.username))
+                    .exists(),
+                "the refused transfer left Git under the destination"
+            );
+            let row = repo_ops::find_by_id(&db, repo.id)
+                .await
+                .expect("read the repository row")
+                .expect("the refused transfer destroyed the repository row");
+            assert_eq!(
+                (row.owner_id, row.org_id),
+                (source_owner.id, org_id),
+                "the refused transfer rewrote the owner of a repository in a retiring namespace"
+            );
+            // And no lease was left behind to block the deletion that refused it.
+            assert!(
+                repo_ops::transfer_lease_in_flight(
+                    &db,
+                    repo.id,
+                    Utc::now() - repo_ops::TRANSFER_LEASE_STALE_AFTER
+                )
+                .await
+                .expect("read the transfer lease")
+                .is_none(),
+                "a refused transfer left its lease behind"
+            );
+        }
+    }
+
+    /// The interleaving neither door can produce: the claim lands *after* the
+    /// lease was taken, on the transfer's own ownership statement. The lease has
+    /// already turned the deleter away, so what is under test is the second line
+    /// — the source admission inside `transfer_owner` — which must roll the
+    /// ownership update back and let the service return all four storage domains
+    /// to the source rather than commit a move whose bytes the source's deleter
+    /// is entitled to collect.
+    #[tokio::test]
+    async fn a_transfer_whose_source_is_claimed_on_its_own_statement_moves_everything_back() {
+        for source_is_an_organization in [false, true] {
+            let db = setup_db().await;
+            let source_owner = user_ops::create_user(
+                &db,
+                "racing-source-owner",
+                "racing-source-owner@example.invalid",
+                "unused",
+                "Racing Source Owner",
+            )
+            .await
+            .expect("create source owner");
+            let destination = user_ops::create_user(
+                &db,
+                "racing-destination",
+                "racing-destination@example.invalid",
+                "unused",
+                "Racing Destination",
+            )
+            .await
+            .expect("create destination owner");
+            let sandbox = tempfile::tempdir().expect("create repository root");
+            let repo_root = sandbox.path().join("repos");
+            let blob_storage = LocalBlobStorage::new(&repo_root);
+            let oci_storage = oci_storage_for(&repo_root);
+
+            let (source_namespace, org_id) = if source_is_an_organization {
+                let org = crate::org::create_org(
+                    &db,
+                    "racing-source-org",
+                    None,
+                    None,
+                    source_owner.id,
+                    "public",
+                )
+                .await
+                .expect("create source organization");
+                (org.name.clone(), Some(org.id))
+            } else {
+                (source_owner.username.clone(), None)
+            };
+
+            let repo = create_repo(
+                &db,
+                source_owner.id,
+                "contested",
+                None,
+                false,
+                &repo_root,
+                org_id,
+            )
+            .await
+            .expect("create repository");
+            let seeded = SeededStorage::seed(
+                &repo_root,
+                &blob_storage,
+                &oci_storage,
+                &source_namespace,
+                "contested",
+            )
+            .await;
+
+            // `NEW.updated_at` is copied rather than a literal written, so the
+            // marker carries the same timestamp encoding sea-orm itself writes
+            // and the row stays readable — the same reason the destination-side
+            // test does it this way.
+            let claim_statement = if let Some(org_id) = org_id {
+                format!("UPDATE organizations SET deleted_at = NEW.updated_at WHERE id = {org_id}")
+            } else {
+                format!(
+                    "UPDATE users SET deleted_at = NEW.updated_at WHERE id = {}",
+                    source_owner.id
+                )
+            };
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER claim_source_on_transfer \
+                 AFTER UPDATE OF owner_id ON repositories \
+                 WHEN NEW.id = {} \
+                 BEGIN {claim_statement}; END",
+                repo.id
+            ))
+            .await
+            .expect("install the source claim trigger");
+
+            let error = transfer_repo(
+                &db,
+                source_owner.id,
+                &source_namespace,
+                "contested",
+                &destination.username,
+                &repo_root,
+                &blob_storage,
+                &oci_storage,
+            )
+            .await
+            .expect_err("a transfer out of a namespace being deleted must not stand");
+            assert!(
+                format!("{error:#}").contains("being deleted"),
+                "the refusal does not say the source is going away \
+                 (source_is_an_organization = {source_is_an_organization}): {error:#}"
+            );
+
+            seeded
+                .assert_all_present(
+                    &blob_storage,
+                    "the transfer refused on its own ownership statement",
+                )
+                .await;
+            assert!(
+                !repo_root
+                    .join(format!("{}/contested.git", destination.username))
+                    .exists(),
+                "the refused transfer left Git under the destination \
+                 (source_is_an_organization = {source_is_an_organization})"
+            );
+            let row = repo_ops::find_by_id(&db, repo.id)
+                .await
+                .expect("read the repository row")
+                .expect("the refused transfer destroyed the repository row");
+            assert_eq!(
+                (row.owner_id, row.org_id),
+                (source_owner.id, org_id),
+                "the refused transfer committed a move out of a namespace being retired \
+                 (source_is_an_organization = {source_is_an_organization})"
+            );
+            assert!(
+                repo_ops::transfer_lease_in_flight(
+                    &db,
+                    repo.id,
+                    Utc::now() - repo_ops::TRANSFER_LEASE_STALE_AFTER
+                )
+                .await
+                .expect("read the transfer lease")
+                .is_none(),
+                "the refused transfer left its lease behind"
+            );
+        }
+    }
+
+    /// A crashed transfer must not make a namespace permanently undeletable.
+    /// The lease is an obstruction only while its holder is plausibly alive.
+    #[tokio::test]
+    async fn a_stale_transfer_lease_stops_blocking_the_namespace_it_was_moving_out_of() {
+        let db = setup_db().await;
+        let source = user_ops::create_user(
+            &db,
+            "stale-lease-source",
+            "stale-lease-source@example.invalid",
+            "unused",
+            "Stale Lease Source",
+        )
+        .await
+        .expect("create source owner");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+
+        let repo = create_repo(&db, source.id, "abandoned", None, false, &repo_root, None)
+            .await
+            .expect("create repository");
+        let _token = hold_transfer_lease(&db, &repo, "stale-lease-source", "elsewhere").await;
+
+        // Age the hold past the staleness horizon, which is the only thing that
+        // distinguishes a dead holder from a slow one.
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        rg_db::entities::repository_transfer_lease::Entity::update_many()
+            .col_expr(
+                rg_db::entities::repository_transfer_lease::Column::Since,
+                sea_orm::sea_query::Expr::value(
+                    Utc::now()
+                        - repo_ops::TRANSFER_LEASE_STALE_AFTER
+                        - chrono::Duration::minutes(1),
+                ),
+            )
+            .filter(rg_db::entities::repository_transfer_lease::Column::RepoId.eq(repo.id))
+            .exec(&db)
+            .await
+            .expect("age the transfer lease");
+
+        crate::user::service::delete_user(&db, &repo_root, &blob_storage, &oci_storage, source.id)
+            .await
+            .expect("a stale transfer lease must not block the deletion for ever");
+        assert!(
+            user_ops::find_by_id(&db, source.id)
+                .await
+                .expect("read the account")
+                .is_none(),
+            "the account survived a deletion that reported success"
+        );
     }
 
     /// card_0213f024e077: once the guarded ownership transaction commits, the
