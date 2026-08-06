@@ -18,11 +18,14 @@ pub struct PaginationParams {
     /// Page number (1-based). Default: 1
     #[serde(
         default = "default_page",
-        deserialize_with = "deserialize_u64_from_query"
+        deserialize_with = "deserialize_page_from_query"
     )]
     pub page: u64,
     /// Items per page. Default: 20, Max: 100
-    #[serde(default = "default_per_page")]
+    #[serde(
+        default = "default_per_page",
+        deserialize_with = "deserialize_per_page_from_query"
+    )]
     pub per_page: u64,
 }
 
@@ -34,15 +37,38 @@ pub fn default_per_page() -> u64 {
     DEFAULT_PER_PAGE
 }
 
-pub fn deserialize_u64_from_query<'de, D>(deserializer: D) -> Result<u64, D::Error>
+/// Parse a `u64` query parameter that reaches us as a string.
+///
+/// Every numeric field of this struct needs this, not just one. Most call sites
+/// pull `PaginationParams` in through `#[serde(flatten)]`, and under `flatten`
+/// serde reads the inner struct via `deserialize_any` — from which
+/// `serde_urlencoded` only ever hands out strings. A bare `u64` field is
+/// therefore unreachable behind a flatten: every value, valid or not, answers
+/// `400 invalid type: string "2", expected u64`. Parsing the string ourselves
+/// keeps the field reachable and still rejects junk with the `400` it deserves.
+fn u64_from_query<'de, D>(deserializer: D, when_empty: u64) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = Option::<String>::deserialize(deserializer)?;
     match value.as_deref().map(str::trim) {
-        Some("") | None => Ok(default_page()),
+        Some("") | None => Ok(when_empty),
         Some(raw) => raw.parse::<u64>().map_err(serde::de::Error::custom),
     }
+}
+
+pub fn deserialize_page_from_query<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64_from_query(deserializer, default_page())
+}
+
+pub fn deserialize_per_page_from_query<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64_from_query(deserializer, default_per_page())
 }
 
 impl PaginationParams {
@@ -277,5 +303,72 @@ mod tests {
     fn test_default_per_page_fn() {
         assert_eq!(default_page(), 1);
         assert_eq!(default_per_page(), 20);
+    }
+
+    // ── Query-string parsing under `#[serde(flatten)]` ──────────────────
+    //
+    // Every list handler but a handful pulls these params in flattened into a
+    // larger query struct, and that is the shape where a bare `u64` field stops
+    // being reachable. Asserting on `PaginationParams` alone would keep passing
+    // with the bug in place, so these go through a flattened stand-in — the
+    // same shape `issues::ListQuery` and its four siblings have.
+
+    #[derive(Debug, Deserialize)]
+    struct FlattenedQuery {
+        state: Option<String>,
+        #[serde(flatten)]
+        pagination: PaginationParams,
+    }
+
+    fn parse(query: &str) -> Result<FlattenedQuery, serde_urlencoded::de::Error> {
+        serde_urlencoded::from_str::<FlattenedQuery>(query)
+    }
+
+    #[test]
+    fn a_flattened_per_page_is_read_from_the_query_string() {
+        let parsed = parse("state=open&per_page=2").expect("per_page=2 is a valid page size");
+        assert_eq!(parsed.pagination.per_page, 2);
+        assert_eq!(parsed.pagination.page, 1);
+        assert_eq!(parsed.state.as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn a_flattened_page_is_read_from_the_query_string() {
+        let parsed = parse("page=3&per_page=5").expect("page and per_page parse together");
+        assert_eq!(parsed.pagination.page, 3);
+        assert_eq!(parsed.pagination.per_page, 5);
+    }
+
+    #[test]
+    fn an_absent_pagination_falls_back_to_the_documented_defaults() {
+        let parsed = parse("state=open").expect("pagination is optional");
+        assert_eq!(parsed.pagination.page, default_page());
+        assert_eq!(parsed.pagination.per_page, default_per_page());
+    }
+
+    #[test]
+    fn an_empty_pagination_value_falls_back_to_the_documented_defaults() {
+        let parsed = parse("page=&per_page=").expect("an empty value means 'unset'");
+        assert_eq!(parsed.pagination.page, default_page());
+        assert_eq!(parsed.pagination.per_page, default_per_page());
+    }
+
+    #[test]
+    fn a_non_numeric_page_size_is_still_rejected() {
+        // Parsing the string ourselves must not turn junk into a default: a
+        // caller who asked for `per_page=abc` gets told, not silently served 20.
+        assert!(parse("per_page=abc").is_err());
+        assert!(parse("page=abc").is_err());
+    }
+
+    #[test]
+    fn an_oversized_page_size_is_clamped_rather_than_rejected() {
+        let parsed = parse("per_page=1000").expect("an oversized page size is not a bad request");
+        let clamped = parsed.pagination.clamp();
+        assert_eq!(clamped.per_page, MAX_PER_PAGE);
+        // Zero is the other end of the same range: it must not reach
+        // `PaginationMeta::from_params`, whose `div_ceil(per_page)` divides by it.
+        let zero = parse("per_page=0").expect("zero is a number, not junk");
+        assert_eq!(zero.pagination.clamp().per_page, 1);
     }
 }
