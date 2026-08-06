@@ -259,9 +259,11 @@ async fn resolve_owner(db: &DatabaseConnection, owner: &str) -> Result<(i64, Opt
 /// the whole point of the check is that guessing here costs bytes nothing can
 /// reach.
 ///
-/// `undone` names what the caller took back, so the two entrances into a
-/// namespace — a creation and a transfer — say what actually happened to the
-/// repository instead of one of them borrowing the other's word for it.
+/// `undone` names what the caller took back, so the two new-publication paths —
+/// a creation and a fork — say what actually happened to the repository instead
+/// of one of them borrowing the other's word for it. Transfer makes this
+/// decision inside `repo_ops::transfer_owner`; checking it again after commit
+/// would race a deleter that is already entitled to consume the moved bytes.
 async fn namespace_still_accepts_repository(
     db: &DatabaseConnection,
     owner_id: i64,
@@ -2313,6 +2315,45 @@ pub async fn transfer_repo(
     blob_storage: &dyn BlobStorage,
     oci_storage: &crate::package_registry::oci::storage::OciStorage,
 ) -> Result<rg_db::entities::repository::Model> {
+    transfer_repo_with_after_commit(
+        db,
+        user_id,
+        owner,
+        repo_name,
+        new_owner,
+        repo_root,
+        blob_storage,
+        oci_storage,
+        || async {},
+    )
+    .await
+}
+
+/// The transfer implementation with one deliberately narrow observation point
+/// after the ownership transaction commits.
+///
+/// Production passes a ready future. Tests use the seam to prove that a delete
+/// completing before the HTTP reply cannot retroactively turn a committed
+/// transfer into an error and trigger compensation of bytes the deleter owns.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the production wrapper supplies every storage domain plus the commit observer used to pin the transfer/delete ordering"
+)]
+async fn transfer_repo_with_after_commit<F, Fut>(
+    db: &DatabaseConnection,
+    user_id: i64,
+    owner: &str,
+    repo_name: &str,
+    new_owner: &str,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    after_commit: F,
+) -> Result<rg_db::entities::repository::Model>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))?;
@@ -2404,7 +2445,7 @@ pub async fn transfer_repo(
         }
     };
 
-    if let Err(error) = repo_ops::transfer_owner(
+    let transfer = repo_ops::transfer_owner(
         db,
         repo.id,
         new_owner_id,
@@ -2413,90 +2454,54 @@ pub async fn transfer_repo(
         &new_owner_name,
         repo_name,
     )
-    .await
-    {
-        oci_storage.restore_repository_transfer(moved_oci).await;
-        restore_transferred_repository_directories(&moved_directories, repo.id);
-        restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-        restore_transferred_repository_directory(&new_path, &old_path, repo.id);
-        // Same race as the create paths, one statement later: the free-name
-        // check above passed, and someone else claimed the destination name
-        // before this update landed. That is the caller's answer in the words
-        // that check uses, not a server fault. Any other failure stays an error.
-        return Err(if rg_db::is_unique_violation_anyhow(&error) {
-            crate::error::conflict(format!(
-                "repository '{repo_name}' already exists at destination"
-            ))
-        } else {
-            error
-        });
-    }
+    .await;
+    let moved = match transfer {
+        Ok(repo_ops::TransferOwnerOutcome::Transferred(moved)) => moved,
+        Ok(repo_ops::TransferOwnerOutcome::DestinationAccountClosed) => {
+            let error = crate::error::conflict(format!(
+                "the account owning '{new_owner_name}' is being deleted; repository \
+                 '{repo_name}' was moved back to its previous owner"
+            ));
+            oci_storage.restore_repository_transfer(moved_oci).await;
+            restore_transferred_repository_directories(&moved_directories, repo.id);
+            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            return Err(error);
+        }
+        Ok(repo_ops::TransferOwnerOutcome::DestinationOrganizationClosed) => {
+            let error = crate::error::conflict(format!(
+                "organization '{new_owner_name}' is being deleted; repository '{repo_name}' was \
+                 moved back to its previous owner"
+            ));
+            oci_storage.restore_repository_transfer(moved_oci).await;
+            restore_transferred_repository_directories(&moved_directories, repo.id);
+            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            return Err(error);
+        }
+        Err(error) => {
+            // Same race as the create paths, one statement later: the free-name
+            // check above passed, and someone else claimed the destination name
+            // before this update landed. That is the caller's answer in the
+            // words that check uses, not a server fault.
+            let error = if rg_db::is_unique_violation_anyhow(&error) {
+                crate::error::conflict(format!(
+                    "repository '{repo_name}' already exists at destination"
+                ))
+            } else {
+                error
+            };
+            oci_storage.restore_repository_transfer(moved_oci).await;
+            restore_transferred_repository_directories(&moved_directories, repo.id);
+            restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
+            restore_transferred_repository_directory(&new_path, &old_path, repo.id);
+            return Err(error);
+        }
+    };
+    after_commit().await;
     // Ownership (and thus who can read/write) changed — drop cached decisions.
     invalidate_perm_cache_repo(db, repo.id);
-
-    // The destination was resolved before any byte moved, and nothing since has
-    // been holding it. `resolve_owner` refuses a namespace already claimed for
-    // retirement, but that is a pre-check: a deletion that claims the
-    // destination *after* it — and whose re-inventory has already made its last
-    // empty pass — would take the namespace out from under this row. For an
-    // organization the row is left pointing at an id nothing resolves; for an
-    // account it is not left at all, because `owner_id` cascades
-    // (card_9323f8041cef, card_da1abc6074ac).
-    //
-    // A transfer cannot undo itself as cheaply as a creation, which only has to
-    // drop a row and a directory it made moments ago: everything has already
-    // moved. So it moves back, in the reverse of the order it came — the row
-    // first, so no byte is put anywhere the metadata does not already say it
-    // is.
-    if let Err(error) = namespace_still_accepts_repository(
-        db,
-        new_owner_id,
-        new_org_id,
-        &new_owner_name,
-        repo_name,
-        "moved back to its previous owner",
-    )
-    .await
-    {
-        if let Err(rollback_error) = repo_ops::transfer_owner(
-            db,
-            repo.id,
-            repo.owner_id,
-            repo.org_id,
-            &new_owner_name,
-            owner,
-            repo_name,
-        )
-        .await
-        {
-            // The row still names the destination, so the bytes stay with it:
-            // moving them back now would put them where nothing says they are.
-            tracing::error!(
-                repo_id = repo.id,
-                from = %new_owner_name,
-                to = %owner,
-                reason = %format!("{error:#}"),
-                error = %format!("{rollback_error:#}"),
-                "a repository was transferred into a namespace that is being deleted and could \
-                 not be moved back — it now belongs to an owner that is going away"
-            );
-            return Err(rollback_error);
-        }
-        invalidate_perm_cache_repo(db, repo.id);
-        oci_storage.restore_repository_transfer(moved_oci).await;
-        restore_transferred_repository_directories(&moved_directories, repo.id);
-        restore_transferred_blob_prefixes(blob_storage, &moved_blobs, repo.id).await;
-        restore_transferred_repository_directory(&new_path, &old_path, repo.id);
-        return Err(error);
-    }
-
-    // Read the moved row back from the namespace it landed in — the same
-    // `(owner_id, org_id)` pair `update_owner` just wrote.
-    let moved = match new_org_id {
-        Some(org_id) => repo_ops::find_by_org_and_name(db, org_id, repo_name).await?,
-        None => repo_ops::find_personal_by_owner_and_name(db, new_owner_id, repo_name).await?,
-    };
-    moved.ok_or_else(|| anyhow::anyhow!("repository not found after transfer"))
+    Ok(moved)
 }
 
 // ── Commit Status ──────────────────────────────────────────────────────
@@ -4866,19 +4871,21 @@ mod repository_deletion_tests {
         );
     }
 
-    /// card_9323f8041cef: a transfer is the second entrance into a namespace,
-    /// and `resolve_owner` only guards its doorway. A deletion that claims the
-    /// destination *after* that resolve — and whose re-inventory has already
-    /// made its last empty pass — would take the namespace out from under the
-    /// moved row. The transfer has to re-read the claim once its own row is
-    /// committed, and move everything back if it lost.
+    /// card_9323f8041cef, card_0213f024e077: a transfer is the second entrance
+    /// into a namespace, and `resolve_owner` only guards its doorway. The final
+    /// admission decision has to share the `transfer_owner` transaction with
+    /// the ownership update: a check after commit can race the deleter that is
+    /// now entitled to retire the moved row and then try to restore bytes the
+    /// deleter already consumed.
     ///
     /// The claim is landed by a trigger on the very statement `transfer_owner`
     /// runs, which is exactly the interleaving that cannot be produced from
-    /// outside: after the destination resolved, before the transfer's own
-    /// post-commit read. `NEW.updated_at` is copied rather than a literal
-    /// written, so the marker carries the same timestamp encoding sea-orm
-    /// itself writes and the row stays readable.
+    /// outside: after the destination resolved, on the transfer's own update.
+    /// The guarded DB transaction must see the marker and roll that update back
+    /// before the service returns every storage domain to the source.
+    /// `NEW.updated_at` is copied rather than a literal written, so the marker
+    /// carries the same timestamp encoding sea-orm itself writes and the row
+    /// stays readable.
     #[tokio::test]
     async fn a_transfer_that_commits_after_the_destination_is_claimed_moves_back() {
         for destination_is_an_organization in [false, true] {
@@ -5009,6 +5016,103 @@ mod repository_deletion_tests {
                 b"must return too"
             );
         }
+    }
+
+    /// card_0213f024e077: once the guarded ownership transaction commits, the
+    /// transfer is ordered before a later deletion. The deleter may retire the
+    /// moved row and all of its bytes before the service writes its reply, but
+    /// that cannot retroactively turn the transfer into an error: an error
+    /// would promise the caller that the source repository was restored.
+    #[tokio::test]
+    async fn a_delete_after_transfer_commit_cannot_turn_the_transfer_into_a_failure() {
+        let db = setup_db().await;
+        let source = user_ops::create_user(
+            &db,
+            "committed-transfer-source",
+            "committed-transfer-source@example.invalid",
+            "unused",
+            "Committed Transfer Source",
+        )
+        .await
+        .expect("create source owner");
+        let destination_owner = user_ops::create_user(
+            &db,
+            "committed-transfer-destination",
+            "committed-transfer-destination@example.invalid",
+            "unused",
+            "Committed Transfer Destination",
+        )
+        .await
+        .expect("create destination owner");
+        let destination = crate::org::create_org(
+            &db,
+            "committed-transfer-org",
+            None,
+            None,
+            destination_owner.id,
+            "public",
+        )
+        .await
+        .expect("create destination organization");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let repo = create_repo(&db, source.id, "committed", None, false, &repo_root, None)
+            .await
+            .expect("create source repository");
+        let blob_storage = LocalBlobStorage::new(&repo_root);
+        let oci_storage = oci_storage_for(&repo_root);
+
+        let delete_db = db.clone();
+        let delete_root = repo_root.clone();
+        let destination_id = destination.id;
+        let destination_owner_id = destination_owner.id;
+        let moved = transfer_repo_with_after_commit(
+            &db,
+            source.id,
+            &source.username,
+            &repo.name,
+            &destination.name,
+            &repo_root,
+            &blob_storage,
+            &oci_storage,
+            move || async move {
+                let delete_storage = LocalBlobStorage::new(&delete_root);
+                crate::org::delete_org(
+                    &delete_db,
+                    &delete_root,
+                    &delete_storage,
+                    &oci_storage_for(&delete_root),
+                    destination_id,
+                    crate::org::OrgDeleteActor::Owner(destination_owner_id),
+                )
+                .await
+                .expect("delete the destination after the transfer committed");
+            },
+        )
+        .await
+        .expect("the committed transfer must remain a successful operation");
+
+        assert_eq!(moved.id, repo.id);
+        assert_eq!(moved.org_id, Some(destination.id));
+        assert!(
+            repo_ops::find_by_id(&db, repo.id)
+                .await
+                .expect("read the repository after destination deletion")
+                .is_none(),
+            "the destination deletion did not retire the transferred row"
+        );
+        assert!(
+            !repo_root
+                .join("committed-transfer-source/committed.git")
+                .exists(),
+            "a successful transfer was compensated back into its deleted source state"
+        );
+        assert!(
+            !repo_root
+                .join("committed-transfer-org/committed.git")
+                .exists(),
+            "the destination deletion left the transferred Git tree live"
+        );
     }
 
     /// A failed rollback cannot replace the original storage/DB error, so its

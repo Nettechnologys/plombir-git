@@ -2,7 +2,11 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{sea_query::Query, ActiveValue::Set, *};
+use sea_orm::{
+    sea_query::{Expr, Query},
+    ActiveValue::Set,
+    *,
+};
 
 use crate::entities::organization_member::{self, Entity as OrgMemberEntity};
 use crate::entities::repo_collaborator::{self, Entity as RepoCollaboratorEntity};
@@ -10,7 +14,8 @@ use crate::entities::repository::{
     self, ActiveModel as RepoActiveModel, Entity as RepoEntity, Model as Repo,
 };
 use crate::entities::{
-    oci_blob, oci_repository, package, package_file, package_registry, package_version,
+    oci_blob, oci_repository, organization, package, package_file, package_registry,
+    package_version, user,
 };
 
 /// Count non-deleted repositories — backs the `forgekeep_repositories` gauge.
@@ -407,15 +412,100 @@ pub async fn update_owner(
     Ok(())
 }
 
+/// Whether the guarded ownership transaction committed or found that its
+/// destination lifecycle had already closed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransferOwnerOutcome {
+    Transferred(Repo),
+    DestinationAccountClosed,
+    DestinationOrganizationClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferDestination {
+    Open,
+    AccountClosed,
+    OrganizationClosed,
+}
+
+async fn write_repository_owner(
+    transaction: &DatabaseTransaction,
+    repo_id: i64,
+    owner_id: i64,
+    org_id: Option<i64>,
+) -> Result<Repo> {
+    // This must be the first statement on SQLite: an UPDATE acquires its one
+    // writer slot immediately. A SELECT followed by UPDATE leaves a lock-upgrade
+    // window where retirement can become the writer and then wait for this
+    // transaction's read snapshot to close while this transaction waits for
+    // retirement — resolved only by the busy timeout.
+    let updated = RepoEntity::update_many()
+        .col_expr(repository::Column::OwnerId, Expr::value(owner_id))
+        .col_expr(repository::Column::OrgId, Expr::value(org_id))
+        .col_expr(repository::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(repository::Column::Id.eq(repo_id))
+        .exec(transaction)
+        .await
+        .context("db: update repo owner")?;
+    if updated.rows_affected != 1 {
+        return Err(anyhow::anyhow!(
+            "repo not found while updating transfer owner"
+        ));
+    }
+    RepoEntity::find_by_id(repo_id)
+        .one(transaction)
+        .await?
+        .context("repo not found after updating transfer owner")
+}
+
+/// Lock the destination lifecycle row(s) and verify that the transfer may
+/// still enter them.
+///
+/// PostgreSQL/MySQL render these reads as `SELECT .. FOR UPDATE`, serializing
+/// them with the retirement claims. SQLite omits that clause, so its caller
+/// first performs the repository update and thereby becomes the database's
+/// sole writer before reaching this check.
+async fn lock_transfer_destination(
+    transaction: &DatabaseTransaction,
+    owner_id: i64,
+    org_id: Option<i64>,
+) -> Result<TransferDestination> {
+    let owner = user::Entity::find_by_id(owner_id)
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .context("db: lock repository transfer destination account")?;
+    if !owner.is_some_and(|owner| owner.is_active && owner.deleted_at.is_none()) {
+        return Ok(TransferDestination::AccountClosed);
+    }
+
+    if let Some(org_id) = org_id {
+        let org = organization::Entity::find_by_id(org_id)
+            .lock_exclusive()
+            .one(transaction)
+            .await
+            .context("db: lock repository transfer destination organization")?;
+        if !org.is_some_and(|org| org.owner_id == owner_id && org.deleted_at.is_none()) {
+            return Ok(TransferDestination::OrganizationClosed);
+        }
+    }
+
+    Ok(TransferDestination::Open)
+}
+
 /// Move a repository row and the namespace-bearing metadata of its registries
 /// in one database transaction.
 ///
 /// Package and OCI objects are addressed by `owner/repository` even though the
-/// rows that describe them hang off the stable repository id.  Their bytes are
+/// rows that describe them hang off the stable repository id. Their bytes are
 /// moved by `rg-core` before this transaction; rewriting only `repositories`
-/// would leave the metadata reading the old keys.  Conversely, a failed
+/// would leave the metadata reading the old keys. Conversely, a failed
 /// metadata rewrite must roll the repository-row update back so `rg-core` can
 /// safely return every storage namespace to its source.
+///
+/// The destination account and organization are locked in the same transaction
+/// as the ownership update. That makes transfer and retirement linearisable:
+/// whichever lifecycle gets the lock first is the one the other observes.
 #[allow(clippy::too_many_arguments)]
 pub async fn transfer_owner(
     db: &DatabaseConnection,
@@ -425,21 +515,42 @@ pub async fn transfer_owner(
     source_namespace: &str,
     destination_namespace: &str,
     repo_name: &str,
-) -> Result<()> {
+) -> Result<TransferOwnerOutcome> {
     let transaction = db.begin().await.context("db: begin repository transfer")?;
 
-    let repo = RepoEntity::find_by_id(repo_id)
-        .one(&transaction)
-        .await?
-        .context("repo not found")?;
-    let mut active: RepoActiveModel = repo.into();
-    active.owner_id = Set(owner_id);
-    active.org_id = Set(org_id);
-    active.updated_at = Set(Utc::now());
-    active
-        .update(&transaction)
-        .await
-        .context("db: update repo owner")?;
+    // On PostgreSQL/MySQL, lock the lifecycle rows before touching the
+    // repository. If transfer wins, a concurrent delete waits and its first
+    // inventory sees the moved row; if deletion wins, the marker is visible and
+    // this transaction changes nothing.
+    //
+    // SQLite has no row-level `FOR UPDATE`. Its first write is the lock, so do
+    // the repository update first there. A trigger (or an already-running
+    // retirement) can still mark/remove the destination before this check; in
+    // that case the whole transaction is rolled back, including the owner
+    // update and every trigger side effect.
+    let sqlite = transaction.get_database_backend() == DatabaseBackend::Sqlite;
+    let mut moved = if sqlite {
+        Some(write_repository_owner(&transaction, repo_id, owner_id, org_id).await?)
+    } else {
+        None
+    };
+    let admission = lock_transfer_destination(&transaction, owner_id, org_id).await?;
+    if admission != TransferDestination::Open {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back repository transfer into a closed namespace")?;
+        return Ok(match admission {
+            TransferDestination::AccountClosed => TransferOwnerOutcome::DestinationAccountClosed,
+            TransferDestination::OrganizationClosed => {
+                TransferOwnerOutcome::DestinationOrganizationClosed
+            }
+            TransferDestination::Open => unreachable!("open destination passed the guard"),
+        });
+    }
+    if !sqlite {
+        moved = Some(write_repository_owner(&transaction, repo_id, owner_id, org_id).await?);
+    }
 
     let source_package_prefix = format!("packages/{source_namespace}/{repo_name}/");
     let destination_package_prefix = format!("packages/{destination_namespace}/{repo_name}/");
@@ -519,7 +630,9 @@ pub async fn transfer_owner(
         .commit()
         .await
         .context("db: commit repository transfer")?;
-    Ok(())
+    Ok(TransferOwnerOutcome::Transferred(moved.expect(
+        "every successful transfer updates the repository row",
+    )))
 }
 
 #[cfg(test)]
