@@ -145,8 +145,8 @@ async fn concurrent_run_migrations_on_one_server_database_all_succeed() {
         .map(|_| {
             let url = url.clone();
             tokio::spawn(async move {
-                let db =
-                    rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 120, 2).await?;
+                let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 120, 2)
+                    .await?;
                 rg_db::run_migrations(&db).await
             })
         })

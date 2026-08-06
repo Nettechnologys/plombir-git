@@ -125,19 +125,17 @@ pub async fn acquire(db: &DatabaseConnection, wait: Duration) -> Result<Migratio
     match db {
         DatabaseConnection::SqlxPostgresPoolConnection(_) => {
             let options = db.get_postgres_connection_pool().connect_options();
-            let mut connection = tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                PgConnection::connect_with(&options),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+            let mut connection =
+                tokio::time::timeout(CONNECT_TIMEOUT, PgConnection::connect_with(&options))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
                     "opening the PostgreSQL session for the ForgeKeep migration lock timed out \
                      after {}s",
                     CONNECT_TIMEOUT.as_secs()
                 )
-            })?
-            .context("open a PostgreSQL session for the ForgeKeep migration lock")?;
+                    })?
+                    .context("open a PostgreSQL session for the ForgeKeep migration lock")?;
             acquire_postgres(&mut connection, wait).await?;
             Ok(MigrationLock {
                 held: Some(Held::Postgres(Box::new(connection))),
@@ -145,19 +143,17 @@ pub async fn acquire(db: &DatabaseConnection, wait: Duration) -> Result<Migratio
         }
         DatabaseConnection::SqlxMySqlPoolConnection(_) => {
             let options = db.get_mysql_connection_pool().connect_options();
-            let mut connection = tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                MySqlConnection::connect_with(&options),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+            let mut connection =
+                tokio::time::timeout(CONNECT_TIMEOUT, MySqlConnection::connect_with(&options))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
                     "opening the MySQL session for the ForgeKeep migration lock timed out after \
                      {}s",
                     CONNECT_TIMEOUT.as_secs()
                 )
-            })?
-            .context("open a MySQL session for the ForgeKeep migration lock")?;
+                    })?
+                    .context("open a MySQL session for the ForgeKeep migration lock")?;
             let name = acquire_mysql(&mut connection, wait).await?;
             Ok(MigrationLock {
                 held: Some(Held::MySql {
@@ -244,11 +240,14 @@ async fn acquire_postgres(connection: &mut PgConnection, wait: Duration) -> Resu
             return Ok(());
         }
 
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()).filter(|left| {
-            // `checked_duration_since` measures the wrong direction for a passed
-            // deadline; a zero remainder is equally out of budget.
-            !left.is_zero()
-        }) else {
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| {
+                // `checked_duration_since` measures the wrong direction for a passed
+                // deadline; a zero remainder is equally out of budget.
+                !left.is_zero()
+            })
+        else {
             anyhow::bail!(
                 "another ForgeKeep process has held the migration lock on this PostgreSQL \
                  database for more than {}s; wait for that migration to finish or stop that \
