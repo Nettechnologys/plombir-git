@@ -163,7 +163,7 @@ const ABSENT_ID: &str = "999999";
 /// checkable claim, "every persona is answered before any gate runs" — was
 /// never compared to what the route actually answers.
 ///
-/// [`the_out_of_reach_routes_are_still_out_of_reach`] closes that: it drives
+/// [`assert_no_fixture_exceptions_are_still_needed`] closes that: it drives
 /// every entry with all three personas, in both repository scopes, and fails if
 /// any of them gets *in*. That is the rot this list can hide — a route stops
 /// being out of reach, keeps its exemption, and nobody is checking who it lets
@@ -178,15 +178,12 @@ const ABSENT_ID: &str = "999999";
 /// fixture seeds an attachment on the pull request and one on its review
 /// comment, and both rows are judged by the matrix like everything else.
 ///
-/// **That is the standing hazard of this list, and it is not fixed.**
-/// [`the_out_of_reach_routes_are_still_out_of_reach`] drives every entry with
-/// [`RepoSeed::placeholders`] — a seed whose every id is `1` — so it can catch a
-/// route that starts letting somebody in *without* a row, and cannot catch the
-/// case that actually happened: the fixture grows a row the entry claims is
-/// impossible, and the reverse check never asks with it. An entry whose reason
-/// is "no such row exists" is therefore checked by a pass that guarantees no
-/// such row exists. Read a new entry with that in mind; the one left is
-/// row-independent, which is the only reason the gap is currently harmless.
+/// The reverse check runs inside [`every_route_answers_its_declared_access_level`]
+/// after [`seed_repo_rows`] has built the same rows the matrix uses. That detail
+/// is load-bearing: checking a "no such row exists" excuse with
+/// [`RepoSeed::placeholders`] only proves the empty fixture is empty, and cannot
+/// notice when the real fixture grows the row and makes the excuse stale
+/// (card_c1145b301d39).
 ///
 /// The three artifact rows used to be here, excused as "this fixture builds no
 /// pipeline — every persona is answered 404 before any gate runs". True, and
@@ -2080,6 +2077,73 @@ fn listed(list: &[(&str, &str)], label: &str) -> bool {
     list.iter().any(|(entry, _)| *entry == label)
 }
 
+/// Every `NO_FIXTURE` exemption is still out of reach with the fixture the
+/// persona matrix actually uses.
+///
+/// This has to run after [`seed_repo_rows`] and before the matrix consumes any
+/// destructive route. A separate empty fixture cannot detect the failure this
+/// guard exists for: a newly seeded row making an old "the fixture cannot build
+/// it" reason false. A success means the route is checkable now and must leave
+/// [`NO_FIXTURE`] so the matrix can judge its declared access level.
+///
+/// Driving the real fixture is also what makes an entry for a destructive route
+/// safe to probe here: the owner probe can only change a row by *succeeding*,
+/// and a success is already the failure this guard reports.
+async fn assert_no_fixture_exceptions_are_still_needed(
+    fx: &Fixture,
+    facts: &[RouteFact],
+    seeds: &[RepoSeed],
+    globals: &GlobalSeed,
+) {
+    let mut offenders: Vec<String> = Vec::new();
+    let mut probed = 0usize;
+
+    for (label, reason) in NO_FIXTURE {
+        let fact = facts
+            .iter()
+            .find(|fact| fact.label() == *label)
+            .unwrap_or_else(|| panic!("NO_FIXTURE names '{label}', which is not a route"));
+
+        for seed in seeds {
+            for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
+                let answer = probe(fx, fact, persona, seed, globals, ORG).await;
+                probed += 1;
+                if !answer.status.is_success() {
+                    continue;
+                }
+                offenders.push(format!(
+                    "  {} {} {label} answered {} (excused as: {reason})\n    {}",
+                    persona.label(),
+                    seed.name,
+                    answer.status,
+                    answer.excerpt(),
+                ));
+            }
+            // Only repository-scoped rows have anything to say about a second
+            // repository; the rest resolve an instance-wide id.
+            if !is_repo_path(&fact.path) {
+                break;
+            }
+        }
+    }
+
+    // An empty `NO_FIXTURE` is the goal state, not a defect; what would be a
+    // defect is entries that no probe ever reached.
+    assert!(
+        probed >= NO_FIXTURE.len(),
+        "{} NO_FIXTURE entr(ies) but only {probed} probe(s) ran — the guard is not guarding",
+        NO_FIXTURE.len()
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} NO_FIXTURE row(s) are no longer out of reach.\nThey are skipped by every persona \
+         pass, so a route that has started letting somebody in is a route nobody is checking. \
+         Drop it from NO_FIXTURE and let the sweep judge it.\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}
+
 // ── The sweep ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2226,6 +2290,8 @@ async fn every_route_answers_its_declared_access_level() {
             "KNOWN_GAPS names '{key}' ({reason}), which is not a route any more — drop it"
         );
     }
+
+    assert_no_fixture_exceptions_are_still_needed(&fx, &facts, &seeds, &globals).await;
 
     // The destructive routes go last, in the order they are listed; DELETE goes
     // after everything else within the main group, so a destructive call is
@@ -3428,106 +3494,5 @@ async fn every_instance_admin_route_demands_the_admin_pat_scope() {
         under_scoped.len() + over_scoped.len(),
         under_scoped.join("\n"),
         over_scoped.join("\n"),
-    );
-}
-
-/// No `NO_FIXTURE` route lets anybody in.
-///
-/// An entry on that list is skipped by every persona pass, which makes it the
-/// widest exemption the sweep grants — and it was the only one of the three
-/// lists nothing re-read: `FALLS_OVER` and `EXTRACTOR_BEFORE_GATE` both fail on
-/// a stale entry, this one only checked that the name still matched a live
-/// route (card_3cc941a766a0).
-///
-/// What can rot here is the precondition: the fixture grows, the route starts
-/// resolving something real, and a row that nobody judges starts answering
-/// `2xx`. So every entry is driven — three personas, both repository scopes —
-/// and a success is the failure: the route has become checkable and owes the
-/// sweep an answer instead of an excuse.
-///
-/// It deliberately does *not* demand a particular non-answer. The rows measure
-/// differently by scope and by persona, and pinning a single status would only
-/// encode the fixture's shape of the day.
-///
-/// What it cannot see is written on [`NO_FIXTURE`] rather than here, because
-/// that is where a reader deciding whether to add an entry will be: it seeds
-/// nothing, so an entry excused as "no such row exists" is re-checked against a
-/// fixture in which no such row exists. The kind of rot that actually bit this
-/// list — the main fixture grew the row and the excuse outlived it — is
-/// invisible from in here.
-#[tokio::test]
-async fn the_out_of_reach_routes_are_still_out_of_reach() {
-    let (base, facts) = spawn_test_app_with_routes().await;
-    let client = Client::builder().build().expect("http client");
-
-    let owner_token = register_user(&base, OWNER, &format!("{OWNER}@example.com"), PW).await;
-    let outsider_token =
-        register_user(&base, OUTSIDER, &format!("{OUTSIDER}@example.com"), PW).await;
-    let fx = Fixture {
-        base,
-        client,
-        owner_token,
-        outsider_token,
-    };
-    create_repo(&fx, PRIVATE_REPO, true).await;
-    create_repo(&fx, PUBLIC_REPO, false).await;
-    // The repositories have to be real, or "out of reach" would be true for the
-    // wrong reason and this test would pass on a dead fixture.
-    for repo in [PRIVATE_REPO, PUBLIC_REPO] {
-        assert_eq!(
-            fx.repo_readable_by_owner(repo).await,
-            StatusCode::OK,
-            "fixture is dead: the owner cannot read '{repo}', so every route below would look \
-             out of reach whatever it does"
-        );
-    }
-    // Nothing is seeded here: these rows resolve an artifact, a pipeline or a
-    // pull request first, and the question this pass asks does not get as far
-    // as anything hanging off one.
-    let seeds = [PRIVATE_REPO, PUBLIC_REPO].map(RepoSeed::placeholders);
-    let globals = GlobalSeed::placeholders();
-
-    let mut offenders: Vec<String> = Vec::new();
-    let mut probed = 0usize;
-    for (label, reason) in NO_FIXTURE {
-        let fact = facts
-            .iter()
-            .find(|fact| fact.label() == *label)
-            .unwrap_or_else(|| panic!("NO_FIXTURE names '{label}', which is not a route"));
-
-        for seed in &seeds {
-            for persona in [Persona::Anonymous, Persona::Outsider, Persona::Owner] {
-                let answer = probe(&fx, fact, persona, seed, &globals, ORG).await;
-                probed += 1;
-                if !answer.status.is_success() {
-                    continue;
-                }
-                offenders.push(format!(
-                    "  {} {} {label} answered {} (excused as: {reason})\n    {}",
-                    persona.label(),
-                    seed.name,
-                    answer.status,
-                    answer.excerpt(),
-                ));
-            }
-            // Only the repository-scoped rows have anything to say about a
-            // second repository; the rest resolve an instance-wide id.
-            if !is_repo_path(&fact.path) {
-                break;
-            }
-        }
-    }
-
-    assert!(
-        probed > 0,
-        "NO_FIXTURE is empty — the guard is not guarding"
-    );
-    assert!(
-        offenders.is_empty(),
-        "{} NO_FIXTURE row(s) are no longer out of reach.\nThey are skipped by every persona \
-         pass, so a route that has started letting somebody in is a route nobody is checking. \
-         Drop it from NO_FIXTURE and let the sweep judge it.\n{}",
-        offenders.len(),
-        offenders.join("\n")
     );
 }
