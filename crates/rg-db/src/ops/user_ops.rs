@@ -421,7 +421,15 @@ pub async fn update_totp_secret(
 }
 
 /// Enable MFA for a user.
-pub async fn enable_mfa(db: &DatabaseConnection, user_id: i64, mfa_type: &str) -> Result<User> {
+///
+/// Generic over the connection so it can run inside a caller's transaction.
+/// Enrolment must go through [`enable_mfa_with_backup_codes`] rather than call
+/// this directly — on its own it publishes a second factor whose recovery set is
+/// still a separate commit away.
+pub async fn enable_mfa<C>(db: &C, user_id: i64, mfa_type: &str) -> Result<User>
+where
+    C: ConnectionTrait,
+{
     let model = UserEntity::find_by_id(user_id)
         .one(db)
         .await?
@@ -434,6 +442,50 @@ pub async fn enable_mfa(db: &DatabaseConnection, user_id: i64, mfa_type: &str) -
         .update(db)
         .await
         .map_err(|e| anyhow::anyhow!("db: {}", e))
+}
+
+/// Turn the second factor on and publish its backup-code set in one commit.
+///
+/// Enrolment used to be two independent commits with the codes carried back by
+/// the response, and the order made the failure worse than a rollback: the flag
+/// landed first, so a failing code write left the account with a second factor
+/// and its owner with no recovery material — under a `500` that told them the
+/// enrolment had not happened. Both writes land or neither does, so the answer
+/// the caller receives is the state that is stored.
+///
+/// `codes` are the plaintext codes the response will show; only their hashes are
+/// stored (see [`crate::ops::mfa_backup_code_ops::set_codes`]).
+pub async fn enable_mfa_with_backup_codes(
+    db: &DatabaseConnection,
+    user_id: i64,
+    mfa_type: &str,
+    codes: &[String],
+) -> Result<User> {
+    let transaction = db.begin().await.context("db: begin MFA enrolment")?;
+    let result: Result<User> = async {
+        let user = enable_mfa(&transaction, user_id, mfa_type).await?;
+        crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, codes)
+            .await
+            .context("db: store MFA backup codes")?;
+        Ok(user)
+    }
+    .await;
+    match result {
+        Ok(user) => {
+            transaction
+                .commit()
+                .await
+                .context("db: commit MFA enrolment")?;
+            Ok(user)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error)
+                    .context(format!("db: roll back MFA enrolment: {rollback_error}"));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Disable MFA for a user.

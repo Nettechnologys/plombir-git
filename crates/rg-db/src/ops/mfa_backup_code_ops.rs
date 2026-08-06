@@ -74,32 +74,53 @@ pub fn generate_codes(n: usize) -> Vec<String> {
         .collect()
 }
 
-/// Store backup codes for a user (replaces existing unused ones).
-pub async fn set_codes(
-    db: &DatabaseConnection,
-    user_id: i64,
-    codes: &[String],
-) -> Result<(), DbErr> {
-    // Delete unused codes for this user
+/// Store backup codes for a user, replacing the unused ones in one commit.
+///
+/// Generic over the connection so the replacement can join a caller's
+/// transaction instead of committing on its own; passing a `DatabaseTransaction`
+/// nests a savepoint. [`crate::ops::user_ops::enable_mfa_with_backup_codes`] uses
+/// that to put "the second factor is on" and "these are the codes" in one
+/// commit.
+///
+/// The transaction is the point of this function, not tidiness. A set is shown
+/// to its owner exactly once — in the response that carries it — so a set
+/// published half-written leaves the account with a second factor and the owner
+/// with recovery material they never saw, under a `500` claiming nothing
+/// happened. Delete-then-insert is also a read-modify-write of the whole set, so
+/// serialising it is what stops two concurrent re-issues from interleaving into a
+/// stored set that matches neither of the two answers handed out.
+pub async fn set_codes<C>(db: &C, user_id: i64, codes: &[String]) -> Result<(), DbErr>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    let txn = db.begin().await?;
+
+    // Used codes are history, not credentials, and stay: only the live set is
+    // being replaced.
     Entity::delete_many()
         .filter(mfa_backup_code::Column::UserId.eq(user_id))
         .filter(mfa_backup_code::Column::Used.eq(false))
-        .exec(db)
+        .exec(&txn)
         .await?;
 
     let now = chrono::Utc::now();
-    for code in codes {
-        let am = mfa_backup_code::ActiveModel {
-            id: NotSet,
-            user_id: Set(user_id),
-            code_hash: Set(hash_code(code)),
-            used: Set(false),
-            used_at: Set(None),
-            created_at: Set(now),
-        };
-        am.insert(db).await?;
-    }
-    Ok(())
+    // One statement for the whole set: a row per round-trip gave the failure ten
+    // places to land inside the window the delete had already opened.
+    // `on_empty_do_nothing` keeps "revoke every unused code" a legitimate
+    // request rather than an INSERT with no VALUES.
+    Entity::insert_many(codes.iter().map(|code| mfa_backup_code::ActiveModel {
+        id: NotSet,
+        user_id: Set(user_id),
+        code_hash: Set(hash_code(code)),
+        used: Set(false),
+        used_at: Set(None),
+        created_at: Set(now),
+    }))
+    .on_empty_do_nothing()
+    .exec(&txn)
+    .await?;
+
+    txn.commit().await
 }
 
 /// Verify a backup code. Returns true if valid and marks it used.
@@ -128,8 +149,11 @@ pub async fn verify_and_consume(
 }
 
 /// List backup codes status for a user.
-pub async fn list_codes(
-    db: &DatabaseConnection,
+///
+/// Generic over the connection for the same reason [`set_codes`] is: a caller
+/// holding a transaction has to be able to read the set it just wrote.
+pub async fn list_codes<C: ConnectionTrait>(
+    db: &C,
     user_id: i64,
 ) -> Result<Vec<mfa_backup_code::Model>, DbErr> {
     Entity::find()

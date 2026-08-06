@@ -33,6 +33,25 @@ fn namespace_repo(
     }
 }
 
+/// The hashes of a user's *live* backup codes, oldest first.
+async fn live_backup_hashes<C: ConnectionTrait>(db: &C, user_id: i64) -> Vec<String> {
+    let mut rows = rg_db::ops::mfa_backup_code_ops::list_codes(db, user_id)
+        .await
+        .expect("read stored backup codes");
+    rows.sort_by_key(|row| row.id);
+    rows.into_iter()
+        .filter(|row| !row.used)
+        .map(|row| row.code_hash)
+        .collect()
+}
+
+fn backup_hashes(codes: &[String]) -> Vec<String> {
+    codes
+        .iter()
+        .map(|code| rg_db::ops::mfa_backup_code_ops::hash_code(code))
+        .collect()
+}
+
 async fn repo_fts_snapshot(db: &DatabaseConnection, repo_id: i64) -> Option<(String, String)> {
     let backend = db.get_database_backend();
     db.query_one(Statement::from_sql_and_values(
@@ -771,6 +790,60 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .await
             .expect("delete smoke-test board"),
         "deleting the smoke-test board removed no row"
+    );
+
+    // ── MFA enrolment atomicity (card_3c33caaf7402) ──────────────────────────
+    //
+    // The precise halves of this live where a fault can be aimed at one row of
+    // the set: `rg-db/tests/mfa_backup_code_set_atomicity` and `rg-http`'s
+    // `mfa_enable_atomicity_tests`, both on a SQLite trigger. Neither seam is
+    // portable, so what this backend has to answer for is the mechanism those
+    // two rest on — the whole replacement joins the caller's unit of work (a
+    // nested SAVEPOINT under an outer transaction), so a failure anywhere in that
+    // unit takes the set with it instead of leaving the account with a second
+    // factor and no codes.
+    let first_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
+        rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
+    );
+    let enrolled =
+        rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user.id, "totp", &first_codes)
+            .await
+            .expect("enrol a second factor and its backup codes in one commit");
+    assert!(
+        enrolled.mfa_enabled,
+        "the enrolment committed the codes without the flag"
+    );
+    assert_eq!(
+        live_backup_hashes(&db, user.id).await,
+        backup_hashes(&first_codes),
+        "the codes handed to the owner are not the codes that were stored"
+    );
+
+    let second_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
+        rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
+    );
+    let doomed = db.begin().await.expect("begin a doomed re-issue");
+    rg_db::ops::mfa_backup_code_ops::set_codes(&doomed, user.id, &second_codes)
+        .await
+        .expect("the replacement must nest inside the caller's transaction");
+    assert_eq!(
+        live_backup_hashes(&doomed, user.id).await,
+        backup_hashes(&second_codes),
+        "the nested replacement is not visible to the transaction that made it"
+    );
+    // A later step of the same enrolment failing is exactly the case the split
+    // commits could not survive. `i64::MAX` is nobody's account.
+    rg_db::ops::user_ops::enable_mfa(&doomed, i64::MAX, "totp")
+        .await
+        .expect_err("the doomed step must fail");
+    doomed
+        .rollback()
+        .await
+        .expect("roll the doomed re-issue back");
+    assert_eq!(
+        live_backup_hashes(&db, user.id).await,
+        backup_hashes(&first_codes),
+        "a re-issue that failed after writing its codes revoked the set the owner still holds"
     );
 
     rg_db::ops::repo_ops::soft_delete(&db, repo.id)

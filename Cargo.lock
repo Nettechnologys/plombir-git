@@ -5308,6 +5308,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "totp-rs",
  "tower",
  "tower-http",
  "tracing",

@@ -219,16 +219,16 @@ pub async fn enable_mfa(
         return Err(AppError::bad_request("invalid TOTP code"));
     }
 
-    // Enable MFA and store re-encrypted secret
-    rg_db::ops::user_ops::enable_mfa(&state.db, user_id, "totp")
-        .await
-        .map_err(AppError::from)?;
-
     // Generate backup codes
     let backup_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
         rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
     );
-    rg_db::ops::mfa_backup_code_ops::set_codes(&state.db, user_id, &backup_codes)
+
+    // The flag and the codes go in as one commit. The response below is the only
+    // place these codes are ever shown, so switching the second factor on first
+    // and failing on the codes afterwards is how an account ends up locked out —
+    // with a `500` telling its owner that nothing was enabled.
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, "totp", &backup_codes)
         .await
         .map_err(AppError::from)?;
 
