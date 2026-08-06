@@ -16,6 +16,37 @@ pub(crate) async fn backup_sqlite_db(
              use your PostgreSQL/MySQL server's native dump tool (pg_dump / mysqldump) for other backends"
         );
     }
+    if let Some(source) = sqlite_backup_source_path(db_url) {
+        let source_exists = source.try_exists().with_context(|| {
+            format!(
+                "failed to inspect source database path before backup: {}",
+                source.display()
+            )
+        })?;
+        let output_exists = output.try_exists().with_context(|| {
+            format!(
+                "failed to inspect backup output path before backup: {}",
+                output.display()
+            )
+        })?;
+        if source_exists
+            && output_exists
+            && same_file::is_same_file(&source, output).with_context(|| {
+                format!(
+                    "failed to compare source database {} with backup output {}",
+                    source.display(),
+                    output.display()
+                )
+            })?
+        {
+            anyhow::bail!(
+                "refusing to create SQLite backup: source database and backup output refer to the \
+                 same file (source: {}, output: {}); choose a different backup output path",
+                source.display(),
+                output.display()
+            );
+        }
+    }
     if output.exists() && !force {
         anyhow::bail!(
             "backup output already exists: {} (use --force to overwrite)",
@@ -52,6 +83,16 @@ pub(crate) async fn backup_sqlite_db(
     tracing::info!(output = %output.display(), "SQLite backup complete");
     println!("Backup written to {}", output.display());
     Ok(())
+}
+
+fn sqlite_backup_source_path(db_url: &str) -> Option<PathBuf> {
+    let rest = db_url
+        .strip_prefix("sqlite://")
+        .or_else(|| db_url.strip_prefix("sqlite:"))?;
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let is_memory = matches!(path, "" | ":memory:" | "/:memory:")
+        || query.split('&').any(|pair| pair == "mode=memory");
+    (!is_memory).then(|| PathBuf::from(path))
 }
 
 pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> anyhow::Result<()> {
