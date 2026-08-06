@@ -2,6 +2,8 @@
 
 import { readFileSync } from 'node:fs';
 
+import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+
 const files = {
   client: 'web/src/lib/api/boards.ts',
   boardsPage: 'web/src/routes/[owner]/[repo]/boards/+page.svelte',
@@ -13,6 +15,18 @@ const files = {
 const source = Object.fromEntries(
   Object.entries(files).map(([key, file]) => [key, readFileSync(file, 'utf8')]),
 );
+
+// A status elsewhere in boards.rs must not stand in for the handler whose
+// response contract is being asserted. Strip comments before extracting each
+// function so a commented-out status cannot satisfy the check either.
+const backendCode = stripRustComments(source.backend);
+const boardDeleteChecks = ['delete_board', 'delete_column', 'delete_card'].map((handler) => {
+  const fn = rustFnBlock(backendCode, handler);
+  return {
+    name: `backend ${handler} returns 204 No Content`,
+    ok: fn !== null && /StatusCode::NO_CONTENT\.into_response\(\)/.test(fn.body),
+  };
+});
 
 const checks = [
   {
@@ -39,10 +53,7 @@ const checks = [
       /deleteCard:\s*\(owner: string, repo: string, boardId: number, cardId: number\)\s*=>\s*\n?\s*request<void>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/boards\/\$\{boardId\}\/cards\/\$\{cardId\}`,\s*\{ method: 'DELETE' \}\)/.test(source.client) &&
       !/request<\{\s*deleted:\s*boolean\s*\}>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/boards\//.test(source.client),
   },
-  {
-    name: 'backend board delete handlers return 204 No Content',
-    ok: (source.backend.match(/StatusCode::NO_CONTENT\.into_response\(\)/g) || []).length >= 3,
-  },
+  ...boardDeleteChecks,
   {
     name: 'standalone board page fetches full board before rendering columns',
     ok:
@@ -56,8 +67,8 @@ const checks = [
   {
     name: 'backend board response enriches cards with issue metadata',
     ok:
-      /pub struct CardFull[\s\S]*#\[serde\(flatten\)\][\s\S]*pub card: Card[\s\S]*pub issue: Option<Issue>/.test(source.backendService) &&
-      /pub cards: Vec<CardFull>/.test(source.backendService),
+      /pub struct CardFull\s*\{[^}]*#\[serde\(flatten\)\][^}]*pub card: Card,[^}]*pub issue: Option<crate::issue::IssueWithLabels>/.test(source.backendService) &&
+      /pub struct ColumnFull\s*\{[^}]*pub cards: Vec<CardFull>/.test(source.backendService),
   },
   {
     name: 'issue board links cards by issue number, not database issue_id',
