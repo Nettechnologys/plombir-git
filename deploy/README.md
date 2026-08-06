@@ -306,8 +306,10 @@ databases. Passing **neither** falls back to `sqlite://./forgekeep.db?mode=rwc`
 relative to the container's `WORKDIR /app` — an empty database that nothing else
 ever opens, which is why the flag matters for `backup-db` in particular.
 
-Standalone migrations against file-backed SQLite use the same offline contract
-as restore. The command enforces it through a process lease, so use:
+CLI commands that can apply pending migrations against file-backed SQLite use
+the same offline contract as restore. `migrate`, `import`, and `package list`
+enforce it through a process lease, so stop the service before running any of
+them. For example:
 
 ```bash
 docker compose stop forgekeep

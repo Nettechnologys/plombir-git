@@ -311,9 +311,9 @@ Beyond `serve`, the `forgekeep` binary offers:
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
-| `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab |
+| `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab (file-backed SQLite requires the server to be stopped) |
 | `index-repo <owner/name>` | Index a repository for code search |
-| `package` | Manage the package registry |
+| `package` | Manage the package registry (`package list` requires a stopped server on file-backed SQLite) |
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `create-repo`, `import`,
@@ -324,11 +324,13 @@ neither, they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working
 directory, so `migrate` would migrate an empty database and `backup-db` would
 back it up.
 
-For a file-backed SQLite deployment, `migrate` is deliberately offline-only:
-stop every ForgeKeep server using the database, run the command, then restart
-the server. Both processes coordinate through a persistent sidecar lease next
-to the database; a live server makes `migrate` fail before it opens a pool.
-PostgreSQL and MySQL migrations keep their existing online behavior.
+For a file-backed SQLite deployment, every CLI path that can apply pending
+migrations (`migrate`, `import`, and `package list`) is deliberately
+offline-only: stop every ForgeKeep server using the database, run the command,
+then restart the server. The processes coordinate through a persistent sidecar
+lease next to the database; a live server makes these commands fail before they
+open a pool. PostgreSQL and MySQL migrations keep their existing online
+behavior.
 
 That trap is the reason backups are not left to a manual command: enable
 `[backup]` in the config file and the server takes a `VACUUM INTO` snapshot

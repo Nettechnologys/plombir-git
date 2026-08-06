@@ -419,8 +419,8 @@ pub(crate) async fn cmd_import(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = dbconn::connect(&db_url).await?;
-    rg_db::run_migrations(&db).await?;
+    let db = dbconn::connect_offline_migration(&db_url).await?;
+    rg_db::run_migrations(db.connection()).await?;
 
     // Verify platform is valid
     if platform != "github" && platform != "gitlab" {
@@ -443,7 +443,7 @@ pub(crate) async fn cmd_import(
     // Start import
     println!("\n⏳ Starting import...");
     let task = rg_core::import::service::start_import(
-        &db,
+        db.connection(),
         1, // user_id — in CLI mode, default to admin (ID 1)
         platform,
         source_url,
@@ -467,7 +467,7 @@ pub(crate) async fn cmd_import(
     // Poll until complete
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let current = rg_db::ops::import_task_ops::find_by_id(&db, task.id)
+        let current = rg_db::ops::import_task_ops::find_by_id(db.connection(), task.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("import task disappeared"))?;
 
@@ -600,11 +600,16 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
                 "Connecting to database: {}",
                 rg_db::redact_database_url(&db_url)
             );
-            let db = dbconn::connect(&db_url).await?;
-            rg_db::run_migrations(&db).await?;
+            let db = dbconn::connect_offline_migration(&db_url).await?;
+            rg_db::run_migrations(db.connection()).await?;
 
-            match rg_core::package_registry::service::list_packages(&db, &owner, &repo, &pkg_type)
-                .await
+            match rg_core::package_registry::service::list_packages(
+                db.connection(),
+                &owner,
+                &repo,
+                &pkg_type,
+            )
+            .await
             {
                 Ok(packages) => {
                     println!("Packages ({}) in {}/{}:", pkg_type, owner, repo);

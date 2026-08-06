@@ -38,6 +38,9 @@ pub(crate) enum PackageCmd {
     },
 
     /// List packages in a repository registry
+    ///
+    /// File-backed SQLite applies pending migrations before listing and requires
+    /// every ForgeKeep server using that database to be stopped.
     List {
         /// Owner of the repository
         owner: String,
@@ -421,6 +424,9 @@ pub(crate) enum Commands {
     },
 
     /// Import a repository from GitHub or GitLab
+    ///
+    /// File-backed SQLite applies pending migrations before importing and
+    /// requires every ForgeKeep server using that database to be stopped.
     Import {
         /// Source platform: "github" or "gitlab"
         #[arg(value_parser = ["github", "gitlab"])]

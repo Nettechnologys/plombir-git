@@ -187,6 +187,12 @@ mod tests {
         assert!(super::acquire_server("postgres://localhost/forgekeep")
             .unwrap()
             .is_none());
+        assert!(super::acquire_migration("postgres://localhost/forgekeep")
+            .unwrap()
+            .is_none());
+        assert!(super::acquire_migration("mysql://localhost/forgekeep")
+            .unwrap()
+            .is_none());
         assert!(super::acquire_restore("postgres://localhost/forgekeep")
             .unwrap()
             .is_none());

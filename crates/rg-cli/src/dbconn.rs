@@ -49,8 +49,8 @@ pub(crate) async fn connect_server_with_timeouts(
     })
 }
 
-/// Open the pool used by `forgekeep migrate`, after proving a file-backed
-/// SQLite server is not alive against the same database.
+/// Open a standalone CLI pool that may apply migrations, after proving a
+/// file-backed SQLite server is not alive against the same database.
 pub(crate) async fn connect_offline_migration(
     db_url: &str,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
