@@ -90,6 +90,21 @@ pub struct SearchCodeQuery {
     pub limit: Option<i64>,
 }
 
+const DEFAULT_AI_LIMIT: i64 = 20;
+const MAX_AI_LIMIT: i64 = 100;
+
+/// Validate the signed HTTP boundary before converting it to a collection size.
+fn ai_limit(limit: Option<i64>) -> Result<usize, AppError> {
+    let limit = limit.unwrap_or(DEFAULT_AI_LIMIT);
+    if limit <= 0 {
+        return Err(AppError::bad_request("limit must be greater than zero"));
+    }
+
+    // The positive value is capped at 100 before conversion, so it fits every
+    // supported target's `usize` without a wrapping cast.
+    Ok(usize::try_from(limit.min(MAX_AI_LIMIT)).expect("validated AI result limit is at most 100"))
+}
+
 // ── Handlers ──────────────────────────────────────
 
 /// GET /api/v1/ai/repos/{owner}/{name}/summary
@@ -131,10 +146,11 @@ pub async fn ai_repo_summary(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
         ("state" = Option<String>, Query, description = "open | closed (default: open)"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 20)"),
+        ("limit" = Option<i64>, Query, description = "Max results (1-100, default 20)"),
     ),
     responses(
         (status = 200, description = "Issue list", body = Vec<IssueSummary>),
+        (status = 400, description = "Invalid limit"),
         (status = 404, description = "Repository not found"),
     ),
     tag = "ai",
@@ -145,13 +161,13 @@ pub async fn ai_list_issues(
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<IssueListQuery>,
 ) -> Result<(StatusCode, Json<Vec<IssueSummary>>), AppError> {
+    let limit = ai_limit(params.limit)?;
     let state_filter = params.state.as_deref().unwrap_or("open");
 
     let issues = rg_core::issue::service::list_issues(&state.db, &owner, &name, Some(state_filter))
         .await
         .map_err(AppError::from)?;
 
-    let limit = params.limit.unwrap_or(20) as usize;
     let summaries = issues
         .into_iter()
         .take(limit)
@@ -175,10 +191,11 @@ pub async fn ai_list_issues(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
         ("state" = Option<String>, Query, description = "open | closed | merged (default: open)"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 20)"),
+        ("limit" = Option<i64>, Query, description = "Max results (1-100, default 20)"),
     ),
     responses(
         (status = 200, description = "PR list", body = Vec<PrSummary>),
+        (status = 400, description = "Invalid limit"),
         (status = 404, description = "Repository not found"),
     ),
     tag = "ai",
@@ -189,6 +206,7 @@ pub async fn ai_list_prs(
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PrListQuery>,
 ) -> Result<(StatusCode, Json<Vec<PrSummary>>), AppError> {
+    let limit = ai_limit(params.limit)?;
     let state_filter = params.state.as_deref().unwrap_or("open");
 
     let prs =
@@ -196,7 +214,6 @@ pub async fn ai_list_prs(
             .await
             .map_err(AppError::from)?;
 
-    let limit = params.limit.unwrap_or(20) as usize;
     let summaries = prs
         .into_iter()
         .take(limit)
@@ -263,11 +280,11 @@ pub struct CodeSearchResult {
         ("name" = String, Path, description = "Repository name"),
         ("q" = String, Query, description = "Search query"),
         ("ref" = Option<String>, Query, description = "Branch/tag/SHA (default: default branch)"),
-        ("limit" = Option<i64>, Query, description = "Max results (default 20)"),
+        ("limit" = Option<i64>, Query, description = "Max results (1-100, default 20)"),
     ),
     responses(
         (status = 200, description = "Code search results", body = Vec<CodeSearchResult>),
-        (status = 400, description = "Repository not indexed"),
+        (status = 400, description = "Invalid limit or repository not indexed"),
         (status = 404, description = "Repository not found"),
     ),
     tag = "ai",
@@ -278,7 +295,8 @@ pub async fn ai_search_code(
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<SearchCodeQuery>,
 ) -> Result<(StatusCode, Json<Vec<CodeSearchResult>>), AppError> {
-    let limit = params.limit.unwrap_or(20).min(100) as u64;
+    let limit =
+        u64::try_from(ai_limit(params.limit)?).expect("validated AI result limit is at most 100");
     let offset = 0u64;
 
     let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone());
@@ -388,5 +406,29 @@ pub async fn ai_index_repository(
         // (Whether this handler is reachable at all is a separate question —
         // it is not mounted, tracked as dead wiring in card_928d72df493a.)
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ai_limit;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn ai_limit_rejects_non_positive_values_and_caps_positive_values() {
+        for invalid in [i64::MIN, -1, 0] {
+            let error = ai_limit(Some(invalid)).expect_err("non-positive limit must fail");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        }
+
+        for (input, expected) in [
+            (None, 20),
+            (Some(1), 1),
+            (Some(100), 100),
+            (Some(101), 100),
+            (Some(i64::MAX), 100),
+        ] {
+            assert_eq!(ai_limit(input).expect("valid limit"), expected);
+        }
     }
 }
