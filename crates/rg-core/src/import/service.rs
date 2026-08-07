@@ -125,10 +125,10 @@ pub async fn run_import(
 ///
 /// The recheck sits as close to the subprocess as the code allows.
 /// [`resolve_or_create_target_repo`] runs once, at the top of the pass, and
-/// `clone_repo` then decides what to do from the presence of a `HEAD` file
-/// alone: a repository deleted in between has had `<owner>/<name>.git` retired,
-/// so the missing directory reads as "nothing here yet" and the whole upstream
-/// is written back under the canonical name (card_a3ce6a2363a7). The deletion
+/// `clone_repo` then decides what to do from what is on disk alone: a
+/// repository deleted in between has had `<owner>/<name>.git` retired, so the
+/// missing directory reads as "nothing here yet" and the whole upstream is
+/// written back under the canonical name (card_a3ce6a2363a7). The deletion
 /// quiescence gate refuses while an import is in a running status; this closes
 /// the window *between* that query and this `git`, which no single query can.
 #[allow(clippy::too_many_arguments)]
@@ -157,20 +157,27 @@ async fn clone_into_target(
         );
     }
 
-    clone_repo(
+    let outcome = clone_repo(
         clone_url,
         repo_root,
         &task.target_owner,
         &task.target_name,
         source_credentials(&task.platform, &task.source_url, token).as_ref(),
     )?;
-    stats.repo_cloned = true;
+    // The fact, not the intention. Set unconditionally, this reported the one
+    // case where the clone deliberately does nothing exactly like a clone that
+    // transferred the whole upstream — and the status response is all a user
+    // has to tell an imported repository from an empty one.
+    stats.repo_cloned = outcome == CloneOutcome::Cloned;
     update_stage(
         db,
         task.id,
         "importing",
         progress_when_done,
-        "Repository cloned",
+        match outcome {
+            CloneOutcome::Cloned => "Repository cloned",
+            CloneOutcome::Skipped => "Target already holds a repository — clone skipped",
+        },
     )
     .await?;
 
@@ -737,7 +744,129 @@ fn source_credentials(platform: &str, source_url: &str, token: &str) -> Option<G
     Some(GitCredentials::token(&username, token))
 }
 
+/// What the clone step did with `<owner>/<name>.git`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneOutcome {
+    /// The upstream was transferred and is installed at the target path.
+    Cloned,
+    /// The target already held a repository with refs of its own. Nothing was
+    /// cloned, and nothing was overwritten.
+    Skipped,
+}
+
+/// Whether `<owner>/<name>.git` already holds a repository of its own.
+///
+/// Fail-closed on purpose: a target that cannot be opened or whose refs cannot
+/// be read counts as holding history, so a repository the import cannot
+/// understand is never cloned over. Only the two states an import may write
+/// into answer `false` — nothing on disk at all, and the ref-less bare skeleton
+/// [`crate::repo::service::create_repo`] leaves behind.
+fn target_holds_history(target_dir: &Path) -> bool {
+    if !target_dir.exists() {
+        return false;
+    }
+    match rg_git::ref_advertisement::collect(target_dir) {
+        Ok(advertisement) => !advertisement.refs.is_empty(),
+        Err(error) => {
+            tracing::warn!(
+                path = %target_dir.display(),
+                error = %format!("{error:#}"),
+                "the import target could not be read — treating it as an existing repository \
+                 rather than cloning over it"
+            );
+            true
+        }
+    }
+}
+
+/// Remove a clone that never made it onto the target path.
+fn discard_partial_clone(staging: &Path) {
+    if !staging.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(staging) {
+        tracing::warn!(
+            path = %staging.display(),
+            error = %error,
+            "a partial import clone could not be removed and is now unreferenced bytes under \
+             the repository root"
+        );
+    }
+}
+
+/// Move a finished clone onto the target path, retiring the skeleton the
+/// repository's creation left there.
+///
+/// Two renames inside one directory rather than "remove the skeleton, then
+/// rename": the skeleton is discarded only once the clone is in its place, so a
+/// failure in between is undone instead of leaving the repository's row
+/// pointing at a path with nothing on it. Both renames stay within `parent`, so
+/// neither can fail for crossing a filesystem boundary.
+fn install_clone(staging: &Path, retired: &Path, target_dir: &Path) -> Result<()> {
+    let occupied = target_dir.exists();
+    if occupied {
+        std::fs::rename(target_dir, retired).map_err(|error| {
+            path_error(
+                "the empty repository the import replaces",
+                target_dir,
+                &error,
+                REPO_ROOT_HINT,
+            )
+        })?;
+    }
+
+    if let Err(error) = std::fs::rename(staging, target_dir) {
+        let failure = path_error(
+            "the imported repository",
+            target_dir,
+            &error,
+            REPO_ROOT_HINT,
+        );
+        if occupied {
+            if let Err(restore) = std::fs::rename(retired, target_dir) {
+                tracing::error!(
+                    path = %target_dir.display(),
+                    retired = %retired.display(),
+                    error = %restore,
+                    "the import could not install its clone and could not put the repository \
+                     it moved aside back — the target path is empty and the row still names it"
+                );
+            }
+        }
+        return Err(failure);
+    }
+
+    if occupied {
+        if let Err(error) = std::fs::remove_dir_all(retired) {
+            tracing::warn!(
+                path = %retired.display(),
+                error = %error,
+                "the empty repository the import replaced could not be removed and is now \
+                 unreferenced bytes under the repository root"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Clone a repository (bare) into the ForgeKeep repo root.
+///
+/// ## Why this does not simply clone into the target path
+///
+/// By the time an import reaches `git`, `<owner>/<name>.git` usually already
+/// exists: on the main path the import creates its own target, and
+/// [`crate::repo::service::create_repo`] writes a bare skeleton — `HEAD`,
+/// `refs/`, `objects/` — before returning. `git clone --bare` refuses a
+/// destination that exists, so "does the path exist" cannot be the question.
+/// Asking it (as a `HEAD`-file check) made the clone a no-op for precisely the
+/// scenario the feature exists for: the import returned success having never
+/// spawned `git`, and the user was handed the empty skeleton back.
+///
+/// So the question is whether the target holds any *history*, and the clone
+/// lands beside it and is moved into place. A clone that dies half-way leaves
+/// the skeleton — and the repository the row points at — untouched.
+///
+/// ## The token
 ///
 /// The source's token never enters `source_url` and never enters argv — it is
 /// handed to the subprocess through the environment by
@@ -751,14 +880,14 @@ fn clone_repo(
     owner: &str,
     name: &str,
     credentials: Option<&GitCredentials>,
-) -> Result<()> {
+) -> Result<CloneOutcome> {
     let target_dir = repo_root.join(format!("{}/{}.git", owner, name));
-    if target_dir.join("HEAD").exists() {
+    if target_holds_history(&target_dir) {
         tracing::info!(
             path = %target_dir.display(),
-            "Repository already exists, skipping clone"
+            "Import target already holds a repository, skipping clone"
         );
-        return Ok(());
+        return Ok(CloneOutcome::Skipped);
     }
 
     let parent = target_dir
@@ -770,18 +899,33 @@ fn clone_repo(
     std::fs::create_dir_all(parent)
         .map_err(|error| path_error("import target directory", parent, &error, REPO_ROOT_HINT))?;
 
+    // A per-pass token, so neither working path can collide with the target,
+    // with a repository sitting next to it, or with another pass importing the
+    // same name. The leading dot only keeps them out of the way visually.
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let staging = parent.join(format!(".{name}.git.importing-{token}"));
+    let retired = parent.join(format!(".{name}.git.replaced-{token}"));
+
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let invocation = credential_invocation(credentials);
-    let destination = target_dir.to_string_lossy();
-    invocation
-        .run(git, &["clone", "--bare", source_url, &destination], None)?
-        .ensure_success()
-        .context("git clone --bare")?;
+    let destination = staging.to_string_lossy();
+    let cloned = invocation
+        .run(git, &["clone", "--bare", source_url, &destination], None)
+        .and_then(|output| output.ensure_success().context("git clone --bare"));
+    if let Err(error) = cloned {
+        discard_partial_clone(&staging);
+        return Err(error);
+    }
+
+    if let Err(error) = install_clone(&staging, &retired, &target_dir) {
+        discard_partial_clone(&staging);
+        return Err(error);
+    }
 
     tracing::info!(path = %target_dir.display(), "Repository cloned");
-    Ok(())
+    Ok(CloneOutcome::Cloned)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2229,6 +2373,227 @@ mod import_target_lifecycle_tests {
         assert!(
             repo_root.path().join("importer/fresh.git/HEAD").exists(),
             "the create branch no longer initialises the target repository"
+        );
+    }
+}
+
+/// card_309ae53b1f5a: the import's whole reason for existing is that the
+/// upstream's objects end up in the target repository. Every test above this
+/// one asserts that a clone *did not* run; these assert that it did, against a
+/// real local bare source rather than a mock, because the defect was that no
+/// `git` ever ran and a mock would have hidden exactly that.
+#[cfg(test)]
+mod clone_effect_tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    fn git(args: &[&str], cwd: Option<&Path>) {
+        global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, cwd)
+            .expect("run git")
+            .ensure_success()
+            .expect("git command succeeds");
+    }
+
+    /// A bare repository holding one commit on `main`, standing in for the
+    /// upstream an import is pointed at.
+    fn upstream_with_a_commit(bare_path: &Path) -> String {
+        let bare_arg = bare_path.to_str().expect("UTF-8 bare path");
+        git(&["init", "-q", "--bare", "-b", "main", bare_arg], None);
+
+        let worktree = tempfile::tempdir().expect("upstream worktree");
+        let path = worktree.path();
+        let path_arg = path.to_str().expect("UTF-8 worktree path");
+        git(&["init", "-q", "-b", "main", path_arg], None);
+        git(&["config", "user.name", "Import fixture"], Some(path));
+        git(
+            &["config", "user.email", "import-fixture@example.invalid"],
+            Some(path),
+        );
+        std::fs::write(path.join("README.md"), "upstream\n").expect("write upstream file");
+        git(&["add", "."], Some(path));
+        git(&["commit", "-qm", "upstream commit"], Some(path));
+        git(&["remote", "add", "origin", bare_arg], Some(path));
+        git(&["push", "-q", "origin", "main"], Some(path));
+
+        let head = global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(&["rev-parse", "HEAD"], Some(path))
+            .expect("read the upstream commit");
+        head.ensure_success().expect("rev-parse succeeds");
+        head.stdout_str().trim().to_string()
+    }
+
+    async fn importing_user() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite pool");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(1, 'importer', 'importer@example.com', 'x', 0, 1, '2024-01-01 00:00:00', '2024-01-01 00:00:00')"
+                .to_string(),
+        ))
+        .await
+        .expect("seed the importing user");
+        db
+    }
+
+    async fn task_for(db: &DatabaseConnection, source_url: &str, target_name: &str) -> ImportTask {
+        let now = Utc::now();
+        import_task_ops::create(
+            db,
+            import_task::ActiveModel {
+                user_id: Set(1),
+                repo_id: Set(None),
+                platform: Set("git".to_string()),
+                source_url: Set(source_url.to_string()),
+                target_owner: Set("importer".to_string()),
+                target_name: Set(target_name.to_string()),
+                status: Set("cloning".to_string()),
+                progress: Set(0),
+                stage: Set(None),
+                error: Set(None),
+                user_mapping: Set(None),
+                import_repo: Set(true),
+                import_issues: Set(false),
+                import_pull_requests: Set(false),
+                import_wiki: Set(false),
+                import_releases: Set(false),
+                import_labels: Set(false),
+                import_milestones: Set(false),
+                stats: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the import task")
+    }
+
+    /// The main import path end to end: a target name that does not exist yet,
+    /// which the pass creates itself and then has to clone into. This is the
+    /// scenario the `HEAD`-file check turned into a no-op — the pass returned
+    /// success, `repo_cloned: true`, and an empty bare skeleton.
+    #[tokio::test]
+    async fn an_import_that_creates_its_own_target_still_transfers_the_upstream() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        let expected_commit = upstream_with_a_commit(&upstream);
+        let source_url = upstream.to_string_lossy().to_string();
+
+        let db = importing_user().await;
+        let repo_root = directory.path().join("repo_root");
+        let task = task_for(&db, &source_url, "fresh").await;
+
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "fresh", &repo_root)
+            .await
+            .expect("the import creates the target it was accepted for");
+
+        let mut stats = ImportStats::default();
+        clone_into_target(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect("the clone runs");
+
+        assert!(
+            stats.repo_cloned,
+            "the pass cloned the upstream but reported that it had not"
+        );
+
+        let target = repo_root.join("importer/fresh.git");
+        let advertisement =
+            rg_git::ref_advertisement::collect(&target).expect("read the imported repository");
+        assert_eq!(
+            advertisement.head_oid.as_deref(),
+            Some(expected_commit.as_str()),
+            "the import left a repository without the upstream's commit — refs: {:?}",
+            advertisement.refs
+        );
+
+        // The staging and retired working paths are internal; leaving either
+        // behind would be unreferenced bytes under the repository root.
+        let leftovers: Vec<_> = std::fs::read_dir(repo_root.join("importer"))
+            .expect("read the namespace directory")
+            .map(|entry| entry.expect("read a directory entry").file_name())
+            .filter(|name| name != "fresh.git")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the import left working directories behind: {leftovers:?}"
+        );
+    }
+
+    /// The other half of the honesty requirement: a target that already holds a
+    /// repository is left alone, and the pass says so instead of claiming a
+    /// clone. Nothing above this test would notice `repo_cloned` being wired to
+    /// a constant `true` again.
+    #[tokio::test]
+    async fn a_target_that_already_holds_a_repository_is_not_cloned_over() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        upstream_with_a_commit(&upstream);
+        let source_url = upstream.to_string_lossy().to_string();
+
+        let db = importing_user().await;
+        let repo_root = directory.path().join("repo_root");
+        let task = task_for(&db, &source_url, "occupied").await;
+
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "occupied", &repo_root)
+            .await
+            .expect("create the target");
+
+        // Give the target a history of its own, so it is no longer the empty
+        // skeleton the creation left.
+        let target = repo_root.join("importer/occupied.git");
+        let existing = upstream_with_a_commit(&directory.path().join("existing.git"));
+        git(
+            &[
+                "fetch",
+                "-q",
+                &directory.path().join("existing.git").to_string_lossy(),
+                "main:refs/heads/main",
+            ],
+            Some(&target),
+        );
+
+        let mut stats = ImportStats::default();
+        clone_into_target(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect("the pass completes");
+
+        assert!(
+            !stats.repo_cloned,
+            "the pass skipped the clone but reported one"
+        );
+        let advertisement =
+            rg_git::ref_advertisement::collect(&target).expect("read the target repository");
+        assert_eq!(
+            advertisement.refs,
+            vec![(existing, "refs/heads/main".to_string())],
+            "the import overwrote a repository that already had a history"
         );
     }
 }
