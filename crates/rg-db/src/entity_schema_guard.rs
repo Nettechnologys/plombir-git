@@ -87,6 +87,7 @@ probed_entities!(
     mfa_backup_code,
     milestone,
     mirror,
+    mirror_sync_lease,
     notification,
     oauth_account,
     oci_blob,

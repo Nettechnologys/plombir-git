@@ -239,11 +239,25 @@ pub fn mirror_clone_path(repo_root: &Path, repo_id: i64) -> std::path::PathBuf {
     repo_root.join(format!("{repo_id}.mirror"))
 }
 
-/// Sync a single mirror: clone (first time) or fetch (subsequent).
+/// Why a call to [`sync_mirror`] did or did not spend a `git` subprocess.
 ///
-/// Returns `Ok(true)` if a pass ran (successful or not — the outcome is on the
-/// row), `Ok(false)` if the operator has this mirror switched off, or if the
-/// repository that owns the mirror is gone.
+/// A `bool` used to carry this, and it stopped being enough once a refusal could
+/// mean three different things — "switched off", "its repository is gone" and
+/// "another pass holds it" are three different answers for the operator and only
+/// one of them is repaired by touching the mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// A pass ran. Whether it succeeded is recorded on the row.
+    Ran,
+    /// The operator has this mirror switched off.
+    SwitchedOff,
+    /// The repository that owns the mirror has been deleted.
+    RepositoryGone,
+    /// Another pass holds this mirror's sync lease right now.
+    AlreadySyncing,
+}
+
+/// Sync a single mirror: clone (first time) or fetch (subsequent).
 ///
 /// The guard tests for *switched off* and nothing else. It used to require
 /// `status == "active"`, which made it refuse exactly the mirrors this function
@@ -251,37 +265,104 @@ pub fn mirror_clone_path(repo_root: &Path, repo_id: i64) -> std::path::PathBuf {
 /// could then never be repaired by a later sync, because no later sync would
 /// run (card_770723efaa96). A failed pass is a reason to retry, not a reason to
 /// stop.
+///
+/// ## The lease
+///
+/// The row outlives its repository: `delete_repo` soft-deletes, so nothing
+/// cascades to `mirrors`, and a pass that ran anyway would `git clone` the whole
+/// upstream straight back into the directory the deletion just retired — bytes
+/// nothing owns, with no sweep that walks the filesystem to find them again
+/// (card_374998ffebc1). `list_due_sync` keeps such rows out of the sweep's
+/// selection, and this function used to re-read the repository immediately
+/// before `git` for the gap after that selection.
+///
+/// Re-reading is not enough, because the pass does not end at the check. `git
+/// clone --mirror` runs for minutes, writing to the absolute path it was handed,
+/// and a deletion that starts in that window retires the directory *underneath*
+/// a live subprocess which then re-creates it (card_a1f2a20281af). No column of
+/// `mirrors` distinguishes "a pass is running" from "a pass finished an hour
+/// ago" — `last_sync_at` is written after the fact — so the pass declares itself
+/// instead: [`rg_db::ops::mirror_ops::bid_for_sync_lease`] takes a lease that
+/// covers the whole subprocess and verifies the repository's lifecycle under the
+/// same transaction, and `delete_repo` reads it and backs off retryably.
 pub async fn sync_mirror(
     db: &DatabaseConnection,
     mirror: &Mirror,
     repo_root: &Path,
     encryption_key: &str,
-) -> Result<bool> {
+) -> Result<SyncOutcome> {
+    use rg_db::ops::mirror_ops::SyncLeaseBid;
+
     if mirror.status == STATUS_INACTIVE {
-        return Ok(false);
+        return Ok(SyncOutcome::SwitchedOff);
     }
 
-    // The row outlives its repository: `delete_repo` soft-deletes, so nothing
-    // cascades to `mirrors`, and a pass that ran anyway would `git clone` the
-    // whole upstream straight back into the directory the deletion just retired
-    // — bytes nothing owns, with no sweep that walks the filesystem to find
-    // them again (card_374998ffebc1). `list_due_sync` already keeps such rows
-    // out of the sweep's selection; this is the guard for the gap *after* that
-    // selection, which is minutes wide — one pass is a `git` subprocess per
-    // mirror — and for `trigger_sync`, which arrives with a row of its own.
-    if rg_db::ops::repo_ops::find_by_id(db, mirror.repo_id)
-        .await
-        .context("check that the mirror's repository still exists")?
-        .is_none()
-    {
-        tracing::debug!(
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let bid = rg_db::ops::mirror_ops::bid_for_sync_lease(
+        db,
+        mirror.repo_id,
+        &token,
+        Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .context("bid for this mirror's sync lease")?;
+    match bid {
+        SyncLeaseBid::Granted | SyncLeaseBid::TakenOver => {}
+        SyncLeaseBid::Busy => {
+            tracing::debug!(
+                repo_id = mirror.repo_id,
+                mirror_id = mirror.id,
+                "skipping mirror sync: another pass is already syncing this mirror"
+            );
+            return Ok(SyncOutcome::AlreadySyncing);
+        }
+        SyncLeaseBid::RepositoryGone => {
+            tracing::debug!(
+                repo_id = mirror.repo_id,
+                mirror_id = mirror.id,
+                "skipping mirror sync: the repository that owns it is deleted"
+            );
+            return Ok(SyncOutcome::RepositoryGone);
+        }
+    }
+
+    let pass = run_sync_pass(db, mirror, repo_root, encryption_key).await;
+
+    // Released however the pass went, including on the error paths above it:
+    // holding it any longer would keep the repository undeletable for the whole
+    // staleness horizon. A release that fails is logged rather than propagated —
+    // the pass itself is what the caller asked about, and the lease expires by
+    // itself.
+    match rg_db::ops::mirror_ops::release_sync_lease(db, mirror.repo_id, &token).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
             repo_id = mirror.repo_id,
             mirror_id = mirror.id,
-            "skipping mirror sync: the repository that owns it is deleted"
-        );
-        return Ok(false);
+            "this mirror's sync lease was taken over while its pass was still running"
+        ),
+        Err(error) => tracing::warn!(
+            repo_id = mirror.repo_id,
+            mirror_id = mirror.id,
+            error = %format!("{error:#}"),
+            "the mirror sync lease could not be released and will block this repository's \
+             deletion until it goes stale"
+        ),
     }
 
+    pass.map(|()| SyncOutcome::Ran)
+}
+
+/// One mirror pass, from the credential to the row that records how it went.
+///
+/// Split out of [`sync_mirror`] so there is exactly one acquire and one release
+/// of the sync lease however this returns — the same shape
+/// `move_repository_storage_and_commit` gives the transfer lease.
+async fn run_sync_pass(
+    db: &DatabaseConnection,
+    mirror: &Mirror,
+    repo_root: &Path,
+    encryption_key: &str,
+) -> Result<()> {
     let repo_path = mirror_clone_path(repo_root, mirror.repo_id);
 
     // Decrypt before the guard so a credential that can no longer be read is
@@ -348,7 +429,7 @@ pub async fn sync_mirror(
     }
 
     rg_db::ops::mirror_ops::update(db, model).await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Sync all due mirrors (called by background task / cron).
@@ -362,8 +443,10 @@ pub async fn sync_due_mirrors(
     let mut count = 0;
     for mirror in &mirrors {
         match sync_mirror(db, mirror, repo_root, encryption_key).await {
-            Ok(true) => count += 1,
-            Ok(false) => { /* switched off, or its repository is gone — skip */ }
+            Ok(SyncOutcome::Ran) => count += 1,
+            // Switched off, repository gone, or already being synced by someone
+            // else — none of the three is this sweep's to report.
+            Ok(_) => {}
             Err(e) => {
                 tracing::error!(mirror_id = %mirror.id, error = %format!("{e:#}"), "mirror sync failed")
             }
@@ -389,23 +472,26 @@ pub async fn trigger_sync(
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
-    if !sync_mirror(db, &mirror, repo_root, encryption_key).await? {
-        // Two reasons now decline a pass, and the operator has to be told which
-        // one: a deleted repository is not something flipping `status` repairs.
-        // (Reaching this with a deleted repository takes the row outliving its
-        // repository *and* a caller that resolved it some other way — every HTTP
-        // route here resolves the repository first.)
-        if mirror.status == STATUS_INACTIVE {
-            return Err(crate::error::conflict(
-                "this mirror is switched off — set its status to `active` before syncing it",
-            ));
-        }
-        return Err(crate::error::conflict(
+    // Three reasons now decline a pass, and the operator has to be told which
+    // one: a deleted repository is not something flipping `status` repairs, and
+    // a pass already running is not something to repair at all.
+    // (Reaching this with a deleted repository takes the row outliving its
+    // repository *and* a caller that resolved it some other way — every HTTP
+    // route here resolves the repository first.)
+    match sync_mirror(db, &mirror, repo_root, encryption_key).await? {
+        SyncOutcome::Ran => Ok(()),
+        SyncOutcome::SwitchedOff => Err(crate::error::conflict(
+            "this mirror is switched off — set its status to `active` before syncing it",
+        )),
+        SyncOutcome::RepositoryGone => Err(crate::error::conflict(
             "the repository this mirror belongs to has been deleted; the mirror can no longer be \
              synced",
-        ));
+        )),
+        SyncOutcome::AlreadySyncing => Err(crate::error::conflict(
+            "this mirror is already syncing; wait for the pass in flight to finish before \
+             starting another",
+        )),
     }
-    Ok(())
 }
 
 // ── Credentials ─────────────────────────────────────────────────────────

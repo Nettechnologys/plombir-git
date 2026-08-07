@@ -325,11 +325,24 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
         "the scheduler still selects the mirror of a deleted repository"
     );
 
-    assert!(
-        !rg_core::mirror::service::sync_mirror(&db, &mirror, &state.repo_root, TEST_ENCRYPTION_KEY)
+    assert_eq!(
+        rg_core::mirror::service::sync_mirror(&db, &mirror, &state.repo_root, TEST_ENCRYPTION_KEY)
             .await
             .expect("sync the mirror of a deleted repository"),
+        rg_core::mirror::service::SyncOutcome::RepositoryGone,
         "a mirror handed directly to `sync_mirror` after its repository was deleted still ran a pass"
+    );
+    assert!(
+        rg_db::ops::mirror_ops::sync_lease_in_flight(
+            &db,
+            repo_id,
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("read the mirror sync lease after a refused pass")
+        .is_none(),
+        "a pass that refused to run left its sync lease behind, so nothing could ever delete this \
+         repository again"
     );
     assert_eq!(
         rg_core::mirror::service::sync_due_mirrors(&db, &state.repo_root, 10, TEST_ENCRYPTION_KEY)
@@ -354,6 +367,289 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
     assert!(
         after.last_sync_at.is_none(),
         "a sync pass ran for a deleted repository: {after:?}"
+    );
+}
+
+/// Configure a mirror on `owner/name` and return the path its clone occupies,
+/// already seeded with the bytes one completed pass leaves behind.
+async fn seed_mirrored_repository(
+    base: &str,
+    token: &str,
+    repo_root: &std::path::Path,
+    owner: &str,
+    name: &str,
+    repo_id: i64,
+) -> std::path::PathBuf {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos/{owner}/{name}/mirror"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"url": MIRROR_REMOTE, "sync_interval_seconds": 3600}))
+        .send()
+        .await
+        .expect("configure the mirror");
+    assert_eq!(response.status(), 201, "baseline mirror create");
+
+    let clone = repo_root.join(format!("{repo_id}.mirror"));
+    std::fs::create_dir_all(clone.join("objects")).expect("seed the mirror clone");
+    std::fs::write(clone.join("HEAD"), b"ref: refs/heads/main\n").expect("seed the mirror HEAD");
+    std::fs::write(clone.join("objects/pack-payload"), b"upstream bytes")
+        .expect("seed the mirror payload");
+    clone
+}
+
+/// card_a1f2a20281af: the residual half of card_374998ffebc1. Re-reading the
+/// repository's lifecycle right before `git` keeps a pass from *starting* under
+/// a completed deletion, but `git clone --mirror` then runs for minutes against
+/// the absolute path it was handed — so a deletion that begins inside that pass
+/// retires the clone directory underneath a live subprocess, answers `200`, and
+/// the subprocess puts a full copy of the upstream back.
+///
+/// Nothing on `mirrors` says "a pass is running" (`last_sync_at` is written
+/// afterwards), so the pass declares itself with a lease. Three claims:
+///   * a held lease refuses the deletion, before anything is staged;
+///   * the refusal is total, not just early — the guarded commit rolls back
+///     rather than soft-deleting a row a pass is still writing storage for;
+///   * a released lease stops refusing, and the deletion then owns the clone.
+#[tokio::test]
+async fn delete_repository_refuses_while_a_mirror_sync_is_in_flight() {
+    let (base, db, state) = spawn_test_app_with_state().await;
+    let (token, _) = register_full(&base, "delete-syncing", "delete-syncing@example.com").await;
+    let repo_id = create_repo(&base, &token, "syncing").await;
+    let clone = seed_mirrored_repository(
+        &base,
+        &token,
+        &state.repo_root,
+        "delete-syncing",
+        "syncing",
+        repo_id,
+    )
+    .await;
+    let git_dir = state.repo_root.join("delete-syncing/syncing.git");
+    assert!(
+        git_dir.join("HEAD").exists(),
+        "the fixture has no Git tree, so nothing below is being tested"
+    );
+
+    let stale_before = || chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER;
+    let holder = "pass-in-flight";
+    assert_eq!(
+        rg_db::ops::mirror_ops::bid_for_sync_lease(&db, repo_id, holder, stale_before())
+            .await
+            .expect("take the mirror sync lease"),
+        rg_db::ops::mirror_ops::SyncLeaseBid::Granted,
+        "the fixture could not take the lease, so nothing below is being tested"
+    );
+
+    let client = reqwest::Client::new();
+    let delete_url = format!("{base}/api/v1/repos/delete-syncing/syncing");
+    let response = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository whose mirror is syncing");
+    assert_eq!(
+        response.status(),
+        409,
+        "the deletion did not refuse a mirror sync in flight"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .expect("re-read the repository")
+            .is_some(),
+        "the refused deletion soft-deleted the row anyway"
+    );
+    assert_eq!(
+        std::fs::read(clone.join("objects/pack-payload"))
+            .expect("the mirror clone was staged aside by a refused deletion"),
+        b"upstream bytes",
+        "the refused deletion did not leave the mirror clone where its `git` subprocess is writing"
+    );
+    assert!(
+        git_dir.join("HEAD").exists(),
+        "the refused deletion left the Git tree staged aside"
+    );
+
+    // The gate above runs before anything is staged, so on its own it only
+    // narrows the window: a pass that takes the lease *after* the gate and
+    // before the commit would still be running while the row went away. The
+    // commit itself has to refuse, and refuse without writing.
+    assert_eq!(
+        rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(&db, repo_id, stale_before())
+            .await
+            .expect("run the guarded soft-delete under a held lease"),
+        rg_db::ops::repo_ops::RepositoryRetirement::MirrorSyncInFlight,
+        "the transaction that retires the row cannot see the lease its own gate reads"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .expect("re-read the repository after the guarded soft-delete")
+            .is_some(),
+        "the guarded soft-delete refused and left the row deleted anyway"
+    );
+
+    // The pass finished. Nothing is writing that directory any more.
+    assert!(
+        rg_db::ops::mirror_ops::release_sync_lease(&db, repo_id, holder)
+            .await
+            .expect("release the mirror sync lease"),
+        "the holder could not release its own lease"
+    );
+    let response = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository whose mirror sync has finished");
+    assert_eq!(
+        response.status(),
+        200,
+        "the gate kept refusing after the mirror sync had finished: {}",
+        response.text().await.unwrap_or_default()
+    );
+    assert!(
+        !clone.exists(),
+        "DELETE returned success with a full copy of the upstream still at {}",
+        clone.display()
+    );
+}
+
+/// The gate and the guarded commit both answer `409`, so the response alone
+/// cannot say which of them refused — and they are not interchangeable. The
+/// gate's whole job is to refuse *before the first rename*, so a deletion that
+/// reached staging is a different behaviour wearing the same status code.
+///
+/// A blob store that cannot perform the prefix move is what tells them apart: a
+/// deletion that got as far as staging answers `500`. A `409` here is the proof
+/// that the blob store was never asked.
+#[tokio::test]
+async fn a_mirror_sync_in_flight_is_refused_before_anything_is_staged() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let (token, _) = register_full(
+        &app.base,
+        "delete-sync-early",
+        "delete-sync-early@example.com",
+    )
+    .await;
+    let repo_id = create_repo(&app.base, &token, "untouched").await;
+
+    // Something for the prepare step to trip over. Without a blob under the
+    // repository's prefix the move has nothing to do and cannot fail, which
+    // would make the assertion below true for the wrong reason.
+    let package = representative_keys("delete-sync-early", "untouched", repo_id)
+        .into_iter()
+        .next()
+        .unwrap();
+    let package_path = package
+        .as_str()
+        .split('/')
+        .fold(app.repo_root.clone(), |path, segment| path.join(segment));
+    std::fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+    std::fs::write(&package_path, b"keep this blob").unwrap();
+
+    assert_eq!(
+        rg_db::ops::mirror_ops::bid_for_sync_lease(
+            &app.db,
+            repo_id,
+            "pass-in-flight",
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("take the mirror sync lease"),
+        rg_db::ops::mirror_ops::SyncLeaseBid::Granted,
+        "the fixture could not take the lease, so nothing below is being tested"
+    );
+
+    app.blob_faults.fail_delete();
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{}/api/v1/repos/delete-sync-early/untouched",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository whose mirror is syncing, with a broken blob store");
+    assert_eq!(
+        response.status(),
+        409,
+        "the deletion staged storage before it noticed the mirror sync holding the repository"
+    );
+    app.blob_faults.heal();
+    assert_eq!(
+        std::fs::read(&package_path).expect("the blob was staged aside"),
+        b"keep this blob"
+    );
+}
+
+/// The other end of the same lease: a holder that died mid-clone can never
+/// release, and a repository whose mirror crashed once must not become
+/// permanently undeletable. Past the staleness horizon the lease stops being an
+/// answer — for the gate and for the guarded commit alike.
+#[tokio::test]
+async fn a_stale_mirror_sync_lease_does_not_make_a_repository_undeletable() {
+    let (base, db, state) = spawn_test_app_with_state().await;
+    let (token, _) = register_full(&base, "delete-stale", "delete-stale@example.com").await;
+    let repo_id = create_repo(&base, &token, "abandoned").await;
+    let clone = seed_mirrored_repository(
+        &base,
+        &token,
+        &state.repo_root,
+        "delete-stale",
+        "abandoned",
+        repo_id,
+    )
+    .await;
+
+    assert_eq!(
+        rg_db::ops::mirror_ops::bid_for_sync_lease(
+            &db,
+            repo_id,
+            "crashed-pass",
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("take the mirror sync lease"),
+        rg_db::ops::mirror_ops::SyncLeaseBid::Granted,
+        "the fixture could not take the lease, so nothing below is being tested"
+    );
+    // The process behind it is gone; only the row is left, and it is older than
+    // any pass could still be running for.
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let lease = rg_db::entities::mirror_sync_lease::Entity::find()
+        .filter(rg_db::entities::mirror_sync_lease::Column::RepoId.eq(repo_id))
+        .one(&db)
+        .await
+        .expect("read the mirror sync lease")
+        .expect("the lease row");
+    let mut model: rg_db::entities::mirror_sync_lease::ActiveModel = lease.into();
+    model.since = sea_orm::ActiveValue::Set(
+        chrono::Utc::now()
+            - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER
+            - chrono::Duration::minutes(1),
+    );
+    sea_orm::ActiveModelTrait::update(model, &db)
+        .await
+        .expect("age the mirror sync lease past its staleness horizon");
+
+    let response = reqwest::Client::new()
+        .delete(format!("{base}/api/v1/repos/delete-stale/abandoned"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository whose mirror sync lease has gone stale");
+    assert_eq!(
+        response.status(),
+        200,
+        "a dead mirror pass made its repository permanently undeletable: {}",
+        response.text().await.unwrap_or_default()
+    );
+    assert!(
+        !clone.exists(),
+        "DELETE returned success with a full copy of the upstream still at {}",
+        clone.display()
     );
 }
 

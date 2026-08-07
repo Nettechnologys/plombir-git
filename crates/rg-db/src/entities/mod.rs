@@ -29,6 +29,7 @@ pub mod merge_queue_entry;
 pub mod mfa_backup_code;
 pub mod milestone;
 pub mod mirror;
+pub mod mirror_sync_lease;
 pub mod notification;
 pub mod oauth_account;
 pub mod oci_blob;

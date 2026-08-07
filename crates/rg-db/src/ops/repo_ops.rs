@@ -297,6 +297,87 @@ pub async fn soft_delete(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Whether the guarded soft-delete committed, or found a writer whose bytes it
+/// would have orphaned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryRetirement {
+    /// The row is soft-deleted.
+    Deleted,
+    /// A mirror pass holds this repository's sync lease; nothing was written.
+    MirrorSyncInFlight,
+}
+
+/// Soft-delete a repository unless a mirror pass is writing its clone directory.
+///
+/// `delete_repo`'s quiescence gate already reads the same lease twice — once
+/// before it stages anything, once after — but a gate and the write it guards
+/// are two statements, and a pass that takes the lease between them would spend
+/// the next several minutes re-creating `<repo_root>/<repo_id>.mirror` by
+/// absolute path, after the deletion had removed it and answered `200`
+/// (`card_a1f2a20281af`). The gate narrows that window; only doing the check and
+/// the write under one transaction closes it.
+///
+/// The UPDATE comes *before* the read deliberately, and this is the half that
+/// makes the protocol total. It takes the repository row's exclusive lock — the
+/// same row [`crate::ops::mirror_ops::bid_for_sync_lease`] reads under
+/// `lock_exclusive` before it admits a pass — so the two transactions are
+/// ordered by the database rather than by luck, whichever arrives first:
+///
+/// * this one first ⇒ the bid waits on the row, then reads a soft-deleted
+///   repository and declines;
+/// * the bid first ⇒ its lease is committed and visible here, and this
+///   transaction rolls back;
+/// * the bid first but still open ⇒ its lease is invisible here and this commits,
+///   after which the bid's locked read finally returns a soft-deleted repository
+///   and declines anyway.
+///
+/// Writing first is also what makes it work on SQLite, where `lock_exclusive` is
+/// a no-op: a transaction that reads and then writes leaves a lock-upgrade
+/// window, while one whose first statement is a write takes the single writer
+/// slot outright — the ordering [`transfer_owner`] and [`bid_for_transfer_lease`]
+/// already rely on.
+pub async fn soft_delete_unless_mirror_syncing(
+    db: &DatabaseConnection,
+    id: i64,
+    stale_before: DateTimeUtc,
+) -> Result<RepositoryRetirement> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin guarded repository soft delete")?;
+
+    let updated = RepoEntity::update_many()
+        .col_expr(repository::Column::DeletedAt, Expr::value(Some(Utc::now())))
+        .filter(repository::Column::Id.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: soft delete repo")?;
+    if updated.rows_affected != 1 {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back a soft delete of a repository that is not there")?;
+        return Err(anyhow::anyhow!("repository not found"));
+    }
+
+    let syncing = crate::ops::mirror_ops::sync_lease_in_flight(&transaction, id, stale_before)
+        .await
+        .context("db: check for a mirror sync in flight while soft-deleting a repository")?;
+    if syncing.is_some() {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back a soft delete a mirror sync is holding")?;
+        return Ok(RepositoryRetirement::MirrorSyncInFlight);
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("db: commit guarded repository soft delete")?;
+    Ok(RepositoryRetirement::Deleted)
+}
+
 /// Update stars_count for a repository based on actual star count (atomic).
 pub async fn update_stars_count(db: &DatabaseConnection, id: i64) -> Result<()> {
     let backend = db.get_database_backend();

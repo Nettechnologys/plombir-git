@@ -1912,7 +1912,44 @@ async fn ensure_repository_deletion_is_quiescent(
              before deleting the repository"
         )));
     }
+
+    // And the fourth: a mirror pass, which owns `<repo_root>/<repo_id>.mirror`
+    // for as long as its `git` subprocess runs. `sync_mirror` re-reads this
+    // repository's lifecycle immediately before it spawns `git`, which is what
+    // keeps a pass from *starting* under a completed deletion — but a pass that
+    // already started keeps writing to the absolute path it was handed, so a
+    // deletion beginning now would retire that directory and hand back a `200`
+    // while a full copy of somebody's upstream reappeared at the same path
+    // (card_a1f2a20281af).
+    //
+    // Refusing here is the cheap half: it costs no staging. The half that is
+    // load-bearing is `soft_delete_unless_mirror_syncing`, which repeats this
+    // read inside the transaction that soft-deletes the row — a gate and the
+    // write it guards are two statements, and the lease can be taken between
+    // them. Retryable on the same terms as the checks above: a pass ends by
+    // itself and `delete_repo` restores everything it staged.
+    if rg_db::ops::mirror_ops::sync_lease_in_flight(
+        db,
+        repo_id,
+        Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .context("failed to check for a mirror sync in flight before repository deletion")?
+    .is_some()
+    {
+        return Err(mirror_sync_in_flight());
+    }
     Ok(())
+}
+
+/// The refusal both mirror-sync checks give, so a caller cannot tell which of
+/// the two noticed — the early one that costs no staging, or the one inside the
+/// soft-delete transaction.
+fn mirror_sync_in_flight() -> anyhow::Error {
+    crate::error::conflict(
+        "this repository's mirror is syncing right now; wait for that pass to finish before \
+         deleting the repository",
+    )
 }
 
 /// Delete a repository's Git/blob data and soft-delete its metadata row.
@@ -2087,7 +2124,26 @@ pub async fn delete_repo(
         return Err(error);
     }
 
-    if let Err(error) = rg_db::ops::repo_ops::soft_delete(db, repo.id).await {
+    // The row leaves the live set here, and this is the last statement that can
+    // still be taken back. A mirror pass is the one writer whose claim can be
+    // read and refused *atomically* with the write — it holds a lease row — so
+    // that check rides inside this transaction rather than in front of it. See
+    // `soft_delete_unless_mirror_syncing` for why the update comes before the
+    // read there and what each interleaving resolves to.
+    let committed = match rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+        db,
+        repo.id,
+        Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    {
+        Ok(rg_db::ops::repo_ops::RepositoryRetirement::Deleted) => Ok(()),
+        Ok(rg_db::ops::repo_ops::RepositoryRetirement::MirrorSyncInFlight) => {
+            Err(mirror_sync_in_flight())
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = committed {
         oci_storage.restore_repository(staged_oci).await;
         restore_repository_filesystem_directories(&staged_directories, repo.id);
         restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
