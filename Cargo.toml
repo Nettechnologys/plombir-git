@@ -195,6 +195,28 @@ sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres
 [profile.dev]
 debug = "line-tables-only"
 
+# Keep the DWARF in the object files instead of copying it into every binary at
+# link time. The workspace produces ~50 test binaries, each statically linking
+# the same dependency graph, and each was carrying its own ~130 MB copy of the
+# same debug info (measured on `integration`: .debug_line 49 MB + .debug_str
+# 43 MB + .debug_info 21 MB + .debug_ranges 10 MB, of a 323 MB binary). Every
+# relink wrote all of it again, and this host is I/O-bound long before it is
+# CPU-bound (`/proc/pressure/io` sits around 25% "full" during a build).
+#
+# Measured, same machine, `touch crates/rg-core/src/lib.rs` then
+# `cargo test --workspace --no-run -j 6`:
+#
+#   off (default)   98.8 s
+#   unpacked        41.3 / 46.5 s      → 2.1-2.4x
+#
+# and `cargo test -p rg-http --no-run` after touching rg-http: 45.2 s → 18-30 s.
+#
+# Backtraces keep their line numbers as long as the `.dwo` files stay beside the
+# binary in `target/`, which is where every dev and CI run executes them. Release
+# builds are untouched — `[profile.release]` strips debug info outright, so the
+# docker image is byte-for-byte what it was.
+split-debuginfo = "unpacked"
+
 [profile.dev.package.argon2]
 opt-level = 3
 
