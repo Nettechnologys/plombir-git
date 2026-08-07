@@ -10,7 +10,14 @@
 # The cargo-free half is delegated to `scripts/run-local-gates.mjs` as ONE
 # target rather than spelled out below, so the set cannot drift away from the
 # workflow unnoticed; `scripts/local-gate-coverage-contract-check.mjs` fails when
-# it does. The Rust half stays here because it needs no such bookkeeping.
+# it does.
+#
+# The two cargo commands below are spelled out, because a Rust build is not a
+# thing that runner may charge a push for — but they are NOT unbookkept. Both are
+# declared in CARGO_JOBS there, and the same check greps this file for them, so
+# deleting a line below turns the gates red instead of removing them quietly.
+# The five cargo jobs that run in no place at all are declared there too, with
+# the reason each one cannot; the local runner prints their count on every push.
 #
 # Budget: ~15s for the cargo-free gates on a warm checkout, plus whatever clippy
 # costs on your target dir. Bypass remains Git's explicit `git push --no-verify`.

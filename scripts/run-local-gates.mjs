@@ -20,9 +20,10 @@
 // It is deliberately ONE target rather than a list of commands inside the hook:
 // a hook that spells out the commands drifts away from the workflow silently,
 // which is the same defect one level down. `scripts/local-gate-coverage-
-// contract-check.mjs` is the ratchet that keeps GATES below in step with the
-// workflow — it fails when a cargo-free job appears there and is mirrored by
-// neither GATES nor EXCLUDED.
+// contract-check.mjs` is the ratchet that keeps this file in step with the
+// workflow — every one of the twelve jobs must be accounted for below, and it
+// fails when one is not, when an entry names a job that no longer exists, or
+// when the hook stops invoking a cargo command CARGO_JOBS says it invokes.
 
 import { existsSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -41,6 +42,55 @@ export const EXCLUDED = new Map([
     'docker-image',
     'builds the release image: `[profile.release]` is fat-LTO with codegen-units=1, '
       + '~18 minutes and 243 MB measured cold. Nothing a pre-push hook may charge for.',
+  ],
+]);
+
+// The cargo half of regression.yml, and where each job actually runs today.
+// This runner does not execute any of them — a Rust build is not a pre-push
+// budget — but the accounting has to live somewhere, because without it the
+// cargo half is exactly the hand-written list this runner exists to replace:
+// `.githooks/pre-push` names two cargo commands, five jobs run nowhere at all,
+// and nothing goes red when either fact changes.
+//
+// Each entry declares one of two things, and the coverage contract check proves
+// it rather than trusting it:
+//   hook:      a command `.githooks/pre-push` must invoke. Delete the line from
+//              the hook and the check goes red, so the gate cannot be dropped
+//              quietly the way it could be while the hook was the only record.
+//   uncovered: this gate is enforced by NOTHING right now, with the reason it
+//              cannot be mirrored before a push. The count is printed, so
+//              "covered" and "half covered" stop looking identical.
+export const CARGO_JOBS = new Map([
+  ['fmt', { hook: 'cargo fmt' }],
+  ['clippy', { hook: 'cargo clippy' }],
+  [
+    'rust',
+    {
+      uncovered: 'the workspace test suite, doc-tests and the fresh-DB migration smoke; '
+        + '25-30 minutes measured, and `cargo test -p rg-http` is not yet green on HEAD anyway.',
+    },
+  ],
+  [
+    'security-audit',
+    {
+      uncovered: '`cargo audit`, `cargo deny` and osv-scanner need three tools installed and an '
+        + 'advisory-database fetch — a push must not depend on the network being up.',
+    },
+  ],
+  [
+    'git-protocol',
+    {
+      uncovered: 'drives a real git client over HTTP and SSH against a release build of ForgeKeep; '
+        + 'needs the binary built and ports bound.',
+    },
+  ],
+  [
+    'postgres-smoke',
+    { uncovered: 'needs a live PostgreSQL; the workflow gets one from a service container.' },
+  ],
+  [
+    'mysql-smoke',
+    { uncovered: 'needs a live MySQL; the workflow gets one from a service container.' },
   ],
 ]);
 
@@ -259,6 +309,17 @@ function main() {
     + (EXCLUDED.size > 0 ? `, ${EXCLUDED.size} cargo-free job(s) excluded by design` : '')
     + (failures.length > 0 ? `, ${failures.length} FAILED` : '');
   console.log(`\n${failures.length === 0 ? '✅' : '❌'} ${summary}`);
+
+  // Said out loud on every push: a green run here covers the cargo-free half and
+  // the two cargo commands the hook names. The rest of regression.yml is still
+  // enforced by nothing, and silence would read as coverage.
+  const uncovered = [...CARGO_JOBS].filter(([, where]) => where.uncovered).map(([job]) => job);
+  if (uncovered.length > 0) {
+    console.log(
+      `ℹ️  ${uncovered.length} gate(s) of regression.yml run nowhere — ${uncovered.join(', ')}. `
+        + 'CI has never executed a step; see the header of this file.',
+    );
+  }
 
   process.exit(failures.length === 0 ? 0 : 1);
 }
