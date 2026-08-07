@@ -273,6 +273,30 @@ pub async fn create(db: &DatabaseConnection, model: RepoActiveModel) -> Result<R
     model.insert(db).await.context("db: create repo")
 }
 
+/// Point `default_branch` at the branch the repository's Git `HEAD` names.
+///
+/// The column is written once, by `create_repo`, from what the *request* asked
+/// for. That holds for every repository whose history this instance produced —
+/// but an import replaces the whole repository with a clone of an upstream, and
+/// `git clone --bare` brings the upstream's `HEAD` with it. From that moment the
+/// column describes a branch that need not exist (`card_0e4d6e7fcdb2`), and the
+/// repository page — which resolves `default_branch` as a ref — answers `404`
+/// for a repository holding the full history.
+///
+/// Returns whether a live row was updated: `false` means the repository was
+/// deleted underneath the caller, not that the branch was already right.
+pub async fn set_default_branch(db: &DatabaseConnection, id: i64, branch: &str) -> Result<bool> {
+    let updated = RepoEntity::update_many()
+        .col_expr(repository::Column::DefaultBranch, Expr::value(branch))
+        .col_expr(repository::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(repository::Column::Id.eq(id))
+        .filter(repository::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: set repository default branch")?;
+    Ok(updated.rows_affected == 1)
+}
+
 /// Delete a repo by id.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
     RepoEntity::delete_by_id(id)

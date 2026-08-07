@@ -144,18 +144,17 @@ async fn clone_into_target(
 ) -> Result<()> {
     update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
 
-    if rg_db::ops::repo_ops::find_by_id(db, repo_id)
+    let Some(target_row) = rg_db::ops::repo_ops::find_by_id(db, repo_id)
         .await
         .context("failed to re-read the import target repository before cloning")?
-        .is_none()
-    {
+    else {
         anyhow::bail!(
             "the target repository '{}/{}' was deleted while this import was running; nothing \
              was cloned",
             task.target_owner,
             task.target_name
         );
-    }
+    };
 
     let outcome = clone_repo(
         clone_url,
@@ -169,6 +168,20 @@ async fn clone_into_target(
     // transferred the whole upstream — and the status response is all a user
     // has to tell an imported repository from an empty one.
     stats.repo_cloned = outcome == CloneOutcome::Cloned;
+
+    // Only a clone that ran replaced `HEAD`. A skipped one left the target's own
+    // history — and its own default branch — in place, and the column already
+    // describes it.
+    if outcome == CloneOutcome::Cloned {
+        adopt_cloned_default_branch(
+            db,
+            repo_id,
+            &repo_root.join(format!("{}/{}.git", task.target_owner, task.target_name)),
+            &target_row.default_branch,
+        )
+        .await;
+    }
+
     update_stage(
         db,
         task.id,
@@ -182,6 +195,96 @@ async fn clone_into_target(
     .await?;
 
     Ok(())
+}
+
+/// Make `repositories.default_branch` name the branch the freshly cloned
+/// repository's `HEAD` actually points at.
+///
+/// `create_repo` writes that column from what the *request* asked for — `main`
+/// unless told otherwise — and sets the bare repository's `HEAD` to match. An
+/// import then replaces the repository wholesale, and `git clone --bare` brings
+/// the upstream's `HEAD` with it. For an upstream on `master` (or `trunk`, or
+/// `devel`) the two disagree from that moment on, and nothing else ever writes
+/// the column: `resolve_content_ref` is handed `main`, finds neither
+/// `refs/heads/main` nor `refs/tags/main`, and the repository page of a
+/// repository holding the entire upstream history answers `404` — while
+/// `is_empty_repo` says `false`, so not even the empty-repository view renders
+/// (card_0e4d6e7fcdb2).
+///
+/// Deliberately not fatal. The bytes are in place and the import succeeded; a
+/// `HEAD` that cannot be read afterwards leaves the column exactly as stale as
+/// it was before this function existed, which is worth a warning naming the
+/// repository, not an import reported as failed after it transferred everything.
+///
+/// An unborn clone is skipped rather than adopted. With no refs at all there is
+/// no branch to describe, and the `HEAD` git wrote in that case can come from
+/// *this host's* `init.defaultBranch` rather than from the upstream — adopting
+/// it would replace a correct column with the server's local git config.
+async fn adopt_cloned_default_branch(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    repo_path: &Path,
+    recorded_branch: &str,
+) {
+    let advertisement = match rg_git::ref_advertisement::collect(repo_path) {
+        Ok(advertisement) => advertisement,
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                path = %repo_path.display(),
+                error = %format!("{error:#}"),
+                recorded_branch,
+                "could not read HEAD of the imported repository — its default branch column still \
+                 names the branch the repository was created with, which the upstream need not have"
+            );
+            return;
+        }
+    };
+
+    // Unborn: the clone carries no history, so there is no branch to adopt.
+    if advertisement.head_oid.is_none() {
+        return;
+    }
+
+    let Some(branch) = advertisement
+        .head_target
+        .as_deref()
+        .and_then(|target| target.strip_prefix("refs/heads/"))
+    else {
+        // Detached, or a symbolic HEAD pointing outside `refs/heads/`. Neither
+        // is a branch name the column can carry.
+        tracing::warn!(
+            repo_id,
+            path = %repo_path.display(),
+            head_target = ?advertisement.head_target,
+            "the imported repository's HEAD names no branch — leaving the default branch column"
+        );
+        return;
+    };
+
+    if branch == recorded_branch {
+        return;
+    }
+
+    match rg_db::ops::repo_ops::set_default_branch(db, repo_id, branch).await {
+        Ok(true) => tracing::info!(
+            repo_id,
+            from = recorded_branch,
+            to = branch,
+            "adopted the imported repository's default branch"
+        ),
+        // The repository was deleted while the clone ran. `clone_into_target`'s
+        // own recheck reports that case; there is nothing to correct here.
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            repo_id,
+            from = recorded_branch,
+            to = branch,
+            error = %format!("{error:#}"),
+            "could not record the imported repository's default branch — its page will resolve a \
+             branch the repository does not have"
+        ),
+    }
 }
 
 async fn run_git_import(
@@ -2400,13 +2503,21 @@ mod clone_effect_tests {
     /// A bare repository holding one commit on `main`, standing in for the
     /// upstream an import is pointed at.
     fn upstream_with_a_commit(bare_path: &Path) -> String {
+        upstream_with_a_commit_on(bare_path, "main")
+    }
+
+    /// The same fixture on a named default branch. Most upstreams are on
+    /// `main`, which is also what `create_repo` writes into the row — so a
+    /// fixture that only ever uses `main` cannot tell a column that tracks the
+    /// clone from one that never moved.
+    fn upstream_with_a_commit_on(bare_path: &Path, branch: &str) -> String {
         let bare_arg = bare_path.to_str().expect("UTF-8 bare path");
-        git(&["init", "-q", "--bare", "-b", "main", bare_arg], None);
+        git(&["init", "-q", "--bare", "-b", branch, bare_arg], None);
 
         let worktree = tempfile::tempdir().expect("upstream worktree");
         let path = worktree.path();
         let path_arg = path.to_str().expect("UTF-8 worktree path");
-        git(&["init", "-q", "-b", "main", path_arg], None);
+        git(&["init", "-q", "-b", branch, path_arg], None);
         git(&["config", "user.name", "Import fixture"], Some(path));
         git(
             &["config", "user.email", "import-fixture@example.invalid"],
@@ -2416,7 +2527,7 @@ mod clone_effect_tests {
         git(&["add", "."], Some(path));
         git(&["commit", "-qm", "upstream commit"], Some(path));
         git(&["remote", "add", "origin", bare_arg], Some(path));
-        git(&["push", "-q", "origin", "main"], Some(path));
+        git(&["push", "-q", "origin", branch], Some(path));
 
         let head = global_gateway()
             .as_ref()
@@ -2594,6 +2705,126 @@ mod clone_effect_tests {
             advertisement.refs,
             vec![(existing, "refs/heads/main".to_string())],
             "the import overwrote a repository that already had a history"
+        );
+    }
+
+    /// card_0e4d6e7fcdb2: the clone replaces `HEAD` along with everything else,
+    /// so the column that names the default branch has to follow it. Left
+    /// behind, it says `main` for a repository whose only branch is `master`,
+    /// and the repository's own page resolves that name and answers `404`.
+    #[tokio::test]
+    async fn an_import_adopts_the_upstreams_default_branch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        upstream_with_a_commit_on(&upstream, "master");
+        let source_url = upstream.to_string_lossy().to_string();
+
+        let db = importing_user().await;
+        let repo_root = directory.path().join("repo_root");
+        let task = task_for(&db, &source_url, "legacy").await;
+
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "legacy", &repo_root)
+            .await
+            .expect("the import creates the target it was accepted for");
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .expect("read the fresh row")
+                .expect("the target exists")
+                .default_branch,
+            "main",
+            "the fixture no longer starts from the mismatch this test is about"
+        );
+
+        let mut stats = ImportStats::default();
+        clone_into_target(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect("the clone runs");
+
+        let target = repo_root.join("importer/legacy.git");
+        let advertisement =
+            rg_git::ref_advertisement::collect(&target).expect("read the imported repository");
+        assert_eq!(
+            advertisement.head_target.as_deref(),
+            Some("refs/heads/master"),
+            "the clone did not bring the upstream's HEAD, so this test proves nothing"
+        );
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .expect("read the imported row")
+                .expect("the target still exists")
+                .default_branch,
+            "master",
+            "the row still names the branch the target was created with — the repository page \
+             will resolve a ref that does not exist"
+        );
+    }
+
+    /// The other edge: a clone that was skipped changed nothing on disk, so the
+    /// column must keep describing the history the target already had. Adopting
+    /// unconditionally would rewrite it from an upstream that was never pulled.
+    #[tokio::test]
+    async fn a_skipped_clone_leaves_the_default_branch_alone() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        upstream_with_a_commit_on(&upstream, "master");
+        let source_url = upstream.to_string_lossy().to_string();
+
+        let db = importing_user().await;
+        let repo_root = directory.path().join("repo_root");
+        let task = task_for(&db, &source_url, "occupied").await;
+
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "occupied", &repo_root)
+            .await
+            .expect("create the target");
+
+        // A history of its own on `main`, which is what the row already says.
+        let target = repo_root.join("importer/occupied.git");
+        let existing_source = directory.path().join("existing.git");
+        upstream_with_a_commit(&existing_source);
+        git(
+            &[
+                "fetch",
+                "-q",
+                &existing_source.to_string_lossy(),
+                "main:refs/heads/main",
+            ],
+            Some(&target),
+        );
+
+        let mut stats = ImportStats::default();
+        clone_into_target(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect("the pass completes");
+
+        assert!(!stats.repo_cloned, "the fixture stopped skipping the clone");
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .expect("read the row")
+                .expect("the target exists")
+                .default_branch,
+            "main",
+            "a skipped clone rewrote the default branch from an upstream it never pulled"
         );
     }
 }
