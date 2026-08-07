@@ -78,6 +78,11 @@ const ABSENT_ID: i64 = 999_999;
 /// Checked both ways: an entry that has started being driven fails the run, and
 /// so does one naming a route the table no longer has. Empty, and meant to stay
 /// that way — an entry here is a Foreign route whose opaque id nothing compares.
+///
+/// "Has started being driven" is decided by asking `plan` first and consulting
+/// this list second. The other order reads the same and proves nothing: a pair
+/// skipped before `plan` is one whose sign-off can never be observed to have
+/// expired.
 const NOT_PROBED: &[(&str, &str)] = &[];
 
 // ── The fixture ────────────────────────────────────────────────────────────
@@ -401,19 +406,38 @@ async fn no_foreign_route_tells_a_real_id_from_an_absent_one() {
     let mut probes: Vec<Probe> = Vec::new();
     let mut unclassified: Vec<String> = Vec::new();
     let mut signed_off: BTreeSet<String> = BTreeSet::new();
+    let mut outgrown: BTreeSet<String> = BTreeSet::new();
     for fact in &facts {
         if !matches!(fact.access, Access::Foreign(_)) {
             continue;
         }
         for subject in id_params(&fact.path) {
             let key = format!("{} [{{{subject}}}]", fact.label());
-            if let Some((entry, _)) = NOT_PROBED.iter().find(|(entry, _)| *entry == key) {
-                signed_off.insert((*entry).to_string());
-                continue;
-            }
-            match plan(fact, &subject, &fx) {
-                Some(probe) => probes.push(probe),
-                None => unclassified.push(format!(
+            let signature = NOT_PROBED.iter().find(|(entry, _)| *entry == key);
+            // `plan` runs *before* the sign-off is honoured, and its answer is
+            // what decides whether the sign-off is still earned. Taking the
+            // exemption first — as this loop used to — put the reverse check on
+            // the wrong side of it: a signed-off pair never reached `plan`, so
+            // `signed_off` always contained it, so the sign-off could never be
+            // reported stale. The list happens to be empty today, so nothing is
+            // being skipped; what the old order guaranteed is that the *first*
+            // entry would become a permanent exemption the moment the fixture
+            // and `plan` grew up enough to drive it (card_9c40c40cb47d).
+            match (signature, plan(fact, &subject, &fx)) {
+                // Signed off, and still beyond what `plan` can build: the
+                // exemption is doing the job it was written for.
+                (Some((entry, _)), None) => {
+                    signed_off.insert((*entry).to_string());
+                }
+                // Signed off, but the sweep can drive it now. Deliberately not
+                // recorded as a live sign-off and deliberately not probed: the
+                // run has to go red and say the exemption has expired, rather
+                // than quietly keep honouring it.
+                (Some((entry, _)), Some(_)) => {
+                    outgrown.insert((*entry).to_string());
+                }
+                (None, Some(probe)) => probes.push(probe),
+                (None, None) => unclassified.push(format!(
                     "  {key}\n      declared {:?} and carries an instance-wide id this sweep \
                      cannot address. Teach `plan` how to hold that transport's credential and \
                      what a real row of this kind is, or sign the pair off in NOT_PROBED with \
@@ -426,10 +450,17 @@ async fn no_foreign_route_tells_a_real_id_from_an_absent_one() {
     }
 
     // A sign-off that has stopped being one has to go, the way every other
-    // quarantine list in this directory is checked in reverse.
+    // quarantine list in this directory is checked in reverse. Two ways it can
+    // stop being one, and they need different instructions: the pair left the
+    // route table, or the sweep grew able to drive it.
     let mut healed: Vec<String> = Vec::new();
     for (entry, reason) in NOT_PROBED {
-        if !signed_off.contains(*entry) {
+        if outgrown.contains(*entry) {
+            healed.push(format!(
+                "  NOT_PROBED names '{entry}', but `plan` builds a probe for it now — drop the \
+                 sign-off and let the pair be driven (was: {reason})"
+            ));
+        } else if !signed_off.contains(*entry) {
             healed.push(format!(
                 "  NOT_PROBED names '{entry}', which is not a Foreign route with that \
                  placeholder any more — drop it (was: {reason})"
