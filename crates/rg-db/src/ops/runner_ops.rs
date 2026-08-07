@@ -73,7 +73,7 @@ pub async fn update_heartbeat(db: &DatabaseConnection, runner_id: i64) -> Result
 }
 
 /// Update runner status.
-pub async fn update_status(db: &DatabaseConnection, runner_id: i64, status: &str) -> Result<()> {
+pub async fn update_status(db: &impl ConnectionTrait, runner_id: i64, status: &str) -> Result<()> {
     let now = Utc::now().naive_utc();
 
     RunnerEntity::update_many()
@@ -85,6 +85,36 @@ pub async fn update_status(db: &DatabaseConnection, runner_id: i64, status: &str
         .context("db: update runner status")?;
 
     Ok(())
+}
+
+/// Retire a runner the watchdog found unreachable: release the jobs it was
+/// holding and mark it `offline`, both or neither.
+///
+/// The two writes are only correct together, and the watchdog used to make them
+/// separately, in the order that disarms its own retry: `status = 'offline'`
+/// first, then the job reset. `find_offline_runners` selects on
+/// `status IN ('online', 'busy')`, so a reset that failed after the status
+/// landed left jobs pinned to a runner that branch would never look at again —
+/// the loop had written the row out of its own selection (card_4d1d8b9fba56).
+///
+/// One transaction rather than a reordering, mirroring [`deregister_runner`]:
+/// the pair is the same pair, and the failure of either write must leave the
+/// runner in a status the next tick still selects, sixty seconds later.
+///
+/// Returns how many jobs were handed back to the queue.
+pub async fn retire_unreachable_runner(db: &DatabaseConnection, runner_id: i64) -> Result<u64> {
+    let txn = db
+        .begin()
+        .await
+        .context("db: begin offline runner retirement")?;
+
+    let released = crate::ops::pipeline_ops::reset_runner_jobs(&txn, runner_id).await?;
+    update_status(&txn, runner_id, "offline").await?;
+
+    txn.commit()
+        .await
+        .context("db: commit offline runner retirement")?;
+    Ok(released)
 }
 
 /// Find a runner by ID.

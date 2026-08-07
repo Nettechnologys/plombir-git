@@ -776,6 +776,11 @@ async fn run_runner_watchdog(
         }
 
         // 1. Reset stuck jobs (assigned/running > 10 min)
+        //
+        // This branch converges on its own: `reset_stuck_job` is one statement,
+        // and a job whose reset fails keeps both the status and the stale
+        // `updated_at` that `find_stuck_jobs` selects on — so the next tick
+        // picks it up again sixty seconds later. Nothing here is delegated.
         match rg_db::ops::pipeline_ops::find_stuck_jobs(&db, 600).await {
             Ok(stuck) => {
                 for job in &stuck {
@@ -814,38 +819,41 @@ async fn run_runner_watchdog(
         // 2. Mark runners as offline if no heartbeat for 90 seconds
         match rg_db::ops::pipeline_ops::find_offline_runners(&db, 90).await {
             Ok(offline) => {
+                let mut retired = 0usize;
                 for runner in &offline {
                     tracing::warn!(
                         runner_id = runner.id,
                         name = %runner.name,
                         "Runner watchdog: marking runner as offline"
                     );
-                    if let Err(e) =
-                        rg_db::ops::runner_ops::update_status(&db, runner.id, "offline").await
-                    {
-                        tracing::error!(
+                    // Releasing the jobs and marking the runner offline are one
+                    // write, not two. Done separately — status first — a failed
+                    // reset left the jobs pinned to a runner that
+                    // `find_offline_runners` no longer selects, so this branch
+                    // never retried it and the rows waited on the ten-minute
+                    // stuck-job sweep above instead (card_4d1d8b9fba56). Now
+                    // either both land or neither does, and a runner whose
+                    // retirement failed is still `online`/`busy` for the next
+                    // tick, sixty seconds later.
+                    match rg_db::ops::runner_ops::retire_unreachable_runner(&db, runner.id).await {
+                        Ok(_) => retired += 1,
+                        Err(e) => tracing::error!(
                             runner_id = runner.id,
                             error = %format!("{e:#}"),
-                            "Failed to mark runner offline"
-                        );
-                    }
-
-                    // Reset jobs assigned to this offline runner
-                    if let Err(e) =
-                        rg_db::ops::pipeline_ops::reset_runner_jobs(&db, runner.id).await
-                    {
-                        tracing::error!(
-                            runner_id = runner.id,
-                            error = %format!("{e:#}"),
-                            "Failed to reset jobs for offline runner"
-                        );
+                            "Failed to retire an unreachable runner — it keeps its status and \
+                             its jobs, and the next watchdog tick will try again"
+                        ),
                     }
                 }
-                if !offline.is_empty() {
+                // The runners actually retired, not the ones the query offered:
+                // the whole point of the pair above is that a failure leaves the
+                // runner where it was, and a summary counting the candidates
+                // would report that as work done.
+                if retired > 0 {
                     tracing::info!(
-                        count = offline.len(),
-                        "Runner watchdog: marked {} runners offline",
-                        offline.len()
+                        count = retired,
+                        candidates = offline.len(),
+                        "Runner watchdog: marked {retired} runners offline"
                     );
                 }
             }
