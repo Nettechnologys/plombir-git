@@ -1,4 +1,5 @@
 //! MFA backup code operations.
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 use sha2::{Digest, Sha256};
 
@@ -123,29 +124,44 @@ where
     txn.commit().await
 }
 
-/// Verify a backup code. Returns true if valid and marks it used.
+/// Spend a backup code, reporting whether this call is the one that spent it.
+///
+/// A compare-and-swap, not a read followed by a write: the `WHERE` names the
+/// exact state the caller believed it was acting on — this user's code, still
+/// unspent — so the database picks the winner in one statement. The
+/// predecessor read the row with `one(db)`, decided `used == false` in
+/// application memory, and only then issued an `UPDATE` filtered on the id
+/// alone. Two `POST /users/mfa/verify` carrying the same code both read the
+/// live row, both marked it used, and both were answered a session: one
+/// single-use code, two passes of the second factor. Same shape as
+/// [`crate::ops::password_reset_token_ops::consume`], for the same reason.
+///
+/// `rows_affected` is a safe answer on every backend here because the `WHERE`
+/// guarantees the row it matches really changes (`used` goes `false → true`),
+/// so MySQL's "changed rows" count and PostgreSQL/SQLite's "matched rows" count
+/// agree.
+///
+/// `false` covers both "no such code" and "already spent" — deliberately, and
+/// not only because the caller does not need to tell them apart: answering them
+/// differently would tell whoever is guessing that a code existed.
 pub async fn verify_and_consume(
     db: &DatabaseConnection,
     user_id: i64,
     code: &str,
 ) -> Result<bool, DbErr> {
     let hash = hash_code(code);
-    let some = Entity::find()
+    let result = Entity::update_many()
+        .col_expr(mfa_backup_code::Column::Used, Expr::value(true))
+        .col_expr(
+            mfa_backup_code::Column::UsedAt,
+            Expr::value(chrono::Utc::now()),
+        )
         .filter(mfa_backup_code::Column::UserId.eq(user_id))
         .filter(mfa_backup_code::Column::CodeHash.eq(hash))
         .filter(mfa_backup_code::Column::Used.eq(false))
-        .one(db)
+        .exec(db)
         .await?;
-
-    if let Some(m) = some {
-        let mut am: mfa_backup_code::ActiveModel = m.into();
-        am.used = Set(true);
-        am.used_at = Set(Some(chrono::Utc::now()));
-        am.update(db).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    Ok(result.rows_affected > 0)
 }
 
 /// List backup codes status for a user.
