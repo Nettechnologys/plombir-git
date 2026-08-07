@@ -545,20 +545,57 @@ pub async fn consume_totp_step(
 
 /// Disable MFA for a user.
 pub async fn disable_mfa(db: &DatabaseConnection, user_id: i64) -> Result<User> {
-    let model = UserEntity::find_by_id(user_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
-    let mut active: ActiveModel = model.into();
-    active.mfa_enabled = Set(false);
-    active.mfa_type = Set(None);
-    active.totp_secret = Set(None);
-    active.backup_codes = Set(None);
-    active.updated_at = Set(chrono::Utc::now());
-    active
-        .update(db)
-        .await
-        .map_err(|e| anyhow::anyhow!("db: {}", e))
+    let transaction = db.begin().await.context("db: begin MFA removal")?;
+    let result: Result<User> = async {
+        let model = UserEntity::find_by_id(user_id)
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
+        let mut active: ActiveModel = model.into();
+        active.mfa_enabled = Set(false);
+        active.mfa_type = Set(None);
+        active.totp_secret = Set(None);
+        active.backup_codes = Set(None);
+        active.updated_at = Set(chrono::Utc::now());
+        let user = active
+            .update(&transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("db: {}", e))?;
+
+        // The unused backup codes go with the factor they recover. Each one is a
+        // full bypass of the second factor, so leaving them behind keeps a live
+        // credential for something the owner has just asked to remove — and
+        // `GET /users/mfa/backup` went on reporting them as ten usable codes on
+        // an account with no second factor at all (card_0a4c00fd1b89).
+        //
+        // Used codes are history rather than credentials and stay, which is the
+        // same line `set_codes` already draws; passing an empty set is its
+        // documented spelling of "revoke every unused code". In the same
+        // transaction as the flag, for the reason enrolment is: the two halves
+        // must not be separately observable, or a failure between them leaves an
+        // account whose recovery material outlives the factor by exactly as long
+        // as nobody notices.
+        crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, &[])
+            .await
+            .context("db: revoke MFA backup codes")?;
+        Ok(user)
+    }
+    .await;
+    match result {
+        Ok(user) => {
+            transaction
+                .commit()
+                .await
+                .context("db: commit MFA removal")?;
+            Ok(user)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error).context(format!("db: roll back MFA removal: {rollback_error}"));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Record a successful login and reset login_attempts/locked_until.
