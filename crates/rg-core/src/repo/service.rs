@@ -1559,19 +1559,24 @@ fn restore_repository_directory(
 /// A repository-owned directory that does not belong to a [`BlobStorage`]
 /// backend and therefore has to participate in deletion through ordinary
 /// filesystem renames.
-struct RepositoryFilesystemDirectory {
-    live: std::path::PathBuf,
-    kind: &'static str,
-    hint: &'static str,
+///
+/// Visible to the rest of the crate because the repository is not the only
+/// thing whose deletion owns such a directory: `DELETE /mirror` retires
+/// `<repo_root>/<repo_id>.mirror` on its own, and a second copy of the
+/// stage/restore/retire dance is a copy that can drift away from this one.
+pub(crate) struct RepositoryFilesystemDirectory {
+    pub(crate) live: std::path::PathBuf,
+    pub(crate) kind: &'static str,
+    pub(crate) hint: &'static str,
 }
 
 /// One filesystem directory moved out of its live namespace before the
 /// repository row is soft-deleted.
-struct StagedRepositoryFilesystemDirectory {
-    live: std::path::PathBuf,
-    staged: std::path::PathBuf,
-    kind: &'static str,
-    hint: &'static str,
+pub(crate) struct StagedRepositoryFilesystemDirectory {
+    pub(crate) live: std::path::PathBuf,
+    pub(crate) staged: std::path::PathBuf,
+    pub(crate) kind: &'static str,
+    pub(crate) hint: &'static str,
 }
 
 /// The absolute paths of this repository's pre-migration package files.
@@ -1687,7 +1692,7 @@ fn repository_filesystem_directories(
     directories
 }
 
-fn restore_repository_filesystem_directories(
+pub(crate) fn restore_repository_filesystem_directories(
     directories: &[StagedRepositoryFilesystemDirectory],
     repo_id: i64,
 ) {
@@ -1705,7 +1710,7 @@ fn restore_repository_filesystem_directories(
     }
 }
 
-fn stage_repository_filesystem_directories(
+pub(crate) fn stage_repository_filesystem_directories(
     directories: Vec<RepositoryFilesystemDirectory>,
     repo_id: i64,
     deletion_id: &str,
@@ -1802,7 +1807,7 @@ fn stage_repository_filesystem_directories(
     Ok(staged_directories)
 }
 
-fn retire_repository_filesystem_directories(
+pub(crate) fn retire_repository_filesystem_directories(
     directories: Vec<StagedRepositoryFilesystemDirectory>,
     repo_id: i64,
 ) -> Result<()> {

@@ -51,6 +51,86 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
     Ok(result.rows_affected > 0)
 }
 
+/// How a mirror deletion ended, from the row's point of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorRetirement {
+    /// The row is gone and its clone directory is the caller's to retire.
+    Deleted,
+    /// There was no such row — a concurrent delete got there first.
+    NotFound,
+    /// A pass holds this mirror's sync lease; nothing was deleted.
+    MirrorSyncInFlight,
+}
+
+/// Delete a mirror row unless a pass is writing its clone directory.
+///
+/// The mirror's own deletion faces the window
+/// [`crate::ops::repo_ops::soft_delete_unless_mirror_syncing`] closes for the
+/// repository's, and for the same reason: `git clone --mirror` writes to the
+/// absolute path it was handed for minutes after the check that admitted it, so
+/// a gate read before the delete leaves a gap in which a pass takes the lease
+/// and re-creates `<repo_root>/<repo_id>.mirror` after the caller has retired it
+/// — bytes nothing owns, under a name no later namespace collides with and no
+/// sweep walks.
+///
+/// The DELETE comes *before* the lease read deliberately, exactly as the
+/// repository's soft delete does. It takes the mirror row's exclusive lock — the
+/// same row [`bid_for_sync_lease`] reads under `lock_exclusive` before it admits
+/// a pass — so the two transactions are ordered by the database rather than by
+/// luck, whichever arrives first:
+///
+/// * this one first ⇒ the bid waits on the row, then reads a deleted mirror and
+///   declines;
+/// * the bid first ⇒ its lease is committed and visible here, and this
+///   transaction rolls back;
+/// * the bid first but still open ⇒ its lease is invisible here and this
+///   commits, after which the bid's locked read finally returns no mirror and
+///   declines anyway.
+///
+/// Writing first is also what makes it work on SQLite, where `lock_exclusive` is
+/// a no-op: a transaction whose first statement is a write takes the single
+/// writer slot outright instead of leaving a lock-upgrade window.
+pub async fn delete_by_id_unless_syncing(
+    db: &DatabaseConnection,
+    id: i64,
+    repo_id: i64,
+    stale_before: DateTimeUtc,
+) -> Result<MirrorRetirement> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin guarded mirror delete")?;
+
+    let deleted = MirrorEntity::delete_by_id(id)
+        .exec(&transaction)
+        .await
+        .context("db: delete mirror")?;
+    if deleted.rows_affected == 0 {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back a delete of a mirror that is not there")?;
+        return Ok(MirrorRetirement::NotFound);
+    }
+
+    let syncing = sync_lease_in_flight(&transaction, repo_id, stale_before)
+        .await
+        .context("db: check for a mirror sync in flight while deleting a mirror")?;
+    if syncing.is_some() {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back a mirror delete a sync pass is holding")?;
+        return Ok(MirrorRetirement::MirrorSyncInFlight);
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("db: commit guarded mirror delete")?;
+    Ok(MirrorRetirement::Deleted)
+}
+
 /// List mirrors that are due for sync.
 ///
 /// "Not switched off", not "healthy": the sweep that consumes this list is also
@@ -137,6 +217,10 @@ pub enum SyncLeaseBid {
     /// The repository row is gone or already soft-deleted — its mirror clone is
     /// storage the deletion has retired, and re-creating it is the whole defect.
     RepositoryGone,
+    /// The mirror row itself is gone. `DELETE /mirror` retires the same clone
+    /// directory the repository's deletion does, so a pass admitted after it
+    /// would re-create exactly the bytes that deletion removed.
+    MirrorGone,
 }
 
 /// Take the lease that makes a mirror pass visible to the deletion of the
@@ -242,6 +326,24 @@ pub async fn bid_for_sync_lease(
             .is_none()
     {
         outcome = SyncLeaseBid::RepositoryGone;
+    }
+
+    // …and neither is holding it worth anything once the mirror itself is gone.
+    // `DELETE /mirror` retires the same clone directory, so this locked read is
+    // the half that orders this bid against
+    // [`delete_by_id_unless_syncing`] — without it the two transactions touch
+    // disjoint rows and both can commit, leaving a pass cloning an upstream back
+    // into a directory the deletion had just removed.
+    if matches!(outcome, SyncLeaseBid::Granted | SyncLeaseBid::TakenOver)
+        && MirrorEntity::find()
+            .filter(mirror::Column::RepoId.eq(repo_id))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .context("db: read the mirror a sync lease was taken for")?
+            .is_none()
+    {
+        outcome = SyncLeaseBid::MirrorGone;
     }
 
     match outcome {

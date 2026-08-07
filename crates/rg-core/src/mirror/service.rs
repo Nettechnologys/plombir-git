@@ -273,20 +273,106 @@ pub async fn update_mirror(
     rg_db::ops::mirror_ops::update(db, model).await
 }
 
-/// Delete a mirror.
+/// Delete a mirror, and with it the clone it owns on disk.
 ///
 /// The lookup and the `DELETE` are two statements, so a concurrent delete can
 /// empty the row out from under this one; zero rows reports `not_found` rather
 /// than confirming a deletion this call did not perform.
-pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
+///
+/// ## The bytes
+///
+/// The row is metadata *for* `<repo_root>/<repo_id>.mirror` — a full clone of a
+/// third-party upstream, the largest thing a repository owns after its own Git
+/// tree. Deleting the row alone left it on disk forever: no sweep anywhere walks
+/// the filesystem, and the directory is named after a `repo_id` no later
+/// namespace ever collides with, so nothing would find it again. Worse, the next
+/// mirror configured on this repository inherited it: `run_sync_pass` branches
+/// on whether `HEAD` exists, found the orphan, and ran `git remote update` — which
+/// takes its remote from the inherited clone's own config, not from the new
+/// `mirrors.url`. The new remote was never contacted, while the row reported
+/// `status=active` with a fresh `last_sync_at`, and the SSRF guard cleared a URL
+/// `git` never dialled (`card_8ee32201d626`).
+///
+/// So the same cross-store shape the repository's deletion uses: rename the
+/// directory aside, mutate the row, remove the tombstone only once the row is
+/// gone, and move the directory back if the row will not move. A tombstone that
+/// cannot be removed is reported as an error rather than folded into the `204` —
+/// bytes still on disk are not a completed deletion.
+///
+/// ## The pass in flight
+///
+/// A mirror pass owns that directory by absolute path for as long as its `git`
+/// subprocess runs, so this refuses while the sync lease is held, exactly as
+/// `ensure_repository_deletion_is_quiescent` does for the repository. The early
+/// read is the cheap half — it costs no staging;
+/// [`rg_db::ops::mirror_ops::delete_by_id_unless_syncing`] is the load-bearing
+/// one, repeating the read inside the transaction that removes the row.
+pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64, repo_root: &Path) -> Result<()> {
+    use rg_db::ops::mirror_ops::{MirrorRetirement, SYNC_LEASE_STALE_AFTER};
+
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
-    if rg_db::ops::mirror_ops::delete_by_id(db, mirror.id).await? {
-        Ok(())
-    } else {
-        Err(crate::error::not_found("mirror"))
+
+    if rg_db::ops::mirror_ops::sync_lease_in_flight(
+        db,
+        repo_id,
+        Utc::now() - SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .context("failed to check for a mirror sync in flight before deleting the mirror")?
+    .is_some()
+    {
+        return Err(mirror_sync_in_flight());
     }
+
+    let deletion_id = uuid::Uuid::new_v4().simple().to_string();
+    let staged = crate::repo::service::stage_repository_filesystem_directories(
+        vec![crate::repo::service::RepositoryFilesystemDirectory {
+            live: mirror_clone_path(repo_root, repo_id),
+            kind: "mirror clone directory",
+            hint: crate::platform::fs::REPO_ROOT_HINT,
+        }],
+        repo_id,
+        &deletion_id,
+    )?;
+
+    let retirement = rg_db::ops::mirror_ops::delete_by_id_unless_syncing(
+        db,
+        mirror.id,
+        repo_id,
+        Utc::now() - SYNC_LEASE_STALE_AFTER,
+    )
+    .await;
+    let retirement = match retirement {
+        Ok(retirement) => retirement,
+        Err(error) => {
+            crate::repo::service::restore_repository_filesystem_directories(&staged, repo_id);
+            return Err(error);
+        }
+    };
+    match retirement {
+        MirrorRetirement::Deleted => {}
+        MirrorRetirement::NotFound => {
+            crate::repo::service::restore_repository_filesystem_directories(&staged, repo_id);
+            return Err(crate::error::not_found("mirror"));
+        }
+        MirrorRetirement::MirrorSyncInFlight => {
+            crate::repo::service::restore_repository_filesystem_directories(&staged, repo_id);
+            return Err(mirror_sync_in_flight());
+        }
+    }
+
+    crate::repo::service::retire_repository_filesystem_directories(staged, repo_id)
+}
+
+/// The refusal both sync-in-flight checks give, so a caller cannot tell which of
+/// the two noticed — the early one that costs no staging, or the one inside the
+/// transaction that removes the row.
+fn mirror_sync_in_flight() -> anyhow::Error {
+    crate::error::conflict(
+        "this mirror is syncing right now; wait for that pass to finish before deleting it",
+    )
 }
 
 /// The full clone a mirror keeps on disk, under the repository root.
@@ -315,6 +401,8 @@ pub enum SyncOutcome {
     SwitchedOff,
     /// The repository that owns the mirror has been deleted.
     RepositoryGone,
+    /// The mirror itself has been deleted since this pass was selected.
+    MirrorGone,
     /// Another pass holds this mirror's sync lease right now.
     AlreadySyncing,
 }
@@ -386,6 +474,15 @@ pub async fn sync_mirror(
             );
             return Ok(SyncOutcome::RepositoryGone);
         }
+        SyncLeaseBid::MirrorGone => {
+            tracing::debug!(
+                repo_id = mirror.repo_id,
+                mirror_id = mirror.id,
+                "skipping mirror sync: the mirror was deleted and its clone directory retired \
+                 with it"
+            );
+            return Ok(SyncOutcome::MirrorGone);
+        }
     }
 
     let pass = run_sync_pass(db, mirror, repo_root, encryption_key).await;
@@ -442,7 +539,7 @@ async fn run_sync_pass(
             Ok(()) => {
                 if repo_path.join("HEAD").exists() {
                     // Existing mirror: git remote update
-                    run_git_remote_update(&repo_path, credentials.as_ref())
+                    run_git_remote_update(&repo_path, &mirror.url, credentials.as_ref())
                 } else {
                     // First time: git clone --mirror
                     run_git_clone_mirror(&mirror.url, &repo_path, credentials.as_ref())
@@ -549,6 +646,10 @@ pub async fn trigger_sync(
             "the repository this mirror belongs to has been deleted; the mirror can no longer be \
              synced",
         )),
+        // Between the lookup above and the bid, `DELETE /mirror` removed the row
+        // and retired its clone. There is nothing left to sync, and the honest
+        // answer is the one the next request would get anyway.
+        SyncOutcome::MirrorGone => Err(crate::error::not_found("mirror")),
         SyncOutcome::AlreadySyncing => Err(crate::error::conflict(
             "this mirror is already syncing; wait for the pass in flight to finish before \
              starting another",
@@ -728,11 +829,38 @@ fn run_git_clone_mirror(
         .context("git clone --mirror")
 }
 
-fn run_git_remote_update(path: &Path, credentials: Option<&GitCredentials>) -> Result<()> {
+/// Refresh an existing mirror clone from `url`.
+///
+/// The remote is pinned to the row's URL before the fetch, and that is not
+/// housekeeping. `git remote update` takes its address from the clone's own
+/// `remote.origin.url`, written once by the `git clone --mirror` that created
+/// the directory — so every later change to `mirrors.url` was silently ignored
+/// for as long as the clone survived. Two ways in: an operator repointing a
+/// mirror through `PATCH /mirror`, and a mirror re-created on a *different* URL
+/// on top of a clone the previous mirror left behind. Both reported
+/// `status=active` with a fresh `last_sync_at` while fetching from the old
+/// upstream, and both made `guard_git_url`'s verdict describe a call that never
+/// happened: the guard cleared the new URL, `git` dialled the old one
+/// (`card_8ee32201d626`).
+///
+/// Pinning here rather than at the point the URL changes is deliberate — this is
+/// the one place the row and the directory are both in hand, so the clone follows
+/// the row no matter which path moved it, including rows that drifted before
+/// this existed.
+fn run_git_remote_update(
+    path: &Path,
+    url: &str,
+    credentials: Option<&GitCredentials>,
+) -> Result<()> {
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    credential_invocation(credentials)
+    let invocation = credential_invocation(credentials);
+    invocation
+        .run(git, &["remote", "set-url", "origin", url], Some(path))?
+        .ensure_success()
+        .context("git remote set-url origin")?;
+    invocation
         .run(git, &["remote", "update", "--prune"], Some(path))?
         .ensure_success()
         .context("git remote update")
@@ -897,6 +1025,62 @@ mod tests {
         assert!(
             masked.contains("example.com/o/r.git"),
             "the remote must still be identifiable: {masked}"
+        );
+    }
+
+    /// Run one `git` command in `path` through the same disarmed invocation the
+    /// mirror passes use, so the fixture cannot pick up the host's git config.
+    fn git_in(path: &Path, args: &[&str]) {
+        let git = global_gateway().as_ref().expect("the git gateway");
+        credential_invocation(None)
+            .run(git, args, Some(path))
+            .expect("run git")
+            .ensure_success()
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error:#}"));
+    }
+
+    /// card_8ee32201d626: `git remote update` reads the address out of the
+    /// clone's own config, written once by the `git clone --mirror` that created
+    /// the directory. Every later change to `mirrors.url` was therefore ignored
+    /// for as long as the clone survived — an operator repointing the mirror, or
+    /// a mirror re-created on a different URL on top of an inherited clone, kept
+    /// fetching the *old* upstream while the row reported `status=active`.
+    ///
+    /// The pass is the one place the row and the directory are both in hand, so
+    /// the pass is what pins them together. Asserted on the config git will
+    /// actually dial, not on the return value: the fetch below fails (the remote
+    /// does not exist), and pinning has to have happened anyway.
+    #[test]
+    fn a_refresh_points_the_clone_at_the_row_s_url_before_it_fetches() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let clone = directory.path().join("7.mirror");
+        std::fs::create_dir_all(&clone).expect("create the clone directory");
+
+        // The state an inherited clone is in: a bare mirror whose remote is the
+        // *previous* mirror's upstream.
+        git_in(&clone, &["init", "--bare", "--quiet"]);
+        git_in(
+            &clone,
+            &["remote", "add", "origin", "file:///stale/upstream.git"],
+        );
+
+        let fresh = "file:///fresh/upstream.git";
+        assert!(
+            run_git_remote_update(&clone, fresh, None).is_err(),
+            "the fixture's remote does not exist — a successful fetch would mean the test is \
+             measuring something else"
+        );
+
+        let git = global_gateway().as_ref().expect("the git gateway");
+        let configured = credential_invocation(None)
+            .run(git, &["config", "--get", "remote.origin.url"], Some(&clone))
+            .expect("read the clone's remote")
+            .stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&configured).trim(),
+            fresh,
+            "the pass fetched from the address the directory happened to carry, not the one the \
+             mirror row names"
         );
     }
 

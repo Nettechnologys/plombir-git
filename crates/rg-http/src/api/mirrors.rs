@@ -241,6 +241,8 @@ pub async fn update_mirror(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No mirror configured", body = serde_json::Value),
+        (status = 409, description = "A sync pass is in flight", body = serde_json::Value),
     ),
 )]
 pub async fn delete_mirror(
@@ -248,7 +250,7 @@ pub async fn delete_mirror(
     Path((_, _)): Path<(String, String)>,
     RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
-    match rg_core::mirror::service::delete_mirror(&state.db, repo.id).await {
+    match rg_core::mirror::service::delete_mirror(&state.db, repo.id, &state.repo_root).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

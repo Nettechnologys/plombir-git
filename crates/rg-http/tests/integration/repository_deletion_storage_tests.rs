@@ -549,6 +549,23 @@ async fn a_mirror_sync_in_flight_is_refused_before_anything_is_staged() {
     std::fs::create_dir_all(package_path.parent().unwrap()).unwrap();
     std::fs::write(&package_path, b"keep this blob").unwrap();
 
+    // A lease is a pass's claim on *a mirror's* clone directory, and
+    // `bid_for_sync_lease` verifies the mirror row under the same transaction —
+    // so a repository with no mirror configured cannot hand one out, and a
+    // fixture that skipped this step would be simulating a state production
+    // never reaches (card_8ee32201d626).
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/repos/delete-sync-early/untouched/mirror",
+            app.base
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"url": MIRROR_REMOTE, "sync_interval_seconds": 3600}))
+        .send()
+        .await
+        .expect("configure the mirror the pass below holds");
+    assert_eq!(response.status(), 201, "baseline mirror create");
+
     assert_eq!(
         rg_db::ops::mirror_ops::bid_for_sync_lease(
             &app.db,

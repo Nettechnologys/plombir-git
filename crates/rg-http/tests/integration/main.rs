@@ -81,6 +81,7 @@ mod merge_queue_ci_tests;
 mod mfa_disable_lockout_tests;
 mod mfa_enable_atomicity_tests;
 mod mfa_totp_replay_tests;
+mod mirror_deletion_storage_tests;
 mod mirror_tests;
 mod namespace_identity_tests;
 mod notification_tests;
