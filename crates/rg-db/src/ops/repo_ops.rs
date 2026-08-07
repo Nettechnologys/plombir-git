@@ -378,21 +378,54 @@ pub async fn soft_delete_unless_mirror_syncing(
     Ok(RepositoryRetirement::Deleted)
 }
 
+/// How many repository ids one `stars_count` refresh statement may name.
+///
+/// The bound is on the bind markers, not on the work: SQLite builds before
+/// 3.32 accept 999 parameters per statement and nothing in this crate pins a
+/// newer one. Each batch is still a single statement, so the aggregate is never
+/// read in one statement and written in another.
+const STARS_COUNT_REFRESH_BATCH: usize = 500;
+
 /// Update stars_count for a repository based on actual star count (atomic).
 pub async fn update_stars_count(db: &DatabaseConnection, id: i64) -> Result<()> {
+    refresh_stars_counts(db, std::slice::from_ref(&id)).await
+}
+
+/// Refresh `stars_count` for several repositories from the live `repo_stars`
+/// rows, reading and writing each counter inside one statement.
+///
+/// Takes any connection so the caller can run it in the same transaction as the
+/// delete that changed the rows it counts — which is what
+/// [`crate::ops::user_ops::delete_by_id`] does, since the stars it removes sit
+/// on repositories belonging to accounts that are not going anywhere.
+///
+/// The subquery is correlated rather than parameterised so one statement can
+/// cover a whole batch. MySQL rejects a subquery that reads the statement's own
+/// target table (error 1093); `repositories` appears here only as a correlated
+/// column reference, never in the subquery's `FROM`, so all three backends
+/// accept it.
+pub async fn refresh_stars_counts(db: &impl ConnectionTrait, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
     let backend = db.get_database_backend();
-    db.execute(Statement::from_sql_and_values(
-        backend,
-        crate::prepare_sql(
-            backend,
+    for batch in ids.chunks(STARS_COUNT_REFRESH_BATCH) {
+        let markers = vec!["?"; batch.len()].join(", ");
+        let sql = format!(
             "UPDATE repositories \
-             SET stars_count = (SELECT COUNT(*) FROM repo_stars WHERE repo_id = ?) \
-             WHERE id = ?",
-        ),
-        [id.into(), id.into()],
-    ))
-    .await
-    .context("db: update stars count")?;
+             SET stars_count = ( \
+                 SELECT COUNT(*) FROM repo_stars WHERE repo_stars.repo_id = repositories.id \
+             ) \
+             WHERE id IN ({markers})"
+        );
+        db.execute(Statement::from_sql_and_values(
+            backend,
+            crate::prepare_sql(backend, &sql),
+            batch.iter().map(|id| (*id).into()).collect::<Vec<Value>>(),
+        ))
+        .await
+        .context("db: update stars count")?;
+    }
     Ok(())
 }
 

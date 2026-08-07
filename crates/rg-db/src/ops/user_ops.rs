@@ -637,6 +637,20 @@ pub async fn record_failed_login(
 }
 
 /// Delete a user by ID, returning whether a row existed.
+///
+/// `repo_stars.user_id` is `ON DELETE CASCADE`, so this also retracts every star
+/// the account gave — and those stars sit on repositories belonging to *other*
+/// accounts, which are not going anywhere. `repositories.stars_count` is
+/// declared to be `COUNT(*)` over `repo_stars`, and the only other writer of it
+/// is `toggle_star`, which refreshes exactly the one repository somebody just
+/// starred: a repository nobody stars again would advertise the departed
+/// account's star forever (card_957cc2683f70).
+///
+/// The inventory therefore has to be read *before* the delete — afterwards the
+/// cascade has already taken the rows that name the affected repositories — and
+/// the refresh has to run in the same transaction, so a failure on either side
+/// rolls the deletion back instead of committing it next to counters nothing
+/// will ever repair.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
     let transaction = db.begin().await.context("db: begin user delete")?;
     let Some(model) = UserEntity::find_by_id(id)
@@ -651,11 +665,14 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
         return Ok(false);
     };
 
+    let starred = crate::ops::repo_star_ops::list_starred_repo_ids(&transaction, id).await?;
+
     crate::serialized_user_grants::remove_user(&transaction, id).await?;
     model
         .delete(&transaction)
         .await
         .context("db: delete user")?;
+    crate::ops::repo_ops::refresh_stars_counts(&transaction, &starred).await?;
     transaction
         .commit()
         .await

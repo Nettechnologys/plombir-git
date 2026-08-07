@@ -453,6 +453,34 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         "only the live fork row contributes to forks_count"
     );
 
+    // card_957cc2683f70: deleting an account retracts its stars through
+    // `repo_stars.user_id ON DELETE CASCADE`, and the repositories they sat on
+    // belong to other people, so `user_ops::delete_by_id` refreshes a whole
+    // inventory of counters at once. That statement carries a variadic `IN`
+    // list and a correlated subquery over its own target table — MySQL rejects
+    // a subquery that reads the target in its `FROM` (error 1093) — so the
+    // multi-id form needs proving on every backend, not just the single-id one
+    // above.
+    rg_db::ops::repo_ops::refresh_stars_counts(&db, &[repo.id, live_fork.id])
+        .await
+        .expect("refresh several star counters in one statement on every backend");
+    let counted_repo = rg_db::ops::repo_ops::find_by_id(&db, repo.id)
+        .await
+        .expect("read source after batched star count refresh")
+        .expect("source repository exists");
+    assert_eq!(
+        counted_repo.stars_count, 1,
+        "the batched refresh lost the star the single-id refresh had counted"
+    );
+    let counted_fork = rg_db::ops::repo_ops::find_by_id(&db, live_fork.id)
+        .await
+        .expect("read fork after batched star count refresh")
+        .expect("fork repository exists");
+    assert_eq!(
+        counted_fork.stars_count, 0,
+        "the batched refresh credited one repository's stars to another"
+    );
+
     // card_615e00843297: `repositories` used to hold one name per *account*, so
     // a personal repository and one in an organization the same account owns
     // could not share a name. The replacement — a `namespace_key` generated

@@ -98,6 +98,25 @@ pub async fn list_stargazers(
     Ok((stargazers, total))
 }
 
+/// List the repositories this account has starred, one id per repository.
+///
+/// Takes any connection because the one caller that needs it —
+/// [`crate::ops::user_ops::delete_by_id`] — has to read the list inside the
+/// transaction that is about to remove the account, and `repo_stars.user_id` is
+/// `ON DELETE CASCADE`: after the delete there is nothing left to inventory.
+/// The repositories these stars sit on belong to other accounts and stay, so
+/// their cached `stars_count` is what the caller then refreshes.
+pub async fn list_starred_repo_ids(db: &impl ConnectionTrait, user_id: i64) -> Result<Vec<i64>> {
+    RepoStarEntity::find()
+        .select_only()
+        .column(repo_star::Column::RepoId)
+        .filter(repo_star::Column::UserId.eq(user_id))
+        .into_tuple::<i64>()
+        .all(db)
+        .await
+        .context("db: list the repositories an account has starred")
+}
+
 /// Count the number of stars for a repository.
 pub async fn count_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<i64> {
     RepoStarEntity::find()
