@@ -47,6 +47,7 @@ webauthn-rs = { workspace = true }
 ldap3 = { workspace = true }
 aes-gcm = { workspace = true }
 ed25519-dalek = { workspace = true }
+subtle = { workspace = true }
 rand = { workspace = true }
 urlencoding = "2.1"
 http = "1"

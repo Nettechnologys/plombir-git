@@ -475,6 +475,7 @@ async fn every_subscriber_is_notified_past_the_old_page_limit() {
                 mfa_enabled: Set(false),
                 mfa_type: Set(None),
                 backup_codes: Set(None),
+                totp_last_step: Set(None),
                 last_login_at: Set(None),
                 login_attempts: Set(0),
                 locked_until: Set(None),

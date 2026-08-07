@@ -323,6 +323,7 @@ pub async fn create_user(
         mfa_enabled: Set(false),
         mfa_type: Set(None),
         backup_codes: Set(None),
+        totp_last_step: Set(None),
         last_login_at: Set(None),
         login_attempts: Set(0),
         locked_until: Set(None),
@@ -365,6 +366,7 @@ pub async fn create_ldap_user(
             mfa_enabled: Set(false),
             mfa_type: Set(None),
             backup_codes: Set(None),
+            totp_last_step: Set(None),
             last_login_at: Set(None),
             login_attempts: Set(0),
             locked_until: Set(None),
@@ -486,6 +488,59 @@ pub async fn enable_mfa_with_backup_codes(
             Err(error)
         }
     }
+}
+
+/// Spend a TOTP time step, reporting whether this call is the one that spent it.
+///
+/// A compare-and-swap, not a write: the `WHERE` names the exact state the caller
+/// believed it was acting on — an account that has never spent a step, or has
+/// spent an *older* one — so the database picks the winner in one statement.
+/// The predecessor was nothing at all. `verify_code` is a pure function of the
+/// secret and the clock, so with `skew = 1` over a 30-second step an intercepted
+/// code passed the second factor for as long as it stayed inside its ~90-second
+/// window, and two concurrent `POST /users/mfa/verify` carrying one code were
+/// answered two sessions. Same shape as
+/// [`crate::ops::mfa_backup_code_ops::verify_and_consume`] and
+/// [`crate::ops::password_reset_token_ops::consume`], for the same reason: the
+/// backup code got its `used` column, and the TOTP step had no state to hold at
+/// all.
+///
+/// The comparison is strictly monotonic (`<`, not `!=`), which also closes the
+/// other half of the window: after step *n* is spent, a code from *n-1* that is
+/// still inside the skew window is refused rather than accepted as "a different
+/// step". A clock that walks backwards therefore costs an honest holder a
+/// 30-second wait — the same tradeoff `session_version` makes, and the safe side
+/// of it.
+///
+/// `rows_affected` is a safe answer on every backend here because the `WHERE`
+/// guarantees the row it matches really changes (`totp_last_step` goes `NULL` or
+/// something smaller → `step`), so MySQL's *changed* rows count and
+/// PostgreSQL/SQLite's *matched* rows count agree.
+///
+/// `false` covers both "already spent" and "no such user" — deliberately: the
+/// caller must answer it with the same `401 invalid TOTP code` a wrong code
+/// gets, or a distinguishable reply tells whoever replayed the code that it was
+/// genuine and merely late.
+pub async fn consume_totp_step(
+    db: &DatabaseConnection,
+    user_id: i64,
+    step: u64,
+) -> Result<bool, DbErr> {
+    // The column is a signed 64-bit integer on every backend; a `u64` step is
+    // seconds-since-epoch divided by 30, so the cast cannot lose a bit this side
+    // of the year 292-billion.
+    let step = step as i64;
+    let result = UserEntity::update_many()
+        .col_expr(user::Column::TotpLastStep, Expr::value(step))
+        .filter(user::Column::Id.eq(user_id))
+        .filter(
+            Condition::any()
+                .add(user::Column::TotpLastStep.is_null())
+                .add(user::Column::TotpLastStep.lt(step)),
+        )
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
 }
 
 /// Disable MFA for a user.

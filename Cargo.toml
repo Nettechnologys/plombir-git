@@ -104,6 +104,11 @@ hex = "0.4"
 base64 = "0.22"
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem"] }
+# Comparing a TOTP candidate against the presented code. A hand-rolled XOR-fold
+# is the same arithmetic, but nothing stops the optimiser from restoring an early
+# exit through it; `subtle`'s whole purpose is to hold that guarantee. Already in
+# the lock through `aes-gcm` and `ed25519-dalek`, so this costs no extra build.
+subtle = "2.6"
 
 # TOTP / 2FA
 totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }

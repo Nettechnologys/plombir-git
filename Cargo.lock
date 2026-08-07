@@ -5218,6 +5218,7 @@ dependencies = [
  "serde_yaml",
  "sha1 0.10.6",
  "sha2 0.10.9",
+ "subtle",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

@@ -102,6 +102,7 @@ pub mod m20260805_000006_clean_serialized_user_grants;
 pub mod m20260806_000001_normalize_user_grants;
 pub mod m20260806_000002_create_repository_transfer_lease;
 pub mod m20260807_000001_create_mirror_sync_lease;
+pub mod m20260807_000002_add_user_totp_last_step;
 
 use sea_orm_migration::prelude::*;
 
@@ -294,6 +295,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260806_000001_normalize_user_grants::Migration),
             Box::new(m20260806_000002_create_repository_transfer_lease::Migration),
             Box::new(m20260807_000001_create_mirror_sync_lease::Migration),
+            Box::new(m20260807_000002_add_user_totp_last_step::Migration),
         ]
     }
 }

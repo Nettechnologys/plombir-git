@@ -217,9 +217,18 @@ async fn account_and_repository_deletion_cascade_the_rows_they_own() {
     assert_reference_shape(&db, true).await;
     assert_rebuild_invariants(&db).await;
 
-    assert!(crate::ops::user_ops::delete_by_id(&db, 2)
+    // A raw `DELETE`, the way `down_removes_only_the_references_this_migration_added`
+    // below already does it, and not `user_ops::delete_by_id`. The claim under
+    // test is a database one — the reference this migration installs carries the
+    // owned rows away — while `fixture` deliberately pins the schema to the point
+    // *before* this migration. An ops function issues `SELECT *` through the
+    // current `users` entity, so calling one here couples a historical schema to
+    // today's entity and every column added to `users` afterwards fails this test
+    // for a reason it is not about (`totp_last_step`, card_9585caf5692d, was the
+    // one that did).
+    db.execute_unprepared("DELETE FROM users WHERE id = 2")
         .await
-        .expect("delete the guest account"));
+        .expect("delete the guest account");
     for table in [
         "repo_collaborators",
         "organization_members",

@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use qrcode::QrCode;
 use std::time::SystemTime;
+use subtle::ConstantTimeEq;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Generate a new TOTP secret. Returns (secret_string, otpauth_url, qr_text).
@@ -50,7 +51,28 @@ pub fn generate_secret(username: &str, issuer: &str) -> Result<(String, String, 
 /// every code against the wrong HMAC key and report "invalid code" for a
 /// storage problem the operator needs to see. A clock before the Unix epoch is
 /// likewise an error, not an invalid code.
+///
+/// A plain `bool` is the right answer only where the check is *not* a pass of
+/// the second factor — enrolment, where the code proves the authenticator holds
+/// the secret the server just handed it. Anything that hands out a session must
+/// use [`verify_code_step`] and spend the step it returns, or the same code
+/// passes again for as long as it stays inside the skew window.
 pub fn verify_code(secret_str: &str, code: &str) -> Result<bool> {
+    Ok(verify_code_step(secret_str, code)?.is_some())
+}
+
+/// Verify a TOTP code and report **which time step** it was derived from.
+///
+/// The step is what makes a successful check consumable: `TOTP::check` swallows
+/// it, so a caller holding only its `bool` has nothing to record and no way to
+/// tell a first use from a replay. RFC 6238 §5.2 — "the verifier MUST NOT
+/// accept the second attempt of the OTP after the successful validation has
+/// been issued for the first OTP" — is a statement about state the verifier
+/// keeps, and there is no state to keep without this number.
+///
+/// `Ok(None)` is a code that matches no step in the window: an ordinary wrong
+/// code, not a failure.
+pub fn verify_code_step(secret_str: &str, code: &str) -> Result<Option<u64>> {
     let secret_bytes = Secret::Encoded(secret_str.to_string())
         .to_bytes()
         .map_err(|e| anyhow::anyhow!("TOTP secret is not valid base32: {}", e))?;
@@ -66,16 +88,44 @@ pub fn verify_code(secret_str: &str, code: &str) -> Result<bool> {
     )
     .map_err(|e| anyhow::anyhow!("TOTP parse error: {}", e))?;
 
-    check_code_at(&totp, code, SystemTime::now())
+    matching_step_at(&totp, code, SystemTime::now())
 }
 
-fn check_code_at(totp: &TOTP, code: &str, now: SystemTime) -> Result<bool> {
+/// The step `code` belongs to, searched over the same window `TOTP::check` uses.
+///
+/// Deliberately a re-implementation of `check` rather than a call to it: the
+/// crate's version returns a `bool` and drops the step. The window is
+/// `[now/step - skew, now/step + skew]`, and each candidate is compared in
+/// constant time so a wrong code leaks nothing about how far along the window
+/// it failed.
+///
+/// At most one step can match a given code — each step derives a different HMAC
+/// — so "the first match wins" is not a policy choice, it is the only match.
+fn matching_step_at(totp: &TOTP, code: &str, now: SystemTime) -> Result<Option<u64>> {
     let seconds = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .context("totp: read the current time step")?
         .as_secs();
 
-    Ok(totp.check(code, seconds))
+    let step_secs = totp.step;
+    let skew = u64::from(totp.skew);
+    // `saturating_sub` rather than `-`: a clock inside the first skew window of
+    // the epoch is a test fixture, not a reason to panic on an underflow.
+    let first = (seconds / step_secs).saturating_sub(skew);
+
+    for step in first..=(seconds / step_secs + skew) {
+        let candidate = totp.generate(step * step_secs);
+        // `ct_eq` and not `==`: `str`'s comparison exits on the first differing
+        // byte, which is what the crate's own `check` avoids and what this
+        // re-implementation must keep avoiding. Length is compared openly first —
+        // a code of the wrong length is not a secret — but `ct_eq` needs equal
+        // slices anyway.
+        if candidate.len() == code.len() && bool::from(candidate.as_bytes().ct_eq(code.as_bytes()))
+        {
+            return Ok(Some(step));
+        }
+    }
+    Ok(None)
 }
 
 /// Generate QR code as SVG for web display.
@@ -186,11 +236,69 @@ mod tests {
         let totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
         let clock_before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
 
-        let error = check_code_at(&totp, "123456", clock_before_epoch).unwrap_err();
+        let error = matching_step_at(&totp, "123456", clock_before_epoch).unwrap_err();
 
         assert!(error
             .to_string()
             .contains("totp: read the current time step"));
         assert!(verify_code(&secret, "123456").is_ok());
+    }
+
+    /// The step is the whole point of `verify_code_step`: a caller that only
+    /// learns "valid" has nothing to spend, which is how one code passed the
+    /// second factor for its whole 90-second window (card_9585caf5692d).
+    #[test]
+    fn a_valid_code_reports_the_step_it_was_derived_from() {
+        let (stored_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let app_totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
+
+        // Fixed instant rather than `now()`: the assertion is about which step
+        // is reported, and a test that reads the clock twice can straddle a
+        // boundary between the two reads.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_777_777_777);
+        let expected_step = 1_777_777_777 / 30;
+        let code = app_totp.generate(expected_step * 30);
+
+        let server_totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
+        assert_eq!(
+            matching_step_at(&server_totp, &code, now).unwrap(),
+            Some(expected_step),
+            "a valid code must name its own step"
+        );
+
+        // Non-vacuity: the same helper still refuses a code from no step at all.
+        assert_eq!(matching_step_at(&server_totp, "000000", now).unwrap(), None);
+        assert!(verify_code_step(&stored_secret, "000000").is_ok());
+    }
+
+    /// Clock skew is still tolerated, and each neighbour reports *its own* step
+    /// — otherwise spending a step would either reject an honest neighbour or
+    /// mark the wrong one as spent.
+    #[test]
+    fn each_step_in_the_skew_window_reports_itself() {
+        let (_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_777_777_777);
+        let current = 1_777_777_777 / 30;
+
+        for step in [current - 1, current, current + 1] {
+            let code = totp.generate(step * 30);
+            assert_eq!(
+                matching_step_at(&totp, &code, now).unwrap(),
+                Some(step),
+                "the code for step {step} must report step {step}"
+            );
+        }
+
+        // Just outside the window, in both directions.
+        for step in [current - 2, current + 2] {
+            let code = totp.generate(step * 30);
+            assert_eq!(
+                matching_step_at(&totp, &code, now).unwrap(),
+                None,
+                "step {step} is outside the skew window and must not verify"
+            );
+        }
     }
 }

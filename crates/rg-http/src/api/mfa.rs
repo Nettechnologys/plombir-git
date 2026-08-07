@@ -211,7 +211,15 @@ pub async fn enable_mfa(
         None => return Err(AppError::bad_request("MFA not set up yet")),
     };
 
-    // Verify the TOTP code
+    // Verify the TOTP code.
+    //
+    // Deliberately the plain `bool` and not the step-spending form `verify_mfa`
+    // uses: enrolment is not a pass of the second factor — the factor does not
+    // exist yet — it is the authenticator proving it holds the secret this
+    // endpoint's caller was just handed, over an already-authenticated session.
+    // Spending the step here would also make enrolment un-retryable for 30
+    // seconds after a failure that rolled the enrolment back, which is exactly
+    // the path `mfa_enable_atomicity_tests` drives.
     let valid =
         rg_core::auth::totp::verify_code(&totp_secret, &req.code).map_err(AppError::from)?;
 
@@ -333,7 +341,25 @@ pub async fn verify_mfa(
         let secret =
             rg_core::auth::encryption::decrypt(totp_secret, &enc_key).map_err(AppError::from)?;
 
-        let valid = rg_core::auth::totp::verify_code(&secret, &req.code).map_err(AppError::from)?;
+        // Two statements, not one check: a TOTP code is a pure function of the
+        // secret and the clock, so verifying it proves possession but consumes
+        // nothing. With `skew = 1` over a 30-second step, one intercepted code
+        // used to pass this gate for its whole ~90-second window, and two
+        // concurrent requests carrying it were answered two sessions. RFC 6238
+        // §5.2 requires the second attempt to be refused, which needs the step
+        // the code came from to be *spent* — see `consume_totp_step`.
+        //
+        // A replay therefore lands in the branch below, indistinguishable from a
+        // wrong code: same `401`, same lockout accounting. Telling the two apart
+        // would confirm to whoever replayed it that the code was genuine.
+        let valid = match rg_core::auth::totp::verify_code_step(&secret, &req.code)
+            .map_err(AppError::from)?
+        {
+            Some(step) => rg_db::ops::user_ops::consume_totp_step(&state.db, user.id, step)
+                .await
+                .map_err(AppError::from)?,
+            None => false,
+        };
 
         if !valid {
             let locked =

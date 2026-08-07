@@ -38,6 +38,15 @@ pub struct Model {
     pub mfa_type: Option<String>,
     /// JSON array of hashed backup codes, stored as TEXT
     pub backup_codes: Option<String>,
+    /// Newest TOTP time step this account has already spent passing the second
+    /// factor. `NULL` = no TOTP login has ever completed.
+    ///
+    /// A TOTP code is a pure function of the secret and the clock, so nothing in
+    /// the secret distinguishes a first use from a replay: with `skew = 1` over a
+    /// 30-second step, one intercepted code stays valid for ~90 seconds. This is
+    /// the spent state that makes a successful check *consume* something, the way
+    /// `mfa_backup_code::used` does for a recovery code.
+    pub totp_last_step: Option<i64>,
     /// Last successful login timestamp
     pub last_login_at: Option<DateTimeUtc>,
     /// Failed login attempts (for brute-force protection)
