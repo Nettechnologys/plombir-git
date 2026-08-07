@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait};
 
+use crate::db_retry::{classify, classify_anyhow};
 use rg_db::entities::issue::{self, Model as Issue};
 use rg_db::entities::issue_comment::{self, Model as Comment};
 use rg_db::ops::{issue_comment_ops, issue_label_ops, issue_ops};
@@ -140,6 +141,13 @@ const MAX_NUMBER_ATTEMPTS: usize = 32;
 /// connection stays an error — otherwise the loop would spin on a failure that
 /// re-reading cannot fix.
 ///
+/// The two retryable outcomes are not retried the same way. A UNIQUE violation
+/// means someone committed and `MAX(number) + 1` has moved, so the next attempt
+/// starts immediately; a busy backend means nothing has moved yet, and
+/// [`crate::db_retry`] makes that attempt wait — without which eight concurrent
+/// creates on SQLite spend the whole attempt budget busy-spinning on a lock
+/// that is still held and answer correct callers with a 5xx (card_f0fd0aaa87b5).
+///
 /// `model.number` is set here; whatever the caller left in it is overwritten.
 pub(crate) async fn insert_with_repo_number(
     db: &DatabaseConnection,
@@ -170,10 +178,8 @@ where
     for attempt in 1..=MAX_NUMBER_ATTEMPTS {
         let txn = match db.begin().await {
             Ok(txn) => txn,
-            Err(error)
-                if attempt < MAX_NUMBER_ATTEMPTS
-                    && rg_db::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if attempt < MAX_NUMBER_ATTEMPTS && classify(&error).is_worthwhile() => {
+                classify(&error).wait(attempt).await;
                 continue;
             }
             Err(error) => return Err(error).context("db: begin issue create transaction"),
@@ -193,18 +199,18 @@ where
             Err(error) => {
                 // The refused insert leaves this transaction unusable on
                 // PostgreSQL, so the retry has to start a fresh one.
-                let retryable = rg_db::is_unique_violation_anyhow(&error)
-                    || rg_db::is_retryable_transaction_error_anyhow(&error);
+                let retry = classify_anyhow(&error);
                 if let Err(rollback_error) = txn.rollback().await {
                     return Err(error).context(format!(
                         "issue create failed and its transaction could not be rolled back: \
                          {rollback_error}"
                     ));
                 }
-                if retryable && attempt < MAX_NUMBER_ATTEMPTS {
+                if retry.is_worthwhile() && attempt < MAX_NUMBER_ATTEMPTS {
+                    retry.wait(attempt).await;
                     continue;
                 }
-                if retryable {
+                if retry.is_worthwhile() {
                     return Err(error).context(format!(
                         "allocate an issue number after {MAX_NUMBER_ATTEMPTS} concurrent conflicts"
                     ));
@@ -228,10 +234,8 @@ where
 
         match txn.commit().await {
             Ok(()) => return Ok(issue),
-            Err(error)
-                if attempt < MAX_NUMBER_ATTEMPTS
-                    && rg_db::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if attempt < MAX_NUMBER_ATTEMPTS && classify(&error).is_worthwhile() => {
+                classify(&error).wait(attempt).await;
                 continue;
             }
             Err(error) => return Err(error).context("db: commit issue create transaction"),

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{DatabaseConnection, TransactionTrait};
 
+use crate::db_retry::{classify, classify_anyhow};
 use rg_db::entities::wiki_page;
 use rg_db::entities::wiki_revision;
 use rg_db::ops::wiki_page_ops;
@@ -171,10 +172,8 @@ where
     for attempt in 1..=MAX_UPDATE_ATTEMPTS {
         let transaction = match db.begin().await {
             Ok(transaction) => transaction,
-            Err(error)
-                if attempt < MAX_UPDATE_ATTEMPTS
-                    && rg_db::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if attempt < MAX_UPDATE_ATTEMPTS && classify(&error).is_worthwhile() => {
+                classify(&error).wait(attempt).await;
                 continue;
             }
             Err(error) => return Err(error).context("begin wiki page update transaction"),
@@ -232,18 +231,18 @@ where
                 continue;
             }
             Err(error) => {
-                let retryable = rg_db::is_unique_violation_anyhow(&error)
-                    || rg_db::is_retryable_transaction_error_anyhow(&error);
+                let retry = classify_anyhow(&error);
                 if let Err(rollback_error) = transaction.rollback().await {
                     return Err(error).context(format!(
                         "wiki page update failed and its transaction could not be rolled back: \
                          {rollback_error}"
                     ));
                 }
-                if retryable && attempt < MAX_UPDATE_ATTEMPTS {
+                if retry.is_worthwhile() && attempt < MAX_UPDATE_ATTEMPTS {
+                    retry.wait(attempt).await;
                     continue;
                 }
-                if retryable {
+                if retry.is_worthwhile() {
                     return Err(error).context(format!(
                         "serialize wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
                     ));
@@ -254,10 +253,8 @@ where
 
         match transaction.commit().await {
             Ok(()) => return Ok(updated),
-            Err(error)
-                if attempt < MAX_UPDATE_ATTEMPTS
-                    && rg_db::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if attempt < MAX_UPDATE_ATTEMPTS && classify(&error).is_worthwhile() => {
+                classify(&error).wait(attempt).await;
                 continue;
             }
             Err(error) if rg_db::is_retryable_transaction_error(&error) => {

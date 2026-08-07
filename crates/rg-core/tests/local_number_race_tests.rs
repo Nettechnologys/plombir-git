@@ -119,3 +119,83 @@ async fn eight_simultaneous_filings_take_eight_consecutive_numbers() {
         "the successful calls and the stored rows must be the same set"
     );
 }
+
+/// card_f0fd0aaa87b5: the attempt budget is a runaway guard, not a concurrency
+/// budget — and until this test nothing held it to that.
+///
+/// The two outcomes the allocator retries on are told apart by what the next
+/// attempt can hope for. A UNIQUE violation means someone committed, so
+/// `MAX(number) + 1` has already moved and retrying at once is right. A busy
+/// backend means nothing has moved and nothing will until the holder commits,
+/// and retrying at once is a busy-spin: thirty-two attempts finish in
+/// milliseconds, all of them refused by the same held lock, and a correct
+/// create is answered with `after 32 concurrent conflicts` — a 5xx.
+///
+/// SQLite produces exactly that refusal here and `busy_timeout` does not absorb
+/// it. The allocator reads inside a deferred transaction and writes inside the
+/// same one, so its `INSERT` has to promote a read lock to a write lock; SQLite
+/// refuses a promotion *immediately* rather than waiting, because waiting on it
+/// could deadlock. Every attempt is therefore fast and free, which is what lets
+/// the whole budget burn while the writer below is still holding the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_lock_held_by_someone_else_does_not_burn_the_attempt_budget() {
+    use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+
+    /// Long enough that an unwaiting loop is certainly exhausted inside it
+    /// (thirty-two refusals cost single-digit milliseconds), and short enough
+    /// to sit far under what the backoff schedule can wait out.
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db = fresh_db(directory.path()).await;
+    let author_id = rg_db::ops::user_ops::create_user(
+        &db,
+        "lockhold",
+        "lockhold@example.invalid",
+        "",
+        "lockhold",
+    )
+    .await
+    .expect("create user")
+    .id;
+    let repo_id = bare_repo_row(&db, author_id, "lockhold").await;
+
+    // A pool of its own, so the holder never competes with the filing for a
+    // connection — the point is the database's write lock, not the pool's.
+    let holder = fresh_db(directory.path()).await;
+    let held = holder.begin().await.expect("begin the holding transaction");
+    held.execute(Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "UPDATE repositories SET description = 'holding the write lock' WHERE id = 1".to_string(),
+    ))
+    .await
+    .expect("take the write lock");
+
+    let filing = tokio::spawn({
+        let db = db.clone();
+        async move {
+            rg_core::issue::service::create_issue(
+                &db,
+                repo_id,
+                author_id,
+                "filed while the write lock was held".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(HOLD).await;
+    held.commit().await.expect("release the write lock");
+
+    let issue = filing
+        .await
+        .expect("the filing task panicked")
+        .expect("a create that only had to wait for a held write lock was refused");
+    assert_eq!(
+        issue.number, 1,
+        "the filing landed, but not on the first free number"
+    );
+}

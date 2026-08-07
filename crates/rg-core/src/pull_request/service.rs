@@ -172,6 +172,13 @@ const MAX_NUMBER_ATTEMPTS: usize = 32;
 /// constraint or a dead connection stays an error — otherwise the loop would
 /// spin on a failure that re-reading cannot fix.
 ///
+/// The two retryable outcomes are not retried the same way. A UNIQUE violation
+/// means someone committed and `MAX(number) + 1` has moved, so the next attempt
+/// starts immediately; a busy backend means nothing has moved yet, and
+/// [`crate::db_retry`] makes that attempt wait — without which concurrent
+/// creates on SQLite spend the whole attempt budget busy-spinning on a lock
+/// that is still held and answer correct callers with a 5xx (card_f0fd0aaa87b5).
+///
 /// `model.number` is set here; whatever the caller left in it is overwritten.
 pub(crate) async fn insert_with_repo_number(
     db: &DatabaseConnection,
@@ -214,12 +221,12 @@ where
         match numbered {
             Ok(pr) => return Ok(pr),
             Err(error) => {
-                let retryable = rg_db::is_unique_violation_anyhow(&error)
-                    || rg_db::is_retryable_transaction_error_anyhow(&error);
-                if retryable && attempt < MAX_NUMBER_ATTEMPTS {
+                let retry = crate::db_retry::classify_anyhow(&error);
+                if retry.is_worthwhile() && attempt < MAX_NUMBER_ATTEMPTS {
+                    retry.wait(attempt).await;
                     continue;
                 }
-                if retryable {
+                if retry.is_worthwhile() {
                     return Err(error).context(format!(
                         "allocate a PR number after {MAX_NUMBER_ATTEMPTS} concurrent conflicts"
                     ));

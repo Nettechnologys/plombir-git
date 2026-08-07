@@ -20,6 +20,7 @@ use sea_orm::{
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::db_retry::{classify, classify_anyhow};
 use crate::search::dialect::{code_fts_snippet_expr, fts_match, CODE_FTS_COLS};
 
 /// Map file extensions to programming languages.
@@ -265,9 +266,8 @@ impl CodeIndexer {
         for attempt in 1..=MAX_ATTEMPTS {
             let transaction = match self.db.begin().await {
                 Ok(transaction) => transaction,
-                Err(error)
-                    if attempt < MAX_ATTEMPTS && rg_db::is_retryable_transaction_error(&error) =>
-                {
+                Err(error) if attempt < MAX_ATTEMPTS && classify(&error).is_worthwhile() => {
+                    classify(&error).wait(attempt).await;
                     continue;
                 }
                 Err(error) => return Err(error).context("begin atomic code index refresh"),
@@ -284,17 +284,18 @@ impl CodeIndexer {
             .await;
 
             if let Err(error) = write_result {
-                let retryable = rg_db::is_retryable_transaction_error_anyhow(&error);
+                let retry = classify_anyhow(&error);
                 if let Err(rollback_error) = transaction.rollback().await {
                     return Err(error).context(format!(
                         "code index refresh failed and its transaction could not be rolled back: \
                          {rollback_error}"
                     ));
                 }
-                if retryable && attempt < MAX_ATTEMPTS {
+                if retry.is_worthwhile() && attempt < MAX_ATTEMPTS {
+                    retry.wait(attempt).await;
                     continue;
                 }
-                if retryable {
+                if retry.is_worthwhile() {
                     return Err(error).context(format!(
                         "serialize code index refresh after {MAX_ATTEMPTS} concurrent conflicts"
                     ));
@@ -304,9 +305,8 @@ impl CodeIndexer {
 
             match transaction.commit().await {
                 Ok(()) => return Ok(()),
-                Err(error)
-                    if attempt < MAX_ATTEMPTS && rg_db::is_retryable_transaction_error(&error) =>
-                {
+                Err(error) if attempt < MAX_ATTEMPTS && classify(&error).is_worthwhile() => {
+                    classify(&error).wait(attempt).await;
                     continue;
                 }
                 Err(error) if rg_db::is_retryable_transaction_error(&error) => {

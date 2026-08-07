@@ -54,6 +54,7 @@ pub mod platform;
 pub mod search; // Cross-platform abstractions
 pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks
 
+pub(crate) mod db_retry; // One retry policy for the bounded database-write loops
 pub mod error; // Domain error types (CoreError)
 pub mod metrics_hook; // Observer hooks so the HTTP layer can meter core-crate events
 
