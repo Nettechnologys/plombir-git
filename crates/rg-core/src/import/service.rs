@@ -116,6 +116,67 @@ pub async fn run_import(
 // Generic Git / Gitea import
 // ═══════════════════════════════════════════════════════════════════════
 
+/// The clone step of an import pass, shared by every platform runner.
+///
+/// Shared rather than repeated so the lifecycle recheck below cannot be added
+/// to one runner and forgotten on the other two: the three had carried three
+/// copies of this block, and a guard that has to be remembered three times is
+/// a guard that will be added twice.
+///
+/// The recheck sits as close to the subprocess as the code allows.
+/// [`resolve_or_create_target_repo`] runs once, at the top of the pass, and
+/// `clone_repo` then decides what to do from the presence of a `HEAD` file
+/// alone: a repository deleted in between has had `<owner>/<name>.git` retired,
+/// so the missing directory reads as "nothing here yet" and the whole upstream
+/// is written back under the canonical name (card_a3ce6a2363a7). The deletion
+/// quiescence gate refuses while an import is in a running status; this closes
+/// the window *between* that query and this `git`, which no single query can.
+#[allow(clippy::too_many_arguments)]
+async fn clone_into_target(
+    db: &DatabaseConnection,
+    task: &ImportTask,
+    repo_id: i64,
+    clone_url: &str,
+    repo_root: &Path,
+    token: &str,
+    progress_when_done: i32,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
+
+    if rg_db::ops::repo_ops::find_by_id(db, repo_id)
+        .await
+        .context("failed to re-read the import target repository before cloning")?
+        .is_none()
+    {
+        anyhow::bail!(
+            "the target repository '{}/{}' was deleted while this import was running; nothing \
+             was cloned",
+            task.target_owner,
+            task.target_name
+        );
+    }
+
+    clone_repo(
+        clone_url,
+        repo_root,
+        &task.target_owner,
+        &task.target_name,
+        source_credentials(&task.platform, &task.source_url, token).as_ref(),
+    )?;
+    stats.repo_cloned = true;
+    update_stage(
+        db,
+        task.id,
+        "importing",
+        progress_when_done,
+        "Repository cloned",
+    )
+    .await?;
+
+    Ok(())
+}
+
 async fn run_git_import(
     db: &DatabaseConnection,
     task: &ImportTask,
@@ -123,23 +184,30 @@ async fn run_git_import(
     auth_token: &str,
     stats: &mut ImportStats,
 ) -> Result<()> {
-    let repo_id =
-        resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
+    let repo_id = resolve_or_create_target_repo(
+        db,
+        task.repo_id,
+        &task.target_owner,
+        &task.target_name,
+        repo_root,
+    )
+    .await?;
     import_task_ops::set_repo_id(db, task.id, repo_id)
         .await
         .context("failed to link the import task to its target repository")?;
 
     if task.import_repo {
-        update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
-        clone_repo(
+        clone_into_target(
+            db,
+            task,
+            repo_id,
             &task.source_url,
             repo_root,
-            &task.target_owner,
-            &task.target_name,
-            source_credentials(&task.platform, &task.source_url, auth_token).as_ref(),
-        )?;
-        stats.repo_cloned = true;
-        update_stage(db, task.id, "importing", 90, "Repository cloned").await?;
+            auth_token,
+            90,
+            stats,
+        )
+        .await?;
     }
 
     Ok(())
@@ -216,8 +284,14 @@ async fn run_github_import(
     let (gh_owner, gh_repo) = parse_github_url(&task.source_url)?;
 
     // Resolve (or create) the target repo in ForgeKeep DB
-    let repo_id =
-        resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
+    let repo_id = resolve_or_create_target_repo(
+        db,
+        task.repo_id,
+        &task.target_owner,
+        &task.target_name,
+        repo_root,
+    )
+    .await?;
 
     // Update task with repo_id
     import_task_ops::set_repo_id(db, task.id, repo_id)
@@ -226,16 +300,17 @@ async fn run_github_import(
 
     // Step 1: Clone repository
     if task.import_repo {
-        update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
-        clone_repo(
+        clone_into_target(
+            db,
+            task,
+            repo_id,
             &task.source_url,
             repo_root,
-            &task.target_owner,
-            &task.target_name,
-            source_credentials(&task.platform, &task.source_url, token).as_ref(),
-        )?;
-        stats.repo_cloned = true;
-        update_stage(db, task.id, "importing", 10, "Repository cloned").await?;
+            token,
+            10,
+            stats,
+        )
+        .await?;
     }
 
     // Build user mapping from all referenced users
@@ -394,8 +469,14 @@ async fn run_gitlab_import(
     let project_path = parse_gitlab_url(&task.source_url)?;
 
     // Resolve (or create) the target repo in ForgeKeep DB
-    let repo_id =
-        resolve_or_create_target_repo(db, &task.target_owner, &task.target_name, repo_root).await?;
+    let repo_id = resolve_or_create_target_repo(
+        db,
+        task.repo_id,
+        &task.target_owner,
+        &task.target_name,
+        repo_root,
+    )
+    .await?;
 
     import_task_ops::set_repo_id(db, task.id, repo_id)
         .await
@@ -403,21 +484,26 @@ async fn run_gitlab_import(
 
     // Step 1: Clone repository
     if task.import_repo {
-        update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
+        // The API round-trip below belongs to the cloning stage: without this
+        // the task would sit in `pending` for its duration, which is a status
+        // the UI renders as "not started yet".
+        update_stage(db, task.id, "cloning", 0, "Resolving source project...").await?;
         let project = client.get_project(&project_path).await?;
         // The clone URL comes from the GitLab API response, not the user's
         // source_url — re-guard it (a malicious/compromised instance could point
         // `http_url_to_repo` at an internal host).
         crate::net::guard_git_url(&project.http_url_to_repo).await?;
-        clone_repo(
+        clone_into_target(
+            db,
+            task,
+            repo_id,
             &project.http_url_to_repo,
             repo_root,
-            &task.target_owner,
-            &task.target_name,
-            source_credentials(&task.platform, &task.source_url, token).as_ref(),
-        )?;
-        stats.repo_cloned = true;
-        update_stage(db, task.id, "importing", 10, "Repository cloned").await?;
+            token,
+            10,
+            stats,
+        )
+        .await?;
     }
 
     // Build milestone cache (existing in target repo + newly imported ones when enabled)
@@ -548,12 +634,35 @@ async fn run_gitlab_import(
 
 /// Find the target repo in ForgeKeep DB, or create it if it doesn't exist.
 /// Returns the repo_id for use in all subsequent import operations.
+///
+/// `anchored_repo_id` is the repository the import was accepted for, recorded
+/// by [`start_import`] when it already existed. It makes "the target is gone"
+/// distinguishable from "the target was never there": without it a repository
+/// deleted after the import started simply falls out of the lookup below, the
+/// create branch runs, and the import quietly rebuilds the namespace the
+/// deletion retired — under the canonical `<owner>/<name>` the next repository
+/// of that name will claim (card_a3ce6a2363a7). An import that was accepted
+/// for a *new* name still creates it; only an anchored one refuses.
 async fn resolve_or_create_target_repo(
     db: &DatabaseConnection,
+    anchored_repo_id: Option<i64>,
     target_owner: &str,
     target_name: &str,
     repo_root: &Path,
 ) -> Result<i64> {
+    if let Some(repo_id) = anchored_repo_id {
+        return match rg_db::ops::repo_ops::find_by_id(db, repo_id)
+            .await
+            .context("failed to re-read the target repository this import was accepted for")?
+        {
+            Some(repo) => Ok(repo.id),
+            None => anyhow::bail!(
+                "the target repository '{target_owner}/{target_name}' was deleted after this \
+                 import started; nothing was cloned"
+            ),
+        };
+    }
+
     // Try to find existing repo via the repo service (handles user+org lookup)
     if let Some(repo) = crate::repo::service::find_repo_by_owner_name(db, target_owner, target_name)
         .await
@@ -1533,9 +1642,24 @@ pub async fn start_import(
         .filter(|token| !token.is_empty())
         .or(source.password);
 
+    // Anchor the task to the repository it was accepted for, when that
+    // repository already exists. Two things follow from writing it here rather
+    // than after the worker's own lookup: the deletion quiescence gate can see
+    // the import before it has resolved anything, and the worker knows it is
+    // continuing an import into an *existing* repository, so a target that
+    // disappears mid-flight stops the pass instead of being re-created under
+    // the name the deletion just freed (card_a3ce6a2363a7).
+    //
+    // A lookup failure fails the request: an import that starts unanchored is
+    // one this gate cannot see.
+    let existing_target =
+        crate::repo::service::find_repo_by_owner_name(db, &target_owner, &target_name)
+            .await
+            .context("failed to look up the import target repository")?;
+
     let model = import_task::ActiveModel {
         user_id: Set(user_id),
-        repo_id: Set(None),
+        repo_id: Set(existing_target.map(|repo| repo.id)),
         platform: Set(platform),
         source_url: Set(source_url),
         target_owner: Set(target_owner),
@@ -1869,9 +1993,10 @@ mod target_repo_resolution_tests {
         db.close().await.expect("close SQLite pool");
         let repo_root = tempfile::tempdir().expect("temporary repository root");
 
-        let error = resolve_or_create_target_repo(&closed_db, "alice", "widgets", repo_root.path())
-            .await
-            .expect_err("the failed existence check must abort target resolution");
+        let error =
+            resolve_or_create_target_repo(&closed_db, None, "alice", "widgets", repo_root.path())
+                .await
+                .expect_err("the failed existence check must abort target resolution");
 
         assert_eq!(
             error.to_string(),
@@ -1880,6 +2005,230 @@ mod target_repo_resolution_tests {
         assert!(
             !repo_root.path().join("alice/widgets.git").exists(),
             "a failed existence check entered the repository creation branch"
+        );
+    }
+}
+
+/// card_a3ce6a2363a7: an import is a detached worker that resolves its target
+/// once and reaches `git` later. Deleting the repository underneath it must not
+/// leave the upstream cloned back under `<owner>/<name>.git` — the canonical
+/// name the next repository of that name will claim.
+///
+/// The two guards are asserted separately because they close different windows:
+/// the anchor stops the pass from resolving a *second* time and re-creating the
+/// target, and the pre-`git` recheck stops the clone when the repository goes
+/// away after resolution. The third test is the one that keeps the pair honest
+/// — an import accepted for a name that never existed still creates it.
+#[cfg(test)]
+mod import_target_lifecycle_tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    /// One user, `importer`, owning one repository, `importer/imported`.
+    async fn lifecycle_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite pool");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(1, 'importer', 'importer@example.com', 'x', 0, 1, '2024-01-01 00:00:00', '2024-01-01 00:00:00')"
+                .to_string(),
+        ))
+        .await
+        .expect("seed the importing user");
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(1, 1, 'imported', 0, 'main', 0, 0, '2024-01-01 00:00:00', '2024-01-01 00:00:00')"
+                .to_string(),
+        ))
+        .await
+        .expect("seed the target repository");
+        db
+    }
+
+    async fn running_task(db: &DatabaseConnection, repo_id: Option<i64>) -> ImportTask {
+        let now = Utc::now();
+        import_task_ops::create(
+            db,
+            import_task::ActiveModel {
+                user_id: Set(1),
+                repo_id: Set(repo_id),
+                platform: Set("git".to_string()),
+                source_url: Set("https://example.invalid/importer/imported.git".to_string()),
+                target_owner: Set("importer".to_string()),
+                target_name: Set("imported".to_string()),
+                status: Set("cloning".to_string()),
+                progress: Set(0),
+                stage: Set(None),
+                error: Set(None),
+                user_mapping: Set(None),
+                import_repo: Set(true),
+                import_issues: Set(false),
+                import_pull_requests: Set(false),
+                import_wiki: Set(false),
+                import_releases: Set(false),
+                import_labels: Set(false),
+                import_milestones: Set(false),
+                stats: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the import task")
+    }
+
+    #[tokio::test]
+    async fn an_anchored_import_does_not_recreate_a_target_deleted_after_it_started() {
+        let db = lifecycle_db().await;
+        let repo_root = tempfile::tempdir().expect("temporary repository root");
+        rg_db::ops::repo_ops::soft_delete(&db, 1)
+            .await
+            .expect("delete the target repository");
+
+        let error =
+            resolve_or_create_target_repo(&db, Some(1), "importer", "imported", repo_root.path())
+                .await
+                .expect_err("an anchored import must not resolve its target a second time");
+
+        assert!(
+            error
+                .to_string()
+                .contains("was deleted after this import started"),
+            "the pass failed for some other reason: {error:#}"
+        );
+        assert!(
+            !repo_root.path().join("importer").exists(),
+            "the import rebuilt the namespace the deletion retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_clone_step_refuses_a_target_deleted_between_resolution_and_git() {
+        let db = lifecycle_db().await;
+        let repo_root = tempfile::tempdir().expect("temporary repository root");
+        let task = running_task(&db, Some(1)).await;
+        rg_db::ops::repo_ops::soft_delete(&db, 1)
+            .await
+            .expect("delete the target repository mid-pass");
+
+        let mut stats = ImportStats::default();
+        let error = clone_into_target(
+            &db,
+            &task,
+            1,
+            "https://example.invalid/importer/imported.git",
+            repo_root.path(),
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect_err("the clone must not run for a repository that no longer exists");
+
+        assert!(
+            error
+                .to_string()
+                .contains("was deleted while this import was running"),
+            "the clone step failed for some other reason: {error:#}"
+        );
+        assert!(
+            !stats.repo_cloned,
+            "the pass reported a clone it never made"
+        );
+        // `clone_repo` creates the namespace directory before it spawns `git`,
+        // so an untouched repository root is the evidence that the recheck ran
+        // *before* the subprocess and not merely that the bogus URL failed.
+        assert!(
+            !repo_root.path().join("importer").exists(),
+            "the clone reached `git` for a repository that no longer exists"
+        );
+    }
+
+    /// The anchor only closes the window if it is written when the import is
+    /// accepted: a task that first learns its `repo_id` from its own worker has
+    /// nothing to compare against by the time the target could be gone.
+    ///
+    /// `file://` is refused by the worker's SSRF guard before it resolves
+    /// anything, so the detached pass cannot race the row this test reads.
+    #[tokio::test]
+    async fn start_import_anchors_the_task_to_a_target_that_already_exists() {
+        let db = lifecycle_db().await;
+        let repo_root = tempfile::tempdir().expect("temporary repository root");
+
+        let existing = start_import(
+            &db,
+            1,
+            "git".to_string(),
+            "file:///srv/upstream.git".to_string(),
+            "importer".to_string(),
+            "imported".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            repo_root.path(),
+        )
+        .await
+        .expect("start an import into an existing repository");
+        assert_eq!(
+            existing.repo_id,
+            Some(1),
+            "the import was accepted unanchored, so no later check can tell \
+             'the target is gone' from 'it was never there'"
+        );
+
+        let fresh = start_import(
+            &db,
+            1,
+            "git".to_string(),
+            "file:///srv/upstream.git".to_string(),
+            "importer".to_string(),
+            "brand-new".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            repo_root.path(),
+        )
+        .await
+        .expect("start an import into a name that does not exist yet");
+        assert_eq!(
+            fresh.repo_id, None,
+            "an import accepted for a name that does not exist yet must stay \
+             free to create it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanchored_import_still_creates_the_target_it_was_accepted_for() {
+        let db = lifecycle_db().await;
+        let repo_root = tempfile::tempdir().expect("temporary repository root");
+
+        let repo_id =
+            resolve_or_create_target_repo(&db, None, "importer", "fresh", repo_root.path())
+                .await
+                .expect("an import accepted for a name that does not exist yet creates it");
+
+        assert_ne!(
+            repo_id, 1,
+            "a new name must not resolve to the existing repo"
+        );
+        assert!(
+            repo_root.path().join("importer/fresh.git/HEAD").exists(),
+            "the create branch no longer initialises the target repository"
         );
     }
 }

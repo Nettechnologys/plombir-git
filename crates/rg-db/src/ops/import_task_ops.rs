@@ -155,6 +155,41 @@ pub async fn list_active(db: &DatabaseConnection, limit: u64) -> Result<Vec<Mode
         .context("db: list active import tasks")
 }
 
+/// Count the imports still in flight against one repository.
+///
+/// An import names its target in two ways and a gate needs both. A worker that
+/// has reached [`set_repo_id`] is linked to the row by `repo_id`; one that has
+/// not — every task still `pending` — carries only the `owner/name` pair the
+/// request was accepted for, and matching on `repo_id` alone would report an
+/// import that has not started resolving yet as no import at all.
+///
+/// The caller is `rg_core::repo::service`'s deletion quiescence check: an
+/// import is a detached `tokio::spawn` that clones the whole upstream into
+/// `<owner>/<name>.git`, so a deletion that slips past it leaves bytes under a
+/// canonical name nothing owns (card_a3ce6a2363a7).
+pub async fn count_active_for_target(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    target_owner: &str,
+    target_name: &str,
+) -> Result<usize> {
+    let count = ImportTaskEntity::find()
+        .filter(import_task::Column::Status.is_in(RUNNING_STATUSES))
+        .filter(
+            Condition::any()
+                .add(import_task::Column::RepoId.eq(repo_id))
+                .add(
+                    Condition::all()
+                        .add(import_task::Column::TargetOwner.eq(target_owner))
+                        .add(import_task::Column::TargetName.eq(target_name)),
+                ),
+        )
+        .count(db)
+        .await
+        .context("db: count active import tasks for a repository")? as usize;
+    Ok(count)
+}
+
 /// Find import tasks that appear stuck: still in a running status but not
 /// updated within `older_than_secs`. The background import runs as a detached
 /// `tokio::spawn`, so a server restart/crash orphans any in-flight import —

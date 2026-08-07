@@ -1852,6 +1852,8 @@ fn retire_repository_filesystem_directories(
 async fn ensure_repository_deletion_is_quiescent(
     db: &DatabaseConnection,
     repo_id: i64,
+    namespace: &str,
+    name: &str,
 ) -> Result<()> {
     let active = rg_db::ops::pipeline_ops::count_active_pipelines(db, repo_id)
         .await
@@ -1885,6 +1887,29 @@ async fn ensure_repository_deletion_is_quiescent(
             "repository is being transferred from '{}' to '{}'; wait for that transfer to finish \
              before deleting it",
             lease.source_namespace, lease.destination_namespace
+        )));
+    }
+
+    // An import is the third writer this function cannot see from the row: a
+    // detached `tokio::spawn` that resolved its target once and reaches
+    // `git clone` later, deciding what to do from the presence of a `HEAD`
+    // file alone. Deleting underneath it retires `<namespace>/<name>.git`, the
+    // clone reads that missing directory as "nothing here yet", and the whole
+    // upstream lands back under the *canonical* name the deletion just freed —
+    // bytes nothing owns, which the next repository created with that name then
+    // inherits (card_a3ce6a2363a7). The mirror clone this echoes was at least
+    // named after a `repo_id` that could never collide.
+    //
+    // Retryable on the same terms as the two checks above: the import ends by
+    // itself, and `delete_repo` restores everything it staged before returning.
+    let imports =
+        rg_db::ops::import_task_ops::count_active_for_target(db, repo_id, namespace, name)
+            .await
+            .context("failed to check for imports in flight before repository deletion")?;
+    if imports > 0 {
+        return Err(crate::error::conflict(format!(
+            "repository has {imports} import(s) in flight; cancel them or wait for them to finish \
+             before deleting the repository"
         )));
     }
     Ok(())
@@ -1927,10 +1952,13 @@ pub async fn delete_repo(
     repo: &rg_db::entities::repository::Model,
 ) -> Result<()> {
     // `_ci_cache/<repo_id>` and `_artifacts/jobs/<job_id>` are writable by CI
-    // workers outside this function. Refuse before the first rename rather
-    // than moving a directory while a live job can immediately recreate it.
-    ensure_repository_deletion_is_quiescent(db, repo.id).await?;
+    // workers outside this function, and `<namespace>/<name>.git` is writable
+    // by an import worker. Refuse before the first rename rather than moving a
+    // directory while a live job or import can immediately recreate it. The
+    // namespace is resolved first because the import check is keyed on the
+    // `owner/name` pair a task that has not resolved its target yet carries.
     let namespace = repository_namespace_name(db, repo.owner_id, repo.org_id).await?;
+    ensure_repository_deletion_is_quiescent(db, repo.id, &namespace, &repo.name).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repo.name));
     let deletion_id = uuid::Uuid::new_v4().simple().to_string();
     // Validate every backend-neutral namespace before moving any live data. A
@@ -2047,7 +2075,9 @@ pub async fn delete_repo(
     // Recheck after every storage namespace is staged; if it published work in
     // that window, restore everything and make the caller retry only after the
     // pipeline has settled.
-    if let Err(error) = ensure_repository_deletion_is_quiescent(db, repo.id).await {
+    if let Err(error) =
+        ensure_repository_deletion_is_quiescent(db, repo.id, &namespace, &repo.name).await
+    {
         oci_storage.restore_repository(staged_oci).await;
         restore_repository_filesystem_directories(&staged_directories, repo.id);
         restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;

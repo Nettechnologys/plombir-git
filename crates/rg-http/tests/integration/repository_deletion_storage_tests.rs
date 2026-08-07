@@ -357,6 +357,151 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
     );
 }
 
+/// Seed an import task in a running status against `owner/name`, optionally
+/// already linked to its target repository.
+async fn seed_running_import(
+    db: &rg_db::DatabaseConnection,
+    user_id: i64,
+    repo_id: Option<i64>,
+    owner: &str,
+    name: &str,
+) -> rg_db::entities::import_task::Model {
+    let now = chrono::Utc::now();
+    rg_db::ops::import_task_ops::create(
+        db,
+        rg_db::entities::import_task::ActiveModel {
+            user_id: sea_orm::ActiveValue::Set(user_id),
+            repo_id: sea_orm::ActiveValue::Set(repo_id),
+            platform: sea_orm::ActiveValue::Set("git".to_string()),
+            source_url: sea_orm::ActiveValue::Set("https://example.com/upstream.git".to_string()),
+            target_owner: sea_orm::ActiveValue::Set(owner.to_string()),
+            target_name: sea_orm::ActiveValue::Set(name.to_string()),
+            status: sea_orm::ActiveValue::Set(
+                if repo_id.is_some() {
+                    "cloning"
+                } else {
+                    "pending"
+                }
+                .to_string(),
+            ),
+            progress: sea_orm::ActiveValue::Set(0),
+            stage: sea_orm::ActiveValue::Set(None),
+            error: sea_orm::ActiveValue::Set(None),
+            user_mapping: sea_orm::ActiveValue::Set(None),
+            import_repo: sea_orm::ActiveValue::Set(true),
+            import_issues: sea_orm::ActiveValue::Set(false),
+            import_pull_requests: sea_orm::ActiveValue::Set(false),
+            import_wiki: sea_orm::ActiveValue::Set(false),
+            import_releases: sea_orm::ActiveValue::Set(false),
+            import_labels: sea_orm::ActiveValue::Set(false),
+            import_milestones: sea_orm::ActiveValue::Set(false),
+            stats: sea_orm::ActiveValue::Set(None),
+            created_at: sea_orm::ActiveValue::Set(now),
+            updated_at: sea_orm::ActiveValue::Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed the in-flight import")
+}
+
+/// card_a3ce6a2363a7: an import is a detached `tokio::spawn` that clones the
+/// upstream into `<owner>/<name>.git`. That is the *canonical* name — unlike
+/// the mirror clone, which was named after a `repo_id` nothing could collide
+/// with — so a deletion that slips past an in-flight import leaves bytes the
+/// next repository of that name inherits.
+///
+/// Three claims, and the middle one is the reason the gate cannot be keyed on
+/// `repo_id` alone:
+///   * an import already linked to the repository refuses the deletion;
+///   * so does one that has not resolved its target yet and is therefore linked
+///     to nothing — the `owner/name` pair it was accepted for is all there is;
+///   * a finished import stops refusing, so the gate is not a one-way door.
+#[tokio::test]
+async fn delete_repository_refuses_while_an_import_is_in_flight() {
+    let (base, db, state) = spawn_test_app_with_state().await;
+    let (token, user_id) = register_full(&base, "delete-import", "delete-import@example.com").await;
+    let repo_id = create_repo(&base, &token, "incoming").await;
+
+    let git_dir = state.repo_root.join("delete-import/incoming.git");
+    assert!(
+        git_dir.join("HEAD").exists(),
+        "the fixture has no Git tree, so nothing below is being tested"
+    );
+
+    let client = reqwest::Client::new();
+    let delete_url = format!("{base}/api/v1/repos/delete-import/incoming");
+
+    let linked =
+        seed_running_import(&db, user_id, Some(repo_id), "delete-import", "incoming").await;
+    let response = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository with an import in flight");
+    assert_eq!(
+        response.status(),
+        409,
+        "the deletion did not refuse an import already linked to the repository"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .expect("re-read the repository")
+            .is_some(),
+        "the refused deletion soft-deleted the row anyway"
+    );
+    assert!(
+        git_dir.join("HEAD").exists(),
+        "the refused deletion left the Git tree staged aside"
+    );
+
+    // The worker has not reached `set_repo_id` yet: the row points at no
+    // repository, and only the pair it was accepted for names the target.
+    rg_db::ops::import_task_ops::mark_completed(&db, linked.id, "{}")
+        .await
+        .expect("settle the linked import");
+    let unlinked = seed_running_import(&db, user_id, None, "delete-import", "incoming").await;
+    let response = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository with an unresolved import in flight");
+    assert_eq!(
+        response.status(),
+        409,
+        "an import that has not resolved its target yet was invisible to the gate"
+    );
+    assert!(
+        git_dir.join("HEAD").exists(),
+        "the refused deletion left the Git tree staged aside"
+    );
+
+    // Nothing in flight any more — the gate has to let go.
+    rg_db::ops::import_task_ops::mark_completed(&db, unlinked.id, "{}")
+        .await
+        .expect("settle the unresolved import");
+    let response = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete a repository whose imports have finished");
+    assert_eq!(
+        response.status(),
+        200,
+        "the gate kept refusing after every import had finished: {}",
+        response.text().await.unwrap_or_default()
+    );
+    assert!(
+        !git_dir.exists(),
+        "the accepted deletion left the Git tree at {}",
+        git_dir.display()
+    );
+}
+
 /// The other side of the same directory: staged, but the deletion does not
 /// commit. The mirror clone has to come back with everything else, because the
 /// repository is still live and still mirroring.
