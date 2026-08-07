@@ -150,8 +150,11 @@ pub async fn list_audit_logs(
     // L-4: Standardized to 1-based page numbering (consistent with PaginationParams).
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(20).clamp(1, 100);
-    // sea_orm paginator is 0-based internally.
-    let page_index = page - 1;
+    // sea_orm paginator is 0-based internally, and it multiplies the index by
+    // the page size without checking — so the index needs the same ceiling
+    // `PaginationParams::offset` applies, or `?page=<2^62>` panics this handler
+    // instead of answering it (card_8973efdcbea5).
+    let page_index = crate::pagination::clamp_page_index(page - 1, per_page);
 
     let start_time = parse_time_bound(q.start_time.as_deref(), "start_time")?;
     let end_time = parse_time_bound(q.end_time.as_deref(), "end_time")?;
@@ -245,7 +248,9 @@ pub async fn list_login_attempts(
     }
     let (attempts, total) = rg_db::ops::login_log_ops::list_paginated(
         &state.db,
-        page - 1,
+        // Same ceiling as `list_audit_logs`: sea_orm's `fetch_page` multiplies
+        // this by `per_page` unchecked.
+        crate::pagination::clamp_page_index(page - 1, per_page),
         per_page,
         username,
         auth_provider,

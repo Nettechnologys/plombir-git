@@ -264,3 +264,91 @@ async fn an_oversized_page_size_is_clamped_rather_than_rejected() {
     .await;
     assert_eq!(per_page, 1, "zero must be clamped, not divided by");
 }
+
+// ── An absurd page NUMBER, not page size (card_8973efdcbea5) ────────────
+//
+// `page` is a bare `u64` off the query string and `offset()` multiplied it out
+// raw. Under `overflow-checks` — every test and debug build — the handler
+// panicked mid-request and the client got a dropped connection with no status
+// at all; in release the product wrapped, and `?page=4611686018427387905` came
+// back `200` carrying the *first* page's rows beside a `pagination.page` that
+// said it was somewhere else entirely. The unit tests next to `offset()` pin the
+// arithmetic; what they cannot show is that a real request now gets an answer.
+
+/// The release-build symptom, asserted where it was visible: this page number
+/// times `per_page=100` wraps to an offset of exactly 0.
+#[tokio::test]
+async fn a_page_number_that_wraps_the_offset_does_not_serve_the_first_page() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _id) = register_full(&base, "pagenum-wrap", "pagenum-wrap@example.com").await;
+    create_repo(&base, &token, "wrap-pages").await;
+    for n in 1..=3 {
+        create_issue(
+            &base,
+            &token,
+            "pagenum-wrap",
+            "wrap-pages",
+            &format!("issue {n}"),
+        )
+        .await;
+    }
+
+    let url = format!(
+        "{base}/api/v1/repos/pagenum-wrap/wrap-pages/issues?page=4611686018427387905&per_page=100"
+    );
+    let (len, _per_page, total) = page_of(&url, &token).await;
+    assert_eq!(
+        len, 0,
+        "a page past the end must be empty, not the first page's rows"
+    );
+    assert_eq!(total, 3, "the total still describes the whole listing");
+}
+
+/// The debug-build symptom: the largest page number there is must produce a
+/// status line, not a transport error. `status_of` panics on a dropped
+/// connection, which is precisely the failure being guarded.
+#[tokio::test]
+async fn the_largest_page_number_gets_an_http_status_rather_than_a_dropped_connection() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _id) = register_full(&base, "pagenum-max", "pagenum-max@example.com").await;
+    create_repo(&base, &token, "max-pages").await;
+
+    for route in [
+        format!("{base}/api/v1/repos/pagenum-max/max-pages/issues?page=18446744073709551615"),
+        format!("{base}/api/v1/repos/pagenum-max/max-pages/pulls?page=18446744073709551615"),
+        format!("{base}/api/v1/repos/pagenum-max/max-pages/pipelines?page=18446744073709551615"),
+        format!("{base}/api/v1/repos/pagenum-max?page=18446744073709551615"),
+        format!("{base}/api/v1/notifications?page=18446744073709551615"),
+        format!("{base}/api/v1/repos/explore?page=18446744073709551615"),
+    ] {
+        assert_eq!(
+            status_of(&route, &token).await,
+            200,
+            "an absurd page number must be answered, not aborted: {route}"
+        );
+    }
+}
+
+/// The audit-log handlers build their own paginator instead of going through
+/// `PaginationParams`, and hand the index to sea_orm, which multiplies it by the
+/// page size with no check of its own — the same overflow one layer down.
+#[tokio::test]
+async fn the_admin_audit_listings_survive_an_absurd_page_number() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, id) = register_full(&base, "pagenum-audit", "pagenum-audit@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, id, None, None, Some(true), None)
+        .await
+        .expect("promote to instance admin")
+        .expect("registered user must exist");
+
+    for route in [
+        format!("{base}/api/v1/admin/audit/logs?page=18446744073709551615&per_page=100"),
+        format!("{base}/api/v1/admin/login-attempts?page=18446744073709551615&per_page=100"),
+    ] {
+        assert_eq!(
+            status_of(&route, &token).await,
+            200,
+            "an absurd page number must be answered, not aborted: {route}"
+        );
+    }
+}
