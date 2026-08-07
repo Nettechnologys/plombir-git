@@ -266,6 +266,7 @@ jobs:
           --test mfa_backup_code_single_use
           --test passkey_counter_compare_and_swap
           --test totp_step_single_use
+          --test webauthn_ceremony_single_use
           -- --nocapture
 
       - name: Prove PostgreSQL code FTS create/retry boundary
@@ -332,6 +333,7 @@ jobs:
           --test mfa_backup_code_single_use
           --test passkey_counter_compare_and_swap
           --test totp_step_single_use
+          --test webauthn_ceremony_single_use
           -- --nocapture
 
       - name: Prove MySQL FTS migration maintenance boundary

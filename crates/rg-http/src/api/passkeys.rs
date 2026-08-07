@@ -13,6 +13,9 @@
 //! The in-progress ceremony state is carried between the *start* and *finish*
 //! calls in a short-lived, HttpOnly, signed cookie (see
 //! [`rg_core::auth::webauthn`]) — ForgeKeep keeps no server-side session store.
+//! The one thing the server does keep is that a ceremony's challenge has been
+//! answered (`rg_db::ops::webauthn_ceremony_ops::spend`), because single use is
+//! not a property a signature can carry and both *finish* calls depend on it.
 
 use std::collections::BTreeSet;
 
@@ -36,6 +39,16 @@ const PASSKEY_REG_COOKIE: &str = "forgekeep_passkey_reg";
 const PASSKEY_AUTH_COOKIE: &str = "forgekeep_passkey_auth";
 /// Ceremony state lifetime (seconds) — matches the browser dialog timeout.
 const CEREMONY_TTL_SECS: i64 = 300;
+/// How long a spent ceremony stays on record.
+///
+/// It has to outlast the last instant its cookie can still be unsealed, or the
+/// record is dropped while the challenge it refuses is still live and the
+/// replay window reopens. That is longer than [`CEREMONY_TTL_SECS`]:
+/// `jsonwebtoken`'s default validation allows 60 seconds of leeway past `exp`,
+/// and two instances of ForgeKeep need not agree on the clock to the second.
+/// Three minutes of margin costs a table that holds a few more minutes of
+/// ceremonies; being short by one second costs the property.
+const CEREMONY_SPEND_RETENTION_SECS: i64 = CEREMONY_TTL_SECS + 180;
 
 // ── Cookie helpers ────────────────────────────────────────────────────────
 
@@ -177,6 +190,12 @@ fn require_same_ceremony_rp(
 #[derive(Serialize, Deserialize)]
 struct RegState {
     user_id: i64,
+    /// Identifies this ceremony so its challenge can be spent exactly once.
+    ///
+    /// No `serde(default)`: a cookie issued before this field existed simply
+    /// stops unsealing, which costs an in-flight ceremony a restart during a
+    /// deploy and never leaves one running with nothing to spend.
+    ceremony_id: String,
     rp: RelyingParty,
     reg: wa::PasskeyRegistration,
 }
@@ -185,8 +204,33 @@ struct RegState {
 struct AuthState {
     user_id: i64,
     username: String,
+    /// Identifies this ceremony so its challenge can be spent exactly once.
+    /// See [`RegState::ceremony_id`].
+    ceremony_id: String,
     rp: RelyingParty,
     auth: wa::PasskeyAuthentication,
+}
+
+/// Spend the challenge of the ceremony that just verified, answering whether
+/// this request is the one that spent it.
+///
+/// A WebAuthn challenge is single-use, and a signed cookie cannot carry that on
+/// its own: signature and `exp` say "we issued this, and it is still young",
+/// never "it has already been answered". Without the spend, one intercepted
+/// `finish` request — the ceremony cookie and the assertion body, exactly the
+/// pair a phishing proxy sees — was replayable for the full
+/// `CEREMONY_TTL_SECS`, and the signature-counter compare-and-swap does not
+/// cover it: a platform passkey reporting `signCount = 0` re-stores a
+/// byte-identical credential, which is an honest `Stored`.
+///
+/// Called after the assertion or attestation has verified, so a request that
+/// proves nothing cannot burn a live ceremony, and before anything is issued or
+/// stored, so nothing outlives a refusal.
+async fn spend_ceremony(state: &AppState, ceremony_id: &str) -> Result<bool, AppError> {
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(CEREMONY_SPEND_RETENTION_SECS);
+    rg_db::ops::webauthn_ceremony_ops::spend(&state.db, ceremony_id, expires_at)
+        .await
+        .map_err(AppError::from)
 }
 
 // ── Public response shapes ────────────────────────────────────────────────
@@ -450,7 +494,12 @@ pub async fn register_start(
         .map_err(AppError::from)?;
 
     let token = wa::seal_state(
-        RegState { user_id, rp, reg },
+        RegState {
+            user_id,
+            ceremony_id: wa::new_ceremony_id(),
+            rp,
+            reg,
+        },
         "reg",
         &state.jwt_secret,
         CEREMONY_TTL_SECS,
@@ -487,7 +536,7 @@ pub struct RegisterFinishRequest {
     request_body = RegisterFinishRequest,
     responses(
         (status = 200, description = "Passkey registered", body = Vec<PasskeyInfo>),
-        (status = 400, description = "Missing, expired, or invalid registration challenge", body = serde_json::Value),
+        (status = 400, description = "Missing, expired, already-answered, or invalid registration challenge", body = serde_json::Value),
         (status = 401, description = "Authentication required", body = serde_json::Value),
         (status = 409, description = "Passkey already registered", body = serde_json::Value),
     ),
@@ -517,6 +566,21 @@ pub async fn register_finish(
             tracing::warn!(user_id, error = %format!("{error:#}"), "passkey registration verification failed");
             AppError::bad_request("passkey registration could not be verified")
         })?;
+
+    // The attestation verified; this challenge is now spent. Registration is
+    // the cheaper half of the class — a replayed enrolment collides on
+    // `credential_id` — but the window is the same 300 seconds, and the refusal
+    // has to be the one a bad attestation gets, so a replay learns nothing
+    // about whether the material it carried was genuine.
+    if !spend_ceremony(&state, &sealed.ceremony_id).await? {
+        tracing::warn!(
+            user_id,
+            "passkey registration challenge had already been answered; refusing the replay"
+        );
+        return Err(AppError::bad_request(
+            "passkey registration could not be verified",
+        ));
+    }
 
     let credential_id = wa::credential_id_b64(passkey.cred_id());
     let passkey_json = wa::passkey_to_json(&passkey).map_err(AppError::from)?;
@@ -708,6 +772,7 @@ pub async fn login_start(
         AuthState {
             user_id: user.id,
             username: user.username.clone(),
+            ceremony_id: wa::new_ceremony_id(),
             rp,
             auth,
         },
@@ -747,7 +812,7 @@ pub struct PasskeyLoginResponse {
     request_body = PasskeyAuthenticationCredential,
     responses(
         (status = 200, description = "Login successful", body = PasskeyLoginResponse),
-        (status = 401, description = "Missing challenge, invalid credential, or locked account", body = serde_json::Value),
+        (status = 401, description = "Missing, expired, or already-answered challenge, invalid credential, or locked account", body = serde_json::Value),
         (status = 409, description = "Another assertion advanced this credential first; retry the login", body = serde_json::Value),
         (status = 500, description = "The advanced signature counter could not be serialized or stored", body = serde_json::Value),
         (status = 503, description = "The advanced signature counter could not be stored: the database is unreachable", body = serde_json::Value),
@@ -783,6 +848,21 @@ pub async fn login_finish(
         tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "passkey authentication verification failed");
         AppError::unauthorized("passkey authentication failed")
     })?;
+
+    // The assertion verified, so this ceremony's challenge is spent here — once,
+    // by whichever request gets there first. Everything below issues or mutates
+    // something, and none of it may happen twice for one challenge.
+    //
+    // Deliberately the same `401 passkey authentication failed` a bad signature
+    // gets: a distinct status would tell whoever is replaying an intercepted
+    // request that the cookie and assertion they hold were real.
+    if !spend_ceremony(&state, &sealed.ceremony_id).await? {
+        tracing::warn!(
+            user_id = user.id,
+            "passkey login challenge had already been answered; refusing the replay"
+        );
+        return Err(AppError::unauthorized("passkey authentication failed"));
+    }
 
     // Advance the stored signature counter for the credential that just signed.
     //

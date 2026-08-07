@@ -50,6 +50,7 @@ pub mod sso_provider_ops;
 pub mod time_entry_ops;
 pub mod token_ops;
 pub mod user_ops;
+pub mod webauthn_ceremony_ops;
 pub mod webhook_ops;
 pub mod wiki_page_ops;
 pub mod wiki_revision_ops;

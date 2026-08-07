@@ -71,6 +71,7 @@ pub mod team;
 pub mod team_member;
 pub mod time_entry;
 pub mod user;
+pub mod webauthn_ceremony_spend;
 pub mod webhook;
 pub mod webhook_delivery;
 pub mod wiki_page;

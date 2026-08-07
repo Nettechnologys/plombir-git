@@ -129,6 +129,7 @@ probed_entities!(
     team_member,
     time_entry,
     user,
+    webauthn_ceremony_spend,
     webhook,
     webhook_delivery,
     wiki_page,

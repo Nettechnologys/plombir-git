@@ -7,6 +7,19 @@
 //! (`jwt::generate_mfa_challenge`). Signing gives integrity + expiry so a client
 //! cannot swap in a challenge the server never issued.
 //!
+//! Signing gives *only* that, though, and a WebAuthn challenge also has to be
+//! single-use: verification is a pure function of the signing key and the
+//! clock, so one intercepted cookie-plus-assertion pair used to be answered a
+//! session as many times as it was presented, for the whole lifetime of the
+//! cookie (`card_7c7ada2d6a72`). Being used is not a property a signature can
+//! carry, so the server does now keep one durable fact per ceremony: that its
+//! challenge has been answered, recorded under [`new_ceremony_id`] by
+//! `rg_db::ops::webauthn_ceremony_ops::spend` and forgotten once the cookie
+//! stops unsealing. That is a spent-nonce ledger and not a session store — the
+//! ceremony state itself still lives only in the cookie, and the server holds
+//! nothing that could reconstruct it — but it is a deliberate narrowing of the
+//! sentence above rather than an accident of it.
+//!
 //! Login uses the **non-discoverable** (allow-list) flavour: the user supplies a
 //! username, we look up their stored passkeys and hand the authenticator an
 //! explicit credential allow-list. The WebAuthn user handle therefore never has
@@ -129,6 +142,23 @@ pub fn passkey_from_json(json: &str) -> Result<Passkey> {
     serde_json::from_str(json).context("deserialize passkey")
 }
 
+/// Mint the identifier of one ceremony — the value under which its challenge is
+/// spent.
+///
+/// Sealed into the ceremony cookie beside the challenge itself, because the
+/// challenge is not reachable through `webauthn-rs`'s opaque
+/// `PasskeyRegistration` / `PasskeyAuthentication`. It stands for the challenge
+/// one-for-one: a fresh 256-bit value per ceremony, from the OS random source,
+/// so two ceremonies never collide and no ceremony's id can be guessed from
+/// another's.
+pub fn new_ceremony_id() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 // ── Signed ceremony-state cookie (begin ⇄ finish bridge) ──────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +225,21 @@ mod tests {
     fn build_rejects_mismatched_rp_id() {
         // rp_id must be a suffix of the origin host.
         assert!(build("example.com", "http://localhost:5173").is_err());
+    }
+
+    #[test]
+    fn ceremony_ids_are_fresh_per_ceremony() {
+        let a = new_ceremony_id();
+        let b = new_ceremony_id();
+        assert_ne!(
+            a, b,
+            "a ceremony id that repeats would refuse the next honest login as a replay"
+        );
+        // 32 random bytes, URL-safe base64 without padding.
+        assert_eq!(a.len(), 43);
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
