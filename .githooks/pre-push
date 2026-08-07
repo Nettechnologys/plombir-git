@@ -1,8 +1,19 @@
 #!/usr/bin/env sh
-# Keep direct pushes from making `main` red after the fact.  CI repeats these
-# checks independently; this hook gives the author the same cheap feedback
-# before refs leave their machine.  Bypass remains Git's explicit
-# `git push --no-verify` escape hatch.
+# Keep direct pushes from making `main` red after the fact.
+#
+# This hook is not a convenience duplicate of CI: right now it is the ONLY place
+# these gates run. `.github/workflows/regression.yml` has never executed a step —
+# 400 runs out of 400 were refused before a runner was assigned, because Actions
+# is blocked on account billing. So everything not mirrored here is enforced by
+# nothing at all.
+#
+# The cargo-free half is delegated to `scripts/run-local-gates.mjs` as ONE
+# target rather than spelled out below, so the set cannot drift away from the
+# workflow unnoticed; `scripts/local-gate-coverage-contract-check.mjs` fails when
+# it does. The Rust half stays here because it needs no such bookkeeping.
+#
+# Budget: ~15s for the cargo-free gates on a warm checkout, plus whatever clippy
+# costs on your target dir. Bypass remains Git's explicit `git push --no-verify`.
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
@@ -13,3 +24,6 @@ cargo fmt --all -- --check
 
 printf '%s\n' 'pre-push: running workspace clippy'
 cargo clippy --workspace --all-targets
+
+printf '%s\n' 'pre-push: running cargo-free regression gates'
+node scripts/run-local-gates.mjs
