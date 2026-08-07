@@ -595,7 +595,9 @@ pub async fn delete_repo_handler(
     }: RepoOwner,
 ) -> impl IntoResponse {
     // Only the audit trail's actor name; the ownership decision above it is the
-    // extractor's and is not re-litigated here. See [`audit_actor_name`].
+    // extractor's and is not re-litigated here. A missing row is the server's
+    // inconsistency, not the caller's fault — the id came from a gate that
+    // resolved it against a repository this account owns — so it is a `500`.
     let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, user_id).await {
         Ok(actor) => actor,
         Err(error) => return AppError::from(error).into_response(),
@@ -820,7 +822,8 @@ pub async fn transfer_repo_handler(
     }: NamespaceCreate<TransferRequest>,
 ) -> impl IntoResponse {
     // Only the audit trail's actor name; both access decisions above it are the
-    // extractors' and are not re-litigated here. See [`audit_actor_name`].
+    // extractors' and are not re-litigated here, for the reason spelled out on
+    // `delete_repo` above.
     let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, user_id).await {
         Ok(actor) => actor,
         Err(error) => return AppError::from(error).into_response(),
