@@ -31,72 +31,6 @@ use crate::{
     AppState,
 };
 
-/// Helper to record audit log (fire-and-forget).
-#[allow(clippy::too_many_arguments)]
-async fn record_audit(
-    db: &sea_orm::DatabaseConnection,
-    user_id: i64,
-    username: &str,
-    action: &str,
-    resource_type: Option<&str>,
-    resource_id: Option<i64>,
-    resource_name: Option<&str>,
-    headers: &HeaderMap,
-    details: Option<serde_json::Value>,
-) {
-    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
-
-    let entry = rg_db::entities::audit_log::ActiveModel {
-        id: sea_orm::NotSet,
-        user_id: sea_orm::Set(Some(user_id)),
-        username: sea_orm::Set(Some(username.to_string())),
-        action: sea_orm::Set(action.to_string()),
-        resource_type: sea_orm::Set(resource_type.map(|s| s.to_string())),
-        resource_id: sea_orm::Set(resource_id),
-        resource_name: sea_orm::Set(resource_name.map(|s| s.to_string())),
-        ip_address: sea_orm::Set(ip_address),
-        user_agent: sea_orm::Set(user_agent),
-        details: sea_orm::Set(details.map(|v| v.to_string())),
-        created_at: sea_orm::Set(chrono::Utc::now()),
-    };
-
-    if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
-        tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
-    }
-}
-
-/// The acting account's name for the audit trail, by the id a gate established.
-///
-/// Read from the account row, not from the session's `username` claim: a session
-/// minted before a rename still carries the old spelling, and this name is what
-/// a human reads in the journal. `create_repo` and `repo.fork` already name the
-/// actor this way; this is the same rule for the handlers that were passing
-/// `claims.sub` — a number — into the actor column (card_fcc07f8d1505).
-///
-/// The distinction that matters: this is a *name lookup*, never an
-/// authentication step. What stood here before was `extract_bearer_claims`,
-/// which re-derived identity from `Authorization: Bearer` alone while the gate
-/// above it accepts the HttpOnly `forgekeep_token` cookie as well — so the
-/// browser session the gate had just admitted got a `401` out of the handler
-/// body (card_7210b02c0ae9). Identity is the extractor's answer; a handler that
-/// asks again narrows it.
-///
-/// A missing row is the server's inconsistency, not the caller's fault: the id
-/// arrives from a gate that resolved it against a repository this account owns,
-/// so the account has to exist. Hence `500`, not another `401`.
-async fn audit_actor_name(
-    db: &sea_orm::DatabaseConnection,
-    actor_id: i64,
-) -> Result<String, AppError> {
-    match rg_db::ops::user_ops::find_by_id(db, actor_id).await {
-        Ok(Some(user)) => Ok(user.username),
-        Ok(None) => Err(AppError::internal(format!(
-            "authenticated actor {actor_id} has no account row"
-        ))),
-        Err(e) => Err(AppError::from(e)),
-    }
-}
-
 /// POST /api/v1/repos
 #[derive(Deserialize, ToSchema)]
 pub struct CreateRepoRequest {
@@ -222,6 +156,13 @@ pub async fn create_repo(
     // `username` claim: a session minted before a rename still carries the old
     // spelling, and this name ends up in the commit author and the audit entry.
     let username = owner_user.username.clone();
+    // The actor is resolved through the one type that may fill the actor column;
+    // `username` below is the *namespace* the repository lands in, which is a
+    // different thing that merely happens to match for a personal repository.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, owner_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let owner_display = owner_user
         .display_name
         .clone()
@@ -266,15 +207,14 @@ pub async fn create_repo(
                 body.org.as_deref().unwrap_or(&username),
                 &body.name
             );
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                owner_id,
-                &username,
+                &audit_actor,
                 "repo.create",
                 Some("repo"),
                 Some(repo.id),
                 Some(&resource_name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -656,9 +596,9 @@ pub async fn delete_repo_handler(
 ) -> impl IntoResponse {
     // Only the audit trail's actor name; the ownership decision above it is the
     // extractor's and is not re-litigated here. See [`audit_actor_name`].
-    let actor_name = match audit_actor_name(&state.db, user_id).await {
-        Ok(name) => name,
-        Err(e) => return e.into_response(),
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
     };
 
     match rg_core::repo::service::delete_repo(
@@ -677,15 +617,14 @@ pub async fn delete_repo_handler(
                 "owner": owner,
                 "name": name
             });
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                user_id,
-                &actor_name,
+                &audit_actor,
                 "repo.delete",
                 Some("repo"),
                 Some(repo.id),
                 Some(&resource_name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -759,15 +698,16 @@ pub async fn fork_repo_handler(
                 "fork_owner": owner_username
             });
             let resource_name = format!("{owner_username}/{}", repo.name);
-            record_audit(
+            let audit_actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await;
+            rg_core::audit::record(
                 &state.db,
-                user_id,
-                &owner_username,
+                &audit_actor,
                 "repo.fork",
                 Some("repo"),
                 Some(repo.id),
                 Some(&resource_name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -881,9 +821,9 @@ pub async fn transfer_repo_handler(
 ) -> impl IntoResponse {
     // Only the audit trail's actor name; both access decisions above it are the
     // extractors' and are not re-litigated here. See [`audit_actor_name`].
-    let actor_name = match audit_actor_name(&state.db, user_id).await {
-        Ok(name) => name,
-        Err(e) => return e.into_response(),
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
     };
 
     match rg_core::repo::service::transfer_repo(
@@ -906,15 +846,14 @@ pub async fn transfer_repo_handler(
                 "name": name
             });
             let resource_name = format!("{}/{}", body.new_owner, name);
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                user_id,
-                &actor_name,
+                &audit_actor,
                 "repo.transfer",
                 Some("repo"),
                 Some(repo.id),
                 Some(&resource_name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;

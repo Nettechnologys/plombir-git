@@ -608,17 +608,48 @@ pub async fn delete_version(
         String,
         String,
     )>,
-    RepoWrite { .. }: RepoWrite,
+    RepoWrite { actor_id, .. }: RepoWrite,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
+    // Publishing is attributed forever — `PublishInfo` puts `author_id` on the
+    // version row. Deleting removes that row and used to leave nothing in its
+    // place, so the one registry operation that cannot be undone was the one
+    // operation nobody could be identified for (card_6baa3e341bf3). The actor
+    // comes from the gate that already admitted the request, not from headers.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
 
     match rg_core::package_registry::service::delete_version(
         &state.db, &storage, &owner, &name, &pkg_type, &pkg_name, &version,
     )
     .await
     {
-        Ok(_) => (StatusCode::NO_CONTENT,).into_response(),
+        Ok(_) => {
+            // Fire-and-forget, after the fact: the bytes and the rows are
+            // already gone and no audit failure may turn that into an error the
+            // caller would retry.
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "package.delete",
+                Some("package_version"),
+                None,
+                Some(&format!("{owner}/{name}/{pkg_name}@{version}")),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "repo": format!("{owner}/{name}"),
+                    "pkg_type": pkg_type,
+                    "pkg_name": pkg_name,
+                    "version": version,
+                })),
+            )
+            .await;
+            (StatusCode::NO_CONTENT,).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -652,19 +683,56 @@ pub async fn yank_version(
         String,
         String,
     )>,
-    RepoWrite { .. }: RepoWrite,
+    RepoWrite { actor_id, .. }: RepoWrite,
+    headers: axum::http::HeaderMap,
     Json(body): Json<YankRequest>,
 ) -> axum::response::Response {
+    // Publishing is attributed forever — `PublishInfo` puts `author_id` on the
+    // version row. Deleting removes that row and used to leave nothing in its
+    // place, so the one registry operation that cannot be undone was the one
+    // operation nobody could be identified for (card_6baa3e341bf3). The actor
+    // comes from the gate that already admitted the request, not from headers.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
     match rg_core::package_registry::service::yank_version(
         &state.db, &owner, &name, &pkg_type, &pkg_name, &version, body.yank,
     )
     .await
     {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"yanked": body.yank})),
-        )
-            .into_response(),
+        Ok(_) => {
+            // Two actions, not one flag: a journal is read by filtering on
+            // `action`, and "who yanked this" and "who put it back" are
+            // different questions.
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                if body.yank {
+                    "package.yank"
+                } else {
+                    "package.unyank"
+                },
+                Some("package_version"),
+                None,
+                Some(&format!("{owner}/{name}/{pkg_name}@{version}")),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "repo": format!("{owner}/{name}"),
+                    "pkg_type": pkg_type,
+                    "pkg_name": pkg_name,
+                    "version": version,
+                    "yanked": body.yank,
+                })),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"yanked": body.yank})),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

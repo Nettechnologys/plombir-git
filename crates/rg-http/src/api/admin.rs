@@ -23,40 +23,6 @@ use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
 
-/// Helper to record audit log (fire-and-forget).
-#[allow(clippy::too_many_arguments)]
-async fn record_audit(
-    db: &sea_orm::DatabaseConnection,
-    user_id: i64,
-    username: &str,
-    action: &str,
-    resource_type: Option<&str>,
-    resource_id: Option<i64>,
-    resource_name: Option<&str>,
-    headers: &HeaderMap,
-    details: Option<serde_json::Value>,
-) {
-    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
-
-    let entry = rg_db::entities::audit_log::ActiveModel {
-        id: sea_orm::NotSet,
-        user_id: sea_orm::Set(Some(user_id)),
-        username: sea_orm::Set(Some(username.to_string())),
-        action: sea_orm::Set(action.to_string()),
-        resource_type: sea_orm::Set(resource_type.map(|s| s.to_string())),
-        resource_id: sea_orm::Set(resource_id),
-        resource_name: sea_orm::Set(resource_name.map(|s| s.to_string())),
-        ip_address: sea_orm::Set(ip_address),
-        user_agent: sea_orm::Set(user_agent),
-        details: sea_orm::Set(details.map(|v| v.to_string())),
-        created_at: sea_orm::Set(chrono::Utc::now()),
-    };
-
-    if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
-        tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
-    }
-}
-
 // ── Request / Response types ────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +177,15 @@ pub async fn update_user(
     Path(user_id): Path<i64>,
     Json(body): Json<UpdateUserRequest>,
 ) -> impl IntoResponse {
+    // The actor column used to get `""` here: an admin action with a known
+    // `user_id` and a blank author, which `/admin/audit` renders as a blank
+    // actor — indistinguishable from a name that failed to load
+    // (card_fcc07f8d1505). Resolved before the mutation, so a database failure
+    // refuses the request rather than recording an anonymous one.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let display_name_for_audit = body.display_name.clone();
     let display_name = body.display_name.map(Some);
     let bio = body.bio.map(Some);
@@ -233,15 +208,14 @@ pub async fn update_user(
                 "is_admin": is_admin,
                 "is_active": is_active
             });
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                current_id,
-                "",
+                &audit_actor,
                 "admin.update_user",
                 Some("user"),
                 Some(user_id),
                 Some(user.username.as_str()),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -278,23 +252,27 @@ pub async fn unlock_user(
         Ok(None) => return AppError::not_found("user not found").into_response(),
         Err(error) => return AppError::from(error).into_response(),
     };
-    let actor_username = rg_db::ops::user_ops::find_by_id(&state.db, current_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|user| user.username)
-        .unwrap_or_default();
+    // Resolved before the reset, and with the failure propagated. This used to
+    // be `.ok().flatten().unwrap_or_default()`, which folded "the query failed"
+    // and "no such account" into `""` — and then reset the target's login
+    // failures anyway, leaving the only record of who unlocked an account with a
+    // blank author that reads as entirely routine
+    // (card_86f40189bc71, card_e2bd7026c87d). The target above is resolved with
+    // the three answers kept apart; the actor gets the same treatment.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_db::ops::user_ops::reset_login_failures(&state.db, user_id).await {
         Ok(updated) => {
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                current_id,
-                &actor_username,
+                &audit_actor,
                 "admin.unlock_user",
                 Some("user"),
                 Some(user_id),
                 Some(&target.username),
-                &headers,
+                Some(&headers),
                 Some(serde_json::json!({
                     "previous_login_attempts": target.login_attempts,
                     "previous_locked_until": target.locked_until,
@@ -334,6 +312,15 @@ pub async fn delete_user(
     if current_id == user_id {
         return AppError::bad_request("cannot delete your own account").into_response();
     }
+    // The actor column used to get `""` here: an admin action with a known
+    // `user_id` and a blank author, which `/admin/audit` renders as a blank
+    // actor — indistinguishable from a name that failed to load
+    // (card_fcc07f8d1505). Resolved before the mutation, so a database failure
+    // refuses the request rather than recording an anonymous one.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     // The account's repositories are deleted with it, so this needs the same
     // three storage handles a routed repository deletion does — the row alone
     // is not what the account owns.
@@ -348,15 +335,14 @@ pub async fn delete_user(
     {
         Ok(()) => {
             let details = serde_json::json!({"deleted_user_id": user_id});
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                current_id,
-                "",
+                &audit_actor,
                 "admin.delete_user",
                 Some("user"),
                 Some(user_id),
                 None,
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -442,6 +428,15 @@ pub async fn delete_org(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // The actor column used to get `""` here: an admin action with a known
+    // `user_id` and a blank author, which `/admin/audit` renders as a blank
+    // actor — indistinguishable from a name that failed to load
+    // (card_fcc07f8d1505). Resolved before the mutation, so a database failure
+    // refuses the request rather than recording an anonymous one.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_core::org::get_org_by_name(&state.db, &name).await {
         // Instance admins delete organizations they do not own — that is the
         // point of the route, and `InstanceAdmin` above is the gate that says
@@ -461,15 +456,14 @@ pub async fn delete_org(
         {
             Ok(()) => {
                 let details = serde_json::json!({"org_name": org.name});
-                record_audit(
+                rg_core::audit::record(
                     &state.db,
-                    current_id,
-                    "",
+                    &audit_actor,
                     "admin.delete_org",
                     Some("org"),
                     Some(org.id),
                     Some(&org.name),
-                    &headers,
+                    Some(&headers),
                     Some(details),
                 )
                 .await;

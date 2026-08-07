@@ -10,40 +10,6 @@ use crate::api::auth::AuthUser;
 use crate::error::AppError;
 use crate::AppState;
 
-/// Helper to record audit log (fire-and-forget).
-#[allow(clippy::too_many_arguments)]
-async fn record_audit(
-    db: &sea_orm::DatabaseConnection,
-    user_id: i64,
-    username: &str,
-    action: &str,
-    resource_type: Option<&str>,
-    resource_id: Option<i64>,
-    resource_name: Option<&str>,
-    headers: &HeaderMap,
-    details: Option<serde_json::Value>,
-) {
-    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
-
-    let entry = rg_db::entities::audit_log::ActiveModel {
-        id: sea_orm::NotSet,
-        user_id: sea_orm::Set(Some(user_id)),
-        username: sea_orm::Set(Some(username.to_string())),
-        action: sea_orm::Set(action.to_string()),
-        resource_type: sea_orm::Set(resource_type.map(|s| s.to_string())),
-        resource_id: sea_orm::Set(resource_id),
-        resource_name: sea_orm::Set(resource_name.map(|s| s.to_string())),
-        ip_address: sea_orm::Set(ip_address),
-        user_agent: sea_orm::Set(user_agent),
-        details: sea_orm::Set(details.map(|v| v.to_string())),
-        created_at: sea_orm::Set(chrono::Utc::now()),
-    };
-
-    if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
-        tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
-    }
-}
-
 // ── Response types ───────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -142,6 +108,16 @@ pub async fn create_org(
     headers: HeaderMap,
     Json(body): Json<CreateOrgRequest>,
 ) -> impl IntoResponse {
+    // The organization is the *resource*, never the actor. This file used to
+    // pass `&org.name` (and, on create, `&body.name`) into the actor column —
+    // one call site even said so: "username not available, use org name". The
+    // admin journal renders that column as who acted, so `acme-corp (#3)` read
+    // as a person doing things (card_fcc07f8d1505). The org's name is recorded
+    // where it belongs, as `resource_name`, a few lines below.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let visibility = body.visibility.as_deref().unwrap_or("public");
 
     match rg_core::org::create_org(
@@ -161,15 +137,14 @@ pub async fn create_org(
                 "display_name": body.display_name,
                 "visibility": visibility
             });
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                user_id,
-                &body.name, // username not available, use org name
+                &audit_actor,
                 "org.create",
                 Some("org"),
                 Some(org.id),
                 Some(&org.name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -256,6 +231,16 @@ pub async fn update_org(
     headers: HeaderMap,
     Json(body): Json<UpdateOrgRequest>,
 ) -> impl IntoResponse {
+    // The organization is the *resource*, never the actor. This file used to
+    // pass `&org.name` (and, on create, `&body.name`) into the actor column —
+    // one call site even said so: "username not available, use org name". The
+    // admin journal renders that column as who acted, so `acme-corp (#3)` read
+    // as a person doing things (card_fcc07f8d1505). The org's name is recorded
+    // where it belongs, as `resource_name`, a few lines below.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_core::org::update_org(
         &state.db,
         org.id,
@@ -271,15 +256,14 @@ pub async fn update_org(
                 "display_name": body.display_name,
                 "visibility": body.visibility
             });
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                actor_id,
-                &org.name,
+                &audit_actor,
                 "org.update",
                 Some("org"),
                 Some(org.id),
                 Some(&org.name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -317,6 +301,16 @@ pub async fn delete_org(
     OrgAdmin { org, actor_id }: OrgAdmin,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // The organization is the *resource*, never the actor. This file used to
+    // pass `&org.name` (and, on create, `&body.name`) into the actor column —
+    // one call site even said so: "username not available, use org name". The
+    // admin journal renders that column as who acted, so `acme-corp (#3)` read
+    // as a person doing things (card_fcc07f8d1505). The org's name is recorded
+    // where it belongs, as `resource_name`, a few lines below.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_core::org::delete_org(
         &state.db,
         &state.repo_root,
@@ -329,15 +323,14 @@ pub async fn delete_org(
     {
         Ok(()) => {
             let details = serde_json::json!({"name": org.name});
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                actor_id,
-                &org.name,
+                &audit_actor,
                 "org.delete",
                 Some("org"),
                 Some(org.id),
                 Some(&org.name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -410,6 +403,16 @@ pub async fn add_org_member(
     headers: HeaderMap,
     Json(body): Json<AddOrgMemberRequest>,
 ) -> impl IntoResponse {
+    // The organization is the *resource*, never the actor. This file used to
+    // pass `&org.name` (and, on create, `&body.name`) into the actor column —
+    // one call site even said so: "username not available, use org name". The
+    // admin journal renders that column as who acted, so `acme-corp (#3)` read
+    // as a person doing things (card_fcc07f8d1505). The org's name is recorded
+    // where it belongs, as `resource_name`, a few lines below.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let role = body.role.as_deref().unwrap_or("member");
 
     match rg_core::org::add_org_member(&state.db, org.id, body.user_id, role).await {
@@ -419,15 +422,14 @@ pub async fn add_org_member(
                 "added_user_id": body.user_id,
                 "role": role
             });
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                actor_id,
-                &org.name,
+                &audit_actor,
                 "org.add_member",
                 Some("org"),
                 Some(org.id),
                 Some(&org.name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -469,21 +471,30 @@ pub async fn remove_org_member(
     headers: HeaderMap,
     Path((_name, user_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
+    // The organization is the *resource*, never the actor. This file used to
+    // pass `&org.name` (and, on create, `&body.name`) into the actor column —
+    // one call site even said so: "username not available, use org name". The
+    // admin journal renders that column as who acted, so `acme-corp (#3)` read
+    // as a person doing things (card_fcc07f8d1505). The org's name is recorded
+    // where it belongs, as `resource_name`, a few lines below.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_core::org::remove_org_member(&state.db, org.id, user_id).await {
         Ok(()) => {
             let details = serde_json::json!({
                 "org_name": org.name,
                 "removed_user_id": user_id
             });
-            record_audit(
+            rg_core::audit::record(
                 &state.db,
-                actor_id,
-                &org.name,
+                &audit_actor,
                 "org.remove_member",
                 Some("org"),
                 Some(org.id),
                 Some(&org.name),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -513,10 +524,20 @@ pub async fn remove_org_member(
 )]
 pub async fn create_team(
     State(state): State<AppState>,
-    OrgAdmin { org, .. }: OrgAdmin,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    headers: HeaderMap,
     Json(body): Json<CreateTeamRequest>,
 ) -> impl IntoResponse {
     let permission = body.permission.as_deref().unwrap_or("read");
+    // The team surface hands out access to the organization's private
+    // repositories — `require_org_admin` says so itself, and
+    // `rg_core::org::add_team_member` flushes the permission cache precisely
+    // because it can. `org.add_member` was audited and this, the operation that
+    // actually grants the repository permission, was not (card_cb0d1ca78d57).
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
 
     match rg_core::org::create_team(
         &state.db,
@@ -527,16 +548,33 @@ pub async fn create_team(
     )
     .await
     {
-        Ok(team) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": team.id,
-                "org_id": team.org_id,
-                "name": team.name,
-                "permission": team.permission,
-            })),
-        )
-            .into_response(),
+        Ok(team) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "team.create",
+                Some("team"),
+                Some(team.id),
+                Some(&team.name),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "org": org.name,
+                    "org_id": org.id,
+                    "permission": team.permission,
+                })),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": team.id,
+                    "org_id": team.org_id,
+                    "name": team.name,
+                    "permission": team.permission,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -632,16 +670,43 @@ pub async fn get_team(
 )]
 pub async fn delete_team(
     State(state): State<AppState>,
-    OrgAdmin { org, .. }: OrgAdmin,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    headers: HeaderMap,
     Path((_name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
     };
+    // The team surface hands out access to the organization's private
+    // repositories — `require_org_admin` says so itself, and
+    // `rg_core::org::add_team_member` flushes the permission cache precisely
+    // because it can. `org.add_member` was audited and this, the operation that
+    // actually grants the repository permission, was not (card_cb0d1ca78d57).
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
 
     match rg_core::org::delete_team(&state.db, team.id).await {
-        Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
+        Ok(()) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "team.delete",
+                Some("team"),
+                Some(team.id),
+                Some(&team.name),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "org": org.name,
+                    "org_id": org.id,
+                    "permission": team.permission,
+                })),
+            )
+            .await;
+            Json(serde_json::json!({"deleted": true})).into_response()
+        }
         // Only the typed `NotFound` the service raises for an absent team may
         // become a `404` here; a failed delete is ours and stays a 5xx (its
         // `db: …` context would otherwise reach the body verbatim — a `404` is
@@ -711,7 +776,8 @@ pub async fn list_team_members(
 )]
 pub async fn add_team_member(
     State(state): State<AppState>,
-    OrgAdmin { org, .. }: OrgAdmin,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    headers: HeaderMap,
     Path((_name, team_id)): Path<(String, i64)>,
     Json(body): Json<AddTeamMemberRequest>,
 ) -> impl IntoResponse {
@@ -721,18 +787,46 @@ pub async fn add_team_member(
     };
 
     let role = body.role.as_deref().unwrap_or("member");
+    // The team surface hands out access to the organization's private
+    // repositories — `require_org_admin` says so itself, and
+    // `rg_core::org::add_team_member` flushes the permission cache precisely
+    // because it can. `org.add_member` was audited and this, the operation that
+    // actually grants the repository permission, was not (card_cb0d1ca78d57).
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
 
     match rg_core::org::add_team_member(&state.db, team.id, body.user_id, role).await {
-        Ok(m) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": m.id,
-                "team_id": m.team_id,
-                "user_id": m.user_id,
-                "role": m.role,
-            })),
-        )
-            .into_response(),
+        Ok(m) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "team.add_member",
+                Some("team"),
+                Some(team.id),
+                Some(&team.name),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "org": org.name,
+                    "org_id": org.id,
+                    "member_user_id": body.user_id,
+                    "role": role,
+                    "team_permission": team.permission,
+                })),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": m.id,
+                    "team_id": m.team_id,
+                    "user_id": m.user_id,
+                    "role": m.role,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -757,16 +851,44 @@ pub async fn add_team_member(
 )]
 pub async fn remove_team_member(
     State(state): State<AppState>,
-    OrgAdmin { org, .. }: OrgAdmin,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    headers: HeaderMap,
     Path((_name, team_id, user_id)): Path<(String, i64, i64)>,
 ) -> impl IntoResponse {
     let team = match resolve_team_in_org(&state.db, org.id, team_id).await {
         Ok(team) => team,
         Err(e) => return e.into_response(),
     };
+    // The team surface hands out access to the organization's private
+    // repositories — `require_org_admin` says so itself, and
+    // `rg_core::org::add_team_member` flushes the permission cache precisely
+    // because it can. `org.add_member` was audited and this, the operation that
+    // actually grants the repository permission, was not (card_cb0d1ca78d57).
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
 
     match rg_core::org::remove_team_member(&state.db, team.id, user_id).await {
-        Ok(()) => Json(serde_json::json!({"removed": true})).into_response(),
+        Ok(()) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "team.remove_member",
+                Some("team"),
+                Some(team.id),
+                Some(&team.name),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "org": org.name,
+                    "org_id": org.id,
+                    "member_user_id": user_id,
+                    "team_permission": team.permission,
+                })),
+            )
+            .await;
+            Json(serde_json::json!({"removed": true})).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

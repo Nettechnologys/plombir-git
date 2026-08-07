@@ -1,37 +1,21 @@
-//! Audit logging module — provides [`record`] for appending audit events.
+//! Audit logging — the workspace's only writer of `audit_log` rows.
 //!
 //! # Usage
 //! ```ignore
-//! use rg_core::audit::record;
+//! use rg_core::audit::{record, AuditActor};
 //!
-//! record(&db, Some(user.id), Some(&user.username),
-//!     "repo.create", Some("repo"), Some(repo.id), Some(&repo.full_name),
-//!     Some(&ip), Some(&ua), Some("{}".to_string())).await?;
+//! // Before the mutation, when a failed lookup should refuse the request:
+//! let actor = AuditActor::resolve(&db, admin_id).await?;
+//! // …perform the mutation…
+//! record(&db, &actor, "admin.unlock_user", Some("user"), Some(target.id),
+//!        Some(&target.username), Some(&headers), None).await;
 //! ```
+//!
+//! The actor is a [`AuditActor`] and not a string on purpose — see the module
+//! docs of the implementation for what that prevents.
 
 pub mod archiver;
 #[path = "audit.rs"]
 mod audit_impl;
 
-pub use audit_impl::record;
-
-/// Shorthand macro so callers don't need to pass `&db` explicitly.
-///
-/// `$db` — `&DatabaseConnection`
-/// `$user_id` — `Option<i64>`
-/// `$username` — `Option<&str>`
-/// `$action` — `&str`
-/// remaining fields are optional (resource_type, resource_id, resource_name, ip, ua, details)
-#[macro_export]
-macro_rules! audit {
-    ($db:expr, $user_id:expr, $username:expr, $action:expr,
-     $rt:expr, $rid:expr, $rn:expr, $ip:expr, $ua:expr, $details:expr $(,)?) => {{
-        if let Err(error) = $crate::audit::record(
-            $db, $user_id, $username, $action, $rt, $rid, $rn, $ip, $ua, $details,
-        )
-        .await
-        {
-            tracing::warn!(%error, "audit record failed");
-        }
-    }};
-}
+pub use audit_impl::{extract_ip_and_ua, record, AuditActor};

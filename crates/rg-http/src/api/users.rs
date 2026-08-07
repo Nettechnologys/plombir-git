@@ -51,39 +51,6 @@ fn is_https_request(headers: &HeaderMap) -> bool {
 }
 
 /// Helper to record audit log (fire-and-forget, does not fail the main operation).
-#[allow(clippy::too_many_arguments)]
-async fn record_audit(
-    db: &sea_orm::DatabaseConnection,
-    user_id: i64,
-    username: &str,
-    action: &str,
-    resource_type: Option<&str>,
-    resource_id: Option<i64>,
-    resource_name: Option<&str>,
-    headers: &HeaderMap,
-    details: Option<serde_json::Value>,
-) {
-    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
-
-    let entry = rg_db::entities::audit_log::ActiveModel {
-        id: sea_orm::NotSet,
-        user_id: sea_orm::Set(Some(user_id)),
-        username: sea_orm::Set(Some(username.to_string())),
-        action: sea_orm::Set(action.to_string()),
-        resource_type: sea_orm::Set(resource_type.map(|s| s.to_string())),
-        resource_id: sea_orm::Set(resource_id),
-        resource_name: sea_orm::Set(resource_name.map(|s| s.to_string())),
-        ip_address: sea_orm::Set(ip_address),
-        user_agent: sea_orm::Set(user_agent),
-        details: sea_orm::Set(details.map(|v| v.to_string())),
-        created_at: sea_orm::Set(chrono::Utc::now()),
-    };
-
-    if let Err(e) = rg_db::ops::audit_log_ops::insert(db, entry).await {
-        tracing::warn!(error = %format!("{e:#}"), "failed to record audit log");
-    }
-}
-
 /// POST /api/v1/users/register
 #[derive(Deserialize, ToSchema)]
 pub struct RegisterRequest {
@@ -194,15 +161,21 @@ pub async fn register(
                 "email": body.email,
                 "username": body.username
             });
-            record_audit(
+            // Resolved after the fact: the account exists and the request has
+            // already succeeded, so a name lookup that fails must not turn a
+            // completed registration or login into a `5xx`. It records the id
+            // with no name and says why in the log — never a blank name, which
+            // the journal cannot tell apart from an action nobody performed.
+            let audit_actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, resp.user_id).await;
+            rg_core::audit::record(
                 &state.db,
-                resp.user_id,
-                &resp.username,
+                &audit_actor,
                 "user.register",
                 Some("user"),
                 Some(resp.user_id),
                 Some(&resp.username),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
@@ -316,15 +289,21 @@ pub async fn login(
                 "mfa_required": mfa_required,
                 "login_method": login_method
             });
-            record_audit(
+            // Resolved after the fact: the account exists and the request has
+            // already succeeded, so a name lookup that fails must not turn a
+            // completed registration or login into a `5xx`. It records the id
+            // with no name and says why in the log — never a blank name, which
+            // the journal cannot tell apart from an action nobody performed.
+            let audit_actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, resp.user_id).await;
+            rg_core::audit::record(
                 &state.db,
-                resp.user_id,
-                &resp.username,
+                &audit_actor,
                 "user.login",
                 Some("user"),
                 Some(resp.user_id),
                 Some(&resp.username),
-                &headers,
+                Some(&headers),
                 Some(details),
             )
             .await;
