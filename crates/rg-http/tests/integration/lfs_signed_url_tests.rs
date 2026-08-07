@@ -553,6 +553,180 @@ async fn upload_href(
     href
 }
 
+/// The same, for a request authenticating with a personal access token.
+///
+/// Split from [`upload_href`] by what it asserts about the href, which is the
+/// whole point: a PAT-issued URL must name the token it was issued against and
+/// must *not* name a session generation, because the two are revoked by
+/// different acts and the redeeming side has to know which question to ask.
+async fn upload_href_via_pat(
+    base: &str,
+    owner: &str,
+    repo: &str,
+    pat: &str,
+    oid: &str,
+    size: usize,
+) -> String {
+    let response = batch(base, owner, repo, Some(pat), "upload", oid, size).await;
+    assert_eq!(response.status(), 200);
+    let href = response.json::<serde_json::Value>().await.unwrap()["objects"][0]["actions"]
+        ["upload"]["href"]
+        .as_str()
+        .expect("an upload batch on a writable repository hands out an upload action")
+        .to_string();
+    assert!(
+        href.contains("actor=") && href.contains("pat="),
+        "a token-issued URL must name the token it was issued against: {href}"
+    );
+    assert!(
+        !href.contains("session="),
+        "a token-issued URL must not be bound to a session generation it has nothing to do \
+         with: {href}"
+    );
+    href
+}
+
+/// Create a `repo`-scoped personal access token, returning `(id, raw)`.
+async fn create_pat(base: &str, token: &str, name: &str) -> (i64, String) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": name, "scopes": "repo" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "creating a PAT failed");
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    (
+        body["id"].as_i64().expect("a created token has an id"),
+        body["token"]
+            .as_str()
+            .expect("a created token is shown once")
+            .to_string(),
+    )
+}
+
+/// card_e4e177acd095: a capability has to inherit the standing of the
+/// credential that asked for it — and a personal access token is not a session.
+///
+/// A PAT reaches the API translated into a synthetic JWT carrying the owner's
+/// *current* session generation, so every handler downstream sees a session.
+/// For a presigned URL that got both halves of revocation wrong. CI pushes with
+/// a PAT and holds a six-hour upload URL; a human logging out of a laptop bumped
+/// the generation and killed that upload mid-flight, though nothing had happened
+/// to the token — while deleting the token, the one act that means "this
+/// credential is revoked", left the URL standing for the rest of its six hours.
+///
+/// The phase's fourth criterion asks what happens to a PAT at a security event.
+/// This is the answer for the capabilities a PAT mints: they follow the token,
+/// not the owner's sessions. The session-issued half is checked in the same run
+/// so the two answers are visibly different rather than accidentally the same.
+#[tokio::test]
+async fn a_token_issued_lfs_url_outlives_a_logout_and_dies_with_its_token() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (session, _user_id) = register_full(&base, "lfs_pat", "lfs_pat@example.com").await;
+    create_repo(&base, &session, "pat-lfs", true).await;
+    let (pat_id, pat) = create_pat(&base, &session, "ci").await;
+
+    // Four objects, because a stored object is handed no upload action on the
+    // next batch: each URL below has to be minted before the event it is meant
+    // to survive or not survive, and redeemed exactly once.
+    let bodies: Vec<Vec<u8>> = (0..4)
+        .map(|i| format!("lfs body {i}").into_bytes())
+        .collect();
+    let oids: Vec<String> = bodies
+        .iter()
+        .map(|body| hex::encode(Sha256::digest(body)))
+        .collect();
+
+    let mut token_hrefs = Vec::new();
+    for i in 0..3 {
+        token_hrefs.push(
+            upload_href_via_pat(&base, "lfs_pat", "pat-lfs", &pat, &oids[i], bodies[i].len()).await,
+        );
+    }
+    // The contrast: minted by the browser session, on the same account.
+    let session_href = upload_href(
+        &base,
+        "lfs_pat",
+        "pat-lfs",
+        &session,
+        &oids[3],
+        bodies[3].len(),
+    )
+    .await;
+
+    let put = |href: String, body: Vec<u8>| async move {
+        reqwest::Client::new()
+            .put(&href)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+
+    assert_eq!(
+        put(token_hrefs[0].clone(), bodies[0].clone()).await,
+        200,
+        "a freshly minted token-issued URL does not work at all"
+    );
+
+    let logout = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/logout"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "logout failed");
+
+    assert_eq!(
+        put(token_hrefs[1].clone(), bodies[1].clone()).await,
+        200,
+        "logging out of a browser killed an upload the CI token had already been handed — the \
+         token itself is untouched, and a PAT survives a password change by policy"
+    );
+    assert_eq!(
+        put(session_href, bodies[3].clone()).await,
+        401,
+        "the session-issued half must still be revoked by the logout, or this test is only \
+         showing that nothing is checked at all"
+    );
+
+    // The act that actually revokes a PAT. A session is needed to make the call,
+    // and the one above was just logged out.
+    let fresh = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/login"))
+        .json(&serde_json::json!({ "login": "lfs_pat", "password": "Qz7$wRtm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), 200, "login after logout failed");
+    let fresh = fresh.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .expect("a login without MFA returns its session token")
+        .to_string();
+
+    let revoked = reqwest::Client::new()
+        .delete(format!("{base}/api/v1/users/tokens/{pat_id}"))
+        .bearer_auth(&fresh)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        revoked.status().is_success(),
+        "revoking the PAT failed: {}",
+        revoked.status()
+    );
+
+    assert_eq!(
+        put(token_hrefs[2].clone(), bodies[2].clone()).await,
+        401,
+        "revoking the token left the upload URL it had minted standing — six hours of write \
+         access to a private repository by a credential that no longer exists"
+    );
+}
+
 /// Plant a reset token straight into the database — the raw value only ever
 /// leaves the server by email, which the test harness cannot read.
 async fn issue_reset_token(db: &rg_db::DatabaseConnection, user_id: i64, raw: &str) -> String {
@@ -719,12 +893,15 @@ async fn a_logout_revokes_the_lfs_urls_its_session_minted_and_spares_the_next_on
 fn lfs_action_signature_rejects_tampering_and_expiry() {
     use rg_core::lfs::service::{
         sign_action_url, verify_action_url, LfsActionKind, LfsActionSignatureError, LfsActor,
+        LfsCredential,
     };
 
     let actor = |user_id, session_version| {
         Some(LfsActor {
             user_id,
-            session_version,
+            credential: LfsCredential::Session {
+                version: session_version,
+            },
         })
     };
 

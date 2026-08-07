@@ -86,6 +86,34 @@ pub(crate) fn extract_user_id(headers: &HeaderMap, jwt_secret: &str) -> Option<i
     extract_user_session(headers, jwt_secret).map(|(user_id, _)| user_id)
 }
 
+/// The account this request's credentials name, *and* which credential named
+/// it — a session with its generation, or the personal access token the
+/// request presented.
+///
+/// [`extract_user_session`] is this reading with the distinction collapsed,
+/// which is all a caller behind [`session_standing_middleware`] needs. The
+/// exception is a caller that mints something outliving the request: a
+/// presigned LFS action URL is redeemed hours later by a request carrying no
+/// credentials at all, so *what to re-check* has to travel inside the
+/// capability — and the two credentials are revoked by different acts
+/// (card_e4e177acd095).
+pub(crate) fn extract_user_credential(
+    headers: &HeaderMap,
+    jwt_secret: &str,
+) -> Option<(i64, rg_core::lfs::service::LfsCredential)> {
+    let claims = extract_token_from_cookie(headers)
+        .and_then(|token| rg_core::auth::jwt::validate_token(&token, jwt_secret))
+        .or_else(|| extract_bearer_claims(headers, jwt_secret))?;
+    let user_id = claims.sub.parse::<i64>().ok()?;
+    let credential = match claims.pat_id {
+        Some(id) => rg_core::lfs::service::LfsCredential::Token { id },
+        None => rg_core::lfs::service::LfsCredential::Session {
+            version: claims.session_version,
+        },
+    };
+    Some((user_id, credential))
+}
+
 /// The account this request's credentials name, *and* the session generation
 /// they were minted under.
 ///

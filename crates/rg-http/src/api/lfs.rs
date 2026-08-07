@@ -29,12 +29,19 @@ pub struct LfsActionQuery {
     /// recomputed over it. It is covered by the HMAC, so neither editing nor
     /// dropping it produces a URL that verifies.
     actor: Option<i64>,
-    /// The `users.session_version` the issuing session held. Covered by the
-    /// HMAC like `actor`, and echoed for the same reason — with the difference
-    /// that this one is also the thing [`signer_still_stands`] compares against
-    /// the account's current generation, which is how a revoked session stops
-    /// being able to redeem what it minted.
+    /// The `users.session_version` the issuing session held, when the URL was
+    /// issued to a session. Covered by the HMAC like `actor`, and echoed for
+    /// the same reason — with the difference that this one is also the thing
+    /// [`signer_still_stands`] compares against the account's current
+    /// generation, which is how a revoked session stops being able to redeem
+    /// what it minted.
     session: Option<i64>,
+    /// `access_tokens.id`, when the URL was issued to a personal access token
+    /// instead. Mutually exclusive with `session` and covered by the same HMAC,
+    /// so a caller cannot swap one question for the other: a PAT-issued URL is
+    /// checked against the PAT still existing, which is what revoking a PAT
+    /// actually does (card_e4e177acd095).
+    pat: Option<i64>,
 }
 
 /// One actionable error for a filesystem failure on an LFS object path.
@@ -79,19 +86,19 @@ async fn signer_still_stands(
     state: &AppState,
     actor: rg_core::lfs::service::LfsActor,
 ) -> Result<(), AppError> {
+    use rg_core::lfs::service::LfsCredential;
+
     let user_id = actor.user_id;
-    match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
-        Ok(Some(user)) if user.is_usable() && user.session_version == actor.session_version => {
-            Ok(())
-        }
-        Ok(_) => {
+    let account_stands = match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
             tracing::warn!(
                 user_id,
-                "rejecting signed LFS action URL: account is disabled or gone, or its session was revoked"
+                "rejecting signed LFS action URL: the account it was issued to is gone"
             );
-            Err(AppError::unauthorized(
-                "LFS action URL belongs to a disabled account or a revoked session",
-            ))
+            return Err(AppError::unauthorized(
+                "LFS action URL belongs to a disabled account or a revoked credential",
+            ));
         }
         Err(error) => {
             tracing::error!(
@@ -99,11 +106,51 @@ async fn signer_still_stands(
                 error = %format!("{error:#}"),
                 "could not verify account standing for a signed LFS action URL"
             );
-            Err(AppError::service_unavailable(
+            return Err(AppError::service_unavailable(
                 "could not verify account standing",
-            ))
+            ));
         }
+    };
+
+    // The credential's own question, and only that one. Asking a PAT-issued URL
+    // about the owner's session generation revokes it on an event the token is
+    // explicitly meant to survive, and leaves it standing through the one event
+    // that means the token *was* revoked.
+    let credential_stands = match actor.credential {
+        LfsCredential::Session { version } => account_stands.session_version == version,
+        LfsCredential::Token { id } => {
+            match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
+                Ok(Some(token)) => {
+                    token.user_id == user_id
+                        && token.expires_at.is_none_or(|at| at > chrono::Utc::now())
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::error!(
+                        user_id,
+                        token_id = id,
+                        error = %format!("{error:#}"),
+                        "could not verify token standing for a signed LFS action URL"
+                    );
+                    return Err(AppError::service_unavailable(
+                        "could not verify account standing",
+                    ));
+                }
+            }
+        }
+    };
+
+    if account_stands.is_usable() && credential_stands {
+        return Ok(());
     }
+    tracing::warn!(
+        user_id,
+        "rejecting signed LFS action URL: account is disabled, or the credential that issued it \
+         was revoked"
+    );
+    Err(AppError::unauthorized(
+        "LFS action URL belongs to a disabled account or a revoked credential",
+    ))
 }
 
 /// Is this request carrying a signed action URL that is *still* good for what
@@ -207,10 +254,10 @@ fn actor_id(headers: &HeaderMap, state: &AppState) -> Option<i64> {
 /// standing of the session that asked for it, and that session has already been
 /// through `session_standing_middleware` on this very request.
 fn issuing_actor(headers: &HeaderMap, state: &AppState) -> Option<rg_core::lfs::service::LfsActor> {
-    crate::api::auth::extract_user_session(headers, &state.jwt_secret).map(
-        |(user_id, session_version)| rg_core::lfs::service::LfsActor {
+    crate::api::auth::extract_user_credential(headers, &state.jwt_secret).map(
+        |(user_id, credential)| rg_core::lfs::service::LfsActor {
             user_id,
-            session_version,
+            credential,
         },
     )
 }
@@ -225,12 +272,21 @@ fn issuing_actor(headers: &HeaderMap, state: &AppState) -> Option<rg_core::lfs::
 fn signed_actor(
     query: &LfsActionQuery,
 ) -> Result<Option<rg_core::lfs::service::LfsActor>, AppError> {
-    match (query.actor, query.session) {
-        (None, None) => Ok(None),
-        (Some(user_id), Some(session_version)) => Ok(Some(rg_core::lfs::service::LfsActor {
+    use rg_core::lfs::service::{LfsActor, LfsCredential};
+
+    match (query.actor, query.session, query.pat) {
+        (None, None, None) => Ok(None),
+        (Some(user_id), Some(version), None) => Ok(Some(LfsActor {
             user_id,
-            session_version,
+            credential: LfsCredential::Session { version },
         })),
+        (Some(user_id), None, Some(id)) => Ok(Some(LfsActor {
+            user_id,
+            credential: LfsCredential::Token { id },
+        })),
+        // Both credentials at once is not a shape this server mints either, and
+        // it is the one a caller would try in order to pick which question gets
+        // asked about their URL.
         _ => Err(AppError::forbidden("incomplete LFS action URL signature")),
     }
 }

@@ -96,15 +96,20 @@ async fn handler_inputs_reach_the_published_openapi_document() {
             &["labels", "page", "per_page", "state"][..],
         ),
         ("get", "/repos/{owner}/{name}/milestones", &["state"][..]),
+        // `session` and `pat` are the two spellings of the credential half of a
+        // signed URL — a session generation or an `access_tokens.id` — and
+        // exactly one of them is ever present on a minted URL (card_e4e177acd095).
+        // Both are published, because a client redeeming a URL sends whichever
+        // one it was handed.
         (
             "put",
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            &["actor", "expires", "session", "signature"][..],
+            &["actor", "expires", "pat", "session", "signature"][..],
         ),
         (
             "get",
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            &["actor", "expires", "session", "signature"][..],
+            &["actor", "expires", "pat", "session", "signature"][..],
         ),
         (
             "post",

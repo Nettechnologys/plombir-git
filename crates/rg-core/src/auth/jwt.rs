@@ -20,6 +20,20 @@ pub struct Claims {
     /// then invalidated by the next password reset or logout.
     #[serde(default)]
     pub session_version: i64,
+    /// `access_tokens.id` when this is the synthetic token minted for a
+    /// presented personal access token, `None` for a real session.
+    ///
+    /// A PAT reaches the API by being translated into one of these
+    /// (`rg_http::pat_auth::pat_to_bearer_jwt`), which makes every handler
+    /// downstream unable to tell the two apart. That is what the translation is
+    /// for — but a handler minting a capability that *outlives the request*
+    /// needs the difference, because the two credentials are revoked by
+    /// different acts: a session by its generation moving on, a PAT by its row
+    /// going away. Without this claim a presigned LFS URL obtained with a PAT
+    /// was bound to a session generation the token has nothing to do with
+    /// (card_e4e177acd095).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pat_id: Option<i64>,
     /// Issued-at (Unix timestamp seconds).
     pub iat: i64,
     /// Expiry (Unix timestamp seconds).
@@ -47,12 +61,47 @@ pub fn generate_token(
     secret: &str,
     ttl_days: i64,
 ) -> Result<String> {
+    encode_claims(user_id, username, session_version, None, secret, ttl_days)
+}
+
+/// Generate the synthetic session a presented personal access token is
+/// translated into, tagged with the token it came from.
+///
+/// Separate from [`generate_token`] so the tag cannot be forgotten at the one
+/// call site that must set it, and so no real login can accidentally set it.
+pub fn generate_token_for_pat(
+    user_id: i64,
+    username: &str,
+    session_version: i64,
+    pat_id: i64,
+    secret: &str,
+    ttl_days: i64,
+) -> Result<String> {
+    encode_claims(
+        user_id,
+        username,
+        session_version,
+        Some(pat_id),
+        secret,
+        ttl_days,
+    )
+}
+
+fn encode_claims(
+    user_id: i64,
+    username: &str,
+    session_version: i64,
+    pat_id: Option<i64>,
+    secret: &str,
+    ttl_days: i64,
+) -> Result<String> {
     let now = Utc::now();
     let exp = now + Duration::days(ttl_days);
     let claims = Claims {
         sub: user_id.to_string(),
         username: username.to_string(),
         session_version,
+        pat_id,
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };

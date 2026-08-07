@@ -71,41 +71,86 @@ pub enum LfsActionSignatureError {
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The account a signed URL is issued to, and the session generation it was
-/// issued under.
+/// The credential a signed URL was issued against — and therefore the thing
+/// that has to still stand when the URL is redeemed.
+///
+/// Which question to ask depends on what was presented, because the two
+/// credentials are revoked by different acts and neither act touches the other:
+///
+/// * a **session** is revoked by a password reset or a `POST /users/logout`,
+///   both of which leave `is_usable()` true and bump `users.session_version`;
+/// * a **personal access token** is revoked by deleting its row (or by its
+///   `expires_at` passing), and deliberately survives a password change — which
+///   is the instance's recorded policy for PATs.
+///
+/// Folding the session generation into *every* capability got both halves
+/// wrong for a PAT-issued one: `pat_to_bearer_jwt` mints a synthetic JWT
+/// carrying the owner's current generation, so a CI upload URL obtained with a
+/// PAT died the moment a human logged out of a laptop — an event with no
+/// bearing on the token — while deleting the PAT itself, the one act that means
+/// "this credential is revoked", left the URL good for the rest of its six
+/// hours (card_e4e177acd095).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LfsCredential {
+    /// A browser or API session, revoked by its generation moving on.
+    Session {
+        /// The `users.session_version` the issuing session was authenticated under.
+        version: i64,
+    },
+    /// A personal access token, revoked by the row going away.
+    Token {
+        /// `access_tokens.id` of the token the request presented.
+        id: i64,
+    },
+}
+
+/// The account a signed URL is issued to, and the credential it was issued
+/// against.
 ///
 /// The two travel as one value because an id on its own can only ask half of the
 /// revocation question at redemption time. Re-reading the account catches a
 /// deactivation, but a password reset and a `POST /users/logout` leave
-/// `is_usable()` true and bump `users.session_version` instead — so a capability
-/// carrying only the id had nothing to compare against, and an upload URL minted
-/// by a stolen session stayed write access to a private repository for the rest
-/// of its six hours (card_c742da1794e4). Same shape, same fix as the WebSocket
-/// half of this class (`rg_http::api::auth::WsSessionUser`).
+/// `is_usable()` true — so a capability carrying only the id had nothing to
+/// compare against, and an upload URL minted by a stolen session stayed write
+/// access to a private repository for the rest of its six hours
+/// (card_c742da1794e4). Same shape, same fix as the WebSocket half of this
+/// class (`rg_http::api::auth::WsSessionUser`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LfsActor {
     pub user_id: i64,
-    /// The `users.session_version` the issuing session was authenticated under.
-    pub session_version: i64,
+    pub credential: LfsCredential,
 }
 
 /// How the actor a signed URL was issued to is rendered into the signed
-/// payload — and, for an authenticated one, into the URL itself as
-/// `actor=`/`session=`.
+/// payload — and, for an authenticated one, into the URL itself.
 ///
 /// An anonymous issue is a distinct value rather than an empty one, so
 /// dropping `actor=` from an authenticated URL changes the payload instead of
-/// reproducing it.
+/// reproducing it. The `s`/`t` tag is inside the signature for the same reason:
+/// the two credentials are checked differently at redemption, so which one this
+/// is must not be something a caller can swap.
 fn actor_token(actor: Option<LfsActor>) -> String {
     match actor {
-        Some(actor) => format!("{}@{}", actor.user_id, actor.session_version),
+        Some(LfsActor {
+            user_id,
+            credential: LfsCredential::Session { version },
+        }) => format!("{user_id}@s{version}"),
+        Some(LfsActor {
+            user_id,
+            credential: LfsCredential::Token { id },
+        }) => format!("{user_id}@t{id}"),
         None => "anon".to_string(),
     }
 }
 
-/// The signed payload. The `v3` generation is what folded the issuing session
-/// into the signature; URLs minted under `v2` carry no generation and therefore
-/// stop verifying, which for a revocation fix is the desired direction.
+/// The signed payload.
+///
+/// `v3` folded the issuing session into the signature; `v4` replaced that with
+/// the issuing *credential*, so a PAT-issued URL is checked against the PAT
+/// rather than against a session generation that has nothing to do with it.
+/// URLs minted under an older generation stop verifying, which for a revocation
+/// change is the desired direction — a client that meets one re-requests a batch
+/// and is handed a fresh URL.
 fn action_signature_payload(
     action: LfsActionKind,
     repo_id: i64,
@@ -114,7 +159,7 @@ fn action_signature_payload(
     actor: Option<LfsActor>,
 ) -> String {
     format!(
-        "forgekeep-lfs-v3:{}:{}:{}:{}:{}",
+        "forgekeep-lfs-v4:{}:{}:{}:{}:{}",
         action.as_str(),
         repo_id,
         oid,
@@ -126,14 +171,23 @@ fn action_signature_payload(
 /// Append the actor a signed URL was issued to, when there was one.
 ///
 /// Both halves are echoed, because both are covered by the HMAC and the
-/// redeeming side needs them to recompute it — and needs the generation on its
-/// own to answer "is this the session that is still allowed to act?".
+/// redeeming side needs them to recompute it — and needs the credential on its
+/// own to answer "is the thing that asked for this still allowed to act?". The
+/// second parameter is named for the credential (`session=` or `pat=`), so a
+/// URL says which question it expects to be asked.
 ///
 /// Anonymous issues carry nothing: there is no account behind them to re-check,
 /// and `anon` is already what the signature covers.
 pub fn action_url_actor_param(actor: Option<LfsActor>) -> String {
     match actor {
-        Some(actor) => format!("&actor={}&session={}", actor.user_id, actor.session_version),
+        Some(LfsActor {
+            user_id,
+            credential: LfsCredential::Session { version },
+        }) => format!("&actor={user_id}&session={version}"),
+        Some(LfsActor {
+            user_id,
+            credential: LfsCredential::Token { id },
+        }) => format!("&actor={user_id}&pat={id}"),
         None => String::new(),
     }
 }

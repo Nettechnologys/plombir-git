@@ -181,10 +181,17 @@ async fn pat_to_bearer_jwt(
                     "personal access token scope denied",
                 ));
             }
-            let jwt = rg_core::auth::jwt::generate_token(
+            // Tagged with the token it came from. The generation still goes in
+            // — `session_standing_middleware` compares it, and a PAT presented
+            // by a disabled account must not sail past that — but a handler
+            // minting something that outlives this request needs to know the
+            // credential was a PAT, whose revocation is its row going away and
+            // not a generation bump (card_e4e177acd095).
+            let jwt = rg_core::auth::jwt::generate_token_for_pat(
                 pat.user_id,
                 &owner.username,
                 owner.session_version,
+                pat.id,
                 &state.jwt_secret,
                 1,
             )
