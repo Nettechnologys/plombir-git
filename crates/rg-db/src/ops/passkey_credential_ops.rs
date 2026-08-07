@@ -65,23 +65,52 @@ pub async fn delete(db: &DatabaseConnection, user_id: i64, id: i64) -> Result<bo
     Ok(res.rows_affected > 0)
 }
 
-/// Persist an updated passkey (e.g. after the signature counter advanced) and
-/// stamp `last_used_at`. Returns false when no row with that id exists.
+/// What became of an attempt to store an advanced credential.
 ///
-/// The absent row is a `false`, not a `DbErr`, on purpose: the caller is the
-/// login path, and "this credential is no longer registered" and "the write
-/// failed" are two different answers there — one ends the ceremony, the other
-/// is a retryable outage. Folding the first into an error left the caller
-/// unable to tell them apart, so it swallowed both.
+/// Three outcomes rather than a `bool`, because the login path has to answer
+/// each of them differently and a `DbErr` is a fourth thing again — an outage,
+/// not a verdict on the ceremony.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterWrite {
+    /// The advanced credential is what the row now holds.
+    Stored,
+    /// No such row: the credential was revoked while the ceremony was in
+    /// flight. The assertion verified, but against something this account can
+    /// no longer be signed in with.
+    Missing,
+    /// Another assertion advanced the same credential first, so the state this
+    /// call verified against is no longer the stored state and the value it
+    /// would write is derived from a snapshot the database has moved past.
+    Conflict,
+}
+
+/// Store an advanced passkey over the exact snapshot it was derived from, and
+/// stamp `last_used_at`.
 ///
-/// A single `UPDATE ... WHERE id = ?` rather than read-then-write, so the row
-/// cannot be deleted between the two statements and turn a concurrent
-/// revocation into `RecordNotUpdated`.
+/// A compare-and-swap, not a write. `expected_passkey_json` is the serialized
+/// credential the caller loaded and verified the assertion against, and it is
+/// part of the `WHERE`: the statement lands only if the row still holds it.
+/// Filtering on the id alone made this a lost update on ceremony material —
+/// two concurrent logins both verify against one stored state, and whichever
+/// `UPDATE` runs second wins, so an assertion carrying the *lower* signature
+/// counter can overwrite the higher one and both logins still report success.
+/// The counter is exactly what the next assertion is checked against to spot a
+/// cloned or replayed credential, so rolling it back quietly disarms that
+/// check.
+///
+/// `rows_affected == 0` is not by itself a refusal: MySQL counts *changed*
+/// rows, so a re-store of a byte-identical credential within the same
+/// `last_used_at` resolution reports zero while having lost nothing. The row is
+/// re-read to tell the three cases apart, and a row that already holds the
+/// value this call wanted to write is a [`CounterWrite::Stored`] — whether this
+/// call put it there or an identical concurrent one did, the state the caller
+/// needs kept is kept.
 pub async fn touch_and_update(
     db: &DatabaseConnection,
     id: i64,
+    expected_passkey_json: &str,
     passkey_json: &str,
-) -> Result<bool, DbErr> {
+) -> Result<CounterWrite, DbErr> {
     let res = Entity::update_many()
         .set(passkey_credential::ActiveModel {
             passkey: Set(passkey_json.to_string()),
@@ -89,7 +118,16 @@ pub async fn touch_and_update(
             ..Default::default()
         })
         .filter(passkey_credential::Column::Id.eq(id))
+        .filter(passkey_credential::Column::Passkey.eq(expected_passkey_json))
         .exec(db)
         .await?;
-    Ok(res.rows_affected > 0)
+    if res.rows_affected > 0 {
+        return Ok(CounterWrite::Stored);
+    }
+
+    match Entity::find_by_id(id).one(db).await? {
+        None => Ok(CounterWrite::Missing),
+        Some(row) if row.passkey == passkey_json => Ok(CounterWrite::Stored),
+        Some(_) => Ok(CounterWrite::Conflict),
+    }
 }

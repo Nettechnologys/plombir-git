@@ -748,6 +748,7 @@ pub struct PasskeyLoginResponse {
     responses(
         (status = 200, description = "Login successful", body = PasskeyLoginResponse),
         (status = 401, description = "Missing challenge, invalid credential, or locked account", body = serde_json::Value),
+        (status = 409, description = "Another assertion advanced this credential first; retry the login", body = serde_json::Value),
         (status = 500, description = "The advanced signature counter could not be serialized or stored", body = serde_json::Value),
         (status = 503, description = "The advanced signature counter could not be stored: the database is unreachable", body = serde_json::Value),
     ),
@@ -827,16 +828,43 @@ pub async fn login_finish(
     // No fallback to the row's previous JSON here: re-storing that would write
     // back the *pre-assertion* counter and report success for it.
     let json = wa::passkey_to_json(&passkey).map_err(AppError::from)?;
-    let stored = rg_db::ops::passkey_credential_ops::touch_and_update(&state.db, model.id, &json)
-        .await
-        .map_err(AppError::from)?;
-    if !stored {
-        tracing::warn!(
-            user_id = user.id,
-            passkey_id = model.id,
-            "passkey row disappeared before its advanced counter could be stored"
-        );
-        return Err(AppError::unauthorized("passkey authentication failed"));
+    // Compare-and-swap against the exact blob this assertion was verified
+    // against. Two logins that both verified against one stored credential must
+    // not both be answered success: the loser's write would put its own — and
+    // possibly lower — signature counter back over the winner's, which is the
+    // material the *next* assertion uses to spot a clone.
+    let stored = rg_db::ops::passkey_credential_ops::touch_and_update(
+        &state.db,
+        model.id,
+        &model.passkey,
+        &json,
+    )
+    .await
+    .map_err(AppError::from)?;
+    match stored {
+        rg_db::ops::passkey_credential_ops::CounterWrite::Stored => {}
+        rg_db::ops::passkey_credential_ops::CounterWrite::Missing => {
+            tracing::warn!(
+                user_id = user.id,
+                passkey_id = model.id,
+                "passkey row disappeared before its advanced counter could be stored"
+            );
+            return Err(AppError::unauthorized("passkey authentication failed"));
+        }
+        rg_db::ops::passkey_credential_ops::CounterWrite::Conflict => {
+            // The assertion was genuine — the holder of the authenticator is
+            // told to try again, not that it failed — but this ceremony ends
+            // here: its counter is not the stored one, and issuing a token now
+            // would be issuing it for state the server did not keep.
+            tracing::warn!(
+                user_id = user.id,
+                passkey_id = model.id,
+                "a concurrent assertion advanced this passkey first; refusing to roll its counter back"
+            );
+            return Err(AppError::conflict(
+                "another sign-in advanced this passkey at the same time; please try again",
+            ));
+        }
     }
 
     // Record the successful login the same way the MFA path does.

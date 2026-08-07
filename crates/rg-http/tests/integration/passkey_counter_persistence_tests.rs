@@ -35,7 +35,7 @@
 //! a callee would need this guard taught about it.
 
 use axum::http::StatusCode;
-use rg_db::ops::passkey_credential_ops;
+use rg_db::ops::passkey_credential_ops::{self, CounterWrite};
 use rg_http::error::AppError;
 
 use crate::common::{setup_test_db, source_scan};
@@ -75,10 +75,19 @@ async fn an_advanced_counter_is_actually_persisted() {
     let (db, _dir) = setup_test_db().await;
     let (user_id, passkey_id) = seed_passkey(&db).await;
 
-    let stored = passkey_credential_ops::touch_and_update(&db, passkey_id, "{\"counter\":2}")
-        .await
-        .expect("store the advanced counter");
-    assert!(stored, "an existing passkey row must report a stored write");
+    let stored = passkey_credential_ops::touch_and_update(
+        &db,
+        passkey_id,
+        "{\"counter\":1}",
+        "{\"counter\":2}",
+    )
+    .await
+    .expect("store the advanced counter");
+    assert_eq!(
+        stored,
+        CounterWrite::Stored,
+        "an existing passkey row still holding the verified snapshot must report a stored write"
+    );
 
     let row = passkey_credential_ops::list_by_user(&db, user_id)
         .await
@@ -115,12 +124,18 @@ async fn a_missing_passkey_row_is_reported_as_absence_not_as_a_write_failure() {
         .expect("revoke the fixture passkey");
     assert!(removed, "the fixture passkey must have been registered");
 
-    let stored = passkey_credential_ops::touch_and_update(&db, passkey_id, "{\"counter\":2}")
-        .await
-        .expect("a vanished row is an answer, not an error");
-    assert!(
-        !stored,
-        "a passkey that is no longer registered must report that nothing was written"
+    let stored = passkey_credential_ops::touch_and_update(
+        &db,
+        passkey_id,
+        "{\"counter\":1}",
+        "{\"counter\":2}",
+    )
+    .await
+    .expect("a vanished row is an answer, not an error");
+    assert_eq!(
+        stored,
+        CounterWrite::Missing,
+        "a passkey that is no longer registered must report absence, not a lost race"
     );
 }
 
@@ -137,9 +152,14 @@ async fn a_closed_pool_makes_the_counter_write_a_retryable_503() {
         .await
         .expect("close passkey fixture pool");
 
-    let error = passkey_credential_ops::touch_and_update(&db, passkey_id, "{\"counter\":2}")
-        .await
-        .expect_err("a closed pool cannot store the advanced counter");
+    let error = passkey_credential_ops::touch_and_update(
+        &db,
+        passkey_id,
+        "{\"counter\":1}",
+        "{\"counter\":2}",
+    )
+    .await
+    .expect_err("a closed pool cannot store the advanced counter");
     let error = AppError::from(error);
     assert_eq!(
         error.status(),

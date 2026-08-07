@@ -257,6 +257,16 @@ jobs:
       - name: Prove a parallel rg-db test file migrates PostgreSQL safely
         run: cargo test -p rg-db -j 6 --test password_reset_token_single_use -- --nocapture
 
+      # Single-use and compare-and-swap are claims the *database* arbitrates, so
+      # they are claims about each backend. Both files honour
+      # FORGEKEEP_TEST_DATABASE_URL for exactly this step.
+      - name: Prove single-use credentials hold on PostgreSQL
+        run: >-
+          cargo test -p rg-db -j 6
+          --test mfa_backup_code_single_use
+          --test passkey_counter_compare_and_swap
+          -- --nocapture
+
       - name: Prove PostgreSQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
@@ -310,6 +320,17 @@ jobs:
 
       - name: Prove a parallel rg-db test file migrates MySQL safely
         run: cargo test -p rg-db -j 6 --test password_reset_token_single_use -- --nocapture
+
+      # MySQL is the backend that makes this worth a step of its own: it counts
+      # *changed* rows rather than matched ones, so a compare-and-swap that
+      # answers from `rows_affected` alone reads a no-op as a lost race here and
+      # nowhere else.
+      - name: Prove single-use credentials hold on MySQL
+        run: >-
+          cargo test -p rg-db -j 6
+          --test mfa_backup_code_single_use
+          --test passkey_counter_compare_and_swap
+          -- --nocapture
 
       - name: Prove MySQL FTS migration maintenance boundary
         run: cargo test -p rg-db -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture
