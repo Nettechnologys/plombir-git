@@ -5142,7 +5142,7 @@ mod repository_deletion_tests {
         };
         assert_eq!(lfs_bytes, lfs_payload);
 
-        let (package, _, _) = crate::package_registry::service::download_file(
+        let package = crate::package_registry::service::download_file(
             &db,
             &package_storage,
             "transfer-destination",
@@ -5154,7 +5154,7 @@ mod repository_deletion_tests {
         )
         .await
         .expect("read package at destination");
-        assert_eq!(package, b"package bytes");
+        assert_eq!(package.data, b"package bytes");
 
         assert_eq!(
             oci_storage

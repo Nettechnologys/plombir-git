@@ -728,7 +728,13 @@ async fn serve_package_file(
     )
     .await
     {
-        Ok((data, content_type, _size)) => {
+        Ok(file) => {
+            let rg_core::package_registry::service::DownloadedFile {
+                data,
+                content_type,
+                sha256,
+                ..
+            } = file;
             // The whole package file is buffered in memory (`read_file` returns a
             // `Vec` — there is no local-path streaming branch, so unlike the
             // LFS/OCI/attachment handlers this fires even in the default on-disk
@@ -739,7 +745,7 @@ async fn serve_package_file(
             // handlers (card_444e03f1ca15). `Content-Length` lets clients spot an
             // idle-aborted short read.
             let len = data.len();
-            (
+            let mut response = (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, content_type),
@@ -751,7 +757,23 @@ async fn serve_package_file(
                 ],
                 crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
             )
-                .into_response()
+                .into_response();
+            // The digest the bytes were just verified against, advertised the way
+            // the release-asset, CI-artifact and CI-cache handlers advertise
+            // theirs, so a client can check the same thing end to end. Reaching
+            // here means the value equals `hex::encode(...)` output, so the
+            // conversion cannot actually fail; dropping an unrepresentable one
+            // would cost an advisory header, never the verification itself.
+            if let Some(value) = sha256
+                .as_deref()
+                .and_then(|sha256| axum::http::HeaderValue::from_str(sha256).ok())
+            {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_static("x-checksum-sha256"),
+                    value,
+                );
+            }
+            response
         }
         Err(e) => package_file_error_response(e),
     }

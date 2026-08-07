@@ -98,6 +98,7 @@ mod org_team_authz_tests;
 mod org_tests;
 mod organization_deletion_storage_tests;
 mod package_deletion_storage_tests;
+mod package_download_integrity_tests;
 mod package_failure_status_tests;
 mod package_format_e2e_tests;
 mod package_manifest_publish_tests;

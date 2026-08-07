@@ -5,6 +5,7 @@
 
 use anyhow::Context as _;
 use sea_orm::{DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
+use sha2::{Digest as _, Sha256};
 
 use crate::error::not_found;
 use crate::package_registry::storage::{PackageStorage, StoredFile};
@@ -707,6 +708,17 @@ pub async fn get_version(
     })
 }
 
+/// One stored package file, read back and checked against its recorded digest.
+pub struct DownloadedFile {
+    pub data: Vec<u8>,
+    pub content_type: String,
+    pub size: i64,
+    /// The digest the bytes were verified against, or `None` for a legacy row
+    /// that carries no recorded hash. Served on to the client as
+    /// `X-Checksum-Sha256`.
+    pub sha256: Option<String>,
+}
+
 /// Download a version file.
 #[allow(clippy::too_many_arguments)]
 pub async fn download_file(
@@ -718,7 +730,7 @@ pub async fn download_file(
     name: &str,
     version_str: &str,
     filename: &str,
-) -> Result<(Vec<u8>, String, i64)> {
+) -> Result<DownloadedFile> {
     // Resolve and increment download count
     let version_detail = get_version(db, owner, repo, package_type, name, version_str).await?;
 
@@ -733,6 +745,41 @@ pub async fn download_file(
         .ok_or_else(|| not_found("package file"))?;
 
     let data = storage.read_file(&file_model.storage_path).await?;
+
+    // Integrity check: the stored bytes must still hash to the digest recorded
+    // at publish. This is the same digest the server hands clients as the
+    // install checksum in the npm / PyPI / RubyGems / Helm indexes, so a package
+    // served without checking it is a package the server vouches for and has not
+    // looked at. Skipping the check does not make the mismatch go away — it moves
+    // it to the client, where storage rot surfaces as `npm ERR! EINTEGRITY` and
+    // reads as a broken registry or a broken client, with nothing on this side to
+    // say otherwise (card_51c3ddd4c3e0).
+    //
+    // Legacy rows written before digest tracking carry no hash and are served
+    // without this guard, exactly as `release::service::download_asset` does.
+    if let Some(expected) = file_model.sha256.as_deref() {
+        let actual = hex::encode(Sha256::digest(&data));
+        if actual != expected {
+            // Logged as well as returned: the client learns its download failed,
+            // but only the operator can act on "the bytes under this key are not
+            // the bytes that were published".
+            tracing::error!(
+                package_file_id = file_model.id,
+                storage_path = %file_model.storage_path,
+                owner = %owner,
+                repo = %repo,
+                name = %name,
+                version = %version_str,
+                filename = %filename,
+                expected_sha256 = %expected,
+                actual_sha256 = %actual,
+                "stored package file does not match its recorded digest — refusing to serve it"
+            );
+            anyhow::bail!(
+                "package file integrity check failed: expected sha256 {expected}, got {actual}"
+            );
+        }
+    }
 
     // Increment download counts. A failure here must not fail the download the
     // client already got — but it does mean the published statistics undercount
@@ -766,7 +813,12 @@ pub async fn download_file(
 
     let content_type = mime_guess_for_filename(filename);
 
-    Ok((data, content_type, file.size))
+    Ok(DownloadedFile {
+        data,
+        content_type,
+        size: file.size,
+        sha256: file_model.sha256,
+    })
 }
 
 /// Delete a package version.
