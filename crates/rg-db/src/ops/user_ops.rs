@@ -200,19 +200,35 @@ pub async fn count_all(db: &DatabaseConnection) -> Result<u64> {
         .context("db: count all users")
 }
 
-/// List all users with optional pagination.
+/// List all users with pagination.
+///
+/// `offset` is a row offset, and the slicing is spelled out with
+/// `.offset().limit()` — as every neighbour in this module does — rather than
+/// through `Paginator::fetch_page`. That is not a style preference: `fetch_page`
+/// takes a 0-based *page index* and builds `OFFSET page_size * page` itself, so
+/// this parameter (which every caller fills from `PaginationParams::offset()`)
+/// was being multiplied by the page size a second time. The real SQL offset came
+/// out as `per_page² × (page − 1)`: with 25 users and `per_page = 20`,
+/// `GET /api/v1/admin/users?page=2` asked for row 400, answered `200` with an
+/// empty `data`, and still reported `total = 25` and `total_pages = 2`
+/// (card_1e3c1cff05b4).
 pub async fn list_users(
     db: &DatabaseConnection,
-    page: u64,
-    per_page: u64,
+    offset: u64,
+    limit: u64,
 ) -> Result<(Vec<User>, i64)> {
-    let paginator = UserEntity::find()
+    let total = UserEntity::find()
+        .count(db)
+        .await
+        .context("db: count users")?;
+    let users = UserEntity::find()
         .order_by_desc(user::Column::CreatedAt)
         .order_by_desc(user::Column::Id)
-        .paginate(db, per_page);
-
-    let total = paginator.num_items().await.context("db: count users")?;
-    let users = paginator.fetch_page(page).await.context("db: list users")?;
+        .offset(offset)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("db: list users")?;
 
     Ok((users, total as i64))
 }

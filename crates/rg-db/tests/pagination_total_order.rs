@@ -342,6 +342,34 @@ async fn audit_log_pages_partition_entries_written_in_one_instant() {
     assert_ids_strictly_ordered(&walked, true, "audit log");
 }
 
+/// Drop the doc comment and attributes that belong to the *next* item.
+///
+/// Splitting a file on `fn` leaves each chunk ending in the doc block of the
+/// function that follows it, so both source scans below would otherwise read
+/// the next function's prose as this one's code. That misattributes in both
+/// directions: prose mentioning `.offset(` makes an innocent neighbour look
+/// like a paginating op, and prose mentioning `order_by_…Column::Id` would let
+/// a real offender pass. A function body ends at its `}`, so stripping the
+/// trailing run of blank, comment and attribute lines is exactly the cut.
+fn without_the_next_item_s_doc_block(body: &str) -> &str {
+    let mut end = body.len();
+    for line in body.lines().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("#[")
+            || trimmed.starts_with("#!")
+        {
+            end -= line.len();
+            // Every line but the last carries a `\n` that goes with it.
+            end = end.saturating_sub(usize::from(end > 0));
+        } else {
+            break;
+        }
+    }
+    &body[..end]
+}
+
 /// Every paginating op in `rg-db`, including the ones written after this test.
 ///
 /// The walks above pin four functions; there are a dozen more, and the next one
@@ -384,6 +412,7 @@ fn every_paginating_op_breaks_ties_on_the_primary_key() {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
+            let body = without_the_next_item_s_doc_block(body);
             if !body.contains(".offset(") && !body.contains(".paginate(") {
                 continue;
             }
@@ -407,5 +436,79 @@ fn every_paginating_op_breaks_ties_on_the_primary_key() {
         "these paginating ops sort on a key that admits ties, so their page \
          boundaries move between requests — add `order_by_*(…Column::Id)` after \
          the sort key: {offenders:#?}"
+    );
+}
+
+/// card_1e3c1cff05b4: `Paginator::fetch_page` takes a **page index**, not a row
+/// offset, and squares the unit if it is handed one.
+///
+/// The guard above cannot see this defect: the offending listings had a perfectly
+/// total order, and the wrong number was the *argument*. `fetch_page(page)`
+/// builds `OFFSET page_size * page` itself, so a row offset arriving there comes
+/// out as `per_page² × (page − 1)` — at `per_page = 20`, page 2 asks for row 400.
+/// The response is `200` with a correct `total` and an empty `data`, and nothing
+/// in it says the rest of the rows are unreachable on every page.
+///
+/// The whole defect is legible at the call site: a parameter named `offset` fed
+/// into `fetch_page`. Two ops did exactly that. So that is what is checked —
+/// every `fetch_page` argument must be page-shaped by name, which is the one
+/// step whose absence produced the defect and is checkable from the source.
+///
+/// A function that wants row offsets should not reach for `fetch_page` at all;
+/// `.offset(offset).limit(limit)` is what every other op in this module uses and
+/// carries no unit to confuse.
+#[test]
+fn no_paginating_op_hands_a_row_offset_to_fetch_page() {
+    let ops_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ops");
+    let mut offenders = Vec::new();
+    let mut checked = 0usize;
+
+    let mut files: Vec<_> = std::fs::read_dir(&ops_dir)
+        .expect("read src/ops")
+        .map(|entry| entry.expect("read dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+
+    for path in &files {
+        let source = std::fs::read_to_string(path).expect("read ops source");
+        let file = path
+            .file_name()
+            .expect("ops file has a name")
+            .to_string_lossy()
+            .into_owned();
+
+        // Comment lines are skipped, so the prose above these very functions —
+        // which has to name `fetch_page` to explain the rule — cannot be read
+        // as a call site.
+        for line in source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            let Some(after) = line.split_once(".fetch_page(") else {
+                continue;
+            };
+            let argument = after.1.split(')').next().unwrap_or_default().trim();
+            checked += 1;
+            // `page` / `page_index` is the unit `fetch_page` means. Anything
+            // else — and `offset` above all — is a different quantity wearing
+            // the same parameter slot.
+            if !argument.contains("page") {
+                offenders.push(format!("{file}: fetch_page({argument})"));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 2,
+        "the scan found only {checked} `fetch_page` call(s) — it stopped matching \
+         the source layout and is no longer checking anything"
+    );
+    assert!(
+        offenders.is_empty(),
+        "`fetch_page` takes a 0-based PAGE INDEX and multiplies it by the page \
+         size itself; these call sites hand it something else, which squares the \
+         unit and makes most of the listing unreachable on every page. Slice with \
+         `.offset(offset).limit(limit)` instead: {offenders:#?}"
     );
 }

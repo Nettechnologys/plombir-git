@@ -57,19 +57,31 @@ pub async fn get_org_by_name(
 }
 
 /// List all organizations with pagination (admin use).
+///
+/// `offset` is a row offset, and the slicing is spelled out with
+/// `.offset().limit()` — as every neighbour in this module does — rather than
+/// through `Paginator::fetch_page`. That is not a style preference: `fetch_page`
+/// takes a 0-based *page index* and builds `OFFSET page_size * page` itself, so
+/// a parameter named `offset` fed into it silently squared the unit. The admin
+/// handler passes `PaginationParams::offset()`, which made the real SQL offset
+/// `per_page² × (page − 1)` — at `per_page = 20`, page 2 asked for row 400 and
+/// an instance with 100 organizations served nothing past the first page while
+/// `total` kept reporting all of them (card_1e3c1cff05b4).
 pub async fn list_all_orgs(
     db: &DatabaseConnection,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<organization::Model>, i64)> {
-    let paginator = organization::Entity::find()
+    let total = organization::Entity::find()
+        .count(db)
+        .await
+        .context("db: count orgs")?;
+    let orgs = organization::Entity::find()
         .order_by_desc(organization::Column::CreatedAt)
         .order_by_desc(organization::Column::Id)
-        .paginate(db, limit);
-
-    let total = paginator.num_items().await.context("db: count orgs")?;
-    let orgs = paginator
-        .fetch_page(offset)
+        .offset(offset)
+        .limit(limit)
+        .all(db)
         .await
         .context("db: list all orgs")?;
 

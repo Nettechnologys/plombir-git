@@ -819,12 +819,17 @@ impl From<rg_db::entities::user::Model> for UserInfo {
 }
 
 /// List all users with pagination (admin only).
+///
+/// `offset` is a row offset, not a page index — the name matters here, because
+/// this function is a pass-through and the caller fills it from
+/// `PaginationParams::offset()`. Called `page` while carrying an offset, it read
+/// as correct at both ends and was wrong in the middle (card_1e3c1cff05b4).
 pub async fn list_users_admin(
     db: &DatabaseConnection,
-    page: u64,
-    per_page: u64,
+    offset: u64,
+    limit: u64,
 ) -> Result<PaginatedUsers> {
-    let (users, total) = user_ops::list_users(db, page, per_page).await?;
+    let (users, total) = user_ops::list_users(db, offset, limit).await?;
     Ok(PaginatedUsers {
         users: users.into_iter().map(Into::into).collect(),
         total,
