@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/timeTracking.ts');
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/time_tracking/+page.svelte');
@@ -13,7 +15,8 @@ const zhTranslationsPath = path.join(root, 'web/src/lib/i18n/translations/zh-CN.
 
 const client = readFileSync(clientPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');
-const backend = readFileSync(backendPath, 'utf8');
+// Comments are stripped so a commented-out handler reads as a deleted one.
+const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
 const repoHeader = readFileSync(repoHeaderPath, 'utf8');
 const enTranslations = JSON.parse(readFileSync(enTranslationsPath, 'utf8'));
 const zhTranslations = JSON.parse(readFileSync(zhTranslationsPath, 'utf8'));
@@ -46,7 +49,18 @@ if (/request<\{\s*deleted:\s*boolean\s*\}>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/i
   failures.push('API client timeTracking.delete still expects a JSON deleted envelope');
 }
 
-if (!/StatusCode::NO_CONTENT/.test(backend)) {
+// Read inside `delete_time_entry`, not across the module. The claim is about one
+// handler's status, and any sibling that grows a `204` of its own would mask
+// this one moving to something else. Proven on 2026-08-06 (HEAD `c9e12cb`) by
+// moving the delete to `200 OK` and giving `add_time` a stray `204`: the check
+// stayed green. A handler this cannot read is a failure too — a gate that
+// silently stops reading its subject is worse than one that goes red.
+const deleteTimeEntry = rustFnBlock(backend, 'delete_time_entry');
+if (deleteTimeEntry === null) {
+  failures.push(
+    'api/time_tracking.rs no longer defines a `pub async fn delete_time_entry` this check can read',
+  );
+} else if (!/StatusCode::NO_CONTENT/.test(deleteTimeEntry.body)) {
   failures.push('Backend delete_time_entry must continue returning 204 No Content');
 }
 

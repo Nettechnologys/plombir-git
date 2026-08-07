@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/collaborators.rs');
@@ -14,7 +14,8 @@ const clientPaths = [
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/collaborators/+page.svelte');
 
-const backend = readFileSync(backendPath, 'utf8');
+// Comments are stripped so a commented-out handler reads as a deleted one.
+const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
 const routes = loadRouteTable(routerPath);
 const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
@@ -95,8 +96,21 @@ if (routes.some((route) => route.path === '/repos/{owner}/{name}/collaborators/{
   failures.push('Backend router must not expose legacy POST /collaborators/{user_id}/remove');
 }
 
-if (!/Ok\(\(\)\)\s*=>\s*StatusCode::NO_CONTENT\.into_response\(\)/.test(backend)) {
-  failures.push('Backend collaborator removal must return an empty 204 response');
+// Read inside `remove_collaborator`, not across the module. The claim is about
+// one handler's success branch, and the file has other handlers that may grow a
+// branch of the same shape — at which point `remove_collaborator` could move to
+// `200 OK` and this check would go on passing, naming a contract nobody is
+// keeping. Proven on 2026-08-06 (HEAD `c9e12cb`) by moving the removal to `200`
+// and giving `list_collaborators` a stray `Ok(()) => 204`: the check stayed
+// green. A handler this cannot read is a failure too — a gate that silently
+// stops reading its subject is worse than one that goes red.
+const removeCollaborator = rustFnBlock(backend, 'remove_collaborator');
+if (removeCollaborator === null) {
+  failures.push(
+    'api/collaborators.rs no longer defines a `pub async fn remove_collaborator` this check can read',
+  );
+} else if (!/Ok\(\(\)\)\s*=>\s*StatusCode::NO_CONTENT\.into_response\(\)/.test(removeCollaborator.body)) {
+  failures.push('Backend remove_collaborator must return an empty 204 response');
 }
 
 for (const [file, source] of clients) {
