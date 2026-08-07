@@ -42,6 +42,62 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use std::path::Path;
 
+/// The shortest sync interval a mirror may be given.
+///
+/// Chosen to match the scheduler's own polling granularity rather than the
+/// hour the settings form offers: a mirror cannot be refreshed more often than
+/// the sweep runs, so anything below this is a number the server could not
+/// honour anyway — while an hour-long floor in the API would forbid legitimate
+/// frequent mirroring that the form simply does not offer.
+pub const MIN_SYNC_INTERVAL_SECONDS: i64 = 60;
+
+/// Reject an interval the scheduler cannot turn into a schedule.
+///
+/// `next_sync_at` is written as `now + sync_interval_seconds` and
+/// [`rg_db::ops::mirror_ops::list_due_sync`] selects on `next_sync_at <= now`,
+/// so a zero or negative interval makes the row *permanently* due: every tick
+/// of the sweep picks it up, every tick spawns a `git remote update` against a
+/// third-party host, and the pass moves the schedule forward by nothing at all.
+/// A handful of such rows also fills the sweep's batch, so correctly configured
+/// mirrors never reach the queue behind them (card_3d4c7b8b27c8).
+///
+/// `MirrorSyncConfig::validate` already refuses `poll_interval_secs = 0` for
+/// exactly this reason — but that guards the knob an instance admin edits in a
+/// config file, while this one is set over HTTP by any repository owner.
+fn check_sync_interval(seconds: i64) -> Result<()> {
+    if seconds < MIN_SYNC_INTERVAL_SECONDS {
+        return Err(crate::error::invalid_request(format!(
+            "`sync_interval_seconds` must be at least {MIN_SYNC_INTERVAL_SECONDS} (a zero or \
+             negative interval is a busy loop, not a schedule, and the sweep cannot refresh a \
+             mirror more often than it runs); set `status` to `{STATUS_INACTIVE}` to switch this \
+             mirror off"
+        )));
+    }
+    Ok(())
+}
+
+/// The interval a pass actually schedules by — the floor again, on the way out.
+///
+/// [`check_sync_interval`] stops a bad interval from being *written*, but a row
+/// stored before that check existed — or written by any future path that
+/// forgets it — would still compute `now + 0` and stay permanently due, which
+/// is the whole failure. The pass is where the schedule is set, so this is the
+/// last place that can guarantee a mirror leaves its own selection.
+fn effective_sync_interval(mirror: &Mirror) -> i64 {
+    let interval = mirror.sync_interval_seconds.max(MIN_SYNC_INTERVAL_SECONDS);
+    if interval != mirror.sync_interval_seconds {
+        tracing::warn!(
+            repo_id = mirror.repo_id,
+            mirror_id = mirror.id,
+            stored = mirror.sync_interval_seconds,
+            used = interval,
+            "this mirror's stored sync interval is below the minimum and would keep it \
+             permanently due; scheduling the next pass at the minimum instead"
+        );
+    }
+    interval
+}
+
 /// Create a new mirror for a repository.
 ///
 /// `password` is the plaintext credential as the operator typed it; it is
@@ -69,6 +125,8 @@ pub async fn create_mirror(
     if repo.is_none() {
         return Err(crate::error::not_found("repository"));
     }
+
+    check_sync_interval(sync_interval_seconds)?;
 
     // Reject an obviously-internal / non-git-transport remote at registration
     // for immediate operator feedback; sync re-checks with DNS resolution.
@@ -160,6 +218,10 @@ pub async fn update_mirror(
     status: Option<String>,
     encryption_key: &str,
 ) -> Result<Mirror> {
+    if let Some(seconds) = sync_interval_seconds {
+        check_sync_interval(seconds)?;
+    }
+
     let existing = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
@@ -398,7 +460,7 @@ async fn run_sync_pass(
     };
 
     let now = Utc::now();
-    let next_sync = now + chrono::Duration::seconds(mirror.sync_interval_seconds);
+    let next_sync = now + chrono::Duration::seconds(effective_sync_interval(mirror));
 
     let mut model: ActiveModel = mirror.clone().into();
     model.last_sync_at = Set(Some(now));
@@ -729,6 +791,58 @@ mod tests {
         let first = encrypt_password(Some("hunter2"), SECRET).unwrap().unwrap();
         let second = encrypt_password(Some("hunter2"), SECRET).unwrap().unwrap();
         assert_ne!(first, second);
+    }
+
+    /// card_3d4c7b8b27c8: `next_sync_at` is written as `now + interval` and
+    /// `list_due_sync` selects on `next_sync_at <= now`, so a zero or negative
+    /// interval makes the row permanently due — every tick of the sweep spawns
+    /// a `git` subprocess against a third-party host, and the schedule never
+    /// converges to a schedule.
+    #[test]
+    fn an_interval_the_scheduler_cannot_honour_is_refused() {
+        for refused in [0, -1, -86_400, MIN_SYNC_INTERVAL_SECONDS - 1] {
+            let error = check_sync_interval(refused).expect_err("interval {refused} was accepted");
+            assert!(
+                error
+                    .downcast_ref::<crate::error::InvalidRequest>()
+                    .is_some(),
+                "a bad interval must be the caller's mistake, not a server fault: {error:#}"
+            );
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("sync_interval_seconds"),
+                "the message has to name the field: {rendered}"
+            );
+        }
+
+        check_sync_interval(MIN_SYNC_INTERVAL_SECONDS).expect("the minimum itself is allowed");
+        check_sync_interval(3600).expect("an hour is allowed");
+    }
+
+    /// The other end of the same guard: rows written before it existed still
+    /// have to leave the sweep's selection after a pass, so the schedule is
+    /// computed from the floor rather than from the stored number.
+    #[test]
+    fn a_pass_schedules_a_row_stored_below_the_floor_past_now_anyway() {
+        let mut legacy = mirror_row(None, None);
+        legacy.sync_interval_seconds = 0;
+        assert_eq!(effective_sync_interval(&legacy), MIN_SYNC_INTERVAL_SECONDS);
+
+        legacy.sync_interval_seconds = -3600;
+        assert_eq!(effective_sync_interval(&legacy), MIN_SYNC_INTERVAL_SECONDS);
+
+        let now = Utc::now();
+        assert!(
+            now + chrono::Duration::seconds(effective_sync_interval(&legacy)) > now,
+            "the pass left the mirror due at the moment it finished"
+        );
+
+        let configured = mirror_row(None, None);
+        assert_eq!(
+            effective_sync_interval(&configured),
+            configured.sync_interval_seconds,
+            "a legitimate interval must not be rewritten by the floor"
+        );
     }
 
     #[test]

@@ -974,3 +974,89 @@ async fn an_unknown_mirror_status_is_refused_rather_than_stored() {
         assert_eq!(body["status"], accepted);
     }
 }
+
+/// card_3d4c7b8b27c8: the scheduler range-checks the knobs an instance admin
+/// edits in a config file and did not range-check the one any repository owner
+/// sets over HTTP — the same switch, one floor down.
+///
+/// `next_sync_at` is written as `now + sync_interval_seconds` and the sweep
+/// selects on `next_sync_at <= now`, so a zero or negative interval makes the
+/// row permanently due: every tick reaches out to a third-party host, and each
+/// pass moves the schedule forward by nothing. The settings form multiplies
+/// hours and never produces one, so the hole is the API alone.
+#[tokio::test]
+async fn an_interval_that_would_make_a_mirror_permanently_due_is_refused() {
+    let base = spawn_test_app().await;
+    let (token, _user_id) =
+        register_full(&base, "mirror-interval", "mirror-interval@example.com").await;
+    create_repo(&base, &token, "paced").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/mirror-interval/paced/mirror");
+
+    for refused in [0, -1, 30] {
+        let resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"url": REMOTE, "sync_interval_seconds": refused}))
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 400,
+            "`sync_interval_seconds: {refused}` was accepted: {body}"
+        );
+        assert!(
+            body.to_string().contains("sync_interval_seconds"),
+            "the refusal has to name the field the caller must edit: {body}"
+        );
+
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status(),
+            404,
+            "a refused create left a mirror row behind"
+        );
+    }
+
+    // A legitimate interval still goes through, so the guard above is a floor
+    // and not a closed door.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"url": REMOTE, "sync_interval_seconds": 3600}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "a legitimate interval was refused");
+
+    // And the update path carries the same floor: it writes the same column.
+    for refused in [0, -1, 30] {
+        let resp = client
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"sync_interval_seconds": refused}))
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 400,
+            "`PATCH sync_interval_seconds: {refused}` was accepted: {body}"
+        );
+
+        let stored = get_mirror(&client, &url, &token).await;
+        assert_eq!(
+            stored["sync_interval_seconds"], 3600,
+            "a refused update changed the stored interval anyway"
+        );
+    }
+}

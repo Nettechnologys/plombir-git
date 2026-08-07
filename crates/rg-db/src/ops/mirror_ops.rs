@@ -69,6 +69,16 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
 /// remote on behalf of a repository that no longer exists (card_374998ffebc1).
 /// The join is what keeps those rows out; `sync_mirror` re-checks for the gap
 /// between this selection and its own `git` subprocess.
+///
+/// Ordered by how long each mirror has been waiting, because the `LIMIT` makes
+/// this a queue and an unordered `LIMIT` is whatever the backend's plan happens
+/// to hand back. A mirror that keeps landing in the batch and a mirror that
+/// never does is the difference between a schedule and a lottery — and a
+/// handful of rows that are due on every single tick would otherwise be able to
+/// fill the batch forever, starving every correctly configured mirror behind
+/// them (card_3d4c7b8b27c8). A row that has never synced sorts first: `NULL` is
+/// "due since forever", and it is the only state in which the mirror has not
+/// run at all.
 pub async fn list_due_sync(db: &DatabaseConnection, limit: u64) -> Result<Vec<Model>> {
     let now = Utc::now();
     MirrorEntity::find()
@@ -80,6 +90,12 @@ pub async fn list_due_sync(db: &DatabaseConnection, limit: u64) -> Result<Vec<Mo
                 .is_null()
                 .or(mirror::Column::NextSyncAt.lte(now)),
         )
+        // `NULL` sorts first on SQLite and MySQL but last on PostgreSQL, so the
+        // "never synced" case is lifted into the ordering itself rather than
+        // left to the backend's null placement.
+        .order_by_asc(Expr::expr(mirror::Column::NextSyncAt.is_null()).eq(false))
+        .order_by_asc(mirror::Column::NextSyncAt)
+        .order_by_asc(mirror::Column::Id)
         .limit(limit)
         .all(db)
         .await
