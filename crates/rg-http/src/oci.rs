@@ -39,6 +39,11 @@ const DOCKER_API_VERSION: HeaderName = HeaderName::from_static("docker-distribut
 /// "there is nobody behind this token", not as "look this account up".
 const ANONYMOUS_SUBJECT: &str = "anonymous";
 
+/// The `service` every challenge advertises and every token is minted for. It
+/// is one value in three places (the version check, the refusal challenge, the
+/// token's `aud`), so it is one constant.
+const REGISTRY_SERVICE: &str = "forgekeep-registry";
+
 // ── helpers ──────────────────────────────────────────────────
 
 /// Build an OCI `{errors:[{code,message}]}` envelope.
@@ -49,17 +54,19 @@ const ANONYMOUS_SUBJECT: &str = "anonymous";
 /// the latter prints the outermost `.context(...)` alone and drops the io /
 /// digest / db error underneath it (card_a997f30c142c).
 fn oci_err(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(ErrorResponse {
-            errors: vec![ErrorDetail {
-                code: code.to_string(),
-                message: message.to_string(),
-                detail: None,
-            }],
-        }),
-    )
-        .into_response()
+    (status, oci_error_body(code, message)).into_response()
+}
+
+/// The envelope on its own, for the responses that carry a header of their own
+/// alongside it (see [`oci_unauthorized`]).
+fn oci_error_body(code: &str, message: &str) -> Json<ErrorResponse> {
+    Json(ErrorResponse {
+        errors: vec![ErrorDetail {
+            code: code.to_string(),
+            message: message.to_string(),
+            detail: None,
+        }],
+    })
 }
 
 fn oci_not_found(code: &str, message: &str) -> Response {
@@ -143,8 +150,32 @@ fn oci_status_for<E: OciDbStatus>(e: &E) -> StatusCode {
     e.oci_status()
 }
 
-fn oci_unauthorized(message: &str) -> Response {
-    oci_err(StatusCode::UNAUTHORIZED, error_codes::UNAUTHORIZED, message)
+/// A `401` that says where to go next.
+///
+/// Every OCI `401` except the one from `GET /v2/` used to leave without a
+/// `WWW-Authenticate`, which RFC 7235 requires of any `401` and which the
+/// distribution spec builds its whole auth flow on. Docker survives it by
+/// caching the challenge from the version-check ping and deriving the scope
+/// from the operation it is attempting; a client that instead reads the
+/// challenge off the request that failed — which is what the spec describes —
+/// has nowhere to read it from (card_87107a1e40bd).
+///
+/// The scope is the one the refused operation needs, not the catalog scope the
+/// version check advertises: a client takes the scope out of the challenge and
+/// asks the token endpoint for exactly that, so a wrong scope here buys a token
+/// that is refused again.
+fn oci_unauthorized(headers: &HeaderMap, scope: &str, message: &str) -> Response {
+    let challenge = www_authenticate(
+        &format!("{}/v2/auth/token", get_base_url(headers)),
+        REGISTRY_SERVICE,
+        scope,
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge.as_str())],
+        oci_error_body(error_codes::UNAUTHORIZED, message),
+    )
+        .into_response()
 }
 
 /// The `Authorization: Bearer` token this request carries, whichever kind.
@@ -340,7 +371,11 @@ async fn require_access(
 ) -> Result<Option<i64>, Response> {
     match check_access(state, headers, owner, repo, required_action).await {
         Ok((true, user_id)) => Ok(user_id),
-        Ok((false, _)) => Err(oci_unauthorized("authentication required")),
+        Ok((false, _)) => Err(oci_unauthorized(
+            headers,
+            &format!("repository:{owner}/{repo}:{required_action}"),
+            "authentication required",
+        )),
         // The gate's own status (503 on a database outage, 500 otherwise)
         // inside the OCI envelope docker expects.
         Err(e) => Err(oci_err(e.status(), "UNKNOWN", &e.to_string())),
@@ -365,20 +400,31 @@ fn www_authenticate(realm: &str, service: &str, scope: &str) -> String {
 
 // ── API Version Check ────────────────────────────────────────
 
-/// `GET /v2/` — API version check.
-/// Docker clients call this first to verify the registry is available.
-/// Returns 401 with WWW-Authenticate if authentication is required.
-pub async fn api_version_check(State(_state): State<AppState>, headers: HeaderMap) -> Response {
-    // Unconditionally 401 + challenge: this endpoint exists so a client learns
-    // *where* to get its token, and it answers the same to everyone. Nothing is
-    // authenticated here, which is why no credential is read — the token this
-    // used to validate and then discard proved nothing about the response.
+/// `GET /v2/` — API version check, and the only place a client can find out
+/// that its credentials were accepted.
+///
+/// This endpoint answers two different questions depending on what the request
+/// carries, and it used to answer only the first. Without credentials it is
+/// "where do I get a token": `401` plus the challenge naming the realm. *With*
+/// credentials it is "are these good": the distribution spec makes a `200` the
+/// answer, and `docker login` is defined as exactly that round trip — ping,
+/// read the challenge, fetch a token, ping again, and treat a `200` as success.
+///
+/// Answering `401` unconditionally therefore meant `docker login` could not
+/// succeed against this registry at all, which in turn meant no client could
+/// hold credentials for a private repository: every push was refused and every
+/// private pull was anonymous. It was never noticed because the registry's
+/// tests speak the wire protocol themselves and never had a login to perform;
+/// the live-client test that found it is `oci_live_client_tests`.
+pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if authenticated_caller(&state, &headers) {
+        return (StatusCode::OK, [(DOCKER_API_VERSION, API_VERSION)]).into_response();
+    }
 
     // The realm is not decoration: a client does not guess where to get its
     // token, it reads this path out of the challenge and goes there. It has to
     // be the path `build_v2_routes` registers for `oci::get_token`.
     let realm = format!("{}/v2/auth/token", get_base_url(&headers));
-    let service = "forgekeep-registry";
 
     (
         StatusCode::UNAUTHORIZED,
@@ -386,11 +432,39 @@ pub async fn api_version_check(State(_state): State<AppState>, headers: HeaderMa
             (DOCKER_API_VERSION, API_VERSION),
             (
                 header::WWW_AUTHENTICATE,
-                www_authenticate(&realm, service, "registry:catalog:*").as_str(),
+                www_authenticate(&realm, REGISTRY_SERVICE, "registry:catalog:*").as_str(),
             ),
         ],
     )
         .into_response()
+}
+
+/// Does this request carry a credential this registry issued or accepts?
+///
+/// Deliberately **not** an authorization decision, and deliberately not a
+/// database read. The `200` it feeds grants nothing — it says "your credentials
+/// were recognised", which is the one thing `docker login` needs and the only
+/// thing it can act on. Whether the account behind them may still read or write
+/// a given repository is asked per request, of the repository gate, by
+/// `check_access`; putting a second, weaker copy of that question here would
+/// only create somewhere for the two answers to drift apart.
+///
+/// So a signature is enough: an OCI token was minted by `get_token` *after*
+/// `authenticate_basic` accepted a password or a PAT, and it expires in five
+/// minutes. A deactivated account holding an unexpired one sees its `docker
+/// login` succeed and then every pull and push refused — which is the correct
+/// outcome, arrived at by the check that decides something.
+///
+/// An anonymous scoped token does not count: `get_token` mints one for a caller
+/// who presented nothing, so honouring it would report a successful login for a
+/// password the registry never accepted.
+fn authenticated_caller(state: &AppState, headers: &HeaderMap) -> bool {
+    if bearer_user_id(headers, &state.jwt_secret).is_some() {
+        return true;
+    }
+    bearer_token(headers)
+        .and_then(|token| validate_oci_token(token, &state.jwt_secret))
+        .is_some_and(|claims| claims.sub != ANONYMOUS_SUBJECT)
 }
 
 // ── Token Endpoint ─────────────────────────────────────

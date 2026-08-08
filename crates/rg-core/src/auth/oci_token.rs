@@ -181,11 +181,21 @@ pub fn validate_oci_token(token: &str, secret: &str) -> Option<OciTokenClaims> {
 /// Bearer realm="https://registry.example.com/v2/auth/token",service="registry",scope="repository:alice/hello:pull,push"
 /// ```
 pub fn build_www_authenticate(realm: &str, service: &str, scope: &str) -> String {
-    // URL-encode the parameters
-    let scope_encoded = urlencoding::encode(scope);
+    // The scope goes in verbatim. It used to be percent-encoded, which turns
+    // `repository:alice/hello:pull` into `repository%3Aalice%2Fhello%3Apull` —
+    // and the client does not decode it. It copies the string out of the
+    // challenge and asks the token endpoint for *that*, where `ParsedScope`
+    // finds no `:` separators, grants nothing, and hands back a token that is
+    // refused by the very request that produced the challenge.
+    //
+    // These are quoted `auth-param` values (RFC 7235 §2.1), so the delimiters
+    // that would need escaping are the quote and the backslash — neither of
+    // which appears in a scope — not `:` and `/`. Every registry in the wild
+    // emits the unencoded form; the spec's own example is
+    // `scope="repository:samalba/my-app:pull,push"`.
     format!(
         r#"Bearer realm="{}",service="{}",scope="{}""#,
-        realm, service, scope_encoded
+        realm, service, scope
     )
 }
 
@@ -264,6 +274,12 @@ mod tests {
         );
         assert!(www.contains(r#"realm="https://example.com/v2/auth/token""#));
         assert!(www.contains(r#"service="registry""#));
-        assert!(www.contains("scope="));
+        // Verbatim, not percent-encoded: the client copies this string into its
+        // token request, so `%3A` here becomes a scope the token endpoint
+        // cannot parse and therefore cannot grant.
+        assert!(
+            www.contains(r#"scope="repository:alice/hello:pull,push""#),
+            "the challenge must carry the scope a client can ask for: {www}"
+        );
     }
 }

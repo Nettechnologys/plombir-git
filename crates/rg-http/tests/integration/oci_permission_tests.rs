@@ -170,6 +170,125 @@ async fn the_registry_answers_the_spec_version_check_path() {
     }
 }
 
+/// The other half of the version check, and the half that was missing: with
+/// credentials it has to say `200`.
+///
+/// `docker login` is defined as ping → challenge → token → ping again, and it
+/// reads the second ping's `200` as "these credentials are good". Answering
+/// `401` to everyone meant login could never succeed, so no client could hold
+/// credentials for a private repository at all. Proved live by
+/// `oci_live_client_tests`; pinned here so the guarantee does not depend on a
+/// Docker daemon being installed.
+#[tokio::test]
+async fn the_version_check_accepts_the_credentials_docker_login_presents() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (user_token, _id) = register_full(&base, "v2pinger", "v2pinger@example.invalid").await;
+    let client = reqwest::Client::new();
+
+    let with_user_jwt = client
+        .get(format!("{base}/v2/"))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        with_user_jwt.status(),
+        200,
+        "a ForgeKeep user JWT is a credential the registry accepts"
+    );
+
+    // The token `docker login` actually comes back with — minted by the realm
+    // out of the challenge, for the scope the challenge names.
+    let scoped = request_oci_token_raw(
+        &base,
+        "registry:catalog:*",
+        Some(basic_auth("v2pinger", "Qz7$wRtm")),
+    )
+    .await;
+    let with_scoped_token = client
+        .get(format!("{base}/v2/"))
+        .bearer_auth(&scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        with_scoped_token.status(),
+        200,
+        "the second ping of the login round trip must succeed, or `docker login` fails"
+    );
+
+    // And the refusal still refuses: a token minted for nobody is not a login.
+    let anonymous = request_oci_token_raw(&base, "registry:catalog:*", None).await;
+    let with_anonymous_token = client
+        .get(format!("{base}/v2/"))
+        .bearer_auth(&anonymous)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        with_anonymous_token.status(),
+        401,
+        "an anonymous token is what a caller with no credentials gets — treating it as a login \
+         would report success for a password the registry never accepted"
+    );
+}
+
+/// card_87107a1e40bd: a `401` from a repository endpoint has to say where to
+/// authenticate, and for *which* scope.
+///
+/// Only `GET /v2/` used to carry the challenge. A client that reads it off the
+/// failing request — which is what the distribution spec describes — had
+/// nothing to read, and one that reads the scope out of it got a percent-encoded
+/// string the token endpoint cannot parse.
+#[tokio::test]
+async fn a_refused_repository_request_carries_a_challenge_for_its_own_scope() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _id) = register_full(&base, "challengeowner", "challenge@example.invalid").await;
+    create_repo(&base, &token, "images", true).await;
+
+    let refused = reqwest::Client::new()
+        .get(format!("{base}/v2/challengeowner/images/manifests/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+
+    let challenge = refused
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        challenge.contains(&format!(r#"realm="{base}/v2/auth/token""#)),
+        "the challenge must point at the realm this registry serves: {challenge}"
+    );
+    assert!(
+        challenge.contains(r#"scope="repository:challengeowner/images:pull""#),
+        "the scope must be the refused operation's, verbatim — a percent-encoded one buys a token \
+         that is refused again: {challenge}"
+    );
+
+    // The challenge is only useful if the realm honours the scope it names.
+    let scoped = request_oci_token_raw(
+        &base,
+        "repository:challengeowner/images:pull",
+        Some(basic_auth("challengeowner", "Qz7$wRtm")),
+    )
+    .await;
+    let retried = reqwest::Client::new()
+        .get(format!("{base}/v2/challengeowner/images/manifests/v1"))
+        .bearer_auth(&scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        retried.status(),
+        401,
+        "following the challenge must get the client past authentication"
+    );
+}
+
 /// The realm in the challenge has to be a path this registry actually serves.
 ///
 /// A client does not guess the token endpoint: it reads `realm=` out of the

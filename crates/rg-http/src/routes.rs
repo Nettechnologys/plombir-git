@@ -53,14 +53,20 @@ const OCI_TOKEN: Access = Foreign(Handler {
     gates: &["require_access"],
     note: "OCI registry: registry-scoped bearer token",
 });
-/// `GET /v2/` and `GET /v2` — the discovery challenge, which is the whole
-/// response: an unconditional `401` naming the realm a client fetches its token
-/// from, identical for every caller and derived from nothing but the request's
-/// own `Host`. There is no gate to reach because there is nothing behind it.
+/// `GET /v2/` and `GET /v2` — the discovery challenge, and the round trip
+/// `docker login` uses to find out whether its credentials were accepted.
+///
+/// To a caller with no credentials it is the constant `401` naming the realm,
+/// derived from nothing but the request's own `Host`. To a caller presenting a
+/// credential this registry recognises it is a bare `200`, because that is what
+/// `docker login` reads as "these are good" and without it login can never
+/// succeed. Still gateless, and still reads nothing: recognising a signature is
+/// not an authorization decision, and every question about what that caller may
+/// actually do is asked per request by `require_access` on the routes below.
 const OCI_DISCOVERY: Access = Foreign(Handler {
     module: "oci.rs",
     gates: &[],
-    note: "OCI registry: constant `WWW-Authenticate` challenge, reads nothing",
+    note: "OCI registry: `WWW-Authenticate` challenge, or a bare `200` for a recognised credential",
 });
 /// The three LFS routes gate per operation and the batch endpoint gates both
 /// ways, so the sign-off names all three shapes the protocol uses: the two
