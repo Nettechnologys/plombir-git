@@ -115,6 +115,20 @@ pub async fn cancel(
             serde_json::json!({}),
         )
         .await?;
+        // The row survives the cancel — only its status changed — so it still
+        // names the pipeline this PR was waiting on.
+        match merge_queue_ops::find_by_pr(db, pr.id).await {
+            Ok(Some(entry)) => {
+                release_merge_group_pipeline(db, &entry, "the queue entry was canceled").await
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                pr_id = pr.id,
+                repo_id = pr.repo_id,
+                error = %format!("{error:#}"),
+                "merge-group pipeline may be left running: the canceled queue entry could not be re-read"
+            ),
+        }
         cleanup_merge_group_ref(db, repo_root, repository, pr.id).await;
         return Ok(CancelOutcome::Canceled);
     }
@@ -138,6 +152,10 @@ async fn finish_entry(
     failure_reason: Option<String>,
 ) -> Result<merge_queue_entry::Model> {
     let finished = merge_queue_ops::finish(db, entry.id, status, failure_reason.clone()).await?;
+    // Reached from every terminal path, including the ones CI had nothing to do
+    // with. When the pipeline is why the entry finished it is already terminal
+    // and this changes nothing.
+    release_merge_group_pipeline(db, entry, &format!("the queue entry finished as {status}")).await;
     rg_db::ops::pr_event_ops::record(
         db,
         entry.repo_id,
@@ -172,6 +190,55 @@ async fn finish_entry(
 /// Opening of every log line the cleanup below emits, so an operator can grep
 /// one phrase for the whole family instead of four different wordings.
 const STALE_REF: &str = "merge-group ref left behind";
+
+/// Cancel the merge-group pipeline an entry has stopped waiting for.
+///
+/// A merge-group pipeline exists to answer one question — "does this PR merge
+/// cleanly into this base?" — for one group commit. Three things end that
+/// question without ending the pipeline: the entry is cancelled, the entry
+/// finishes for a reason that is not CI (a merge conflict, a lost worker lease,
+/// a closed PR), and the group commit is rebuilt because the PR's head moved.
+/// Left running, its jobs are handed to real runners and burn real minutes on a
+/// group nobody will merge — and for a repository that declares `concurrency:`
+/// without `cancel_in_progress`, the stale run makes every later queue pass fail
+/// outright, because the group ref is stable and still has an active pipeline on
+/// it (card_13d8ebde295b).
+///
+/// Best-effort, like the ref cleanup beside it: the state change the caller was
+/// told about is already committed, and a pipeline that will not cancel must not
+/// unwind it. Best-effort is not silent — a failure leaves a live pipeline, and
+/// nothing else in the system will come back for it.
+///
+/// `cancel_pipeline_chain` is itself a no-op on a pipeline that already reached
+/// a terminal status, so the common paths (the queue merged, or CI failed and
+/// that is why the entry finished) cost one read and change nothing.
+async fn release_merge_group_pipeline(
+    db: &DatabaseConnection,
+    entry: &merge_queue_entry::Model,
+    reason: &str,
+) {
+    let Some(pipeline_id) = entry.merge_group_pipeline_id else {
+        return;
+    };
+    match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id).await {
+        Ok(true) => tracing::info!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            pipeline_id,
+            reason,
+            "canceled the merge-group pipeline its queue entry no longer waits for"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            pipeline_id,
+            reason,
+            error = %format!("{error:#}"),
+            "merge-group pipeline left running: its queue entry no longer waits for it and nothing else will"
+        ),
+    }
+}
 
 /// Delete the merge-group ref the entry created, best-effort.
 ///
@@ -554,6 +621,28 @@ async fn ensure_merge_group_ci(
     commit_output.ensure_success()?;
     let group_sha = commit_output.stdout_str().trim().to_string();
     let group_ref = format!("refs/merge-queue/{}", entry.id);
+
+    // Reaching here with a different group commit than the entry recorded means
+    // the PR's head (or its base) moved while it sat in the queue: the pipeline
+    // the entry still names was asked about a merge that no longer exists.
+    // Release it before the ref moves out from under it — the ref is stable per
+    // entry, so a moment later `refs/merge-queue/{id}` points at the new group
+    // commit while the old run is still marked active on it.
+    let rebuilt = entry.merge_group_sha.as_deref() != Some(group_sha.as_str());
+    if rebuilt && entry.merge_group_pipeline_id.is_some() {
+        release_merge_group_pipeline(db, entry, "the merge group was rebuilt on a newer head").await;
+        // Stop the row naming a pipeline that has just been canceled. If the
+        // trigger below fails, the next pass rebuilds from nothing rather than
+        // adopting a dead run.
+        if let Err(error) = merge_queue_ops::clear_merge_group(db, entry.id).await {
+            tracing::warn!(
+                entry_id = entry.id,
+                error = %format!("{error:#}"),
+                "merge-queue entry still names the merge-group pipeline that was just canceled"
+            );
+        }
+    }
+
     git.run(&["update-ref", &group_ref, &group_sha], Some(&repo_path))?
         .ensure_success()?;
 
