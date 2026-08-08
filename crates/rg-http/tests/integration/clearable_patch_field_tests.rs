@@ -367,3 +367,80 @@ async fn a_board_card_is_detached_from_its_issue_by_null_only() {
     let reattached = patch(serde_json::json!({"issue_id": issue_id})).await;
     assert_eq!(reattached["issue_id"], issue_id);
 }
+
+/// card_f2d5f0e52900 — the same three-state contract, broken the *other* way.
+///
+/// A label's `description` reached the service already wrapped as
+/// `Some(body.description)`, so an absent key arrived as `Some(None)`: the
+/// clearing branch. `PATCH {"name": "…"}` — a rename, saying nothing about the
+/// description — deleted it and answered `200`. Every other test in this file
+/// guards a branch that never ran; this one guards a branch that ran too often,
+/// which is why the omission assertion below is the regression and the other two
+/// are its company.
+#[tokio::test]
+async fn a_label_description_survives_a_rename_and_clears_only_on_null() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "labelowner", "labelowner@example.com").await;
+    create_repo(&base, &token, "labelled").await;
+
+    let created = client
+        .post(format!("{base}/api/v1/repos/labelowner/labelled/labels"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "bug",
+            "color": "#ff0000",
+            "description": "something is broken"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let body = created.json::<serde_json::Value>().await.unwrap();
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(body["description"], "something is broken");
+    let url = format!("{base}/api/v1/repos/labelowner/labelled/labels/{id}");
+
+    let patch = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = url.clone();
+        let token = token.clone();
+        async move {
+            let resp = client
+                .patch(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+
+    let renamed = patch(serde_json::json!({"name": "bug2"})).await;
+    assert_eq!(renamed["name"], "bug2");
+    assert_eq!(
+        renamed["description"], "something is broken",
+        "renaming a label must not delete its description: {renamed}"
+    );
+
+    let recoloured = patch(serde_json::json!({"color": "#00ff00"})).await;
+    assert_eq!(
+        recoloured["description"], "something is broken",
+        "a colour-only PATCH must not delete the description either: {recoloured}"
+    );
+
+    let cleared = patch(serde_json::json!({"description": null})).await;
+    assert!(
+        cleared["description"].is_null(),
+        "an explicit null must clear the description: {cleared}"
+    );
+    assert_eq!(
+        cleared["name"], "bug2",
+        "clearing the description must not disturb the name: {cleared}"
+    );
+
+    let refilled = patch(serde_json::json!({"description": "broken again"})).await;
+    assert_eq!(refilled["description"], "broken again");
+}

@@ -35,8 +35,18 @@ pub struct UpdateLabelRequest {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    /// Absent leaves the description alone; `null` clears it.
+    ///
+    /// A plain `Option<String>` handed to the service as `Some(...)` made those
+    /// two the same input, and the one they collapsed onto was *clear* — so
+    /// `PATCH {"name": "bug2"}`, a rename, silently deleted the description and
+    /// answered `200` (card_f2d5f0e52900). See [`crate::api::clearable`].
+    #[serde(
+        default,
+        deserialize_with = "crate::api::clearable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<Option<String>>,
 }
 
 /// GET /api/v1/repos/:owner/:name/labels
@@ -177,7 +187,7 @@ pub async fn update_label(
         id,
         body.name,
         body.color,
-        Some(body.description),
+        body.description,
     )
     .await
     {
