@@ -86,6 +86,15 @@ pub struct WorkflowTriggerSingle {
     pub workflow_dispatch: Option<serde_yaml::Value>,
     #[serde(default, deserialize_with = "deserialize_present_yaml")]
     pub workflow_call: Option<serde_yaml::Value>,
+    /// Every other key under `on:`.
+    ///
+    /// Serde drops unknown fields by default, which for an `on:` clause means
+    /// `on:\n  release:\n    types: [published]` deserialized into a trigger set
+    /// that declares *nothing* — indistinguishable from an empty `on:`. Keeping
+    /// the keys is what lets `validate_supported_triggers` refuse the workflow
+    /// by the name its author actually wrote (card_c8f24edaee89).
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_yaml::Value>,
 }
 
 /// Event filter with optional branch/tag/path filtering.
@@ -106,6 +115,36 @@ pub struct EventFilter {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScheduleTrigger {
     pub cron: String,
+}
+
+/// `on:` names that are not events a producer emits.
+///
+/// `workflow_call` is the odd one out and the only one that is *allowed*: it
+/// declares the file reusable rather than asking for a run, so a workflow that
+/// names only it is correct even though nothing will ever trigger it directly.
+const WORKFLOW_CALL_TRIGGER: &str = "workflow_call";
+/// The `on:` spelling of [`rg_core::ci::pull_request::PULL_REQUEST_EVENT`].
+const PULL_REQUEST_TRIGGER: &str = "pull_request";
+/// Parsed, matched by nothing: the workflow would be taken from the base branch
+/// rather than from the PR's head, which no producer here does (card_c8f24edaee89).
+const PULL_REQUEST_TARGET_TRIGGER: &str = "pull_request_target";
+/// Parsed, matched by nothing, and there is no scheduler in the tree to emit it.
+const SCHEDULE_TRIGGER: &str = "schedule";
+
+/// Whether an `on:` name is something this engine can actually run.
+fn is_runnable_trigger(name: &str) -> bool {
+    rg_core::ci::PIPELINE_EVENTS.contains(&name) || name == WORKFLOW_CALL_TRIGGER
+}
+
+/// The supported `on:` names, for an error message that tells the author what
+/// to write instead.
+fn supported_trigger_list() -> String {
+    rg_core::ci::PIPELINE_EVENTS
+        .iter()
+        .copied()
+        .chain(std::iter::once(WORKFLOW_CALL_TRIGGER))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A Gitea Actions job definition.
@@ -274,10 +313,108 @@ impl GiteaWorkflow {
 
     fn is_reusable(&self) -> bool {
         match &self.on {
-            WorkflowTriggers::Simple(name) => name == "workflow_call",
-            WorkflowTriggers::Array(names) => names.iter().any(|name| name == "workflow_call"),
+            WorkflowTriggers::Simple(name) => name == WORKFLOW_CALL_TRIGGER,
+            WorkflowTriggers::Array(names) => {
+                names.iter().any(|name| name == WORKFLOW_CALL_TRIGGER)
+            }
             WorkflowTriggers::Single(trigger) => trigger.workflow_call.is_some(),
         }
+    }
+
+    /// The trigger names this workflow declares, whichever shape `on:` took.
+    ///
+    /// The `Single` arm destructures exhaustively on purpose: a trigger field
+    /// added to [`WorkflowTriggerSingle`] without a line here stops compiling,
+    /// which is the whole mechanism that keeps a parsed-but-unrunnable trigger
+    /// from going unnoticed a fourth time.
+    fn declared_triggers(&self) -> Vec<String> {
+        match &self.on {
+            WorkflowTriggers::Simple(name) => vec![name.clone()],
+            WorkflowTriggers::Array(names) => names.clone(),
+            WorkflowTriggers::Single(trigger) => {
+                let WorkflowTriggerSingle {
+                    push,
+                    pull_request,
+                    pull_request_target,
+                    schedule,
+                    workflow_dispatch,
+                    workflow_call,
+                    other,
+                } = trigger.as_ref();
+                [
+                    push.is_some().then_some("push"),
+                    pull_request.is_some().then_some(PULL_REQUEST_TRIGGER),
+                    pull_request_target
+                        .is_some()
+                        .then_some(PULL_REQUEST_TARGET_TRIGGER),
+                    schedule.is_some().then_some(SCHEDULE_TRIGGER),
+                    workflow_dispatch
+                        .is_some()
+                        .then_some(rg_core::ci::WORKFLOW_DISPATCH_EVENT),
+                    workflow_call.is_some().then_some(WORKFLOW_CALL_TRIGGER),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_string)
+                // Sorted so the refusal below reads the same on every run —
+                // `HashMap` iteration order is not stable across processes.
+                .chain({
+                    let mut rest = other.keys().cloned().collect::<Vec<_>>();
+                    rest.sort();
+                    rest
+                })
+                .collect()
+            }
+        }
+    }
+
+    /// Reject a workflow whose `on:` clause names something nothing here emits.
+    ///
+    /// `on: schedule`, `on: pull_request_target` and `on: release` all parse.
+    /// None of them ever ran: `matches_event` answers `false` for every event a
+    /// producer in this tree can name, and for `schedule` there is no scheduler
+    /// in the tree at all. The file was accepted, reported as valid, and never
+    /// produced a pipeline — the author's only evidence being that nothing
+    /// happened (card_c8f24edaee89).
+    ///
+    /// So the declaration is refused where the file is read, rather than
+    /// half-honoured at match time. That is the same answer this module already
+    /// gives to a step it cannot run (see [`validate_supported_actions`]) and to
+    /// a workflow that does not parse: a repository whose CI cannot do what its
+    /// file asks for finds out at the next push, not after a week of wondering
+    /// why the nightly build never fired.
+    ///
+    /// The supported set is [`rg_core::ci::PIPELINE_EVENTS`] — the events
+    /// producers actually create pipelines under — plus `workflow_call`, which
+    /// is not an event at all but the declaration that a file is reusable. That
+    /// makes this check self-maintaining in the other direction too: a producer
+    /// inventing an event name of its own is already caught by
+    /// `every_event_a_pipeline_is_created_under_is_one_a_workflow_can_declare`.
+    ///
+    /// [`validate_supported_actions`]: GiteaWorkflow::validate_supported_actions
+    pub fn validate_supported_triggers(&self) -> Result<()> {
+        let declared = self.declared_triggers();
+        if declared.is_empty() {
+            anyhow::bail!(
+                "its `on:` clause declares no trigger at all, so nothing can ever run it. \
+                 Declare one of: {}",
+                supported_trigger_list()
+            );
+        }
+        let unrunnable = declared
+            .iter()
+            .filter(|name| !is_runnable_trigger(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unrunnable.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "no producer emits trigger(s): {}. A workflow declaring one is accepted and never runs. \
+             Supported: {}",
+            unrunnable.join(", "),
+            supported_trigger_list()
+        )
     }
 
     /// Reject workflows that would otherwise appear successful after silently
@@ -383,6 +520,13 @@ impl GiteaWorkflow {
             WorkflowTriggers::Simple(name) => name.as_str() == event,
             WorkflowTriggers::Array(names) => names.iter().any(|n| n.as_str() == event),
             WorkflowTriggers::Single(trigger) => {
+                // The three `_` bindings are triggers no producer emits, so no
+                // arm below could ever be reached through them. They are not
+                // silently dropped any more: `validate_supported_triggers` — run
+                // where the file is read, before this — refuses a workflow that
+                // declares `pull_request_target` or `schedule` outright, and
+                // `workflow_call` marks a reusable file that is expanded into
+                // its caller rather than triggered on its own.
                 let WorkflowTriggerSingle {
                     push,
                     pull_request,
@@ -390,6 +534,7 @@ impl GiteaWorkflow {
                     schedule: _,
                     workflow_dispatch,
                     workflow_call: _,
+                    other: _,
                 } = trigger.as_ref();
                 match event {
                     "push" => {
@@ -1810,6 +1955,83 @@ jobs:
             &ChangedPaths::unknown()
         ));
         assert!(!wf.matches_event("schedule", "", "main", &ChangedPaths::unknown()));
+        wf.validate_supported_triggers()
+            .expect("push and pull_request both have producers");
+    }
+
+    /// card_c8f24edaee89 — the three triggers that parsed and never ran.
+    ///
+    /// Asserting the refusal *and* the message: "this workflow never fires" is
+    /// exactly the state the author could already observe, so a bare `is_err()`
+    /// would be satisfied by a refusal that says nothing about which trigger is
+    /// the problem or what to write instead.
+    #[test]
+    fn a_trigger_no_producer_emits_is_refused_by_name() {
+        for (label, on) in [
+            (
+                "schedule, mapped shape",
+                "on:\n  schedule:\n    - cron: '0 3 * * *'\n",
+            ),
+            ("schedule, bare name", "on: schedule\n"),
+            ("schedule, in an array", "on: [push, schedule]\n"),
+            ("pull_request_target", "on:\n  pull_request_target:\n"),
+            ("an event this engine has never heard of", "on: release\n"),
+            // Serde drops unknown fields, so before `other` this shape declared
+            // *nothing* and the refusal could not have named `release`.
+            (
+                "an unknown event in the mapped shape",
+                "on:\n  release:\n    types: [published]\n",
+            ),
+        ] {
+            let yml = format!("{on}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n");
+            let workflow =
+                GiteaWorkflow::parse(&yml).unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+            let error = workflow
+                .validate_supported_triggers()
+                .expect_err(&format!("{label} must be refused, not silently accepted"))
+                .to_string();
+            let named = on
+                .contains("schedule")
+                .then_some("schedule")
+                .or(on
+                    .contains("pull_request_target")
+                    .then_some("pull_request_target"))
+                .unwrap_or("release");
+            assert!(
+                error.contains(named),
+                "{label}: the refusal must name the offending trigger, got: {error}"
+            );
+            assert!(
+                error.contains("workflow_dispatch"),
+                "{label}: the refusal must list what IS supported, got: {error}"
+            );
+        }
+    }
+
+    /// The other half: everything with a producer still loads, and so does a
+    /// reusable file, whose `workflow_call` is a declaration rather than an
+    /// event and must not be mistaken for an unrunnable trigger.
+    #[test]
+    fn every_trigger_with_a_producer_is_accepted() {
+        let body =
+            "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        for event in rg_core::ci::PIPELINE_EVENTS {
+            let mapped = format!("on:\n  {event}:\n{body}");
+            GiteaWorkflow::parse(&mapped)
+                .unwrap()
+                .validate_supported_triggers()
+                .unwrap_or_else(|e| panic!("mapped `on: {event}` must be accepted: {e}"));
+            let bare = format!("on: {event}\n{body}");
+            GiteaWorkflow::parse(&bare)
+                .unwrap()
+                .validate_supported_triggers()
+                .unwrap_or_else(|e| panic!("bare `on: {event}` must be accepted: {e}"));
+        }
+        let reusable = format!("on:\n  workflow_call:\n{body}");
+        GiteaWorkflow::parse(&reusable)
+            .unwrap()
+            .validate_supported_triggers()
+            .expect("a reusable workflow declares no event and is still valid");
     }
 
     #[test]

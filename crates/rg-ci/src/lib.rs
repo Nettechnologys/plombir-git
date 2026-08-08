@@ -1004,6 +1004,16 @@ fn try_read_gitea_workflows(
             rg_core::error::invalid_request(format!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))
         })?;
 
+        // Before the match, not after it: a workflow that asks for an event
+        // nothing emits never matches, so a check placed below would be the one
+        // thing it can never reach — which is exactly how `on: schedule` came to
+        // be accepted and silently never run (card_c8f24edaee89).
+        workflow.validate_supported_triggers().map_err(|e| {
+            rg_core::error::invalid_request(format!(
+                "unsupported trigger in {WORKFLOW_DIR}/{name}: {e:#}"
+            ))
+        })?;
+
         // Check if this workflow should be triggered
         if !workflow.matches_event(event, ref_name, &match_branch, &changed) {
             continue;
