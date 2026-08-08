@@ -2894,3 +2894,184 @@ async fn pypi_simple_page_states_what_a_resolver_filters_on() {
     );
     assert_eq!(page.matches("data-yanked").count(), 1, "{page}");
 }
+
+/// Bundler keys a candidate on `(number, platform)` and picks between a
+/// pure-ruby gem and a native build with it, so answering a flat `ruby` for
+/// every gem locks a native build as platform-independent and sends the client
+/// after a `VERSION-PLATFORM` file that does not exist. `required_ruby_version`
+/// is the other constraint it filters on, and the compact index published none
+/// of it (card_0c9e858230b6).
+#[tokio::test]
+async fn rubygems_publishes_the_platform_and_interpreter_constraints_bundler_resolves_on() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    // A native gem: `platform` is declared, and so is the interpreter it needs.
+    let gem_metadata = br#"name: matrix-native
+version: 1.0.0
+platform: x86_64-linux
+summary: a native build
+required_ruby_version: !ruby/object:Gem::Requirement
+  requirements:
+  - - ">="
+    - !ruby/object:Gem::Version
+      version: '3.1'
+"#;
+    let gem_file = tar_archive(&[("metadata.gz", &gzip(gem_metadata))]);
+
+    // Pushed the way `gem push` sends it — no filename on the wire, so the one
+    // the registry derives has to carry the platform too.
+    let pushed = client
+        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(gem_file.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+
+    // ── The compact index, which is what a modern client reads ─────────────
+    let info = client
+        .get(package_url(&base, &["rubygems", "info", "matrix-native"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = info
+        .lines()
+        .find(|line| line.starts_with("1.0.0"))
+        .unwrap_or_else(|| panic!("the version is missing from the info file: {info}"));
+    assert!(
+        line.starts_with("1.0.0-x86_64-linux "),
+        "the chunk the client turns into a download URL must carry the platform: {line}"
+    );
+    assert!(
+        line.contains("ruby:>= 3.1"),
+        "a resolver with no interpreter constraint installs this on 2.7: {line}"
+    );
+
+    // ...and the file really is at the path that chunk builds.
+    let downloaded = client
+        .get(package_url(
+            &base,
+            &["rubygems", "gems", "matrix-native-1.0.0-x86_64-linux.gem"],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        downloaded.status(),
+        StatusCode::OK,
+        "the platform chunk names a file the registry does not serve"
+    );
+    assert_eq!(
+        downloaded.bytes().await.unwrap().as_ref(),
+        gem_file.as_slice()
+    );
+
+    // ── The two JSON endpoints, which used to answer `ruby` for everything ──
+    let mut deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies"]);
+    deps_url
+        .query_pairs_mut()
+        .append_pair("gems", "matrix-native");
+    let deps: serde_json::Value = client
+        .get(deps_url.clone())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deps[0]["platform"], "x86_64-linux", "{deps}");
+
+    let gem_info: serde_json::Value = client
+        .get(package_url(
+            &base,
+            &["rubygems", "api", "v1", "gems", "matrix-native.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        gem_info["versions"]["1.0.0"]["platform"], "x86_64-linux",
+        "{gem_info}"
+    );
+
+    // ── A pure-ruby gem keeps the default, and no `-ruby` suffix ───────────
+    let pure = tar_archive(&[(
+        "metadata.gz",
+        &gzip(b"name: matrix-pure\nversion: 2.0.0\nplatform: ruby\nsummary: pure\n"),
+    )]);
+    let pushed = client
+        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(pure)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+
+    let info = client
+        .get(package_url(&base, &["rubygems", "info", "matrix-pure"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        info.lines().any(|line| line.starts_with("2.0.0 ")),
+        "a pure-ruby gem must not grow a `-ruby` suffix: {info}"
+    );
+    assert!(!info.contains("ruby:"), "nothing was declared: {info}");
+
+    // ── Yanking reaches both JSON endpoints too ────────────────────────────
+    let yanked = client
+        .patch(package_url(
+            &base,
+            &["rubygems", "matrix-native", "1.0.0", "yank"],
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "yank": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK);
+
+    let deps: serde_json::Value = client
+        .get(deps_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        deps,
+        serde_json::json!([]),
+        "the dependency API still offers a withdrawn version as a candidate"
+    );
+
+    let gem_info: serde_json::Value = client
+        .get(package_url(
+            &base,
+            &["rubygems", "api", "v1", "gems", "matrix-native.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        gem_info["versions"]["1.0.0"].is_null(),
+        "the gem info API still offers a withdrawn version: {gem_info}"
+    );
+}

@@ -265,6 +265,28 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> String {
         out.insert("licenses".into(), licenses.into());
     }
 
+    // The platform is a *declared* fact, not one to be inferred back out of a
+    // filename. The compact index has to spell the `VERSION-PLATFORM` chunk the
+    // client will turn into a download URL, and both resolver endpoints used to
+    // answer a flat `ruby` for every gem — which locks a native build as
+    // platform-independent (card_0c9e858230b6).
+    if let Some(platform) = gemspec_platform(doc) {
+        out.insert("platform".into(), platform.into());
+    }
+
+    // `required_ruby_version` is the constraint a resolver filters candidates
+    // on before it looks at a dependency. Unpublished, a gem needing 3.1
+    // resolves cleanly onto 2.7 and fails at parse time.
+    for key in ["required_ruby_version", "required_rubygems_version"] {
+        if let Some(requirement) = doc
+            .get(key)
+            .map(gem_requirement_string)
+            .filter(|r| !r.is_empty())
+        {
+            out.insert(key.into(), requirement.into());
+        }
+    }
+
     let dependencies: Vec<serde_json::Value> = gemspec_dependencies(doc)
         .into_iter()
         .map(|(name, requirements)| {
@@ -274,6 +296,41 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> String {
     out.insert("dependencies".into(), dependencies.into());
 
     serde_json::Value::Object(out).to_string()
+}
+
+/// The platform a gemspec declares, when it is not the default `ruby`.
+///
+/// Recorded only when it differs, because that is exactly the rule the compact
+/// index follows: `1.0.0` for a pure-ruby gem, `1.0.0-x86_64-linux` for a native
+/// one, and a spurious `-ruby` suffix would send the client after a file that
+/// does not exist.
+fn gemspec_platform(doc: &serde_yaml::Value) -> Option<String> {
+    let platform = doc.get("platform")?;
+
+    let spelled = match platform.as_str() {
+        Some(text) => text.trim().to_string(),
+        // Gems packed before RubyGems flattened the field carry a serialized
+        // `Gem::Platform` instead of the `cpu-os-version` string it prints as.
+        None => {
+            let part = |key: &str| {
+                platform
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            };
+            let parts: Vec<&str> = ["cpu", "os", "version"]
+                .iter()
+                .filter_map(|k| part(k))
+                .collect();
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join("-")
+        }
+    };
+
+    (!spelled.is_empty() && spelled != "ruby").then_some(spelled)
 }
 
 /// The runtime dependencies a gemspec declares, as `(name, requirement)`.
@@ -461,6 +518,12 @@ pub struct CompactIndexVersion {
     /// gets one checks the file against it and refuses a mismatch, so it is
     /// omitted rather than faked when the stored file has no digest.
     pub checksum: Option<String>,
+    /// `required_ruby_version` — the interpreter constraint the resolver
+    /// applies before it looks at a single dependency. Published as the `ruby:`
+    /// segment of the requirements chunk.
+    pub ruby_version: Option<String>,
+    /// `required_rubygems_version`, published as the `rubygems:` segment.
+    pub rubygems_version: Option<String>,
 }
 
 impl CompactIndexVersion {
@@ -506,11 +569,24 @@ pub fn build_compact_index_info(versions: &[CompactIndexVersion]) -> String {
             .collect();
         out.push_str(&deps.join(","));
 
+        // Everything after the pipe is a comma-separated `key:value` list, and
+        // the two version constraints live there beside the checksum. Without
+        // `ruby:`, a gem that needs 3.1 resolves cleanly onto 2.7 and fails at
+        // parse time — the resolver had nothing to filter on (card_0c9e858230b6).
         out.push('|');
+        let mut requirements: Vec<String> = Vec::new();
         if let Some(ref checksum) = version.checksum {
-            out.push_str("checksum:");
-            out.push_str(checksum);
+            requirements.push(format!("checksum:{checksum}"));
         }
+        for (key, requirement) in [
+            ("ruby", &version.ruby_version),
+            ("rubygems", &version.rubygems_version),
+        ] {
+            if let Some(requirement) = requirement {
+                requirements.push(format!("{key}:{}", join_constraints(requirement)));
+            }
+        }
+        out.push_str(&requirements.join(","));
         out.push('\n');
     }
 
@@ -876,6 +952,8 @@ dependencies:
                 },
             ],
             checksum: Some("6d2f".into()),
+            ruby_version: None,
+            rubygems_version: None,
         }]);
 
         assert_eq!(
@@ -893,6 +971,8 @@ dependencies:
             platform: Some("java".into()),
             dependencies: Vec::new(),
             checksum: None,
+            ruby_version: None,
+            rubygems_version: None,
         }]);
 
         assert_eq!(info, "---\n1.0.0-java |\n");
@@ -905,6 +985,8 @@ dependencies:
             platform: None,
             dependencies: Vec::new(),
             checksum: Some("abc".into()),
+            ruby_version: None,
+            rubygems_version: None,
         }]);
         let checksum = compact_index_info_checksum(&info);
 
@@ -927,6 +1009,79 @@ dependencies:
         // column against its own digest of the cached file.
         use md5::{Digest, Md5};
         assert_eq!(checksum, format!("{:x}", Md5::digest(info.as_bytes())));
+    }
+
+    /// Everything after the pipe is a `key:value` list, and `ruby:` is the
+    /// constraint a resolver filters candidates on before it looks at a single
+    /// dependency. Its several constraints join with `&`, like a dependency's —
+    /// the comma belongs to the list.
+    #[test]
+    fn info_line_publishes_the_interpreter_constraints_beside_the_checksum() {
+        let info = build_compact_index_info(&[CompactIndexVersion {
+            number: "1.0.0".into(),
+            platform: Some("x86_64-linux".into()),
+            dependencies: vec![RubyGemsDep {
+                name: "rack".into(),
+                requirements: ">= 2.0".into(),
+            }],
+            checksum: Some("6d2f".into()),
+            ruby_version: Some(">= 3.1, < 4.0".into()),
+            rubygems_version: Some(">= 3.0".into()),
+        }]);
+
+        assert_eq!(
+            info,
+            "---\n1.0.0-x86_64-linux rack:>= 2.0|checksum:6d2f,ruby:>= 3.1&< 4.0,rubygems:>= 3.0\n"
+        );
+
+        // A gem that declares neither says nothing after the pipe but the
+        // checksum — an empty `ruby:` would be a constraint of its own.
+        let info = build_compact_index_info(&[CompactIndexVersion {
+            number: "1.0.0".into(),
+            platform: None,
+            dependencies: Vec::new(),
+            checksum: Some("abc".into()),
+            ruby_version: None,
+            rubygems_version: None,
+        }]);
+        assert_eq!(info, "---\n1.0.0 |checksum:abc\n");
+    }
+
+    /// The platform is what Bundler keys a candidate on together with the
+    /// version, and what the compact index turns into a download URL. It is
+    /// recorded only when it differs from `ruby`, because a spurious `-ruby`
+    /// suffix names a file that does not exist.
+    #[test]
+    fn gemspec_records_the_platform_and_the_interpreter_constraints() {
+        let native = parse_gemspec_yaml(
+            "name: nokogiri\nversion: 1.16.0\nplatform: x86_64-linux\n\
+             required_ruby_version: !ruby/object:Gem::Requirement\n\
+             \x20 requirements:\n\
+             \x20 - - \">=\"\n\
+             \x20   - !ruby/object:Gem::Version\n\
+             \x20     version: '3.1'\n",
+        )
+        .unwrap();
+        let native: serde_json::Value =
+            serde_json::from_str(&native.protocol_metadata.unwrap()).unwrap();
+        assert_eq!(native["platform"], "x86_64-linux");
+        assert_eq!(native["required_ruby_version"], ">= 3.1");
+
+        // The default is an absence, not the string `ruby`.
+        let pure = parse_gemspec_yaml("name: rack\nversion: 3.0.0\nplatform: ruby\n").unwrap();
+        let pure: serde_json::Value =
+            serde_json::from_str(&pure.protocol_metadata.unwrap()).unwrap();
+        assert!(pure["platform"].is_null(), "{pure}");
+        assert!(pure["required_ruby_version"].is_null(), "{pure}");
+
+        // Gems packed before the field was flattened carry a `Gem::Platform`.
+        let legacy = parse_gemspec_yaml(
+            "name: old\nversion: 0.1.0\nplatform:\n  cpu: x86_64\n  os: darwin\n  version: '19'\n",
+        )
+        .unwrap();
+        let legacy: serde_json::Value =
+            serde_json::from_str(&legacy.protocol_metadata.unwrap()).unwrap();
+        assert_eq!(legacy["platform"], "x86_64-darwin-19");
     }
 
     #[test]

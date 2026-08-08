@@ -2284,13 +2284,25 @@ pub async fn rubygems_dependencies(
         };
 
         for v in &versions {
+            // A withdrawn version is not a candidate. The compact index has
+            // always dropped them; this endpoint is the other half of the same
+            // resolution and used to offer them (card_0c9e858230b6).
+            if v.is_yanked {
+                continue;
+            }
+
             // Parse dependencies from metadata JSON
             let deps = parse_rubygems_deps(v.metadata.as_deref());
 
             entries.push(rg_core::package_registry::RubyGemsDependencyEntry {
                 name: gem_name.to_string(),
                 number: v.version.clone(),
-                platform: "ruby".to_string(),
+                // Bundler keys a candidate on `(number, platform)` and picks
+                // between a pure-ruby gem and a native build with it. A flat
+                // `ruby` for every gem locks a native build as
+                // platform-independent, and the URL Bundler derives from the
+                // pair does not exist.
+                platform: gem_declared_platform(v, gem_name),
                 dependencies: deps,
             });
         }
@@ -2335,6 +2347,9 @@ pub async fn rubygems_gem_info(
 
     let entries: Vec<rg_core::package_registry::RubyGemsVersionEntry> = versions
         .iter()
+        // A withdrawn version is not on offer here either — see
+        // `rubygems_dependencies`, which resolves against the same rows.
+        .filter(|v| !v.is_yanked)
         .map(|v| {
             // The name the file was published under, not one rebuilt from the
             // coordinates: a platform gem is stored as `{name}-{ver}-{platform}.gem`.
@@ -2353,7 +2368,7 @@ pub async fn rubygems_gem_info(
 
             rg_core::package_registry::RubyGemsVersionEntry {
                 number: v.version.clone(),
-                platform: "ruby".to_string(),
+                platform: gem_declared_platform(v, &gem_name),
                 summary,
                 description: desc,
                 homepage: hp,
@@ -2424,22 +2439,78 @@ fn compact_index_entries(
         .filter(|v| !v.is_yanked)
         .map(|v| {
             let file = gem_file(v);
+            let facts = parse_rubygems_facts(v.metadata.as_deref());
             rg_core::package_registry::CompactIndexVersion {
                 number: v.version.clone(),
-                platform: file.and_then(|f| gem_platform(&f.filename, gem_name, &v.version)),
+                platform: facts
+                    .platform
+                    .or_else(|| file.and_then(|f| gem_platform(&f.filename, gem_name, &v.version))),
                 dependencies: parse_rubygems_deps(v.metadata.as_deref()),
                 checksum: file.and_then(|f| v.sha256_of(f)),
+                ruby_version: facts.ruby_version,
+                rubygems_version: facts.rubygems_version,
             }
         })
         .collect()
 }
 
+/// The gemspec facts every RubyGems endpoint needs beside the dependency list.
+struct RubyGemsFacts {
+    /// The declared platform, and only when it is not the default `ruby`.
+    platform: Option<String>,
+    ruby_version: Option<String>,
+    rubygems_version: Option<String>,
+}
+
+/// Read them back out of a version's stored gemspec metadata.
+///
+/// `platform` is absent for a pure-ruby gem *and* for anything published before
+/// the adapter recorded it; [`gem_platform`] is the fallback for the second
+/// case, and it cannot tell the two apart — which is the whole reason the
+/// declared value is now stored.
+fn parse_rubygems_facts(metadata_json: Option<&str>) -> RubyGemsFacts {
+    let field = |doc: &serde_json::Value, key: &str| {
+        doc.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+
+    match metadata_json.and_then(|md| serde_json::from_str::<serde_json::Value>(md).ok()) {
+        Some(doc) => RubyGemsFacts {
+            platform: field(&doc, "platform"),
+            ruby_version: field(&doc, "required_ruby_version"),
+            rubygems_version: field(&doc, "required_rubygems_version"),
+        },
+        None => RubyGemsFacts {
+            platform: None,
+            ruby_version: None,
+            rubygems_version: None,
+        },
+    }
+}
+
+/// The platform a version declares, spelled the way the two JSON RubyGems APIs
+/// publish it: `ruby` for a pure-ruby gem, and the real one otherwise.
+fn gem_declared_platform(
+    version: &rg_core::package_registry::VersionDetail,
+    gem_name: &str,
+) -> String {
+    parse_rubygems_facts(version.metadata.as_deref())
+        .platform
+        .or_else(|| {
+            gem_file(version).and_then(|f| gem_platform(&f.filename, gem_name, &version.version))
+        })
+        .unwrap_or_else(|| "ruby".to_string())
+}
+
 /// The platform a stored `.gem` carries, when it is not the default `ruby`.
 ///
-/// ForgeKeep keeps no platform column — but the client encodes it in the file
-/// name it published (`nokogiri-1.16.0-x86_64-linux.gem`), and the compact
-/// index has to spell the same `VERSION-PLATFORM` chunk back or the download
-/// the client derives from it will not exist.
+/// The fallback for a version published before the gemspec's own `platform` was
+/// recorded: the client encodes it in the file name it published
+/// (`nokogiri-1.16.0-x86_64-linux.gem`), and the compact index has to spell the
+/// same `VERSION-PLATFORM` chunk back or the download the client derives from it
+/// will not exist.
 fn gem_platform(filename: &str, gem_name: &str, version: &str) -> Option<String> {
     let stem = filename.strip_suffix(".gem")?;
     let rest = stem.strip_prefix(&format!("{gem_name}-{version}"))?;
@@ -2668,7 +2739,15 @@ pub async fn rubygems_push(
         Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
     let (gem_name, version) = (meta.name.clone(), meta.version.clone());
-    let filename = format!("{gem_name}-{version}.gem");
+    // `{name}-{version}[-{platform}].gem`, the name RubyGems itself builds. The
+    // platform belongs in it because the compact index spells the same
+    // `VERSION-PLATFORM` chunk back and the client turns that chunk into the
+    // download URL — a native gem stored under the pure-ruby name would be
+    // advertised at a path nothing serves (card_0c9e858230b6).
+    let filename = match parse_rubygems_facts(meta.protocol_metadata.as_deref()).platform {
+        Some(platform) => format!("{gem_name}-{version}-{platform}.gem"),
+        None => format!("{gem_name}-{version}.gem"),
+    };
 
     let published = publish_package(
         state,
