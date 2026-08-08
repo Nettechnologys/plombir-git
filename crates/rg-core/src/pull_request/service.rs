@@ -10,7 +10,7 @@ use rg_git::protocol::receive_pack::RefUpdate;
 
 use rg_db::entities::pull_request::{self, Model as PullRequest};
 use rg_db::entities::repository as repo_entity;
-use rg_db::ops::{pull_request_ops, repo_ops, user_ops};
+use rg_db::ops::{pull_request_ops, user_ops};
 
 // ── PR CRUD ─────────────────────────────────────────────────────────────
 
@@ -243,39 +243,43 @@ where
 }
 
 /// Resolve a head reference in `owner:branch` format to (head_branch, head_repo_id).
-/// Returns (branch_name, Some(head_repo_id)) if owner differs from the target repo owner,
-/// or (branch_name, None) if same owner (same-repo PR).
+///
+/// Returns `(branch_name, Some(head_repo_id))` when the prefix names a different
+/// repository — a fork PR — and `(branch_name, None)` when it names the target
+/// repository itself, which is a plain same-repo PR written the long way.
+///
+/// The prefix is a **namespace**, and the only thing that knows how to read one
+/// is [`crate::repo::service::find_repo_by_owner_name`]. Resolving it through
+/// `users` instead had both failure modes of that shortcut at once
+/// (card_2e84eeed4ff4): an organization is not a row in `users`, so `acme:feature`
+/// could never be a head ref at all; and an organization's repositories carry
+/// `owner_id = org.owner_id`, so comparing that column against the target's
+/// treated a user's personal repository and their organization's repository of
+/// the same name as one namespace. Identity is compared between *repositories*
+/// here, which is the thing the answer is about.
 pub async fn resolve_head_ref(
     db: &DatabaseConnection,
     target_repo_id: i64,
     head_ref: &str,
 ) -> Result<(String, Option<i64>)> {
-    if let Some((head_owner, head_branch)) = head_ref.split_once(':') {
-        // Cross-repo (fork) PR: "owner:branch"
-        let head_branch = head_branch.to_string();
-        // The head ref is client input, so an unknown owner in it is the
-        // caller's mistake — `InvalidRequest` keeps it a 400 while a failed
-        // lookup on the same line stays a 5xx.
-        let head_owner_user = user_ops::find_by_username(db, head_owner)
-            .await?
-            .ok_or_else(|| {
-                crate::error::invalid_request(format!("head owner '{head_owner}' not found"))
-            })?;
+    let Some((head_owner, head_branch)) = head_ref.split_once(':') else {
+        // Simple branch name — same-repo PR.
+        return Ok((head_ref.to_string(), None));
+    };
+    let head_branch = head_branch.to_string();
 
-        // Find the target repo to compare
-        let target_repo = repo_entity::Entity::find_by_id(target_repo_id)
-            .one(db)
-            .await?
-            .context("target repository not found")?;
+    let target_repo = repo_entity::Entity::find_by_id(target_repo_id)
+        .one(db)
+        .await?
+        .context("target repository not found")?;
 
-        if head_owner_user.id != target_repo.owner_id {
-            // Different owner — this is a fork PR
-            // Find the fork repo by the head owner (user may have forked the same repo)
-            let fork_repo = repo_ops::find_personal_by_owner_and_name(
-                db,
-                head_owner_user.id,
-                &target_repo.name,
-            )
+    // The head ref is client input, so a namespace that holds no such repository
+    // is the caller's mistake — `InvalidRequest` keeps it a 400, while a failed
+    // lookup behind it stays a 5xx. The two cases the caller could tell apart —
+    // no such namespace, or a namespace without this repository — read the same
+    // on purpose: neither gives them a next step the other does not.
+    let head_repo =
+        crate::repo::service::find_repo_by_owner_name(db, head_owner, &target_repo.name)
             .await?
             .ok_or_else(|| {
                 crate::error::invalid_request(format!(
@@ -284,23 +288,19 @@ pub async fn resolve_head_ref(
                 ))
             })?;
 
-            // Verify it's actually a fork of the target
-            if fork_repo.origin_repo_id != Some(target_repo_id) && fork_repo.id != target_repo_id {
-                return Err(crate::error::invalid_request(format!(
-                    "'{}/{}' is not a fork of the target repository",
-                    head_owner, target_repo.name
-                )));
-            }
-
-            return Ok((head_branch, Some(fork_repo.id)));
-        }
-
-        // Same owner — not a fork, just a branch reference with owner prefix
-        Ok((head_branch, None))
-    } else {
-        // Simple branch name — same-repo PR
-        Ok((head_ref.to_string(), None))
+    // The target repository named through its own namespace prefix.
+    if head_repo.id == target_repo_id {
+        return Ok((head_branch, None));
     }
+
+    if head_repo.origin_repo_id != Some(target_repo_id) {
+        return Err(crate::error::invalid_request(format!(
+            "'{}/{}' is not a fork of the target repository",
+            head_owner, target_repo.name
+        )));
+    }
+
+    Ok((head_branch, Some(head_repo.id)))
 }
 
 pub(super) async fn repository_namespace(
@@ -680,18 +680,23 @@ pub async fn compute_diff(
             .one(db)
             .await?
             .context("head repository not found")?;
-        let head_owner = user_ops::find_by_id(db, head_repo.owner_id)
-            .await?
-            .context("head repo owner not found")?;
-        let head_repo_path =
-            repo_root.join(format!("{}/{}.git", head_owner.username, head_repo.name));
+        // `repository_namespace`, not the owner's username: an organization's
+        // repository lives on disk under the organization's name while its row
+        // carries `owner_id = org.owner_id`, so building the path from that user
+        // pointed at a directory that does not exist. `merge_claimed_pr` and
+        // `create_pr` already resolved the namespace; this one did not, and it
+        // became reachable the moment an organization could be a fork head
+        // (card_2e84eeed4ff4) — the diff would have failed where the merge
+        // succeeded.
+        let head_namespace = repository_namespace(db, &head_repo).await?;
+        let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
 
         // Do not let a failed fetch silently reuse an old `refs/forks/...` ref:
         // a deleted head branch is a stale PR state (409), whereas an unreadable
         // fork repository or a failed fetch is our retryable failure (5xx).
         require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
         let fetch_ref = format!("refs/heads/{}", pr.head_branch);
-        let local_ref = format!("refs/forks/{}/{}", head_owner.username, pr.head_branch);
+        let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
 
         let git = rg_git::cli_gateway::global_gateway()
             .as_ref()

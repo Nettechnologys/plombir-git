@@ -129,6 +129,7 @@ mod pr_permission_tests;
 mod private_repo_issue_metadata_tests;
 mod private_repo_visibility_tests;
 mod pull_request_ci_tests;
+mod pull_request_head_namespace_tests;
 mod push_hook_drain_tests;
 mod pypi_simple_index_tests;
 mod rate_limit_mounted_tests;
