@@ -1207,7 +1207,8 @@ async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
     assert!(
         !healthy
             .has_files("pkg_part", "half-published", "maven", "widget", "1.0.0")
-            .await,
+            .await
+            .expect("the healthy store must be able to answer"),
         "the file stored before the failure outlived the publish that would have claimed it"
     );
 
@@ -1220,7 +1221,8 @@ async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
     assert!(
         healthy
             .has_files("pkg_part", "half-published", "maven", "widget", "1.0.0")
-            .await,
+            .await
+            .expect("the healthy store must be able to answer"),
         "a successful publish must leave its files in storage"
     );
 }

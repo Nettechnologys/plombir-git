@@ -235,7 +235,22 @@ impl PackageStorage {
         Ok(())
     }
 
-    /// Check if a version directory has any files (synchronous check for simplicity).
+    /// Whether the version's live prefix currently holds any object.
+    ///
+    /// Test-only, and deliberately so: it had no production caller in the whole
+    /// tree while being `pub` and returning a bare `bool`, which is the shape
+    /// that made it dangerous rather than merely unused (card_cc376dd3605e). An
+    /// unusable key and an unreachable backend both collapsed into `false` —
+    /// "this version has no files" — with nothing logged, so whoever eventually
+    /// wired it to a real decision ("show this version?", "is it safe to
+    /// delete?") would have inherited a storage outage answering as an empty
+    /// version.
+    ///
+    /// It answers `Result` now, so every caller — the staging assertions below
+    /// and the publish-rollback ones in `rg-http`'s `fault_injection_tests` —
+    /// fails loudly on a backend error instead of passing because the failure
+    /// looked like the absence it was checking for. The collapse is what must
+    /// not come back if a production consumer ever appears.
     pub async fn has_files(
         &self,
         owner: &str,
@@ -243,15 +258,9 @@ impl PackageStorage {
         package_type: &str,
         name: &str,
         version: &str,
-    ) -> bool {
-        let Ok(prefix) = self.version_key(owner, repo, package_type, name, version) else {
-            return false;
-        };
-        self.backend
-            .list(Some(&prefix))
-            .await
-            .map(|objects| !objects.is_empty())
-            .unwrap_or(false)
+    ) -> Result<bool> {
+        let prefix = self.version_key(owner, repo, package_type, name, version)?;
+        Ok(!self.backend.list(Some(&prefix)).await?.is_empty())
     }
 }
 
@@ -459,11 +468,10 @@ mod tests {
             storage.read_file(&stored.storage_path).await.unwrap(),
             b"package"
         );
-        assert!(
-            storage
-                .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
-                .await
-        );
+        assert!(storage
+            .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
+            .await
+            .unwrap());
 
         let staged = storage
             .stage_version_deletion("alice", "demo", "npm", "@scope/pkg", "1.0.0", &[], "abc123")
@@ -471,11 +479,10 @@ mod tests {
             .unwrap();
         // Staging alone frees the live prefix — that is what makes the metadata
         // delete safe to attempt — but the bytes are still recoverable.
-        assert!(
-            !storage
-                .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
-                .await
-        );
+        assert!(!storage
+            .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
+            .await
+            .unwrap());
         staged.restore(&storage).await;
         assert_eq!(
             storage.read_file(&stored.storage_path).await.unwrap(),
@@ -487,11 +494,10 @@ mod tests {
             .await
             .unwrap();
         staged.retire(&storage).await.unwrap();
-        assert!(
-            !storage
-                .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
-                .await
-        );
+        assert!(!storage
+            .has_files("alice", "demo", "npm", "@scope/pkg", "1.0.0")
+            .await
+            .unwrap());
         assert!(
             !directory
                 .path()
