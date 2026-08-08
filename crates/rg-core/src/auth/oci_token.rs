@@ -174,64 +174,6 @@ pub fn validate_oci_token(token: &str, secret: &str) -> Option<OciTokenClaims> {
     }
 }
 
-/// Extract and validate the OCI Bearer token from HTTP headers.
-///
-/// Looks for `Authorization: Bearer <token>` and validates it.
-/// Returns `Some(claims)` if valid, `None` otherwise.
-pub fn extract_oci_claims(headers: &http::HeaderMap, secret: &str) -> Option<OciTokenClaims> {
-    let auth = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
-    let token = auth.strip_prefix("Bearer ")?;
-    validate_oci_token(token, secret)
-}
-
-/// Check if the request has permission for a specific repository action.
-///
-/// - `headers`: HTTP headers (for `Authorization: Bearer`)
-/// - `secret`: JWT secret
-/// - `owner`: Repository owner
-/// - `repo`: Repository name
-/// - `required_action`: `"pull"` or `"push"`
-///
-/// Returns `true` if authorized, `false` otherwise.
-///
-/// ## Logic
-///
-/// 1. If no token: public pull is allowed (for public repos)
-/// 2. If token has `repository:<owner>/<repo>:pull` → allow pull
-/// 3. If token has `repository:<owner>/<repo>:push` → allow push
-/// 4. If token has `repository:<owner>/<repo>:*` → allow all
-pub fn check_repo_access(
-    headers: &http::HeaderMap,
-    secret: &str,
-    owner: &str,
-    repo: &str,
-    required_action: &str,
-) -> bool {
-    let claims = match extract_oci_claims(headers, secret) {
-        Some(c) => c,
-        None => {
-            // No token: allow public pull only
-            return required_action == "pull";
-        }
-    };
-
-    let scope_str = match claims.scope {
-        Some(ref s) => s.clone(),
-        None => return false,
-    };
-
-    // Parse all scopes (space-separated)
-    for single_scope in scope_str.split_whitespace() {
-        if let Some(parsed) = ParsedScope::parse(single_scope) {
-            if parsed.matches_repo(owner, repo) && parsed.has_action(required_action) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 /// Build the `WWW-Authenticate` header value for OCI Distribution auth.
 ///
 /// Example:
@@ -311,73 +253,6 @@ mod tests {
     fn test_parsed_scope_invalid() {
         assert!(ParsedScope::parse("invalid-scope").is_none());
         assert!(ParsedScope::parse("type:name").is_none()); // missing actions
-    }
-
-    #[test]
-    fn test_check_repo_access_no_token() {
-        let headers = http::HeaderMap::new();
-        // No token: public pull allowed
-        assert!(check_repo_access(
-            &headers,
-            TEST_SECRET,
-            "alice",
-            "hello",
-            "pull"
-        ));
-        // No token: push NOT allowed
-        assert!(!check_repo_access(
-            &headers,
-            TEST_SECRET,
-            "alice",
-            "hello",
-            "push"
-        ));
-    }
-
-    #[test]
-    fn test_check_repo_access_with_token() {
-        let token = generate_oci_token(
-            "alice",
-            "repository:alice/hello:pull,push",
-            TEST_SECRET,
-            300,
-        )
-        .unwrap();
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::AUTHORIZATION,
-            http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
-        );
-
-        assert!(check_repo_access(
-            &headers,
-            TEST_SECRET,
-            "alice",
-            "hello",
-            "pull"
-        ));
-        assert!(check_repo_access(
-            &headers,
-            TEST_SECRET,
-            "alice",
-            "hello",
-            "push"
-        ));
-        assert!(!check_repo_access(
-            &headers,
-            TEST_SECRET,
-            "alice",
-            "hello",
-            "delete"
-        ));
-        // Wrong repo
-        assert!(!check_repo_access(
-            &headers,
-            TEST_SECRET,
-            "bob",
-            "hello",
-            "pull"
-        ));
     }
 
     #[test]
