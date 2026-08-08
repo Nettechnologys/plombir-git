@@ -270,9 +270,19 @@ async fn cleanup_merge_group_ref(
             return;
         }
     };
-    if entry.merge_group_sha.is_none() {
-        return;
-    }
+    // No gate on `merge_group_sha`. That field used to mean "a merge-group ref
+    // exists", because `update-ref` and `set_merge_group` were written next to
+    // each other. `ensure_merge_group_ci` now creates the ref and then returns
+    // `Ready` for a repository with no CI config — several statements before
+    // `set_merge_group` — so the field stopped meaning that and the gate stopped
+    // matching reality: the ref was written on every queue pass and deleted on
+    // none, one per queue entry, forever (card_884d819fc51b). The partial-write
+    // path of card_55282a865b8e lands in the same gap, with the ref created and
+    // the row not owning it.
+    //
+    // Deleting by the ref's own existence is what cannot drift: `update-ref -d`
+    // is idempotent and exits 0 on a ref that is not there, so the entry that
+    // never created one costs a no-op instead of an inaccurate skip.
     let namespace = match service::repository_namespace(db, repository).await {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -1069,6 +1079,93 @@ mod merge_group_ref_cleanup_tests {
 
         assert!(!ref_exists(&fixture, &group_ref), "the ref is gone");
         assert!(logs.rendered().is_empty(), "{}", logs.rendered());
+    }
+
+    /// card_884d819fc51b: the cleanup used to skip on `merge_group_sha IS NULL`,
+    /// and the ref is created several statements before that column is written.
+    ///
+    /// A repository with no CI config takes the `has_ci_config` early return in
+    /// `ensure_merge_group_ci` — after `update-ref`, before `set_merge_group` —
+    /// so the column stayed NULL on an entry that owned a ref, and the cleanup
+    /// declined on every terminal path. One `refs/merge-queue/*` per queue
+    /// entry, forever, each one advertised to every client and each one keeping
+    /// its group commit alive against `gc`.
+    ///
+    /// Driven through `cancel`, not the helper: the point is that a real
+    /// terminal path leaves nothing behind.
+    #[tokio::test]
+    async fn a_ref_whose_entry_never_recorded_a_group_sha_is_still_deleted() {
+        let fixture = fixture("no-ci-config").await;
+        let group_ref = create_group_ref(&fixture);
+        // Put the entry back in the state `ensure_merge_group_ci` leaves it in
+        // when the repository has no CI config: ref on disk, column unset.
+        fixture
+            .db
+            .execute_unprepared(&format!(
+                "UPDATE merge_queue_entries SET merge_group_sha = NULL WHERE id = {}",
+                fixture.entry.id
+            ))
+            .await
+            .expect("clear the recorded group sha");
+        assert!(
+            merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+                .await
+                .expect("read entry")
+                .expect("entry exists")
+                .merge_group_sha
+                .is_none(),
+            "the fixture must reproduce the unset column"
+        );
+
+        let (logs, _guard) = capture_warnings();
+        let outcome = cancel(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &fixture.pr,
+            fixture.owner.id,
+        )
+        .await
+        .expect("cancel succeeds");
+
+        assert_eq!(outcome, CancelOutcome::Canceled);
+        assert!(
+            !ref_exists(&fixture, &group_ref),
+            "the ref is deleted by its own existence, not by a column that no \
+             longer means it exists"
+        );
+        assert!(logs.rendered().is_empty(), "{}", logs.rendered());
+    }
+
+    /// The other half: an entry that never created a ref must stay quiet.
+    ///
+    /// Dropping the column gate means `update-ref -d` now runs on every
+    /// terminal path. It is idempotent and exits 0 on a ref that is not there,
+    /// so the no-op must not turn into a warning an operator would chase.
+    #[tokio::test]
+    async fn an_entry_that_never_created_a_ref_deletes_nothing_and_warns_about_nothing() {
+        let fixture = fixture("never-created").await;
+        let group_ref = format!("refs/merge-queue/{}", fixture.entry.id);
+        assert!(
+            !ref_exists(&fixture, &group_ref),
+            "the fixture must start with no ref"
+        );
+
+        let (logs, _guard) = capture_warnings();
+        cleanup_merge_group_ref(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            fixture.pr.id,
+        )
+        .await;
+
+        assert!(!ref_exists(&fixture, &group_ref));
+        assert!(
+            logs.rendered().is_empty(),
+            "deleting an absent ref is a no-op, not something to report: {}",
+            logs.rendered()
+        );
     }
 
     #[tokio::test]
