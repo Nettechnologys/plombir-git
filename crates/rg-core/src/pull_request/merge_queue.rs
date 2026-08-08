@@ -338,28 +338,20 @@ async fn cleanup_merge_group_ref(
     }
 }
 
-pub async fn process_repository(
-    db: &DatabaseConnection,
-    repo_root: &Path,
-    repository: &repository::Model,
-) -> Result<MergeQueueProcessResult> {
-    process_repository_inner(db, repo_root, repository, None).await
-}
-
 pub async fn process_repository_with_ci(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
     ci: &PipelineCi<'_>,
 ) -> Result<MergeQueueProcessResult> {
-    process_repository_inner(db, repo_root, repository, Some(ci)).await
+    process_repository_inner(db, repo_root, repository, ci).await
 }
 
 async fn process_repository_inner(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
-    ci: Option<&PipelineCi<'_>>,
+    ci: &PipelineCi<'_>,
 ) -> Result<MergeQueueProcessResult> {
     let namespace = service::repository_namespace(db, repository).await?;
     let mut result = MergeQueueProcessResult {
@@ -445,38 +437,15 @@ async fn process_repository_inner(
             result.waiting_reason = Some(format!("{error:#}"));
             break;
         }
-        if let Some(ci) = ci {
-            match ensure_merge_group_ci(db, repo_root, repository, &entry, &pr, ci).await? {
-                MergeGroupState::Ready => {}
-                MergeGroupState::Waiting(reason) => {
-                    result.waiting_reason = Some(reason);
-                    break;
-                }
-                MergeGroupState::Failed => {
-                    result.failed.push(pr.id);
-                    continue;
-                }
+        match ensure_merge_group_ci(db, repo_root, repository, &entry, &pr, ci).await? {
+            MergeGroupState::Ready => {}
+            MergeGroupState::Waiting(reason) => {
+                result.waiting_reason = Some(reason);
+                break;
             }
-        } else if let Some(pipeline_id) = entry.merge_group_pipeline_id {
-            let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id).await?;
-            match pipeline.as_ref().map(|pipeline| pipeline.status.as_str()) {
-                Some("success") => {}
-                Some("failed" | "canceled") => {
-                    finish_entry(
-                        db,
-                        repo_root,
-                        &entry,
-                        "failed",
-                        Some("merge-group CI failed".into()),
-                    )
-                    .await?;
-                    result.failed.push(pr.id);
-                    continue;
-                }
-                _ => {
-                    result.waiting_reason = Some("merge-group CI is still running".into());
-                    break;
-                }
+            MergeGroupState::Failed => {
+                result.failed.push(pr.id);
+                continue;
             }
         }
         if !merge_queue_ops::claim(db, entry.id).await? {
@@ -795,15 +764,6 @@ async fn merge_group_state(
     })
 }
 
-pub async fn process_for_head_commit(
-    db: &DatabaseConnection,
-    repo_root: &Path,
-    source_repo_id: i64,
-    commit_sha: &str,
-) -> Result<Vec<MergeQueueProcessResult>> {
-    process_for_head_commit_inner(db, repo_root, source_repo_id, commit_sha, None).await
-}
-
 pub async fn process_for_head_commit_with_ci(
     db: &DatabaseConnection,
     repo_root: &Path,
@@ -811,7 +771,7 @@ pub async fn process_for_head_commit_with_ci(
     commit_sha: &str,
     ci: &PipelineCi<'_>,
 ) -> Result<Vec<MergeQueueProcessResult>> {
-    process_for_head_commit_inner(db, repo_root, source_repo_id, commit_sha, Some(ci)).await
+    process_for_head_commit_inner(db, repo_root, source_repo_id, commit_sha, ci).await
 }
 
 async fn process_for_head_commit_inner(
@@ -819,7 +779,7 @@ async fn process_for_head_commit_inner(
     repo_root: &Path,
     source_repo_id: i64,
     commit_sha: &str,
-    ci: Option<&PipelineCi<'_>>,
+    ci: &PipelineCi<'_>,
 ) -> Result<Vec<MergeQueueProcessResult>> {
     if let Some(entry) =
         merge_queue_ops::find_by_merge_group_sha(db, source_repo_id, commit_sha).await?
@@ -828,10 +788,7 @@ async fn process_for_head_commit_inner(
             .one(db)
             .await?
             .context("merge-group repository not found")?;
-        let result = match ci {
-            Some(ci) => process_repository_with_ci(db, repo_root, &repository, ci).await?,
-            None => process_repository(db, repo_root, &repository).await?,
-        };
+        let result = process_repository_with_ci(db, repo_root, &repository, ci).await?;
         return Ok(vec![result]);
     }
     let prs = pull_request_ops::list_open_for_head_commit(db, source_repo_id, commit_sha).await?;
@@ -845,10 +802,7 @@ async fn process_for_head_commit_inner(
             .one(db)
             .await?
             .context("merge-queue repository not found")?;
-        results.push(match ci {
-            Some(ci) => process_repository_with_ci(db, repo_root, &repository, ci).await?,
-            None => process_repository(db, repo_root, &repository).await?,
-        });
+        results.push(process_repository_with_ci(db, repo_root, &repository, ci).await?);
     }
     Ok(results)
 }

@@ -8,8 +8,8 @@
 //!
 //! ## Compression
 //!
-//! Every object this service stores is zstd-compressed: `store_object` and
-//! `store_object_from_file` compress before publishing and key the blob as
+//! Every object this service stores is zstd-compressed: `store_object_from_file`
+//! compresses before publishing and keys the blob as
 //! `<oid>.zst`. Storage format:
 //! - Compressed: `<oid>.zst` (zstd compressed)
 //! - Uncompressed (legacy): `<oid>` (raw)
@@ -50,6 +50,7 @@ use hmac::{Hmac, Mac};
 use sea_orm::{ActiveModelTrait, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+#[cfg(test)]
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -607,8 +608,10 @@ async fn handle_download(
     })
 }
 
-/// Store an uploaded LFS object to disk and mark as uploaded in DB.
-pub async fn store_object(
+/// Buffered publication path used to exercise the same lease/rollback logic as
+/// the production file-backed upload without staging another temporary file.
+#[cfg(test)]
+async fn store_object(
     db: &DatabaseConnection,
     repo_id: i64,
     storage: &dyn BlobStorage,
@@ -706,6 +709,7 @@ enum BlobPublication {
 
 /// Where the compressed bytes of a publication come from.
 enum PublicationSource<'a> {
+    #[cfg(test)]
     Buffered(&'a [u8]),
     File(&'a std::path::Path),
 }
@@ -863,6 +867,7 @@ async fn publish_under_lease(
         BlobPublication::Reused
     } else {
         match request.source {
+            #[cfg(test)]
             PublicationSource::Buffered(bytes) => storage.put(request.key, bytes).await?,
             PublicationSource::File(path) => storage.put_file(request.key, path).await?,
         };
@@ -1145,6 +1150,7 @@ pub async fn read_object_source(
 // ── Compression helpers ───────────────────────────────────────────────────────
 
 /// Compress data using zstd.
+#[cfg(test)]
 fn compress_data(data: &[u8]) -> Result<Vec<u8>> {
     let mut compressed = Vec::with_capacity(data.len());
     let mut encoder =
@@ -1423,10 +1429,9 @@ mod blob_publication_tests {
         .unwrap();
     }
 
-    /// Both public store implementations must carry the publication outcome to
-    /// `mark_uploaded`: the buffered helper is currently not routed from HTTP,
-    /// but returning its old unconditional rollback would reintroduce the same
-    /// data loss for its callers.
+    /// Both publication sources must carry the publication outcome to
+    /// `mark_uploaded`: the buffered source exercises the same rollback branch
+    /// without pretending to be a second production upload API.
     #[tokio::test]
     async fn failed_retries_keep_reused_blobs_for_buffered_and_file_stores() {
         let dir = tempfile::tempdir().unwrap();

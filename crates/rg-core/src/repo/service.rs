@@ -2257,19 +2257,6 @@ pub async fn delete_repo(
     cleanup_error.map_or(Ok(()), Err)
 }
 
-/// Find repo by owner/name (skip soft-deleted).
-pub async fn find_active_repo_by_owner_name(
-    db: &DatabaseConnection,
-    owner: &str,
-    repo_name: &str,
-) -> Result<Option<rg_db::entities::repository::Model>> {
-    // Reuse find_repo_by_owner_name logic but add deleted_at IS NULL filter
-    // Actually existing find_repo_by_owner_name doesn't check deleted_at,
-    // so we need to query via rg_db::ops and filter
-    let repo = find_repo_by_owner_name(db, owner, repo_name).await?;
-    Ok(repo.filter(|r| r.deleted_at.is_none()))
-}
-
 /// A repository that was just forked, and the account name it landed under.
 ///
 /// The name is returned rather than re-derived by the caller because it is the
@@ -4991,7 +4978,7 @@ mod repository_deletion_tests {
         );
 
         assert!(
-            find_active_repo_by_owner_name(&db, "forks-refresh-fail-forker", "forkable")
+            find_repo_by_owner_name(&db, "forks-refresh-fail-forker", "forkable")
                 .await
                 .expect("read the fork after the failed refresh")
                 .is_none(),

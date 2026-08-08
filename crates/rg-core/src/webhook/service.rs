@@ -640,54 +640,6 @@ pub async fn trigger_release_deleted(
     trigger_event(db, repo_id, "release.deleted", &payload).await
 }
 
-/// Trigger a branch.created webhook event.
-pub async fn trigger_branch_created(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    branch: &str,
-) -> Result<()> {
-    let payload = serde_json::json!({
-        "event": "branch.created",
-        "ref": branch,
-        "ref_type": "branch",
-    });
-    trigger_event(db, repo_id, "branch.created", &payload).await
-}
-
-/// Trigger a branch.deleted webhook event.
-pub async fn trigger_branch_deleted(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    branch: &str,
-) -> Result<()> {
-    let payload = serde_json::json!({
-        "event": "branch.deleted",
-        "ref": branch,
-        "ref_type": "branch",
-    });
-    trigger_event(db, repo_id, "branch.deleted", &payload).await
-}
-
-/// Trigger a tag.created webhook event.
-pub async fn trigger_tag_created(db: &DatabaseConnection, repo_id: i64, tag: &str) -> Result<()> {
-    let payload = serde_json::json!({
-        "event": "tag.created",
-        "ref": tag,
-        "ref_type": "tag",
-    });
-    trigger_event(db, repo_id, "tag.created", &payload).await
-}
-
-/// Trigger a tag.deleted webhook event.
-pub async fn trigger_tag_deleted(db: &DatabaseConnection, repo_id: i64, tag: &str) -> Result<()> {
-    let payload = serde_json::json!({
-        "event": "tag.deleted",
-        "ref": tag,
-        "ref_type": "tag",
-    });
-    trigger_event(db, repo_id, "tag.deleted", &payload).await
-}
-
 /// Trigger an issue.opened webhook event.
 pub async fn trigger_issue_opened(
     db: &DatabaseConnection,

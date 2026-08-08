@@ -65,20 +65,6 @@ impl CiJobClaims {
     }
 }
 
-/// Generate a least-privilege CI job token.
-///
-/// The token is scoped to a specific repository with limited permissions.
-/// Default TTL is 1 hour (CI jobs should be short-lived).
-pub fn generate_ci_job_token(
-    repo_id: i64,
-    pipeline_id: i64,
-    job_id: i64,
-    scopes: &str,
-    secret: &str,
-) -> Result<String> {
-    generate_ci_job_token_with_ttl(repo_id, pipeline_id, job_id, scopes, secret, 3600)
-}
-
 pub fn generate_ci_job_token_with_ttl(
     repo_id: i64,
     pipeline_id: i64,
@@ -152,7 +138,9 @@ mod tests {
     #[test]
     fn test_generate_and_validate() {
         let secret = "ci_secret";
-        let token = generate_ci_job_token(100, 1, 42, "repo:read packages:read", secret).unwrap();
+        let token =
+            generate_ci_job_token_with_ttl(100, 1, 42, "repo:read packages:read", secret, 3600)
+                .unwrap();
         let claims = validate_ci_token(&token, secret, 100, "repo:read").unwrap();
         assert_eq!(claims.sub, "ci:job:42");
         assert_eq!(claims.repo_id, 100);
@@ -163,14 +151,14 @@ mod tests {
     #[test]
     fn test_wrong_repo_rejected() {
         let secret = "ci_secret";
-        let token = generate_ci_job_token(100, 1, 42, "repo:read", secret).unwrap();
+        let token = generate_ci_job_token_with_ttl(100, 1, 42, "repo:read", secret, 3600).unwrap();
         assert!(validate_ci_token(&token, secret, 200, "repo:read").is_none());
     }
 
     #[test]
     fn test_scope_hierarchy() {
         let secret = "ci_secret";
-        let token = generate_ci_job_token(100, 1, 42, "repo:write", secret).unwrap();
+        let token = generate_ci_job_token_with_ttl(100, 1, 42, "repo:write", secret, 3600).unwrap();
         // write implies read
         assert!(validate_ci_token(&token, secret, 100, "repo:read").is_some());
         assert!(validate_ci_token(&token, secret, 100, "packages:read").is_none());

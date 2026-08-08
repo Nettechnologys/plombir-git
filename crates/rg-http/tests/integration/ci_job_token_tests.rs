@@ -39,12 +39,13 @@ async fn running_job_token(
         .await
         .expect("fixture: mark the job running");
 
-    let token = rg_core::auth::ci_token::generate_ci_job_token(
+    let token = rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
         repo_id,
         pipeline.id,
         job.id,
         scopes,
         "test-secret-key",
+        3600,
     )
     .expect("generate ci job token");
     (token, job.id)
@@ -185,12 +186,13 @@ async fn a_token_naming_rows_that_were_never_written_opens_nothing() {
 
     // Well-formed, correctly signed, in date, right repository, right scope —
     // and naming a job that does not exist. Signature alone used to be enough.
-    let ghost = rg_core::auth::ci_token::generate_ci_job_token(
+    let ghost = rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
         repo_id,
         999_999,
         999_999,
         "repo:read",
         "test-secret-key",
+        3600,
     )
     .expect("generate ci job token");
 

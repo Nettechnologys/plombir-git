@@ -37,17 +37,6 @@ pub async fn write_sideband_progress<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Write sideband error (band 3) — fatal error message.
-pub async fn write_sideband_error<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    message: &str,
-) -> Result<()> {
-    let mut payload = vec![3u8]; // band 3
-    payload.extend_from_slice(message.as_bytes());
-    write_pkt_line(writer, &PktLine::Data(payload)).await?;
-    Ok(())
-}
-
 /// Write the sideband flush packet (signals end of multiplexed data).
 pub async fn write_sideband_flush<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
     write_flush(writer).await
@@ -88,23 +77,6 @@ mod tests {
         if let PktLine::Data(data) = pkt {
             assert_eq!(data[0], 2u8); // band 2
             assert_eq!(&data[1..], b"counting objects");
-        } else {
-            panic!("expected Data pkt-line");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_sideband_error_write_and_read() {
-        let (mut writer, reader) = duplex(1024);
-        write_sideband_error(&mut writer, "fatal error occurred")
-            .await
-            .unwrap();
-
-        let mut buf_reader = BufReader::new(reader);
-        let pkt = read_pkt_line(&mut buf_reader).await.unwrap();
-        if let PktLine::Data(data) = pkt {
-            assert_eq!(data[0], 3u8); // band 3
-            assert_eq!(&data[1..], b"fatal error occurred");
         } else {
             panic!("expected Data pkt-line");
         }

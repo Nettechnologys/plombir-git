@@ -620,14 +620,6 @@ pub async fn list_review_comments(
     review_comment_ops::list_by_pr(db, pr.id).await
 }
 
-/// List comments for a specific review.
-pub async fn list_comments_for_review(
-    db: &DatabaseConnection,
-    review_id: i64,
-) -> Result<Vec<ReviewComment>> {
-    review_comment_ops::list_by_review(db, review_id).await
-}
-
 // `check_approval_status` used to live here: "does this PR have enough
 // approvals", judged against a `required_approvals` handed in by the *caller*
 // and so detached from the branch-protection rule where that number actually

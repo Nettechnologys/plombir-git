@@ -1,8 +1,8 @@
 //! Git receive-pack protocol implementation (git push).
 //!
-//! Supports two modes:
-//! 1. Split reader/writer (HTTP mode) — via `handle_receive_pack`
-//! 2. Single bidirectional stream (SSH mode) — via `handle_receive_pack_stream`
+//! Supports split HTTP reader/writer after advertisement and a single
+//! bidirectional SSH stream. Both production receive paths select the variant
+//! that carries the caller's pre-receive rejections when policy requires it.
 
 use std::path::Path;
 
@@ -20,36 +20,6 @@ pub struct RefUpdate {
     pub refname: String,
     pub status: String,
     pub message: String,
-}
-
-/// Handle receive-pack with separate reader and writer (HTTP mode).
-/// Returns the list of ref updates that were processed.
-pub async fn handle_receive_pack<R, W>(
-    repo_path: &Path,
-    reader: R,
-    writer: W,
-) -> Result<Vec<RefUpdate>>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut reader = BufReader::new(reader);
-    let mut writer = writer;
-
-    // Send ref advertisement
-    let ref_list = build_ref_list(repo_path)?;
-    let ad = build_ref_advertisement(&ref_list, "git-receive-pack");
-    for pkt in &ad {
-        write_pkt_line(&mut writer, pkt).await?;
-    }
-    write_flush(&mut writer).await?;
-
-    // Process the push
-    let results = process_push(repo_path, &mut reader).await?;
-
-    // Send response
-    send_response(&mut writer, &results).await?;
-    Ok(results)
 }
 
 /// Handle receive-pack with a single bidirectional stream (SSH mode).
@@ -81,24 +51,6 @@ where
 {
     do_receive_pack_stream_with_rejections(repo_path, stream, rejected_refs, require_signed_refs)
         .await
-}
-
-/// Handle receive-pack for HTTP mode where ref advertisement is already sent.
-/// Returns the list of ref updates that were processed.
-pub async fn handle_receive_pack_http<R, W>(
-    repo_path: &Path,
-    reader: R,
-    mut writer: W,
-) -> Result<Vec<RefUpdate>>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut reader = BufReader::new(reader);
-
-    let results = process_push(repo_path, &mut reader).await?;
-    send_response(&mut writer, &results).await?;
-    Ok(results)
 }
 
 /// Handle receive-pack for HTTP mode with a caller-provided pre-receive validator.

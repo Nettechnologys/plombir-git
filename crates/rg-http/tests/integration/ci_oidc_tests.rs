@@ -45,12 +45,13 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
     )
     .await
     .unwrap();
-    let ci_token = rg_core::auth::ci_token::generate_ci_job_token(
+    let ci_token = rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
         repo_id,
         pipeline.id,
         job.id,
         "repo:read",
         "test-secret-key",
+        3600,
     )
     .unwrap();
 
@@ -109,12 +110,13 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
     assert_eq!(claims.pipeline_id, pipeline.id);
     assert_eq!(claims.job_id, job.id);
 
-    let forged_binding = rg_core::auth::ci_token::generate_ci_job_token(
+    let forged_binding = rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
         repo_id,
         pipeline.id + 1,
         job.id,
         "repo:read",
         "test-secret-key",
+        3600,
     )
     .unwrap();
     assert_eq!(

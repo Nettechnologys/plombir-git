@@ -64,7 +64,7 @@ pub(crate) async fn migrated_memory_database() -> sea_orm::DatabaseConnection {
 /// Both outbound-credential paths — mirror sync and repository import — prove
 /// the same thing with it: that the secret we stored actually reaches the
 /// remote, rather than being kept and then dropped on the floor.
-pub fn spawn_authenticating_remote() -> (String, Arc<Mutex<Vec<String>>>) {
+pub(crate) fn spawn_authenticating_remote() -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("addr").to_string();
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

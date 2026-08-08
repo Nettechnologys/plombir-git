@@ -90,12 +90,6 @@ pub async fn write_flush<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-/// Write a delimiter packet (0001) - used in V2 protocol.
-pub async fn write_delim<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
-    writer.write_all(b"0001").await?;
-    Ok(())
-}
-
 /// Read a single pkt-line from an async reader.
 ///
 /// Accepts any `AsyncRead + Unpin` directly (with or without BufReader).
@@ -133,39 +127,6 @@ pub async fn read_pkt_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<PktLi
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
     Ok(PktLine::Data(payload))
-}
-
-/// Read pkt-lines until flush. Returns all data lines (excluding flush).
-///
-/// Accepts any `AsyncRead + Unpin` directly.
-pub async fn read_pkt_lines_until_flush<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<Vec<PktLine>> {
-    let mut lines = Vec::new();
-    loop {
-        let pkt = read_pkt_line(reader).await?;
-        match pkt {
-            PktLine::Flush => break,
-            _ => lines.push(pkt),
-        }
-    }
-    Ok(lines)
-}
-
-/// Read a single text line (non-flush pkt-line) as a string.
-///
-/// Accepts any `AsyncRead + Unpin` directly.
-pub async fn read_text_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<String>> {
-    let pkt = read_pkt_line(reader).await?;
-    match pkt {
-        PktLine::Flush => Ok(None),
-        PktLine::Data(data) => {
-            let text = String::from_utf8(data)?;
-            Ok(Some(text))
-        }
-        PktLine::Delim => Ok(Some(String::new())), // Treat as empty line
-        PktLine::ResponseEnd => Ok(None),          // End of response
-    }
 }
 
 #[cfg(test)]
@@ -232,19 +193,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_multiple_then_flush() {
-        let mut reader = make_reader(&[
-            PktLine::data(b"line one\n"),
-            PktLine::data(b"line two\n"),
-            PktLine::Flush,
-        ]);
-        let lines = read_pkt_lines_until_flush(&mut reader).await.unwrap();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], PktLine::data(b"line one\n"));
-        assert_eq!(lines[1], PktLine::data(b"line two\n"));
-    }
-
-    #[tokio::test]
     async fn test_read_empty_data_pkt_line() {
         // A pkt-line with just the 4-byte header (length=4, payload=0) should return empty data.
         let buf = Vec::from(b"0004".as_slice());
@@ -288,20 +236,6 @@ mod tests {
             format!("{}", PktLine::data(b"\xff\xfe\xfd")),
             "Data(3 bytes)"
         );
-    }
-
-    #[tokio::test]
-    async fn test_read_text_line_returns_string() {
-        let mut reader = make_reader(&[PktLine::data(b"some text\n"), PktLine::Flush]);
-        let line = read_text_line(&mut reader).await.unwrap();
-        assert_eq!(line, Some("some text\n".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_read_text_line_on_flush_returns_none() {
-        let mut reader = make_reader(&[PktLine::Flush]);
-        let line = read_text_line(&mut reader).await.unwrap();
-        assert!(line.is_none());
     }
 
     // --- Malformed / truncated input must return Err, never panic (CWE-252/755) ---
@@ -362,17 +296,6 @@ mod tests {
             .await
             .expect("partial header must not error");
         assert!(matches!(pkt, PktLine::Flush));
-    }
-
-    #[tokio::test]
-    async fn test_read_lines_until_flush_propagates_error_on_garbage() {
-        // Batch reader must propagate the parser error rather than loop or panic.
-        let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
-        let result = read_pkt_lines_until_flush(&mut reader).await;
-        assert!(
-            result.is_err(),
-            "expected Err from batch reader on garbage, got {result:?}"
-        );
     }
 
     // --- Fuzz / property tests: no bounded input must ever panic (CWE-248/755) ---
@@ -441,25 +364,6 @@ mod tests {
             buf.extend((0..payload_len).map(|_| rng.byte()));
             let mut reader = BufReader::new(Cursor::new(buf));
             drop(read_pkt_line(&mut reader).await);
-        }
-    }
-
-    #[tokio::test]
-    async fn fuzz_batch_and_text_readers_never_panic() {
-        // The higher-level readers loop over read_pkt_line; a hostile stream must
-        // not make them spin forever or panic. On a finite Cursor every branch
-        // eventually hits EOF (graceful Flush) or a payload-truncation Err, so
-        // both loops must terminate for every seed.
-        let mut rng = Rng::new(0xA076_1D64_78BD_642F);
-        for _ in 0..2000 {
-            let len = rng.below(96);
-            let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
-
-            let mut batch_reader = BufReader::new(Cursor::new(buf.clone()));
-            drop(read_pkt_lines_until_flush(&mut batch_reader).await);
-
-            let mut text_reader = BufReader::new(Cursor::new(buf));
-            drop(read_text_line(&mut text_reader).await);
         }
     }
 }

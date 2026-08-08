@@ -218,15 +218,6 @@ pub async fn get_issue_labels(db: &DatabaseConnection, issue_id: i64) -> Result<
     label_ops::find_by_ids(db, &label_ids).await
 }
 
-/// Set labels for an issue.
-pub async fn set_issue_labels(
-    db: &DatabaseConnection,
-    issue_id: i64,
-    label_ids: Vec<i64>,
-) -> Result<()> {
-    issue_label_ops::set_labels(db, issue_id, label_ids).await
-}
-
 /// Resolve label names to the ids of this repository's labels.
 ///
 /// One helper for every path that turns names into ids — reading and writing

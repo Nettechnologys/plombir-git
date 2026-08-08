@@ -1,8 +1,7 @@
 //! Git upload-pack protocol implementation (git clone/fetch).
 //!
-//! Supports two modes:
-//! 1. Split reader/writer (HTTP mode) — via `handle_upload_pack`
-//! 2. Single bidirectional stream (SSH mode) — via `handle_upload_pack_stream`
+//! Supports split reader/writer after the HTTP advertisement and a single
+//! bidirectional SSH stream.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -11,18 +10,6 @@ use tracing;
 
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
-
-/// Handle upload-pack with separate reader and writer (HTTP mode).
-/// This sends the ref advertisement, negotiates, and sends the packfile.
-pub async fn handle_upload_pack<R, W>(repo_path: &Path, reader: R, writer: W) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut reader = reader;
-    let mut writer = writer;
-    upload_pack_refs_and_negotiate(repo_path, &mut reader, &mut writer).await
-}
 
 /// Handle upload-pack with a single bidirectional stream (SSH mode).
 /// Takes a mutable reference so the caller can send exit-status before dropping the stream.
@@ -57,43 +44,6 @@ where
     let use_sideband = client_caps.contains(&"side-band-64k".to_string())
         || client_caps.contains(&"side-band".to_string());
     send_packfile(repo_path, &wants, &haves, &mut writer, use_sideband).await
-}
-
-/// Internal: send ref advertisement and negotiate with separate reader/writer.
-async fn upload_pack_refs_and_negotiate<R, W>(
-    repo_path: &Path,
-    reader: &mut R,
-    writer: &mut W,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let advertisement = crate::ref_advertisement::collect(repo_path)?;
-    let ref_list = build_ref_advertisement_vec(advertisement.refs, advertisement.head_oid);
-
-    // Send ref advertisement
-    let ad = build_ref_advertisement(&ref_list, "git-upload-pack");
-    for pkt in &ad {
-        write_pkt_line(writer, pkt).await?;
-    }
-    write_flush(writer).await?;
-
-    // Read client negotiation
-    let (wants, haves, client_caps) = read_want_have_split(&mut BufReader::new(reader)).await?;
-
-    if wants.is_empty() {
-        write_flush(writer).await?;
-        return Ok(());
-    }
-
-    // Send NAK
-    write_pkt_line(writer, &PktLine::data(b"NAK")).await?;
-
-    // Send packfile
-    let use_sideband = client_caps.contains(&"side-band-64k".to_string())
-        || client_caps.contains(&"side-band".to_string());
-    send_packfile(repo_path, &wants, &haves, writer, use_sideband).await
 }
 
 /// Internal: SSH mode implementation with single stream type.
@@ -384,18 +334,31 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod ref_advertisement_tests {
-    use std::io::Cursor;
+    use std::path::Path;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn run_live_upload_pack(repo_path: &Path) -> (anyhow::Result<()>, Vec<u8>) {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client.shutdown().await.unwrap();
+        let repo_path = repo_path.to_path_buf();
+        let handler =
+            tokio::spawn(
+                async move { super::handle_upload_pack_stream(&repo_path, &mut server).await },
+            );
+
+        let mut output = Vec::new();
+        client.read_to_end(&mut output).await.unwrap();
+        (handler.await.unwrap(), output)
+    }
 
     #[tokio::test]
     async fn upload_pack_advertises_an_unborn_repository_as_empty() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("unborn.git");
         gix::init_bare(&repo_path).unwrap();
-        let mut output = Vec::new();
-
-        super::handle_upload_pack(&repo_path, Cursor::new(Vec::<u8>::new()), &mut output)
-            .await
-            .unwrap();
+        let (result, output) = run_live_upload_pack(&repo_path).await;
+        result.unwrap();
 
         let output = String::from_utf8(output).unwrap();
         assert!(output
@@ -409,12 +372,8 @@ mod ref_advertisement_tests {
         gix::init_bare(&repo_path).unwrap();
         std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
         std::fs::write(repo_path.join("refs/heads/broken"), "not-an-object-id\n").unwrap();
-        let mut output = Vec::new();
-
-        let error =
-            super::handle_upload_pack(&repo_path, Cursor::new(Vec::<u8>::new()), &mut output)
-                .await
-                .unwrap_err();
+        let (result, output) = run_live_upload_pack(&repo_path).await;
+        let error = result.unwrap_err();
 
         assert!(output.is_empty(), "no partial advertisement may be written");
         assert!(

@@ -89,19 +89,6 @@ pub fn ensure_archive_dir(archive_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Start the background audit archive task without a shutdown signal.
-///
-/// There is deliberately no `Result`-swallowing convenience wrapper next to
-/// this one: the previous `spawn_archiver` turned a bad `archive_dir` into a
-/// `warn!` and no archiver at all, which is the failure this module exists to
-/// stop being silent. Every entry point returns the error to its caller.
-pub fn spawn_archiver_with_config(
-    db: DatabaseConnection,
-    config: AuditArchiveConfig,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    spawn_archiver_with_shutdown(db, config, None)
-}
-
 /// Start the background audit archive task, optionally wired to a graceful
 /// shutdown signal. When `shutdown_rx` flips to `true`, the archiver stops at
 /// the next idle point rather than being aborted mid-run — its writes are
