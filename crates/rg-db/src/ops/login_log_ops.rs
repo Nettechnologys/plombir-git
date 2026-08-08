@@ -35,35 +35,6 @@ pub async fn log_attempt(
     am.insert(db).await
 }
 
-/// Get recent login logs for a user.
-pub async fn recent_for_user(
-    db: &DatabaseConnection,
-    user_id: i64,
-    limit: u64,
-) -> Result<Vec<login_log::Model>, DbErr> {
-    Entity::find()
-        .filter(login_log::Column::UserId.eq(user_id))
-        .order_by_desc(login_log::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-}
-
-/// Count failed attempts for a username since a given time (brute-force detection).
-pub async fn count_failed_since(
-    db: &DatabaseConnection,
-    username: &str,
-    since: chrono::DateTime<chrono::Utc>,
-) -> Result<u64, DbErr> {
-    use sea_orm::QueryFilter;
-    Entity::find()
-        .filter(login_log::Column::Username.eq(username))
-        .filter(login_log::Column::Success.eq(false))
-        .filter(login_log::Column::CreatedAt.gte(since))
-        .count(db)
-        .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn list_paginated(
     db: &DatabaseConnection,

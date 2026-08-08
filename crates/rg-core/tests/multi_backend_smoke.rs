@@ -440,9 +440,13 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let deleted_fork = rg_db::ops::repo_ops::create(&db, deleted_fork)
         .await
         .expect("create deleted fork row");
-    rg_db::ops::repo_ops::soft_delete(&db, deleted_fork.id)
-        .await
-        .expect("soft-delete one fork before refreshing the count");
+    rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+        &db,
+        deleted_fork.id,
+        chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .expect("soft-delete one fork before refreshing the count");
 
     rg_db::ops::repo_ops::update_forks_count(&db, repo.id)
         .await
@@ -520,9 +524,13 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
          enforced by the database, not only by the service layer"
     );
 
-    rg_db::ops::repo_ops::soft_delete(&db, personal_twin.id)
-        .await
-        .expect("soft-delete the personal repository");
+    rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+        &db,
+        personal_twin.id,
+        chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .expect("soft-delete the personal repository");
     rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, None, &twin))
         .await
         .expect(
@@ -1061,9 +1069,13 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         "a refused bid left its lease row behind"
     );
 
-    rg_db::ops::repo_ops::soft_delete(&db, repo.id)
-        .await
-        .expect("soft-delete the repository through the source row");
+    rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+        &db,
+        repo.id,
+        chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .expect("soft-delete the repository through the source row");
     assert_eq!(
         repo_fts_snapshot(&db, repo.id).await,
         None,

@@ -132,26 +132,3 @@ pub async fn mark_uploaded(db: &DatabaseConnection, id: i64) -> Result<()> {
         .context("db: mark LFS object as uploaded")?;
     Ok(())
 }
-
-/// Update compression info for an LFS object.
-pub async fn update_compression(
-    db: &DatabaseConnection,
-    id: i64,
-    compression: &str,
-    compressed_size: i64,
-) -> Result<()> {
-    let obj = LfsEntity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find LFS object for update_compression")?
-        .ok_or_else(|| anyhow::anyhow!("LFS object {} not found", id))?;
-
-    let mut model: ActiveModel = obj.into();
-    model.compression = sea_orm::Set(Some(compression.to_string()));
-    model.compressed_size = sea_orm::Set(Some(compressed_size));
-    model
-        .update(db)
-        .await
-        .context("db: update LFS object compression")?;
-    Ok(())
-}

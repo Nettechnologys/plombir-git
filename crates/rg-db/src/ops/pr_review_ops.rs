@@ -26,21 +26,6 @@ pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<PrRev
         .context("db: list reviews by PR")
 }
 
-/// List reviews by PR and reviewer.
-pub async fn list_by_pr_and_reviewer(
-    db: &DatabaseConnection,
-    pr_id: i64,
-    reviewer_id: i64,
-) -> Result<Vec<PrReview>> {
-    ReviewEntity::find()
-        .filter(pr_review::Column::PrId.eq(pr_id))
-        .filter(pr_review::Column::ReviewerId.eq(reviewer_id))
-        .order_by_asc(pr_review::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list reviews by PR and reviewer")
-}
-
 /// Count approvals for a PR.
 pub async fn count_approvals(db: &DatabaseConnection, pr_id: i64) -> Result<i64> {
     count_current_approvals(db, pr_id, None).await

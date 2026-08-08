@@ -4,9 +4,7 @@ use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, *};
 use std::collections::HashMap;
 
-use crate::entities::issue_label::{
-    self, ActiveModel, Entity as IssueLabelEntity, Model as IssueLabel,
-};
+use crate::entities::issue_label::{self, ActiveModel, Entity as IssueLabelEntity};
 
 /// Set labels for an issue (replace all existing labels).
 ///
@@ -76,15 +74,6 @@ pub async fn get_label_ids(db: &DatabaseConnection, issue_id: i64) -> Result<Vec
         .await
         .context("db: get issue label ids")?;
     Ok(labels.into_iter().map(|l| l.label_id).collect())
-}
-
-/// Get all issue labels for an issue.
-pub async fn get_labels(db: &DatabaseConnection, issue_id: i64) -> Result<Vec<IssueLabel>> {
-    IssueLabelEntity::find()
-        .filter(issue_label::Column::IssueId.eq(issue_id))
-        .all(db)
-        .await
-        .context("db: get issue labels")
 }
 
 /// Load the canonical label names for a batch of issues.

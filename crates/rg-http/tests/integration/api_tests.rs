@@ -385,14 +385,19 @@ async fn test_password_failures_are_logged_and_lock_known_accounts() {
     assert_eq!(locked.login_attempts, 5);
     assert!(locked.locked_until.is_some());
     assert!(
-        rg_db::ops::login_log_ops::count_failed_since(
+        rg_db::ops::login_log_ops::list_paginated(
             &db,
-            "lock_user",
-            chrono::Utc::now() - chrono::Duration::minutes(1),
+            1,
+            50,
+            Some("lock_user"),
+            None,
+            Some(false),
+            Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            None,
         )
         .await
         .unwrap()
-            >= 5
+        .1 >= 5
     );
 
     let blocked = client

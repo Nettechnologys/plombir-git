@@ -248,17 +248,6 @@ pub async fn count_approvals(db: &DatabaseConnection, job_id: i64) -> Result<u64
         .await
         .context("db: count live environment approvers")
 }
-pub async fn list_approvals(
-    db: &DatabaseConnection,
-    job_id: i64,
-) -> Result<Vec<ci_environment_approval::Model>> {
-    ci_environment_approval::Entity::find()
-        .filter(ci_environment_approval::Column::JobId.eq(job_id))
-        .order_by_asc(ci_environment_approval::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list environment approvals")
-}
 pub async fn release_approved_job(db: &DatabaseConnection, job_id: i64) -> Result<bool> {
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))

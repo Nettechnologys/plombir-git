@@ -3780,9 +3780,13 @@ mod repository_fts_tests {
         .expect("create repository");
         assert!(repo_fts_snapshot(&db, repo.id).await.is_some());
 
-        repo_ops::soft_delete(&db, repo.id)
-            .await
-            .expect("soft-delete repository source row");
+        repo_ops::soft_delete_unless_mirror_syncing(
+            &db,
+            repo.id,
+            Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("soft-delete repository source row");
         assert_eq!(
             repo_fts_snapshot(&db, repo.id).await,
             None,

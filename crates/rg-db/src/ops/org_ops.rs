@@ -455,26 +455,6 @@ pub async fn is_team_member(db: &DatabaseConnection, team_id: i64, user_id: i64)
     Ok(member.is_some())
 }
 
-/// List teams that a user belongs to (across all orgs).
-pub async fn list_user_teams(db: &DatabaseConnection, user_id: i64) -> Result<Vec<team::Model>> {
-    let memberships = team_member::Entity::find()
-        .filter(team_member::Column::UserId.eq(user_id))
-        .all(db)
-        .await
-        .context("db: list user team memberships")?;
-
-    let team_ids: Vec<i64> = memberships.iter().map(|m| m.team_id).collect();
-    if team_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    team::Entity::find()
-        .filter(team::Column::Id.is_in(team_ids))
-        .all(db)
-        .await
-        .context("db: list user teams")
-}
-
 /// Decode the single row a `COUNT(*)` aggregate is obliged to return.
 ///
 /// An absent row and a `cnt` that will not decode are *failures of the check*,

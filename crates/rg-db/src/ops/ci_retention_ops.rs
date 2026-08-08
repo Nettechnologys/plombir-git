@@ -183,26 +183,6 @@ async fn apply_cache_entry(
     active.update(db).await.context("db: update CI cache entry")
 }
 
-pub async fn touch_cache_entry(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    key_hash: &str,
-    retention_days: i32,
-) -> Result<()> {
-    if let Some(model) = ci_cache_entry::Entity::find()
-        .filter(ci_cache_entry::Column::RepoId.eq(repo_id))
-        .filter(ci_cache_entry::Column::KeyHash.eq(key_hash))
-        .one(db)
-        .await?
-    {
-        let mut active: ci_cache_entry::ActiveModel = model.into();
-        let now = Utc::now();
-        active.last_accessed_at = Set(now);
-        active.expires_at = Set(now + Duration::days(retention_days as i64));
-        active.update(db).await?;
-    }
-    Ok(())
-}
 pub async fn list_expired_cache(db: &DatabaseConnection) -> Result<Vec<ci_cache_entry::Model>> {
     ci_cache_entry::Entity::find()
         .filter(ci_cache_entry::Column::ExpiresAt.lte(Utc::now()))

@@ -57,25 +57,6 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Model
     Entity::find_by_id(id).one(db).await
 }
 
-/// Count audit logs for a specific user (for rate-limiting or dashboard).
-pub async fn count_for_user(db: &DatabaseConnection, user_id: i64) -> Result<u64, DbErr> {
-    Entity::find()
-        .filter(Column::UserId.eq(user_id))
-        .count(db)
-        .await
-}
-
-/// List audit log entries before a given date (for archival).
-pub async fn list_before(
-    db: &DatabaseConnection,
-    cutoff: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<Model>, DbErr> {
-    Entity::find()
-        .filter(Column::CreatedAt.lt(cutoff))
-        .all(db)
-        .await
-}
-
 /// List a bounded oldest-first batch of audit entries before a cutoff.
 pub async fn list_before_limit(
     db: &DatabaseConnection,

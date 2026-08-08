@@ -2715,9 +2715,13 @@ mod import_target_lifecycle_tests {
     async fn an_anchored_import_does_not_recreate_a_target_deleted_after_it_started() {
         let db = lifecycle_db().await;
         let repo_root = tempfile::tempdir().expect("temporary repository root");
-        rg_db::ops::repo_ops::soft_delete(&db, 1)
-            .await
-            .expect("delete the target repository");
+        rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+            &db,
+            1,
+            Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("delete the target repository");
 
         let error =
             resolve_or_create_target_repo(&db, Some(1), "importer", "imported", repo_root.path())
@@ -2741,9 +2745,13 @@ mod import_target_lifecycle_tests {
         let db = lifecycle_db().await;
         let repo_root = tempfile::tempdir().expect("temporary repository root");
         let task = running_task(&db, Some(1)).await;
-        rg_db::ops::repo_ops::soft_delete(&db, 1)
-            .await
-            .expect("delete the target repository mid-pass");
+        rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+            &db,
+            1,
+            Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("delete the target repository mid-pass");
 
         let mut stats = ImportStats::default();
         let error = clone_into_target(

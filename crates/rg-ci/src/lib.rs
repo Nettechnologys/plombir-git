@@ -1830,9 +1830,10 @@ mod matrix_tests {
         // Nothing survived the failure: no pipeline to show green, no stage, no
         // job for a runner to take.
         assert!(
-            rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
                 .await
                 .unwrap()
+                .0
                 .is_empty(),
             "a pipeline that could not be built must not stay in the database"
         );
@@ -1850,10 +1851,12 @@ mod matrix_tests {
                 .unwrap(),
             0
         );
-        assert!(rg_db::ops::pipeline_ops::find_pending_job(&db)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // The other half: a graph that is still being written is invisible to
         // the query the runners poll with, so there is no window in which an
@@ -2012,9 +2015,10 @@ mod matrix_tests {
 
         // The count is the whole point: a failed cancellation must not grow the
         // number of active pipelines on the ref.
-        let pipelines = rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
-            .await
-            .unwrap();
+        let (pipelines, _) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap();
         assert_eq!(
             pipelines.len(),
             1,
@@ -2145,9 +2149,10 @@ mod matrix_tests {
 
         // The refusal is a refusal: nothing was started.
         assert_eq!(
-            rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
                 .await
                 .unwrap()
+                .0
                 .len(),
             1
         );
@@ -2192,9 +2197,10 @@ mod matrix_tests {
             "a refused write is ours, not the caller's: {storage_error:#}"
         );
         assert_eq!(
-            rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo.id)
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
                 .await
                 .unwrap()
+                .0
                 .len(),
             1,
             "the failed write left nothing behind"

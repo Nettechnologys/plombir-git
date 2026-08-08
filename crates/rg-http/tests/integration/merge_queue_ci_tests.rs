@@ -672,9 +672,10 @@ async fn a_queue_pass_adopts_the_merge_group_pipeline_instead_of_triggering_anot
     // Opening the PR triggers a `pull_request` pipeline of its own, so only the
     // merge-group ones are the queue's doing.
     let merge_group_pipelines = |db: sea_orm::DatabaseConnection| async move {
-        rg_db::ops::pipeline_ops::list_pipelines_by_repo(&db, repo_id)
+        rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo_id, 0, 100)
             .await
             .unwrap()
+            .0
             .into_iter()
             .filter(|pipeline| pipeline.trigger_type == "merge_group")
             .map(|pipeline| pipeline.id)

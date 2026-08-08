@@ -78,19 +78,6 @@ pub async fn get_pipeline(db: &impl ConnectionTrait, id: i64) -> Result<Option<p
         .context("db: get pipeline")
 }
 
-/// List pipelines for a repo.
-pub async fn list_pipelines_by_repo(
-    db: &DatabaseConnection,
-    repo_id: i64,
-) -> Result<Vec<pipeline::Model>> {
-    pipeline::Entity::find()
-        .filter(pipeline::Column::RepoId.eq(repo_id))
-        .order_by_desc(pipeline::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list pipelines by repo")
-}
-
 /// Paginated list of pipelines for a repo. Returns (data, total).
 pub async fn list_pipelines_by_repo_paginated(
     db: &DatabaseConnection,
@@ -699,24 +686,6 @@ pub async fn try_update_pipeline(
     Ok(Some(new_status.to_string()))
 }
 
-/// Find a pending job (status = "pending" and runner_id is NULL).
-/// Returns the oldest pending job (by id).
-pub async fn find_pending_job(db: &DatabaseConnection) -> Result<Option<pipeline_job::Model>> {
-    let jobs = pipeline_job::Entity::find()
-        .filter(pipeline_job::Column::Status.eq("pending"))
-        .filter(pipeline_job::Column::RunnerId.is_null())
-        .order_by_asc(pipeline_job::Column::Id)
-        .all(db)
-        .await
-        .context("db: find pending job")?;
-    for job in jobs {
-        if job_is_schedulable(db, &job).await? {
-            return Ok(Some(job));
-        }
-    }
-    Ok(None)
-}
-
 /// Find a pending job that matches the given runner labels.
 ///
 /// A job matches if:
@@ -881,16 +850,6 @@ pub async fn find_offline_runners(
         .all(db)
         .await
         .context("db: find offline runners")
-}
-
-/// Mark a job as timed out (error status).
-///
-/// Conditional for the same reason a runner's `finish` is: the watchdog decides
-/// a job is stale from a snapshot, and a job canceled in the meantime must not
-/// come back as `error`. Returns whether the row was actually moved.
-pub async fn mark_job_timeout(db: &DatabaseConnection, job_id: i64) -> Result<bool> {
-    let now = chrono::Utc::now().naive_utc();
-    settle_job_if_active(db, job_id, "error", Some(-1), None, Some(now)).await
 }
 
 /// Reset all jobs assigned to a runner back to pending (for deregistration).

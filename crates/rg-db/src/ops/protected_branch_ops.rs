@@ -76,16 +76,6 @@ pub async fn list_rules_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result
     Ok(rules)
 }
 
-/// Check if a branch is protected.
-pub async fn is_protected(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    branch_name: &str,
-) -> Result<bool> {
-    let found = find_by_repo_and_branch(db, repo_id, branch_name).await?;
-    Ok(found.is_some())
-}
-
 /// Create a new protected branch rule.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<ProtectedBranch> {
     model

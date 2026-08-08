@@ -116,13 +116,3 @@ pub async fn list_starred_repo_ids(db: &impl ConnectionTrait, user_id: i64) -> R
         .await
         .context("db: list the repositories an account has starred")
 }
-
-/// Count the number of stars for a repository.
-pub async fn count_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<i64> {
-    RepoStarEntity::find()
-        .filter(repo_star::Column::RepoId.eq(repo_id))
-        .count(db)
-        .await
-        .context("db: count stars")
-        .map(|c| c as i64)
-}

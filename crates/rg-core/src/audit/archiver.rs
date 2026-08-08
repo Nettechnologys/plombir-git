@@ -391,7 +391,7 @@ mod tests {
 
         // The row must still be there: nothing is purged unless the archive
         // was written durably.
-        let remaining = rg_db::ops::audit_log_ops::list_before(&db, Utc::now())
+        let remaining = rg_db::ops::audit_log_ops::list_before_limit(&db, Utc::now(), 100)
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
@@ -475,9 +475,10 @@ mod tests {
         }
         assert_eq!(archived_actions, ["old.action.1", "old.action.2"]);
 
-        let remaining = rg_db::ops::audit_log_ops::list_before(&db, Utc::now() + Duration::days(1))
-            .await
-            .unwrap();
+        let remaining =
+            rg_db::ops::audit_log_ops::list_before_limit(&db, Utc::now() + Duration::days(1), 100)
+                .await
+                .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].action, "new.action");
         assert!(run_archive_once(&db, &config).await.unwrap().is_none());

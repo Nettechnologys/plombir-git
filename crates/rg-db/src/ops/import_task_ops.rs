@@ -37,31 +37,6 @@ pub async fn find_by_user(db: &DatabaseConnection, user_id: i64, limit: u64) -> 
         .context("db: find import tasks by user")
 }
 
-/// Find an import task by target owner/name (latest first).
-pub async fn find_by_target(
-    db: &DatabaseConnection,
-    owner: &str,
-    name: &str,
-) -> Result<Option<Model>> {
-    ImportTaskEntity::find()
-        .filter(import_task::Column::TargetOwner.eq(owner))
-        .filter(import_task::Column::TargetName.eq(name))
-        .order_by_desc(import_task::Column::CreatedAt)
-        .one(db)
-        .await
-        .context("db: find import task by target")
-}
-
-/// Find import tasks by repo_id.
-pub async fn find_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Option<Model>> {
-    ImportTaskEntity::find()
-        .filter(import_task::Column::RepoId.eq(repo_id))
-        .order_by_desc(import_task::Column::CreatedAt)
-        .one(db)
-        .await
-        .context("db: find import task by repo")
-}
-
 /// Update an import task.
 pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     model.update(db).await.context("db: update import task")
@@ -142,17 +117,6 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
         .await
         .context("db: delete import task")?;
     Ok(result.rows_affected > 0)
-}
-
-/// List all active (non-completed, non-failed) import tasks.
-pub async fn list_active(db: &DatabaseConnection, limit: u64) -> Result<Vec<Model>> {
-    ImportTaskEntity::find()
-        .filter(import_task::Column::Status.is_in(RUNNING_STATUSES))
-        .order_by_asc(import_task::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("db: list active import tasks")
 }
 
 /// Count the imports still in flight against one repository.

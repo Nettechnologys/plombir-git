@@ -22,7 +22,9 @@
 //! `user_delete_cascades_repositories.rs`: what the account *owns* is still
 //! destroyed by the same statement.
 
-use rg_db::sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait};
+use rg_db::sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+};
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
 struct TempDb {
@@ -322,7 +324,9 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
         "the board's card died with the account that created the board"
     );
 
-    let approvals = rg_db::ops::ci_environment_ops::list_approvals(&db, 1)
+    let approvals = rg_db::entities::ci_environment_approval::Entity::find()
+        .filter(rg_db::entities::ci_environment_approval::Column::JobId.eq(1))
+        .all(&db)
         .await
         .expect("read the environment approvals after the approver was deleted");
     assert_eq!(

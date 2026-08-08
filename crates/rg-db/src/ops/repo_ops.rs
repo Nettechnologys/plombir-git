@@ -67,22 +67,6 @@ pub async fn find_personal_by_owner_and_name(
         .context("db: find personal repo by owner and name")
 }
 
-/// List all non-deleted repos in a user's **personal** namespace.
-///
-/// `org_id IS NULL` for the same reason as
-/// [`find_personal_by_owner_and_name`]: without it, the repositories of every
-/// organization this user owns are listed as if they were their own.
-pub async fn list_personal_by_owner(db: &DatabaseConnection, owner_id: i64) -> Result<Vec<Repo>> {
-    RepoEntity::find()
-        .filter(repository::Column::OwnerId.eq(owner_id))
-        .filter(repository::Column::OrgId.is_null())
-        .filter(repository::Column::DeletedAt.is_null())
-        .order_by_asc(repository::Column::Name)
-        .all(db)
-        .await
-        .context("db: list personal repos by owner")
-}
-
 /// Every non-deleted repo whose `owner_id` is this user, in **both** namespaces.
 ///
 /// The deliberate opposite of [`list_personal_by_owner`]: this one exists for
@@ -306,21 +290,6 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Soft-delete a repository (set deleted_at timestamp).
-pub async fn soft_delete(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let repo = RepoEntity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find repo for soft delete")?
-        .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-
-    let mut model: RepoActiveModel = repo.into();
-    model.deleted_at = Set(Some(Utc::now()));
-    model.update(db).await.context("db: soft delete repo")?;
-
-    Ok(())
-}
-
 /// Whether the guarded soft-delete committed, or found a writer whose bytes it
 /// would have orphaned.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -530,25 +499,6 @@ pub async fn list_forks(
         .await
         .context("db: list forks")?;
     Ok((repos, total))
-}
-
-/// Update repo owner (for transfer).
-pub async fn update_owner(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    owner_id: i64,
-    org_id: Option<i64>,
-) -> Result<()> {
-    let repo = RepoEntity::find_by_id(repo_id)
-        .one(db)
-        .await?
-        .context("repo not found")?;
-    let mut active: RepoActiveModel = repo.into();
-    active.owner_id = Set(owner_id);
-    active.org_id = Set(org_id);
-    active.updated_at = Set(Utc::now());
-    active.update(db).await.context("db: update repo owner")?;
-    Ok(())
 }
 
 /// How long a transfer lease may go unreleased before another transfer is

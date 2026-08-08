@@ -137,17 +137,6 @@ pub async fn find_by_token(db: &DatabaseConnection, token: &str) -> Result<Optio
         .context("db: find runner by token")
 }
 
-/// List online runners (last_seen_at within 90 seconds).
-pub async fn list_online_runners(db: &DatabaseConnection) -> Result<Vec<Runner>> {
-    let cutoff = Utc::now().naive_utc() - chrono::Duration::seconds(90);
-
-    RunnerEntity::find()
-        .filter(Column::LastSeenAt.gt(cutoff))
-        .all(db)
-        .await
-        .context("db: list online runners")
-}
-
 /// List all runners (for admin).
 pub async fn list_all(db: &DatabaseConnection) -> Result<Vec<Runner>> {
     RunnerEntity::find()

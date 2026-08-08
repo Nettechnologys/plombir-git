@@ -31,21 +31,6 @@ pub async fn create_artifact(
     active_model.insert(db).await.context("db: create artifact")
 }
 
-/// List artifacts by job ID.
-pub async fn list_by_job(db: &DatabaseConnection, job_id: i64) -> Result<Vec<Artifact>> {
-    ArtifactEntity::find()
-        .filter(Column::JobId.eq(job_id))
-        .filter(
-            Condition::any()
-                .add(Column::ExpiresAt.is_null())
-                .add(Column::ExpiresAt.gt(Utc::now())),
-        )
-        .order_by_desc(Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list artifacts by job")
-}
-
 /// List artifacts by pipeline ID.
 /// Fetches all jobs belonging to the pipeline's stages, then queries artifacts.
 pub async fn list_by_pipeline(db: &DatabaseConnection, pipeline_id: i64) -> Result<Vec<Artifact>> {

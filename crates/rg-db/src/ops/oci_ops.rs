@@ -149,33 +149,6 @@ pub async fn list_tags(db: &DatabaseConnection, oci_repo_id: i64) -> Result<Vec<
     Ok(manifests.into_iter().filter_map(|m| m.tag).collect())
 }
 
-/// Insert a new manifest.
-#[allow(clippy::too_many_arguments)]
-pub async fn insert_manifest(
-    db: &DatabaseConnection,
-    oci_repo_id: i64,
-    digest: &str,
-    tag: Option<&str>,
-    media_type: &str,
-    size: i64,
-    manifest_json: &str,
-    schema_version: i32,
-    push_by: Option<i64>,
-) -> Result<oci_manifest::Model, DbErr> {
-    manifest_model(
-        oci_repo_id,
-        digest,
-        tag,
-        media_type,
-        size,
-        manifest_json,
-        schema_version,
-        push_by,
-    )
-    .insert(db)
-    .await
-}
-
 /// Insert a digest-addressed manifest and claim its blob references exactly once.
 ///
 /// A client retry or two concurrent PUTs can legitimately reach the unique

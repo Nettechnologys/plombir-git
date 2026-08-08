@@ -24,7 +24,7 @@
 //!   stayed live is gone (card_1cfc81035e92).
 
 use rg_core::blob_storage::BlobKey;
-use rg_db::sea_orm::{NotSet, Set};
+use rg_db::sea_orm::{ColumnTrait, EntityTrait, NotSet, QueryFilter, Set};
 
 use crate::common::{
     create_issue, create_repo, fault::spawn_test_app_for_fault_sweep, register_full,
@@ -449,7 +449,9 @@ async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_relea
         0,
         "a deleted approver still contributes a current approval"
     );
-    let history = rg_db::ops::ci_environment_ops::list_approvals(&db, job_id)
+    let history = rg_db::entities::ci_environment_approval::Entity::find()
+        .filter(rg_db::entities::ci_environment_approval::Column::JobId.eq(job_id))
+        .all(&db)
         .await
         .expect("read approval history after deletion");
     assert_eq!(history.len(), 1);
@@ -1286,16 +1288,17 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
     )
     .await
     .expect("seed OCI repository owned by the host namespace");
-    let manifest = rg_db::ops::oci_ops::insert_manifest(
+    let manifest = rg_db::ops::oci_ops::upsert_tag_manifest(
         &db,
         oci_repo.id,
+        "latest",
         &format!("sha256:{}", "4".repeat(64)),
-        Some("latest"),
         "application/vnd.oci.image.manifest.v1+json",
         2,
         "{}",
         2,
         Some(guest_id),
+        &[],
     )
     .await
     .expect("seed OCI manifest pushed by the guest");
