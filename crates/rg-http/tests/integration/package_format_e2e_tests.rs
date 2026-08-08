@@ -2767,3 +2767,130 @@ async fn nuget_registration_publishes_the_graph_and_the_availability_restore_rea
     assert!(catalog["dependencyGroups"].is_null(), "{catalog}");
     assert_eq!(catalog["listed"], true);
 }
+
+/// The Simple page is where pip / uv / poetry choose a candidate, and they
+/// choose on two attributes before they look at anything else: PEP 503's
+/// `data-requires-python` and PEP 592's `data-yanked`. Neither used to be
+/// emitted, so a 3.12-only wheel was offered to a 3.8 interpreter and a
+/// withdrawn release was offered to everyone (card_5d5a0e91d324).
+#[tokio::test]
+async fn pypi_simple_page_states_what_a_resolver_filters_on() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let publish = |filename: &'static str, body: Vec<u8>, expect: StatusCode| {
+        let (client, token, base) = (client.clone(), token.clone(), base.clone());
+        async move {
+            let response = client
+                .post(package_url(&base, &["pypi", "publish"]))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expect, "publish {filename}");
+        }
+    };
+
+    let wheel = |version: &str, requires_python: Option<&str>| {
+        let constraint = requires_python
+            .map(|spec| format!("Requires-Python: {spec}\n"))
+            .unwrap_or_default();
+        zip_archive(&[(
+            &format!("matrix_pin-{version}.dist-info/METADATA"),
+            format!(
+                "Metadata-Version: 2.1\nName: matrix-pin\nVersion: {version}\n\
+                 Summary: resolver attributes\n{constraint}"
+            )
+            .as_bytes(),
+        )])
+    };
+
+    publish(
+        "matrix_pin-1.0.0-py3-none-any.whl",
+        wheel("1.0.0", Some(">=3.10")),
+        StatusCode::CREATED,
+    )
+    .await;
+    publish(
+        "matrix_pin-1.1.0-py3-none-any.whl",
+        wheel("1.1.0", Some(">=3.12")),
+        StatusCode::CREATED,
+    )
+    .await;
+    // Published without the header at all — the page must say nothing about it
+    // rather than claim it runs anywhere.
+    publish(
+        "matrix_pin-0.9.0-py3-none-any.whl",
+        wheel("0.9.0", None),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let simple_page = |client: reqwest::Client, base: String| async move {
+        let page = client
+            .get(package_url(&base, &["pypi", "simple", "matrix-pin", ""]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        page.text().await.unwrap()
+    };
+    let line_for = |page: &str, filename: &str| {
+        page.lines()
+            .find(|line| line.contains(filename))
+            .unwrap_or_else(|| panic!("{filename} is missing from the Simple page:\n{page}"))
+            .to_string()
+    };
+
+    let page = simple_page(client.clone(), base.clone()).await;
+    let pinned = line_for(&page, "matrix_pin-1.0.0-py3-none-any.whl");
+    assert!(
+        pinned.contains("data-requires-python=\"&gt;=3.10\""),
+        "the first filter a resolver applies is missing: {pinned}"
+    );
+    assert!(
+        line_for(&page, "matrix_pin-1.1.0-py3-none-any.whl")
+            .contains("data-requires-python=\"&gt;=3.12\""),
+        "{page}"
+    );
+    let undeclared = line_for(&page, "matrix_pin-0.9.0-py3-none-any.whl");
+    assert!(
+        !undeclared.contains("data-requires-python"),
+        "a distribution that declared nothing must not be given a constraint: {undeclared}"
+    );
+    assert!(
+        !page.contains("data-yanked"),
+        "nothing is yanked yet: {page}"
+    );
+
+    // Yanking has to reach the resolver. The file stays on the page — that is
+    // what keeps `matrix-pin==1.1.0` resolvable — and the attribute is what
+    // takes it out of every resolution that is not that exact pin.
+    let yanked = client
+        .patch(package_url(&base, &["pypi", "matrix-pin", "1.1.0", "yank"]))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "yank": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK);
+
+    let page = simple_page(client.clone(), base.clone()).await;
+    let withdrawn = line_for(&page, "matrix_pin-1.1.0-py3-none-any.whl");
+    assert!(
+        withdrawn.contains("data-yanked=\"\""),
+        "the yanked release is still offered as an ordinary candidate: {withdrawn}"
+    );
+    assert!(
+        !line_for(&page, "matrix_pin-1.0.0-py3-none-any.whl").contains("data-yanked"),
+        "{page}"
+    );
+    assert_eq!(page.matches("data-yanked").count(), 1, "{page}");
+}

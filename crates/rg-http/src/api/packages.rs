@@ -1246,6 +1246,13 @@ pub async fn pypi_simple_index(
     let entries: Vec<rg_core::package_registry::PyPIVersionEntry> = versions
         .iter()
         .flat_map(|v| {
+            // Both attributes describe the *version*, so every file of it
+            // carries the same pair. A yanked version stays on the page — that
+            // is what keeps an exact pin resolvable — and `data-yanked` is what
+            // takes it out of every other resolution (PEP 592).
+            let requires_python = parse_pypi_requires_python(v.metadata.as_deref());
+            let yanked = v.is_yanked;
+
             let files: Vec<rg_core::package_registry::PyPIVersionEntry> = v
                 .files
                 .iter()
@@ -1255,6 +1262,8 @@ pub async fn pypi_simple_index(
                     filename: f.filename.clone(),
                     sha256: v.sha256_of(f),
                     download_url: link_to(&v.version, &f.filename),
+                    requires_python: requires_python.clone(),
+                    yanked,
                 })
                 .collect();
 
@@ -1272,6 +1281,8 @@ pub async fn pypi_simple_index(
                 filename,
                 sha256: v.sha256.clone(),
                 download_url,
+                requires_python,
+                yanked,
             }]
         })
         .collect();
@@ -3100,6 +3111,20 @@ fn parse_nuget_dependency_groups(
         })
         .filter(|group| group.target_framework.is_some() || !group.dependencies.is_empty())
         .collect()
+}
+
+/// The `Requires-Python` a PyPI version recorded at publish.
+///
+/// Absent for anything published before the adapter read the field, and for a
+/// distribution that declared none — both mean the same thing to the page: no
+/// attribute, so no claim is made either way.
+fn parse_pypi_requires_python(metadata_json: Option<&str>) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(metadata_json?)
+        .ok()?
+        .get("requires_python")?
+        .as_str()
+        .filter(|spec| !spec.is_empty())
+        .map(String::from)
 }
 
 /// Parse RubyGems dependencies from version metadata JSON.

@@ -101,12 +101,7 @@ impl PackageAdapter for PyPIAdapter {
 /// Parse RFC 822-style metadata (e.g., METADATA / PKG-INFO).
 /// Fields: Name, Version, Summary, Home-page, License, Keywords, etc.
 fn parse_rfc822_meta(content: &str) -> Result<ExtractedMetadata, anyhow::Error> {
-    let mut name = String::new();
-    let mut version = String::new();
-    let mut description = None;
-    let mut homepage = None;
-    let mut license = None;
-    let mut keywords = None;
+    let mut fields = Rfc822Fields::default();
     let mut current_field = String::new();
     let mut current_value = String::new();
     let mut in_continuation = false;
@@ -123,16 +118,7 @@ fn parse_rfc822_meta(content: &str) -> Result<ExtractedMetadata, anyhow::Error> 
 
         // Save previous field if any
         if !current_field.is_empty() {
-            save_field(
-                &current_field,
-                &current_value,
-                &mut name,
-                &mut version,
-                &mut description,
-                &mut homepage,
-                &mut license,
-                &mut keywords,
-            );
+            save_field(&current_field, &current_value, &mut fields);
             current_field.clear();
             current_value.clear();
         }
@@ -149,72 +135,83 @@ fn parse_rfc822_meta(content: &str) -> Result<ExtractedMetadata, anyhow::Error> 
 
     // Save last field
     if !current_field.is_empty() {
-        save_field(
-            &current_field,
-            &current_value,
-            &mut name,
-            &mut version,
-            &mut description,
-            &mut homepage,
-            &mut license,
-            &mut keywords,
-        );
+        save_field(&current_field, &current_value, &mut fields);
     }
 
-    if name.is_empty() {
+    if fields.name.is_empty() {
         anyhow::bail!("metadata missing 'Name' field");
     }
-    if version.is_empty() {
+    if fields.version.is_empty() {
         anyhow::bail!("metadata missing 'Version' field");
     }
 
     Ok(ExtractedMetadata {
-        name,
-        version: version.clone(),
-        description,
-        homepage,
+        name: fields.name,
+        version: fields.version.clone(),
+        description: fields.description,
+        homepage: fields.homepage,
         repository_url: None, // PyPI metadata has no standard repository field
-        keywords,
-        license,
-        semver: Some(version),
-        protocol_metadata: None,
+        keywords: fields.keywords,
+        license: fields.license,
+        semver: Some(fields.version),
+        protocol_metadata: pypi_protocol_metadata(fields.requires_python.as_deref()),
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn save_field(
-    field: &str,
-    value: &str,
-    name: &mut String,
-    version: &mut String,
-    description: &mut Option<String>,
-    homepage: &mut Option<String>,
-    license: &mut Option<String>,
-    keywords: &mut Option<String>,
-) {
+/// The `METADATA` / `PKG-INFO` headers this adapter reads.
+#[derive(Default)]
+struct Rfc822Fields {
+    name: String,
+    version: String,
+    description: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+    keywords: Option<String>,
+    /// `Requires-Python`. No package column holds it, and it is the *first*
+    /// filter a resolver applies — see [`pypi_protocol_metadata`].
+    requires_python: Option<String>,
+}
+
+fn save_field(field: &str, value: &str, fields: &mut Rfc822Fields) {
     match field {
-        "name" => *name = value.to_string(),
-        "version" => *version = value.to_string(),
-        "summary" => *description = Some(value.to_string()),
+        "name" => fields.name = value.to_string(),
+        "version" => fields.version = value.to_string(),
+        "summary" => fields.description = Some(value.to_string()),
         "description" => {
             // If we already have a summary, keep it (summary is shorter/better)
-            if description.is_none() {
+            if fields.description.is_none() {
                 // Truncate long description
                 let desc = if value.len() > 500 {
                     format!("{}...", &value[..500])
                 } else {
                     value.to_string()
                 };
-                *description = Some(desc);
+                fields.description = Some(desc);
             }
         }
         "home-page" | "homepage" | "project-url" | "url" => {
-            *homepage = Some(value.to_string());
+            fields.homepage = Some(value.to_string());
         }
-        "license" => *license = Some(value.to_string()),
-        "keywords" => *keywords = Some(value.to_string()),
+        "license" => fields.license = Some(value.to_string()),
+        "keywords" => fields.keywords = Some(value.to_string()),
+        "requires-python" => {
+            fields.requires_python = Some(value.to_string()).filter(|v| !v.is_empty())
+        }
         _ => {}
     }
+}
+
+/// The per-version PyPI fields no package column holds, keyed the way
+/// `parse_pypi_metadata` (rg-http) reads them back.
+///
+/// `Requires-Python` is the reason this exists. It is the first filter pip / uv
+/// / poetry apply when choosing a candidate, and a link published without
+/// `data-requires-python` is a link they consider compatible with every
+/// interpreter — so a 3.12-only wheel installs on 3.8 and fails at import time
+/// instead of resolving honestly (card_5d5a0e91d324).
+fn pypi_protocol_metadata(requires_python: Option<&str>) -> Option<String> {
+    let requires_python = requires_python.filter(|v| !v.is_empty())?;
+    Some(serde_json::json!({ "requires_python": requires_python }).to_string())
 }
 
 /// Extract metadata from a .whl (ZIP) file.
@@ -363,10 +360,33 @@ pub fn build_simple_repository_html(package_name: &str, versions: &[PyPIVersionE
             .as_ref()
             .map(|s| format!("#sha256={}", s))
             .unwrap_or_default();
+
+        // PEP 503: the interpreter constraint the resolver filters on before it
+        // looks at anything else. Absent, the file is a candidate for every
+        // interpreter — which is a claim, not a silence.
+        let requires_python = entry
+            .requires_python
+            .as_ref()
+            .map(|spec| format!(" data-requires-python=\"{}\"", escape_html(spec)))
+            .unwrap_or_default();
+
+        // PEP 592: a yanked file stays in the index — that is what keeps an
+        // exact pin resolvable — and the attribute is what takes it out of every
+        // resolution that is not one. The attribute's value is the reason, and
+        // the empty string is the spelling for "yanked, no reason given", which
+        // is all this registry records: `set_yanked` stores a bool.
+        let yanked = if entry.yanked {
+            " data-yanked=\"\""
+        } else {
+            ""
+        };
+
         html.push_str(&format!(
-            "  <a href=\"{}{}\">{}</a><br/>\n",
+            "  <a href=\"{}{}\"{}{}>{}</a><br/>\n",
             escape_html(&entry.download_url),
             escape_html(&sha_frag),
+            requires_python,
+            yanked,
             escape_html(&entry.filename),
         ));
     }
@@ -405,6 +425,11 @@ pub struct PyPIVersionEntry {
     pub filename: String,
     pub sha256: Option<String>,
     pub download_url: String,
+    /// The `Requires-Python` of the distribution, as its metadata spelled it.
+    /// `None` means the distribution declared none, not that we did not look.
+    pub requires_python: Option<String>,
+    /// Whether the version was yanked (PEP 592).
+    pub yanked: bool,
 }
 
 /// One project row of the Simple Repository API root index.
@@ -447,11 +472,53 @@ mod simple_repository_tests {
                 filename: "x\"><script>alert(1)</script>.whl".into(),
                 sha256: None,
                 download_url: "https://example.test/a\"b".into(),
+                // The resolver attributes are publisher-controlled text too.
+                requires_python: Some(">=3.10,\"><script>alert(2)</script>".into()),
+                yanked: false,
             }],
         );
 
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("&quot;"), "{html}");
+    }
+
+    /// PEP 503's `data-requires-python` is the first filter pip / uv / poetry
+    /// apply, and PEP 592's `data-yanked` is what keeps a withdrawn release out
+    /// of every resolution that is not an exact pin. Neither used to be emitted,
+    /// so every file was offered as compatible with everything and alive.
+    #[test]
+    fn the_project_page_states_the_two_facts_a_resolver_filters_on() {
+        let entry = |version: &str, requires_python: Option<&str>, yanked: bool| PyPIVersionEntry {
+            version: version.into(),
+            filename: format!("matrix-{version}-py3-none-any.whl"),
+            sha256: Some("abc".into()),
+            download_url: format!("https://example.test/matrix-{version}.whl"),
+            requires_python: requires_python.map(String::from),
+            yanked,
+        };
+
+        let html = build_simple_repository_html(
+            "matrix",
+            &[
+                entry("1.0.0", Some(">=3.10"), false),
+                entry("1.1.0", Some(">=3.12"), true),
+                entry("0.9.0", None, false),
+            ],
+        );
+
+        assert!(
+            html.contains("#sha256=abc\" data-requires-python=\"&gt;=3.10\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-requires-python=\"&gt;=3.12\" data-yanked=\"\">"),
+            "a yanked version stays on the page, and says so: {html}"
+        );
+        // No declaration is no attribute: an empty one would claim the
+        // distribution runs on everything.
+        assert!(html.contains("matrix-0.9.0.whl#sha256=abc\">"), "{html}");
+        assert_eq!(html.matches("data-yanked").count(), 1, "{html}");
+        assert_eq!(html.matches("data-requires-python").count(), 2, "{html}");
     }
 
     #[test]
