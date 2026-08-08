@@ -1,8 +1,13 @@
 //! GitHub REST API v3 client for data migration import.
 //!
 //! Provides typed API calls to fetch repository data (issues, PRs,
-//! labels, milestones, releases, wiki) from GitHub.com or GitHub
-//! Enterprise Server instances.
+//! labels, milestones, releases) from GitHub.com or GitHub Enterprise Server
+//! instances.
+//!
+//! A repository's wiki is deliberately absent: GitHub serves no page content
+//! over this API, only the `has_wiki` feature flag — which is on by default and
+//! says nothing about whether any page was ever written. The wiki is a second
+//! git repository, and `import::service::import_wiki_pages` clones it.
 
 use anyhow::{Context, Result};
 use reqwest::{header, Client};
@@ -306,13 +311,6 @@ impl GitHubClient {
             ),
         )
         .await
-    }
-
-    /// Check if the repository has a wiki.
-    pub async fn has_wiki(&self, owner: &str, repo: &str) -> Result<bool> {
-        let url = format!("{}/repos/{}/{}", self.base_url, owner, repo);
-        let repo_meta: serde_json::Value = self.client.get(&url).send().await?.json().await?;
-        Ok(repo_meta["has_wiki"].as_bool().unwrap_or(false))
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

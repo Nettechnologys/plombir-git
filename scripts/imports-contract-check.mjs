@@ -168,6 +168,43 @@ for (const field of [
   }
 }
 
+// ── Every option the form offers must have a consumer ─────────────────────
+//
+// `import_wiki` travelled from the checkbox to its own database column and
+// stopped there: `start_import` wrote it, and not one runner ever read it
+// (card_20cf2efd80c4). The symmetry checks above asserted that field along its
+// whole path and passed the entire time, because every hop they know about was
+// present — the missing one was the *consumer*, which no frontend/backend
+// symmetry can see. The user ticked the box, the task reached `completed`, and
+// the status said `wiki_pages_imported: 0`, which is exactly what a source with
+// no wiki says.
+//
+// So the option columns are read out of the entity and each is required to be
+// read back as `task.<field>` by the import pipeline. Derived rather than
+// listed: an option column added tomorrow is covered the day it is added, and
+// the writer in `start_import` (a bare `import_wiki:` parameter, not
+// `task.import_wiki`) cannot stand in for a reader.
+const servicePath = path.join(root, 'crates/rg-core/src/import/service.rs');
+const service = stripRustComments(readFileSync(servicePath, 'utf8'));
+const optionColumns = [...stripRustComments(entity).matchAll(/^\s*pub (import_\w+):\s*bool/gm)].map((m) => m[1]);
+
+if (optionColumns.length === 0) {
+  failures.push(
+    'This check can no longer read the `import_*` option columns off import_task.rs, so the ' +
+      'consumer assertions below mean nothing. Fix the parsing, not the entity.',
+  );
+}
+
+for (const option of optionColumns) {
+  if (!new RegExp(`\\btask\\.${option}\\b`).test(service)) {
+    failures.push(
+      `import_tasks.${option} is written by start_import and read by no runner in ` +
+        'import/service.rs — the option would reach the database and have no effect, which a ' +
+        'user cannot tell from a source that had nothing to import',
+    );
+  }
+}
+
 for (const field of ['repo_id', 'stage', 'error', 'stats']) {
   if (!client.includes(field)) {
     failures.push(`ImportTask client model must expose backend field ${field}`);

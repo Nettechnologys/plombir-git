@@ -26,6 +26,7 @@ mod common;
 mod create_unique_race_tests;
 mod encryption_key_check_tests;
 mod encryption_rekey_tests;
+mod import_wiki_tests;
 mod local_number_race_tests;
 mod mirror_create_race_tests;
 mod status_check_gate_tests;

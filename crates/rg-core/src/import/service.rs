@@ -6,6 +6,7 @@
 //! - Issues with comments
 //! - Pull/Merge requests with reviews/comments
 //! - Releases
+//! - Wiki pages, cloned from the source's `<repo>.wiki.git`
 //!
 //! Generic Git and Gitea imports currently clone the repository only.
 //!
@@ -49,7 +50,7 @@ use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::{credential_invocation, GitCredentials};
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rg_db::entities::import_task::{self, Model as ImportTask};
 use rg_db::entities::{issue, label, milestone};
@@ -559,6 +560,28 @@ async fn run_github_import(
         .await?;
     }
 
+    // Step 7: Wiki
+    if task.import_wiki {
+        update_stage(db, task.id, "importing", 92, "Importing wiki...").await?;
+        stats.wiki_pages_imported = import_wiki_pages(
+            db,
+            repo_id,
+            &wiki_clone_url(&task.source_url),
+            &wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
+            source_credentials(&task.platform, &task.source_url, token).as_ref(),
+            Some(task.user_id),
+        )
+        .await?;
+        update_stage(
+            db,
+            task.id,
+            "importing",
+            95,
+            &format!("Imported {} wiki pages", stats.wiki_pages_imported),
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -731,6 +754,32 @@ async fn run_gitlab_import(
             "importing",
             90,
             &format!("Imported {} releases", stats.releases_imported),
+        )
+        .await?;
+    }
+
+    // Step 7: Wiki
+    //
+    // Derived from `task.source_url`, not from the project the API described:
+    // GitLab's `http_url_to_repo` is only read on the cloning path, and the
+    // wiki lives at the same address the user typed with one suffix added.
+    if task.import_wiki {
+        update_stage(db, task.id, "importing", 92, "Importing wiki...").await?;
+        stats.wiki_pages_imported = import_wiki_pages(
+            db,
+            repo_id,
+            &wiki_clone_url(&task.source_url),
+            &wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
+            source_credentials(&task.platform, &task.source_url, token).as_ref(),
+            Some(task.user_id),
+        )
+        .await?;
+        update_stage(
+            db,
+            task.id,
+            "importing",
+            95,
+            &format!("Imported {} wiki pages", stats.wiki_pages_imported),
         )
         .await?;
     }
@@ -1029,6 +1078,331 @@ fn clone_repo(
 
     tracing::info!(path = %target_dir.display(), "Repository cloned");
     Ok(CloneOutcome::Cloned)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Wiki import
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The file extensions an imported wiki page may carry.
+///
+/// Both platforms keep a wiki as a gollum repository, and gollum renders
+/// textile, rdoc, org, creole and rst besides Markdown. A ForgeKeep wiki page
+/// is Markdown — that is what `wiki_pages.content` holds and what the page view
+/// renders — so a page written in one of the others would be stored as text
+/// this wiki then renders as something it is not. Those are counted and named
+/// in a warning rather than carried in under a format they are not written in.
+const WIKI_PAGE_EXTENSIONS: [&str; 2] = ["md", "markdown"];
+
+/// Page formats gollum renders and a ForgeKeep wiki page cannot hold.
+///
+/// Only used to tell "this repository holds pages we left behind" from "this
+/// repository holds the images its pages link to", which is the ordinary case
+/// and not worth a word.
+const FOREIGN_WIKI_PAGE_EXTENSIONS: [&str; 9] = [
+    "adoc",
+    "asciidoc",
+    "creole",
+    "mediawiki",
+    "org",
+    "pod",
+    "rdoc",
+    "rst",
+    "textile",
+];
+
+/// The largest wiki page this import reads into memory and into a row.
+///
+/// A wiki repository also holds whatever its authors attached to the pages, and
+/// `ls-tree -l` reports each object's size before anything is read — so an
+/// oversized page is named in a warning instead of travelling through the
+/// import process's heap.
+const MAX_WIKI_PAGE_BYTES: u64 = 1024 * 1024;
+
+/// The wiki repository that sits beside a source repository.
+///
+/// GitHub and GitLab both publish a repository's wiki as a *second* git
+/// repository one path suffix away — `<repo>.wiki.git`, same host, same
+/// credential — and neither serves page content through its REST API. So a wiki
+/// is imported the way a repository is: by cloning it.
+///
+/// Derived from the source URL the import was accepted for, which [`run_import`]
+/// has already put through [`crate::net::guard_git_url`]. Only the path changes
+/// here, so the host that guard approved is the host this clone reaches.
+fn wiki_clone_url(source_url: &str) -> String {
+    let base = source_url.trim_end_matches('/').trim_end_matches(".git");
+    format!("{base}.wiki.git")
+}
+
+/// Where a wiki clone is staged: beside the repository it belongs to, under a
+/// per-pass name, so two passes over one repository cannot share it and neither
+/// can collide with `<name>.git` itself. Mirrors [`clone_repo`]'s staging.
+fn wiki_staging_dir(repo_root: &Path, owner: &str, name: &str) -> PathBuf {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    repo_root.join(format!("{owner}/.{name}.wiki.git.importing-{token}"))
+}
+
+/// A page as the source wiki holds it.
+struct SourceWikiPage {
+    title: String,
+    content: String,
+}
+
+/// The title a wiki file is served under, or `None` when the file is not a page.
+///
+/// A page named `Foo Bar` is stored by both platforms as `Foo-Bar.md` and
+/// served at `/wiki/Foo-Bar`; `wiki_pages.title` is that same slug — it is what
+/// `/{owner}/{repo}/wiki/{title}` matches on. So the file's stem is kept
+/// verbatim rather than un-hyphenated into a display title: every `[[Foo-Bar]]`
+/// already written inside the imported pages keeps naming a page that exists.
+///
+/// A page in a subdirectory keeps its stem alone. The title is one URL segment
+/// and the unique key of a page within a repository, with nowhere to put the
+/// directory — so two pages that flatten onto one title are reported by the
+/// caller, never merged.
+fn wiki_page_title(path: &str) -> Option<&str> {
+    let file_name = path.rsplit('/').next()?;
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    WIKI_PAGE_EXTENSIONS
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        .then_some(stem)
+}
+
+/// Whether a file is a wiki page this import cannot carry, as opposed to an
+/// image or attachment the pages link to.
+fn is_foreign_wiki_page(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|file_name| file_name.rsplit_once('.'))
+        .is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && FOREIGN_WIKI_PAGE_EXTENSIONS
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+/// Read the Markdown pages a cloned wiki repository holds at `HEAD`.
+///
+/// A wiki that exists but was never written to is not an error: the platform
+/// hands out a repository with no commit in it, and an unborn `HEAD` has no
+/// tree to list.
+fn collect_wiki_pages(staging: &Path) -> Result<Vec<SourceWikiPage>> {
+    let git = global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    if rg_git::ref_advertisement::collect(staging)
+        .context("read the cloned source wiki")?
+        .head_oid
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+
+    let listing = git.run(&["ls-tree", "-r", "-l", "-z", "HEAD"], Some(staging))?;
+    listing
+        .ensure_success()
+        .context("list the source wiki's pages")?;
+
+    let mut pages = Vec::new();
+    let mut foreign = Vec::new();
+    for record in listing.stdout.split(|byte| *byte == 0) {
+        // `<mode> SP <type> SP <oid> SP <size> TAB <path>`: `-z` turns off the
+        // quoting that would otherwise mangle a path, and `-l` reports the size
+        // before the blob is read.
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (meta, path) = record.split_at(tab);
+        let meta = String::from_utf8_lossy(meta);
+        let mut fields = meta.split_whitespace();
+        let (Some(_mode), Some(kind), Some(_oid), Some(size)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if kind != "blob" {
+            continue;
+        }
+
+        let Ok(path) = std::str::from_utf8(&path[1..]) else {
+            tracing::warn!(
+                "a file of the source wiki has a path that is not UTF-8 and was not imported"
+            );
+            continue;
+        };
+        let Some(title) = wiki_page_title(path) else {
+            if is_foreign_wiki_page(path) {
+                foreign.push(path.to_string());
+            }
+            continue;
+        };
+
+        // An unparseable size is treated as too large: the guard exists so that
+        // nothing unbounded is read, and a field we cannot read is not a reason
+        // to read one.
+        if size.parse::<u64>().unwrap_or(u64::MAX) > MAX_WIKI_PAGE_BYTES {
+            tracing::warn!(
+                path,
+                size,
+                limit = MAX_WIKI_PAGE_BYTES,
+                "a source wiki page is larger than an import carries and was not imported"
+            );
+            continue;
+        }
+
+        // `cat-file blob` rather than `show`: the bytes as committed, with no
+        // filter of the host's able to rewrite them on the way out.
+        let blob = git.run(
+            &["cat-file", "blob", &format!("HEAD:{path}")],
+            Some(staging),
+        )?;
+        blob.ensure_success()
+            .with_context(|| format!("read the source wiki page {path}"))?;
+        let Ok(content) = String::from_utf8(blob.stdout) else {
+            tracing::warn!(
+                path,
+                "a source wiki page is not UTF-8 text and was not imported"
+            );
+            continue;
+        };
+
+        pages.push(SourceWikiPage {
+            title: title.to_string(),
+            content,
+        });
+    }
+
+    if !foreign.is_empty() {
+        tracing::warn!(
+            count = foreign.len(),
+            pages = %foreign.join(", "),
+            "the source wiki holds pages written in a markup a ForgeKeep wiki page does not \
+             render — they were not imported"
+        );
+    }
+
+    Ok(pages)
+}
+
+/// Render a wiki clone failure for the log with the source token taken back out
+/// of it — the same last-resort net [`failure_reason`] is, for the same reason:
+/// the token reaches `git` and the remote, so it can come back inside their
+/// error text.
+fn wiki_failure_reason(error: &anyhow::Error, credentials: Option<&GitCredentials>) -> String {
+    let reason = crate::net::mask_url_credentials(&format!("{error:#}"));
+    match credentials.map(|credentials| credentials.password().to_string()) {
+        Some(token) => crate::auth::encryption::mask_values(&reason, &[token]),
+        None => reason,
+    }
+}
+
+/// Clone a source wiki and create its pages in `repo_id`'s ForgeKeep wiki.
+/// Returns the number of pages created.
+///
+/// `staging` is a directory that does not exist yet: the wiki is cloned into it
+/// and it is removed again before this returns, on every path. It is the
+/// caller's to choose because the only place an import may write is the
+/// repository root it was handed.
+///
+/// ## A source that has no wiki
+///
+/// This is the one step of an import whose failure is not fatal. Both platforms
+/// answer a wiki that was never written with a plain clone failure, and there is
+/// no field to ask beforehand: GitHub's `has_wiki` is true for every repository
+/// whose wiki feature is merely *enabled*, which is the default, so it says
+/// nothing about whether `<repo>.wiki.git` exists. Failing the pass over that
+/// would mean ticking the box breaks the import of every repository that never
+/// wrote a wiki page — including the repository itself, which by then is already
+/// on disk. So a clone that does not come back is a warning naming the reason,
+/// and the import finishes reporting zero wiki pages.
+///
+/// Everything after the clone stays fatal: a wiki we did clone and then could
+/// not read, or could not write into the database, is our failure and is
+/// reported as one.
+pub async fn import_wiki_pages(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    wiki_url: &str,
+    staging: &Path,
+    credentials: Option<&GitCredentials>,
+    author_id: Option<i64>,
+) -> Result<usize> {
+    let parent = staging
+        .parent()
+        .context("wiki staging path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| path_error("wiki import directory", parent, &error, REPO_ROOT_HINT))?;
+
+    let git = global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let invocation = credential_invocation(credentials);
+    let destination = staging.to_string_lossy();
+    // `--depth 1`: only the pages as they stand are imported. A ForgeKeep wiki
+    // keeps its own revision history from the first edit onwards, and there is
+    // nowhere to put the source's.
+    let cloned = invocation
+        .run(
+            git,
+            &["clone", "--bare", "--depth", "1", wiki_url, &destination],
+            None,
+        )
+        .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
+    if let Err(error) = cloned {
+        discard_partial_clone(staging);
+        tracing::warn!(
+            repo_id,
+            reason = %wiki_failure_reason(&error, credentials),
+            "the source wiki could not be cloned — the import carried no wiki pages"
+        );
+        return Ok(0);
+    }
+
+    // Read first, then put the clone away whatever the read did: the staging
+    // directory is unreferenced bytes under the repository root from the moment
+    // the pages are in hand.
+    let pages = collect_wiki_pages(staging);
+    discard_partial_clone(staging);
+    let pages = pages?;
+
+    let mut imported = 0usize;
+    for page in &pages {
+        match crate::wiki::service::create_page(
+            db,
+            repo_id,
+            &page.title,
+            &page.content,
+            Some("Imported from the source wiki"),
+            author_id,
+        )
+        .await
+        {
+            Ok(_) => imported += 1,
+            // The target already holds a page under that title — either one of
+            // its own, or a second source file that flattens onto the same
+            // title. Neither is a reason to overwrite what is there, and both
+            // are worth naming.
+            Err(error) if error.downcast_ref::<crate::error::Conflict>().is_some() => {
+                tracing::warn!(
+                    repo_id,
+                    title = %page.title,
+                    "the target repository already holds a wiki page under this title — the \
+                     source page was not imported over it"
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("import the wiki page '{}'", page.title))
+            }
+        }
+    }
+
+    Ok(imported)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
