@@ -12,6 +12,7 @@ pub mod ci_environments;
 pub mod ci_oidc;
 pub mod ci_retention;
 pub mod ci_secrets;
+pub mod clearable;
 pub mod collaborators;
 pub mod deploy_keys;
 pub mod imports;

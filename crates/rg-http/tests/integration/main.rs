@@ -45,6 +45,7 @@ mod ci_oidc_tests;
 mod ci_permission_tests;
 mod ci_secrets_tag_protection_tests;
 mod ci_state_conflict_tests;
+mod clearable_patch_field_tests;
 mod collaborator_authz_tests;
 mod collaborator_tests;
 mod concurrent_delete_confirmation_tests;

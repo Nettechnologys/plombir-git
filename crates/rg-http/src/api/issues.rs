@@ -35,9 +35,11 @@ pub struct UpdateIssueRequest {
     pub state: Option<String>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
-    #[serde(default)]
+    // `null` clears the field; an absent key leaves it alone. See
+    // `crate::api::clearable` for why the attribute is load-bearing.
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
     pub assignee_id: Option<Option<i64>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
     pub milestone_id: Option<Option<i64>>,
 }
 
@@ -825,8 +827,12 @@ pub async fn get_milestone(
 #[derive(Deserialize)]
 pub struct UpdateMilestoneRequest {
     pub title: Option<String>,
+    // `null` clears the field; an absent key leaves it alone. See
+    // `crate::api::clearable` for why the attribute is load-bearing.
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
     pub description: Option<Option<String>>,
     pub state: Option<String>,
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
     pub due_date: Option<Option<String>>,
 }
 

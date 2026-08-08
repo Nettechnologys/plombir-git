@@ -574,12 +574,10 @@ async fn test_issue_assignee_id_must_resolve_to_a_user_who_can_read_the_repo() {
 
     // Neither rejection touched the row.
     //
-    // Clearing the assignee is deliberately not asserted here: `assignee_id:
-    // null` currently deserializes to "field absent" rather than "clear it"
-    // (`Option<Option<i64>>` without `double_option`), so there is no reachable
-    // clear path to guard yet. That is card_a156a521ca3b, and it is a separate
-    // defect from resolving the id — the check added here sits on
-    // `Some(Some(id))` and stays correct once `Some(None)` becomes reachable.
+    // Clearing the assignee is asserted by `clearable_patch_field_tests`, not
+    // here: this test is about resolving an id, and the check it added sits on
+    // `Some(Some(id))`, which a clear never reaches. `Some(None)` became
+    // reachable when card_a156a521ca3b landed.
     let issue: serde_json::Value = client
         .get(format!(
             "{base}/api/v1/repos/{owner}/{repo}/issues/{number}"

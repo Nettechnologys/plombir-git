@@ -27,8 +27,12 @@ use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateUserRequest {
-    pub display_name: Option<String>,
-    pub bio: Option<String>,
+    // `null` clears the field; an absent key leaves it alone. See
+    // `crate::api::clearable` for why the attribute is load-bearing.
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
+    pub display_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
+    pub bio: Option<Option<String>>,
     pub is_admin: Option<bool>,
     pub is_active: Option<bool>,
 }
@@ -187,8 +191,11 @@ pub async fn update_user(
         Err(error) => return AppError::from(error).into_response(),
     };
     let display_name_for_audit = body.display_name.clone();
-    let display_name = body.display_name.map(Some);
-    let bio = body.bio.map(Some);
+    // Passed through as they arrived: `map(Some)` used to fold an explicit
+    // `null` into "leave it alone", because serde had already collapsed it into
+    // the absent-field `None` one layer up (card_a156a521ca3b).
+    let display_name = body.display_name;
+    let bio = body.bio;
     let is_admin = body.is_admin;
     let is_active = body.is_active;
     match rg_core::user::service::update_user_admin(

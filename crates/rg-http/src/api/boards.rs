@@ -76,7 +76,13 @@ pub struct CreateCardRequest {
 pub struct UpdateCardRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // `null` detaches the card from its issue; an absent key leaves the link
+    // alone. See `crate::api::clearable` for why the attribute is load-bearing.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::clearable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub issue_id: Option<Option<i64>>,
 }
 
