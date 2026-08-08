@@ -34,6 +34,17 @@
   let editingSsoId = $state<number | null>(null);
   let ssoForm = $state<SsoProviderPayload>(emptySsoProviderForm());
 
+  // The slug decides which endpoints the backend can resolve, and which slugs
+  // are usable depends on the type — so the example has to follow the type
+  // rather than always suggesting `google`, which plain OAuth2 rejects.
+  const ssoSlugPlaceholder = $derived(
+    ssoForm.provider_type === 'ldap'
+      ? 'corp-ldap'
+      : ssoForm.provider_type === 'oidc'
+        ? 'keycloak'
+        : 'github',
+  );
+
   function emptySsoProviderForm(): SsoProviderPayload {
     return {
       name: '',
@@ -371,7 +382,15 @@
           </div>
           <div class="form-group">
             <label for="sso-slug">Slug</label>
-            <input id="sso-slug" type="text" bind:value={ssoForm.slug} placeholder="google" />
+            <input id="sso-slug" type="text" bind:value={ssoForm.slug} placeholder={ssoSlugPlaceholder} />
+            {#if ssoForm.provider_type === 'oauth2'}
+              <!--
+                The slug is not a label here: plain OAuth2 has no discovery
+                step, so the endpoints come from the built-in table and nothing
+                else. Saying which slugs it holds beats finding out from a 400.
+              -->
+              <p class="field-hint">Plain OAuth2 recognises <code>github</code> and <code>gitlab</code>. Anything else needs the OIDC type and a discovery URL.</p>
+            {/if}
           </div>
           <div class="form-group">
             <label for="sso-type">Type</label>
