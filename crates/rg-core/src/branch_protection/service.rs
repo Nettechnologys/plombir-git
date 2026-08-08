@@ -1,6 +1,6 @@
 //! Branch protection service — protected branches + required status checks.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 
@@ -245,44 +245,12 @@ pub async fn delete_protection_for_repo(
     delete_protection(db, protection_id).await
 }
 
-/// Check if a push to a branch is allowed.
-/// Returns Ok(()) if allowed, or Err with the reason if blocked.
-pub async fn check_push_allowed(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    branch_name: &str,
-    user_id: Option<i64>,
-) -> Result<()> {
-    let protection =
-        protected_branch_ops::find_rule_by_repo_and_branch(db, repo_id, branch_name).await?;
-
-    let Some(protection) = protection else {
-        // Not protected, push is allowed
-        return Ok(());
-    };
-
-    if user_id.is_some_and(|uid| protection.allowed_push_user_ids.contains(&uid)) {
-        return Ok(());
-    }
-
-    let protection = protection.protection;
-
-    if protection.require_pr {
-        bail!(
-            "push to protected branch '{}' is not allowed; open a pull request instead",
-            branch_name
-        );
-    }
-
-    if !protection.allow_force_push {
-        bail!(
-            "force push to protected branch '{}' is not allowed",
-            branch_name
-        );
-    }
-
-    Ok(())
-}
+// `check_push_allowed` used to live here: a second, drifted copy of the push
+// gate with no caller anywhere in the tree. The push path is
+// `push_rules::branch_protection_rejected_refs`, called from `git_http.rs`, and
+// it is the only one — deleted rather than kept "for later", because "for later"
+// is exactly the mechanism by which a second dialect of a gate comes back
+// (card_ab36709fa0c7, card_1d07a85117ac).
 
 /// Check if a PR merge is allowed under branch protection rules.
 pub async fn check_merge_allowed(
@@ -334,12 +302,12 @@ pub async fn check_merge_allowed(
             // lit up in the UI while every merge into the protected branch
             // went through with no CI checked at all.
             //
-            // Its sibling in `check_push_allowed` fails *closed* on the same
-            // shape of data — an unreadable allow-list refuses the push — and
-            // that is the whole difference: a broken row there costs someone
-            // an unexplained 403, here it costs the branch its protection.
-            // `?` makes an unreadable rule a server error, and a merge that
-            // cannot be checked does not happen.
+            // The push path (`push_rules::branch_protection_rejected_refs`)
+            // fails *closed* on the same shape of data — an unreadable
+            // allow-list refuses the push — and that is the whole difference: a
+            // broken row there costs someone an unexplained 403, here it costs
+            // the branch its protection. `?` makes an unreadable rule a server
+            // error, and a merge that cannot be checked does not happen.
             let required_checks: Vec<String> =
                 serde_json::from_str(checks_json).with_context(|| {
                     format!(

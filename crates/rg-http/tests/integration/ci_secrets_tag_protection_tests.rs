@@ -168,7 +168,7 @@ async fn branch_protection_persists_signed_commit_requirement() {
 /// `ActiveModel` built from it afterwards carried every field as `Unchanged`,
 /// so the `UPDATE` had no `SET` clause. The operator who just turned on
 /// `require_signed_commits` read that `200` as "the branch is protected now"
-/// while `check_push_allowed` kept enforcing the old rule — so the assertion
+/// while the push gate kept enforcing the old rule — so the assertion
 /// that matters is the re-read, not the status code.
 #[tokio::test]
 async fn branch_protection_patch_actually_writes_the_new_rule() {

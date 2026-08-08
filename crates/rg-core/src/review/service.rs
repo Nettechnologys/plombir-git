@@ -628,19 +628,12 @@ pub async fn list_comments_for_review(
     review_comment_ops::list_by_review(db, review_id).await
 }
 
-/// Check if a PR has enough approvals.
-pub async fn check_approval_status(
-    db: &DatabaseConnection,
-    pr_id: i64,
-    required_approvals: i64,
-) -> Result<bool> {
-    let pr = pull_request::Entity::find_by_id(pr_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| crate::error::not_found("pull request"))?;
-    let count = pr_review_ops::count_current_approvals(db, pr_id, pr.head_sha.as_deref()).await?;
-    Ok(count >= required_approvals)
-}
+// `check_approval_status` used to live here: "does this PR have enough
+// approvals", judged against a `required_approvals` handed in by the *caller*
+// and so detached from the branch-protection rule where that number actually
+// lives. It had no caller; the live answer is `branch_protection::service::
+// check_merge_allowed`, which reads the number off the rule
+// (card_ab36709fa0c7).
 
 // ── Helpers ───────────────────────────────────────────────────────────
 

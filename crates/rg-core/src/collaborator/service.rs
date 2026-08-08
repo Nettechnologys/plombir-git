@@ -172,25 +172,12 @@ pub async fn remove_collaborator(
     Ok(())
 }
 
-/// Get the effective permission for a user on a repo.
-/// Takes into account: repo owner (admin) + collaborator permission.
-/// Returns: "admin" | "write" | "read" | None
-pub async fn get_effective_permission(
-    db: &DatabaseConnection,
-    owner: &str,
-    repo_name: &str,
-    user_id: i64,
-) -> Result<Option<String>> {
-    let repo = resolve_repo(db, owner, repo_name).await?;
-
-    // Owner always has admin
-    if repo.owner_id == user_id {
-        return Ok(Some("admin".to_string()));
-    }
-
-    // Check collaborator
-    repo_collaborator_ops::get_permission(db, repo.id, user_id).await
-}
+// `get_effective_permission` used to live here: a second answer to "what may
+// this account do with this repository", returned as a bare
+// `"admin" | "write" | "read"` string, with no caller anywhere in the tree. The
+// live answer is `rg_http::api::repo_access`, which is a layer rather than a
+// string — deleted rather than kept for a future caller to find and adopt
+// (card_ab36709fa0c7).
 
 // ── Helpers ───────────────────────────────────────────────────────────
 

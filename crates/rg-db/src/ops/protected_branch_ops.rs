@@ -50,17 +50,11 @@ pub async fn find_by_repo_and_branch(
         .context("db: find protected branch by repo and branch")
 }
 
-/// Find a rule together with the relational allow-list used by push gates.
-pub async fn find_rule_by_repo_and_branch(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    branch_name: &str,
-) -> Result<Option<Rule>> {
-    match find_by_repo_and_branch(db, repo_id, branch_name).await? {
-        Some(protection) => with_grants(db, protection).await.map(Some),
-        None => Ok(None),
-    }
-}
+// `find_rule_by_repo_and_branch` used to live here. Its one caller was
+// `branch_protection::service::check_push_allowed`, the drifted second copy of
+// the push gate; the live path loads every rule of the repository at once
+// through `list_rules_by_repo`, because a push carries many refs
+// (card_ab36709fa0c7).
 
 /// List all protected branch rules for a repo.
 pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<ProtectedBranch>> {
