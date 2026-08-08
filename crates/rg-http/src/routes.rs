@@ -862,6 +862,11 @@ pub(crate) fn build_all_routes(
 
     // ── REST API routes ────────────────────────────────────────────────────
     let (api_v1, api_facts) = RouteTable::new("/api/v1")
+        // ── Instance ───────────────────────────────────────────────────────
+        // Public on purpose: the banner announces maintenance to the people it
+        // will affect, and behind the admin gate it reached none of them
+        // (card_801b8bcdb880).
+        .get(Public, "/instance", api::instance::get_instance)
         // ── Users ──────────────────────────────────────────────────────────
         .post_with(Public, "/users/register", api::users::register, &auth_rl)
         .post_with(Public, "/users/login", api::users::login, &auth_rl)

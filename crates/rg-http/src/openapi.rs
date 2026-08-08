@@ -553,6 +553,8 @@ pub(crate) fn stamp_security(
         // Admin settings
         crate::api::admin::get_settings,
         crate::api::admin::update_settings,
+        // The public half of them
+        crate::api::instance::get_instance,
         // AI Agent endpoints
         crate::api::ai::ai_repo_summary,
         crate::api::ai::ai_list_issues,
@@ -587,6 +589,7 @@ pub(crate) fn stamp_security(
     ),
     components(
         schemas(
+            crate::api::instance::InstanceInfo,
             crate::api::users::RegisterRequest,
             crate::api::users::LoginRequest,
             crate::api::users::AuthResponse,

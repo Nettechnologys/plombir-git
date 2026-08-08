@@ -9,6 +9,7 @@ import { locale, t } from '$lib/i18n';
 import { onMount } from 'svelte';
 import type { Snippet } from 'svelte';
 import { setBanner } from '$lib/stores/instance.svelte';
+import { instance } from '$lib/api/client.svelte';
 import { withBackendBase } from '$lib/api/_base';
 
   interface Props {
@@ -42,6 +43,28 @@ import { withBackendBase } from '$lib/api/_base';
       }
     } catch {
       setBanner(t('errors.backend_unreachable'), 'error');
+      return;
+    }
+    await loadInstanceBanner();
+  }
+
+  // Only after the health check has passed, and only on its success path: the
+  // banners above are about this browser failing to reach the backend, and an
+  // operator's announcement must not overwrite that diagnosis.
+  //
+  // Without this call the operator's banner had no reader at all — it lived
+  // behind `/admin/settings`, which answers 403 to everyone else and is not
+  // fetched on any other page (card_801b8bcdb880).
+  async function loadInstanceBanner() {
+    try {
+      const info = await instance.get();
+      if (info.banner_message) {
+        setBanner(info.banner_message, info.banner_type ?? 'info');
+      }
+    } catch {
+      // The instance has nothing to announce, or could not say so. Either way
+      // this is not the browser's problem to report — the health check above is
+      // what speaks about reachability.
     }
   }
 </script>

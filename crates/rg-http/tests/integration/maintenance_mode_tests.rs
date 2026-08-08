@@ -413,3 +413,76 @@ async fn maintenance_mode_allows_http_clone_and_fetch_but_rejects_push_with_503(
 
     server.abort();
 }
+
+/// card_801b8bcdb880: the banner has to reach the people it is about.
+///
+/// `banner_message` / `banner_type` were served only by `GET /admin/settings`,
+/// which answers `403` to everyone who is not an instance admin — so an
+/// operator's "planned maintenance at 22:00" was read by the admin who wrote
+/// it, in that page session, and by nobody else ever. `maintenance_mode` rides
+/// along for the same reason: a client that is about to be refused with `503`
+/// should be able to say why before it tries.
+///
+/// The anonymity of the request is the assertion. A version of this test that
+/// authenticated would pass against the admin-only endpoint too.
+#[tokio::test]
+async fn the_instance_banner_is_readable_without_logging_in() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let token = admin_token(&base, &db, "bannerop").await;
+
+    let quiet = client
+        .get(format!("{base}/api/v1/instance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(quiet.status(), 200, "{}", quiet.text().await.unwrap());
+    let quiet = quiet.json::<serde_json::Value>().await.unwrap();
+    assert!(
+        quiet["banner_message"].is_null(),
+        "an instance with no announcement must say so with null, not with a string: {quiet}"
+    );
+    assert_eq!(quiet["maintenance_mode"], false);
+
+    let set = client
+        .patch(format!("{base}/api/v1/admin/settings"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "banner_message": "planned maintenance at 22:00",
+            "banner_type": "warning",
+            "maintenance_mode": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200, "{}", set.text().await.unwrap());
+
+    // No bearer token: this is the browser of somebody who has not logged in,
+    // which is exactly the reader the admin endpoint refuses.
+    let announced = client
+        .get(format!("{base}/api/v1/instance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(announced.status(), 200);
+    let announced = announced.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(
+        announced["banner_message"], "planned maintenance at 22:00",
+        "an anonymous visitor must see the operator's announcement: {announced}"
+    );
+    assert_eq!(announced["banner_type"], "warning");
+    assert_eq!(announced["maintenance_mode"], true);
+
+    // The admin door still refuses the same caller, so the new route is an
+    // addition and not a hole punched through `require_instance_admin`.
+    let refused = client
+        .get(format!("{base}/api/v1/admin/settings"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        refused.status().is_client_error(),
+        "the admin settings endpoint must stay closed to anonymous callers, got {}",
+        refused.status()
+    );
+}

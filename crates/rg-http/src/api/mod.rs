@@ -16,6 +16,7 @@ pub mod clearable;
 pub mod collaborators;
 pub mod deploy_keys;
 pub mod imports;
+pub mod instance;
 pub mod issues;
 pub mod labels;
 pub mod lfs;
