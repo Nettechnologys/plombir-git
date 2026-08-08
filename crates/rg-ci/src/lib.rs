@@ -210,11 +210,23 @@ pub async fn trigger_pipeline(
     validate_execution_semantics(&config)?;
 
     // 2. Concurrency control
-    if let Some(ref concurrency) = config.concurrency {
-        let group =
-            rg_db::ops::pipeline_ops::resolve_concurrency_group(&concurrency.group, ref_name);
+    //
+    // The group is what the config asked to serialize on, so the group is what
+    // is looked up. This used to search by `ref_name`, which answered a
+    // different question in both directions: a fixed group such as
+    // `deploy-production`, shared by `main` and `release/*`, did not serialize
+    // across them — the very reason a fixed name is written — while two
+    // workflows declaring *different* groups on one branch cancelled each
+    // other's pipelines. Only pipelines carrying the same group are this
+    // trigger's business; a workflow that declared no `concurrency:` block
+    // carries `NULL` and is neither waited for nor cancelled.
+    let concurrency_group = config
+        .concurrency
+        .as_ref()
+        .map(|c| rg_db::ops::pipeline_ops::resolve_concurrency_group(&c.group, ref_name));
+    if let (Some(concurrency), Some(group)) = (config.concurrency.as_ref(), &concurrency_group) {
         let active =
-            rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(db, repo_id, ref_name).await?;
+            rg_db::ops::pipeline_ops::find_active_pipelines_by_group(db, repo_id, group).await?;
 
         if !active.is_empty() {
             if concurrency.cancel_in_progress {
@@ -289,6 +301,7 @@ pub async fn trigger_pipeline(
         ref_name,
         trigger_type,
         triggered_by,
+        concurrency_group: concurrency_group.as_deref(),
         config: &config,
     };
     let pipeline_id = match graph.create(&tx).await {
@@ -381,6 +394,11 @@ struct PipelineGraph<'a> {
     ref_name: &'a str,
     trigger_type: &'a str,
     triggered_by: Option<i64>,
+    /// The resolved `concurrency.group` this pipeline joins, or `None` when the
+    /// config declared no `concurrency:` block. Written onto the pipeline row so
+    /// the *next* trigger can find it — the group was previously computed,
+    /// logged, and thrown away (card_4c5214698ae9).
+    concurrency_group: Option<&'a str>,
     config: &'a CiConfig,
 }
 
@@ -392,13 +410,14 @@ impl PipelineGraph<'_> {
     /// jobs, a protected job not yet gated behind its environment — are never
     /// observable by a runner.
     async fn create(&self, tx: &sea_orm::DatabaseTransaction) -> Result<i64> {
-        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline_in_group(
             tx,
             self.repo_id,
             self.commit_sha,
             self.ref_name,
             self.trigger_type,
             self.triggered_by,
+            self.concurrency_group,
         )
         .await?;
 
@@ -1928,14 +1947,17 @@ mod matrix_tests {
         .await
         .unwrap();
 
-        // The in-progress pipeline the next push is supposed to replace.
-        let in_progress = rg_db::ops::pipeline_ops::create_pipeline(
+        // The in-progress pipeline the next push is supposed to replace. It has
+        // to carry the group the config resolves to (`${{ ref }}`), because the
+        // group — not the ref — is what the trigger looks up.
+        let in_progress = rg_db::ops::pipeline_ops::create_pipeline_in_group(
             &db,
             repo.id,
             &sha,
             "refs/heads/main",
             "push",
             Some(user.id),
+            Some("refs/heads/main"),
         )
         .await
         .unwrap();
@@ -2066,14 +2088,16 @@ mod matrix_tests {
         .await
         .unwrap();
 
-        // The pipeline that holds the group.
-        let in_progress = rg_db::ops::pipeline_ops::create_pipeline(
+        // The pipeline that holds the group — same resolved name the config
+        // under test declares.
+        let in_progress = rg_db::ops::pipeline_ops::create_pipeline_in_group(
             &db,
             repo.id,
             &sha,
             "refs/heads/main",
             "push",
             Some(user.id),
+            Some("refs/heads/main"),
         )
         .await
         .unwrap();
@@ -2176,6 +2200,174 @@ mod matrix_tests {
             "the failed write left nothing behind"
         );
         assert_eq!(in_progress.status, "pending");
+    }
+
+    /// card_4c5214698ae9: the group is what serializes, and only the group.
+    ///
+    /// `concurrency.group` was resolved, logged and thrown away — the search for
+    /// "what has to finish first" ran on `ref_name`. That is wrong in both
+    /// directions at once, so this drives both:
+    ///
+    /// * a fixed group shared by two branches has to serialize *across* them —
+    ///   writing `group: deploy-production` instead of `${{ ref }}` is precisely
+    ///   the request not to deploy two branches at the same time;
+    /// * a pipeline belonging to a *different* group on the same branch is
+    ///   somebody else's work and must survive untouched, even under
+    ///   `cancel_in_progress: true`.
+    #[tokio::test]
+    async fn concurrency_serializes_by_group_and_leaves_other_groups_alone() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"concurrency:\n  group: deploy-production\n  cancel_in_progress: true\nbuild:\n  script: [echo one]\n"
+                as &[u8],
+        )]);
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("group.db").display()
+        ))
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "group-owner",
+            "group@example.com",
+            "unused",
+            "Group Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("group".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        let trigger = |ref_name: &'static str| {
+            let db = db.clone();
+            let path = temp.path().to_path_buf();
+            let sha = sha.clone();
+            let repo_id = repo.id;
+            let user_id = user.id;
+            async move {
+                trigger_pipeline(
+                    TriggerPipelineParams {
+                        db: &db,
+                        repo_path: &path,
+                        repo_id,
+                        commit_sha: &sha,
+                        ref_name,
+                        trigger_type: "push",
+                        base_branch: None,
+                        previous_sha: None,
+                        triggered_by: Some(user_id),
+                        docker_enabled: false,
+                        external_runners: true,
+                        allow_host_runner: false,
+                        jwt_secret: Some("secret"),
+                        encryption_key: Some("secret"),
+                        external_url: None,
+                    },
+                    &CiNotifications::default(),
+                )
+                .await
+            }
+        };
+
+        let seed = |ref_name: &'static str, group: &'static str| {
+            let db = db.clone();
+            let sha = sha.clone();
+            let repo_id = repo.id;
+            let user_id = user.id;
+            async move {
+                rg_db::ops::pipeline_ops::create_pipeline_in_group(
+                    &db,
+                    repo_id,
+                    &sha,
+                    ref_name,
+                    "push",
+                    Some(user_id),
+                    Some(group),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let status = |id: i64| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::pipeline_ops::get_pipeline(&db, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+            }
+        };
+
+        // A deploy already running on `main`, and somebody else's nightly audit
+        // on the very same branch under its own group.
+        let deploy_on_main = seed("refs/heads/main", "deploy-production").await;
+        let stranger = seed("refs/heads/main", "nightly-audit").await;
+
+        // The push lands on a *different* branch, and the group is a fixed name
+        // both branches declare. Matching on the ref found nothing here, so two
+        // deploys of the same environment ran side by side.
+        let on_release = trigger("refs/heads/release")
+            .await
+            .expect("a cancelling group lets the replacement start");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, on_release)
+                .await
+                .unwrap()
+                .unwrap()
+                .concurrency_group
+                .as_deref(),
+            Some("deploy-production"),
+            "the resolved group has to be recorded, or the next trigger cannot find it"
+        );
+        assert_eq!(
+            status(deploy_on_main.id).await,
+            "canceled",
+            "a fixed group did not serialize across branches — the ref, not the group, was matched"
+        );
+        assert_eq!(
+            status(stranger.id).await,
+            "pending",
+            "another group's pipeline was cancelled by a trigger that never named it"
+        );
+
+        // The other direction, on one branch: a push to `main` cancels the
+        // deploy it replaces and still leaves the nightly audit alone, even
+        // though all three share the ref.
+        let deploy_again = seed("refs/heads/main", "deploy-production").await;
+        trigger("refs/heads/main").await.expect("push builds");
+        assert_eq!(
+            status(deploy_again.id).await,
+            "canceled",
+            "the pipeline of this very group survived a cancelling trigger"
+        );
+        assert_eq!(
+            status(stranger.id).await,
+            "pending",
+            "a same-branch pipeline of another group was cancelled"
+        );
     }
 
     #[test]

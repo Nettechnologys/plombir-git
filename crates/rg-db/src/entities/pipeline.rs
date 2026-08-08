@@ -14,6 +14,13 @@ pub struct Model {
     pub status: String,       // pending, running, success, failed, canceled
     pub trigger_type: String, // push, manual, webhook
     pub triggered_by: Option<i64>,
+    /// The resolved `concurrency.group` this pipeline belongs to, or `None` when
+    /// its workflow declared no `concurrency:` block.
+    ///
+    /// This is what "what does this pipeline have to wait for" is answered
+    /// from. `None` neither waits nor is waited for: a workflow that asked for
+    /// no serialization must not be cancelled by one that did (card_4c5214698ae9).
+    pub concurrency_group: Option<String>,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
     pub created_at: DateTime,

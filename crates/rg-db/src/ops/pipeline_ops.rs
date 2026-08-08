@@ -23,6 +23,35 @@ pub async fn create_pipeline(
     trigger_type: &str,
     triggered_by: Option<i64>,
 ) -> Result<pipeline::Model> {
+    create_pipeline_in_group(
+        db,
+        repo_id,
+        commit_sha,
+        ref_name,
+        trigger_type,
+        triggered_by,
+        None,
+    )
+    .await
+}
+
+/// Create a pipeline that belongs to a `concurrency.group`.
+///
+/// Same row as [`create_pipeline`], plus the resolved group name — the value
+/// [`find_active_pipelines_by_group`] matches on. `None` is the honest default
+/// for a workflow with no `concurrency:` block, which is why `create_pipeline`
+/// stays the plain spelling: a pipeline that asked for no serialization must
+/// neither wait for a group nor be cancelled by one.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_pipeline_in_group(
+    db: &impl ConnectionTrait,
+    repo_id: i64,
+    commit_sha: &str,
+    ref_name: &str,
+    trigger_type: &str,
+    triggered_by: Option<i64>,
+    concurrency_group: Option<&str>,
+) -> Result<pipeline::Model> {
     let now = chrono::Utc::now().naive_utc();
     let model = pipeline::ActiveModel {
         repo_id: Set(repo_id),
@@ -31,6 +60,7 @@ pub async fn create_pipeline(
         status: Set("pending".to_string()),
         trigger_type: Set(trigger_type.to_string()),
         triggered_by: Set(triggered_by),
+        concurrency_group: Set(concurrency_group.map(str::to_string)),
         started_at: Set(None),
         finished_at: Set(None),
         created_at: Set(now),
@@ -946,8 +976,40 @@ pub async fn count_active_pipelines(db: &DatabaseConnection, repo_id: i64) -> Re
     Ok(count)
 }
 
+/// Find active pipelines belonging to a `concurrency.group`.
+///
+/// This is the question `concurrency:` actually asks, and it is not the same
+/// question as "what else is running on this branch" (card_4c5214698ae9). A
+/// fixed group such as `deploy-production` is shared *across* refs and must
+/// serialize across them; two workflows that declare different groups on one ref
+/// must not touch each other's pipelines.
+///
+/// A `NULL` group can never match: a workflow that declared no `concurrency:`
+/// block is not part of anyone's group, so it is neither waited for nor
+/// cancelled. `Column::ConcurrencyGroup.eq(group)` is already `NULL`-safe in SQL
+/// — `NULL = 'x'` is unknown, not true — but the guarantee is stated here
+/// because it is the half of the fix that prevents *over*-cancelling.
+pub async fn find_active_pipelines_by_group(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    group: &str,
+) -> Result<Vec<pipeline::Model>> {
+    pipeline::Entity::find()
+        .filter(pipeline::Column::RepoId.eq(repo_id))
+        .filter(pipeline::Column::ConcurrencyGroup.eq(group))
+        .filter(pipeline::Column::Status.is_in([
+            "pending",
+            "running",
+            "manual",
+            "waiting_approval",
+        ]))
+        .order_by_asc(pipeline::Column::Id)
+        .all(db)
+        .await
+        .context("db: find active pipelines by concurrency group")
+}
+
 /// Find active pipelines on a specific git ref (branch/tag).
-/// Used for concurrency control by ref name.
 pub async fn find_active_pipelines_by_ref(
     db: &DatabaseConnection,
     repo_id: i64,
