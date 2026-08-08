@@ -375,55 +375,72 @@
           </div>
           <div class="form-group">
             <label for="sso-type">Type</label>
+            <!--
+              `oidc` is a distinct type on the backend, not a synonym of
+              `oauth2`: only `oidc` reads `discovery_url`, while `oauth2`
+              resolves endpoints from the built-in table, which holds github
+              and gitlab and nothing else. One combined "OAuth2 / OIDC" option
+              meant the Discovery URL below could be filled in but never read,
+              and a self-hosted IdP was unreachable from this form entirely.
+            -->
             <select id="sso-type" bind:value={ssoForm.provider_type}>
-              <option value="oauth2">OAuth2 / OIDC</option>
+              <option value="oauth2">OAuth2 (GitHub / GitLab)</option>
+              <option value="oidc">OIDC (discovery URL)</option>
               <option value="ldap">LDAP</option>
             </select>
           </div>
-          <div class="form-group">
-            <label for="sso-client-id">Client ID</label>
-            <input id="sso-client-id" type="text" bind:value={ssoForm.client_id} />
-          </div>
-          <div class="form-group">
-            <label for="sso-client-secret">Client Secret</label>
-            <input id="sso-client-secret" type="password" bind:value={ssoForm.client_secret} placeholder={editingSsoId ? 'Leave blank to keep existing secret' : ''} />
-          </div>
-          <div class="form-group">
-            <label for="sso-discovery-url">Discovery URL</label>
-            <input id="sso-discovery-url" type="url" bind:value={ssoForm.discovery_url} />
-          </div>
-          <div class="form-group">
-            <label for="sso-scopes">Scopes</label>
-            <input id="sso-scopes" type="text" bind:value={ssoForm.scopes} />
-          </div>
+          {#if ssoForm.provider_type !== 'ldap'}
+            <div class="form-group">
+              <label for="sso-client-id">Client ID</label>
+              <input id="sso-client-id" type="text" bind:value={ssoForm.client_id} />
+            </div>
+            <div class="form-group">
+              <label for="sso-client-secret">Client Secret</label>
+              <input id="sso-client-secret" type="password" bind:value={ssoForm.client_secret} placeholder={editingSsoId ? 'Leave blank to keep existing secret' : ''} />
+            </div>
+          {/if}
+          {#if ssoForm.provider_type === 'oidc'}
+            <div class="form-group">
+              <label for="sso-discovery-url">Discovery URL</label>
+              <input id="sso-discovery-url" type="url" bind:value={ssoForm.discovery_url} placeholder="https://idp.example.com/.well-known/openid-configuration" />
+            </div>
+          {/if}
+          {#if ssoForm.provider_type !== 'ldap'}
+            <div class="form-group">
+              <label for="sso-scopes">Scopes</label>
+              <input id="sso-scopes" type="text" bind:value={ssoForm.scopes} />
+            </div>
+          {/if}
           <div class="form-group">
             <label for="sso-icon-url">Icon URL</label>
             <input id="sso-icon-url" type="url" bind:value={ssoForm.icon_url} />
           </div>
-          <div class="form-group">
-            <label for="sso-ldap-host">LDAP Host</label>
-            <input id="sso-ldap-host" type="text" bind:value={ssoForm.ldap_host} placeholder="ldap.example.com (LDAPS by default)" />
-          </div>
-          <div class="form-group">
-            <label for="sso-ldap-port">LDAP Port</label>
-            <input id="sso-ldap-port" type="number" min="1" bind:value={ssoForm.ldap_port} />
-          </div>
-          <div class="form-group">
-            <label for="sso-ldap-bind-dn">LDAP Bind DN</label>
-            <input id="sso-ldap-bind-dn" type="text" bind:value={ssoForm.ldap_bind_dn} />
-          </div>
-          <div class="form-group">
-            <label for="sso-ldap-bind-password">LDAP Bind Password</label>
-            <input id="sso-ldap-bind-password" type="password" bind:value={ssoForm.ldap_bind_password} placeholder={editingSsoId ? 'Leave blank to keep existing password' : ''} />
-          </div>
-          <div class="form-group">
-            <label for="sso-ldap-base-dn">LDAP Base DN</label>
-            <input id="sso-ldap-base-dn" type="text" bind:value={ssoForm.ldap_base_dn} />
-          </div>
-          <div class="form-group">
-            <label for="sso-ldap-filter">LDAP User Filter</label>
-            <input id="sso-ldap-filter" type="text" bind:value={ssoForm.ldap_user_filter} placeholder={'(uid={username})'} />
-          </div>
+          {#if ssoForm.provider_type === 'ldap'}
+            <div class="form-group">
+              <label for="sso-ldap-host">LDAP Host</label>
+              <input id="sso-ldap-host" type="text" bind:value={ssoForm.ldap_host} placeholder="ldap.example.com (LDAPS by default)" />
+            </div>
+            <div class="form-group">
+              <label for="sso-ldap-port">LDAP Port</label>
+              <input id="sso-ldap-port" type="number" min="1" bind:value={ssoForm.ldap_port} />
+            </div>
+            <div class="form-group">
+              <label for="sso-ldap-bind-dn">LDAP Bind DN</label>
+              <input id="sso-ldap-bind-dn" type="text" bind:value={ssoForm.ldap_bind_dn} />
+            </div>
+            <div class="form-group">
+              <label for="sso-ldap-bind-password">LDAP Bind Password</label>
+              <input id="sso-ldap-bind-password" type="password" bind:value={ssoForm.ldap_bind_password} placeholder={editingSsoId ? 'Leave blank to keep existing password' : ''} />
+            </div>
+            <div class="form-group">
+              <label for="sso-ldap-base-dn">LDAP Base DN</label>
+              <input id="sso-ldap-base-dn" type="text" bind:value={ssoForm.ldap_base_dn} />
+            </div>
+            <div class="form-group">
+              <label for="sso-ldap-filter">LDAP User Filter</label>
+              <input id="sso-ldap-filter" type="text" bind:value={ssoForm.ldap_user_filter} placeholder={'(uid={username})'} />
+            </div>
+          {/if}
         </div>
         <div class="toggle-row">
           <input id="sso-enabled" type="checkbox" bind:checked={ssoForm.enabled} />

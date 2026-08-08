@@ -99,11 +99,17 @@ export interface AdminSettings {
   banner_type: 'info' | 'warning' | 'error';
 }
 
+/// The provider kinds `validate_sso_provider_request` accepts, spelled out so a
+/// typo in the admin form is a compile error rather than a `400` the operator
+/// discovers. `oidc` is not a synonym of `oauth2`: only `oidc` reads
+/// `discovery_url`; `oauth2` resolves its endpoints from the built-in table.
+export type SsoProviderType = 'oauth2' | 'oidc' | 'ldap';
+
 export interface AdminSsoProvider {
   id: number;
   name: string;
   slug: string;
-  provider_type: string;
+  provider_type: SsoProviderType;
   client_id: string | null;
   discovery_url: string | null;
   scopes: string | null;
@@ -123,7 +129,7 @@ export interface AdminSsoProvider {
 export interface SsoProviderPayload {
   name: string;
   slug: string;
-  provider_type?: string;
+  provider_type?: SsoProviderType;
   client_id?: string;
   client_secret?: string;
   discovery_url?: string;
