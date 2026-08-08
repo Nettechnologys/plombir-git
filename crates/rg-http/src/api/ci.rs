@@ -72,8 +72,18 @@ struct StageWithJobsResponse {
     jobs: Vec<JobResponse>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct TriggerPipelineRequest {
+    /// The ref to build: `refs/heads/…` / `refs/tags/…` verbatim, a bare name
+    /// read as a branch. Absent or empty → the repository's default branch.
+    ///
+    /// The wire name is `ref`, which is what every client and every other
+    /// trigger path in this codebase calls it. It used to be `ref_name` on the
+    /// struct with no rename, so `serde` filled it with `None` for every request
+    /// the web client sent and the handler silently built something else
+    /// (`card_64804da48693`). `ref_name` stays accepted as an alias so a caller
+    /// written against the old struct name is not broken by the fix.
+    #[serde(rename = "ref", alias = "ref_name")]
     ref_name: Option<String>,
 }
 
@@ -403,7 +413,7 @@ pub async fn play_job(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
     ),
-    request_body(content = serde_json::Value),
+    request_body = TriggerPipelineRequest,
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
@@ -437,14 +447,32 @@ pub async fn trigger_pipeline(
         return AppError::from(e).into_response();
     }
 
-    // Resolve HEAD commit SHA
-    let ref_name = body
-        .ref_name
-        .unwrap_or_else(|| "refs/heads/main".to_string());
+    // The ref to build. A literal `refs/heads/main` used to stand in for
+    // "nothing was asked for", so a repository whose default branch is
+    // `develop` answered `400` about a branch its caller never named — while
+    // the branch it should have used was sitting in the row the gate had
+    // already read.
+    let requested = body.ref_name.as_deref().map(str::trim).unwrap_or_default();
+    let ref_name = if requested.is_empty() {
+        repo.default_branch.as_str()
+    } else {
+        requested
+    };
+    // Canonical form for everything downstream: the pipeline row records it,
+    // and `on:` filters read `refs/tags/` off it to tell a tag from a branch.
+    let ref_name = if ref_name.starts_with("refs/") {
+        ref_name.to_string()
+    } else {
+        format!("refs/heads/{ref_name}")
+    };
     let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
         Ok(Some(sha)) => sha,
         Ok(None) => {
-            return AppError::bad_request("cannot resolve commit SHA for ref").into_response()
+            // Naming the ref is the whole point: the caller has to be able to
+            // tell "the branch I asked for is gone" from "the default branch
+            // this repository records does not exist".
+            return AppError::bad_request(format!("cannot resolve commit SHA for ref {ref_name}"))
+                .into_response();
         }
         Err(e) => return AppError::from(e).into_response(),
     };

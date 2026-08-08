@@ -625,6 +625,15 @@ const KNOWN_BODY_CONTRACTS = [
     required: ['action'],
     forbidden: ['verdict'],
   },
+  {
+    // The branch a manual run is asked for. The backend read `ref_name` while
+    // the client sent `ref`, so every trigger fell through to a hardcoded
+    // `refs/heads/main` (card_64804da48693).
+    method: 'post',
+    path: '/repos/{owner}/{repo}/pipelines',
+    required: ['ref'],
+    forbidden: ['ref_name'],
+  },
 ];
 
 function equivalentParam(left, right) {
@@ -720,6 +729,14 @@ function extractBody(cfg) {
   let km;
   while ((km = keyRe.exec(body)) !== null) {
     keys.push(km[1]);
+  }
+  // Shorthand properties carry no colon, so the scan above walked straight past
+  // `JSON.stringify({ ref })` and reported a body with no fields at all — which
+  // is exactly the shape the pipeline trigger uses, and exactly the shape whose
+  // field name went unchecked while the backend read a different one.
+  const shorthandRe = /(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?=,|$)/g;
+  while ((km = shorthandRe.exec(body)) !== null) {
+    if (!keys.includes(km[1])) keys.push(km[1]);
   }
   return { present: true, keys, dynamic: false };
 }
