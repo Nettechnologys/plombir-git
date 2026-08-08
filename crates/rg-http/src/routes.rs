@@ -804,6 +804,15 @@ fn rubygems_protocol_routes(table: RouteTable) -> RouteTable {
             "/repos/{owner}/{name}/packages/rubygems/gems/{filename}",
             api::packages::rubygems_gem_download,
         )
+        // The write side. `gem push` derives this URL from the same `--host`
+        // the read routes above hang off, and sends the `.gem` as the body —
+        // there was no route under it to reach at all, so a gem could be
+        // installed from ForgeKeep but never pushed to it (card_11a578ae1820).
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/rubygems/api/v1/gems",
+            api::packages::rubygems_push,
+        )
 }
 
 /// Build every route the server serves, and the access level of each.

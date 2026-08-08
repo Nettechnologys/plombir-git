@@ -2526,3 +2526,105 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
         );
     }
 }
+
+/// `gem push` reaches the registry at the URL it derives from `--host`, and
+/// what it pushed is resolvable and downloadable afterwards.
+///
+/// The read side was finished first (card_01ee27252197), which left the gem the
+/// odd one out: installable from ForgeKeep, never publishable to it, because
+/// nothing under `/packages/rubygems/` answered a `POST` at all
+/// (card_11a578ae1820). The download half is asserted here and not taken on
+/// trust: `gem push` sends no filename, and the name the file is stored under is
+/// the only thing `Gem::RemoteFetcher#download` can ask for.
+#[tokio::test]
+async fn rubygems_pushes_the_way_gem_push_sends_it() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let gem_metadata = b"name: matrix-push-gem\nversion: 2.1.0\nsummary: pushed by gem push\n";
+    let gem_file = tar_archive(&[("metadata.gz", &gzip(gem_metadata))]);
+
+    // The whole request: the `.gem` as the body, no `Content-Disposition`, and
+    // the api key out of `~/.gem/credentials` with no `Bearer` in front of it.
+    let pushed = client
+        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(gem_file.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pushed.status(),
+        StatusCode::CREATED,
+        "`gem push` could not reach the registry its --host names"
+    );
+    assert!(
+        pushed
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/plain")),
+        "`gem` prints the body of a 2xx verbatim, so it must not be JSON"
+    );
+    let said = pushed.text().await.unwrap();
+    assert!(
+        said.contains("matrix-push-gem") && said.contains("2.1.0"),
+        "the line `gem push` prints back should name what was published: {said}"
+    );
+
+    // The version has to be resolvable through the file a modern client reads.
+    let info = client
+        .get(package_url(&base, &["rubygems", "info", "matrix-push-gem"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.status(), StatusCode::OK);
+    let info = info.text().await.unwrap();
+    assert!(
+        info.lines().any(|line| line.starts_with("2.1.0")),
+        "the pushed version never reached the compact index: {info}"
+    );
+
+    // ...and downloadable at the path the client builds on its own. This is
+    // what the derived filename buys: stored under the `Content-Disposition`
+    // fallback the gem would sit in the registry under the name `package`.
+    let downloaded = client
+        .get(package_url(
+            &base,
+            &["rubygems", "gems", "matrix-push-gem-2.1.0.gem"],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        downloaded.status(),
+        StatusCode::OK,
+        "the pushed gem is not at the only path `gem install` will ask for"
+    );
+    assert_eq!(
+        downloaded.bytes().await.unwrap().as_ref(),
+        gem_file.as_slice()
+    );
+
+    // A body that is not a gem is refused before anything is stored.
+    let rejected = client
+        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(vec![0u8; 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    // And an anonymous push is a push nobody made.
+    let anonymous = client
+        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .body(gem_file)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}

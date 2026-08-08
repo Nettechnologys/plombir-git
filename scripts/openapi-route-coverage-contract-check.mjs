@@ -135,6 +135,7 @@ const UNDOCUMENTED = new Map([
   ['api::packages::rubygems_dependencies', 'RubyGems dependency API — layout fixed by gem/bundler'],
   ['api::packages::rubygems_gem_info', 'RubyGems v1 gem info — layout fixed by gem/bundler'],
   ['api::packages::rubygems_gem_download', 'RubyGems .gem download path — derived by the client from the source URL'],
+  ['api::packages::rubygems_push', 'RubyGems write API — the verb, URL and bare-body upload are fixed by `gem push`'],
 ]);
 
 // Handlers the spec advertises that no route mounts.

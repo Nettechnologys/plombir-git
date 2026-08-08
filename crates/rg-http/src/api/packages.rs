@@ -2603,6 +2603,87 @@ pub async fn rubygems_gem_download(
     )
 }
 
+// ── RubyGems write API ────────────────────────────────────
+//
+// The read side was completed long before this existed (card_01ee27252197), so
+// a gem could be resolved and installed from ForgeKeep but never put there by
+// the tool that builds it (card_11a578ae1820).
+
+/// POST /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems
+///
+/// What `gem push <file> --host <source>` sends: the `.gem` as the entire body,
+/// no `Content-Disposition` naming it, and the API key out of
+/// `~/.gem/credentials` in a scheme-less `Authorization` header — the spelling
+/// the PAT middleware learned for cargo (card_5a790cc6ac35), which is why this
+/// route can sit behind the ordinary [`RepoWrite`] gate.
+///
+/// The stored filename is therefore ours to derive, and it is not cosmetic:
+/// `Gem::RemoteFetcher#download` asks for `gems/{name}-{version}.gem`, and
+/// [`rubygems_gem_download`] resolves a file by the name it was published
+/// under. Routing this through the generic publish handler instead would have
+/// stored the gem as `package` — the `Content-Disposition` fallback — leaving
+/// it undownloadable by the very client that pushed it.
+///
+/// The answer is `text/plain` because `gem` prints the body of a 2xx verbatim
+/// as the server's word on the push; the generic publish envelope would reach
+/// the user as a line of JSON. A failure is passed through as it came, since
+/// the client prints that body just as literally and the shared classifier's
+/// message is the informative part.
+pub async fn rubygems_push(
+    State(state): State<AppState>,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
+    Path((owner, name)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let Some(adapter) = rg_core::package_registry::get_adapter("rubygems") else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the rubygems adapter is not registered",
+        );
+    };
+
+    // Read the gemspec here rather than letting `publish_package` do it,
+    // because the name and version are what the filename is built from and the
+    // filename has to be settled before the upload is described at all.
+    let meta = match adapter.extract_metadata("package.gem", &body) {
+        Ok(meta) => meta,
+        Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    let (gem_name, version) = (meta.name.clone(), meta.version.clone());
+    let filename = format!("{gem_name}-{version}.gem");
+
+    let published = publish_package(
+        state,
+        user_id,
+        owner,
+        name,
+        "rubygems".to_string(),
+        PublishPackageQuery {
+            name: Some(gem_name.clone()),
+            version: Some(version.clone()),
+            description: None,
+            homepage: None,
+            repository_url: None,
+            semver: None,
+        },
+        filename,
+        body,
+    )
+    .await;
+
+    if !published.status().is_success() {
+        return published;
+    }
+    (
+        published.status(),
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("Successfully registered gem: {gem_name} ({version})\n"),
+    )
+        .into_response()
+}
+
 /// The gems published to a repository, or nothing at all.
 ///
 /// A repository that never enabled the registry is not an error on these
