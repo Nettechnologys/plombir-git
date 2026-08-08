@@ -24,6 +24,10 @@ pub struct RetentionPolicyRequest {
 pub struct CleanupResponse {
     pub artifacts_deleted: u64,
     pub caches_deleted: u64,
+    /// Abandoned OCI blob-upload sessions whose 24h TTL has passed. Not a CI
+    /// artifact, but it is the same question — storage whose retention window
+    /// closed — and this is the pass that already asks it hourly.
+    pub oci_uploads_deleted: u64,
     pub failures: u64,
 }
 
@@ -196,6 +200,75 @@ pub async fn cleanup_expired_storage(
         }
         summary.caches_deleted += 1;
     }
+
+    // Abandoned `docker push` sessions. `create_upload` has always stamped a
+    // 24h `expires_at`, and until now nothing ever read it: a dropped
+    // connection left both the `oci_upload` row and a staging directory holding
+    // every layer byte already sent, and the disk leaked by exactly that much
+    // forever (card_487dc1247247). This is the same sweep the CI retention
+    // already runs, on the same schedule and behind the same route, because a
+    // second scheduler for one more TTL is how the first one stops being the
+    // place anybody looks.
+    for (upload, oci_repo) in rg_db::ops::oci_ops::list_expired_uploads(&state.db).await? {
+        // `oci_repository.repo_id` is the ForgeKeep repository id, so the routed
+        // per-repository cleanup filters on it directly — no second lookup that
+        // could resolve differently from the one the row was written with.
+        if repo_filter.is_some_and(|repo_id| repo_id != oci_repo.repo_id) {
+            continue;
+        }
+        // The namespace column is `{owner}/{repo}` — the same string the push
+        // built its staging path from. Splitting it is deliberate: deriving
+        // `owner` and `repo` from anywhere else risks a path that points at
+        // nothing, and `delete_upload` tolerates an absent directory (it has to,
+        // so a retry is free), so a wrong path would report success and leave
+        // the bytes exactly where they were.
+        let Some((owner, repo)) = oci_repo.namespace.split_once('/') else {
+            summary.failures += 1;
+            tracing::error!(
+                upload_uuid = %upload.uuid,
+                namespace = %oci_repo.namespace,
+                "expired OCI upload session kept: its repository namespace is not owner/repo, so \
+                 the staging path cannot be built"
+            );
+            continue;
+        };
+
+        // Bytes first, row second, and the order is the whole argument. There is
+        // nothing to compensate here — the session is dead either way — so the
+        // only question is which failure is recoverable. A directory that will
+        // not delete leaves the row, and the next pass tries again; a row
+        // deleted ahead of the directory leaves bytes nothing in the database
+        // names, and no pass ever comes back for them.
+        if let Err(error) = state
+            .oci_storage
+            .delete_upload(owner, repo, &upload.uuid)
+            .await
+        {
+            summary.failures += 1;
+            tracing::error!(
+                upload_uuid = %upload.uuid,
+                repo_id = oci_repo.repo_id,
+                error = %format!("{error:#}"),
+                "expired OCI upload session kept: its staged chunks could not be removed, and dropping the row would strand them"
+            );
+            continue;
+        }
+        if let Err(error) =
+            rg_db::ops::oci_ops::delete_upload(&state.db, upload.oci_repository_id, &upload.uuid)
+                .await
+        {
+            summary.failures += 1;
+            tracing::error!(
+                upload_uuid = %upload.uuid,
+                repo_id = oci_repo.repo_id,
+                error = %format!("{error:#}"),
+                "expired OCI upload session: its chunks are gone but the row remains, and the next pass will retry"
+            );
+            continue;
+        }
+        summary.oci_uploads_deleted += 1;
+    }
+
     Ok(summary)
 }
 
@@ -368,11 +441,13 @@ pub async fn run_cleanup_loop(
             Ok(summary)
                 if summary.artifacts_deleted > 0
                     || summary.caches_deleted > 0
+                    || summary.oci_uploads_deleted > 0
                     || summary.failures > 0 =>
             {
                 tracing::info!(
                     artifacts = summary.artifacts_deleted,
                     caches = summary.caches_deleted,
+                    oci_uploads = summary.oci_uploads_deleted,
                     failures = summary.failures,
                     "CI retention cleanup completed"
                 )

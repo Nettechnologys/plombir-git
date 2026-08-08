@@ -565,15 +565,40 @@ pub async fn delete_upload(
     Ok(result.rows_affected)
 }
 
-/// Clean up expired uploads.
-pub async fn cleanup_expired_uploads(db: &DatabaseConnection) -> Result<u64, DbErr> {
+/// Upload sessions whose 24h TTL has passed, each with the repository it
+/// belongs to.
+///
+/// Returns rows rather than deleting them, and that is the whole point. The
+/// predecessor was a bulk `DELETE ... WHERE expires_at < now` — which nobody
+/// ever called, and which would have been wrong if they had: an abandoned
+/// `docker push` leaves both a row and a staging directory of already-uploaded
+/// layer bytes, and dropping the row first strands the bytes with nothing left
+/// in the database that names them (card_487dc1247247). The sweep needs the
+/// `oci_repository` beside each row because the staging path is keyed by
+/// `{owner}/{repo}/{uuid}`, not by the row's id.
+pub async fn list_expired_uploads(
+    db: &DatabaseConnection,
+) -> Result<Vec<(oci_upload::Model, oci_repository::Model)>, DbErr> {
+    use oci_repository::Entity as OciRepo;
     use oci_upload::Entity as Upload;
-    let now = Utc::now();
-    let result = Upload::delete_many()
-        .filter(oci_upload::Column::ExpiresAt.lt(now))
-        .exec(db)
+
+    let expired = Upload::find()
+        .filter(oci_upload::Column::ExpiresAt.lt(Utc::now()))
+        .order_by_asc(oci_upload::Column::Id)
+        .all(db)
         .await?;
-    Ok(result.rows_affected)
+
+    let mut rows = Vec::with_capacity(expired.len());
+    for upload in expired {
+        // A session whose repository row is gone is skipped rather than
+        // reported: the repository deletion already retired the whole
+        // `oci-uploads/{owner}/{repo}` directory, chunks in flight included,
+        // so there is no path left to build and nothing left to remove.
+        if let Some(repository) = OciRepo::find_by_id(upload.oci_repository_id).one(db).await? {
+            rows.push((upload, repository));
+        }
+    }
+    Ok(rows)
 }
 
 // ── OCI publication lease ───────────────────────────────────
