@@ -199,8 +199,26 @@ pub async fn trigger_pipeline(
     } = params;
 
     // 1. Read CI config from repo
+    //
+    // The identity is read first because the config conversion needs it, but its
+    // failure is *held*: a broken workflow file has to arrive as a 400 even when
+    // the pool is dead, and every case in
+    // `a_broken_ci_config_is_the_clients_mistake_not_a_server_failure` reaches
+    // this function with a connection that has no tables at all. So the file
+    // gets its verdict first, and an unresolvable identity is re-raised below —
+    // still before anything is written, so no pipeline is ever built against the
+    // empty placeholder.
+    let identity = repository_identity(db, repo_id).await;
+    let (identity_owner, identity_name) = identity
+        .as_ref()
+        .map(|(owner, name)| (owner.as_str(), name.as_str()))
+        .unwrap_or(("", ""));
     let config = read_ci_config(
         repo_path,
+        RepositoryName {
+            owner: identity_owner,
+            name: identity_name,
+        },
         commit_sha,
         ref_name,
         trigger_type,
@@ -208,6 +226,9 @@ pub async fn trigger_pipeline(
         previous_sha,
     )?;
     validate_execution_semantics(&config)?;
+    // Held until every verdict about the client's file has been given, and still
+    // before the first write.
+    let (repo_owner, repo_name) = identity?;
 
     // 2. Concurrency control
     //
@@ -297,6 +318,10 @@ pub async fn trigger_pipeline(
         .context("db: begin pipeline creation transaction")?;
     let graph = PipelineGraph {
         repo_id,
+        repository: RepositoryName {
+            owner: &repo_owner,
+            name: &repo_name,
+        },
         commit_sha,
         ref_name,
         trigger_type,
@@ -390,6 +415,13 @@ pub async fn trigger_pipeline(
 /// transaction — a pipeline is either declared in full or not at all.
 struct PipelineGraph<'a> {
     repo_id: i64,
+    /// `<owner>/<name>`, for the `github.repository` half of the condition
+    /// context. Every job's `if:` is evaluated here, so this is the second place
+    /// the identity has to reach — the config-conversion context in
+    /// `gitea_actions` is the first, and a value present in one and empty in the
+    /// other is how a condition comes to mean different things at two hops of
+    /// the same trigger.
+    repository: RepositoryName<'a>,
     commit_sha: &'a str,
     ref_name: &'a str,
     trigger_type: &'a str,
@@ -445,6 +477,7 @@ impl PipelineGraph<'_> {
     ) -> Result<()> {
         let PipelineGraph {
             repo_id,
+            repository,
             commit_sha,
             ref_name,
             trigger_type,
@@ -512,6 +545,7 @@ impl PipelineGraph<'_> {
                             ref_name,
                             trigger_type,
                             commit_sha,
+                            repository,
                             &variant.variables,
                             job_config,
                         ),
@@ -738,6 +772,7 @@ fn job_condition_context(
     ref_name: &str,
     event: &str,
     sha: &str,
+    repository: RepositoryName<'_>,
     variables: &std::collections::BTreeMap<String, String>,
     config: &config::JobConfig,
 ) -> std::collections::HashMap<String, String> {
@@ -753,6 +788,14 @@ fn job_condition_context(
         ),
         ("github.event_name".into(), event.to_string()),
         ("github.sha".into(), sha.to_string()),
+        (
+            "github.repository".into(),
+            format!("{}/{}", repository.owner, repository.name),
+        ),
+        (
+            "github.repository_owner".into(),
+            repository.owner.to_string(),
+        ),
     ]);
     for (name, value) in variables {
         context.insert(format!("env.{name}"), value.clone());
@@ -842,6 +885,44 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
         .collect())
 }
 
+/// The `<owner>/<name>` the pipeline belongs to, read from the row that owns it
+/// rather than from the directory the caller passed.
+///
+/// An organization's repository keeps the organization's *owner* in `owner_id`
+/// while living under the organization's name, so the namespace is not a column —
+/// `repository_namespace_name` is the one function in the tree that resolves it,
+/// and the on-disk path is built from that same function.
+async fn repository_identity(
+    db: &sea_orm::DatabaseConnection,
+    repo_id: i64,
+) -> Result<(String, String)> {
+    let repository = rg_db::ops::repo_ops::find_by_id(db, repo_id)
+        .await?
+        .context("repository of the pipeline being triggered no longer exists")?;
+    let owner = rg_core::repo::service::repository_namespace_name(
+        db,
+        repository.owner_id,
+        repository.org_id,
+    )
+    .await?;
+    Ok((owner, repository.name))
+}
+
+/// The `<owner>/<name>` a pipeline is running for.
+///
+/// Carried down to [`gitea_actions::WorkflowContext`] so `${{ github.repository }}`
+/// and `${{ github.repository_owner }}` resolve to something. It is resolved once
+/// in [`trigger_pipeline`] from the database rather than passed in by each
+/// producer: five call sites construct [`TriggerPipelineParams`], and a field
+/// every one of them has to remember is a field one of them will forget — which
+/// is how both halves of this identity came to be `String::new() // filled later`
+/// in the first place (card_054e997a46e6).
+#[derive(Debug, Clone, Copy)]
+pub struct RepositoryName<'a> {
+    pub owner: &'a str,
+    pub name: &'a str,
+}
+
 /// Read CI configuration from the repo at the given commit.
 ///
 /// Tries formats in order:
@@ -868,6 +949,7 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
 /// must never take the branch that reaches the client (H-05).
 fn read_ci_config(
     repo_path: &std::path::Path,
+    repository: RepositoryName<'_>,
     commit_sha: &str,
     ref_name: &str,
     event: &str,
@@ -881,6 +963,7 @@ fn read_ci_config(
     // Try Gitea Actions format first
     let gitea = try_read_gitea_workflows(
         &repo,
+        repository,
         commit_sha,
         ref_name,
         event,
@@ -953,6 +1036,35 @@ fn read_ci_config(
     Ok(config)
 }
 
+/// [`read_ci_config`] in the shape the tests ask it.
+///
+/// The repository identity only reaches the expression context, and every test
+/// in this file is about the config that comes out — so they name a fixed
+/// `owner/repo` here instead of thirty times each. The one test that *is* about
+/// the identity asserts it through `WorkflowContext` directly.
+#[cfg(test)]
+fn read_ci_config_for_test(
+    repo_path: &std::path::Path,
+    commit_sha: &str,
+    ref_name: &str,
+    event: &str,
+    base_branch: Option<&str>,
+    previous_sha: Option<&str>,
+) -> Result<CiConfig> {
+    read_ci_config(
+        repo_path,
+        RepositoryName {
+            owner: "owner",
+            name: "repo",
+        },
+        commit_sha,
+        ref_name,
+        event,
+        base_branch,
+        previous_sha,
+    )
+}
+
 /// Resolve a commit once, then use tree lookup APIs whose `Option` means only
 /// that a path is absent. `rev_parse_single("commit:path")` mixed a missing
 /// path with every ref/object-store error behind one `Err` value.
@@ -993,6 +1105,7 @@ enum GiteaWorkflows {
 /// parsing error instead of being mistaken for "no CI config at all".
 fn try_read_gitea_workflows(
     repo: &gix::Repository,
+    repository: RepositoryName<'_>,
     commit_sha: &str,
     ref_name: &str,
     event: &str,
@@ -1056,8 +1169,8 @@ fn try_read_gitea_workflows(
             ref_name: ref_name.to_string(),
             sha: commit_sha.to_string(),
             event: event.to_string(),
-            repo_owner: String::new(), // filled later
-            repo_name: String::new(),
+            repo_owner: repository.owner.to_string(),
+            repo_name: repository.name.to_string(),
         };
 
         let mut wf_config = workflow.to_ci_config(&ctx);
@@ -2417,13 +2530,212 @@ mod matrix_tests {
             .trim()
             .to_owned();
         let config =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap();
         let job = config.jobs.get("main/shared/build").unwrap();
         assert!(job
             .script
             .iter()
             .any(|line| line.contains("${INPUT_TARGET}")));
         assert_eq!(job.variables.as_ref().unwrap()["INPUT_TARGET"], "staging");
+    }
+
+    /// Three lists have to agree about `github.*`: the validator that decides
+    /// whether a condition may be written at all, and the two context builders
+    /// that decide what it means — one for step conditions at conversion time,
+    /// one for job conditions when the graph is written. A name the validator
+    /// accepts and a builder does not answer evaluates to the empty string, and
+    /// `github.repository == 'acme/api'` then reports a confident `false`
+    /// (card_054e997a46e6, which was that state for two of the six).
+    ///
+    /// Asserted in both directions, because each catches a different mistake:
+    /// forgetting to answer a canonical name, and answering a name the validator
+    /// would have rejected.
+    #[test]
+    fn every_condition_key_the_validator_accepts_is_answered_by_both_contexts() {
+        let job = job_condition_context(
+            "refs/heads/main",
+            "push",
+            "abc123",
+            RepositoryName {
+                owner: "acme",
+                name: "api",
+            },
+            &std::collections::BTreeMap::new(),
+            &config::JobConfig {
+                stage: None,
+                script: vec!["echo ok".into()],
+                image: None,
+                only: None,
+                variables: None,
+                when: None,
+                condition: None,
+                environment: None,
+                allow_failure: None,
+                timeout_seconds: None,
+                tags: None,
+                matrix: None,
+                cache: None,
+            },
+        );
+        let step = gitea_actions::actions_condition_context(
+            &gitea_actions::WorkflowContext {
+                ref_name: "refs/heads/main".into(),
+                sha: "abc123".into(),
+                event: "push".into(),
+                repo_owner: "acme".into(),
+                repo_name: "api".into(),
+            },
+            &std::collections::HashMap::new(),
+        );
+
+        for key in condition::GITHUB_CONTEXT_KEYS {
+            for (label, context) in [("job", &job), ("step", &step)] {
+                let value = context.get(key).unwrap_or_else(|| {
+                    panic!(
+                        "the validator accepts `{key}` in an `if:` condition, but the {label} \
+                         context has no answer for it — the condition would compare against the \
+                         empty string and report a plain false"
+                    )
+                });
+                assert!(
+                    !value.is_empty(),
+                    "the {label} context answers `{key}` with the empty string, which is what a \
+                     `// filled later` placeholder looks like from a condition"
+                );
+            }
+        }
+
+        for (label, context) in [("job", &job), ("step", &step)] {
+            for key in context.keys().filter(|key| key.starts_with("github.")) {
+                assert!(
+                    condition::GITHUB_CONTEXT_KEYS.contains(&key.as_str()),
+                    "the {label} context answers `{key}`, which the validator rejects — a \
+                     condition using it is refused as unsupported, so the answer is unreachable"
+                );
+            }
+        }
+    }
+
+    /// A job condition may name the repository the pipeline belongs to, and the
+    /// name it gets is the one in the database.
+    ///
+    /// `WorkflowContext.repo_owner` / `repo_name` were declared, filled with
+    /// `String::new() // filled later` by the only producer, and read by nobody
+    /// — so `github.repository` was the empty string and any comparison against
+    /// it was a plain `false`, indistinguishable from a condition that correctly
+    /// did not match (card_054e997a46e6). Two properties are asserted together
+    /// because either alone can pass on an accident:
+    ///
+    ///  * the job whose condition names `<owner>/<name>` runs, and the job that
+    ///    names another repository is skipped — an empty identity fails the first;
+    ///  * the identity comes from the repository *row*, not from the directory:
+    ///    the fixture's working tree lives in a random temp directory whose name
+    ///    matches neither, so a path-derived answer fails the same assertion.
+    #[tokio::test]
+    async fn a_job_condition_can_name_the_repository_the_pipeline_belongs_to() {
+        // An Actions workflow, because the identity has to arrive at *both*
+        // hops: the step conditions are resolved while the workflow is converted
+        // (`WorkflowContext`), the job conditions when the graph is written
+        // (`job_condition_context`). Filling one and leaving the other empty is
+        // exactly the state this card found.
+        let (repo_dir, sha) = commit_repo(&[(
+            ".gitea/workflows/ci.yml",
+            b"name: CI\non: push\njobs:\n  mine:\n    runs-on: ubuntu-latest\n    if: github.repository == 'acme/api'\n    steps:\n      - if: github.repository_owner == 'acme'\n        run: echo my-owner\n      - if: github.repository == 'someone/else'\n        run: echo not-mine\n  theirs:\n    runs-on: ubuntu-latest\n    if: github.repository == 'someone/else'\n    steps:\n      - run: echo nope\n" as &[u8],
+        )]);
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            repo_dir.path().join("identity.db").display()
+        ))
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let org_owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "acme-admin",
+            "admin@example.com",
+            "unused",
+            "Acme Admin",
+        )
+        .await
+        .unwrap();
+        // An organization repository is the case a path-or-column shortcut gets
+        // wrong: the row's `owner_id` is the organization's *owner*, while the
+        // namespace is the organization's name.
+        let org = rg_db::ops::org_ops::create_org(&db, "acme", None, None, org_owner.id, "public")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(org_owner.id),
+                name: Set("api".into()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(Some(org.id)),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        let pipeline_id = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: repo_dir.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(org_owner.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
+        .await
+        .unwrap();
+
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        let mine = jobs.iter().find(|job| job.name == "ci/mine").unwrap();
+        assert_eq!(
+            mine.status, "pending",
+            "`github.repository == 'acme/api'` did not match the repository the pipeline is for"
+        );
+        let theirs = jobs.iter().find(|job| job.name == "ci/theirs").unwrap();
+        assert_eq!(
+            theirs.status, "skipped",
+            "a condition naming another repository must not run here"
+        );
+        // The step half: kept when it names this repository's owner, dropped
+        // when it names another repository.
+        assert!(
+            mine.script.contains("echo my-owner"),
+            "the step condition naming this owner was dropped: {}",
+            mine.script
+        );
+        assert!(
+            !mine.script.contains("echo not-mine"),
+            "a step condition naming another repository was kept: {}",
+            mine.script
+        );
     }
 
     /// Commit `files` (relative path → contents) into a fresh repo and return
@@ -2490,7 +2802,8 @@ mod matrix_tests {
         ]);
 
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml"),
@@ -2515,7 +2828,8 @@ mod matrix_tests {
         ]);
 
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("UTF-8"),
@@ -2532,7 +2846,8 @@ mod matrix_tests {
         )]);
 
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("setup-node"),
@@ -2548,7 +2863,8 @@ mod matrix_tests {
         )]);
 
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         let rendered = format!("{error}");
         assert!(
             rendered.contains(".forgekeep-ci.yml") && rendered.contains("line"),
@@ -2568,7 +2884,8 @@ mod matrix_tests {
         )]);
 
         let config =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap();
         assert!(config.jobs.contains_key("build"));
     }
 
@@ -2584,7 +2901,8 @@ mod matrix_tests {
         ]);
 
         let config =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap();
         assert!(config.jobs.contains_key("build"));
         assert!(!config.jobs.keys().any(|name| name.starts_with("tags/")));
     }
@@ -2598,7 +2916,8 @@ mod matrix_tests {
         )]);
 
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         let rendered = format!("{error}");
         assert!(
             rendered.contains(".gitea/workflows") && rendered.contains("refs/heads/main"),
@@ -2615,7 +2934,8 @@ mod matrix_tests {
         let (temp, sha) = commit_repo(&[("README.md", b"nothing to build\n" as &[u8])]);
 
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         assert!(
             error.to_string().contains("no CI config found"),
             "genuinely missing config keeps its own message: {error:#}"
@@ -2640,8 +2960,9 @@ mod matrix_tests {
             .to_owned();
         remove_loose_object(temp.path(), &object_id);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
-            .expect_err("a dangling config entry must not become absent config");
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a dangling config entry must not become absent config");
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("failed to read CI config object"),
@@ -2671,8 +2992,9 @@ mod matrix_tests {
             .to_owned();
         remove_loose_object(temp.path(), &object_id);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
-            .expect_err("a dangling workflow must not select the native fallback");
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a dangling workflow must not select the native fallback");
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("failed to read .gitea/workflows/ci.yml from the object database"),
@@ -2869,16 +3191,18 @@ mod matrix_tests {
             (".gitea/workflows/c.yml", &workflow("third")),
         ]);
 
-        let expected = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
-            .unwrap()
-            .stages
-            .unwrap();
-        assert_eq!(expected.len(), 3);
-        for _ in 0..8 {
-            let stages = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
+        let expected =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
                 .unwrap()
                 .stages
                 .unwrap();
+        assert_eq!(expected.len(), 3);
+        for _ in 0..8 {
+            let stages =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .unwrap()
+                    .stages
+                    .unwrap();
             assert_eq!(stages, expected, "stage order must not depend on hashing");
         }
     }
@@ -2895,7 +3219,7 @@ mod matrix_tests {
                 as &[u8],
         )]);
 
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/1/head",
@@ -2913,7 +3237,8 @@ mod matrix_tests {
         // The same repository under `push` has nothing to offer, and says so
         // rather than claiming there is no CI config at all.
         let error =
-            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap_err();
         assert!(
             error.to_string().contains("pull_request") || error.to_string().contains("triggered"),
             "the push event must report an untriggered workflow: {error:#}"
@@ -2931,7 +3256,7 @@ mod matrix_tests {
             b"on:\n  pull_request:\n    branches: [develop]\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n" as &[u8],
         )]);
 
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/7/head",
@@ -2944,7 +3269,7 @@ mod matrix_tests {
 
         // The fixture's default branch is whatever `git init` produced, never
         // `develop`, so without the base branch the filter used to reject this.
-        let error = read_ci_config(
+        let error = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/7/head",
@@ -3035,7 +3360,7 @@ mod matrix_tests {
             commit_repo(&[(".gitea/workflows/pr.yml", &pull_request_workflow("release"))]);
         git(temp.path(), &["branch", "-m", "release"]);
 
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/3/head",
@@ -3059,7 +3384,7 @@ mod matrix_tests {
         git(temp.path(), &["branch", "-m", "main"]);
 
         // Baseline: with a readable HEAD this repository does match.
-        read_ci_config(
+        read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/3/head",
@@ -3081,7 +3406,7 @@ mod matrix_tests {
         // no longer a ref at all.
         std::fs::write(temp.path().join(".git/refs/heads/main"), b"not a ref\n").unwrap();
 
-        let error = read_ci_config(
+        let error = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/3/head",
@@ -3112,7 +3437,7 @@ mod matrix_tests {
         // Points HEAD at a branch that does not exist while keeping the objects.
         git(temp.path(), &["checkout", "--orphan", "future"]);
 
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/3/head",
@@ -3137,7 +3462,7 @@ mod matrix_tests {
         git(temp.path(), &["branch", "-m", "trunk"]);
         git(temp.path(), &["checkout", "--detach"]);
 
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/pull/3/head",
@@ -3228,8 +3553,9 @@ mod matrix_tests {
             b"stages:\n  - test\n\ndeploy:\n  stage: test\n  timeout_seconds: -1\n  script:\n    - echo ok\n",
         )]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
-            .expect("a negative timeout must reach the validator, not die in the parser");
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("a negative timeout must reach the validator, not die in the parser");
         let error = validate_execution_semantics(&config)
             .expect_err("a negative timeout must not produce a runnable pipeline");
         let message = format!("{error:#}");
@@ -3254,7 +3580,7 @@ mod manual_trigger_tests {
     fn a_bare_workflow_dispatch_trigger_is_read_as_present() {
         let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", DISPATCH_WORKFLOW)]);
 
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &sha,
             "refs/heads/main",
@@ -3371,7 +3697,7 @@ mod trigger_filter_tests {
         ]);
 
         let (before, after) = commit_again(&temp, &[("README.md", b"docs, edited\n")]);
-        let error = read_ci_config(
+        let error = read_ci_config_for_test(
             temp.path(),
             &after,
             "refs/heads/main",
@@ -3386,7 +3712,7 @@ mod trigger_filter_tests {
         );
 
         let (before, after) = commit_again(&temp, &[("backend/main.rs", b"fn main() { }\n")]);
-        let config = read_ci_config(
+        let config = read_ci_config_for_test(
             temp.path(),
             &after,
             "refs/heads/main",
@@ -3411,7 +3737,7 @@ mod trigger_filter_tests {
 
         let (before, after) = commit_again(&temp, &[("docs/guide.md", b"guide v2\n")]);
         assert!(
-            read_ci_config(
+            read_ci_config_for_test(
                 temp.path(),
                 &after,
                 "refs/heads/main",
@@ -3433,7 +3759,7 @@ mod trigger_filter_tests {
             ],
         );
         assert!(
-            read_ci_config(
+            read_ci_config_for_test(
                 temp.path(),
                 &after,
                 "refs/heads/main",
@@ -3464,7 +3790,7 @@ mod trigger_filter_tests {
         let (_, after) = commit_again(&temp, &[("README.md", b"docs again\n")]);
 
         assert!(
-            read_ci_config(
+            read_ci_config_for_test(
                 temp.path(),
                 &after,
                 "refs/heads/main",
@@ -3478,7 +3804,8 @@ mod trigger_filter_tests {
         // …and with no previous revision to compare against, the fallback is the
         // head commit's own diff, which here says "README only".
         assert!(
-            read_ci_config(temp.path(), &after, "refs/heads/main", "push", None, None).is_err(),
+            read_ci_config_for_test(temp.path(), &after, "refs/heads/main", "push", None, None)
+                .is_err(),
             "the documented fallback is the commit's own diff"
         );
     }

@@ -10,7 +10,7 @@ use rg_git::protocol::receive_pack::RefUpdate;
 
 use rg_db::entities::pull_request::{self, Model as PullRequest};
 use rg_db::entities::repository as repo_entity;
-use rg_db::ops::{pull_request_ops, user_ops};
+use rg_db::ops::pull_request_ops;
 
 // ── PR CRUD ─────────────────────────────────────────────────────────────
 
@@ -303,20 +303,18 @@ pub async fn resolve_head_ref(
     Ok((head_branch, Some(head_repo.id)))
 }
 
+/// The namespace of a repository, taking the row instead of its two id columns.
+///
+/// One rule, one implementation: this used to be its own copy of the org-then-user
+/// lookup, next to an identical private copy in `repo::service` that the create
+/// and delete paths use to build the on-disk directory. Two copies of "what is
+/// this repository called" is how the disk and the API start disagreeing.
 pub(super) async fn repository_namespace(
     db: &DatabaseConnection,
     repository: &repo_entity::Model,
 ) -> Result<String> {
-    if let Some(org_id) = repository.org_id {
-        return rg_db::ops::org_ops::get_org(db, org_id)
-            .await?
-            .map(|org| org.name)
-            .context("repository organization not found");
-    }
-    user_ops::find_by_id(db, repository.owner_id)
-        .await?
-        .map(|user| user.username)
-        .context("repository owner not found")
+    crate::repo::service::repository_namespace_name(db, repository.owner_id, repository.org_id)
+        .await
 }
 
 /// Notify watchers of a PR event (`opened` / `closed` / `reopened` / `merged`).

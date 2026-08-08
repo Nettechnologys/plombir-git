@@ -357,12 +357,26 @@ fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> 
 }
 
 /// Context for workflow expression evaluation.
+///
+/// `repo_owner` / `repo_name` are the `<owner>/<name>` the pipeline is running
+/// for. They were declared here and filled with `String::new() // filled later`
+/// by the only producer, and nothing read them either — so `${{ github.repository }}`
+/// and `${{ github.repository_owner }}` in an `if:` condition resolved to the
+/// empty string, which an expression like `github.repository == 'acme/api'`
+/// reports as a plain false (card_054e997a46e6).
 pub struct WorkflowContext {
     pub ref_name: String,
     pub sha: String,
     pub event: String,
     pub repo_owner: String,
     pub repo_name: String,
+}
+
+impl WorkflowContext {
+    /// `<owner>/<name>` — the value GitHub calls `github.repository`.
+    pub fn repository(&self) -> String {
+        format!("{}/{}", self.repo_owner, self.repo_name)
+    }
 }
 
 impl GiteaWorkflow {
@@ -1545,7 +1559,7 @@ fn supported_condition(condition: &str, allow_matrix: bool) -> bool {
         && (allow_matrix || !condition.contains("matrix."))
 }
 
-fn actions_condition_context(
+pub(crate) fn actions_condition_context(
     ctx: &WorkflowContext,
     variables: &HashMap<String, String>,
 ) -> HashMap<String, String> {
@@ -1561,6 +1575,8 @@ fn actions_condition_context(
         ),
         ("github.event_name".into(), ctx.event.clone()),
         ("github.sha".into(), ctx.sha.clone()),
+        ("github.repository".into(), ctx.repository()),
+        ("github.repository_owner".into(), ctx.repo_owner.clone()),
     ]);
     for (name, value) in variables {
         context.insert(format!("env.{name}"), value.clone());
@@ -2587,6 +2603,47 @@ mod trigger_event_vocabulary_tests {
                 "a workflow declaring `on: {event}:` is not matched by {event}"
             );
         }
+    }
+
+    /// `${{ github.repository }}` names the repository the run belongs to, and
+    /// for a long while it named nothing: the two fields behind it were declared
+    /// on `WorkflowContext`, filled with `String::new() // filled later` by the
+    /// only producer, and read by nobody (card_054e997a46e6). A step condition
+    /// comparing against them was therefore *always false*, which is
+    /// indistinguishable from a condition that correctly did not match.
+    #[test]
+    fn a_step_condition_can_name_the_repository_the_run_belongs_to() {
+        let workflow = GiteaWorkflow::parse(
+            "name: W
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - if: github.repository == 'owner/repo'
+        run: echo mine
+      - if: github.repository_owner == 'owner'
+        run: echo my-owner
+      - if: github.repository == 'someone/else'
+        run: echo theirs
+",
+        )
+        .expect("parse");
+        let ci = workflow.to_ci_config(&WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc123".into(),
+            event: "push".into(),
+            repo_owner: "owner".into(),
+            repo_name: "repo".into(),
+        });
+        let script = ci.jobs["build"].script.join("\n");
+
+        assert!(script.contains("echo mine"), "{script}");
+        assert!(script.contains("echo my-owner"), "{script}");
+        assert!(
+            !script.contains("echo theirs"),
+            "a condition naming another repository must not run here: {script}"
+        );
     }
 
     /// The alias is intentional and stays: the queue builds a speculative merge

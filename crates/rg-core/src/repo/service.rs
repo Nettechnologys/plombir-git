@@ -287,13 +287,19 @@ async fn namespace_still_accepts_repository(
     Ok(())
 }
 
-/// Resolve the directory name that owns a repository row on disk.
+/// Resolve the namespace a repository row lives under — its directory on disk
+/// and the `<owner>` half of every `<owner>/<name>` the server renders.
 ///
 /// `owner_id` alone is not enough: organization repositories retain the
 /// organization's owner there, while their directory lives under the
 /// organization name. Keeping this resolution next to create/delete prevents
 /// the two lifecycle ends from deriving different paths.
-async fn repository_namespace_name(
+///
+/// Public because it is the *only* answer to "what is this repository called":
+/// `pull_request::service::repository_namespace` is the model-taking spelling of
+/// this same function, and `rg_ci` needs it to fill the `github.repository`
+/// expression context.
+pub async fn repository_namespace_name(
     db: &DatabaseConnection,
     owner_id: i64,
     org_id: Option<i64>,

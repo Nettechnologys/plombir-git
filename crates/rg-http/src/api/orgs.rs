@@ -1027,13 +1027,16 @@ async fn resolve_team_in_org(
 /// about the organization it refuses to show. Not the same thing as hiding the
 /// name: see [`require_org_visible`] for what the `404` does and does not buy.
 ///
-/// `viewer` is `None` for an anonymous caller, and that is precisely why this is
-/// its own extractor rather than a weaker rung of [`OrgAdmin`]: the level admits
-/// a caller with no identity to report, so there is no `actor_id` to hand over
-/// and no scale the two levels share.
+/// The viewer is `None` for an anonymous caller, and that is precisely why this
+/// is its own extractor rather than a weaker rung of [`OrgAdmin`]: the level
+/// admits a caller with no identity to report, so there is no `actor_id` to hand
+/// over and no scale the two levels share. It stays inside the extractor's
+/// `from_request_parts` — deciding visibility is this extractor's whole job, and
+/// every one of the five handlers destructures
+/// `OrgRead { org, .. }`. Carrying it out as a `pub` field only offered a second,
+/// ungated way to identify the caller.
 pub struct OrgRead {
     pub org: rg_db::entities::organization::Model,
-    pub viewer: Option<i64>,
 }
 
 impl axum::extract::FromRequestParts<AppState> for OrgRead {
@@ -1047,7 +1050,7 @@ impl axum::extract::FromRequestParts<AppState> for OrgRead {
         let name = org_name_in_path(parts, state).await?;
         let org = resolve_org(&state.db, &name).await?;
         require_org_visible(&state.db, &org, viewer).await?;
-        Ok(Self { org, viewer })
+        Ok(Self { org })
     }
 }
 

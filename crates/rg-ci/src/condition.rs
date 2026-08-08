@@ -38,12 +38,30 @@ enum Token {
     End,
 }
 
+/// The `github.*` names an `if:` condition may read.
+///
+/// The list is public and enumerable because it is one of *three* places that
+/// have to agree: this validator decides whether a condition is accepted at all,
+/// and two separate context builders decide what it evaluates to —
+/// `gitea_actions::actions_condition_context` for step conditions at conversion
+/// time and `job_condition_context` for job conditions at graph-write time. A
+/// name present here and missing from a builder evaluates to the empty string,
+/// which a comparison reports as a plain `false` — a silently wrong answer, not
+/// an error. `every_condition_key_the_validator_accepts_is_answered_by_both_contexts`
+/// holds the three together.
+pub const GITHUB_CONTEXT_KEYS: [&str; 6] = [
+    "github.ref",
+    "github.ref_name",
+    "github.event_name",
+    "github.sha",
+    "github.repository",
+    "github.repository_owner",
+];
+
 pub fn validate_condition(input: &str) -> Result<()> {
     evaluate_with(input, |name| {
-        if matches!(
-            name,
-            "github.ref" | "github.ref_name" | "github.event_name" | "github.sha"
-        ) || name.strip_prefix("env.").is_some_and(valid_context_key)
+        if GITHUB_CONTEXT_KEYS.contains(&name)
+            || name.strip_prefix("env.").is_some_and(valid_context_key)
             || name.strip_prefix("matrix.").is_some_and(valid_context_key)
         {
             Some(String::new())
