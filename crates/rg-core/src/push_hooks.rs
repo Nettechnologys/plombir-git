@@ -378,6 +378,9 @@ struct HookTarget {
     name: String,
     /// Bare repository the ref lives in.
     path: PathBuf,
+    /// The branch this repository's derived snapshots are taken from — the
+    /// code-search index refresh below only fires for a move of this ref.
+    default_branch: String,
 }
 
 impl RefUpdateCascade {
@@ -447,6 +450,7 @@ async fn resolve_hook_target(
             owner: owner.to_string(),
             name: name.to_string(),
             path: repo_root.join(format!("{owner}/{name}.git")),
+            default_branch: repo.default_branch,
         }),
         Ok(None) => {
             tracing::warn!(
@@ -486,6 +490,7 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
             owner: params.owner.to_string(),
             name: params.repo_name.to_string(),
             path: params.repo_path.to_path_buf(),
+            default_branch: repo.default_branch,
         },
         Ok(None) => {
             tracing::warn!(
@@ -593,7 +598,94 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
             pusher_name.as_deref().unwrap_or_default(),
             &update.refname,
         );
+
+        // 5. Keep an existing code-search snapshot in step with the tree.
+        refresh_code_index_for_push(params, &target, &update);
     }
+}
+
+/// Section 5 of the post-push hook: refresh the repository's `code_fts`
+/// snapshot when its default branch moves.
+///
+/// `code_fts` is a copy of one tree at one moment, and nothing used to move it
+/// afterwards: the only producers were the `index-repo` CLI command and the AI
+/// index endpoint. So `ai_search_code` refused a repository exactly once in its
+/// life — the first query, before anyone had indexed it — and from then on kept
+/// answering `200` out of a snapshot that drifted further from the tree with
+/// every push. Files deleted a hundred commits ago were still findable, files
+/// added since were not, and nothing anywhere said so (card_a1237efc85b7).
+///
+/// **Refresh, not build.** A repository with no snapshot is left without one:
+/// indexing reads every blob of the tree and stores its text a second time, and
+/// an instance where nobody uses AI code search should not pay that on every
+/// push to every repository. Taking the first snapshot stays an explicit act
+/// (`POST /ai/repos/{owner}/{name}/index`, or `forgekeep index-repo`); what this
+/// fixes is that the act used to be permanent.
+///
+/// Detached onto the run's tracker rather than awaited, for the same reason the
+/// watch fan-out is: a whole-tree walk has no business delaying the CI trigger
+/// of the next ref in the same push. Tracked rather than bare-spawned so a
+/// SIGTERM in the next second cannot sever it silently.
+fn refresh_code_index_for_push(
+    params: &PostPushParams<'_>,
+    target: &HookTarget,
+    update: &RefUpdate,
+) {
+    let Some(branch) = update.refname.strip_prefix("refs/heads/") else {
+        return;
+    };
+    if branch != target.default_branch {
+        return;
+    }
+
+    // A deleted default branch has no tree to index. Leaving the previous
+    // snapshot in place is the same answer `index_repository` gives for a
+    // failed traversal, and the repository is in a state where every other
+    // read of it is empty too.
+    if update.new_sha.chars().all(|c| c == '0') {
+        return;
+    }
+
+    let db = params.db.clone();
+    let repo_id = target.repo_id;
+    let repo_path = target.path.clone();
+    let ref_name = target.default_branch.clone();
+
+    params.delivery_tracker.spawn(async move {
+        let indexer = crate::search::code_indexer::CodeIndexer::new(db);
+        match indexer.indexed_file_count(repo_id).await {
+            // Never indexed — see "refresh, not build" above.
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    repo_id,
+                    error = %format!("{error:#}"),
+                    "Post-push: could not read code index state, skipping refresh"
+                );
+                return;
+            }
+        }
+
+        match indexer
+            .index_repository(repo_id, &repo_path, &ref_name)
+            .await
+        {
+            Ok(indexed_files) => tracing::info!(
+                repo_id,
+                indexed_files,
+                "Post-push: code search index refreshed"
+            ),
+            // The push is already accepted and the previous snapshot survives a
+            // failed refresh intact, so this is the only place an operator
+            // learns that code search is now answering out of a stale one.
+            Err(error) => tracing::warn!(
+                repo_id,
+                error = %format!("{error:#}"),
+                "Post-push: code search index refresh failed, previous snapshot kept"
+            ),
+        }
+    });
 }
 
 const OPEN_PR_HEAD_REFRESH_ATTEMPTS: usize = 4;
@@ -1009,6 +1101,7 @@ mod tests {
             owner: "owner".to_string(),
             name: format!("repo-{repo_id}"),
             path: PathBuf::from(format!("/repos/owner/repo-{repo_id}.git")),
+            default_branch: "main".to_string(),
         })
     }
 
@@ -1186,6 +1279,7 @@ mod tests {
             owner: "headsync".to_string(),
             name: "head-sync".to_string(),
             path: repo_path.clone(),
+            default_branch: "main".to_string(),
         };
         let stale_update = RefUpdate {
             old_sha: initial,

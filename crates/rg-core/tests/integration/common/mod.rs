@@ -1,6 +1,8 @@
 //! Fixtures shared by the integration tests in this binary.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 /// A migrated SQLite database at `db_path`, without running the migration chain
 /// for it.
@@ -83,4 +85,119 @@ async fn copy_migrated_template(db_path: &Path) {
             std::fs::copy(&sidecar, &target).expect("copy the template WAL sidecar");
         }
     }
+}
+
+/// A `CiTrigger` that reports no CI config, so a hook run under test is just
+/// the DB-visible half: PR head-SHA refresh, webhooks (none registered), the
+/// watch fan-out and the code-index refresh. Triggering a real pipeline would
+/// drag `rg-ci` in for nothing.
+pub struct NoCi;
+
+impl rg_core::ci::CiTrigger for NoCi {
+    fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+        false
+    }
+
+    /// Mirrors `has_ci_config`: this double has no workflow files to
+    /// match an event against, so it answers the same for every event.
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
+        false
+    }
+
+    fn trigger_pipeline<'a>(
+        &'a self,
+        _params: rg_core::ci::TriggerPipelineParams<'a>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("no CI config in this test") })
+    }
+
+    fn resume_pipeline<'a>(
+        &'a self,
+        _params: rg_core::ci::ResumePipelineParams<'a>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// One accepted ref move, as `receive-pack` reports it to the hooks.
+#[allow(dead_code)]
+pub fn accepted_push(refname: &str, new_sha: &str) -> rg_git::protocol::receive_pack::RefUpdate {
+    rg_git::protocol::receive_pack::RefUpdate {
+        old_sha: "0".repeat(40),
+        new_sha: new_sha.to_string(),
+        refname: refname.to_string(),
+        status: "ok".to_string(),
+        message: String::new(),
+    }
+}
+
+/// Run the post-push hooks the way a transport does, then drain the detached
+/// work they spawned.
+///
+/// The tracker is local to the fixture on purpose — closing the process-global
+/// one would reach into whatever else the test binary is running in parallel
+/// (card_0ce231198269).
+#[allow(dead_code)]
+pub async fn run_post_push_hooks(
+    db: &sea_orm::DatabaseConnection,
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    pusher_id: Option<i64>,
+    ref_updates: &[rg_git::protocol::receive_pack::RefUpdate],
+) {
+    let ci = NoCi;
+    let delivery_tracker = rg_core::task_tracker::TaskTracker::new();
+    rg_core::push_hooks::post_push_hooks(
+        &rg_core::push_hooks::PostPushParams {
+            db,
+            repo_path: &repo_root.join(format!("{owner}/{repo_name}.git")),
+            repo_root,
+            owner,
+            repo_name,
+            pusher_id,
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: Some("test-secret"),
+            encryption_key: Some("test-encryption-key"),
+            notifier: None,
+            smtp_config: &None,
+            ci_engine: &ci,
+            external_url: None,
+            delivery_tracker: &delivery_tracker,
+        },
+        ref_updates,
+    )
+    .await;
+    drain(&delivery_tracker).await;
+}
+
+/// Await the detached work a call produced, on the caller's own tracker.
+///
+/// Fan-outs are spawned rather than awaited, so "the effect is not there yet"
+/// is a normal state right after the producer returns; draining is what makes
+/// the assertions deterministic.
+///
+/// The timeout is a hang-guard, not a deadline: a tracker that never drains
+/// fails at any finite bound, while a tight one turns machine load into a red
+/// suite.
+#[allow(dead_code)]
+pub async fn drain(tracker: &rg_core::task_tracker::TaskTracker) {
+    tracker.close();
+    tokio::time::timeout(std::time::Duration::from_secs(120), tracker.wait())
+        .await
+        .expect("delivery tracker drained within timeout");
+}
+
+/// Run one `git` command through the gateway every other call site uses.
+#[allow(dead_code)]
+pub fn git(args: &[&str], cwd: Option<&Path>) {
+    rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway")
+        .run(args, cwd)
+        .expect("run git")
+        .ensure_success()
+        .expect("git command succeeds");
 }

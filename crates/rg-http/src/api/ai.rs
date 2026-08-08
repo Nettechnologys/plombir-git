@@ -15,7 +15,6 @@ use utoipa::ToSchema;
 use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
-use sea_orm::{ConnectionTrait, Statement};
 
 // ── Response types ───────────────────────────────────
 
@@ -301,27 +300,23 @@ pub async fn ai_search_code(
 
     let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone());
 
-    // Check if repo is indexed
-    let backend = state.db.get_database_backend();
-    let check_sql = rg_db::prepare_sql(
-        backend,
-        "SELECT COUNT(*) as cnt FROM code_fts WHERE repo_id = ?",
-    );
-    let check_result = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            check_sql,
-            [repo.id.into()],
-        ))
+    // Check if repo is indexed.
+    //
+    // The message used to promise that pushing to the repository would build
+    // the index. It never did — no push path touched `code_fts` — and the
+    // promise sent people to do the one thing that could not work
+    // (card_a1237efc85b7). A push now *refreshes* an existing snapshot, so the
+    // wording names the act that actually creates one.
+    let indexed_count = indexer
+        .indexed_file_count(repo.id)
         .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::internal("Failed to check index status".to_string()))?;
-    let indexed_count: i64 = check_result.try_get_by_index(0).map_err(AppError::from)?;
+        .map_err(AppError::from)?;
 
     if indexed_count == 0 {
         return Err(AppError::bad_request(
-            "Repository not indexed. Please trigger indexing first by pushing to the repository or calling the index endpoint.".to_string()
+            "Repository not indexed. Build the index first with POST /api/v1/ai/repos/{owner}/{name}/index (or the `forgekeep index-repo` command); \
+             later pushes to the default branch keep it up to date."
+                .to_string(),
         ));
     }
 

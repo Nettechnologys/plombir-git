@@ -254,6 +254,32 @@ impl CodeIndexer {
         Ok(count)
     }
 
+    /// How many files this repository currently has in the code index.
+    ///
+    /// Zero is the "no snapshot" state, and both readers of it branch on that
+    /// one fact: the AI search handler refuses the query, and the post-push
+    /// refresh (`rg_core::push_hooks`) leaves the repository alone rather than
+    /// building an index nobody asked for. It lives here rather than as a raw
+    /// `SELECT COUNT(*)` at each call site because `code_fts` is this module's
+    /// table — the HTTP layer had a hand-written copy of this query, and a
+    /// second one in the hook path would have made three.
+    pub async fn indexed_file_count(&self, repo_id: i64) -> Result<i64> {
+        let backend = self.db.get_database_backend();
+        let sql = rg_db::prepare_sql(backend, "SELECT COUNT(*) FROM code_fts WHERE repo_id = ?");
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                &sql,
+                [repo_id.into()],
+            ))
+            .await
+            .with_context(|| format!("count code index rows for repository {repo_id}"))?
+            .with_context(|| format!("COUNT(*) returned no row for repository {repo_id}"))?;
+        row.try_get_by_index(0)
+            .with_context(|| format!("decode code index row count for repository {repo_id}"))
+    }
+
     /// Publish one complete repository snapshot.
     ///
     /// The transaction is the visibility boundary: a failed clear or batch
