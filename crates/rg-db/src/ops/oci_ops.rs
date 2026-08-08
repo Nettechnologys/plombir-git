@@ -180,9 +180,10 @@ pub async fn insert_manifest(
 ///
 /// A client retry or two concurrent PUTs can legitimately reach the unique
 /// `(repository, digest)` key. The conflict is a successful no-op; only the
-/// request that inserts the row increments reference counts. Keeping both
-/// writes in one transaction also prevents a failed ref-count update from
-/// leaving a manifest row that every retry would mistake for fully recorded.
+/// request that inserts the row claims the blobs. Keeping both in one
+/// transaction is what makes a manifest row and the layers it names arrive
+/// together — a row committed ahead of a failed claim is one every later retry
+/// would mistake for a fully recorded image.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_digest_manifest(
     db: &DatabaseConnection,
@@ -195,7 +196,6 @@ pub async fn insert_digest_manifest(
     push_by: Option<i64>,
     referenced_blob_digests: &[String],
 ) -> Result<ManifestInsertOutcome, DbErr> {
-    use oci_blob::Entity as Blob;
     use oci_manifest::Entity as Manifest;
 
     let transaction = db.begin().await?;
@@ -223,17 +223,7 @@ pub async fn insert_digest_manifest(
 
     let outcome = match inserted {
         TryInsertResult::Inserted(_) => {
-            for blob_digest in referenced_blob_digests {
-                Blob::update_many()
-                    .col_expr(
-                        oci_blob::Column::RefCount,
-                        Expr::col(oci_blob::Column::RefCount).add(1),
-                    )
-                    .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
-                    .filter(oci_blob::Column::Digest.eq(blob_digest))
-                    .exec(&transaction)
-                    .await?;
-            }
+            claim_referenced_blobs(&transaction, oci_repo_id, referenced_blob_digests).await?;
             ManifestInsertOutcome::Inserted
         }
         TryInsertResult::Conflicted => ManifestInsertOutcome::Existing,
@@ -266,7 +256,6 @@ async fn upsert_tag_manifest_once(
     push_by: Option<i64>,
     referenced_blob_digests: &[String],
 ) -> Result<oci_manifest::Model, (DbErr, bool)> {
-    use oci_blob::Entity as Blob;
     use oci_manifest::Entity as Manifest;
 
     let transaction = db.begin().await.map_err(|error| (error, false))?;
@@ -320,26 +309,9 @@ async fn upsert_tag_manifest_once(
         .map_err(|error| (error, true))?
     };
 
-    for blob_digest in referenced_blob_digests {
-        let result = Blob::update_many()
-            .col_expr(
-                oci_blob::Column::RefCount,
-                Expr::col(oci_blob::Column::RefCount).add(1),
-            )
-            .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
-            .filter(oci_blob::Column::Digest.eq(blob_digest))
-            .exec(&transaction)
-            .await
-            .map_err(|error| (error, started_without_tag))?;
-        if result.rows_affected != 1 {
-            return Err((
-                DbErr::Custom(format!(
-                    "referenced OCI blob {blob_digest} is missing from repository {oci_repo_id}"
-                )),
-                started_without_tag,
-            ));
-        }
-    }
+    claim_referenced_blobs(&transaction, oci_repo_id, referenced_blob_digests)
+        .await
+        .map_err(|error| (error, started_without_tag))?;
 
     transaction
         .commit()
@@ -446,7 +418,6 @@ pub async fn insert_blob(
         media_type: Set(media_type.to_string()),
         size: Set(size),
         storage_path: Set(storage_path.to_string()),
-        ref_count: Set(0),
         created_at: Set(now),
     };
     oci_blob::Entity::insert(m)
@@ -463,31 +434,42 @@ pub async fn insert_blob(
     Ok(())
 }
 
-/// Increment blob reference count.
-pub async fn increment_blob_ref(db: &DatabaseConnection, blob_id: i64) -> Result<(), DbErr> {
+/// Prove, inside the caller's transaction, that this repository owns every blob
+/// the manifest about to be committed references.
+///
+/// A manifest whose layers are missing is an image that pulls a 404 for one of
+/// its own parts, and the client that pushed it is long gone by the time anyone
+/// finds out — so the push has to fail while it can still be retried. Both
+/// manifest writers claim through here, so the digest-addressed path and the
+/// tagged path cannot disagree about what a valid manifest is.
+///
+/// This used to be a side effect of bumping `oci_blob.ref_count`, a counter no
+/// reader ever had: the registry exposes no delete of any kind, so a reference
+/// could never be released and nothing collected the blobs (card_e9b4da7bf8ca).
+/// The column is gone; the guarantee it was accidentally providing is not.
+///
+/// The claim is a read, which is enough while nothing can delete a blob row.
+/// Whoever adds the first delete path owes this call a row lock — otherwise a
+/// collector can remove a layer between this check and the commit that depends
+/// on it.
+async fn claim_referenced_blobs<C: ConnectionTrait>(
+    txn: &C,
+    oci_repo_id: i64,
+    referenced_blob_digests: &[String],
+) -> Result<(), DbErr> {
     use oci_blob::Entity as Blob;
-    Blob::update_many()
-        .col_expr(
-            oci_blob::Column::RefCount,
-            Expr::col(oci_blob::Column::RefCount).add(1),
-        )
-        .filter(oci_blob::Column::Id.eq(blob_id))
-        .exec(db)
-        .await?;
-    Ok(())
-}
-
-/// Decrement blob reference count.
-pub async fn decrement_blob_ref(db: &DatabaseConnection, blob_id: i64) -> Result<(), DbErr> {
-    use oci_blob::Entity as Blob;
-    Blob::update_many()
-        .col_expr(
-            oci_blob::Column::RefCount,
-            Expr::col(oci_blob::Column::RefCount).sub(1),
-        )
-        .filter(oci_blob::Column::Id.eq(blob_id))
-        .exec(db)
-        .await?;
+    for blob_digest in referenced_blob_digests {
+        let present = Blob::find()
+            .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+            .filter(oci_blob::Column::Digest.eq(blob_digest))
+            .count(txn)
+            .await?;
+        if present != 1 {
+            return Err(DbErr::Custom(format!(
+                "referenced OCI blob {blob_digest} is missing from repository {oci_repo_id}"
+            )));
+        }
+    }
     Ok(())
 }
 

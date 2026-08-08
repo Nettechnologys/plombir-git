@@ -150,7 +150,6 @@ async fn a_cross_repository_mount_records_the_blob_and_its_manifest_reference() 
         .unwrap()
         .expect("the 201 mount must create the target blob row");
     assert_eq!(mounted_blob.size, payload.len() as i64);
-    assert_eq!(mounted_blob.ref_count, 0);
 
     let manifest = serde_json::json!({
         "schemaVersion": 2,
@@ -180,13 +179,16 @@ async fn a_cross_repository_mount_records_the_blob_and_its_manifest_reference() 
         "manifest push over mounted blob failed: {body}"
     );
 
-    let referenced = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &digest)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        referenced.ref_count, 1,
-        "put_manifest must find and count the mounted blob row"
+    // The manifest push is the assertion: it claims every blob it names inside
+    // its own transaction, so a 201 over a mounted layer proves `put_manifest`
+    // found the row the mount created. Before card_dc95e1661124 the mount wrote
+    // no row and this push failed.
+    assert!(
+        rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &digest)
+            .await
+            .unwrap()
+            .is_some(),
+        "the mounted blob row must survive the manifest push that claims it"
     );
 }
 

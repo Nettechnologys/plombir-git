@@ -19,8 +19,6 @@ pub struct Model {
     pub size: i64,
     /// File-system path to the stored blob
     pub storage_path: String,
-    /// Reference count — blob is garbage-collected when this reaches 0
-    pub ref_count: i32,
     pub created_at: DateTimeUtc,
 }
 

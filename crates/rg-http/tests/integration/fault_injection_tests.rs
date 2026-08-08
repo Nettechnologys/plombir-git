@@ -519,14 +519,13 @@ async fn a_second_put_of_the_same_manifest_digest_is_idempotent() {
         .unwrap();
     assert_eq!(manifest_rows, 1, "a retry created a second manifest row");
 
-    let blob = rg_db::ops::oci_ops::find_blob(&app.db, oci_repo.id, &config_digest)
+    let blobs = rg_db::entities::oci_blob::Entity::find()
+        .filter(rg_db::entities::oci_blob::Column::OciRepositoryId.eq(oci_repo.id))
+        .filter(rg_db::entities::oci_blob::Column::Digest.eq(&config_digest))
+        .count(&app.db)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(
-        blob.ref_count, 1,
-        "the same digest-addressed manifest incremented its blob twice"
-    );
+    assert_eq!(blobs, 1, "the retry created a second row for the same layer");
 }
 
 /// Two concurrent PUTs of one manifest digest both succeed, and the second one
@@ -633,13 +632,15 @@ async fn concurrent_puts_of_the_same_manifest_digest_both_succeed() {
         .await
         .unwrap();
     assert_eq!(manifest_rows, 1);
-    let blob = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &config_digest)
+    let blobs = rg_db::entities::oci_blob::Entity::find()
+        .filter(rg_db::entities::oci_blob::Column::OciRepositoryId.eq(oci_repo.id))
+        .filter(rg_db::entities::oci_blob::Column::Digest.eq(&config_digest))
+        .count(&db)
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(
-        blob.ref_count, 1,
-        "both concurrent requests claimed the same blob reference"
+        blobs, 1,
+        "the two concurrent requests left two rows for one layer"
     );
 }
 
@@ -1030,12 +1031,19 @@ async fn a_failed_repush_does_not_delete_the_layer_an_earlier_push_stored() {
     );
 }
 
-/// A manifest whose blob ref counts were not incremented must fail the push.
+/// A manifest naming a blob this repository does not have must fail the push.
 ///
-/// An under-counted blob is one the GC may delete while this manifest still
-/// points at it: the image breaks later, far from the push that caused it.
+/// A manifest is only as good as its parts: accept one whose layer row is
+/// missing and the registry hands out an image that 404s on a pull, long after
+/// the client that could still have retried the push has gone. The claim runs
+/// inside the manifest transaction precisely so the failure lands on the push.
+///
+/// Both reference forms are driven, and that is the point rather than
+/// thoroughness for its own sake: the check used to live in the tagged writer
+/// only, so a digest-addressed push of the very same broken manifest was
+/// accepted (card_e9b4da7bf8ca). One claim now serves both writers.
 #[tokio::test]
-async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
+async fn a_manifest_naming_an_absent_blob_fails_the_push() {
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let (token, _user_id) = register_full(&base, "fault_ref", "fault_ref@example.com").await;
@@ -1066,10 +1074,17 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
         ok.text().await.unwrap()
     );
 
-    // Re-pushing the tag takes the transactional replacement path and attempts
-    // to claim its blob references again — which is the write this fault
-    // rejects.
-    let _fault = fail_db_writes(&db, "oci_blob", DbWrite::Update).await;
+    // Re-pushing the tag takes the transactional replacement path and claims
+    // its blob references again — against a row that is now gone. Removing the
+    // row is the honest way to state the fault: it is the state a future blob
+    // collector would produce, and unlike a write trigger it does not depend on
+    // the claim happening to be a write.
+    rg_db::entities::oci_blob::Entity::delete_many()
+        .filter(rg_db::entities::oci_blob::Column::Digest.eq(&digest))
+        .exec(&db)
+        .await
+        .expect("remove the blob row the manifest names");
+
     let broken = client
         .put(&url)
         .bearer_auth(&token)
@@ -1077,7 +1092,7 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
             reqwest::header::CONTENT_TYPE,
             "application/vnd.docker.distribution.manifest.v2+json",
         )
-        .body(manifest)
+        .body(manifest.clone())
         .send()
         .await
         .unwrap();
@@ -1085,12 +1100,54 @@ async fn a_ref_count_that_was_not_incremented_fails_the_manifest_push() {
     let body: Value = broken.json().await.unwrap();
     assert_eq!(
         status, 500,
-        "a lost ref-count increment must fail the manifest push: {body}"
+        "a manifest naming a blob this repository does not have must fail the push: {body}"
     );
     let message = body["errors"][0]["message"].as_str().unwrap_or_default();
     assert_eq!(
         message, "failed to record manifest",
         "the OCI response must be useful without disclosing backend internals: {message}"
+    );
+
+    // The digest-addressed writer is the other half, and it is driven directly
+    // rather than over HTTP on purpose. `put_manifest` refuses an unknown layer
+    // at the edge with `MANIFEST_BLOB_UNKNOWN`, so no request can reach this
+    // writer with a missing row — except by losing the race between that check
+    // and the transaction, which is precisely the state the tagged half above
+    // simulates and which this writer used to commit without noticing.
+    let forgekeep_repo = rg_core::repo::service::find_repo_by_owner_name(&db, "fault_ref", "lost-ref")
+        .await
+        .unwrap()
+        .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed = rg_db::ops::oci_ops::insert_digest_manifest(
+        &db,
+        oci_repo.id,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        "application/vnd.docker.distribution.manifest.v2+json",
+        manifest.len() as i64,
+        &manifest,
+        2,
+        None,
+        std::slice::from_ref(&digest),
+    )
+    .await;
+    assert!(
+        claimed.is_err(),
+        "the digest-addressed writer recorded a manifest whose layer row is gone: {claimed:?}"
+    );
+    assert!(
+        rg_db::ops::oci_ops::find_manifest_by_digest(
+            &db,
+            oci_repo.id,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the refused manifest still left its row behind — the claim ran outside the transaction"
     );
 }
 
