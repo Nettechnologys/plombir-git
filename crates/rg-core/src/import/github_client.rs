@@ -167,10 +167,11 @@ pub struct GitHubReview {
 impl GitHubClient {
     /// Create a new GitHub API client.
     ///
-    /// `base_url` should be `https://api.github.com` for GitHub.com
-    /// or `https://<hostname>/api/v3` for GitHub Enterprise Server.
-    pub fn new(token: String, base_url: Option<String>) -> Result<Self> {
-        let base = base_url.unwrap_or_else(|| "https://api.github.com".to_string());
+    /// `base_url` must be `https://api.github.com` for GitHub.com
+    /// or `https://<hostname>/api/v3` for GitHub Enterprise Server. Requiring
+    /// it keeps the source repository and the authenticated API host coupled;
+    /// the import service derives it from the source URL.
+    pub fn new(token: String, base_url: String) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -200,7 +201,7 @@ impl GitHubClient {
 
         Ok(Self {
             client,
-            base_url: base,
+            base_url,
             token,
         })
     }

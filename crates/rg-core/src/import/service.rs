@@ -408,10 +408,15 @@ async fn run_github_import(
     token: &str,
     stats: &mut ImportStats,
 ) -> Result<()> {
-    let client = GitHubClient::new(token.to_string(), None)?;
-
-    // Parse owner/repo from source URL (https://github.com/owner/repo)
-    let (gh_owner, gh_repo) = parse_github_url(&task.source_url)?;
+    // Parse the repository identity and its API host together. Computing only
+    // owner/repo here used to leave the client's optional base URL at `None`,
+    // which sent a GHES token and every metadata request to api.github.com.
+    let GitHubImportSource {
+        owner: gh_owner,
+        repo: gh_repo,
+        api_base_url,
+    } = parse_github_url(&task.source_url)?;
+    let client = GitHubClient::new(token.to_string(), api_base_url)?;
 
     // Resolve (or create) the target repo in ForgeKeep DB
     let repo_id = resolve_or_create_target_repo(
@@ -611,10 +616,14 @@ async fn run_gitlab_import(
     token: &str,
     stats: &mut ImportStats,
 ) -> Result<()> {
-    let client = GitLabClient::new(token.to_string(), None)?;
-
-    // Extract project path from source URL (https://gitlab.com/group/project)
-    let project_path = parse_gitlab_url(&task.source_url)?;
+    // Parse the project identity and its API host together. Computing only the
+    // path here used to leave the client's optional base URL at `None`, which
+    // sent a self-hosted token and every metadata request to gitlab.com.
+    let GitLabImportSource {
+        project_path,
+        api_base_url,
+    } = parse_gitlab_url(&task.source_url)?;
+    let client = GitLabClient::new(token.to_string(), api_base_url)?;
 
     // Resolve (or create) the target repo in ForgeKeep DB
     let repo_id = resolve_or_create_target_repo(
@@ -1420,27 +1429,163 @@ pub async fn import_wiki_pages(
 // URL parsing
 // ═══════════════════════════════════════════════════════════════════════
 
-fn parse_github_url(url: &str) -> Result<(String, String)> {
-    let url = url.trim_end_matches('/').trim_end_matches(".git");
-    let parts: Vec<&str> = url.split('/').collect();
-    if parts.len() < 2 {
-        anyhow::bail!("invalid GitHub URL: {url}");
-    }
-    let repo = parts[parts.len() - 1].to_string();
-    let owner = parts[parts.len() - 2].to_string();
-    Ok((owner, repo))
+struct GitHubImportSource {
+    owner: String,
+    repo: String,
+    api_base_url: String,
 }
 
-fn parse_gitlab_url(url: &str) -> Result<String> {
-    let url = url.trim_end_matches('/').trim_end_matches(".git");
-    if let Some(pos) = url.find("://") {
-        let after_protocol = &url[pos + 3..];
-        if let Some(slash_pos) = after_protocol.find('/') {
-            let path = &after_protocol[slash_pos + 1..];
-            return Ok(path.to_string());
-        }
+struct GitLabImportSource {
+    project_path: String,
+    api_base_url: String,
+}
+
+fn parse_github_url(raw: &str) -> Result<GitHubImportSource> {
+    let source = parse_api_source_url(raw, "GitHub")?;
+    let (owner, repo) = {
+        let mut segments = source
+            .path_segments()
+            .ok_or_else(|| anyhow::anyhow!("invalid GitHub URL: repository path is missing"))?
+            .filter(|segment| !segment.is_empty());
+        let repo = segments
+            .next_back()
+            .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
+            .filter(|segment| !segment.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("invalid GitHub URL: repository name is missing"))?;
+        let owner = segments
+            .next_back()
+            .filter(|segment| !segment.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("invalid GitHub URL: repository owner is missing"))?;
+        (owner.to_string(), repo.to_string())
+    };
+
+    let api_base_url = if source.host_str().is_some_and(|host| {
+        host.trim_end_matches('.')
+            .eq_ignore_ascii_case("github.com")
+    }) {
+        "https://api.github.com".to_string()
+    } else {
+        api_base_url(source, "/api/v3", "GitHub")?
+    };
+
+    Ok(GitHubImportSource {
+        owner,
+        repo,
+        api_base_url,
+    })
+}
+
+fn parse_gitlab_url(raw: &str) -> Result<GitLabImportSource> {
+    let source = parse_api_source_url(raw, "GitLab")?;
+    let project_path = {
+        let mut segments = source
+            .path_segments()
+            .ok_or_else(|| anyhow::anyhow!("invalid GitLab URL: project path is missing"))?
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let last = segments
+            .pop()
+            .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
+            .filter(|segment| !segment.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("invalid GitLab URL: project path is missing"))?;
+        segments.push(last);
+        segments.join("/")
+    };
+    let api_base_url = api_base_url(source, "/api/v4", "GitLab")?;
+
+    Ok(GitLabImportSource {
+        project_path,
+        api_base_url,
+    })
+}
+
+fn parse_api_source_url(raw: &str, platform: &str) -> Result<reqwest::Url> {
+    let source = reqwest::Url::parse(raw).with_context(|| format!("invalid {platform} URL"))?;
+    if !matches!(source.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "invalid {platform} URL: scheme '{}' cannot identify an HTTP API host",
+            source.scheme()
+        );
     }
-    anyhow::bail!("invalid GitLab URL: {url}")
+    if source.host_str().is_none() {
+        anyhow::bail!("invalid {platform} URL: host is missing");
+    }
+    Ok(source)
+}
+
+fn api_base_url(mut source: reqwest::Url, path: &str, platform: &str) -> Result<String> {
+    source.set_username("").map_err(|()| {
+        anyhow::anyhow!("invalid {platform} URL: user information cannot be removed")
+    })?;
+    source.set_password(None).map_err(|()| {
+        anyhow::anyhow!("invalid {platform} URL: user information cannot be removed")
+    })?;
+    source.set_path(path);
+    source.set_query(None);
+    source.set_fragment(None);
+    Ok(source.to_string().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod import_source_url_tests {
+    use super::*;
+
+    #[test]
+    fn github_com_uses_the_public_api_host() {
+        let source = parse_github_url("https://github.com/acme/widgets.git/")
+            .expect("a GitHub repository URL");
+
+        assert_eq!(source.owner, "acme");
+        assert_eq!(source.repo, "widgets");
+        assert_eq!(source.api_base_url, "https://api.github.com");
+    }
+
+    #[test]
+    fn ghes_uses_the_source_origin_and_never_its_userinfo() {
+        let source = parse_github_url(
+            "http://git@github.acme.example:8443/acme/widgets.git?view=source#readme",
+        )
+        .expect("a GHES repository URL");
+
+        assert_eq!(source.owner, "acme");
+        assert_eq!(source.repo, "widgets");
+        assert_eq!(
+            source.api_base_url,
+            "http://github.acme.example:8443/api/v3"
+        );
+    }
+
+    #[test]
+    fn self_hosted_gitlab_uses_the_source_origin_and_nested_project_path() {
+        let source = parse_gitlab_url(
+            "https://git@gitlab.acme.example:9443/teams/platform/widgets.git?ref=main#readme",
+        )
+        .expect("a self-hosted GitLab repository URL");
+
+        assert_eq!(source.project_path, "teams/platform/widgets");
+        assert_eq!(
+            source.api_base_url,
+            "https://gitlab.acme.example:9443/api/v4"
+        );
+    }
+
+    #[test]
+    fn gitlab_com_uses_its_v4_api() {
+        let source = parse_gitlab_url("https://gitlab.com/acme/widgets")
+            .expect("a GitLab.com repository URL");
+
+        assert_eq!(source.project_path, "acme/widgets");
+        assert_eq!(source.api_base_url, "https://gitlab.com/api/v4");
+    }
+
+    #[test]
+    fn api_backed_imports_reject_a_non_http_source() {
+        let error = parse_github_url("git://github.example/acme/widgets.git")
+            .err()
+            .expect("a git transport cannot identify an HTTP API endpoint");
+
+        assert!(format!("{error:#}").contains("cannot identify an HTTP API host"));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

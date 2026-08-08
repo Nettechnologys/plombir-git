@@ -166,10 +166,11 @@ pub struct GitLabNote {
 impl GitLabClient {
     /// Create a new GitLab API client.
     ///
-    /// `base_url` should be `https://gitlab.com/api/v4` for GitLab.com
-    /// or `https://<hostname>/api/v4` for self-hosted instances.
-    pub fn new(token: String, base_url: Option<String>) -> Result<Self> {
-        let base = base_url.unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
+    /// `base_url` must be `https://gitlab.com/api/v4` for GitLab.com
+    /// or `https://<hostname>/api/v4` for self-hosted instances. Requiring it
+    /// keeps the source repository and the authenticated API host coupled; the
+    /// import service derives it from the source URL.
+    pub fn new(token: String, base_url: String) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "PRIVATE-TOKEN",
@@ -189,10 +190,7 @@ impl GitLabClient {
             .build()
             .context("failed to build GitLab HTTP client")?;
 
-        Ok(Self {
-            client,
-            base_url: base,
-        })
+        Ok(Self { client, base_url })
     }
 
     /// Get project metadata.
