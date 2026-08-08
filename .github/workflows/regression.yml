@@ -249,25 +249,24 @@ jobs:
       # which the same test can only prove that the lock path does not break a
       # no-op run.
       - name: Prove concurrent PostgreSQL migrators are serialized
-        run: cargo test -p rg-db -j 6 --test server_migration_serialization -- --ignored --nocapture
+        run: cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture
 
       # The claim that the migration lock removed the need for `--test-threads=1`
       # on a server backend: this file's tests migrate the same database in
       # parallel, which is exactly what used to collide.
       - name: Prove a parallel rg-db test file migrates PostgreSQL safely
-        run: cargo test -p rg-db -j 6 --test password_reset_token_single_use -- --nocapture
+        run: cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture
 
       # Single-use and compare-and-swap are claims the *database* arbitrates, so
       # they are claims about each backend. Both files honour
       # FORGEKEEP_TEST_DATABASE_URL for exactly this step.
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
-          cargo test -p rg-db -j 6
-          --test mfa_backup_code_single_use
-          --test passkey_counter_compare_and_swap
-          --test totp_step_single_use
-          --test webauthn_ceremony_single_use
-          -- --nocapture
+          cargo test -p rg-db -j 6 --test integration -- --nocapture
+          mfa_backup_code_single_use::
+          passkey_counter_compare_and_swap::
+          totp_step_single_use::
+          webauthn_ceremony_single_use::
 
       - name: Prove PostgreSQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
@@ -318,10 +317,10 @@ jobs:
       # First test step, for the same reason as in the PostgreSQL job: concurrent
       # migrators only collide while the schema is still absent.
       - name: Prove concurrent MySQL migrators are serialized
-        run: cargo test -p rg-db -j 6 --test server_migration_serialization -- --ignored --nocapture
+        run: cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture
 
       - name: Prove a parallel rg-db test file migrates MySQL safely
-        run: cargo test -p rg-db -j 6 --test password_reset_token_single_use -- --nocapture
+        run: cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture
 
       # MySQL is the backend that makes this worth a step of its own: it counts
       # *changed* rows rather than matched ones, so a compare-and-swap that
@@ -329,12 +328,11 @@ jobs:
       # nowhere else.
       - name: Prove single-use credentials hold on MySQL
         run: >-
-          cargo test -p rg-db -j 6
-          --test mfa_backup_code_single_use
-          --test passkey_counter_compare_and_swap
-          --test totp_step_single_use
-          --test webauthn_ceremony_single_use
-          -- --nocapture
+          cargo test -p rg-db -j 6 --test integration -- --nocapture
+          mfa_backup_code_single_use::
+          passkey_counter_compare_and_swap::
+          totp_step_single_use::
+          webauthn_ceremony_single_use::
 
       - name: Prove MySQL FTS migration maintenance boundary
         run: cargo test -p rg-db -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture
