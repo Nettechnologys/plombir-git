@@ -39,6 +39,7 @@ for (const [method, route, handler] of [
   ['post', '/users/mfa/setup', 'setup_mfa'],
   ['post', '/users/mfa/enable', 'enable_mfa'],
   ['get', '/users/mfa/backup', 'get_backup_codes'],
+  ['post', '/users/mfa/backup/regenerate', 'regenerate_backup_codes'],
   ['post', '/users/mfa/disable', 'disable_mfa'],
 ]) {
   expect(
@@ -55,6 +56,7 @@ for (const [name, route, httpMethod] of [
   ['setup', '/users/mfa/setup', 'POST'],
   ['enable', '/users/mfa/enable', 'POST'],
   ['backup', '/users/mfa/backup', 'GET'],
+  ['regenerateBackup', '/users/mfa/backup/regenerate', 'POST'],
   ['disable', '/users/mfa/disable', 'POST'],
 ]) {
   expect(client, new RegExp(`${name}: [\\s\\S]*['"]${route}['"]`), `API client is missing mfa.${name} route`);
@@ -85,6 +87,11 @@ expect(page, /mfa\.setup\(\)/, 'Security page must call mfa.setup() for QR enrol
 expect(page, /mfa\.enable\(verificationCode\.trim\(\)\)/, 'Security page must enable MFA with the entered code');
 expect(page, /mfa\.backup\(\)/, 'Security page must load backup code status');
 expect(page, /mfa\.disable\(disablePassword\)/, 'Security page must disable MFA with current password');
+expect(
+  page,
+  /mfa\.regenerateBackup\(regeneratePassword\)/,
+  'Security page must offer a backup-code re-issue confirmed by the current password',
+);
 expect(page, /{@html setup\.qr_svg}/, 'Security page must render backend QR SVG from setup response');
 expect(navbar, /href="\/settings\/security"/, 'User menu must link to security settings');
 

@@ -283,6 +283,7 @@ pub(crate) fn stamp_security(
         crate::api::mfa::enable_mfa,
         crate::api::mfa::verify_mfa,
         crate::api::mfa::get_backup_codes,
+        crate::api::mfa::regenerate_backup_codes,
         crate::api::mfa::disable_mfa,
         // Passkeys
         crate::api::passkeys::list_passkeys,
@@ -609,6 +610,8 @@ pub(crate) fn stamp_security(
             crate::api::mfa::VerifyMfaRequest,
             crate::api::mfa::VerifyMfaResponse,
             crate::api::mfa::DisableMfaRequest,
+            crate::api::mfa::RegenerateBackupCodesRequest,
+            crate::api::mfa::RegenerateBackupCodesResponse,
             crate::api::passkeys::PasskeyInfo,
             crate::api::passkeys::PasskeyRegisterStartResponse,
             crate::api::passkeys::PasskeyCreationOptions,

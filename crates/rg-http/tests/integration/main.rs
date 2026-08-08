@@ -84,6 +84,7 @@ mod login_failure_semantics_tests;
 mod maintenance_mode_tests;
 mod merge_queue_cancel_status_tests;
 mod merge_queue_ci_tests;
+mod mfa_backup_regenerate_tests;
 mod mfa_disable_lockout_tests;
 mod mfa_enable_atomicity_tests;
 mod mfa_totp_replay_tests;

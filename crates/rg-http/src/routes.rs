@@ -909,6 +909,11 @@ pub(crate) fn build_all_routes(
         // session yet, so this one is reachable without a token by design.
         .post(Public, "/users/mfa/verify", api::mfa::verify_mfa)
         .get(User, "/users/mfa/backup", api::mfa::get_backup_codes)
+        .post(
+            User,
+            "/users/mfa/backup/regenerate",
+            api::mfa::regenerate_backup_codes,
+        )
         .post(User, "/users/mfa/disable", api::mfa::disable_mfa)
         // Passkeys (WebAuthn)
         .get(User, "/users/passkeys", api::passkeys::list_passkeys)

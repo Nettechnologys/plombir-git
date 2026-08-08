@@ -6,6 +6,7 @@
 //!   POST   /users/mfa/disable  — Disable MFA (requires password)
 //!   POST   /users/mfa/verify   — Verify TOTP code (during login)
 //!   GET    /users/mfa/backup   — Backup code status (never the codes themselves)
+//!   POST   /users/mfa/backup/regenerate — Replace the unused backup codes
 //!
 //! A backup code is redeemed through `POST /users/mfa/verify` with `backup:
 //! true`; the `POST /users/mfa/backup` this header used to advertise has never
@@ -461,6 +462,131 @@ pub struct DisableMfaRequest {
     password: String,
 }
 
+/// Re-confirm the account password on a door that sits *behind* a session.
+///
+/// Shared by every MFA operation whose success would make a stolen session
+/// permanent — taking the second factor off, and minting a fresh set of backup
+/// codes, which is the same thing by another route. Keeping it in one function
+/// is what stops the next such door from being added with the verification but
+/// without the lockout: guessing here costs only Argon2 (~50 ms a try), and an
+/// attempt that advances no counter leaves neither the audit log nor the admin's
+/// view of the account showing a thousand tries.
+///
+/// `channel` names the door in the attempt record; the strike itself is the
+/// account-wide one `POST /users/login`, SSH and `docker login` record.
+async fn confirm_account_password(
+    state: &AppState,
+    user: &rg_db::entities::user::Model,
+    password: &str,
+    channel: &'static str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    // `map_err(|_| unauthorized(...))` would answer "invalid password" to a
+    // hash the verifier could not use and throw the reason away — the caller
+    // here is already authenticated, so that tells a legitimate user their own
+    // password is wrong and leaves the operator nothing. Only a genuine
+    // mismatch is a 401.
+    let password_ok = rg_core::auth::password::verify_password(password, &user.password_hash)
+        .with_context(|| format!("cannot verify the password of user {}", user.id))
+        .map_err(AppError::from)?;
+
+    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
+    let attempt = rg_core::auth::lockout::settle_password_attempt(
+        &state.db,
+        Some(user),
+        password_ok,
+        rg_core::auth::lockout::AttemptOrigin {
+            login: &user.username,
+            channel,
+            ip_address: ip_address.as_deref(),
+            user_agent: user_agent.as_deref(),
+        },
+    )
+    .await;
+
+    if let rg_core::auth::lockout::PasswordAttempt::Rejected { locked } = attempt {
+        // The caller is authenticated as this very account, so naming the lock
+        // leaks nothing — it is what `POST /users/mfa/verify` already answers,
+        // and the alternative is telling the owner their password is wrong when
+        // it is not.
+        return Err(AppError::unauthorized(if locked {
+            "account is temporarily locked"
+        } else {
+            "invalid password"
+        }));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RegenerateBackupCodesRequest {
+    password: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RegenerateBackupCodesResponse {
+    backup_codes: Vec<String>,
+}
+
+/// POST /users/mfa/backup/regenerate
+/// Replace the unused backup codes with a fresh set (requires current password).
+///
+/// Without this the only way to refresh a spent or leaked printout was to turn
+/// MFA off and on again — i.e. to drop the second factor in order to renew the
+/// material that exists precisely for when the second factor is unavailable.
+#[utoipa::path(
+    post,
+    path = "/users/mfa/backup/regenerate",
+    tag = "MFA",
+    request_body = RegenerateBackupCodesRequest,
+    responses(
+        (status = 200, description = "New backup codes, shown once", body = RegenerateBackupCodesResponse),
+        (status = 400, description = "MFA is not enabled for this account"),
+        (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+)]
+pub async fn regenerate_backup_codes(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
+    Json(req): Json<RegenerateBackupCodesRequest>,
+) -> Result<Json<RegenerateBackupCodesResponse>, AppError> {
+    let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
+
+    if !user.mfa_enabled {
+        return Err(AppError::bad_request("MFA is not enabled for this account"));
+    }
+
+    confirm_account_password(
+        &state,
+        &user,
+        &req.password,
+        "mfa-backup-regenerate",
+        &headers,
+    )
+    .await?;
+
+    let backup_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
+        rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
+    );
+
+    // `set_codes` replaces the unused rows inside one transaction, so the old
+    // set stops working exactly when the new one starts — there is no window
+    // where both, or neither, are live.
+    rg_db::ops::mfa_backup_code_ops::set_codes(&state.db, user_id, &backup_codes)
+        .await
+        .map_err(AppError::from)?;
+
+    // The one and only time these are ever shown.
+    Ok(Json(RegenerateBackupCodesResponse { backup_codes }))
+}
+
 /// POST /users/mfa/disable
 /// Disable MFA (requires current password for security).
 #[utoipa::path(
@@ -486,54 +612,18 @@ pub async fn disable_mfa(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
-    // Verify password before disabling MFA. `map_err(|_| unauthorized(...))`
-    // used to answer "invalid password" to a hash the verifier could not use
-    // and throw the reason away — the caller here is already authenticated, so
-    // that told a legitimate user their own password was wrong and left the
-    // operator nothing at all. Only a genuine mismatch is a 401 now.
-    let password_ok = rg_core::auth::password::verify_password(&req.password, &user.password_hash)
-        .with_context(|| format!("cannot verify the password of user {user_id}"))
-        .map_err(AppError::from)?;
-
     // The fourth password door, and the one that is easiest to miss: it sits
     // behind a valid session, so it is not a way *in* — it is the way a stolen
-    // session is made permanent. Guessing the owner's password here costs only
-    // Argon2 (~50 ms a try), and until this call the guessing advanced no
-    // counter and left no row, so neither the audit log nor the admin's view of
-    // the account showed a thousand attempts at taking the second factor off.
-    //
-    // It settles through the shared helper, so a strike here is the same strike
-    // `POST /users/login`, SSH and `docker login` record: the whole account
-    // locks, not just this door. Locking the account from a door behind a
-    // session grants an attacker no new denial-of-service — anyone who merely
-    // knows a username can already trip the same lock from the login form — and
-    // a door-local counter would not stop the guessed password from being used
-    // everywhere else, which is the point of guessing it.
-    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(&headers);
-    let attempt = rg_core::auth::lockout::settle_password_attempt(
-        &state.db,
-        Some(&user),
-        password_ok,
-        rg_core::auth::lockout::AttemptOrigin {
-            login: &user.username,
-            channel: "mfa-disable",
-            ip_address: ip_address.as_deref(),
-            user_agent: user_agent.as_deref(),
-        },
-    )
-    .await;
-
-    if let rg_core::auth::lockout::PasswordAttempt::Rejected { locked } = attempt {
-        // The caller is authenticated as this very account, so naming the lock
-        // leaks nothing — it is what `POST /users/mfa/verify` already answers,
-        // and the alternative is telling the owner their password is wrong when
-        // it is not.
-        return Err(AppError::unauthorized(if locked {
-            "account is temporarily locked"
-        } else {
-            "invalid password"
-        }));
-    }
+    // session is made permanent. Both the verification and the lockout live in
+    // `confirm_account_password`, shared with the backup-code re-issue, so a
+    // strike here is the same strike `POST /users/login`, SSH and `docker
+    // login` record: the whole account locks, not just this door. Locking the
+    // account from a door behind a session grants an attacker no new
+    // denial-of-service — anyone who merely knows a username can already trip
+    // the same lock from the login form — and a door-local counter would not
+    // stop the guessed password from being used everywhere else, which is the
+    // point of guessing it.
+    confirm_account_password(&state, &user, &req.password, "mfa-disable", &headers).await?;
 
     rg_db::ops::user_ops::disable_mfa(&state.db, user_id)
         .await

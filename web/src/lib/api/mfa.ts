@@ -11,6 +11,10 @@ export interface MfaEnableResponse {
   backup_codes: string[];
 }
 
+export interface MfaRegenerateBackupResponse {
+  backup_codes: string[];
+}
+
 export interface MfaBackupStatus {
   total: number;
   unused: number;
@@ -27,6 +31,11 @@ export const mfa = {
     }),
   backup: () =>
     request<MfaBackupStatus>('/users/mfa/backup'),
+  regenerateBackup: (password: string) =>
+    request<MfaRegenerateBackupResponse>('/users/mfa/backup/regenerate', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    }),
   disable: (password: string) =>
     request<void>('/users/mfa/disable', {
       method: 'POST',

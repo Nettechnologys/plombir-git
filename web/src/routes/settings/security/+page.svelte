@@ -18,6 +18,7 @@
   let setup = $state<MfaSetupResponse | null>(null);
   let verificationCode = $state('');
   let disablePassword = $state('');
+  let regeneratePassword = $state('');
   let newBackupCodes = $state<string[]>([]);
 
   let passkeyList = $state<PasskeyInfo[]>([]);
@@ -146,6 +147,30 @@
     }
   }
 
+  async function regenerateBackupCodes(event: SubmitEvent) {
+    event.preventDefault();
+    if (!regeneratePassword) {
+      error = 'Current password is required';
+      return;
+    }
+    if (!confirm('Replace your backup codes? Every unused code you have now stops working.')) return;
+
+    try {
+      saving = true;
+      error = '';
+      success = '';
+      const result = await mfa.regenerateBackup(regeneratePassword);
+      regeneratePassword = '';
+      newBackupCodes = result.backup_codes;
+      success = 'New backup codes issued. Save them before leaving this page — the old ones no longer work.';
+      await loadSecurity();
+    } catch (err: any) {
+      error = err.message || 'Failed to regenerate backup codes';
+    } finally {
+      saving = false;
+    }
+  }
+
   async function copyBackupCodes() {
     if (newBackupCodes.length === 0) return;
     await navigator.clipboard.writeText(newBackupCodes.join('\n'));
@@ -195,6 +220,24 @@
           <span>total backup codes</span>
         </div>
       </div>
+
+      <form class="disable-form" onsubmit={regenerateBackupCodes}>
+        <label>
+          Current password
+          <input
+            type="password"
+            bind:value={regeneratePassword}
+            autocomplete="current-password"
+            disabled={saving}
+          />
+        </label>
+        <button type="submit" class="btn btn-secondary" disabled={saving || !regeneratePassword}>
+          {saving ? 'Working...' : 'Regenerate backup codes'}
+        </button>
+      </form>
+      <p class="muted">
+        Issues a fresh set of {backupStatus?.total ?? 0} codes and revokes every unused one you have now.
+      </p>
 
       <form class="disable-form" onsubmit={disableMfa}>
         <label>
