@@ -335,26 +335,39 @@ The gate is `cargo-nextest` plus a doc-test pass — the same two commands CI
 runs:
 
 ```bash
-cargo install cargo-nextest --locked   # one-off
-cargo nextest run --workspace -j 6     # 642 tests
-cargo test --workspace --doc           # nextest does not run doc-tests
+cargo install cargo-nextest --locked      # one-off
+cargo nextest run --workspace             # 2045 tests
+cargo test --workspace --doc              # nextest does not run doc-tests
 ```
 
 Both commands are needed. `cargo nextest` does not run doc-tests at all, so on
 its own it silently stops checking them.
 
-`cargo test --workspace -j 6` still works and runs the same tests, it is just
-several times slower: it runs the workspace's 14 test binaries one after
-another and only parallelises inside one of them, so on a 24-core machine most
-of the machine sits idle. Measured on a warm `target` and a quiet machine,
-medians of interleaved rounds: 92s for `cargo test` against 21s for
-`cargo nextest run`.
+`cargo test --workspace` still works and runs the same tests, it is just far
+slower: it runs the workspace's test binaries one after another and only
+parallelises inside one of them, so on a 24-core machine most of the machine
+sits idle. Measured on a warm `target` and a quiet machine: **496s for
+`cargo test --workspace` against 60s for `cargo nextest run --workspace`.**
 
-Use `-j 6` (or lower) rather than the default: full build parallelism
-saturates RAM during linking on this tree. `-j` caps *build* jobs only — if the
-run itself needs to be gentler on memory, cap the runner instead with
-`cargo nextest run --workspace --test-threads 8`. For reference, a full
-`--workspace` run on a 24-core / 125 GB machine peaks around 17 GB above idle.
+**`-j` does not mean the same thing to the two commands, and getting it wrong
+costs half the run.** For `cargo test` it caps *build* jobs. For `cargo nextest`
+it is `--test-threads` — it caps how many tests run at once and leaves the build
+alone. `cargo nextest run --workspace -j 6` therefore runs the suite at a
+quarter of this machine's width: 118s against 60s, measured back to back. Cap
+the build with `--build-jobs` when you need to (the build cap that matters is
+already in `~/.cargo/config.toml`), and only reach for `-j` when the *run* has
+to be gentler on memory. For reference, a full `--workspace` run on a 24-core /
+125 GB machine peaks around 17 GB above idle.
+
+Nextest gives every test its own process, which is what makes its isolation
+worth having and which used to make the schema expensive: the migrated-template
+cache in each suite's `common` module was a per-process `OnceCell`, so under
+nextest it hit exactly once and every other test ran the whole migration chain
+again. The template is now published under `target/debug/deps/` keyed on the
+test binary's own modification time, so it is built once per build and read by
+every process of every later run — 226s to 60s on the same suite. A binary
+newer than its template is exactly the condition under which the template is
+stale, so nothing there can hand a test an older chain's schema.
 
 To run one crate or one file:
 

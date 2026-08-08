@@ -32,16 +32,51 @@ pub async fn migrated_sqlite(db_path: &Path, max_connections: u32) -> rg_db::Dat
     .expect("connect sqlite")
 }
 
-/// The migrated schema, built once per test binary.
+/// The migrated schema, built once per *binary build* and shared by every
+/// process that runs it.
 ///
-/// Held in a `static`, so the directory outlives every test and is never
-/// dropped; it is a `tempfile` directory, which the OS reclaims.
+/// Not a hand-written schema dump: it is produced by `run_migrations` itself, so
+/// what a test starts from is exactly what the chain produces — a migration
+/// added tomorrow is in the template the moment it is in the chain, with nothing
+/// to keep in sync. The bookkeeping table travels with it, so a test that runs
+/// the migrations again gets the same no-op it always did.
+///
+/// It used to be a per-process `OnceCell`, which was right for `cargo test`
+/// (one process per binary, so the chain ran once for hundreds of tests) and
+/// wrong for the runner this suite is actually gated by: nextest gives **every
+/// test its own process**, so the cache hit exactly once and every test paid the
+/// full chain again — 0.46 s measured, times 2045 tests.
+///
+/// The cache key is this executable's own modification time. Any change to a
+/// migration rebuilds `rg-db`, which relinks this binary, so a binary newer than
+/// its template is exactly the condition under which the template is stale.
+/// Nothing here can hand a test the schema of an older chain.
+///
+/// Publication is a directory rename, which is atomic and fails when the
+/// destination exists — so concurrent first-starters race harmlessly: the loser
+/// throws its copy away and reads the winner's. A lock would only save the few
+/// duplicate builds in the first wave of a cold run.
 async fn migrated_template() -> &'static Path {
-    static TEMPLATE: tokio::sync::OnceCell<tempfile::TempDir> = tokio::sync::OnceCell::const_new();
+    static TEMPLATE: tokio::sync::OnceCell<std::path::PathBuf> = tokio::sync::OnceCell::const_new();
     TEMPLATE
         .get_or_init(|| async {
-            let dir = tempfile::tempdir().expect("create the template directory");
-            let path = dir.path().join("template.db");
+            let published = template_dir_for_this_build();
+            if published.join("template.db").exists() {
+                return published;
+            }
+
+            let staging = published.with_file_name(format!(
+                "{}.building-{}",
+                published
+                    .file_name()
+                    .expect("template directory name")
+                    .to_string_lossy(),
+                std::process::id()
+            ));
+            discard_directory(&staging);
+            std::fs::create_dir_all(&staging).expect("create the template staging directory");
+
+            let path = staging.join("template.db");
             let db = rg_db::connect_with_pool(
                 &format!("sqlite://{}?mode=rwc", path.display()),
                 rg_db::TEST_CONNECT_TIMEOUT_SECS,
@@ -57,10 +92,68 @@ async fn migrated_template() -> &'static Path {
             // copied. Without it a test would start from a database missing
             // every table the last checkpoint did not cover.
             db.close().await.expect("close the template database");
-            dir
+
+            if std::fs::rename(&staging, &published).is_err() {
+                // Somebody published first. Theirs is the same schema by
+                // construction, so drop ours rather than racing to replace it.
+                discard_directory(&staging);
+            }
+            assert!(
+                published.join("template.db").exists(),
+                "no migrated template at {} after publication",
+                published.display()
+            );
+            published
         })
         .await
-        .path()
+        .as_path()
+}
+
+/// Remove a directory if it is there, and stay quiet when it is not.
+///
+/// `let _ =` on a `Result` is denied workspace-wide, and rightly — but here the
+/// *absent* case is the normal one and carries no information, while a removal
+/// that failed for any other reason is worth a line, because the next thing
+/// this code does is try to create that same path.
+fn discard_directory(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "could not clear the template staging directory {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Where this build's template lives: beside the test binary, under a name
+/// carrying the binary's modification time.
+///
+/// Under `target/`, so `cargo clean` takes it and nothing outside the build
+/// directory is written. Per binary *and* per build, so two binaries — or the
+/// same binary before and after a migration — never share a file.
+fn template_dir_for_this_build() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("the test executable's own path");
+    let stamp = exe
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        // No mtime (an exotic filesystem): fall back to a per-process directory,
+        // which is the old behaviour rather than a shared file we cannot date.
+        .unwrap_or_else(|| u128::from(std::process::id()));
+    let name = exe
+        .file_name()
+        .expect("the test executable's file name")
+        .to_string_lossy()
+        .into_owned();
+    let base = exe
+        .parent()
+        .expect("the test executable's directory")
+        .join(".forgekeep-test-schema");
+    std::fs::create_dir_all(&base).expect("create the shared template directory");
+    base.join(format!("{name}-{stamp}"))
 }
 
 async fn copy_migrated_template(db_path: &Path) {
