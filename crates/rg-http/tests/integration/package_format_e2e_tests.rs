@@ -2239,7 +2239,6 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     );
 }
 
-
 /// `mvn deploy` publishes by PUT-ing each file to the layout its resolver reads.
 ///
 /// The registry only had `POST .../packages/maven/publish`, a spelling no Maven
@@ -2291,7 +2290,10 @@ async fn maven_deploys_by_layout_and_resolves_the_same_paths_back() {
     ] {
         let resolved = client.get(layout(file)).send().await.unwrap();
         assert_eq!(resolved.status(), StatusCode::OK, "GET {file}");
-        assert_eq!(resolved.bytes().await.unwrap().as_ref(), expected.as_slice());
+        assert_eq!(
+            resolved.bytes().await.unwrap().as_ref(),
+            expected.as_slice()
+        );
     }
 
     // ...and it fetches the checksums to verify what it downloaded. They are not
@@ -2301,7 +2303,11 @@ async fn maven_deploys_by_layout_and_resolves_the_same_paths_back() {
         .send()
         .await
         .unwrap();
-    assert_eq!(sha1.status(), StatusCode::OK, "the resolver's checksum fetch");
+    assert_eq!(
+        sha1.status(),
+        StatusCode::OK,
+        "the resolver's checksum fetch"
+    );
     let sha1 = sha1.text().await.unwrap();
     assert_eq!(
         sha1,
@@ -2319,7 +2325,11 @@ async fn maven_deploys_by_layout_and_resolves_the_same_paths_back() {
         .send()
         .await
         .unwrap();
-    assert!(accepted.status().is_success(), "a matching checksum: {}", accepted.status());
+    assert!(
+        accepted.status().is_success(),
+        "a matching checksum: {}",
+        accepted.status()
+    );
 
     let refused = client
         .put(layout("matrix-maven-1.0.0.jar.sha1"))
@@ -2437,7 +2447,10 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
 
     // The crate has to show up where cargo looks for it: the prefixed index path.
     let index = client
-        .get(package_url(&base, &["cargo", "index", "ma", "tr", "matrix-crate"]))
+        .get(package_url(
+            &base,
+            &["cargo", "index", "ma", "tr", "matrix-crate"],
+        ))
         .send()
         .await
         .unwrap();
@@ -2458,7 +2471,10 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
         .await
         .unwrap();
     assert_eq!(downloaded.status(), StatusCode::OK);
-    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), archive.as_slice());
+    assert_eq!(
+        downloaded.bytes().await.unwrap().as_ref(),
+        archive.as_slice()
+    );
 
     // A body cargo would never send is a protocol mismatch, and says so.
     let malformed = client
@@ -2472,8 +2488,14 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
 
     // `cargo yank` / `cargo yank --undo`: separated by verb, answered `{"ok":true}`.
     for (yanked, request) in [
-        (true, client.delete(format!("{api}/api/v1/crates/matrix-crate/1.0.0/yank"))),
-        (false, client.put(format!("{api}/api/v1/crates/matrix-crate/1.0.0/unyank"))),
+        (
+            true,
+            client.delete(format!("{api}/api/v1/crates/matrix-crate/1.0.0/yank")),
+        ),
+        (
+            false,
+            client.put(format!("{api}/api/v1/crates/matrix-crate/1.0.0/unyank")),
+        ),
     ] {
         let response = request
             .header(reqwest::header::AUTHORIZATION, token.clone())
@@ -2482,10 +2504,16 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "yank={yanked}");
         let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["ok"], true, "cargo reads `ok`, not our own envelope: {body}");
+        assert_eq!(
+            body["ok"], true,
+            "cargo reads `ok`, not our own envelope: {body}"
+        );
 
         let index = client
-            .get(package_url(&base, &["cargo", "index", "ma", "tr", "matrix-crate"]))
+            .get(package_url(
+                &base,
+                &["cargo", "index", "ma", "tr", "matrix-crate"],
+            ))
             .send()
             .await
             .unwrap()

@@ -1475,8 +1475,19 @@ pub async fn maven_download(
     // already determine — so they are computed here from the file itself. A
     // registry that 404s them makes every `mvn` build print a checksum warning
     // for artifacts that are in fact intact.
-    if let Some((target, algorithm)) = rg_core::package_registry::MavenChecksum::split_sidecar(filename) {
-        return match read_package_file(&state, &request.owner, &request.repo, &pkg_name, version, target).await {
+    if let Some((target, algorithm)) =
+        rg_core::package_registry::MavenChecksum::split_sidecar(filename)
+    {
+        return match read_package_file(
+            &state,
+            &request.owner,
+            &request.repo,
+            &pkg_name,
+            version,
+            target,
+        )
+        .await
+        {
             Ok(data) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -1508,7 +1519,8 @@ async fn read_package_file(
     version: &str,
     filename: &str,
 ) -> Result<Vec<u8>, axum::response::Response> {
-    let storage = rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
+    let storage =
+        rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
     match rg_core::package_registry::service::download_file(
         &state.db, &storage, owner, repo, "maven", pkg_name, version, filename,
     )
@@ -1537,9 +1549,9 @@ fn split_cargo_publish_frame(body: &[u8]) -> Result<(&[u8], &[u8]), String> {
             .split_at_checked(4)
             .ok_or_else(|| format!("body ends before the {what} length prefix"))?;
         let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
-        let (block, rest) = rest
-            .split_at_checked(len)
-            .ok_or_else(|| format!("the {what} length prefix claims {len} bytes, the body has fewer"))?;
+        let (block, rest) = rest.split_at_checked(len).ok_or_else(|| {
+            format!("the {what} length prefix claims {len} bytes, the body has fewer")
+        })?;
         Ok((block, rest))
     }
 
@@ -1785,7 +1797,9 @@ pub async fn maven_upload(
     };
     let pkg_name = format!("{group_id}:{artifact_id}");
 
-    if let Some((target, algorithm)) = rg_core::package_registry::MavenChecksum::split_sidecar(filename) {
+    if let Some((target, algorithm)) =
+        rg_core::package_registry::MavenChecksum::split_sidecar(filename)
+    {
         let stored = match read_package_file(
             &state,
             &request.owner,
