@@ -97,7 +97,6 @@ pub struct AppState {
     /// separate channel this does not touch; see
     /// [`rg_core::user::registration`].
     pub registration: rg_core::user::registration::RegistrationMode,
-    pub rate_limiter: rate_limit::RateLimiter,
     pub notification_hub: ws::NotificationHub,
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
     /// Backend-neutral durable object storage.
@@ -440,7 +439,6 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         external_runners: config.external_runners,
         allow_host_runner: config.allow_host_runner,
         registration: config.registration,
-        rate_limiter: rate_limiter.clone(),
         notification_hub: notification_hub.clone(),
         smtp_config: config.smtp_config,
         blob_storage,
@@ -457,7 +455,11 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         instance_settings: config.instance_settings,
     };
 
-    let app = routes::create_router(state.clone(), rate_limiter.clone(), auth_rate_limiter);
+    // The limiters go to the router and nowhere else. `AppState` used to carry a
+    // third clone of the global one that nothing ever read — a handler reaching
+    // for "the limiter in the state" would have taken an object whose budget
+    // nobody spends, i.e. a limit that limits nothing (card_11cba7708615).
+    let app = routes::create_router(state.clone(), rate_limiter, auth_rate_limiter);
 
     tokio::spawn(api::ci_retention::run_cleanup_loop(
         state.clone(),

@@ -237,7 +237,6 @@ pub fn build_test_app_state_with(
         external_runners: false,
         allow_host_runner: false,
         registration: overrides.registration.unwrap_or_default(),
-        rate_limiter: rg_http::rate_limit::RateLimiter::new(10000, 60),
         notification_hub: rg_http::ws::NotificationHub::new(),
         smtp_config: None,
         oci_storage: Arc::new(OciStorage::from_backend(blob_storage, oci_storage_path)),
