@@ -32,7 +32,7 @@
 // handler was documented, or deleted, or finally mounted — fails the check, so
 // the list cannot rot into a permanent blanket exemption.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -439,6 +439,80 @@ for (const handler of UNMOUNTED.keys()) {
   }
 }
 
+// ── The fourth comparison: a published schema no operation names ─────────
+//
+// `components(schemas(...))` is a separate declaration from `paths(...)`, and
+// nothing ties the two together. A type listed there reaches the published
+// document — and every generated client — whether or not a single operation
+// refers to it. `ForkRequest { org }` sat there for months while the fork
+// handler took no body at all: a client that believed the schema sent
+// `{"org": "acme"}`, got `201`, and found its fork under a personal account.
+// The field did not fail, it disappeared (card_98be888fb9fc).
+//
+// So: every registered schema must be named by at least one `#[utoipa::path]`
+// annotation, or reached through another type that is. The second half matters
+// — most schemas are nested response types no operation lists directly — so the
+// rule is "somebody refers to this", not "an operation lists it".
+const registeredSchemas = (() => {
+  const src = stripRustComments(openapiSource);
+  const block = src.match(/\bcomponents\(\s*schemas\(([\s\S]*?)\n {8}\)\n {4}\),/);
+  if (!block) {
+    throw new Error(
+      `Could not find the components(schemas(...)) list in ${OPENAPI}. The #[openapi(...)] form ` +
+        'changed — fix this check rather than deleting the assertion.',
+    );
+  }
+  return block[1]
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith('crate::'));
+})();
+
+if (registeredSchemas.length < 60) {
+  failures.push(
+    `only ${registeredSchemas.length} schemas parsed out of components(...) — the parse broke, ` +
+      'so this comparison would pass vacuously.',
+  );
+}
+
+// Every `#[utoipa::path(...)]` attribute body in the API sources, concatenated:
+// this is where `request_body(content = X)` and `body = X` are written.
+// The whole crate, not just `api/`: a schema can live anywhere (`crate::
+// pagination::PaginationMeta` does) and be reached from anywhere.
+//
+// `openapi.rs` itself is excluded, and that exclusion is the difference between
+// a gate and a formality: the `components(schemas(...))` line being checked is
+// itself a mention of the type, so leaving the file in makes every schema
+// vindicate itself and the comparison can never fail. Found by re-adding
+// `ForkRequest` and watching the check stay green.
+const HTTP_SRC = join(root, 'crates/rg-http/src');
+const apiBlob = readdirSync(HTTP_SRC, { recursive: true })
+  .filter((name) => String(name).endsWith('.rs') && join(HTTP_SRC, String(name)) !== OPENAPI)
+  .map((name) => stripRustComments(readFileSync(join(HTTP_SRC, String(name)), 'utf8')))
+  .join('\n');
+const annotationBlob = [...apiBlob.matchAll(/#\[utoipa::path\(([\s\S]*?)\n\)\]/g)]
+  .map((m) => m[1])
+  .join('\n');
+
+let orphanSchemas = 0;
+for (const schema of registeredSchemas) {
+  const name = schema.split('::').pop();
+  const word = new RegExp(`\\b${name}\\b`);
+  if (word.test(annotationBlob)) continue;
+  // Second chance: reached through another type's field rather than named by an
+  // operation. Its own declaration does not count as a use of itself.
+  const withoutDeclaration = apiBlob.replace(
+    new RegExp(`(struct|enum)\\s+${name}\\b`, 'g'),
+    '$1 __declaration__',
+  );
+  if (word.test(withoutDeclaration)) continue;
+  orphanSchemas += 1;
+  failures.push(
+    `${schema} is published in components(schemas(...)) and nothing names it — the spec offers a ` +
+      'type the server never reads. Wire it to a route, or drop it from components.',
+  );
+}
+
 const exempt = UNDOCUMENTED.size;
 const covered = [...mounted.keys()].filter((handler) => documented.has(handler)).length;
 
@@ -460,4 +534,5 @@ console.log(
     `${uncomparable.length} compared by method only, ${extraMounts} extra mount(s) no annotation can describe`,
 );
 console.log(`   request body/query declarations agreed with ${inputCompared} published handler signatures`);
+console.log(`   ${registeredSchemas.length} published schemas are all named by an operation or reached through one`);
 for (const entry of uncomparable) console.log(`   - URL not comparable: ${entry}`);

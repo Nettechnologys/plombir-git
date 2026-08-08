@@ -640,10 +640,14 @@ pub async fn delete_repo_handler(
 
 // ── Fork handlers ──────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize, ToSchema)]
-pub struct ForkRequest {
-    pub org: Option<String>,
-}
+// A `ForkRequest { org }` used to be declared here and registered in the
+// published spec's `components`, and no route ever read it: the handler takes
+// no body, and `fork_repo` forks into the caller's own account and accepts no
+// other destination. A client that believed the schema sent `{"org": "acme"}`,
+// got `201`, and found the fork under its personal account — the field did not
+// fail, it disappeared (card_98be888fb9fc). Forking into an organization is a
+// real feature and is tracked as one; until it exists, the spec does not offer
+// it. Do not re-add the type ahead of a route that reads it.
 
 /// POST /api/v1/repos/:owner/:name/fork
 #[utoipa::path(

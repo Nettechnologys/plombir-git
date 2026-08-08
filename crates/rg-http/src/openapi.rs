@@ -633,7 +633,6 @@ pub(crate) fn stamp_security(
             crate::api::repos::CreateRepoRequest,
             crate::api::repos::RepoResponse,
             crate::api::repos::WatchRequest,
-            crate::api::repos::ForkRequest,
             crate::api::repos::TransferRequest,
             crate::api::repos::CreateCommitStatusRequest,
             crate::pagination::PaginationParams,
