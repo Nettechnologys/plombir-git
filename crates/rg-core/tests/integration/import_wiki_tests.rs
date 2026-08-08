@@ -12,16 +12,24 @@
 
 use std::path::Path;
 
+/// Through the gateway, like every other git invocation in the tree.
+///
+/// Spawning the binary directly here is what `test_no_raw_git_command_in_crates`
+/// exists to refuse: the gateway is where the binary is resolved and where the
+/// environment a subprocess inherits is decided, so a second spawn site is a
+/// second policy. (That gate greps the source line by line and does not strip
+/// comments, so spelling the forbidden call even in prose trips it.)
 fn git(args: &[&str], cwd: &Path) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
+    let gateway = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .unwrap_or_else(|error| panic!("git gateway unavailable: {error}"));
+    let output = gateway
+        .run(args, Some(cwd))
         .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
     assert!(
-        output.status.success(),
+        output.success(),
         "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        output.stderr_str()
     );
 }
 
