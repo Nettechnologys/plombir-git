@@ -750,6 +750,11 @@ export function parseUtoipaPaths(source, modulePath, file) {
       signatureParams: fnBlock?.params ?? null,
       declaresParams: hasAttributeDeclaration(body, 'params', ['(']),
       paramsBody: attributeCallBody(body, 'params'),
+      // The annotation sits *above* its handler, so a check that anchors on the
+      // function name and reaches forward reads the *next* handler's responses.
+      // Handing the attributed body out here is what lets a caller assert on the
+      // status codes this handler actually advertises (card_9808ff5aec29).
+      responsesBody: attributeCallBody(body, 'responses'),
       declaresRequestBody: hasAttributeDeclaration(body, 'request_body', ['(', '=']),
       file,
       line: src.slice(0, start).split('\n').length,

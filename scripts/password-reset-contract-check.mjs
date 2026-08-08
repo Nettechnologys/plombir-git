@@ -3,6 +3,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import { tsFunctionBody } from './lib/ts-source.mjs';
+
 const root = process.cwd();
 const resetPagePath = path.join(root, 'web/src/routes/reset-password/+page.svelte');
 const forgotPagePath = path.join(root, 'web/src/routes/forgot-password/+page.svelte');
@@ -14,7 +17,7 @@ const resetPage = readFileSync(resetPagePath, 'utf8');
 const forgotPage = existsSync(forgotPagePath) ? readFileSync(forgotPagePath, 'utf8') : '';
 const loginPage = readFileSync(loginPagePath, 'utf8');
 const passwordValidator = readFileSync(passwordValidatorPath, 'utf8');
-const userService = readFileSync(userServicePath, 'utf8');
+const userService = stripRustComments(readFileSync(userServicePath, 'utf8'));
 
 const failures = [];
 
@@ -22,20 +25,31 @@ function expect(source, pattern, message) {
   if (!pattern.test(source)) failures.push(message);
 }
 
-expect(
-  userService,
-  /reset_password[\s\S]*PasswordValidator::standard\(\)[\s\S]*validate_with_username\(new_password,\s*&user\.username\)/,
-  'Backend reset_password must keep using the standard password validator',
-);
+// Both backend assertions are read out of `reset_password`'s own body rather
+// than out of the file. The previous spelling bridged from the name with
+// `[\s\S]*` and was satisfied by a match anywhere below it: moving *either*
+// block out into a neighbouring function of the same file left the gate green,
+// so the reset could have stopped enforcing the password policy and stopped
+// withholding the session from an MFA account without a word (card_a08ef8308236).
+const resetPassword = rustFnBlock(userService, 'reset_password');
+if (resetPassword === null) {
+  failures.push('user/service.rs no longer defines a `pub async fn reset_password` this check can read');
+} else {
+  expect(
+    resetPassword.body,
+    /PasswordValidator::standard\(\)[\s\S]*?validate_with_username\(new_password,\s*&user\.username\)/,
+    'Backend reset_password must keep using the standard password validator',
+  );
 
-// The reset door is reachable precisely when a mailbox or a password is
-// already compromised, which is the case MFA is bought for. Both halves of the
-// hand-off are asserted here so neither can quietly drift back to "log them in".
-expect(
-  userService,
-  /fn reset_password[\s\S]*if user\.mfa_enabled[\s\S]*PasswordResetOutcome::SecondFactorRequired/,
-  'Backend reset_password must refuse the session for an account that owes a second factor',
-);
+  // The reset door is reachable precisely when a mailbox or a password is
+  // already compromised, which is the case MFA is bought for. Both halves of the
+  // hand-off are asserted here so neither can quietly drift back to "log them in".
+  expect(
+    resetPassword.body,
+    /if user\.mfa_enabled[\s\S]*?PasswordResetOutcome::SecondFactorRequired/,
+    'Backend reset_password must refuse the session for an account that owes a second factor',
+  );
+}
 expect(
   resetPage,
   /if\s*\(res\.mfa_required\)/,
@@ -59,14 +73,23 @@ expect(passwordValidator, /require_lowercase:\s*true/, 'Backend standard passwor
 expect(passwordValidator, /require_digit:\s*true/, 'Backend standard password validator must require digits');
 expect(passwordValidator, /require_special:\s*true/, 'Backend standard password validator must require special characters');
 
-expect(resetPage, /function\s+validatePassword\s*\(/, 'Reset page must validate password policy before calling the API');
-expect(resetPage, /value\.length\s*<\s*8/, 'Reset page must enforce the backend minimum password length');
-expect(resetPage, /value\.length\s*>\s*128/, 'Reset page must enforce the backend maximum password length');
-expect(resetPage, /\\s/, 'Reset page must reject whitespace before submitting');
-expect(resetPage, /\[A-Z\]/, 'Reset page must require an uppercase letter before submitting');
-expect(resetPage, /\[a-z\]/, 'Reset page must require a lowercase letter before submitting');
-expect(resetPage, /\[0-9\]/, 'Reset page must require a digit before submitting');
-expect(resetPage, /specialChars\.test\(value\)/, 'Reset page must require a special character before submitting');
+// Read inside `validatePassword`, not across the page. Every rule below is a
+// character class, and the page carries a second copy of the whole policy as
+// the `pattern=` attribute string on the input — so a file-wide `/\[A-Z\]/`
+// went on passing with the uppercase rule deleted from the validator, quoting
+// that attribute back at itself (card_a08ef8308236).
+const validatePassword = tsFunctionBody(resetPage, 'validatePassword');
+if (validatePassword === null) {
+  failures.push('Reset page must validate password policy before calling the API');
+} else {
+  expect(validatePassword, /value\.length\s*<\s*8/, 'Reset page must enforce the backend minimum password length');
+  expect(validatePassword, /value\.length\s*>\s*128/, 'Reset page must enforce the backend maximum password length');
+  expect(validatePassword, /\/\\s\/\.test\(value\)/, 'Reset page must reject whitespace before submitting');
+  expect(validatePassword, /\[A-Z\]/, 'Reset page must require an uppercase letter before submitting');
+  expect(validatePassword, /\[a-z\]/, 'Reset page must require a lowercase letter before submitting');
+  expect(validatePassword, /\[0-9\]/, 'Reset page must require a digit before submitting');
+  expect(validatePassword, /specialChars\.test\(value\)/, 'Reset page must require a special character before submitting');
+}
 expect(resetPage, /auth\.resetPassword\(token,\s*password\)/, 'Reset page must still call the reset-password API after validation');
 expect(resetPage, /import\s*\{\s*fetchUser\s*\}\s*from\s*['"]\$lib\/stores\/auth\.svelte['"]/, 'Reset page must import the auth-store profile refresh helper');
 expect(resetPage, /setToken\(res\.token\)[\s\S]*await\s+fetchUser\(\)/, 'Reset page must refresh the auth store after storing the reset JWT');

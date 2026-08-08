@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, requireBlock, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, parseUtoipaPaths, requireBlock, routeFailures, rustFnBlock } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPaths = [
@@ -77,21 +77,35 @@ failures.push(
   ]),
 );
 
-const deleteHandlerBlock = backend.match(/pub async fn delete_repo_handler[\s\S]*?\n\}/);
-if (!deleteHandlerBlock) {
+const deleteHandler = rustFnBlock(backend, 'delete_repo_handler');
+if (deleteHandler === null) {
   failures.push('Backend repo delete handler missing');
 } else {
-  if (!/StatusCode::OK[\s\S]*"deleted": true/.test(deleteHandlerBlock[0])) {
+  if (!/StatusCode::OK[\s\S]*"deleted": true/.test(deleteHandler.body)) {
     failures.push('Backend repo delete handler must return the JSON deleted envelope used by the frontend');
   }
-  if (/StatusCode::NO_CONTENT/.test(deleteHandlerBlock[0])) {
+  if (/StatusCode::NO_CONTENT/.test(deleteHandler.body)) {
     failures.push('Backend repo delete handler must not return 204 while the frontend expects JSON');
   }
 }
 
-const deleteAnnotationBlock = backend.match(/pub async fn delete_repo_handler[\s\S]*?responses\([\s\S]*?\)\s*,\s*\)\]/)
-  || backend.match(/\/\/\/ DELETE \/api\/v1\/repos\/:owner\/:name[\s\S]*?pub async fn delete_repo_handler/);
-if (deleteAnnotationBlock && /status = 204/.test(deleteAnnotationBlock[0])) {
+// The annotation is read through the parser that attributes each
+// `#[utoipa::path(...)]` to the function *below* it. The previous spelling
+// anchored on `pub async fn delete_repo_handler` and reached forward with
+// `[\s\S]*?` — but the annotation stands *above* its handler, so the 82-line
+// match ran into the `responses(...)` of the next handler, the fork. The claim
+// about the delete contract was reading the fork's annotation, and it failed
+// both ways: a `204` returning to delete went unnoticed, while a `204` on
+// whichever handler happens to follow reddened the gate under delete's name
+// (card_9808ff5aec29).
+const deleteAnnotation = parseUtoipaPaths(backend, 'api::repos', path.relative(root, backendPath)).find(
+  (row) => row.handler === 'api::repos::delete_repo_handler',
+);
+if (!deleteAnnotation) {
+  failures.push('Backend repo delete handler must carry a #[utoipa::path] annotation this check can attribute to it');
+} else if (deleteAnnotation.responsesBody === null) {
+  failures.push('Backend repo delete OpenAPI annotation must declare its responses(...)');
+} else if (/status\s*=\s*204/.test(deleteAnnotation.responsesBody)) {
   failures.push('Backend repo delete OpenAPI annotation must not advertise an unused 204 response');
 }
 
