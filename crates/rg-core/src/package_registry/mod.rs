@@ -15,7 +15,8 @@ pub use adapters::helm::{build_helm_index, HelmIndexEntry};
 pub use adapters::maven::{build_maven_metadata_xml, MavenVersionEntry};
 pub use adapters::npm::{build_npm_metadata, NpmVersionInfo};
 pub use adapters::nuget::{
-    build_registration_index, build_search_results, build_service_index, NuGetRegistrationEntry,
+    build_autocomplete_results, build_flat_container_index, build_registration_index,
+    build_search_results, build_service_index, normalize_package_id, NuGetRegistrationEntry,
     NuGetSearchResult,
 };
 pub use adapters::pypi::{

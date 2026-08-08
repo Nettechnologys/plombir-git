@@ -2059,3 +2059,183 @@ async fn a_composer_entry_always_carries_a_require_table() {
         "a manifest that declares no type falls back to the Composer default: {entry}"
     );
 }
+
+/// Every resource the NuGet service index advertises has to be a path this
+/// server answers.
+///
+/// A NuGet client does not guess its endpoints: it reads `index.json` and uses
+/// the `@id` of each `@type` it needs. Two of the five were fiction — the flat
+/// container (`PackageBaseAddress`, which is where `dotnet restore` downloads
+/// from) had no routes at all, and autocomplete pointed at the bare `nuget/`
+/// root — so the document described a server nobody was running
+/// (card_dba77cceec56).
+///
+/// The `@type` list is asserted exhaustively on purpose. A resource added to
+/// the index later, with no probe here, fails this test rather than being
+/// silently exempt from it — which is exactly how the two dead resources
+/// survived.
+#[tokio::test]
+async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let nuspec = br#"<?xml version="1.0"?>
+<package><metadata><id>Matrix.NuGet</id><version>1.0.0</version><description>NuGet matrix package</description></metadata></package>"#;
+    let nupkg = zip_archive(&[("Matrix.NuGet.nuspec", nuspec)]);
+
+    let published = client
+        .post(package_url(&base, &["nuget", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"Matrix.NuGet.1.0.0.nupkg\"",
+        )
+        .body(nupkg.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let index: serde_json::Value = client
+        .get(package_url(&base, &["nuget", "index.json"]))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut advertised: std::collections::BTreeMap<String, String> = Default::default();
+    for resource in index["resources"].as_array().expect("resources array") {
+        advertised.insert(
+            resource["@type"].as_str().expect("@type").to_string(),
+            resource["@id"].as_str().expect("@id").to_string(),
+        );
+    }
+    let types: Vec<&str> = advertised.keys().map(String::as_str).collect();
+    assert_eq!(
+        types,
+        vec![
+            "PackageBaseAddress/3.0.0",
+            "PackagePublish/2.0.0",
+            "RegistrationsBaseUrl/3.6.0",
+            "SearchAutocompleteService/3.5.0",
+            "SearchQueryService/3.5.0",
+        ],
+        "an advertised resource with no probe below is a resource nobody proved is served"
+    );
+
+    // Base addresses are prefixes, not endpoints: the client appends the layout
+    // the protocol defines, so that layout is what gets probed. The lowercase
+    // ids are deliberate — that is the only spelling a NuGet client ever sends.
+    let base_address = &advertised["PackageBaseAddress/3.0.0"];
+    let versions: serde_json::Value = {
+        let response = client
+            .get(format!("{base_address}matrix.nuget/index.json"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the advertised flat container does not serve {base_address}matrix.nuget/index.json"
+        );
+        response.json().await.unwrap()
+    };
+    assert_eq!(versions["versions"], serde_json::json!(["1.0.0"]));
+
+    let content = client
+        .get(format!(
+            "{base_address}matrix.nuget/1.0.0/matrix.nuget.1.0.0.nupkg"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        content.status(),
+        StatusCode::OK,
+        "the flat container must serve the package content itself, not only its version list"
+    );
+    assert_eq!(
+        content.bytes().await.unwrap().as_ref(),
+        nupkg.as_slice(),
+        "restore downloads the bytes that were published"
+    );
+
+    let registration = client
+        .get(format!(
+            "{}matrix.nuget/index.json",
+            advertised["RegistrationsBaseUrl/3.6.0"]
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        registration.status(),
+        StatusCode::OK,
+        "the registration index must answer the lowercase id a client sends, \
+         not only the published spelling"
+    );
+    let registration: serde_json::Value = registration.json().await.unwrap();
+    assert_eq!(registration["count"], 1, "registration: {registration}");
+
+    for (resource, label) in [
+        ("SearchQueryService/3.5.0", "search"),
+        ("SearchAutocompleteService/3.5.0", "autocomplete"),
+    ] {
+        let url = &advertised[resource];
+        let response = client
+            .get(url.clone())
+            .query(&[("q", "matrix")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the advertised {label} resource {url} is not a route this registry serves"
+        );
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["totalHits"], 1, "{label}: {body}");
+    }
+
+    // `dotnet nuget push` sends PUT here. POST-only meant the one verb the
+    // document invites answered 405.
+    let pushed = client
+        .put(advertised["PackagePublish/2.0.0"].clone())
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"Matrix.NuGet.2.0.0.nupkg\"",
+        )
+        .body(zip_archive(&[(
+            "Matrix.NuGet.nuspec",
+            br#"<?xml version="1.0"?>
+<package><metadata><id>Matrix.NuGet</id><version>2.0.0</version><description>NuGet matrix package</description></metadata></package>"# as &[u8],
+        )]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pushed.status(),
+        StatusCode::CREATED,
+        "the advertised publish resource must accept the verb `dotnet nuget push` sends"
+    );
+
+    let versions: serde_json::Value = client
+        .get(format!("{base_address}matrix.nuget/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        versions["versions"],
+        serde_json::json!(["1.0.0", "2.0.0"]),
+        "the pushed version has to show up where restore looks for it"
+    );
+}
+

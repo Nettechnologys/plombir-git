@@ -236,6 +236,50 @@ pub async fn publish(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    publish_package(state, user_id, owner, name, pkg_type, query, headers, body).await
+}
+
+/// POST/PUT /api/v1/repos/{owner}/{name}/packages/nuget/publish
+///
+/// `dotnet nuget push` sends PUT to the advertised `PackagePublish` resource,
+/// and the generic publish route is POST only — so the endpoint the service
+/// index names answered `405` to the one client that reads it
+/// (card_dba77cceec56). Same body, same rules; only the verb and the fixed
+/// package type differ.
+pub async fn nuget_publish(
+    State(state): State<AppState>,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<PublishPackageQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    publish_package(
+        state,
+        user_id,
+        owner,
+        name,
+        "nuget".to_string(),
+        query,
+        headers,
+        body,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_package(
+    state: AppState,
+    user_id: i64,
+    owner: String,
+    name: String,
+    pkg_type: String,
+    query: PublishPackageQuery,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
     if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
         return err(
             StatusCode::BAD_REQUEST,
@@ -1458,6 +1502,11 @@ pub async fn nuget_registration_index(
     Path((owner, name, pkg_name)): Path<(String, String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
+    let pkg_name = match resolve_nuget_id(&state, &owner, &name, &pkg_name).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
     let versions = match rg_core::package_registry::service::list_versions(
         &state.db, &owner, &name, "nuget", &pkg_name,
     )
@@ -1541,14 +1590,13 @@ pub async fn nuget_search(
     let query = params.q.as_deref().unwrap_or("");
     let base_url = build_base_url(&headers);
 
-    // List all nuget packages in the repo
-    let packages =
-        match rg_core::package_registry::service::list_packages(&state.db, &owner, &name, "nuget")
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    // List all nuget packages in the repo. A repository that never enabled the
+    // registry answers an empty result set rather than a 404: the service index
+    // advertises this endpoint for any repository, so it owes a readable answer.
+    let packages = match nuget_packages(&state, &owner, &name).await {
+        Ok(packages) => packages,
+        Err(response) => return response,
+    };
 
     let mut results: Vec<rg_core::package_registry::NuGetSearchResult> = Vec::new();
     let query_lower = query.to_lowercase();
@@ -1597,6 +1645,212 @@ pub struct NuGetSearchParams {
     pub skip: Option<usize>,
     #[serde(default)]
     pub take: Option<usize>,
+}
+
+/// Resolve the package id a NuGet client asked for to the id it was published
+/// under.
+///
+/// Ids are case-insensitive and every v3 URL carries the lowercase form, so
+/// `dotnet restore` of `Matrix.NuGet` asks for `matrix.nuget` while the registry
+/// stores what the nuspec said. Matching the path segment literally therefore
+/// missed every id with a capital in it — the same defect PyPI already fixed
+/// with [`resolve_pypi_project`] (card_dba77cceec56).
+///
+/// One query, and an exact spelling still wins over a case-folded one, so a
+/// registry that somehow holds two ids differing only in case keeps answering
+/// for the one that was actually asked for. An unresolvable id is handed back
+/// unchanged: producing the 404 is the caller's job, not this helper's.
+async fn resolve_nuget_id(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    requested: &str,
+) -> Result<String, axum::response::Response> {
+    let packages =
+        match rg_core::package_registry::service::list_packages(&state.db, owner, repo, "nuget")
+            .await
+        {
+            Ok(packages) => packages,
+            Err(error) if package_is_absent(&error) => return Ok(requested.to_string()),
+            Err(error) => return Err(package_error_response(error)),
+        };
+
+    if packages.iter().any(|pkg| pkg.name == requested) {
+        return Ok(requested.to_string());
+    }
+
+    let wanted = rg_core::package_registry::normalize_package_id(requested);
+    Ok(packages
+        .into_iter()
+        .find(|pkg| rg_core::package_registry::normalize_package_id(&pkg.name) == wanted)
+        .map_or_else(|| requested.to_string(), |pkg| pkg.name))
+}
+
+/// The nuget packages of a repository, or nothing at all.
+///
+/// A repository that never enabled the registry is not an error on the discovery
+/// routes: the service index is served for any repository, so every resource it
+/// advertises has to answer something a client can read. An empty answer is that
+/// something — a 404 here would make the advertised endpoint look unrouted.
+async fn nuget_packages(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<rg_core::package_registry::PackageSummary>, axum::response::Response> {
+    match rg_core::package_registry::service::list_packages(&state.db, owner, repo, "nuget").await {
+        Ok(packages) => Ok(packages),
+        Err(error) if package_is_absent(&error) => Ok(Vec::new()),
+        Err(error) => Err(package_error_response(error)),
+    }
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/nuget/package/{id}/index.json
+///
+/// NuGet flat container (`PackageBaseAddress/3.0.0`) — the versions of one
+/// package. This is the first hop of `dotnet restore`, and it had no route at
+/// all while the service index advertised the resource, so restore could not
+/// download anything (card_dba77cceec56).
+pub async fn nuget_flat_container_index(
+    State(state): State<AppState>,
+    Path((owner, name, pkg_name)): Path<(String, String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let pkg_name = match resolve_nuget_id(&state, &owner, &name, &pkg_name).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
+    let versions = match rg_core::package_registry::service::list_versions(
+        &state.db, &owner, &name, "nuget", &pkg_name,
+    )
+    .await
+    {
+        Ok(versions) => versions,
+        Err(error) => return package_error_response(error),
+    };
+
+    // Oldest first. `list_versions` answers newest first, and every other
+    // registry publishes its version list ascending — a NuGet client parses the
+    // whole array and orders it itself, so this is presentation, but presenting
+    // it backwards from every neighbour invites a reader to assume the wrong
+    // one. Publish order is the only ordering this registry can establish
+    // without a semver parser, which the workspace does not carry.
+    let listed: Vec<String> = versions.into_iter().rev().map(|v| v.version).collect();
+    let json = rg_core::package_registry::build_flat_container_index(&listed);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/nuget/package/{id}/{version}/{file}
+///
+/// NuGet flat container package content — the `.nupkg` itself.
+///
+/// The client builds this URL out of *normalized* parts (`{id-lower}` and
+/// `{id-lower}.{version}.nupkg`), which is almost never the filename the package
+/// was published under, so the stored file is matched case-insensitively and
+/// then by extension rather than by the client's spelling.
+pub async fn nuget_flat_container_download(
+    State(state): State<AppState>,
+    Path((owner, name, pkg_name, version, filename)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let pkg_name = match resolve_nuget_id(&state, &owner, &name, &pkg_name).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
+    let versions = match rg_core::package_registry::service::list_versions(
+        &state.db, &owner, &name, "nuget", &pkg_name,
+    )
+    .await
+    {
+        Ok(versions) => versions,
+        Err(error) => return package_error_response(error),
+    };
+
+    let wanted_version = version.to_lowercase();
+    let Some(found) = versions
+        .iter()
+        .find(|v| v.version.to_lowercase() == wanted_version)
+    else {
+        return err_text(
+            StatusCode::NOT_FOUND,
+            &format!("package '{pkg_name}' has no version '{version}'"),
+        );
+    };
+
+    let wanted_file = filename.to_lowercase();
+    let Some(file) = found
+        .files
+        .iter()
+        .find(|f| f.filename.to_lowercase() == wanted_file)
+        .or_else(|| {
+            found
+                .files
+                .iter()
+                .find(|f| f.filename.to_lowercase().ends_with(".nupkg"))
+        })
+    else {
+        return err_text(
+            StatusCode::NOT_FOUND,
+            &format!("no package content stored for '{pkg_name}' {version}"),
+        );
+    };
+
+    serve_package_file(
+        &state,
+        &owner,
+        &name,
+        "nuget",
+        &pkg_name,
+        &found.version,
+        &file.filename,
+    )
+    .await
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/nuget/autocomplete?q=...
+///
+/// NuGet `SearchAutocompleteService/3.5.0`. The service index used to advertise
+/// this resource at the bare `nuget/` root, which is not an endpoint of anything
+/// (card_dba77cceec56).
+pub async fn nuget_autocomplete(
+    State(state): State<AppState>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(params): Query<NuGetSearchParams>,
+) -> axum::response::Response {
+    let query = params.q.as_deref().unwrap_or("").to_lowercase();
+    let packages = match nuget_packages(&state, &owner, &name).await {
+        Ok(packages) => packages,
+        Err(response) => return response,
+    };
+
+    let names: Vec<String> = packages
+        .into_iter()
+        .filter(|pkg| query.is_empty() || pkg.name.to_lowercase().contains(&query))
+        .map(|pkg| pkg.name)
+        .collect();
+    let total_hits = names.len();
+    let json = rg_core::package_registry::build_autocomplete_results(&names, total_hits);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json),
+    )
+        .into_response()
 }
 
 // ── RubyGems Protocol Endpoints ───────────────────────────

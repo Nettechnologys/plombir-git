@@ -964,7 +964,9 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
              names a person, not a row belonging to another repository, so a cross-repository \
              probe reaches nothing to begin with",
         ),
-        "/packages/nuget/registration/{id}/index.json" => Coverage::Skipped(
+        "/packages/nuget/registration/{id}/index.json"
+        | "/packages/nuget/package/{id}/index.json"
+        | "/packages/nuget/package/{id}/{version}/{file}" => Coverage::Skipped(
             "`{id}` here is a NuGet package name rather than a primary key — package names are \
              scoped to their repository's registry",
         ),

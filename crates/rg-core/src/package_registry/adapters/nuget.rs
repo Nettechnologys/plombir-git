@@ -248,9 +248,51 @@ fn extract_repository_url_from_xml(xml: &str) -> Option<String> {
 
 // ── NuGet API v3 helpers ──────────────────────────────────
 
+/// The spelling a NuGet client puts in a URL.
+///
+/// Package ids are case-insensitive and every v3 URL carries the *lowercase*
+/// form: `dotnet restore` of `Matrix.NuGet` asks for `matrix.nuget`. The
+/// registry stores the id as the nuspec spelled it, so a lookup on the literal
+/// path segment misses every id that has a capital in it. Same shape as PyPI's
+/// [`normalize_project_name`](super::pypi::normalize_project_name), simpler
+/// rule: NuGet folds case and nothing else.
+pub fn normalize_package_id(id: &str) -> String {
+    id.to_lowercase()
+}
+
+/// The flat container's version list — `{id-lower}/index.json`.
+///
+/// This is the first hop of a restore: the client reads the available versions
+/// here and only then asks for a `.nupkg`. Versions are lowercased because the
+/// flat container addresses them in their normalized form.
+pub fn build_flat_container_index(versions: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "versions": versions
+            .iter()
+            .map(|version| version.to_lowercase())
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The autocomplete answer — a bare list of package ids.
+pub fn build_autocomplete_results(names: &[String], total_hits: usize) -> serde_json::Value {
+    serde_json::json!({
+        "@context": { "@vocab": "http://schema.nuget.org/schema#" },
+        "totalHits": total_hits,
+        "data": names,
+    })
+}
+
 /// Build the NuGet Service Index JSON response.
 ///
 /// This advertises all available NuGet API resources for the repository.
+///
+/// Every `@id` here has to be a path the router serves. It did not use to be:
+/// `PackageBaseAddress` pointed at a flat container with no routes at all — so
+/// `dotnet restore` could not download a package — and
+/// `SearchAutocompleteService` pointed at the bare `nuget/` root, which is not
+/// an endpoint of anything (card_dba77cceec56). The invariant is now held by a
+/// test that walks every advertised `@id` and refuses a 404.
 pub fn build_service_index(base_url: &str, owner: &str, repo: &str) -> serde_json::Value {
     let prefix = format!(
         "{}/api/v1/repos/{}/{}/packages/nuget",
@@ -283,7 +325,7 @@ pub fn build_service_index(base_url: &str, owner: &str, repo: &str) -> serde_jso
                 "comment": "Push NuGet packages"
             },
             {
-                "@id": format!("{}/", prefix),
+                "@id": format!("{}/autocomplete", prefix),
                 "@type": "SearchAutocompleteService/3.5.0",
                 "comment": "Autocomplete package IDs"
             }

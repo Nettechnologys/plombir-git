@@ -2010,6 +2010,44 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/nuget/query",
             api::packages::nuget_search,
         )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/nuget/autocomplete",
+            api::packages::nuget_autocomplete,
+        )
+        // Flat container (`PackageBaseAddress/3.0.0`) — what `dotnet restore`
+        // actually downloads from. The service index advertised it long before
+        // anything served it (card_dba77cceec56).
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/nuget/package/{id}/index.json",
+            api::packages::nuget_flat_container_index,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/nuget/package/{id}/{version}/{file}",
+            api::packages::nuget_flat_container_download,
+        )
+        // `dotnet nuget push` sends PUT to the advertised PackagePublish
+        // resource; the generic publish route is POST only, so the documented
+        // push verb answered 405.
+        //
+        // POST is registered here too, and it is not decoration. A literal path
+        // segment shadows the `{pkg_type}` one for the whole URL, so declaring
+        // only PUT here would have taken `POST .../packages/nuget/publish` —
+        // which every existing publisher uses — away from the generic route and
+        // answered *it* 405 instead. Same reason npm spells both of its own
+        // routes out rather than leaning on the generic ones.
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/nuget/publish",
+            api::packages::nuget_publish,
+        )
+        .put(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/nuget/publish",
+            api::packages::nuget_publish,
+        )
         // RubyGems compact index — see `rubygems_protocol_routes`.
         .with(rubygems_protocol_routes)
         // RubyGems protocol endpoints
