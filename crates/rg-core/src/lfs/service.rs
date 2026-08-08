@@ -16,8 +16,8 @@
 //!
 //! The `compression` field in DB tracks the algorithm used.
 //!
-//! Legacy uncompressed objects are **read** through the same fallback the
-//! delete path uses, and are not re-compressed in place. There used to be a
+//! Legacy uncompressed objects are **read** through the fallback at the end of
+//! `read_object_source`, and are not re-compressed in place. There used to be a
 //! `compress_existing` backfill here; nothing ever called it (card_f569b0674f50)
 //! and it could not have been called safely as written — it walked the local
 //! filesystem with `std::fs` rather than the `BlobStorage` backend the objects
@@ -26,6 +26,23 @@
 //! costs disk, not correctness. A backfill that is wanted back has to go through
 //! `publish_object` like every other writer, and that is a feature, not a
 //! resurrection of the deleted function.
+//!
+//! ## Deletion
+//!
+//! There is deliberately no per-object delete here. Objects are reclaimed by the
+//! owner that holds them: deleting a repository retires the whole
+//! `lfs/<namespace>/<repo>` blob prefix (`repo::service::repository_blob_prefixes`),
+//! and a publication that fails after writing bytes compensates itself through
+//! `discard_stored_blob`. `delete_object` and `delete_object_from_storage` used
+//! to sit here with zero callers — no route, no CLI command, no job
+//! (card_9dc9cac96edc) — which read as "ForgeKeep can delete an LFS object" when
+//! nothing ever did.
+//!
+//! What is genuinely missing is a *garbage collector*: an object whose last
+//! referencing commit is gone stays on disk forever. That needs a reachability
+//! walk over the repository's history, which is a feature to design, not a
+//! function to re-add — and it must go through `BlobStorage`, not the legacy
+//! filesystem path the deleted pair reached for.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -1070,30 +1087,14 @@ async fn stream_compress_and_store(
     Ok(())
 }
 
-/// Read an LFS object from disk.
-pub async fn read_object(lfs_root: &std::path::Path, oid: &str) -> Result<Vec<u8>> {
-    let obj_path = lfs_object_path(lfs_root, oid);
-
-    // Try compressed version first (.zst)
-    let compressed_path = obj_path.with_extension("zst");
-    if compressed_path.exists() {
-        let compressed = std::fs::read(&compressed_path)
-            .with_context(|| format!("read compressed LFS object {:?}", compressed_path))?;
-        return decompress_data(&compressed);
-    }
-
-    // Fallback to uncompressed (legacy)
-    if obj_path.exists() {
-        return std::fs::read(&obj_path).with_context(|| format!("read LFS object {:?}", obj_path));
-    }
-
-    anyhow::bail!("LFS object {} not found", oid)
-}
-
-/// Get the file paths needed for streaming an LFS object.
-/// Returns `(file_path, is_compressed)` — the caller should stream-decompress
-/// if `is_compressed` is true.
-pub fn read_object_path(lfs_root: &std::path::Path, oid: &str) -> Result<(PathBuf, bool)> {
+/// Locate the legacy on-disk copy of an object for streaming.
+///
+/// Returns `(file_path, is_compressed)`; the caller stream-decompresses when
+/// `is_compressed`. Private because the only legitimate entry point is
+/// [`read_object_source`], which asks the blob storage first and falls back
+/// here — a caller that reached straight for this one would answer `404` for
+/// every object stored on a non-local backend.
+fn read_object_path(lfs_root: &std::path::Path, oid: &str) -> Result<(PathBuf, bool)> {
     let obj_path = lfs_object_path(lfs_root, oid);
 
     // Try compressed version first (.zst)
@@ -1156,71 +1157,17 @@ fn compress_data(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decompress zstd data.
+///
+/// Test-only: production decompression happens at the streaming edge in
+/// `rg_http::api::lfs`, which decodes on a blocking thread straight into the
+/// response body rather than buffering a whole object here. This one exists so
+/// the publication tests can read back what they stored.
+#[cfg(test)]
 fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>> {
     let mut decompressed = Vec::new();
     let mut decoder = zstd::Decoder::new(compressed).context("failed to create zstd decoder")?;
     std::io::copy(&mut decoder, &mut decompressed).context("failed to decompress zstd data")?;
     Ok(decompressed)
-}
-
-/// Delete an LFS object from disk and DB.
-pub async fn delete_object(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    lfs_root: &std::path::Path,
-    oid: &str,
-) -> Result<()> {
-    let obj_path = lfs_object_path(lfs_root, oid);
-
-    // Delete compressed version
-    let compressed_path = obj_path.with_extension("zst");
-    if compressed_path.exists() {
-        std::fs::remove_file(&compressed_path)
-            .with_context(|| format!("delete compressed LFS object {:?}", compressed_path))?;
-    }
-
-    // Delete uncompressed version (legacy)
-    if obj_path.exists() {
-        std::fs::remove_file(&obj_path)
-            .with_context(|| format!("delete LFS object {:?}", obj_path))?;
-    }
-
-    // Delete from DB
-    if let Some(obj) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? {
-        lfs_object_ops::delete_by_id(db, obj.id).await?;
-    }
-
-    Ok(())
-}
-
-/// Delete both backend-neutral and historical local representations before
-/// removing the database row.
-pub async fn delete_object_from_storage(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    storage: &dyn BlobStorage,
-    legacy_lfs_root: &std::path::Path,
-    owner: &str,
-    repo: &str,
-    oid: &str,
-) -> Result<()> {
-    for compressed in [true, false] {
-        let key = lfs_object_key(owner, repo, oid, compressed)?;
-        storage.delete(&key).await?;
-    }
-
-    let legacy = lfs_object_path(legacy_lfs_root, oid);
-    for path in [legacy.with_extension("zst"), legacy] {
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("delete legacy LFS object {path:?}"))?;
-        }
-    }
-
-    if let Some(obj) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? {
-        lfs_object_ops::delete_by_id(db, obj.id).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

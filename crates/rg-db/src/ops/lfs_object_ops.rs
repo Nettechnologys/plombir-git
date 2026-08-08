@@ -133,15 +133,6 @@ pub async fn mark_uploaded(db: &DatabaseConnection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Delete an LFS object by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    LfsEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete LFS object")?;
-    Ok(())
-}
-
 /// Update compression info for an LFS object.
 pub async fn update_compression(
     db: &DatabaseConnection,
