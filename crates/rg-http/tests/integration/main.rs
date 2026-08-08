@@ -20,6 +20,7 @@ mod account_deletion_serialized_grant_tests;
 mod account_deletion_storage_tests;
 mod admin_org_tests;
 mod admin_pagination_walk_tests;
+mod admin_runner_tests;
 mod admin_settings_tests;
 mod admin_sso_audit_tests;
 mod admin_user_tests;

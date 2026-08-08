@@ -52,11 +52,7 @@ const MIN_OPERATIONS: usize = 250;
 /// is a ratchet, not a dumping ground: an entry whose route gets mounted fails
 /// below, so the exemption cannot outlive its reason. The same row is tracked
 /// on the other side by `scripts/openapi-route-coverage-contract-check.mjs`.
-const UNMOUNTED: [(&str, &str); 1] = [(
-    "GET /admin/runners/{id}",
-    "card_a76ad95240d5 — api::runners::get_runner_admin is implemented and documented but never \
-     mounted",
-)];
+const UNMOUNTED: [(&str, &str); 0] = [];
 
 /// What the document must say for a route declaring `access`.
 ///

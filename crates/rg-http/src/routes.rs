@@ -2131,6 +2131,11 @@ pub(crate) fn build_all_routes(
             "/admin/runners",
             api::runners::list_runners_admin,
         )
+        .get(
+            InstanceAdmin,
+            "/admin/runners/{id}",
+            api::runners::get_runner_admin,
+        )
         .delete(
             InstanceAdmin,
             "/admin/runners/{id}",

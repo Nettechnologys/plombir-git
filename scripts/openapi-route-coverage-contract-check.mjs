@@ -134,12 +134,8 @@ const UNDOCUMENTED = new Map([
 // design decision — the spec is lying and the fix belongs to whoever owns that
 // card. It is listed so the gate can start blocking new drift today instead of
 // waiting for the backlog, and it fails the moment the card lands.
-const UNMOUNTED = new Map([
-  [
-    'api::runners::get_runner_admin',
-    'card_a76ad95240d5 — GET /admin/runners/{id} is implemented and documented but never mounted',
-  ],
-]);
+// Empty is the intended steady state: every documented handler is mounted.
+const UNMOUNTED = new Map([]);
 
 /** `crate::api::*` entries of the `paths(...)` list in `openapi.rs`. */
 function documentedHandlers(source) {
