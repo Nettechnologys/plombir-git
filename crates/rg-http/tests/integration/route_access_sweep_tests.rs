@@ -460,6 +460,14 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
         PACKAGE_PROTOCOL,
     ),
     (
+        "DELETE /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank",
+        PACKAGE_PROTOCOL,
+    ),
+    (
+        "PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank",
+        PACKAGE_PROTOCOL,
+    ),
+    (
         "GET /api/v1/repos/{owner}/{name}/packages/nuget/package/{id}/index.json",
         PACKAGE_PROTOCOL,
     ),

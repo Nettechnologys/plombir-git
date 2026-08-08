@@ -175,6 +175,14 @@ const PER_REPO_PLACEHOLDERS: &[(&str, &str)] = &[
         "number",
         "issues and pull requests are numbered from 1 in every repository",
     ),
+    (
+        "crate_name",
+        "a crate name is scoped to its repository's cargo registry, not an instance-wide key",
+    ),
+    (
+        "version",
+        "a package version string is scoped to its package, not an instance-wide key",
+    ),
     ("title", "a wiki page title, unique within its repository"),
     ("path", "a path inside the repository's tree"),
     ("file", "a path inside the repository's tree"),

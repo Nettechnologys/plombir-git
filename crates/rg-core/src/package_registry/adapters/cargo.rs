@@ -498,13 +498,17 @@ pub fn cargo_index_prefix(name: &str) -> Vec<String> {
 /// would turn `cargo publish` into an unexplained failure; without the key
 /// Cargo says outright that the registry does not support the command.
 pub fn build_cargo_index_config(base_url: &str, owner: &str, repo: &str) -> serde_json::Value {
+    let base = base_url.trim_end_matches('/');
     serde_json::json!({
         "dl": format!(
-            "{}/api/v1/repos/{}/{}/packages/cargo/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
-            base_url.trim_end_matches('/'),
-            owner,
-            repo,
+            "{base}/api/v1/repos/{owner}/{repo}/packages/cargo/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
         ),
+        // The base cargo appends its write API to: `{api}/api/v1/crates/new`,
+        // `{api}/api/v1/crates/{crate}/{version}/yank`. Withheld until those
+        // routes existed — a registry that advertises `api` without serving it
+        // turns cargo's honest "registry does not support API commands" into a
+        // silent 404 (card_5a790cc6ac35).
+        "api": format!("{base}/api/v1/repos/{owner}/{repo}/packages/cargo"),
     })
 }
 
@@ -899,7 +903,14 @@ version = "1.0.0"
             dl,
             "https://forge.example/api/v1/repos/acme/tools/packages/cargo/{crate}/{version}/{crate}-{version}.crate"
         );
-        // No `api`: `cargo publish` must fail loudly, not against a dead URL.
-        assert!(config.get("api").is_none());
+        // `api` is the base cargo appends its write API to, and it may only be
+        // present while those routes answer — advertising it without them turns
+        // cargo's honest "registry does not support API commands" into a silent
+        // 404. It became honest in card_5a790cc6ac35; the round trip is proved
+        // by `cargo_publishes_and_yanks_through_the_api_its_index_advertises`.
+        assert_eq!(
+            config["api"].as_str().unwrap(),
+            "https://forge.example/api/v1/repos/acme/tools/packages/cargo"
+        );
     }
 }

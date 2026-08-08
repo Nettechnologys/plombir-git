@@ -110,6 +110,9 @@ function declaredModifiers(source) {
 const UNDOCUMENTED = new Map([
   ['api::packages::cargo_index_config', 'Cargo sparse index (RFC 2789) — layout fixed by cargo'],
   ['api::packages::cargo_sparse_index', 'Cargo sparse index (RFC 2789) — layout fixed by cargo'],
+  ['api::packages::cargo_publish_new', 'Cargo write API — the verb, URL and length-prefixed body are fixed by cargo'],
+  ['api::packages::cargo_yank', 'Cargo write API — the verb and URL are fixed by cargo'],
+  ['api::packages::cargo_unyank', 'Cargo write API — the verb and URL are fixed by cargo'],
   ['api::packages::composer_packages_json', 'Composer repository protocol — layout fixed by composer'],
   ['api::packages::helm_index', 'Helm chart repository index.yaml — layout fixed by helm'],
   ['api::packages::maven_metadata', 'Maven repository layout — layout fixed by mvn/Gradle'],

@@ -1519,6 +1519,194 @@ async fn read_package_file(
     }
 }
 
+// ── Cargo write API ───────────────────────────────────────
+//
+// `cargo publish` / `cargo yank` derive these URLs from the `api` key of the
+// sparse index's `config.json`. Reading the index was served long before any of
+// this was, so a crate could be resolved from ForgeKeep but never put there by
+// the tool that builds it (card_5a790cc6ac35).
+
+/// Split cargo's publish body into its metadata and its `.crate`.
+///
+/// The frame is two length-prefixed blocks — `u32-LE len`, JSON, `u32-LE len`,
+/// archive — and cargo sends nothing else, so a body this cannot read is a
+/// protocol mismatch worth naming rather than a bad crate.
+fn split_cargo_publish_frame(body: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    fn take<'a>(rest: &'a [u8], what: &str) -> Result<(&'a [u8], &'a [u8]), String> {
+        let (len, rest) = rest
+            .split_at_checked(4)
+            .ok_or_else(|| format!("body ends before the {what} length prefix"))?;
+        let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+        let (block, rest) = rest
+            .split_at_checked(len)
+            .ok_or_else(|| format!("the {what} length prefix claims {len} bytes, the body has fewer"))?;
+        Ok((block, rest))
+    }
+
+    let (metadata, rest) = take(body, "metadata")?;
+    let (archive, rest) = take(rest, "crate")?;
+    if !rest.is_empty() {
+        return Err(format!("{} trailing byte(s) after the crate", rest.len()));
+    }
+    Ok((metadata, archive))
+}
+
+/// PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new
+///
+/// What `cargo publish` sends: one request whose body is the index metadata and
+/// the `.crate` archive, each behind a `u32-LE` length. The name and version are
+/// taken from that metadata rather than from the archive, because it is the
+/// metadata cargo will expect back out of the index.
+pub async fn cargo_publish_new(
+    State(state): State<AppState>,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
+    Path((owner, name)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let (metadata, archive) = match split_cargo_publish_frame(&body) {
+        Ok(split) => split,
+        Err(reason) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("malformed cargo publish body: {reason}"),
+            )
+        }
+    };
+
+    let metadata: serde_json::Value = match serde_json::from_slice(metadata) {
+        Ok(value) => value,
+        Err(error) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("cargo publish metadata is not JSON: {error}"),
+            )
+        }
+    };
+    let (Some(crate_name), Some(version)) = (
+        metadata["name"].as_str().filter(|v| !v.is_empty()),
+        metadata["vers"].as_str().filter(|v| !v.is_empty()),
+    ) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "cargo publish metadata must carry a non-empty `name` and `vers`",
+        );
+    };
+
+    let query = PublishPackageQuery {
+        name: Some(crate_name.to_string()),
+        version: Some(version.to_string()),
+        description: None,
+        homepage: None,
+        repository_url: None,
+        semver: None,
+    };
+    let filename = format!("{crate_name}-{version}.crate");
+
+    let published = publish_package(
+        state,
+        user_id,
+        owner,
+        name,
+        "cargo".to_string(),
+        query,
+        filename,
+        axum::body::Bytes::copy_from_slice(archive),
+    )
+    .await;
+
+    // cargo reads the body of a 2xx as its warnings document and reports
+    // anything else as a publish failure, so the generic publish envelope
+    // cannot be passed through.
+    if !published.status().is_success() {
+        return published;
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "warnings": { "invalid_categories": [], "invalid_badges": [], "other": [] }
+        })),
+    )
+        .into_response()
+}
+
+/// DELETE /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate}/{version}/yank
+pub async fn cargo_yank(
+    state: State<AppState>,
+    write: RepoWrite,
+    path: Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    cargo_set_yanked(state, write, path, headers, true).await
+}
+
+/// PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate}/{version}/unyank
+pub async fn cargo_unyank(
+    state: State<AppState>,
+    write: RepoWrite,
+    path: Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    cargo_set_yanked(state, write, path, headers, false).await
+}
+
+/// The shared body of [`cargo_yank`] / [`cargo_unyank`].
+///
+/// cargo separates the two by verb rather than by a flag in a body, and answers
+/// `{"ok": true}` — the generic yank route's `{"yanked": …}` envelope is not
+/// what it reads.
+async fn cargo_set_yanked(
+    State(state): State<AppState>,
+    RepoWrite { actor_id, .. }: RepoWrite,
+    Path((owner, name, crate_name, version)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
+    yanked: bool,
+) -> axum::response::Response {
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
+    match rg_core::package_registry::service::yank_version(
+        &state.db,
+        &owner,
+        &name,
+        "cargo",
+        &crate_name,
+        &version,
+        yanked,
+    )
+    .await
+    {
+        Ok(_) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                if yanked {
+                    "package.yank"
+                } else {
+                    "package.unyank"
+                },
+                Some("package_version"),
+                None,
+                Some(&format!("{owner}/{name}/{crate_name}@{version}")),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "repo": format!("{owner}/{name}"),
+                    "pkg_type": "cargo",
+                    "pkg_name": crate_name,
+                    "version": version,
+                    "yanked": yanked,
+                })),
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
 /// PUT /api/v1/repos/{owner}/{name}/packages/maven/{group…}/{artifact}/maven-metadata.xml
 ///
 /// Accepted, and deliberately not stored. `mvn deploy` finishes by uploading its

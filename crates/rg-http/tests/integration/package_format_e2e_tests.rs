@@ -2366,3 +2366,135 @@ async fn maven_deploys_by_layout_and_resolves_the_same_paths_back() {
         "the served metadata is derived from the rows, not from the uploaded copy: {derived}"
     );
 }
+
+/// `cargo publish` and `cargo yank` reach the registry the way cargo builds
+/// their URLs: from the `api` key of the sparse index's `config.json`.
+///
+/// Reading the index was served long before any write route existed, so a crate
+/// could be resolved out of ForgeKeep but never put there by the tool that
+/// builds it — and `api` was deliberately withheld to keep cargo saying "this
+/// registry does not support API commands" instead of walking into a 404
+/// (card_5a790cc6ac35). Both halves are asserted together here: the key is only
+/// honest while the routes behind it answer.
+#[tokio::test]
+async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let config: serde_json::Value = client
+        .get(package_url(&base, &["cargo", "index", "config.json"]))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let api = config["api"]
+        .as_str()
+        .expect("the sparse index must name its write API")
+        .to_string();
+
+    let manifest = b"[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n";
+    let archive = tar_gz(&[("matrix-crate-1.0.0/Cargo.toml", manifest)]);
+
+    // The publish body: `u32-LE len` + index metadata, then `u32-LE len` + the
+    // `.crate` archive. Exactly what cargo puts on the wire.
+    let metadata = serde_json::json!({
+        "name": "matrix-crate",
+        "vers": "1.0.0",
+        "deps": [],
+        "features": {},
+        "authors": [],
+        "links": serde_json::Value::Null,
+    })
+    .to_string();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    frame.extend_from_slice(metadata.as_bytes());
+    frame.extend_from_slice(&(archive.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&archive);
+
+    // cargo sends the registry token with no scheme at all.
+    let published = client
+        .put(format!("{api}/api/v1/crates/new"))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(frame.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        published.status(),
+        StatusCode::OK,
+        "`cargo publish` could not reach the API its own index advertises"
+    );
+    let warnings: serde_json::Value = published.json().await.unwrap();
+    assert!(
+        warnings["warnings"]["other"].is_array(),
+        "cargo reads the 2xx body as its warnings document: {warnings}"
+    );
+
+    // The crate has to show up where cargo looks for it: the prefixed index path.
+    let index = client
+        .get(package_url(&base, &["cargo", "index", "ma", "tr", "matrix-crate"]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+    let index = index.text().await.unwrap();
+    assert!(
+        index.contains("\"vers\":\"1.0.0\"") && index.contains("\"yanked\":false"),
+        "the published version is missing from the sparse index: {index}"
+    );
+
+    // ...and the archive downloads from the `dl` template of the same document.
+    let downloaded = client
+        .get(package_url(
+            &base,
+            &["cargo", "matrix-crate", "1.0.0", "matrix-crate-1.0.0.crate"],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), archive.as_slice());
+
+    // A body cargo would never send is a protocol mismatch, and says so.
+    let malformed = client
+        .put(format!("{api}/api/v1/crates/new"))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(vec![0u8, 1, 2])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+    // `cargo yank` / `cargo yank --undo`: separated by verb, answered `{"ok":true}`.
+    for (yanked, request) in [
+        (true, client.delete(format!("{api}/api/v1/crates/matrix-crate/1.0.0/yank"))),
+        (false, client.put(format!("{api}/api/v1/crates/matrix-crate/1.0.0/unyank"))),
+    ] {
+        let response = request
+            .header(reqwest::header::AUTHORIZATION, token.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "yank={yanked}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], true, "cargo reads `ok`, not our own envelope: {body}");
+
+        let index = client
+            .get(package_url(&base, &["cargo", "index", "ma", "tr", "matrix-crate"]))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            index.contains(&format!("\"yanked\":{yanked}")),
+            "the index must reflect the yank cargo just performed: {index}"
+        );
+    }
+}

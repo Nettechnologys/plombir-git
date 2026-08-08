@@ -733,11 +733,30 @@ fn cargo_index_routes(table: RouteTable) -> RouteTable {
         "/repos/{owner}/{name}/packages/cargo/index/{c1}/{c2}/{c3}",
     ];
 
-    let mut table = table.get(
-        RepoRead,
-        "/repos/{owner}/{name}/packages/cargo/index/config.json",
-        api::packages::cargo_index_config,
-    );
+    let mut table = table
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/cargo/index/config.json",
+            api::packages::cargo_index_config,
+        )
+        // The write API, in the shape cargo derives from `config.json`'s `api`
+        // key. Reading the index worked long before any of this existed, so
+        // `cargo publish` had no route to reach at all (card_5a790cc6ac35).
+        .put(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/cargo/api/v1/crates/new",
+            api::packages::cargo_publish_new,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank",
+            api::packages::cargo_yank,
+        )
+        .put(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank",
+            api::packages::cargo_unyank,
+        );
     for path in INDEX {
         table = table.get(RepoRead, path, api::packages::cargo_sparse_index);
     }

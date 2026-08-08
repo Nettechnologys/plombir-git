@@ -161,6 +161,16 @@ async fn pat_to_bearer_jwt(
             .filter(|c| !c.is_empty())
             .map(|c| c.to_string())
             .collect()
+    } else if !auth.contains(' ') && !auth.is_empty() {
+        // A bare, scheme-less credential. `cargo publish` sends the registry
+        // token exactly this way — `Authorization: <token>`, no `Bearer` — so
+        // without this branch the whole cargo write API answers 401 to a
+        // correctly configured client (card_5a790cc6ac35).
+        //
+        // Deliberately narrowed to a value carrying no space, so an
+        // `Authorization: <UnknownScheme> <secret>` is still ignored rather than
+        // having its scheme name tried as a token.
+        vec![auth.to_string()]
     } else {
         return Ok(None);
     };
