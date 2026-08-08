@@ -129,6 +129,44 @@ export function rustFnBlock(source, name) {
 }
 
 /**
+ * The signature of a top-level `fn <name>` — parameter list and return type, up
+ * to (not including) the body's opening brace — or `null`.
+ *
+ * `rustFnBlock` only reads `pub async fn`, which leaves free helper functions to
+ * the idiom `/fn list_branch_refs[\s\S]*?anyhow::Result<Vec<BranchRef>>/`. That
+ * spelling asserts nothing about `list_branch_refs`: the lazy bridge walks past
+ * the function's own signature into the next one that happens to return the
+ * type, so changing this function's return type stays green as long as *some*
+ * later function returns it. Read the one signature, assert inside it.
+ *
+ * Handles rustfmt's wrapped form (closing paren and `->` on their own line),
+ * since the whole head is returned rather than a single line.
+ */
+export function rustFnHead(source, name) {
+  const start = source.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn ${name}\\b`, 'm'));
+  if (start < 0) return null;
+  const rest = source.slice(start);
+  const open = rest.indexOf('(');
+  if (open < 0) return null;
+
+  let depth = 0;
+  let end = open;
+  while (end < rest.length) {
+    if (rest[end] === '(') depth += 1;
+    else if (rest[end] === ')') {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+    end += 1;
+  }
+  if (depth !== 0) return null;
+
+  const brace = rest.indexOf('{', end + 1);
+  if (brace < 0) return null;
+  return rest.slice(0, brace);
+}
+
+/**
  * The field block of a top-level `struct <name> { … }`, or `null`.
  *
  * The idiom this replaces is `/pub struct Foo[\s\S]*field: T/` — which does not

@@ -3,7 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
+import { tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/auth.ts');
@@ -13,13 +14,29 @@ const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const client = readFileSync(clientPath, 'utf8');
 const login = readFileSync(loginPath, 'utf8');
-const backend = readFileSync(backendPath, 'utf8');
+// Comments are stripped so a commented-out field reads as a deleted one.
+const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
 const routes = loadRouteTable(routerPath);
 
 const failures = [];
 
-if (!/pub\s+struct\s+SsoProviderInfo\s*\{[\s\S]*slug:\s*String[\s\S]*name:\s*String[\s\S]*provider_type:\s*String[\s\S]*icon_url:\s*Option<String>[\s\S]*\}/.test(backend)) {
-  failures.push('Backend public SSO provider response must include slug, name, provider_type, and icon_url');
+// Read inside the struct rather than `/pub struct SsoProviderInfo[\s\S]*slug:/`,
+// which any later declaration in sso.rs satisfies — see `rustStructBody`.
+const ssoProviderInfo = rustStructBody(backend, 'SsoProviderInfo');
+if (ssoProviderInfo === null) {
+  failures.push('api/sso.rs no longer defines a `struct SsoProviderInfo` this check can read');
+} else {
+  const fields = [
+    ['slug', /\bslug:\s*String/],
+    ['name', /\bname:\s*String/],
+    ['provider_type', /\bprovider_type:\s*String/],
+    ['icon_url', /\bicon_url:\s*Option<String>/],
+  ];
+  for (const [field, re] of fields) {
+    if (!re.test(ssoProviderInfo)) {
+      failures.push(`Backend SsoProviderInfo must declare \`${field}\` — the login page renders it before anyone is logged in`);
+    }
+  }
 }
 
 // The login page fetches this before anyone is logged in, so `Public` is the
@@ -30,8 +47,22 @@ failures.push(
   ]),
 );
 
-if (!/export\s+interface\s+PublicSsoProvider\s*\{[\s\S]*slug:\s*string[\s\S]*name:\s*string[\s\S]*provider_type:\s*string[\s\S]*icon_url:\s*string\s*\|\s*null[\s\S]*\}/.test(client)) {
-  failures.push('API client must type public SSO providers');
+// Same bridge on the client half of the same contract — see `tsInterfaceBody`.
+const publicSsoProvider = tsInterfaceBody(client, 'PublicSsoProvider');
+if (publicSsoProvider === null) {
+  failures.push('web/src/lib/api/auth.ts no longer declares an `interface PublicSsoProvider` this check can read');
+} else {
+  const members = [
+    ['slug', /\bslug:\s*string/],
+    ['name', /\bname:\s*string/],
+    ['provider_type', /\bprovider_type:\s*string/],
+    ['icon_url', /\bicon_url:\s*string\s*\|\s*null/],
+  ];
+  for (const [member, re] of members) {
+    if (!re.test(publicSsoProvider)) {
+      failures.push(`API client PublicSsoProvider must type \`${member}\` as the backend sends it`);
+    }
+  }
 }
 
 if (!/listSsoProviders:\s*\(\)\s*=>\s*\n?\s*request<PublicSsoProvider\[\]>\('\/auth\/sso\/providers'\)/.test(client)) {

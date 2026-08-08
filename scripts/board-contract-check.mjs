@@ -2,7 +2,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import { rustFnBlock, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
 
 const files = {
   client: 'web/src/lib/api/boards.ts',
@@ -28,12 +28,25 @@ const boardDeleteChecks = ['delete_board', 'delete_column', 'delete_card'].map((
   };
 });
 
+// Both halves of this one used to bridge out of the struct: the positive was
+// satisfied by any later `pub note:` in boards.rs, and the negative — the more
+// dangerous direction — asserted only that *no struct anywhere in the file* has
+// a `pub title:`, so re-adding one to `CreateCardRequest` would have gone red
+// for the wrong reason and dropping the guard entirely would not have been
+// noticed. Read the body once, assert inside it (see `rustStructBody`).
+const createCardRequest = rustStructBody(backendCode, 'CreateCardRequest');
+
 const checks = [
+  {
+    name: 'backend boards.rs still defines a readable struct CreateCardRequest',
+    ok: createCardRequest !== null,
+  },
   {
     name: 'backend create-card request accepts note, not title',
     ok:
-      /pub struct CreateCardRequest[\s\S]*pub note: Option<String>/.test(source.backend) &&
-      !/pub struct CreateCardRequest[\s\S]*pub title:/.test(source.backend),
+      createCardRequest !== null &&
+      /\bpub note: Option<String>/.test(createCardRequest) &&
+      !/\bpub title:/.test(createCardRequest),
   },
   {
     name: 'API client createCard payload does not expose title',

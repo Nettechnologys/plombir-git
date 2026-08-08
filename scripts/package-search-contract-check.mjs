@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { stripRustComments } from './lib/rust-source.mjs';
+import { tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/packages.ts');
@@ -68,8 +69,13 @@ if (/delete:\s*\([^)]*version[^)]*\)\s*=>\s*\n?\s*request<\{\s*deleted:\s*boolea
   failures.push('packages.delete must not expect a JSON deleted envelope from the backend 204 response');
 }
 
-if (!/interface\s+PackageFileResponse[\s\S]*filename:\s*string[\s\S]*size:\s*number/.test(client)) {
-  failures.push('API client must type package version files returned by the backend');
+// Read inside the interface: `/interface PackageFileResponse[\s\S]*filename:/`
+// is satisfied by any later declaration in packages.ts — see `tsInterfaceBody`.
+const packageFileResponse = tsInterfaceBody(client, 'PackageFileResponse');
+if (packageFileResponse === null) {
+  failures.push('web/src/lib/api/packages.ts no longer declares an `interface PackageFileResponse` this check can read');
+} else if (!/\bfilename:\s*string/.test(packageFileResponse) || !/\bsize:\s*number/.test(packageFileResponse)) {
+  failures.push('API client PackageFileResponse must type the filename and size the backend returns for package version files');
 }
 
 if (/getVersions:[\s\S]*versions:\s*\(res\.versions\s*\|\|\s*\[\]\)\.map\(\(v\)\s*=>\s*v\.version\)/.test(client)) {
