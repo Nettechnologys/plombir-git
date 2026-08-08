@@ -42,6 +42,19 @@ pub struct LogQuery {
     pub limit: Option<i64>,
 }
 
+/// One entry of `GET /repos/{owner}/{name}/branches`.
+///
+/// The list used to be bare `Vec<String>`, which left the browser unable to say
+/// which branch is the default one: the page could only guess from a second
+/// request for the repository row. `is_default` is read from the repository's
+/// symbolic `HEAD`, i.e. from Git itself rather than from the database mirror of
+/// it, so the marker matches what a `git clone` would check out.
+#[derive(Debug, Serialize)]
+pub struct BranchRef {
+    pub name: String,
+    pub is_default: bool,
+}
+
 const DEFAULT_COMMIT_LOG_LIMIT: i64 = 50;
 const MAX_COMMIT_LOG_LIMIT: i64 = 100;
 
@@ -408,7 +421,7 @@ pub async fn list_branches(
         return AppError::from(e).into_response();
     }
 
-    match list_branch_names(&repo_path) {
+    match list_branch_refs(&repo_path) {
         Ok(branches) => (StatusCode::OK, Json(branches)).into_response(),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "list_branches failed");
@@ -1042,9 +1055,29 @@ fn get_commit_log(
     Ok(entries)
 }
 
-fn list_branch_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+/// Enumerate the repository's branches, marking the one `HEAD` points at.
+///
+/// `HEAD` is read from the same open repository as the branch refs, so the
+/// snapshot is internally consistent. A detached or unreadable-target `HEAD`
+/// simply yields no default branch — that is a legitimate repository state and
+/// must not fail the listing — whereas an unreadable *branch* ref still fails
+/// the whole read (card_9fcb45a0018d: a shortened list would falsely claim the
+/// omitted branch does not exist).
+fn list_branch_refs(repo_path: &std::path::Path) -> anyhow::Result<Vec<BranchRef>> {
     let repo = gix::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
+
+    // An unborn HEAD still records the branch a first push must use, so this is
+    // read before the branch list and is deliberately not fatal on its own.
+    let default_branch = repo
+        .head()
+        .with_context(|| format!("failed to read HEAD in {}", repo_path.display()))?
+        .referent_name()
+        .map(|name| name.as_bstr().to_string())
+        .and_then(|name| {
+            name.strip_prefix("refs/heads/")
+                .map(|branch| branch.to_string())
+        });
 
     let references = repo.references()?;
     let mut branches = Vec::new();
@@ -1053,7 +1086,11 @@ fn list_branch_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>>
             Ok(reference) => {
                 let name = reference.name().as_bstr();
                 let stripped = &name["refs/heads/".len()..];
-                branches.push(String::from_utf8_lossy(stripped).to_string());
+                let name = String::from_utf8_lossy(stripped).to_string();
+                branches.push(BranchRef {
+                    is_default: default_branch.as_deref() == Some(name.as_str()),
+                    name,
+                });
             }
             Err(e) => {
                 return Err(anyhow::Error::from_boxed(e).context(format!(
@@ -1571,7 +1608,7 @@ mod tests {
 
     use super::{
         commit_log_limit, get_commit_log, gpg_signature_from_output, is_empty_repo,
-        list_branch_names, list_tag_names, list_tree_entries, AppError,
+        list_branch_refs, list_tag_names, list_tree_entries, AppError,
     };
 
     fn overwrite_loose_object(repo_path: &std::path::Path, oid: &str, kind: &str, data: &[u8]) {
@@ -1849,6 +1886,56 @@ mod tests {
         );
     }
 
+    /// The branch picker marks the default branch itself. Before this the
+    /// endpoint answered with bare names and the browser's `is_default` markup
+    /// could never light up (card_ee7e4c250ca0), so the marker is asserted
+    /// against Git's own `HEAD` rather than against the database mirror of it.
+    #[test]
+    fn branch_listing_marks_the_branch_head_points_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("defaulted.git");
+        gix::init_bare(&repo_path).expect("a bare repo must initialise");
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
+        for branch in ["main", "release"] {
+            std::fs::write(repo_path.join("refs/heads").join(branch), format!("{oid}\n")).unwrap();
+        }
+        std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/release\n").unwrap();
+
+        let branches = list_branch_refs(&repo_path).expect("branch listing must succeed");
+        let marked: Vec<&str> = branches
+            .iter()
+            .filter(|b| b.is_default)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            vec!["release"],
+            "exactly the branch HEAD points at must be marked as default"
+        );
+        assert_eq!(branches.len(), 2, "every branch must still be listed");
+    }
+
+    /// A detached `HEAD` is a legitimate repository state, not a failure: the
+    /// picker must still list every branch, just without a default marker.
+    #[test]
+    fn branch_listing_survives_a_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("detached.git");
+        gix::init_bare(&repo_path).expect("a bare repo must initialise");
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
+        std::fs::write(repo_path.join("refs/heads/main"), format!("{oid}\n")).unwrap();
+        std::fs::write(repo_path.join("HEAD"), format!("{oid}\n")).unwrap();
+
+        let branches = list_branch_refs(&repo_path).expect("branch listing must succeed");
+        assert_eq!(branches.len(), 1, "the branch must still be listed");
+        assert!(
+            !branches[0].is_default,
+            "a detached HEAD marks no branch as default"
+        );
+    }
+
     /// A ref picker is a snapshot, not a best-effort hint: one unreadable ref
     /// must fail the whole read instead of pretending the omitted ref is absent.
     #[test]
@@ -1861,7 +1948,7 @@ mod tests {
         std::fs::write(repo_path.join("refs/heads/broken"), "not an object id\n").unwrap();
         std::fs::write(repo_path.join("refs/tags/broken"), "not an object id\n").unwrap();
 
-        let branch_error = list_branch_names(&repo_path).expect_err("broken branch ref must fail");
+        let branch_error = list_branch_refs(&repo_path).expect_err("broken branch ref must fail");
         let tag_error = list_tag_names(&repo_path).expect_err("broken tag ref must fail");
         assert!(
             branch_error

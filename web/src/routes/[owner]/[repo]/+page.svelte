@@ -24,7 +24,11 @@
   let readmeLoading = $state(false);
   let loading = $state(true);
   let error = $state('');
-  let currentRefLabel = $derived(ref || repoInfo?.default_branch || branches.find((b: any) => b.is_default)?.name || 'main');
+  // The branch list carries Git's own default marker, so it is the primary
+  // source: the label then names the same branch the dropdown highlights. The
+  // repository row is the fallback for a repo with no branches yet (unborn
+  // HEAD), where the list is empty but the row still knows the branch name.
+  let currentRefLabel = $derived(ref || branches.find((b: any) => b.is_default)?.name || repoInfo?.default_branch || 'main');
 
   // Clone URLs for empty-repo setup
   let httpCloneUrl = $derived(withBackendBase(`/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`));

@@ -10,17 +10,15 @@ interface FileOperationResponse {
   commit_sha: string;
 }
 
-type BranchRefResponse = string | { name: string; is_default?: boolean };
-type TagRefResponse = string | { name: string };
-
-function normalizeBranchRef(branch: BranchRefResponse): { name: string; is_default: boolean } {
-  if (typeof branch === 'string') return { name: branch, is_default: false };
-  return { name: branch.name, is_default: Boolean(branch.is_default) };
-}
+// `GET /branches` answers with objects (`BranchRef` in `repo_content.rs`) so the
+// UI can mark the default branch; `GET /tags` answers with bare names, which is
+// all a tag picker needs. Both are normalized to `{ name }`-shaped objects here
+// so every page consumes one shape.
+type BranchRefResponse = { name: string; is_default: boolean };
+type TagRefResponse = string;
 
 function normalizeTagRef(tag: TagRefResponse): { name: string } {
-  if (typeof tag === 'string') return { name: tag };
-  return { name: tag.name };
+  return { name: tag };
 }
 
 export const repos = {
@@ -97,7 +95,7 @@ export const repos = {
     return request<{ commits: { sha: string; message: string; author: string; date: string }[] }>(`/repos/${owner}/${repo}/log${qs({ ref, path })}`);
   },
   branches: (owner: string, repo: string) =>
-    request<BranchRefResponse[]>(`/repos/${owner}/${repo}/branches`).then((branches) => branches.map(normalizeBranchRef)),
+    request<BranchRefResponse[]>(`/repos/${owner}/${repo}/branches`),
   tags: (owner: string, repo: string) =>
     request<TagRefResponse[]>(`/repos/${owner}/${repo}/tags`).then((tags) => tags.map(normalizeTagRef)),
   commitSignature: (owner: string, repo: string, sha: string) =>

@@ -52,7 +52,10 @@ if (/ref\s*\|\|\s*['"]main['"]/.test(repoPage)) {
   failures.push('Repository browser branch selector must not hardcode main when no ref query is selected.');
 }
 
-if (!/currentRefLabel[\s\S]*repoInfo\?\.default_branch[\s\S]*branches\.find\(\(b: any\) => b\.is_default\)\?\.name/.test(repoPage)) {
+// The branch list is the primary source (it carries Git's own default marker,
+// so the label cannot disagree with the highlighted dropdown entry); the
+// repository row remains the fallback for a repo whose HEAD is still unborn.
+if (!/currentRefLabel[\s\S]*branches\.find\(\(b: any\) => b\.is_default\)\?\.name[\s\S]*repoInfo\?\.default_branch/.test(repoPage)) {
   failures.push('Repository browser must display the backend default branch when no ref query is selected.');
 }
 
