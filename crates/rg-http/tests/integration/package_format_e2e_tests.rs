@@ -2628,3 +2628,142 @@ async fn rubygems_pushes_the_way_gem_push_sends_it() {
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// `dotnet restore` builds its dependency graph out of the registration index
+/// and never opens the `.nupkg` to look for one, so a leaf without
+/// `dependencyGroups` does not read as "unknown" — it reads as a package that
+/// genuinely depends on nothing. Restore then goes green and the build fails on
+/// a missing assembly instead (card_b21fb6511a25). `listed` is the other half:
+/// its default is `true`, so a yanked version inherits candidacy unless the
+/// leaf says otherwise.
+#[tokio::test]
+async fn nuget_registration_publishes_the_graph_and_the_availability_restore_reads() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let nuspec = br#"<?xml version="1.0"?>
+<package><metadata>
+  <id>Matrix.Deps</id>
+  <version>1.0.0</version>
+  <description>NuGet package with a dependency graph</description>
+  <dependencies>
+    <group targetFramework="net8.0">
+      <dependency id="Newtonsoft.Json" version="13.0.1" />
+      <dependency id="Serilog" version="[3.0.0, 4.0.0)" exclude="Build,Analyzers" />
+    </group>
+    <group targetFramework="netstandard2.0" />
+  </dependencies>
+</metadata></package>"#;
+
+    let published = client
+        .post(package_url(&base, &["nuget", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"Matrix.Deps.1.0.0.nupkg\"",
+        )
+        .body(zip_archive(&[("Matrix.Deps.nuspec", nuspec)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let registration = |client: reqwest::Client, base: String| async move {
+        client
+            .get(package_url(
+                &base,
+                &["nuget", "registration", "Matrix.Deps", "index.json"],
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+
+    let index = registration(client.clone(), base.clone()).await;
+    let catalog = &index["items"][0]["items"][0]["catalogEntry"];
+
+    let groups = catalog["dependencyGroups"]
+        .as_array()
+        .unwrap_or_else(|| panic!("restore resolves against this key: {catalog}"));
+    assert_eq!(groups.len(), 2, "both groups of the nuspec: {catalog}");
+    assert_eq!(groups[0]["@type"], "PackageDependencyGroup");
+    assert_eq!(groups[0]["targetFramework"], "net8.0");
+    assert_eq!(
+        groups[0]["dependencies"],
+        serde_json::json!([
+            { "@type": "PackageDependency", "id": "Newtonsoft.Json", "range": "13.0.1" },
+            { "@type": "PackageDependency", "id": "Serilog", "range": "[3.0.0, 4.0.0)" },
+        ]),
+        "the range is passed through as the nuspec spelled it"
+    );
+    // A framework that needs nothing is a declaration, not an absence.
+    assert_eq!(groups[1]["targetFramework"], "netstandard2.0");
+    assert_eq!(groups[1]["dependencies"], serde_json::json!([]));
+    assert_eq!(catalog["listed"], true);
+
+    // Yanking has to reach the resolver: the version stays in the registration
+    // so an already-locked consumer keeps restoring, and stops being a candidate.
+    let yanked = client
+        .patch(package_url(
+            &base,
+            &["nuget", "Matrix.Deps", "1.0.0", "yank"],
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "yank": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK);
+
+    let index = registration(client.clone(), base.clone()).await;
+    let catalog = &index["items"][0]["items"][0]["catalogEntry"];
+    assert_eq!(
+        catalog["listed"], false,
+        "a yanked version inherits `listed: true` unless the leaf says otherwise: {catalog}"
+    );
+    assert_eq!(
+        catalog["version"], "1.0.0",
+        "the yanked version must still be listed for a consumer that already resolved it"
+    );
+
+    // A nuspec that declares no dependencies says nothing, rather than
+    // publishing an empty graph it never read.
+    let bare = br#"<?xml version="1.0"?>
+<package><metadata>
+  <id>Matrix.Bare</id>
+  <version>1.0.0</version>
+  <description>No dependency block at all</description>
+</metadata></package>"#;
+    let published = client
+        .post(package_url(&base, &["nuget", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"Matrix.Bare.1.0.0.nupkg\"",
+        )
+        .body(zip_archive(&[("Matrix.Bare.nuspec", bare)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let index = client
+        .get(package_url(
+            &base,
+            &["nuget", "registration", "Matrix.Bare", "index.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let catalog = &index["items"][0]["items"][0]["catalogEntry"];
+    assert!(catalog["dependencyGroups"].is_null(), "{catalog}");
+    assert_eq!(catalog["listed"], true);
+}

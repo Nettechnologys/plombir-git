@@ -74,6 +74,188 @@ impl PackageAdapter for NuGetAdapter {
     }
 }
 
+/// Case-insensitive search for an ASCII `needle`, as a byte offset into
+/// `haystack`.
+///
+/// The neighbouring helpers lowercase the whole document and then index the
+/// original with the offset they found, which only holds while lowercasing
+/// preserves byte lengths — it does not for every character a description may
+/// carry. This one compares in place, so its offsets are offsets into the
+/// string that produced them. Every needle here begins with `<`, `</` or a
+/// space, so the offsets always land on an ASCII byte and slicing is safe.
+fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let (hay, pin) = (haystack.as_bytes(), needle.as_bytes());
+    if pin.is_empty() || hay.len() < pin.len() || from > hay.len() - pin.len() {
+        return None;
+    }
+    (from..=hay.len() - pin.len()).find(|&at| {
+        hay[at..at + pin.len()]
+            .iter()
+            .zip(pin)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// One element named `name`, found at or after `from`.
+struct XmlElement<'a> {
+    /// The text between the element name and the `>` that ends its start tag.
+    attrs: &'a str,
+    /// The element's content — empty for a self-closing element.
+    inner: &'a str,
+    /// Byte offset just past the element, to resume scanning from.
+    end: usize,
+}
+
+/// Scan out the next `<name …>` element.
+///
+/// The workspace carries no XML parser and a `.nuspec` is small and
+/// machine-written, so this is a scanner rather than a parse: it honours the
+/// self-closing form, refuses to mistake `<dependencies>` for `<dependency>`,
+/// and reads content up to the first matching end tag. Same-name nesting is not
+/// supported, and a nuspec's dependency block has none.
+fn xml_element_at<'a>(xml: &'a str, name: &str, from: usize) -> Option<XmlElement<'a>> {
+    let open = format!("<{name}");
+    let mut cursor = from;
+    loop {
+        let start = find_ascii_ci(xml, &open, cursor)?;
+        let after = start + open.len();
+        // `<dependency` must not match the `<dependencies>` that contains it.
+        if xml
+            .as_bytes()
+            .get(after)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
+            cursor = after;
+            continue;
+        }
+
+        let tag_end = start + xml[start..].find('>')?;
+        let raw = xml[after..tag_end].trim_end();
+        let self_closing = raw.ends_with('/');
+        let attrs = raw.trim_end_matches('/');
+        if self_closing {
+            return Some(XmlElement {
+                attrs,
+                inner: "",
+                end: tag_end + 1,
+            });
+        }
+
+        let content_start = tag_end + 1;
+        let close = format!("</{name}>");
+        let inner_len = find_ascii_ci(xml, &close, content_start)? - content_start;
+        return Some(XmlElement {
+            attrs,
+            inner: &xml[content_start..content_start + inner_len],
+            end: content_start + inner_len + close.len(),
+        });
+    }
+}
+
+/// One attribute of a start tag, by name.
+fn xml_attr(attrs: &str, name: &str) -> Option<String> {
+    let mut cursor = 0;
+    loop {
+        let at = find_ascii_ci(attrs, name, cursor)?;
+        // The name has to stand on its own: `version` must not be read out of
+        // `minVersion`, nor out of the value of an earlier attribute.
+        let standalone = at == 0
+            || attrs.as_bytes()[at - 1].is_ascii_whitespace()
+            || attrs.as_bytes()[at - 1] == b'<';
+        let rest = attrs[at + name.len()..].trim_start();
+        if !standalone || !rest.starts_with('=') {
+            cursor = at + name.len();
+            continue;
+        }
+
+        let value = rest[1..].trim_start();
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let value = &value[1..];
+        let end = value.find(quote)?;
+        return Some(value[..end].trim().to_string());
+    }
+}
+
+/// One `<dependency>` of a nuspec, as the registration index publishes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NuGetDependency {
+    pub id: String,
+    /// The version range, passed through as the nuspec spelled it. NuGet reads
+    /// a bare `1.2.3` as `[1.2.3, )` and a bracketed form literally, so
+    /// re-spelling it here would only risk saying something the author did not.
+    pub range: String,
+}
+
+/// One `targetFramework` group of a nuspec's `<dependencies>` block.
+///
+/// A group with no dependencies is a fact, not an empty result: it declares
+/// that the framework is supported and needs nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NuGetDependencyGroup {
+    pub target_framework: Option<String>,
+    pub dependencies: Vec<NuGetDependency>,
+}
+
+/// The dependency groups a `.nuspec` declares.
+///
+/// `dotnet restore` builds its graph out of the registration index, not out of
+/// the `.nupkg` — so a leaf without these is read as a package that genuinely
+/// depends on nothing, restore goes green, and the build fails on a missing
+/// assembly instead (card_b21fb6511a25).
+///
+/// Two shapes are accepted because both are in the wild: the modern one groups
+/// dependencies under `<group targetFramework=…>`, and the pre-2.0 one lists
+/// them flat. A flat list is returned as one group with no framework, which is
+/// exactly what it means.
+fn nuspec_dependency_groups(xml: &str) -> Vec<NuGetDependencyGroup> {
+    let Some(block) = xml_element_at(xml, "dependencies", 0) else {
+        return Vec::new();
+    };
+
+    let mut groups = Vec::new();
+    let mut cursor = 0;
+    while let Some(group) = xml_element_at(block.inner, "group", cursor) {
+        cursor = group.end;
+        groups.push(NuGetDependencyGroup {
+            target_framework: xml_attr(group.attrs, "targetFramework").filter(|f| !f.is_empty()),
+            dependencies: nuspec_dependencies(group.inner),
+        });
+    }
+
+    if groups.is_empty() {
+        let flat = nuspec_dependencies(block.inner);
+        if !flat.is_empty() {
+            groups.push(NuGetDependencyGroup {
+                target_framework: None,
+                dependencies: flat,
+            });
+        }
+    }
+
+    groups
+}
+
+/// The `<dependency>` elements directly inside one block.
+fn nuspec_dependencies(xml: &str) -> Vec<NuGetDependency> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(dep) = xml_element_at(xml, "dependency", cursor) {
+        cursor = dep.end;
+        let Some(id) = xml_attr(dep.attrs, "id").filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        out.push(NuGetDependency {
+            id,
+            // An absent `version` means "any", which NuGet spells as an
+            // unbounded range rather than as an empty string.
+            range: xml_attr(dep.attrs, "version")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "(, )".to_string()),
+        });
+    }
+    out
+}
+
 /// Extract a simple XML tag value (no attributes).
 fn xml_tag_value(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
@@ -188,6 +370,7 @@ fn extract_from_nuspec(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         homepage.as_deref(),
         license.as_deref(),
         keywords.as_deref(),
+        &nuspec_dependency_groups(xml),
     );
 
     Ok(ExtractedMetadata {
@@ -211,6 +394,7 @@ fn nuspec_protocol_metadata(
     project_url: Option<&str>,
     license: Option<&str>,
     tags: Option<&str>,
+    dependency_groups: &[NuGetDependencyGroup],
 ) -> Option<String> {
     let fields = [
         ("description", description),
@@ -224,6 +408,29 @@ fn nuspec_protocol_metadata(
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             out.insert(key.into(), value.into());
         }
+    }
+
+    // Written only when the nuspec declared a `<dependencies>` block: an absent
+    // key and an empty list both mean "no dependencies" to a client, but only
+    // the empty list would claim we looked.
+    if !dependency_groups.is_empty() {
+        out.insert(
+            "dependencyGroups".into(),
+            dependency_groups
+                .iter()
+                .map(|group| {
+                    serde_json::json!({
+                        "targetFramework": group.target_framework,
+                        "dependencies": group
+                            .dependencies
+                            .iter()
+                            .map(|dep| serde_json::json!({ "id": dep.id, "range": dep.range }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
     }
 
     (!out.is_empty()).then(|| serde_json::Value::Object(out).to_string())
@@ -342,6 +549,14 @@ pub struct NuGetRegistrationEntry {
     pub tags: Option<String>,
     pub download_url: String,
     pub nuspec_url: Option<String>,
+    /// What the nuspec's `<dependencies>` block declared. This is the graph
+    /// `dotnet restore` resolves against — it never opens the `.nupkg` to find
+    /// one (card_b21fb6511a25).
+    pub dependency_groups: Vec<NuGetDependencyGroup>,
+    /// Whether the version is offered as a candidate. A yanked version is still
+    /// listed in the registration — that is how an already-locked consumer keeps
+    /// restoring — but `listed: false` keeps it out of a fresh resolution.
+    pub listed: bool,
 }
 
 /// Build the NuGet Registration Index JSON (3.6.0 format).
@@ -358,14 +573,7 @@ pub fn build_registration_index(
             "registration": e.nuspec_url.as_ref().unwrap_or(&String::new()),
         });
 
-        if let Some(ref catalog_entry) = build_catalog_entry(
-            package_name,
-            &e.version,
-            e.description.as_deref(),
-            e.homepage.as_deref(),
-            e.license.as_deref(),
-            e.tags.as_deref(),
-        ) {
+        if let Some(ref catalog_entry) = build_catalog_entry(package_name, e) {
             leaf["catalogEntry"] = catalog_entry.clone();
         }
 
@@ -384,29 +592,27 @@ pub fn build_registration_index(
     })
 }
 
-fn build_catalog_entry(
-    name: &str,
-    version: &str,
-    description: Option<&str>,
-    homepage: Option<&str>,
-    license: Option<&str>,
-    tags: Option<&str>,
-) -> Option<serde_json::Value> {
-    let mut entry = serde_json::Map::new();
-    entry.insert("@id".into(), "".into());
-    entry.insert("id".into(), name.into());
-    entry.insert("version".into(), version.into());
-    if let Some(d) = description {
-        entry.insert("description".into(), d.into());
+/// The `catalogEntry` of one registration leaf — the document `dotnet restore`
+/// reads a version's identity, dependency graph and availability out of.
+fn build_catalog_entry(name: &str, entry: &NuGetRegistrationEntry) -> Option<serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert("@id".into(), "".into());
+    out.insert("id".into(), name.into());
+    out.insert("version".into(), entry.version.clone().into());
+    // Stated rather than left to the client's default, because the default is
+    // `true` and a yanked version would inherit it.
+    out.insert("listed".into(), entry.listed.into());
+    if let Some(d) = entry.description.as_deref() {
+        out.insert("description".into(), d.into());
     }
-    if let Some(h) = homepage {
-        entry.insert("projectUrl".into(), h.into());
+    if let Some(h) = entry.homepage.as_deref() {
+        out.insert("projectUrl".into(), h.into());
     }
-    if let Some(l) = license {
-        entry.insert("licenseUrl".into(), l.into());
+    if let Some(l) = entry.license.as_deref() {
+        out.insert("licenseUrl".into(), l.into());
     }
-    if let Some(t) = tags {
-        entry.insert(
+    if let Some(t) = entry.tags.as_deref() {
+        out.insert(
             "tags".into(),
             t.split(&[',', ' '][..])
                 .filter(|s| !s.is_empty())
@@ -414,7 +620,47 @@ fn build_catalog_entry(
                 .into(),
         );
     }
-    Some(serde_json::Value::Object(entry))
+    if !entry.dependency_groups.is_empty() {
+        out.insert(
+            "dependencyGroups".into(),
+            entry
+                .dependency_groups
+                .iter()
+                .map(build_dependency_group)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+/// One `PackageDependencyGroup` of a catalog entry.
+///
+/// `targetFramework` is omitted rather than sent as `null` when the nuspec
+/// listed its dependencies flat: NuGet reads an absent framework as "applies to
+/// all of them", and a `null` as a malformed group.
+fn build_dependency_group(group: &NuGetDependencyGroup) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert("@type".into(), "PackageDependencyGroup".into());
+    if let Some(framework) = group.target_framework.as_deref() {
+        out.insert("targetFramework".into(), framework.into());
+    }
+    out.insert(
+        "dependencies".into(),
+        group
+            .dependencies
+            .iter()
+            .map(|dep| {
+                serde_json::json!({
+                    "@type": "PackageDependency",
+                    "id": dep.id,
+                    "range": dep.range,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    serde_json::Value::Object(out)
 }
 
 /// Build the NuGet Search Query response (3.5.0 format).
@@ -597,6 +843,14 @@ mod tests {
                 tags: Some("test".into()),
                 download_url: "https://git.example.com/dl/1.0.0".into(),
                 nuspec_url: Some("https://git.example.com/dl/1.0.0.nuspec".into()),
+                dependency_groups: vec![NuGetDependencyGroup {
+                    target_framework: Some("net8.0".into()),
+                    dependencies: vec![NuGetDependency {
+                        id: "Newtonsoft.Json".into(),
+                        range: "13.0.1".into(),
+                    }],
+                }],
+                listed: true,
             },
             NuGetRegistrationEntry {
                 version: "2.0.0".into(),
@@ -606,6 +860,8 @@ mod tests {
                 tags: None,
                 download_url: "https://git.example.com/dl/2.0.0".into(),
                 nuspec_url: None,
+                dependency_groups: Vec::new(),
+                listed: false,
             },
         ];
 
@@ -623,6 +879,128 @@ mod tests {
         assert!(items[0]["catalogEntry"].is_object());
         assert_eq!(items[0]["catalogEntry"]["id"], "MyLib");
         assert_eq!(items[0]["catalogEntry"]["version"], "1.0.0");
+
+        // The graph `dotnet restore` resolves against — it never opens the
+        // `.nupkg` to find one, so an absent key reads as "no dependencies".
+        let group = &items[0]["catalogEntry"]["dependencyGroups"][0];
+        assert_eq!(group["@type"], "PackageDependencyGroup");
+        assert_eq!(group["targetFramework"], "net8.0");
+        assert_eq!(group["dependencies"][0]["@type"], "PackageDependency");
+        assert_eq!(group["dependencies"][0]["id"], "Newtonsoft.Json");
+        assert_eq!(group["dependencies"][0]["range"], "13.0.1");
+
+        // A version with no declared dependencies says nothing rather than
+        // publishing an empty list it never read.
+        assert_eq!(items[0]["catalogEntry"]["listed"], true);
+        assert!(items[1]["catalogEntry"]["dependencyGroups"].is_null());
+        assert_eq!(
+            items[1]["catalogEntry"]["listed"], false,
+            "a yanked version stays in the registration but must not be a candidate"
+        );
+    }
+
+    #[test]
+    fn nuspec_dependency_groups_reads_both_layouts_and_neither() {
+        let grouped = r#"<package><metadata>
+            <id>MyLib</id><version>1.0.0</version>
+            <dependencies>
+              <group targetFramework="net8.0">
+                <dependency id="Newtonsoft.Json" version="13.0.1" />
+                <dependency id="Serilog" version="[3.0.0, 4.0.0)" exclude="Build" />
+              </group>
+              <group targetFramework="netstandard2.0" />
+            </dependencies>
+        </metadata></package>"#;
+
+        let groups = nuspec_dependency_groups(grouped);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].target_framework.as_deref(), Some("net8.0"));
+        assert_eq!(
+            groups[0].dependencies,
+            vec![
+                NuGetDependency {
+                    id: "Newtonsoft.Json".into(),
+                    range: "13.0.1".into(),
+                },
+                NuGetDependency {
+                    id: "Serilog".into(),
+                    range: "[3.0.0, 4.0.0)".into(),
+                },
+            ]
+        );
+        // A framework that needs nothing is a declaration, not an empty result.
+        assert_eq!(
+            groups[1].target_framework.as_deref(),
+            Some("netstandard2.0")
+        );
+        assert!(groups[1].dependencies.is_empty());
+
+        // The pre-2.0 layout lists them flat, which means "every framework".
+        let flat = r#"<package><metadata><dependencies>
+            <dependency id="Legacy.Pack" version="1.0" />
+            <dependency id="Anything" />
+        </dependencies></metadata></package>"#;
+        let groups = nuspec_dependency_groups(flat);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].target_framework, None);
+        assert_eq!(
+            groups[0].dependencies,
+            vec![
+                NuGetDependency {
+                    id: "Legacy.Pack".into(),
+                    range: "1.0".into(),
+                },
+                // No `version` is NuGet's unbounded range, not an empty string.
+                NuGetDependency {
+                    id: "Anything".into(),
+                    range: "(, )".into(),
+                },
+            ]
+        );
+
+        // No block at all is not an empty block: nothing is published.
+        assert!(
+            nuspec_dependency_groups("<package><metadata><id>x</id></metadata></package>")
+                .is_empty()
+        );
+        assert!(nuspec_dependency_groups(
+            "<package><metadata><dependencies /></metadata></package>"
+        )
+        .is_empty());
+    }
+
+    /// `<dependency` must not be read out of the `<dependencies>` that holds
+    /// it, and `version` must not be read out of another attribute's value.
+    #[test]
+    fn nuspec_dependency_scanner_does_not_confuse_neighbouring_names() {
+        let xml = r#"<package><metadata><dependencies>
+            <dependency id="My.Version.Helper" version="2.0" />
+        </dependencies></metadata></package>"#;
+
+        let groups = nuspec_dependency_groups(xml);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].dependencies,
+            vec![NuGetDependency {
+                id: "My.Version.Helper".into(),
+                range: "2.0".into(),
+            }]
+        );
+    }
+
+    /// The scanner's offsets are offsets into the document it was given — the
+    /// lowercase-a-copy-and-index-the-original shape breaks on a character
+    /// whose lowercase form is a different number of bytes.
+    #[test]
+    fn nuspec_dependency_scanner_survives_non_ascii_before_the_block() {
+        let xml = "<package><metadata>\
+            <description>İstanbul — Ünïcode</description>\
+            <dependencies><dependency id=\"Ok\" version=\"1.0\" /></dependencies>\
+        </metadata></package>";
+
+        let groups = nuspec_dependency_groups(xml);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].dependencies[0].id, "Ok");
     }
 
     #[test]

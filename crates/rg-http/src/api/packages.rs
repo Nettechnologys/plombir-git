@@ -1933,16 +1933,21 @@ pub async fn nuget_registration_index(
             });
 
             // Parse NuGet-specific metadata from version JSON if available
-            let (desc, hp, lic, tags) = parse_nuget_metadata(v.metadata.as_deref());
+            let meta = parse_nuget_metadata(v.metadata.as_deref());
 
             rg_core::package_registry::NuGetRegistrationEntry {
                 version: v.version.clone(),
-                description: desc,
-                homepage: hp,
-                license: lic,
-                tags,
+                description: meta.description,
+                homepage: meta.homepage,
+                license: meta.license,
+                tags: meta.tags,
                 download_url,
                 nuspec_url,
+                dependency_groups: meta.dependency_groups,
+                // A yanked version stays in the registration so a consumer that
+                // already resolved it keeps restoring; `listed` is what keeps it
+                // out of a fresh resolution.
+                listed: !v.is_yanked,
             }
         })
         .collect();
@@ -2998,24 +3003,30 @@ fn build_base_url(headers: &axum::http::HeaderMap) -> String {
         .unwrap_or_else(|| "http://localhost".into())
 }
 
+/// What a NuGet version's stored `protocol_metadata` says, in the shape the
+/// registration index publishes it.
+#[derive(Default)]
+struct NuGetVersionMetadata {
+    description: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+    tags: Option<String>,
+    /// The `<dependencies>` block of the nuspec, read back. Empty when the
+    /// nuspec declared none — which is not the same as "we did not look", and
+    /// is why the key is absent from the leaf rather than sent empty.
+    dependency_groups: Vec<rg_core::package_registry::NuGetDependencyGroup>,
+}
+
 /// Parse NuGet-specific metadata from a JSON metadata string.
-/// Returns (description, homepage, license, tags).
-fn parse_nuget_metadata(
-    metadata_json: Option<&str>,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
+fn parse_nuget_metadata(metadata_json: Option<&str>) -> NuGetVersionMetadata {
     let md = match metadata_json {
         Some(s) => s,
-        None => return (None, None, None, None),
+        None => return NuGetVersionMetadata::default(),
     };
 
     let doc: serde_json::Value = match serde_json::from_str(md) {
         Ok(v) => v,
-        Err(_) => return (None, None, None, None),
+        Err(_) => return NuGetVersionMetadata::default(),
     };
 
     let description = doc
@@ -3034,7 +3045,61 @@ fn parse_nuget_metadata(
         .map(String::from);
     let tags = doc.get("tags").and_then(|v| v.as_str()).map(String::from);
 
-    (description, homepage, license, tags)
+    NuGetVersionMetadata {
+        description,
+        homepage,
+        license,
+        tags,
+        dependency_groups: parse_nuget_dependency_groups(&doc),
+    }
+}
+
+/// The dependency groups stored beside a NuGet version.
+///
+/// A group whose `dependencies` array is missing is still a group — it declares
+/// a supported framework that needs nothing — so an unreadable entry is dropped
+/// only when it carries no framework *and* no dependencies at all.
+fn parse_nuget_dependency_groups(
+    doc: &serde_json::Value,
+) -> Vec<rg_core::package_registry::NuGetDependencyGroup> {
+    let Some(groups) = doc.get("dependencyGroups").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    groups
+        .iter()
+        .map(|group| rg_core::package_registry::NuGetDependencyGroup {
+            target_framework: group
+                .get("targetFramework")
+                .and_then(|v| v.as_str())
+                .filter(|f| !f.is_empty())
+                .map(String::from),
+            dependencies: group
+                .get("dependencies")
+                .and_then(|v| v.as_array())
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(|dep| {
+                            Some(rg_core::package_registry::NuGetDependency {
+                                id: dep
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|id| !id.is_empty())?
+                                    .to_string(),
+                                range: dep
+                                    .get("range")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|r| !r.is_empty())
+                                    .unwrap_or("(, )")
+                                    .to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .filter(|group| group.target_framework.is_some() || !group.dependencies.is_empty())
+        .collect()
 }
 
 /// Parse RubyGems dependencies from version metadata JSON.
