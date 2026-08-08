@@ -42,9 +42,26 @@ import path from 'node:path';
 import { stripRustComments } from './lib/rust-source.mjs';
 
 const root = process.cwd();
-const opsDir = path.join(root, 'crates/rg-db/src/ops');
 const cratesDir = path.join(root, 'crates');
 const failures = [];
+
+// The directories whose public functions owe a caller.
+//
+// Both are places where a call always *looks* like a call, which is what makes
+// the name-based counting below meaningful. `rg-http` is deliberately absent:
+// its handlers are named in the router without parentheses (`get(api::admin::
+// get_user)`), so the same scan reports 178 of its 349 public functions as
+// orphans, nearly all of them false. That boundary already has
+// `openapi-route-coverage-contract-check.mjs`.
+const SCANNED = [
+  'crates/rg-db/src/ops',
+  // Was three modules of `#[cfg(unix)]/#[cfg(windows)]` pairs promising
+  // portability nothing asked for: `platform::process` had six public functions
+  // and zero callers (card_af921becd2a0). What is left is the path-error
+  // vocabulary and one traversal check — small enough that a new uncalled
+  // helper here should fail a gate the day it lands.
+  'crates/rg-core/src/platform',
+];
 
 /**
  * Drop `#[cfg(test)]` items (and `#[cfg(all(test, …))]`) with their bodies.
@@ -103,15 +120,19 @@ function rustFiles(dir) {
   return found;
 }
 
-const opsFiles = readdirSync(opsDir)
-  .filter((entry) => entry.endsWith('.rs') && entry !== 'mod.rs')
-  .map((entry) => path.join(opsDir, entry));
-
-if (opsFiles.length === 0) {
-  failures.push(
-    `This check found no ops modules under ${path.relative(root, opsDir)}, so every verdict below ` +
-      'means nothing. Fix the path, not the ops layer.',
-  );
+const scannedFiles = [];
+for (const scanned of SCANNED) {
+  const dir = path.join(root, scanned);
+  const found = readdirSync(dir)
+    .filter((entry) => entry.endsWith('.rs') && entry !== 'mod.rs')
+    .map((entry) => path.join(dir, entry));
+  if (found.length === 0) {
+    failures.push(
+      `This check found no modules under ${scanned}, so every verdict below means nothing. ` +
+        'Fix the path, not the code.',
+    );
+  }
+  scannedFiles.push(...found);
 }
 
 // Production source of the whole workspace, keyed by file, comments and test
@@ -121,9 +142,9 @@ for (const file of rustFiles(cratesDir)) {
   production.set(file, stripCfgTest(stripRustComments(readFileSync(file, 'utf8'))));
 }
 
-/** Every `pub async fn` / `pub fn` defined by an ops module. */
+/** Every `pub async fn` / `pub fn` defined by a scanned module. */
 const declarations = [];
-for (const file of opsFiles) {
+for (const file of scannedFiles) {
   const source = production.get(file) ?? stripCfgTest(stripRustComments(readFileSync(file, 'utf8')));
   for (const match of source.matchAll(/^pub (?:async )?fn (\w+)/gm)) {
     declarations.push({ name: match[1], file });
@@ -132,8 +153,8 @@ for (const file of opsFiles) {
 
 if (declarations.length === 0) {
   failures.push(
-    'This check can no longer read a single `pub fn` out of the ops layer, so its verdicts mean ' +
-      'nothing. Fix the parsing, not the ops layer.',
+    'This check can no longer read a single `pub fn` out of the scanned directories, so its ' +
+      'verdicts mean nothing. Fix the parsing, not the code.',
   );
 }
 
@@ -181,18 +202,21 @@ for (const { name, file } of orphans) {
   failures.push(
     `${file}: \`${name}\` is public and no production code anywhere calls it — not even its own ` +
       'module, and a test caller does not count. ' +
-      'Wire it up where the feature it names is supposed to work, or delete it — a database entry ' +
-      'point with no arc reads as a working feature and is not one. If it is genuinely meant to ' +
-      'stay callable with no caller, add it to ALLOWED_WITHOUT_CONSUMER with the reason.',
+      'Wire it up where the feature it names is supposed to work, or delete it — an entry point ' +
+      'with no arc reads as a working feature and is not one. If it is genuinely meant to stay ' +
+      'callable with no caller, add it to ALLOWED_WITHOUT_CONSUMER with the reason.',
   );
 }
 
 if (failures.length > 0) {
-  console.error('rg-db ops consumer contract failed:');
+  console.error('consumer contract failed:');
   for (const failure of failures) {
     console.error(`- ${failure}`);
   }
   process.exit(1);
 }
 
-console.log(`rg-db ops consumer contract ok (${declarations.length} public ops, every one consumed)`);
+console.log(
+  `consumer contract ok (${declarations.length} public functions across ${SCANNED.length} ` +
+    'directories, every one consumed)',
+);
