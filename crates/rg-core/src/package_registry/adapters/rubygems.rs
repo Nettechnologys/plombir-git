@@ -60,25 +60,12 @@ impl PackageAdapter for RubyGemsAdapter {
             anyhow::bail!("file too small to be a valid RubyGem");
         }
 
-        // Try to find metadata.gz inside the tar
-        let mut archive = tar::Archive::new(data);
-        let mut found_metadata = false;
-        for entry in archive.entries()? {
-            let entry = entry?;
-            let path = entry.path()?;
-            if path
-                .file_name()
-                .map(|n| n == "metadata.gz")
-                .unwrap_or(false)
-            {
-                found_metadata = true;
-                break;
-            }
-        }
-
-        if !found_metadata {
-            anyhow::bail!("invalid RubyGem: no metadata.gz found");
-        }
+        // Read the gemspec, don't merely find `metadata.gz` — see
+        // `CargoAdapter::validate`. A `metadata.gz` that is not gzip, or whose
+        // YAML has no name, is a gem `gem install` cannot resolve, and this is
+        // the only gate publish always runs. The absence check survives inside
+        // `extract_from_gem` (`invalid .gem: no metadata.gz found`).
+        extract_from_gem(data)?;
         Ok(())
     }
 

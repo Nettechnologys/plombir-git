@@ -4,6 +4,7 @@
   import { packages } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
   import { packageFormatLabel } from '$lib/packageFormats';
+  import { packageInstallSnippet, packageInstallText } from '$lib/packageInstall';
 
   const t = createT();
 
@@ -35,22 +36,17 @@
     }
   }
 
-  function getInstallCommand(pkg: any): string {
-    const f = format!.toLowerCase();
-    const name = pkg.name;
-    const version = pkg.latest_version || '';
-
-    if (f === 'cargo') return `cargo add ${name}`;
-    if (f === 'npm') return `npm install ${name}`;
-    if (f === 'pypi') return `pip install ${name}`;
-    if (f === 'maven') return `<dependency>\n  <groupId>...</groupId>\n  <artifactId>${name}</artifactId>\n  <version>${version}</version>\n</dependency>`;
-    if (f === 'docker') return `docker pull ${owner}/${repo}:${version}`;
-    if (f === 'nuget') return `dotnet add package ${name}`;
-    if (f === 'rubygems') return `gem install ${name}`;
-    if (f === 'go') return `GOPROXY=<ForgeKeep URL>/api/v1/repos/${owner}/${repo}/packages/go go get ${name}`;
-    if (f === 'helm') return `helm install my-release ${name}`;
-    if (f === 'composer') return `composer require ${name}`;
-    return `# install ${name}`;
+  function getInstallCommand(pkg: { name: string; latest_version?: string }): string {
+    return packageInstallText(
+      packageInstallSnippet({
+        format: format!,
+        owner: owner!,
+        repo: repo!,
+        name: pkg.name,
+        version: pkg.latest_version || undefined,
+        origin: $page.url.origin,
+      }),
+    );
   }
 
   function encodePackageRouteName(name: string): string {

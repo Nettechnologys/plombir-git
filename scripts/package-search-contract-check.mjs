@@ -13,6 +13,8 @@ const formatPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[
 const uploadPath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/upload/+page.svelte');
 const packageFormatsPath = path.join(root, 'web/src/lib/packageFormats.ts');
 const backendPackageServicePath = path.join(root, 'crates/rg-core/src/package_registry/service.rs');
+const backendAdaptersPath = path.join(root, 'crates/rg-core/src/package_registry/adapters/mod.rs');
+const packageInstallPath = path.join(root, 'web/src/lib/packageInstall.ts');
 const httpLibPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
@@ -26,6 +28,8 @@ const detailPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[
 const detailPage = readFileSync(detailPagePath, 'utf8');
 const packageFormats = readFileSync(packageFormatsPath, 'utf8');
 const backendPackageService = readFileSync(backendPackageServicePath, 'utf8');
+const backendAdapters = stripRustComments(readFileSync(backendAdaptersPath, 'utf8'));
+const packageInstall = readFileSync(packageInstallPath, 'utf8');
 const httpLib = stripRustComments(readFileSync(httpLibPath, 'utf8'));
 
 const failures = [];
@@ -179,6 +183,85 @@ if (backendTypes && sharedTypes) {
   }
   if (extraInShared.length > 0) {
     failures.push(`Shared package format list contains types absent from backend: ${extraInShared.join(', ')}`);
+  }
+}
+
+// ── Declared support must be the support that exists ──────────────────────
+//
+// `NATIVE_PACKAGE_FORMATS` is what the UI prints as "Native adapter" rather
+// than "Generic fallback", and until now nothing compared it with the set of
+// adapters the backend actually has. Adding an adapter would leave the UI
+// saying "Generic fallback"; removing one would leave it promising a native
+// protocol, and the client would find out by trying.
+const adapterModules = [...backendAdapters.matchAll(/pub\s+mod\s+([a-z0-9_]+)\s*;/g)].map(
+  (m) => m[1],
+);
+const nativeFormats = extractQuotedArray(packageFormats, 'NATIVE_PACKAGE_FORMATS');
+
+if (adapterModules.length === 0) {
+  failures.push('Could not extract the package adapter modules from adapters/mod.rs');
+}
+if (!nativeFormats || nativeFormats.length === 0) {
+  failures.push('Could not extract NATIVE_PACKAGE_FORMATS from the shared package format list');
+}
+if (adapterModules.length > 0 && nativeFormats && nativeFormats.length > 0) {
+  const missingFromUi = adapterModules.filter((name) => !nativeFormats.includes(name));
+  const notAnAdapter = nativeFormats.filter((name) => !adapterModules.includes(name));
+  if (missingFromUi.length > 0) {
+    failures.push(
+      `NATIVE_PACKAGE_FORMATS is missing formats that have a backend adapter: ${missingFromUi.join(', ')}`,
+    );
+  }
+  if (notAnAdapter.length > 0) {
+    failures.push(
+      `NATIVE_PACKAGE_FORMATS promises a native adapter for formats the backend has none for: ${notAnAdapter.join(', ')}`,
+    );
+  }
+}
+
+// ── Install snippets must point at THIS registry ──────────────────────────
+//
+// A bare `gem install foo` resolves against the public registry: for a free
+// name it 404s, and for a taken one it installs somebody else's code under the
+// name the user was reading about.
+for (const [label, source] of [
+  ['Package format page', formatPage],
+  ['Package detail page', detailPage],
+]) {
+  if (!/packageInstallSnippet/.test(source)) {
+    failures.push(`${label} must build install commands through the shared packageInstallSnippet helper`);
+  }
+  if (/<ForgeKeep URL>/.test(source)) {
+    failures.push(`${label} must not print a placeholder instance URL in an install command`);
+  }
+}
+
+// `GOPROXY=` is the command form; the prose above the `default:` branch may
+// still name the protocol to explain why there is no command.
+if (/<ForgeKeep URL>|GOPROXY\s*=/.test(packageInstall)) {
+  failures.push(
+    'packageInstall must not advertise a Go module proxy endpoint: this server routes none',
+  );
+}
+
+// Every format with an install command must name the registry root in it —
+// `root` for the package API surface, `host` for the OCI one.
+const installCases = [...packageInstall.matchAll(/case '([a-z0-9]+)':([\s\S]*?)(?=\n    case '|\n    default:)/g)];
+if (installCases.length === 0) {
+  failures.push('Could not read the per-format install snippets from packageInstall.ts');
+}
+for (const [, format, body] of installCases) {
+  if (!/\$\{root\}|\$\{host\}/.test(body)) {
+    failures.push(`Install snippet for ${format} must point at this instance's registry root`);
+  }
+}
+if (nativeFormats) {
+  const covered = installCases.map(([, format]) => format);
+  const uncovered = nativeFormats.filter(
+    (format) => format !== 'generic' && !covered.includes(format),
+  );
+  if (uncovered.length > 0) {
+    failures.push(`Formats declared native but with no install snippet: ${uncovered.join(', ')}`);
   }
 }
 

@@ -645,6 +645,148 @@ async fn writes_that_fail_on_something_other_than_uniqueness_are_still_errors() 
     }
 }
 
+/// card_2827bf918a9d: the first two steps of a package publish are the same
+/// read-then-insert. A repository that has never served a package type, and a
+/// package name that has never been published, are both created by whichever
+/// request arrives first — and the request behind it contradicts nothing, so it
+/// must adopt that row instead of failing on the UNIQUE index.
+///
+/// The ordinary traffic that reaches this: two CI jobs publishing *different
+/// versions of one new package* at the same time. The loser used to take a 5xx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_package_publishes_all_succeed_and_leave_one_registry_and_package() {
+    let (db, _temp) = setup("package-registry").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    // Step 1 and step 2 of `publish`, run together the way two jobs run them:
+    // every caller creates the registry and then the package, and each carries
+    // its own descriptive columns so a blended row would be visible.
+    let attempts = (0..ATTEMPTS).map(|i| {
+        let db = db.clone();
+        async move {
+            let registry = rg_db::ops::package_registry_ops::find_or_create(&db, repo_id, "npm")
+                .await
+                .map_err(|error| format!("registry: {error}"))?;
+            let package = rg_db::ops::package_ops::find_or_create(
+                &db,
+                registry.id,
+                user_id,
+                "matrix-race",
+                Some(&format!("published by {i}")),
+                Some(&format!("https://example.invalid/{i}")),
+                None,
+            )
+            .await
+            .map_err(|error| format!("package: {error}"))?;
+            Ok::<(i64, i64), String>((registry.id, package.id))
+        }
+    });
+
+    let results = futures_join_all(attempts).await;
+    assert_all_ok(&results, "package publish");
+
+    // Everyone ends up on the same two rows — not merely "nobody errored".
+    let first = *results[0].as_ref().expect("the first caller succeeded");
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(
+            *result.as_ref().expect("checked above"),
+            first,
+            "caller {i} must publish into the same registry and package as the rest",
+        );
+    }
+
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM package_registry \
+                 WHERE repo_id = {repo_id} AND package_type = 'npm'"
+            ),
+        )
+        .await,
+        1,
+        "one repository serves one package type from exactly one registry row",
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM packages \
+                 WHERE package_registry_id = {} AND name = 'matrix-race'",
+                first.0
+            ),
+        )
+        .await,
+        1,
+        "one package name occupies exactly one row in its registry",
+    );
+
+    // The surviving package row belongs to one publisher, not to a merge of two.
+    let package = rg_db::ops::package_ops::find_by_registry_and_name(&db, first.0, "matrix-race")
+        .await
+        .expect("read the package back")
+        .expect("the package exists");
+    let publisher = package
+        .description
+        .as_deref()
+        .and_then(|d| d.strip_prefix("published by "))
+        .expect("the description came from one of the callers")
+        .to_string();
+    assert_eq!(
+        package.homepage.as_deref(),
+        Some(format!("https://example.invalid/{publisher}").as_str()),
+        "description and homepage must come from the same publish",
+    );
+}
+
+/// The adoption is keyed on the whole schema key, not on the part that reads
+/// like an identity. `idx_package_registry_name` is UNIQUE on
+/// `(package_registry_id, name)`, so the same package name in two registries is
+/// two rows — a re-read by name alone would hand the second caller the first
+/// registry's package and publish npm versions into the cargo registry.
+///
+/// (The usual companion guard — force a non-UNIQUE failure and check it is
+/// still an error — has nothing to force here: unlike most of this file's
+/// tables, `package_registry` and `packages` declare no foreign keys at all, so
+/// an orphan insert simply succeeds. That gap is filed separately; it is not
+/// something this test can assert around.)
+#[tokio::test]
+async fn one_package_name_in_two_registries_stays_two_rows() {
+    let (db, _temp) = setup("package-key").await;
+    let (user_id, repo_id) = fixture(&db).await;
+
+    let npm = rg_db::ops::package_registry_ops::find_or_create(&db, repo_id, "npm")
+        .await
+        .expect("create the npm registry");
+    let cargo = rg_db::ops::package_registry_ops::find_or_create(&db, repo_id, "cargo")
+        .await
+        .expect("create the cargo registry");
+    assert_ne!(npm.id, cargo.id, "two package types are two registries");
+
+    let in_npm =
+        rg_db::ops::package_ops::find_or_create(&db, npm.id, user_id, "shared", None, None, None)
+            .await
+            .expect("create the npm package");
+    let in_cargo =
+        rg_db::ops::package_ops::find_or_create(&db, cargo.id, user_id, "shared", None, None, None)
+            .await
+            .expect("create the cargo package");
+
+    assert_ne!(
+        in_npm.id, in_cargo.id,
+        "one name in two registries must not collapse onto one package row",
+    );
+    assert_eq!(in_cargo.package_registry_id, cargo.id);
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) AS n FROM packages WHERE name = 'shared'"
+        )
+        .await,
+        2,
+    );
+}
+
 /// `futures::future::join_all` without taking a dependency on `futures` for one
 /// call: poll the futures together by handing them to the runtime as tasks.
 async fn futures_join_all<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>

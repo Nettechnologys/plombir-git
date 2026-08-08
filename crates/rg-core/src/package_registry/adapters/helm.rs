@@ -169,11 +169,17 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
 ///
 /// `apiVersion` is the load-bearing one: Helm decides how to read a chart from
 /// it, so an index entry missing it describes a chart the client cannot place.
+/// `kubeVersion` and `deprecated` are next: `helm install` refuses a chart whose
+/// `kubeVersion` range the cluster does not satisfy, and `helm search repo`
+/// hides deprecated charts — both decided from the *index*, not the archive, by
+/// every client that resolves before downloading (Flux's `HelmRepository`,
+/// ChartMuseum mirrors). A chart that omits them from the index looks
+/// installable and current when it is neither.
 /// `None` when the chart declared none of these.
 fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Option<String> {
     let mut out = serde_json::Map::new();
 
-    for key in ["appVersion", "apiVersion"] {
+    for key in ["appVersion", "apiVersion", "kubeVersion", "type"] {
         // `appVersion: 1.19` is a number to YAML and a string to Helm.
         let value = doc.get(key).and_then(|v| {
             v.as_str()
@@ -202,6 +208,27 @@ fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Option<String> {
         }
     }
 
+    // Only a `true` is worth recording: Helm's own `ChartMetadata` omits the
+    // key when the chart is current, and writing `deprecated: false` into every
+    // entry would say the registry checked something it merely defaulted.
+    if doc.get("deprecated").and_then(|v| v.as_bool()) == Some(true) {
+        out.insert("deprecated".into(), true.into());
+    }
+
+    // `dependencies` travels as the chart spells it — a list of tables with
+    // `name` / `version` / `repository` and optional `condition` / `tags` /
+    // `alias`. Rendering it here rather than reshaping it keeps the index entry
+    // a faithful `ChartMetadata`, which is what a mirror re-serves verbatim.
+    if let Some(deps) = doc.get("dependencies").and_then(|v| v.as_sequence()) {
+        let deps: Vec<serde_json::Value> = deps
+            .iter()
+            .filter_map(|dep| serde_json::to_value(dep).ok())
+            .collect();
+        if !deps.is_empty() {
+            out.insert("dependencies".into(), deps.into());
+        }
+    }
+
     (!out.is_empty()).then(|| serde_json::Value::Object(out).to_string())
 }
 
@@ -214,6 +241,17 @@ pub struct HelmIndexEntry {
     pub app_version: Option<String>,
     pub description: Option<String>,
     pub api_version: Option<String>,
+    /// The semver range of Kubernetes the chart supports. `helm install`
+    /// refuses a chart the cluster does not satisfy, and decides it from here
+    /// when it resolved through the index.
+    pub kube_version: Option<String>,
+    /// `application` or `library` — a library chart installs nothing on its own.
+    pub chart_type: Option<String>,
+    /// Written only when true, the way Helm's own `ChartMetadata` writes it:
+    /// `helm search repo` hides the chart on this key alone.
+    pub deprecated: bool,
+    /// The chart's subchart requirements, as `Chart.yaml` spells them.
+    pub dependencies: Vec<serde_json::Value>,
     pub home: Option<String>,
     pub sources: Vec<String>,
     pub keywords: Vec<String>,
@@ -246,6 +284,20 @@ pub fn build_helm_index(entries: &[HelmIndexEntry]) -> String {
             }
             if let Some(ref api) = entry.api_version {
                 ver.insert("apiVersion".into(), api.clone().into());
+            }
+            if let Some(ref kube) = entry.kube_version {
+                ver.insert("kubeVersion".into(), kube.clone().into());
+            }
+            if let Some(ref chart_type) = entry.chart_type {
+                ver.insert("type".into(), chart_type.clone().into());
+            }
+            if entry.deprecated {
+                ver.insert("deprecated".into(), true.into());
+            }
+            if !entry.dependencies.is_empty() {
+                if let Ok(deps) = serde_yaml::to_value(&entry.dependencies) {
+                    ver.insert("dependencies".into(), deps);
+                }
             }
             if let Some(ref home) = entry.home {
                 ver.insert("home".into(), home.clone().into());
@@ -447,6 +499,10 @@ sources:
             app_version: Some("1.19.0".into()),
             description: Some("A Helm chart".into()),
             api_version: Some("v2".into()),
+            kube_version: None,
+            chart_type: None,
+            deprecated: false,
+            dependencies: Vec::new(),
             home: Some("https://example.com".into()),
             sources: vec!["https://github.com/x/y".into()],
             keywords: vec!["web".into(), "proxy".into()],
@@ -461,5 +517,70 @@ sources:
         assert!(yaml.contains("1.2.3"));
         assert!(yaml.contains("sha256:abc123"));
         assert!(yaml.contains("generated"));
+        // A chart that declared neither must not have the keys invented for it:
+        // `deprecated: false` in an index entry is an answer, not a silence.
+        assert!(!yaml.contains("deprecated"), "{yaml}");
+        assert!(!yaml.contains("kubeVersion"), "{yaml}");
+    }
+
+    /// `helm install` refuses a chart whose `kubeVersion` the cluster does not
+    /// satisfy, and `helm search repo` hides a deprecated one — both decided
+    /// from the index by any client that resolves before downloading. A chart
+    /// that declared them must carry them through to `index.yaml`.
+    #[test]
+    fn the_index_republishes_kube_version_deprecation_and_dependencies() {
+        let chart = make_chart(
+            r#"apiVersion: v2
+name: legacy
+version: 1.0.0
+kubeVersion: ">=1.21.0-0 <1.28.0-0"
+type: application
+deprecated: true
+dependencies:
+  - name: postgresql
+    version: "12.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+"#,
+        );
+
+        let stored = HelmAdapter
+            .extract_metadata("legacy-1.0.0.tgz", &chart)
+            .unwrap()
+            .protocol_metadata
+            .expect("chart declares protocol metadata");
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+
+        assert_eq!(stored["kubeVersion"], ">=1.21.0-0 <1.28.0-0", "{stored}");
+        assert_eq!(stored["type"], "application", "{stored}");
+        assert_eq!(stored["deprecated"], true, "{stored}");
+        assert_eq!(stored["dependencies"][0]["name"], "postgresql", "{stored}");
+        assert_eq!(
+            stored["dependencies"][0]["condition"], "postgresql.enabled",
+            "the dependency table travels as the chart spells it: {stored}"
+        );
+
+        let yaml = build_helm_index(&[HelmIndexEntry {
+            name: "legacy".into(),
+            version: "1.0.0".into(),
+            app_version: None,
+            description: None,
+            api_version: Some("v2".into()),
+            kube_version: stored["kubeVersion"].as_str().map(String::from),
+            chart_type: stored["type"].as_str().map(String::from),
+            deprecated: stored["deprecated"].as_bool().unwrap_or(false),
+            dependencies: stored["dependencies"].as_array().cloned().unwrap(),
+            home: None,
+            sources: Vec::new(),
+            keywords: Vec::new(),
+            created: "2024-01-01T00:00:00Z".into(),
+            digest: None,
+            urls: vec!["https://example.com/charts/legacy-1.0.0.tgz".into()],
+        }]);
+
+        assert!(yaml.contains("kubeVersion:"), "{yaml}");
+        assert!(yaml.contains("deprecated: true"), "{yaml}");
+        assert!(yaml.contains("postgresql"), "{yaml}");
+        assert!(yaml.contains("condition: postgresql.enabled"), "{yaml}");
     }
 }

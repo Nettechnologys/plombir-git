@@ -56,6 +56,7 @@ use std::io::Read;
 use tar::Archive;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::url_path::encode_path_segment;
 
 pub struct NpmAdapter;
 
@@ -178,25 +179,11 @@ impl PackageAdapter for NpmAdapter {
             .read_to_end(&mut buf)
             .map_err(|e| anyhow::anyhow!("invalid npm package (not valid gzip): {e}"))?;
 
-        // Check package.json presence
-        let tar = GzDecoder::new(data);
-        let mut archive = Archive::new(tar);
-        let mut found = false;
-        for entry in archive.entries()? {
-            let entry = entry?;
-            let path = entry.path()?;
-            let is_pkg_json = path
-                .file_name()
-                .map(|n| n == "package.json")
-                .unwrap_or(false);
-            if is_pkg_json {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            anyhow::bail!("invalid npm package: package.json not found");
-        }
+        // Parse the manifest, don't merely find it — see `CargoAdapter::validate`
+        // for why presence is not enough: this is the only gate publish always
+        // runs, and a `package.json` that is present but unreadable would be
+        // stored and then served to npm as a packument built from nothing.
+        self.extract_metadata("", data)?;
         Ok(())
     }
 
@@ -366,14 +353,21 @@ pub fn build_npm_metadata(
             latest_version = Some(vi.version.clone());
         }
 
+        // Every component is percent-encoded into ONE segment. A scoped name
+        // (`@scope/name`) carries a literal slash, and pasted raw it turns the
+        // four-segment download route into six: the router would read
+        // `pkg_name=@scope`, `version=name`, and answer the client's own
+        // `dist.tarball` with a 404. Encoded, it arrives at the handler
+        // decoded and matches the stored row — the same shape the metadata
+        // route already receives from npm itself (`@scope%2Fname`).
         let tarball_url = format!(
             "{}/api/v1/repos/{}/{}/packages/npm/{}/{}/{}",
             base_url.trim_end_matches('/'),
-            owner,
-            repo,
-            name,
-            vi.version,
-            vi.filename.as_deref().unwrap_or("package.tgz"),
+            encode_path_segment(owner),
+            encode_path_segment(repo),
+            encode_path_segment(name),
+            encode_path_segment(&vi.version),
+            encode_path_segment(vi.filename.as_deref().unwrap_or("package.tgz")),
         );
 
         let mut ver_obj = serde_json::Map::new();

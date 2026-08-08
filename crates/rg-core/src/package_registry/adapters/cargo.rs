@@ -125,25 +125,14 @@ impl PackageAdapter for CargoAdapter {
             .read_to_end(&mut buf)
             .map_err(|e| anyhow::anyhow!("invalid .crate file (not valid gzip): {e}"))?;
 
-        // Check that Cargo.toml exists
-        let tar = GzDecoder::new(data);
-        let mut archive = Archive::new(tar);
-        let mut found = false;
-        for entry in archive.entries()? {
-            let entry = entry?;
-            if entry
-                .path()?
-                .file_name()
-                .map(|n| n == "Cargo.toml")
-                .unwrap_or(false)
-            {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            anyhow::bail!("invalid .crate file: Cargo.toml not found");
-        }
+        // Parse the manifest, don't merely find it. `validate` is the only
+        // unconditional gate publish runs — `extract_metadata` failing is not
+        // fatal when the coordinates arrived as query parameters — so a crate
+        // whose `Cargo.toml` is present but unparseable would otherwise be
+        // stored, served from the sparse index, and break `cargo` at install.
+        // The absence check is not lost: parsing reports it first, and more
+        // precisely (`no Cargo.toml found in archive`).
+        self.extract_metadata("", data)?;
         Ok(())
     }
 

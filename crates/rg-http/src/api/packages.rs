@@ -33,6 +33,7 @@ use utoipa::ToSchema;
 
 use crate::api::repo_access::{CiRead, Packages, RepoWrite};
 use crate::AppState;
+use rg_core::package_registry::encode_path_segment;
 
 // ── Request / Response types ─────────────────────────────
 
@@ -1176,11 +1177,11 @@ pub async fn pypi_simple_index(
         format!(
             "{}/api/v1/repos/{}/{}/packages/pypi/{}/{}/{}",
             base_url.trim_end_matches('/'),
-            owner,
-            name,
-            project,
-            version,
-            filename,
+            encode_path_segment(&owner),
+            encode_path_segment(&name),
+            encode_path_segment(&project),
+            encode_path_segment(version),
+            encode_path_segment(filename),
         )
     };
 
@@ -1483,22 +1484,22 @@ pub async fn nuget_registration_index(
             let download_url = format!(
                 "{}/api/v1/repos/{}/{}/packages/nuget/{}/{}/{}",
                 base_url.trim_end_matches('/'),
-                owner,
-                name,
-                pkg_name,
-                v.version,
-                filename,
+                encode_path_segment(&owner),
+                encode_path_segment(&name),
+                encode_path_segment(&pkg_name),
+                encode_path_segment(&v.version),
+                encode_path_segment(&filename),
             );
 
             let nuspec_url = primary_file.map(|_| {
                 format!(
                     "{}/api/v1/repos/{}/{}/packages/nuget/{}/{}/{}.nuspec",
                     base_url.trim_end_matches('/'),
-                    owner,
-                    name,
-                    pkg_name,
-                    v.version,
-                    pkg_name,
+                    encode_path_segment(&owner),
+                    encode_path_segment(&name),
+                    encode_path_segment(&pkg_name),
+                    encode_path_segment(&v.version),
+                    encode_path_segment(&pkg_name),
                 )
             });
 
@@ -1562,9 +1563,9 @@ pub async fn nuget_search(
             let registration_url = format!(
                 "{}/api/v1/repos/{}/{}/packages/nuget/registration/{}/index.json",
                 base_url.trim_end_matches('/'),
-                owner,
-                name,
-                pkg.name,
+                encode_path_segment(&owner),
+                encode_path_segment(&name),
+                encode_path_segment(&pkg.name),
             );
 
             results.push(rg_core::package_registry::NuGetSearchResult {
@@ -2059,11 +2060,11 @@ pub async fn helm_index(
             let download_url = format!(
                 "{}/api/v1/repos/{}/{}/packages/helm/{}/{}/{}",
                 base_url.trim_end_matches('/'),
-                owner,
-                name,
-                pkg.name,
-                v.version,
-                filename,
+                encode_path_segment(&owner),
+                encode_path_segment(&name),
+                encode_path_segment(&pkg.name),
+                encode_path_segment(&v.version),
+                encode_path_segment(&filename),
             );
 
             // Parse Helm-specific metadata from version JSON
@@ -2075,6 +2076,10 @@ pub async fn helm_index(
                 app_version: meta.app_version,
                 description: pkg.description.clone(),
                 api_version: meta.api_version,
+                kube_version: meta.kube_version,
+                chart_type: meta.chart_type,
+                deprecated: meta.deprecated,
+                dependencies: meta.dependencies,
                 home: pkg.homepage.clone(),
                 sources: meta.sources,
                 keywords: meta.keywords,
@@ -2157,19 +2162,30 @@ pub async fn composer_packages_json(
                     sha256: archive.and_then(|f| v.sha256_of(f)),
                     sha1: archive.and_then(|f| f.sha1.clone()),
                     description: pkg.description.clone(),
-                    license: None, // Composer license is stored in metadata
+                    // `license` and `type` come out of the manifest sections the
+                    // adapter lifted at publish, below — there is no license or
+                    // type column on a version row to read them from, and the
+                    // literal `None` that used to sit here is what made every
+                    // package announce itself as a `library`.
+                    license: None,
                     package_type: None,
+                    metadata: v.metadata.clone(),
                 }
             })
             .collect();
         let name_json = serde_json::json!(pkg.name).to_string();
-        let versions_json = rg_core::package_registry::adapters::composer::build_packages_json(
+        // Same as the npm packument and the cargo index: an unreadable row must
+        // not be served as an entry saying the package requires nothing.
+        let versions_json = match rg_core::package_registry::adapters::composer::build_packages_json(
             &pkg.name,
             &composer_versions,
             &base_url,
             &owner,
             &name,
-        );
+        ) {
+            Ok(versions_json) => versions_json,
+            Err(error) => return package_error_response(error),
+        };
         // Extract just the inner version map from the full response
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&versions_json) {
             if let Some(pkgs) = val.get("packages") {
@@ -2200,6 +2216,10 @@ pub async fn composer_packages_json(
 struct HelmChartMetadata {
     app_version: Option<String>,
     api_version: Option<String>,
+    kube_version: Option<String>,
+    chart_type: Option<String>,
+    deprecated: bool,
+    dependencies: Vec<serde_json::Value>,
     keywords: Vec<String>,
     sources: Vec<String>,
 }
@@ -2225,15 +2245,22 @@ fn parse_helm_metadata(metadata_json: Option<&str>) -> HelmChartMetadata {
             .unwrap_or_default()
     };
 
+    let string_field = |key: &str| doc.get(key).and_then(|v| v.as_str()).map(String::from);
+
     HelmChartMetadata {
-        app_version: doc
-            .get("appVersion")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        api_version: doc
-            .get("apiVersion")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        app_version: string_field("appVersion"),
+        api_version: string_field("apiVersion"),
+        kube_version: string_field("kubeVersion"),
+        chart_type: string_field("type"),
+        deprecated: doc
+            .get("deprecated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        dependencies: doc
+            .get("dependencies")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
         keywords: string_list("keywords"),
         sources: string_list("sources"),
     }

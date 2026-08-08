@@ -153,24 +153,20 @@ pub async fn publish(
     let registry =
         rg_db::ops::package_registry_ops::find_or_create(db, repo.id, &info.package_type).await?;
 
-    // 2. Find or create the package
-    let pkg = match rg_db::ops::package_ops::find_by_registry_and_name(db, registry.id, &info.name)
-        .await?
-    {
-        Some(p) => p,
-        None => {
-            rg_db::ops::package_ops::create(
-                db,
-                registry.id,
-                info.author_id,
-                &info.name,
-                info.description.as_deref(),
-                info.homepage.as_deref(),
-                info.repository_url.as_deref(),
-            )
-            .await?
-        }
-    };
+    // 2. Find or create the package. Get-or-create, not read-then-insert: two
+    //    CI jobs publishing different versions of the same new package race
+    //    here, and the loser must adopt the winner's row rather than fail a
+    //    request that contradicts nothing.
+    let pkg = rg_db::ops::package_ops::find_or_create(
+        db,
+        registry.id,
+        info.author_id,
+        &info.name,
+        info.description.as_deref(),
+        info.homepage.as_deref(),
+        info.repository_url.as_deref(),
+    )
+    .await?;
 
     // 3. Check if version already exists
     let existing =

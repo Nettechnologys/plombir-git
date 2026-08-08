@@ -24,6 +24,7 @@
 use std::io::{Cursor, Read};
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::url_path::encode_path_segment;
 use serde_json::Value;
 
 pub struct ComposerAdapter;
@@ -93,6 +94,11 @@ impl PackageAdapter for ComposerAdapter {
             }
         });
 
+        // Everything a Composer client resolves and installs by lives inside
+        // the zip and nowhere else — `packages.json` never opens an archive —
+        // so it is lifted here, once, at publish.
+        let protocol_metadata = Some(composer_protocol_metadata(&json, license.as_deref()));
+
         Ok(ExtractedMetadata {
             name,
             version,
@@ -102,7 +108,7 @@ impl PackageAdapter for ComposerAdapter {
             keywords,
             license,
             semver: None,
-            protocol_metadata: None,
+            protocol_metadata,
         })
     }
 
@@ -111,8 +117,19 @@ impl PackageAdapter for ComposerAdapter {
         if data.len() < 4 || &data[0..4] != b"PK\x03\x04" {
             anyhow::bail!("invalid Composer package: not a valid ZIP archive");
         }
-        // Try to extract and parse composer.json
-        extract_composer_json(data)?;
+        // Read the manifest, don't merely pull the bytes out: `extract_composer_json`
+        // returns a string and never parses it, so a `composer.json` of pure
+        // garbage passed this gate the same way the other adapters' presence
+        // checks did.
+        //
+        // The gate stops at "is this JSON" rather than running the full
+        // extraction, unlike the other adapters: `composer.json` legitimately
+        // omits `version` — Composer derives it from the VCS tag — and such a
+        // package is published with the coordinates in the query string. A
+        // stricter check here would reject the normal case.
+        let json_str = extract_composer_json(data)?;
+        serde_json::from_str::<Value>(&json_str)
+            .map_err(|e| anyhow::anyhow!("invalid composer.json: {e}"))?;
         Ok(())
     }
 
@@ -165,19 +182,77 @@ fn extract_composer_json(data: &[u8]) -> anyhow::Result<String> {
     anyhow::bail!("composer.json not found in archive (looked at root and subdirectories)")
 }
 
+/// The `composer.json` keys a repository entry has to carry, because a Composer
+/// client reads them from the repository and never from the archive.
+///
+/// `require` and its solver siblings (`conflict` / `replace` / `provide`) are
+/// what the 2.x SAT solver resolves against — a package published without them
+/// installs alone, and `composer require vendor/pkg` succeeds while leaving
+/// every dependency out. `autoload` is what makes the installed files loadable
+/// at all: Composer builds the autoloader from the repository metadata, so a
+/// package whose entry has no `autoload` lands on disk with none of its classes
+/// reachable. `type` picks the installer, and with it the directory the package
+/// is unpacked into.
+const PROTOCOL_FIELDS: [&str; 11] = [
+    "type",
+    "require",
+    "require-dev",
+    "conflict",
+    "replace",
+    "provide",
+    "suggest",
+    "autoload",
+    "autoload-dev",
+    "bin",
+    "extra",
+];
+
+/// The `composer.json` sections a repository entry is expected to carry, as a
+/// JSON object recorded at publish.
+///
+/// `require` is always written, so an empty table is a fact the registry knows
+/// about the package rather than one it failed to look up. `license` is folded
+/// in already normalized (`composer.json` allows a string or a list, and the
+/// adapter joins the list) because there is no license column on a version row
+/// to read it back from.
+fn composer_protocol_metadata(doc: &Value, license: Option<&str>) -> String {
+    let mut out = serde_json::Map::new();
+
+    for field in PROTOCOL_FIELDS {
+        if let Some(value) = doc.get(field) {
+            if !value.is_null() {
+                out.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    out.entry("require")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+    if let Some(license) = license {
+        out.insert("license".into(), license.into());
+    }
+
+    Value::Object(out).to_string()
+}
+
 /// Build the packages.json metadata for a list of Composer versions.
 ///
 /// Returns a JSON string matching the Composer repository format:
 /// ```json
 /// { "packages": { "vendor/pkg": { "1.0.0": { ... }, ... } } }
 /// ```
+///
+/// A stored metadata blob that cannot be read is an error rather than an absent
+/// overlay: serving an entry with no `require` would not tell the client
+/// "unknown", it would tell it the package depends on nothing — a resolution
+/// that succeeds and an install that is missing every dependency.
 pub fn build_packages_json(
     package_name: &str,
     versions: &[ComposerVersionInfo],
     base_url: &str,
     owner: &str,
     repo: &str,
-) -> String {
+) -> anyhow::Result<String> {
     let mut packages_map = serde_json::Map::new();
     let mut version_map = serde_json::Map::new();
 
@@ -218,7 +293,13 @@ pub fn build_packages_json(
         }
         entry.insert("dist".into(), Value::Object(dist));
 
-        // Include download count as a custom metric
+        // `type` dispatches Composer's installer, and with it the directory the
+        // package is unpacked into: `composer-plugin`, `wordpress-plugin` and
+        // `drupal-module` each travel their own way, and `metapackage` has no
+        // archive at all. Defaulting a plugin to `library` puts it in
+        // `vendor/`, where nothing picks it up — so the manifest's own answer
+        // wins, and the fallback applies only to a package published before the
+        // adapter recorded one.
         entry.insert(
             "type".into(),
             v.package_type
@@ -234,30 +315,40 @@ pub fn build_packages_json(
             entry.insert("license".into(), license.clone().into());
         }
 
+        // The manifest sections lifted at publish. They are applied last and
+        // overwrite the fallbacks above — `type` and `license` recorded from
+        // the package's own `composer.json` are the answer, the entries above
+        // are only what the registry can say without one.
+        if let Some(raw) = v.metadata.as_deref().filter(|raw| !raw.trim().is_empty()) {
+            let stored: Value = serde_json::from_str(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "stored composer metadata for {package_name} {} is unreadable: {e}",
+                    v.version
+                )
+            })?;
+            let Value::Object(stored) = stored else {
+                anyhow::bail!(
+                    "stored composer metadata for {package_name} {} is not an object",
+                    v.version
+                );
+            };
+            for (key, value) in stored {
+                entry.insert(key, value);
+            }
+        }
+        // Never absent, whatever the row carried: to Composer a missing
+        // `require` reads as "depends on nothing", not as "not recorded".
+        entry
+            .entry("require")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
         version_map.insert(v.version.clone(), Value::Object(entry));
     }
 
     packages_map.insert(package_name.to_string(), Value::Object(version_map));
-    serde_json::to_string_pretty(&serde_json::json!({ "packages": Value::Object(packages_map) }))
-        .unwrap_or_default()
-}
-
-fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char)
-            }
-            _ => {
-                encoded.push('%');
-                encoded.push(HEX[(byte >> 4) as usize] as char);
-                encoded.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    encoded
+    Ok(serde_json::to_string_pretty(
+        &serde_json::json!({ "packages": Value::Object(packages_map) }),
+    )?)
 }
 
 /// Version info used by `build_packages_json`.
@@ -273,6 +364,11 @@ pub struct ComposerVersionInfo {
     pub description: Option<String>,
     pub license: Option<String>,
     pub package_type: Option<String>,
+    /// The `composer.json` sections recorded at publish, as the JSON object
+    /// `composer_protocol_metadata` wrote. `None` for a version stored before
+    /// the adapter recorded any — its entry then falls back to the fields
+    /// above and an empty `require`.
+    pub metadata: Option<String>,
 }
 
 #[cfg(test)]
@@ -309,6 +405,7 @@ mod tests {
             description: Some("Test package".into()),
             license: Some("MIT".into()),
             package_type: Some("library".into()),
+            metadata: None,
         }];
         let json = build_packages_json(
             "vendor/pkg",
@@ -316,7 +413,8 @@ mod tests {
             "https://forge.example",
             "owner",
             "repo",
-        );
+        )
+        .unwrap();
         assert!(json.contains("\"vendor/pkg\""));
         assert!(json.contains("\"1.0.0\""));
         assert!(json.contains("\"zip\""));
@@ -331,7 +429,8 @@ mod tests {
             "https://forge.example",
             "owner",
             "repo",
-        );
+        )
+        .unwrap();
         let document: Value = serde_json::from_str(&json).unwrap();
         document["packages"]["vendor/pkg"]["1.0.0"]["dist"].clone()
     }
@@ -349,6 +448,7 @@ mod tests {
             description: None,
             license: None,
             package_type: None,
+            metadata: None,
         });
 
         assert_eq!(dist["shasum"], "b".repeat(40), "dist: {dist}");
@@ -369,6 +469,7 @@ mod tests {
             description: None,
             license: None,
             package_type: None,
+            metadata: None,
         });
 
         assert!(dist.get("shasum").is_none(), "dist: {dist}");

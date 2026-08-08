@@ -31,6 +31,57 @@ pub async fn create(
     pkg.insert(db).await
 }
 
+/// Ensure a package row exists for `(registry_id, name)` (get-or-create).
+///
+/// Same shape, and same reason, as `package_registry_ops::find_or_create`: the
+/// lookup and the insert are separate statements, and `idx_package_registry_name`
+/// is UNIQUE on `(package_registry_id, name)`. Two CI jobs publishing *different
+/// versions of the same new package* — the ordinary case, not an exotic one —
+/// both read `None` and both insert; the loser would get a 5xx on a request
+/// that contradicts nothing.
+///
+/// The loser adopts the winner's row. The descriptive columns are deliberately
+/// left as the winner wrote them: the existing-row branch does not rewrite them
+/// either, so a package's description belongs to whoever published it first and
+/// a race does not change that. The version row written afterwards is where a
+/// genuine conflict lives, and that one is still reported (409).
+pub async fn find_or_create(
+    db: &DatabaseConnection,
+    registry_id: i64,
+    owner_id: i64,
+    name: &str,
+    description: Option<&str>,
+    homepage: Option<&str>,
+    repository_url: Option<&str>,
+) -> Result<package::Model, DbErr> {
+    if let Some(existing) = find_by_registry_and_name(db, registry_id, name).await? {
+        return Ok(existing);
+    }
+
+    match create(
+        db,
+        registry_id,
+        owner_id,
+        name,
+        description,
+        homepage,
+        repository_url,
+    )
+    .await
+    {
+        Ok(created) => Ok(created),
+        Err(error) if crate::is_unique_violation(&error) => {
+            match find_by_registry_and_name(db, registry_id, name).await? {
+                Some(winner) => Ok(winner),
+                // Not there after all, so the collision was on some other
+                // constraint. Report the original failure.
+                None => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Find a package by registry and name.
 pub async fn find_by_registry_and_name(
     db: &DatabaseConnection,

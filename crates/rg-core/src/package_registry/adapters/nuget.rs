@@ -46,26 +46,11 @@ impl PackageAdapter for NuGetAdapter {
             anyhow::bail!("invalid NuGet package: not a valid ZIP");
         }
 
-        // Find .nuspec inside
-        let cursor = Cursor::new(data);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| anyhow::anyhow!("invalid NuGet package (corrupt ZIP): {e}"))?;
-
-        let mut found_nuspec = false;
-        for i in 0..archive.len() {
-            let entry = archive
-                .by_index(i)
-                .map_err(|e| anyhow::anyhow!("failed to read ZIP entry: {e}"))?;
-            let name = entry.name().to_lowercase();
-            if name.ends_with(".nuspec") {
-                found_nuspec = true;
-                break;
-            }
-        }
-
-        if !found_nuspec {
-            anyhow::bail!("invalid NuGet package: no .nuspec found");
-        }
+        // Read the .nuspec, don't merely find it — see `CargoAdapter::validate`.
+        // A `.nuspec` with no `<id>` is a package NuGet cannot resolve, and
+        // `extract_from_nupkg` is where that is decided; it reports the absent
+        // file too (`no .nuspec found in package`).
+        extract_from_nupkg(data)?;
         Ok(())
     }
 

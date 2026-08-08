@@ -274,25 +274,11 @@ fn extract_from_sdist(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 
 /// Validate a .whl file (check ZIP structure and METADATA presence).
 fn validate_whl(data: &[u8]) -> Result<(), anyhow::Error> {
-    let cursor = Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| anyhow::anyhow!("invalid .whl file (not a valid ZIP): {e}"))?;
-
-    let mut found_metadata = false;
-    for i in 0..archive.len() {
-        let entry = archive
-            .by_index(i)
-            .map_err(|e| anyhow::anyhow!("failed to read .whl entry: {e}"))?;
-        let path = entry.name().to_lowercase();
-        if path.ends_with(".dist-info/metadata") || path.ends_with(".dist-info\\metadata") {
-            found_metadata = true;
-            break;
-        }
-    }
-
-    if !found_metadata {
-        anyhow::bail!("invalid .whl file: no .dist-info/METADATA found");
-    }
+    // Read METADATA, don't merely find it — see `CargoAdapter::validate`. A
+    // `METADATA` with no `Name:` is a distribution pip cannot resolve, and
+    // `validate` is the only gate publish runs unconditionally. The absence
+    // check survives inside the parser (`no .dist-info/METADATA found`).
+    extract_from_whl(data)?;
     Ok(())
 }
 
@@ -305,21 +291,8 @@ fn validate_sdist(data: &[u8]) -> Result<(), anyhow::Error> {
         .read_to_end(&mut buf)
         .map_err(|e| anyhow::anyhow!("invalid source distribution (not valid gzip): {e}"))?;
 
-    // Check PKG-INFO presence
-    let tar = GzDecoder::new(data);
-    let mut archive = tar::Archive::new(tar);
-    let mut found = false;
-    for entry in archive.entries()? {
-        let entry = entry?;
-        let path = entry.path()?;
-        if path.file_name().map(|n| n == "PKG-INFO").unwrap_or(false) {
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        anyhow::bail!("invalid source distribution: PKG-INFO not found");
-    }
+    // Read PKG-INFO, don't merely find it — same reasoning as `validate_whl`.
+    extract_from_sdist(data)?;
     Ok(())
 }
 

@@ -1163,6 +1163,82 @@ async fn npm_metadata_carries_the_manifest_dependencies() {
     );
 }
 
+/// A scoped name (`@scope/name`) carries a literal slash, and `dist.tarball` is
+/// the *only* address npm ever downloads from — it never rebuilds the path from
+/// the package name itself. Pasted raw into the URL, that slash turns the
+/// four-segment download route into six: the router reads `pkg_name=@scope`,
+/// `version=name`, and answers the registry's own published link with a 404,
+/// while the metadata request right before it succeeded (npm sends the scoped
+/// name percent-encoded, and axum hands the handler the stored spelling back).
+///
+/// So the assertion has to *follow* the published URL rather than assert a
+/// package exists: the failure only shows up between the two.
+#[tokio::test]
+async fn a_scoped_npm_package_downloads_from_the_url_it_publishes() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let package_json = br#"{
+  "name": "@matrix-scope/scoped-npm",
+  "version": "1.0.0",
+  "description": "scoped npm matrix package"
+}"#;
+    let tarball = tar_gz(&[("package/package.json", package_json)]);
+
+    let published = client
+        .post(package_url(&base, &["npm", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-scope-scoped-npm-1.0.0.tgz\"",
+        )
+        .body(tarball.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    // Spelled the way npm itself spells a scoped packument request: the slash
+    // percent-encoded so the name stays one route segment.
+    let metadata_url = format!(
+        "{}/api/v1/repos/matrix-owner/matrix-repo/packages/npm/@matrix-scope%2Fscoped-npm",
+        base.trim_end_matches('/')
+    );
+    let metadata = client.get(&metadata_url).send().await.unwrap();
+    assert_eq!(
+        metadata.status(),
+        StatusCode::OK,
+        "scoped packument must resolve at {metadata_url}"
+    );
+    let document: serde_json::Value = metadata.json().await.unwrap();
+    assert_eq!(document["name"], "@matrix-scope/scoped-npm", "{document}");
+
+    let tarball_url = document["versions"]["1.0.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no dist.tarball in {document}"));
+    assert!(
+        tarball_url.ends_with(
+            "/packages/npm/%40matrix-scope%2Fscoped-npm/1.0.0/matrix-scope-scoped-npm-1.0.0.tgz"
+        ),
+        "the scope separator must not become a path separator: {tarball_url}"
+    );
+
+    // The bytes, followed from the link the registry published.
+    let downloaded = client.get(tarball_url).send().await.unwrap();
+    assert_eq!(
+        downloaded.status(),
+        StatusCode::OK,
+        "dist.tarball must be a path this server routes: {tarball_url}"
+    );
+    assert_eq!(
+        downloaded.bytes().await.unwrap().to_vec(),
+        tarball,
+        "the tarball served is the one published"
+    );
+}
+
 /// The `dist` block is a promise about bytes, and both of its checksum fields
 /// name the algorithm they are in: `shasum` is SHA-1 (pacote feeds it to ssri
 /// as `sha1-<base64>`, Composer runs `hash_file('sha1')` on the archive) and
@@ -1845,5 +1921,141 @@ sources:
     assert_eq!(
         chart["sources"],
         serde_json::json!(["https://example.com/matrix-chart-source"])
+    );
+}
+
+/// Composer 2.x resolves against the repository's own `packages.json` and never
+/// opens the archive. An entry without `require` therefore does not say
+/// "unknown", it says the package needs nothing: `composer require vendor/pkg`
+/// succeeds and installs none of its dependencies. `type` is the other half —
+/// it dispatches the installer, so a `composer-plugin` announced as a `library`
+/// is unpacked into `vendor/` where nothing picks it up, and `autoload` is what
+/// makes the installed files reachable at all.
+#[tokio::test]
+async fn composer_metadata_carries_the_manifest_requirements_type_and_license() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let composer_json = br#"{
+  "name": "vendor/matrix-plugin",
+  "version": "1.0.0",
+  "description": "composer matrix plugin",
+  "type": "composer-plugin",
+  "license": ["MIT", "Apache-2.0"],
+  "require": { "php": ">=8.1", "composer-plugin-api": "^2.0" },
+  "require-dev": { "phpunit/phpunit": "^10.0" },
+  "conflict": { "vendor/old-plugin": "*" },
+  "autoload": { "psr-4": { "Vendor\\Matrix\\": "src/" } },
+  "extra": { "class": "Vendor\\Matrix\\Plugin" }
+}"#;
+
+    let published = client
+        .post(package_url(&base, &["composer", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-plugin-1.0.0.zip\"",
+        )
+        .body(zip_archive(&[("composer.json", composer_json)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let document: serde_json::Value = client
+        .get(package_url(&base, &["composer", "packages.json"]))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = &document["packages"]["vendor/matrix-plugin"]["1.0.0"];
+
+    // The solver's input.
+    assert_eq!(
+        entry["require"],
+        serde_json::json!({ "php": ">=8.1", "composer-plugin-api": "^2.0" }),
+        "entry: {entry}"
+    );
+    assert_eq!(
+        entry["require-dev"],
+        serde_json::json!({ "phpunit/phpunit": "^10.0" })
+    );
+    assert_eq!(
+        entry["conflict"],
+        serde_json::json!({ "vendor/old-plugin": "*" })
+    );
+
+    // The installer's input: `library` here would put the plugin in `vendor/`.
+    assert_eq!(
+        entry["type"], "composer-plugin",
+        "the manifest's own type must win over the fallback: {entry}"
+    );
+    assert_eq!(
+        entry["extra"],
+        serde_json::json!({ "class": "Vendor\\Matrix\\Plugin" })
+    );
+    // Composer builds the autoloader from the repository metadata, not from the
+    // archive: without this the files land on disk unreachable.
+    assert_eq!(
+        entry["autoload"],
+        serde_json::json!({ "psr-4": { "Vendor\\Matrix\\": "src/" } })
+    );
+    assert_eq!(entry["license"], "MIT, Apache-2.0", "entry: {entry}");
+
+    // The registry's own answers about its own storage are unchanged by any of it.
+    assert_eq!(entry["name"], "vendor/matrix-plugin");
+    assert_eq!(entry["version"], "1.0.0");
+    assert!(
+        entry["dist"]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/packages/composer/vendor%2Fmatrix-plugin/1.0.0/matrix-plugin-1.0.0.zip"),
+        "entry: {entry}"
+    );
+}
+
+/// A package published before the adapter recorded any manifest sections — and
+/// one whose format never carries them — must still resolve. To Composer a
+/// missing `require` reads as "needs nothing", so the key is written whatever
+/// the row held.
+#[tokio::test]
+async fn a_composer_entry_always_carries_a_require_table() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let composer_json = br#"{ "name": "vendor/matrix-bare", "version": "2.0.0" }"#;
+    let published = client
+        .post(package_url(&base, &["composer", "publish"]))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"matrix-bare-2.0.0.zip\"",
+        )
+        .body(zip_archive(&[("composer.json", composer_json)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let document: serde_json::Value = client
+        .get(package_url(&base, &["composer", "packages.json"]))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = &document["packages"]["vendor/matrix-bare"]["2.0.0"];
+
+    assert_eq!(entry["require"], serde_json::json!({}), "entry: {entry}");
+    assert_eq!(
+        entry["type"], "library",
+        "a manifest that declares no type falls back to the Composer default: {entry}"
     );
 }

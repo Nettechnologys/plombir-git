@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod oci;
 pub mod service;
 pub mod storage;
+pub mod url_path;
 
 pub use adapter::{get_adapter, ExtractedMetadata, PackageAdapter};
 pub use adapters::cargo::{
@@ -31,3 +32,4 @@ pub use service::{
     VersionDetail,
 };
 pub use storage::PackageStorage;
+pub use url_path::encode_path_segment;

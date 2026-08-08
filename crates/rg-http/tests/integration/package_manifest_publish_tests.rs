@@ -313,3 +313,114 @@ async fn a_docker_publish_is_refused_and_points_at_the_oci_api() {
         "a refused docker publish must not leave a version row behind"
     );
 }
+
+/// A tar archive with no gzip around it — a `.gem` is a plain tar.
+fn tar_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut out);
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            archive.append(&header, *content).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+    out
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// card_9f264cb67dd9: `validate` is the only gate a publish always runs —
+/// `extract_metadata` failing is deliberately survivable when the coordinates
+/// arrive in the query string, which is how a Maven classifier artifact gets
+/// published. Five adapters used to spend that one unconditional gate checking
+/// that the manifest was *present*, never that it could be *read*.
+///
+/// The consequence is a `201` for an artifact no client can install: `cargo`,
+/// `npm`, `pip`, `gem` and `dotnet` all parse the same manifest the registry
+/// declined to look at, and they parse it after resolving, downloading and
+/// unpacking.
+///
+/// Each case below is a perfectly good envelope — real gzip, real ZIP, real tar
+/// — with the manifest inside it broken, published with `?name=&version=` so
+/// the extraction failure is survivable and only `validate` stands between the
+/// artifact and the registry.
+///
+/// The other half of the discrimination is not repeated here: the nine-format
+/// matrix in `package_format_e2e_tests` publishes a healthy artifact of every
+/// one of these formats, so a `validate` that rejected too much goes red there.
+#[tokio::test]
+async fn a_manifest_that_cannot_be_read_is_refused_for_every_format_that_has_one() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    // `(package type, file name, body, the word the refusal has to name)`.
+    let cases: Vec<(&str, &str, Vec<u8>, &str)> = vec![
+        (
+            "cargo",
+            "broken-1.0.0.crate",
+            tar_gz(&[("broken-1.0.0/Cargo.toml", b"[package\nname = ")]),
+            "cargo.toml",
+        ),
+        (
+            "npm",
+            "broken-1.0.0.tgz",
+            tar_gz(&[("package/package.json", b"{ \"name\": ")]),
+            "package.json",
+        ),
+        (
+            "nuget",
+            "broken.1.0.0.nupkg",
+            zip_archive(&[(
+                "broken.nuspec",
+                br#"<?xml version="1.0"?><package><metadata><version>1.0.0</version></metadata></package>"#,
+            )]),
+            ".nuspec",
+        ),
+        (
+            "pypi",
+            "broken-1.0.0-py3-none-any.whl",
+            zip_archive(&[("broken-1.0.0.dist-info/METADATA", b"Version: 1.0.0\n")]),
+            "metadata",
+        ),
+        (
+            "rubygems",
+            "broken-1.0.0.gem",
+            tar_archive(&[("metadata.gz", &gzip(b"[this is not: a gemspec\n"))]),
+            "metadata",
+        ),
+    ];
+
+    for (package_type, filename, body, expected) in cases {
+        let response = fixture
+            .publish(package_type, filename, body, Some(("broken", "1.0.0")))
+            .await;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a {package_type} artifact whose manifest cannot be read must not be stored: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains(expected),
+            "the {package_type} refusal must name the manifest that failed, got: {text}"
+        );
+    }
+
+    assert_eq!(
+        fixture.stored_versions().await,
+        before,
+        "no refused publish may leave a version row behind"
+    );
+}

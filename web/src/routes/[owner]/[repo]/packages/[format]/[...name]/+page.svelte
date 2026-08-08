@@ -4,6 +4,7 @@
   import { packages } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
   import { packageFormatLabel } from '$lib/packageFormats';
+  import { packageInstallSnippet, packageInstallText } from '$lib/packageInstall';
 
   const t = createT();
 
@@ -73,19 +74,19 @@
     }
   }
 
+  function installSnippet(ver: string) {
+    return packageInstallSnippet({
+      format: format!,
+      owner: owner!,
+      repo: repo!,
+      name: name!,
+      version: ver,
+      origin: $page.url.origin,
+    });
+  }
+
   function getInstallCommand(ver: string): string {
-    const f = format!.toLowerCase();
-    if (f === 'cargo') return `cargo add ${name!}`;
-    if (f === 'npm') return `npm install ${name!}@${ver}`;
-    if (f === 'pypi') return `pip install ${name!}==${ver}`;
-    if (f === 'maven') return `<version>${ver}</version>`;
-    if (f === 'docker') return `docker pull ${owner}/${repo}:${ver}`;
-    if (f === 'nuget') return `dotnet add package ${name!} --version ${ver}`;
-    if (f === 'rubygems') return `gem install ${name!} --version ${ver}`;
-    if (f === 'go') return `GOPROXY=<ForgeKeep URL>/api/v1/repos/${owner}/${repo}/packages/go go get ${name!}@${ver}`;
-    if (f === 'helm') return `helm install my-release ${name!} --version ${ver}`;
-    if (f === 'composer') return `composer require ${name!}:${ver}`;
-    return `# install ${name!} ${ver}`;
+    return packageInstallText(installSnippet(ver));
   }
 
   function copyInstall(ver: string) {
