@@ -76,6 +76,17 @@ pub struct WorkflowTriggerSingle {
         deserialize_with = "deserialize_present_filter"
     )]
     pub pull_request_target: Option<EventFilter>,
+    /// The merge queue's speculative-merge event.
+    ///
+    /// The queue runs a trial merge of the pull request, so it takes the
+    /// workflows the PR itself declares — `on: pull_request` has always matched
+    /// it. What did not work was the spelling GitHub's own documentation uses:
+    /// `on:\n  merge_group:` had no field to land in, so it fell into `other`,
+    /// passed validation (`merge_group` *is* an event a producer emits), and
+    /// then matched nothing — a repository whose CI is written that way got no
+    /// merge-queue checks at all, with no error anywhere (card_69d4f18b0b23).
+    #[serde(default, deserialize_with = "deserialize_present_filter")]
+    pub merge_group: Option<EventFilter>,
     pub schedule: Option<Vec<ScheduleTrigger>>,
     /// Manual runs. Read with the same "present, even if empty" deserializer as
     /// `workflow_call`: the usual spelling is a bare `workflow_dispatch:` with
@@ -125,6 +136,8 @@ pub struct ScheduleTrigger {
 const WORKFLOW_CALL_TRIGGER: &str = "workflow_call";
 /// The `on:` spelling of [`rg_core::ci::pull_request::PULL_REQUEST_EVENT`].
 const PULL_REQUEST_TRIGGER: &str = "pull_request";
+/// The `on:` spelling of the merge queue's speculative-merge event.
+const MERGE_GROUP_TRIGGER: &str = "merge_group";
 /// Parsed, matched by nothing: the workflow would be taken from the base branch
 /// rather than from the PR's head, which no producer here does (card_c8f24edaee89).
 const PULL_REQUEST_TARGET_TRIGGER: &str = "pull_request_target";
@@ -394,6 +407,7 @@ impl GiteaWorkflow {
                     push,
                     pull_request,
                     pull_request_target,
+                    merge_group,
                     schedule,
                     workflow_dispatch,
                     workflow_call,
@@ -405,6 +419,7 @@ impl GiteaWorkflow {
                     pull_request_target
                         .is_some()
                         .then_some(PULL_REQUEST_TARGET_TRIGGER),
+                    merge_group.is_some().then_some(MERGE_GROUP_TRIGGER),
                     schedule.is_some().then_some(SCHEDULE_TRIGGER),
                     workflow_dispatch
                         .is_some()
@@ -605,9 +620,18 @@ impl GiteaWorkflow {
         base_branch: &str,
         changed: &ChangedPaths<'_>,
     ) -> bool {
+        // The merge queue's alias, in the two shapes that carry no filters. It
+        // lived only in the mapped arm below, so a one-line `on: pull_request`
+        // — or the same name inside `on: [push, pull_request]` — matched
+        // nothing for `merge_group` and the queue merged with no checks of the
+        // speculative commit at all, while the very same declaration written as
+        // `on:\n  pull_request:` did run them (card_69d4f18b0b23).
+        let declares = |name: &str| {
+            name == event || (event == MERGE_GROUP_TRIGGER && name == PULL_REQUEST_TRIGGER)
+        };
         match &self.on {
-            WorkflowTriggers::Simple(name) => name.as_str() == event,
-            WorkflowTriggers::Array(names) => names.iter().any(|n| n.as_str() == event),
+            WorkflowTriggers::Simple(name) => declares(name),
+            WorkflowTriggers::Array(names) => names.iter().any(|name| declares(name)),
             WorkflowTriggers::Single(trigger) => {
                 // The three `_` bindings are triggers no producer emits, so no
                 // arm below could ever be reached through them. They are not
@@ -620,11 +644,21 @@ impl GiteaWorkflow {
                     push,
                     pull_request,
                     pull_request_target: _,
+                    merge_group,
                     schedule: _,
                     workflow_dispatch,
                     workflow_call: _,
                     other: _,
                 } = trigger.as_ref();
+                // For PR-shaped events, GitHub/Gitea `branches` filters apply to
+                // the PR's base (target) branch, not the head ref.
+                let base_branch_matches = |filter: Option<&EventFilter>| {
+                    filter.is_some_and(|filter| {
+                        let base_ref = format!("refs/heads/{base_branch}");
+                        ref_matches_filter(&base_ref, filter, base_branch)
+                            && paths_match_filter(filter, changed)
+                    })
+                };
                 match event {
                     "push" => {
                         if let Some(filter) = push {
@@ -634,16 +668,15 @@ impl GiteaWorkflow {
                             false
                         }
                     }
-                    "pull_request" | "merge_group" => {
-                        if let Some(filter) = pull_request {
-                            // For pull_request events, GitHub/Gitea `branches` filters
-                            // apply to the PR's base (target) branch, not the head ref.
-                            let base_ref = format!("refs/heads/{base_branch}");
-                            ref_matches_filter(&base_ref, filter, base_branch)
-                                && paths_match_filter(filter, changed)
-                        } else {
-                            false
-                        }
+                    PULL_REQUEST_TRIGGER => base_branch_matches(pull_request.as_ref()),
+                    // Two spellings, one event. The queue merges the PR
+                    // speculatively, so the workflows the PR declares are the
+                    // ones it has to run — that alias stays. But `merge_group`
+                    // also has to be declarable by its own name, which is what
+                    // GitHub's documentation tells an author to write and what
+                    // used to match nothing at all (card_69d4f18b0b23).
+                    MERGE_GROUP_TRIGGER => {
+                        base_branch_matches(merge_group.as_ref().or(pull_request.as_ref()))
                     }
                     // A manual run carries no ref filter of its own — GitHub's
                     // `workflow_dispatch` takes `inputs`, not `branches` — so
@@ -2528,31 +2561,108 @@ mod trigger_event_vocabulary_tests {
         );
     }
 
-    /// …and the matcher answers every one of them. A name in the canon that the
-    /// matcher does not handle is the same dead end from the other side.
+    /// …and the matcher answers every one of them, each under **its own name**.
+    /// A name in the canon that the matcher does not handle is the same dead end
+    /// from the other side, and it does not stop being one because some *other*
+    /// key happens to cover the event: `merge_group` was reachable only by
+    /// declaring `pull_request`, so the alias branch this loop used to carry was
+    /// the bug, written down as if it were the rule (card_69d4f18b0b23).
     ///
-    /// The declaration a workflow writes is not always the event's own name:
-    /// the merge queue runs a *speculative* merge of the PR, so it asks the
-    /// workflows the PR itself declares. Everything else is spelled as it is
-    /// raised — including the empty-bodied `on:\n  <event>:` form, which read as
-    /// "not declared" until this test asked.
+    /// Every event is spelled here as it is raised — including the empty-bodied
+    /// `on:\n  <event>:` form, which read as "not declared" until this test
+    /// asked.
     #[test]
     fn the_matcher_answers_yes_to_a_workflow_that_declares_any_canonical_event() {
         for event in rg_core::ci::PIPELINE_EVENTS {
-            let declared = match event {
-                "merge_group" => "pull_request",
-                other => other,
-            };
             let yaml = format!(
-                "name: W\non:\n  {declared}:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+                "name: W\non:\n  {event}:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
             );
             let workflow: GiteaWorkflow =
-                serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse {declared}: {e}"));
+                serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse {event}: {e}"));
+            workflow
+                .validate_supported_triggers()
+                .unwrap_or_else(|e| panic!("`on: {event}:` refused by validation: {e:#}"));
             assert!(
                 workflow.matches_event(event, "refs/heads/main", "main", &ChangedPaths::unknown()),
-                "a workflow declaring `on: {declared}:` is not matched by {event}"
+                "a workflow declaring `on: {event}:` is not matched by {event}"
             );
         }
+    }
+
+    /// The alias is intentional and stays: the queue builds a speculative merge
+    /// of the pull request, so a workflow that only ever mentions
+    /// `pull_request` is still the workflow that has to gate the merge.
+    #[test]
+    fn a_pull_request_workflow_still_gates_the_merge_queue() {
+        // …in every shape `on:` can take. The filterless spellings are the
+        // common ones and were the ones the alias never reached.
+        for on in [
+            "on: pull_request\n",
+            "on: [push, pull_request]\n",
+            "on:\n  pull_request:\n",
+        ] {
+            let workflow = GiteaWorkflow::parse(&format!(
+                "name: W\n{on}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            ))
+            .unwrap_or_else(|e| panic!("parse {on:?}: {e}"));
+            assert!(
+                workflow.matches_event(
+                    "merge_group",
+                    "refs/heads/gh-readonly-queue/main/pr-1",
+                    "main",
+                    &ChangedPaths::unknown()
+                ),
+                "`{on}` leaves the merge queue with nothing to run"
+            );
+        }
+
+        let workflow = GiteaWorkflow::parse(
+            "name: W\non:\n  pull_request:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+        )
+        .expect("parse");
+        assert!(workflow.matches_event(
+            "merge_group",
+            "refs/heads/gh-readonly-queue/main/pr-1",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+        assert!(
+            !workflow.matches_event(
+                "merge_group",
+                "refs/heads/gh-readonly-queue/release/pr-1",
+                "release",
+                &ChangedPaths::unknown()
+            ),
+            "the `branches:` filter is about the branch the queue merges into"
+        );
+    }
+
+    /// And a `merge_group:` of its own answers only for the merge queue — the
+    /// fix must not turn it into a second way of declaring `pull_request`.
+    #[test]
+    fn a_merge_group_declaration_does_not_also_match_pull_request() {
+        let workflow = GiteaWorkflow::parse(
+            "name: W\non:\n  merge_group:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+        )
+        .expect("parse");
+        assert!(workflow.matches_event(
+            "merge_group",
+            "refs/heads/main",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+        assert!(!workflow.matches_event(
+            "pull_request",
+            "refs/heads/feature",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+        assert!(!workflow.matches_event(
+            "push",
+            "refs/heads/main",
+            "main",
+            &ChangedPaths::unknown()
+        ));
     }
 }
 
