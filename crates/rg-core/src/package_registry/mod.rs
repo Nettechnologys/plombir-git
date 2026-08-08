@@ -12,7 +12,7 @@ pub use adapters::cargo::{
     CargoIndexVersion,
 };
 pub use adapters::helm::{build_helm_index, HelmIndexEntry};
-pub use adapters::maven::{build_maven_metadata_xml, MavenVersionEntry};
+pub use adapters::maven::{build_maven_metadata_xml, MavenChecksum, MavenVersionEntry};
 pub use adapters::npm::{build_npm_metadata, NpmVersionInfo};
 pub use adapters::nuget::{
     build_autocomplete_results, build_flat_container_index, build_registration_index,

@@ -236,7 +236,21 @@ pub async fn publish(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    publish_package(state, user_id, owner, name, pkg_type, query, headers, body).await
+    let filename = filename_from_disposition(&headers);
+    publish_package(state, user_id, owner, name, pkg_type, query, filename, body).await
+}
+
+/// The upload's filename as the `Content-Disposition` header spells it.
+///
+/// Only the routes that carry the payload in the body need this: a protocol
+/// route whose URL *is* the layout (Maven's, for one) reads the filename off the
+/// path instead, and must not be handed this fallback.
+fn filename_from_disposition(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_filename_from_disposition)
+        .unwrap_or_else(|| "package".to_string())
 }
 
 /// POST/PUT /api/v1/repos/{owner}/{name}/packages/nuget/publish
@@ -256,6 +270,7 @@ pub async fn nuget_publish(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    let filename = filename_from_disposition(&headers);
     publish_package(
         state,
         user_id,
@@ -263,7 +278,7 @@ pub async fn nuget_publish(
         name,
         "nuget".to_string(),
         query,
-        headers,
+        filename,
         body,
     )
     .await
@@ -277,7 +292,7 @@ async fn publish_package(
     name: String,
     pkg_type: String,
     query: PublishPackageQuery,
-    headers: axum::http::HeaderMap,
+    filename: String,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
@@ -286,12 +301,6 @@ async fn publish_package(
             &format!("unsupported package type: {}", pkg_type),
         );
     }
-
-    let filename = headers
-        .get(header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_filename_from_disposition)
-        .unwrap_or_else(|| "package".to_string());
 
     // Try to auto-extract metadata via the adapter
     let adapter = rg_core::package_registry::get_adapter(&pkg_type);
@@ -1460,6 +1469,24 @@ pub async fn maven_download(
 
     let pkg_name = format!("{}:{}", group_id, artifact_id);
 
+    // A resolver fetches `<artifact>.jar.sha1` right after the artifact to check
+    // it. The sidecars are not stored — see `maven_upload`, which verifies them
+    // on the way in rather than keeping a second copy of a number the bytes
+    // already determine — so they are computed here from the file itself. A
+    // registry that 404s them makes every `mvn` build print a checksum warning
+    // for artifacts that are in fact intact.
+    if let Some((target, algorithm)) = rg_core::package_registry::MavenChecksum::split_sidecar(filename) {
+        return match read_package_file(&state, &request.owner, &request.repo, &pkg_name, version, target).await {
+            Ok(data) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                algorithm.hex(&data),
+            )
+                .into_response(),
+            Err(response) => response,
+        };
+    }
+
     serve_package_file(
         &state,
         &request.owner,
@@ -1468,6 +1495,157 @@ pub async fn maven_download(
         &pkg_name,
         version,
         filename,
+    )
+    .await
+}
+
+/// The stored bytes of one Maven file, or the response that explains their absence.
+async fn read_package_file(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    pkg_name: &str,
+    version: &str,
+    filename: &str,
+) -> Result<Vec<u8>, axum::response::Response> {
+    let storage = rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
+    match rg_core::package_registry::service::download_file(
+        &state.db, &storage, owner, repo, "maven", pkg_name, version, filename,
+    )
+    .await
+    {
+        Ok(file) => Ok(file.data),
+        Err(error) => Err(package_file_error_response(error)),
+    }
+}
+
+/// PUT /api/v1/repos/{owner}/{name}/packages/maven/{group…}/{artifact}/maven-metadata.xml
+///
+/// Accepted, and deliberately not stored. `mvn deploy` finishes by uploading its
+/// own copy of the version list, but the list this registry serves is derived
+/// from its own rows (see [`maven_metadata`]) — keeping the client's copy would
+/// create a second, immediately stale source of the same answer, and refusing it
+/// would fail the whole deploy over a document nobody reads back.
+///
+/// Separate from [`maven_upload`] because on this route the filename is part of
+/// the pattern rather than a capture: the shared handler would read `{m3}` as
+/// the file and mistake the coordinate for one segment short.
+pub async fn maven_upload_metadata(
+    _state: State<AppState>,
+    _write: RepoWrite,
+    _params: axum::extract::RawPathParams,
+    _body: axum::body::Bytes,
+) -> axum::response::Response {
+    (StatusCode::OK, "").into_response()
+}
+
+/// PUT /api/v1/repos/{owner}/{name}/packages/maven/{group…}/{artifact}/{version}/{file}
+///
+/// The way `mvn deploy` publishes: one `PUT` per file, addressed by the very
+/// layout the resolver later reads. The registry only had `POST
+/// .../packages/maven/publish`, a spelling no Maven client knows, so the
+/// deploy half of the round trip could not be driven by the real tool at all
+/// (card_11d8655a9cd8).
+///
+/// Three kinds of upload arrive on this path and each is answered differently:
+///
+///   * `maven-metadata.xml` is **accepted and not stored**. The version list
+///     this registry serves is derived from its own rows (`maven_metadata`), so
+///     storing the client's copy would create a second, immediately stale
+///     source of the same answer. Refusing it instead would fail the deploy over
+///     a document we do not need.
+///   * `*.sha1` / `*.md5` are **verified, not stored**. A checksum is a claim
+///     about bytes we already hold, so the useful thing to do with it is check
+///     it — a mismatch fails the deploy loudly, which is the entire point of
+///     sending one. `maven_download` computes them back on the way out.
+///   * everything else is the artifact, published under the coordinate the URL
+///     spells out. The URL wins over anything the POM says, because the URL is
+///     where the resolver will come looking.
+pub async fn maven_upload(
+    State(state): State<AppState>,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
+    params: axum::extract::RawPathParams,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let request = MavenRequest::from_params(&params);
+
+    let Some((filename, head)) = request.segments.split_last() else {
+        return err(StatusCode::NOT_FOUND, "empty Maven path");
+    };
+
+    // A SNAPSHOT deploy sends `<group…>/<artifact>/<version>/maven-metadata.xml`,
+    // and its checksums arrive as ordinary files because the sidecar suffix
+    // stops the static route from matching. Both are the derived document —
+    // accepted, not stored, same as the version-less spelling that
+    // `maven_upload_metadata` answers.
+    let base = rg_core::package_registry::MavenChecksum::split_sidecar(filename)
+        .map_or(filename.as_str(), |(target, _)| target);
+    if base == "maven-metadata.xml" {
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let Some((version, head)) = head.split_last() else {
+        return err(StatusCode::NOT_FOUND, "Maven path carries no version");
+    };
+    let Some((group_id, artifact_id)) = MavenRequest::coordinates(head) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "Maven path carries no groupId/artifactId",
+        );
+    };
+    let pkg_name = format!("{group_id}:{artifact_id}");
+
+    if let Some((target, algorithm)) = rg_core::package_registry::MavenChecksum::split_sidecar(filename) {
+        let stored = match read_package_file(
+            &state,
+            &request.owner,
+            &request.repo,
+            &pkg_name,
+            version,
+            target,
+        )
+        .await
+        {
+            Ok(data) => data,
+            Err(response) => return response,
+        };
+        let expected = algorithm.hex(&stored);
+        let claimed = String::from_utf8_lossy(&body);
+        // Maven writes the bare hex digest, but some clients append a filename
+        // the way `sha1sum` does.
+        let claimed = claimed.split_whitespace().next().unwrap_or("");
+        if !claimed.eq_ignore_ascii_case(&expected) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "checksum mismatch for {target}: the upload claims {claimed}, \
+                     the stored file is {expected}"
+                ),
+            );
+        }
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let query = PublishPackageQuery {
+        name: Some(pkg_name),
+        version: Some(version.clone()),
+        description: None,
+        homepage: None,
+        repository_url: None,
+        semver: None,
+    };
+
+    publish_package(
+        state,
+        user_id,
+        request.owner,
+        request.repo,
+        "maven".to_string(),
+        query,
+        filename.clone(),
+        body,
     )
     .await
 }

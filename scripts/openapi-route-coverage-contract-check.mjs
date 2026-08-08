@@ -114,6 +114,8 @@ const UNDOCUMENTED = new Map([
   ['api::packages::helm_index', 'Helm chart repository index.yaml — layout fixed by helm'],
   ['api::packages::maven_metadata', 'Maven repository layout — layout fixed by mvn/Gradle'],
   ['api::packages::maven_download', 'Maven repository layout — layout fixed by mvn/Gradle'],
+  ['api::packages::maven_upload', 'Maven repository layout — the deploy verb and URL are fixed by mvn/Gradle'],
+  ['api::packages::maven_upload_metadata', 'Maven repository layout — the deploy verb and URL are fixed by mvn/Gradle'],
   ['api::packages::npm_registry_metadata', 'npm registry metadata document — layout fixed by npm'],
   ['api::packages::nuget_service_index', 'NuGet V3 service index — layout fixed by dotnet/nuget'],
   ['api::packages::nuget_registration_index', 'NuGet V3 registration index — layout fixed by dotnet/nuget'],

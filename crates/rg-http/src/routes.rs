@@ -688,9 +688,17 @@ fn maven_layout_routes(table: RouteTable) -> RouteTable {
     let mut table = table;
     for path in METADATA {
         table = table.get(RepoRead, path, api::packages::maven_metadata);
+        // `mvn deploy` uploads its own `maven-metadata.xml` alongside the
+        // artifacts. Registering the verb here is what keeps the deploy from
+        // failing on a document the registry derives for itself — see
+        // `maven_upload_metadata`, which accepts it without storing it.
+        table = table.put(RepoWrite, path, api::packages::maven_upload_metadata);
     }
     for path in FILES {
         table = table.get(RepoRead, path, api::packages::maven_download);
+        // The deploy half of the same layout: Maven PUTs each file to the very
+        // URL its resolver will later GET (card_11d8655a9cd8).
+        table = table.put(RepoWrite, path, api::packages::maven_upload);
     }
     table
 }

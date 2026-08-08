@@ -2239,3 +2239,130 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     );
 }
 
+
+/// `mvn deploy` publishes by PUT-ing each file to the layout its resolver reads.
+///
+/// The registry only had `POST .../packages/maven/publish`, a spelling no Maven
+/// client knows, so the deploy half of the round trip could not be driven by the
+/// real tool at all — reading the layout was fixed long before writing it
+/// (card_11d8655a9cd8). This drives the sequence Wagon actually sends: the
+/// artifact, then its checksums, then `maven-metadata.xml`.
+#[tokio::test]
+async fn maven_deploys_by_layout_and_resolves_the_same_paths_back() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let pom = br#"<?xml version="1.0"?>
+<project><groupId>com.example</groupId><artifactId>matrix-maven</artifactId><version>1.0.0</version></project>"#;
+    let jar = zip_archive(&[("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")]);
+
+    let layout = |file: &str| {
+        format!(
+            "{base}/api/v1/repos/matrix-owner/matrix-repo/packages/maven/\
+             com/example/matrix-maven/1.0.0/{file}"
+        )
+        .replace(' ', "")
+    };
+
+    for (file, body) in [
+        ("matrix-maven-1.0.0.pom", pom.to_vec()),
+        ("matrix-maven-1.0.0.jar", jar.clone()),
+    ] {
+        let deployed = client
+            .put(layout(file))
+            .bearer_auth(&token)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            deployed.status().is_success(),
+            "PUT {file} answered {} — `mvn deploy` cannot publish here",
+            deployed.status()
+        );
+    }
+
+    // The resolver reads back from the very URLs the deploy wrote to.
+    for (file, expected) in [
+        ("matrix-maven-1.0.0.pom", pom.to_vec()),
+        ("matrix-maven-1.0.0.jar", jar.clone()),
+    ] {
+        let resolved = client.get(layout(file)).send().await.unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK, "GET {file}");
+        assert_eq!(resolved.bytes().await.unwrap().as_ref(), expected.as_slice());
+    }
+
+    // ...and it fetches the checksums to verify what it downloaded. They are not
+    // stored, so a 404 here would make every build warn about intact artifacts.
+    let sha1 = client
+        .get(layout("matrix-maven-1.0.0.jar.sha1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sha1.status(), StatusCode::OK, "the resolver's checksum fetch");
+    let sha1 = sha1.text().await.unwrap();
+    assert_eq!(
+        sha1,
+        rg_core::package_registry::MavenChecksum::Sha1.hex(&jar),
+        "the served checksum has to describe the bytes actually stored"
+    );
+
+    // Wagon uploads the same checksum right after the artifact. A correct one is
+    // accepted; a wrong one has to fail the deploy, which is the only reason to
+    // send a checksum at all.
+    let accepted = client
+        .put(layout("matrix-maven-1.0.0.jar.sha1"))
+        .bearer_auth(&token)
+        .body(sha1)
+        .send()
+        .await
+        .unwrap();
+    assert!(accepted.status().is_success(), "a matching checksum: {}", accepted.status());
+
+    let refused = client
+        .put(layout("matrix-maven-1.0.0.jar.sha1"))
+        .bearer_auth(&token)
+        .body("0000000000000000000000000000000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "a checksum that does not describe the stored bytes must fail the deploy"
+    );
+
+    // Maven finishes by uploading its own metadata document. The registry
+    // derives that answer from its rows, so it is accepted and not stored —
+    // refusing it would fail the deploy over a document nobody reads back.
+    let metadata = client
+        .put(format!(
+            "{base}/api/v1/repos/matrix-owner/matrix-repo/packages/maven/com/example/matrix-maven/maven-metadata.xml"
+        ))
+        .bearer_auth(&token)
+        .body("<metadata/>")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        metadata.status().is_success(),
+        "maven-metadata.xml upload answered {}",
+        metadata.status()
+    );
+
+    let derived = client
+        .get(format!(
+            "{base}/api/v1/repos/matrix-owner/matrix-repo/packages/maven/com/example/matrix-maven/maven-metadata.xml"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(derived.status(), StatusCode::OK);
+    let derived = derived.text().await.unwrap();
+    assert!(
+        derived.contains("<version>1.0.0</version>") && derived.contains("matrix-maven"),
+        "the served metadata is derived from the rows, not from the uploaded copy: {derived}"
+    );
+}

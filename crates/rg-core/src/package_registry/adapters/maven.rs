@@ -332,3 +332,71 @@ fn escape_xml(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+
+/// The digest algorithms a Maven checksum sidecar carries.
+///
+/// `mvn deploy` uploads `<artifact>.sha1` and `<artifact>.md5` next to each
+/// file, and a resolver fetches them back to verify what it downloaded. Neither
+/// is stored: a checksum is a claim about bytes the registry already holds, so
+/// it is verified on the way in and recomputed on the way out (card_11d8655a9cd8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MavenChecksum {
+    Sha1,
+    Md5,
+}
+
+impl MavenChecksum {
+    /// The lowercase hex digest of `data`, spelled the way Maven writes it.
+    pub fn hex(self, data: &[u8]) -> String {
+        use sha1::Digest as _;
+        match self {
+            Self::Sha1 => hex::encode(sha1::Sha1::digest(data)),
+            Self::Md5 => hex::encode(md5::Md5::digest(data)),
+        }
+    }
+
+    /// `matrix-1.0.0.jar.sha1` → the file it describes and the algorithm.
+    pub fn split_sidecar(filename: &str) -> Option<(&str, Self)> {
+        for (suffix, algorithm) in [(".sha1", Self::Sha1), (".md5", Self::Md5)] {
+            if let Some(target) = filename.strip_suffix(suffix) {
+                if !target.is_empty() {
+                    return Some((target, algorithm));
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::MavenChecksum;
+
+    #[test]
+    fn sidecars_are_split_off_the_file_they_describe() {
+        assert_eq!(
+            MavenChecksum::split_sidecar("matrix-1.0.0.jar.sha1"),
+            Some(("matrix-1.0.0.jar", MavenChecksum::Sha1))
+        );
+        assert_eq!(
+            MavenChecksum::split_sidecar("matrix-1.0.0.pom.md5"),
+            Some(("matrix-1.0.0.pom", MavenChecksum::Md5))
+        );
+        // An artifact is not a sidecar, and a bare suffix describes no file.
+        assert_eq!(MavenChecksum::split_sidecar("matrix-1.0.0.jar"), None);
+        assert_eq!(MavenChecksum::split_sidecar(".sha1"), None);
+    }
+
+    #[test]
+    fn digests_are_the_ones_maven_writes() {
+        // Known vectors for the empty input, so a swapped algorithm is visible.
+        assert_eq!(
+            MavenChecksum::Sha1.hex(b""),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert_eq!(
+            MavenChecksum::Md5.hex(b""),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+    }
+}
