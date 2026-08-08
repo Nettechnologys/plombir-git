@@ -13,6 +13,25 @@
 //! The import runs asynchronously and updates progress in the
 //! import_tasks database table.
 //!
+//! ## Imported content belongs to the account that imported it
+//!
+//! Every issue, comment, review and merge request this module writes is
+//! attributed to `task.user_id`. There is no mapping from a source-platform
+//! login to a local account, and the code no longer pretends otherwise: it used
+//! to walk the source's issues and PRs to collect logins, hand them to a
+//! `map_users` whose whole body was `mapping.entry(login).or_insert(task.user_id)`,
+//! and then look each author up in the constant map it had just built
+//! (card_dd6ae4f40206). The lookups that missed fell through to a hardcoded
+//! user id `1`, which is not "the admin" on any instance where account 1 was
+//! renamed, deleted, or never an admin to begin with.
+//!
+//! Attributing by name match is not the obvious fix it looks like. The source
+//! platform's `alice` and this instance's `alice` are unrelated accounts, so a
+//! name match would let anyone who can import a repository publish issues and
+//! reviews under a colleague's name. A real mapping needs the importer to state
+//! it — there is no API or UI to state one, so there is no mapping to store,
+//! and `import_tasks.user_mapping` is gone rather than left NULL forever.
+//!
 //! ## The source platform's access token
 //!
 //! The PAT the user hands us for the source platform lives in memory only, for
@@ -424,9 +443,6 @@ async fn run_github_import(
         .await?;
     }
 
-    // Build user mapping from all referenced users
-    let user_map = build_github_user_map(&client, &gh_owner, &gh_repo, task).await?;
-
     // Build milestone cache (existing in target repo + newly imported ones when enabled)
     let mut milestone_map = load_milestone_map(db, repo_id).await?;
 
@@ -485,7 +501,7 @@ async fn run_github_import(
                 &task.target_name,
                 issue,
                 &comments,
-                &user_map,
+                task.user_id,
                 &milestone_map,
                 label_map.as_ref(),
             )
@@ -524,7 +540,7 @@ async fn run_github_import(
                 pr,
                 &comments,
                 &reviews,
-                &user_map,
+                task.user_id,
                 &milestone_map,
             )
             .await?;
@@ -548,8 +564,7 @@ async fn run_github_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&gh_owner, &gh_repo).await?;
-        stats.releases_imported =
-            import_github_releases(db, repo_id, &releases, &user_map, repo_root).await?;
+        stats.releases_imported = import_github_releases(db, repo_id, &releases, repo_root).await?;
         update_stage(
             db,
             task.id,
@@ -680,9 +695,6 @@ async fn run_gitlab_import(
         .await?;
     }
 
-    // Build user map
-    let user_map = build_gitlab_user_map(&client, &project_path, task).await?;
-
     // Step 4: Issues
     if task.import_issues {
         update_stage(db, task.id, "importing", 35, "Importing issues...").await?;
@@ -698,7 +710,7 @@ async fn run_gitlab_import(
                 &task.target_name,
                 issue,
                 &notes,
-                &user_map,
+                task.user_id,
                 &milestone_map,
                 label_map.as_ref(),
             )
@@ -726,7 +738,7 @@ async fn run_gitlab_import(
 
         for (i, mr) in mrs.iter().enumerate() {
             let notes = client.list_mr_notes(&project_path, mr.iid).await?;
-            import_gitlab_mr(db, repo_id, mr, &notes, &user_map, &milestone_map).await?;
+            import_gitlab_mr(db, repo_id, mr, &notes, task.user_id, &milestone_map).await?;
             stats.prs_imported += 1;
             stats.issue_comments_imported += notes.len();
 
@@ -746,8 +758,7 @@ async fn run_gitlab_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&project_path).await?;
-        stats.releases_imported =
-            import_gitlab_releases(db, repo_id, &releases, &user_map, repo_root).await?;
+        stats.releases_imported = import_gitlab_releases(db, repo_id, &releases, repo_root).await?;
         update_stage(
             db,
             task.id,
@@ -1433,83 +1444,6 @@ fn parse_gitlab_url(url: &str) -> Result<String> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// User mapping
-// ═══════════════════════════════════════════════════════════════════════
-
-async fn build_github_user_map(
-    client: &GitHubClient,
-    owner: &str,
-    repo: &str,
-    task: &ImportTask,
-) -> Result<HashMap<String, i64>> {
-    let mut logins: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    if task.import_issues {
-        if let Ok(issues) = client.list_issues(owner, repo).await {
-            for issue in &issues {
-                if let Some(ref user) = issue.user {
-                    logins.insert(user.login.clone());
-                }
-                for a in &issue.assignees {
-                    logins.insert(a.login.clone());
-                }
-            }
-        }
-    }
-
-    if task.import_pull_requests {
-        if let Ok(prs) = client.list_pull_requests(owner, repo).await {
-            for pr in &prs {
-                if let Some(ref user) = pr.user {
-                    logins.insert(user.login.clone());
-                }
-            }
-        }
-    }
-
-    map_users(task, &logins)
-}
-
-async fn build_gitlab_user_map(
-    client: &GitLabClient,
-    project_id: &str,
-    task: &ImportTask,
-) -> Result<HashMap<String, i64>> {
-    let mut usernames: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    if let Ok(issues) = client.list_issues(project_id).await {
-        for issue in &issues {
-            if let Some(ref author) = issue.author {
-                usernames.insert(author.username.clone());
-            }
-        }
-    }
-
-    if let Ok(mrs) = client.list_merge_requests(project_id).await {
-        for mr in &mrs {
-            if let Some(ref author) = mr.author {
-                usernames.insert(author.username.clone());
-            }
-        }
-    }
-
-    map_users(task, &usernames)
-}
-
-/// Map external user logins/usernames to local ForgeKeep user IDs.
-/// Falls back to the importing user if no match is found.
-fn map_users(
-    task: &ImportTask,
-    external_users: &std::collections::HashSet<String>,
-) -> Result<HashMap<String, i64>> {
-    let mut mapping = HashMap::new();
-    for user in external_users {
-        mapping.entry(user.clone()).or_insert(task.user_id);
-    }
-    Ok(mapping)
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Date/time helpers
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1631,18 +1565,10 @@ async fn import_github_issue(
     _target_name: &str,
     issue: &GitHubIssue,
     comments: &[GitHubComment],
-    user_map: &HashMap<String, i64>,
+    author_id: i64,
     milestone_map: &HashMap<String, i64>,
     label_map: Option<&HashMap<String, i64>>,
 ) -> Result<()> {
-    // Resolve author
-    let author_id = issue
-        .user
-        .as_ref()
-        .and_then(|u| user_map.get(&u.login))
-        .copied()
-        .unwrap_or(1); // fallback to admin
-
     // Collect label names
     let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
     let label_ids = resolve_imported_label_ids(label_map, &label_names)?;
@@ -1683,17 +1609,10 @@ async fn import_github_issue(
 
     // Import comments
     for comment in comments {
-        let comment_author = comment
-            .user
-            .as_ref()
-            .and_then(|u| user_map.get(&u.login))
-            .copied()
-            .unwrap_or(author_id);
-
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
-            author_id: Set(comment_author),
+            author_id: Set(author_id),
             body: Set(comment.body.clone().unwrap_or_default()),
             created_at: Set(parse_datetime_or_now(&comment.created_at)),
             updated_at: Set(parse_datetime_or_now(&comment.updated_at)),
@@ -1713,16 +1632,9 @@ async fn import_github_pr(
     pr: &GitHubPR,
     comments: &[GitHubComment],
     reviews: &[GitHubReview],
-    user_map: &HashMap<String, i64>,
+    author_id: i64,
     milestone_map: &HashMap<String, i64>,
 ) -> Result<()> {
-    let author_id = pr
-        .user
-        .as_ref()
-        .and_then(|u| user_map.get(&u.login))
-        .copied()
-        .unwrap_or(1);
-
     let label_names: Vec<String> = pr.labels.iter().map(|l| l.name.clone()).collect();
     let labels_json = if label_names.is_empty() {
         None
@@ -1780,17 +1692,10 @@ async fn import_github_pr(
 
     // Import PR comments (general discussion)
     for comment in comments {
-        let comment_author = comment
-            .user
-            .as_ref()
-            .and_then(|u| user_map.get(&u.login))
-            .copied()
-            .unwrap_or(author_id);
-
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id), // issue_id is PR id in this context
-            author_id: Set(comment_author),
+            author_id: Set(author_id),
             body: Set(comment.body.clone().unwrap_or_default()),
             created_at: Set(parse_datetime_or_now(&comment.created_at)),
             updated_at: Set(parse_datetime_or_now(&comment.updated_at)),
@@ -1803,13 +1708,6 @@ async fn import_github_pr(
 
     // Import reviews
     for review in reviews {
-        let reviewer_id = review
-            .user
-            .as_ref()
-            .and_then(|u| user_map.get(&u.login))
-            .copied()
-            .unwrap_or(author_id);
-
         let action = match review.state.as_str() {
             "APPROVED" => "approve",
             "CHANGES_REQUESTED" => "request_changes",
@@ -1822,7 +1720,7 @@ async fn import_github_pr(
             id: sea_orm::NotSet,
             pr_id: Set(saved.id),
             repo_id: Set(repo_id),
-            reviewer_id: Set(reviewer_id),
+            reviewer_id: Set(author_id),
             action: Set(action.to_string()),
             body: Set(review.body.clone()),
             commit_id: Set(None),
@@ -1843,7 +1741,6 @@ async fn import_github_releases(
     db: &DatabaseConnection,
     repo_id: i64,
     releases: &[GitHubRelease],
-    _user_map: &HashMap<String, i64>,
     repo_root: &Path,
 ) -> Result<usize> {
     let mut count = 0;
@@ -1984,17 +1881,10 @@ async fn import_gitlab_issue(
     _target_name: &str,
     issue: &GitLabIssue,
     notes: &[GitLabNote],
-    user_map: &HashMap<String, i64>,
+    author_id: i64,
     milestone_map: &HashMap<String, i64>,
     label_map: Option<&HashMap<String, i64>>,
 ) -> Result<()> {
-    let author_id = issue
-        .author
-        .as_ref()
-        .and_then(|a| user_map.get(&a.username))
-        .copied()
-        .unwrap_or(1);
-
     // GitLab labels are plain strings.
     let label_ids = resolve_imported_label_ids(label_map, &issue.labels)?;
 
@@ -2034,17 +1924,10 @@ async fn import_gitlab_issue(
         if note.system {
             continue;
         }
-        let note_author = note
-            .author
-            .as_ref()
-            .and_then(|a| user_map.get(&a.username))
-            .copied()
-            .unwrap_or(author_id);
-
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
-            author_id: Set(note_author),
+            author_id: Set(author_id),
             body: Set(note.body.clone().unwrap_or_default()),
             created_at: Set(parse_datetime_or_now(&note.created_at)),
             updated_at: Set(parse_datetime_or_now(&note.updated_at)),
@@ -2063,16 +1946,9 @@ async fn import_gitlab_mr(
     repo_id: i64,
     mr: &GitLabMR,
     notes: &[GitLabNote],
-    user_map: &HashMap<String, i64>,
+    author_id: i64,
     milestone_map: &HashMap<String, i64>,
 ) -> Result<()> {
-    let author_id = mr
-        .author
-        .as_ref()
-        .and_then(|a| user_map.get(&a.username))
-        .copied()
-        .unwrap_or(1);
-
     let labels_json = if mr.labels.is_empty() {
         None
     } else {
@@ -2132,17 +2008,10 @@ async fn import_gitlab_mr(
         if note.system {
             continue;
         }
-        let note_author = note
-            .author
-            .as_ref()
-            .and_then(|a| user_map.get(&a.username))
-            .copied()
-            .unwrap_or(author_id);
-
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
-            author_id: Set(note_author),
+            author_id: Set(author_id),
             body: Set(note.body.clone().unwrap_or_default()),
             created_at: Set(parse_datetime_or_now(&note.created_at)),
             updated_at: Set(parse_datetime_or_now(&note.updated_at)),
@@ -2160,7 +2029,6 @@ async fn import_gitlab_releases(
     db: &DatabaseConnection,
     repo_id: i64,
     releases: &[GitLabRelease],
-    _user_map: &HashMap<String, i64>,
     repo_root: &Path,
 ) -> Result<usize> {
     let mut count = 0;
@@ -2297,7 +2165,6 @@ pub async fn start_import(
         progress: Set(0),
         stage: Set(None),
         error: Set(None),
-        user_mapping: Set(None),
         import_repo: Set(import_repo),
         import_issues: Set(supports_metadata && import_issues),
         import_pull_requests: Set(supports_metadata && import_pull_requests),
@@ -2427,6 +2294,10 @@ mod imported_issue_label_tests {
     use rg_db::ops::{issue_label_ops, issue_ops};
     use sea_orm::{ConnectionTrait, Database, Statement};
 
+    /// The account these fixtures import as. Imported content is attributed to
+    /// the importer and to nobody else — see the module docs.
+    const IMPORTER_ID: i64 = 1;
+
     async fn test_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -2464,6 +2335,16 @@ mod imported_issue_label_tests {
         )
         .await
         .unwrap()
+    }
+
+    fn github_user(id: i64, login: &str) -> crate::import::github_client::GitHubUser {
+        crate::import::github_client::GitHubUser {
+            id,
+            login: login.to_string(),
+            email: None,
+            avatar_url: None,
+            user_type: None,
+        }
     }
 
     fn github_issue(label: GitHubLabel) -> GitHubIssue {
@@ -2504,6 +2385,114 @@ mod imported_issue_label_tests {
         }
     }
 
+    /// card_dd6ae4f40206: imported content belongs to the account that
+    /// imported it, and to that account only.
+    ///
+    /// What this replaces was worse than a missing feature. The author was
+    /// looked up in a "user map" built by `map_users`, whose entire body was
+    /// `mapping.entry(login).or_insert(task.user_id)` — so every login resolved
+    /// to the importer anyway — and a login the walk had not collected fell
+    /// through to a hardcoded `1`. On an instance where account 1 is not an
+    /// admin, or not the importer, or has been deleted, that is an issue filed
+    /// under a name that never wrote it.
+    #[tokio::test]
+    async fn imported_issues_and_their_comments_belong_to_the_importer() {
+        let db = test_db().await;
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(7, 'second', 'second@example.com', 'x', 0, 1, '2024-01-01', '2024-01-01')"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // The payload names a source-platform author, and it is *not* the
+        // importer. Nothing about that login may reach the stored rows.
+        let mut issue = github_issue(GitHubLabel {
+            id: 10,
+            name: "bug".to_string(),
+            color: "ee0701".to_string(),
+            description: None,
+        });
+        issue.user = Some(github_user(999, "importer"));
+
+        let comments = vec![GitHubComment {
+            id: 1,
+            body: Some("from somebody else entirely".to_string()),
+            user: Some(github_user(1000, "stranger")),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }];
+
+        import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &issue,
+            &comments,
+            7,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let imported = issue_ops::find_by_repo_and_number(&db, 1, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            imported.author_id, 7,
+            "the issue belongs to the account that ran the import, not to a \
+             login that merely matches one"
+        );
+
+        let stored_comments = rg_db::ops::issue_comment_ops::list_by_issue(&db, imported.id)
+            .await
+            .unwrap();
+        assert_eq!(stored_comments.len(), 1);
+        assert_eq!(
+            stored_comments[0].author_id, 7,
+            "a comment must not fall through to user id 1 either"
+        );
+    }
+
+    /// The source's issues and merge requests are listed **once**, by the step
+    /// that imports them.
+    ///
+    /// A second listing call is exactly how this went wrong: `build_github_user_map`
+    /// and `build_gitlab_user_map` walked those lists before the import steps to
+    /// collect logins for a map that was a constant. The GitLab one did it with
+    /// no flag at all, so importing nothing but labels paginated the whole
+    /// issue list of the source project and spent its rate limit on it.
+    ///
+    /// A count rather than a block-structure check on purpose: the defect's
+    /// shape is an *extra* call site, and a count says so without pretending to
+    /// parse Rust with a line scanner.
+    #[test]
+    fn the_source_issue_and_merge_request_lists_are_fetched_once() {
+        let source = include_str!("service.rs");
+        // Built rather than written out, so this test's own text is not one of
+        // the call sites it counts.
+        for (method, expected, step) in [
+            ("list_issues", 2, "one GitHub step and one GitLab step"),
+            ("list_pull_requests", 1, "the GitHub step"),
+            ("list_merge_requests", 1, "the GitLab step"),
+        ] {
+            let needle = format!("client.{method}(");
+            let calls = source.matches(needle.as_str()).count();
+            assert_eq!(
+                calls, expected,
+                "{needle} appears {calls} times; it belongs to {step} and nowhere else. \
+                 Listing the source's issues or merge requests outside the step that imports \
+                 them is how a label-only import came to paginate the entire issue list of the \
+                 source project."
+            );
+        }
+    }
+
     /// Both platform paths must populate the store read by label filtering and
     /// by `GET /issues/{number}/labels`, not a response-only copy.
     #[tokio::test]
@@ -2512,7 +2501,6 @@ mod imported_issue_label_tests {
         let bug = create_label(&db, 10, "bug").await;
         let triage = create_label(&db, 11, "triage").await;
         let label_map = load_label_map(&db, 1).await.unwrap();
-        let empty_users = HashMap::new();
         let empty_milestones = HashMap::new();
 
         import_github_issue(
@@ -2527,7 +2515,7 @@ mod imported_issue_label_tests {
                 description: None,
             }),
             &[],
-            &empty_users,
+            IMPORTER_ID,
             &empty_milestones,
             Some(&label_map),
         )
@@ -2540,7 +2528,7 @@ mod imported_issue_label_tests {
             "imported",
             &gitlab_issue(&triage.name),
             &[],
-            &empty_users,
+            IMPORTER_ID,
             &empty_milestones,
             Some(&label_map),
         )
@@ -2584,7 +2572,7 @@ mod imported_issue_label_tests {
                 description: None,
             }),
             &[],
-            &HashMap::new(),
+            IMPORTER_ID,
             &HashMap::new(),
             None,
         )
@@ -2693,7 +2681,6 @@ mod import_target_lifecycle_tests {
                 progress: Set(0),
                 stage: Set(None),
                 error: Set(None),
-                user_mapping: Set(None),
                 import_repo: Set(true),
                 import_issues: Set(false),
                 import_pull_requests: Set(false),
@@ -2959,7 +2946,6 @@ mod clone_effect_tests {
                 progress: Set(0),
                 stage: Set(None),
                 error: Set(None),
-                user_mapping: Set(None),
                 import_repo: Set(true),
                 import_issues: Set(false),
                 import_pull_requests: Set(false),

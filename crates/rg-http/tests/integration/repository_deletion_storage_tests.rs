@@ -700,7 +700,6 @@ async fn seed_running_import(
             progress: sea_orm::ActiveValue::Set(0),
             stage: sea_orm::ActiveValue::Set(None),
             error: sea_orm::ActiveValue::Set(None),
-            user_mapping: sea_orm::ActiveValue::Set(None),
             import_repo: sea_orm::ActiveValue::Set(true),
             import_issues: sea_orm::ActiveValue::Set(false),
             import_pull_requests: sea_orm::ActiveValue::Set(false),

@@ -242,7 +242,6 @@ mod tests {
             progress: Set(0),
             stage: Set(None),
             error: Set(None),
-            user_mapping: Set(None),
             import_repo: Set(true),
             import_issues: Set(false),
             import_pull_requests: Set(false),

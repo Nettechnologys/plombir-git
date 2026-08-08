@@ -47,8 +47,6 @@ pub struct Model {
     pub stage: Option<String>,
     /// Error message if status is "failed"
     pub error: Option<String>,
-    /// JSON mapping of external user logins to local user IDs
-    pub user_mapping: Option<String>,
     pub import_repo: bool,
     pub import_issues: bool,
     pub import_pull_requests: bool,
