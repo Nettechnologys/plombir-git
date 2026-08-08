@@ -94,9 +94,21 @@ inhibit_rules:
       service: 'forgekeep'
     equal: ['service']
 
-  # If a specific route is slow, suppress generic "high latency" alerts
-  - source_match:
-      severity: 'critical'
-    target_match:
-      severity: 'warning'
+  # If a route is already paging, its own warnings on that route add nothing.
+  #
+  # Both sides require the `route` label to be present. `equal` compares label
+  # VALUES, and a missing label is the empty string — so two alerts that both
+  # lack `route` compared equal, and every route-less critical (currently
+  # `HighGitOperationFailure`) suppressed every route-less warning. Measured on
+  # Alertmanager v0.27.0 with this config: one 5xx spike on the Git handlers hid
+  # `LowDiskSpace`, `HighMemoryUsage` and `CIJobQueueBuildup` for as long as it
+  # burned (card_2206bf4038e7). Only `HighErrorRate` and `SlowRequestDuration`
+  # carry a route at all — they come from `by (route)` aggregations in
+  # deploy/prometheus/alerts.yml — and they are exactly the pair this is for.
+  - source_matchers:
+      - 'severity = "critical"'
+      - 'route != ""'
+    target_matchers:
+      - 'severity = "warning"'
+      - 'route != ""'
     equal: ['service', 'route']

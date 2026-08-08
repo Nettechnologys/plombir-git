@@ -275,6 +275,9 @@ if (rules.length === 0) {
   );
 }
 
+/** Every parsed alert, keyed by name: its static labels and its expression. */
+const alertsByName = new Map();
+
 for (const [, , name, body] of rules) {
   const expr = body.match(/\bexpr:\s*(\|[-+]?\s*\n([\s\S]*?)(?=^\s*(?:for|labels|annotations):)|(.+))/m);
   if (!expr) {
@@ -282,6 +285,15 @@ for (const [, , name, body] of rules) {
     continue;
   }
   const expression = expr[2] ?? expr[3];
+
+  // `labels:` up to the next key at the same level — the static labels every
+  // instance of this alert carries, as opposed to the ones its expr retains.
+  const staticLabels = new Map();
+  const labelBlock = body.match(/^([ \t]*)labels:\s*\n([\s\S]*?)(?=^\1\w|(?![\s\S]))/m);
+  for (const [, key, value] of (labelBlock?.[2] ?? '').matchAll(/^[ \t]+([a-z_][a-z0-9_]*):\s*(\S.*?)\s*$/gm)) {
+    staticLabels.set(key, value.replace(/^['"]|['"]$/g, ''));
+  }
+  alertsByName.set(name, { staticLabels, expression });
   alertReferences += checkExpression(expression, `alerts.yml: ${name}`);
 
   // An annotation interpolating `$labels.x` is a promise that x is on the
@@ -304,6 +316,186 @@ if (alertReferences < MIN_ALERT_REFERENCES) {
     `Only ${alertReferences} ForgeKeep metric references found in alerts.yml ` +
       `(floor ${MIN_ALERT_REFERENCES}) — the rule parse has stopped reading the file`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Alertmanager inhibition rules.
+// ---------------------------------------------------------------------------
+//
+// An `equal:` list is the one place in the observability stack where a label
+// that is *absent* silently means something. Alertmanager compares label
+// VALUES, and a missing label is the empty string — so two alerts that both
+// lack the label compare equal and the rule matches them. A rule written for
+// one pair of route-scoped alerts therefore also fires between every pair of
+// alerts that has nothing to do with routes.
+//
+// That is not a syntax error, so `amtool check-config` (the `observability-
+// config` job) accepts it, and it is not visible in the rule either: it takes
+// the alert definitions to see which labels can be absent. Measured on
+// Alertmanager v0.27.0 with the config in this repository: `HighGitOperation-
+// Failure` suppressed `LowDiskSpace`, `HighMemoryUsage` and `CIJobQueueBuildup`
+// while it burned (card_2206bf4038e7).
+//
+// So the rule asserted here is: every label named in `equal:` must be carried
+// by every alert that can match the source, and by every alert that can match
+// the target.
+
+const alertmanagerPath = path.join(root, 'deploy/alertmanager/alertmanager.yml');
+const alertmanager = readFileSync(alertmanagerPath, 'utf8');
+
+/**
+ * Whether an alert carries `label` on every instance it can produce.
+ *
+ * Three ways to have it, and the third is what makes the answer useful here:
+ * a static `labels:` entry, a target label Prometheus attaches to everything,
+ * or a series the expression reads that the exporter emits with that label and
+ * whose aggregations do not drop it. Asking only "does the expression retain
+ * it" would answer yes for every raw-vector alert — the operator retains all
+ * labels, including ones the metric never had.
+ *
+ * Foreign metrics keep their benefit of the doubt, the same way section 3 does:
+ * we cannot know what somebody else's exporter emits, and claiming a label is
+ * absent there would be a fabricated failure.
+ */
+// Labels Prometheus attaches to every scraped series. `alertname` and
+// `severity` live in `targetLabels` because an expression may legitimately
+// reference them, but on an alert they come from the rule's own `labels:`
+// block — treating them as always-present would make every alert look like it
+// carries a severity it never declared.
+const ATTACHED_LABELS = new Set([...targetLabels].filter((label) => label !== 'alertname' && label !== 'severity'));
+
+function alertCarriesLabel(alert, label) {
+  if (alert.staticLabels.has(label) || ATTACHED_LABELS.has(label)) return true;
+  if (!alertExpressionKeepsLabel(alert.expression, label)) return false;
+
+  const references = metricReferences(alert.expression);
+  if (references.length === 0) return false;
+  return references.some(({ metric }) => {
+    if (FOREIGN_METRIC.test(metric)) return true;
+    const suffix = metric.match(/_(bucket|sum|count)$/)?.[1];
+    const base = suffix ? metric.slice(0, -(suffix.length + 1)) : metric;
+    return exported.get(base)?.labels.has(label) ?? false;
+  });
+}
+
+/**
+ * Label constraints of one side of an inhibit rule.
+ *
+ * Both the legacy `*_match` / `*_match_re` maps and the current `*_matchers`
+ * list are read, because the file has historically mixed them. A constraint is
+ * recorded as `{ value, requiresPresence }`: `route != ""` requires the label
+ * to exist without pinning a value, which is exactly the shape that fixes the
+ * defect above and must not read as "no constraint".
+ */
+function sideConstraints(rule, side) {
+  const constraints = new Map();
+
+  for (const key of [`${side}_match`, `${side}_match_re`]) {
+    const block = rule.match(new RegExp(`^([ \\t]*)${key}:\\s*\\n([\\s\\S]*?)(?=^\\1\\w|(?![\\s\\S]))`, 'm'));
+    for (const [, label, raw] of (block?.[2] ?? '').matchAll(/^[ \t]+([a-z_][a-z0-9_]*):\s*(\S.*?)\s*$/gm)) {
+      const value = raw.replace(/^['"]|['"]$/g, '');
+      constraints.set(label, { value, regex: key.endsWith('_re'), negated: false, requiresPresence: value !== '' });
+    }
+  }
+
+  const matchers = rule.match(new RegExp(`^([ \\t]*)${side}_matchers:\\s*\\n([\\s\\S]*?)(?=^\\1\\w|(?![\\s\\S]))`, 'm'));
+  for (const [, raw] of (matchers?.[2] ?? '').matchAll(/^[ \t]+-\s*(\S.*?)\s*$/gm)) {
+    const matcher = raw.replace(/^['"]|['"]$/g, '');
+    const parsed = matcher.match(/^([a-z_][a-z0-9_]*)\s*(=~|!~|!=|=)\s*"((?:[^"\\]|\\.)*)"$/);
+    if (!parsed) {
+      failures.push(`alertmanager.yml: ${side}_matchers entry ${JSON.stringify(matcher)} is not a matcher this check can read`);
+      continue;
+    }
+    const [, label, operator, value] = parsed;
+    // `label = "x"` and `label =~ "x"` require the label; so does `label != ""`,
+    // which is the idiomatic "must be present". `label != "x"` does not.
+    const negated = operator.startsWith('!');
+    const requiresPresence = negated ? value === '' : value !== '';
+    constraints.set(label, { value, regex: operator.includes('~'), negated, requiresPresence });
+  }
+
+  return constraints;
+}
+
+/**
+ * The alerts whose declared labels can satisfy every constraint of one side.
+ *
+ * Values are only compared where the alert fixes one — its `alertname` and its
+ * static `labels:`. A label an alert gains from the series it reads has a value
+ * this check cannot know, so such an alert stays a candidate rather than being
+ * excluded by a guess; presence is still decided, which is the part `equal:`
+ * turns on.
+ */
+function alertsMatching(constraints) {
+  return [...alertsByName].filter(([name, alert]) => {
+    for (const [label, { value, regex, negated, requiresPresence }] of constraints) {
+      const present = alertCarriesLabel(alert, label);
+      if (requiresPresence && !present) return false;
+
+      const fixed = label === 'alertname' ? name : alert.staticLabels.get(label);
+      // Absent means the empty string to Alertmanager; dynamic means unknown.
+      if (fixed === undefined && present) continue;
+      const declared = fixed ?? '';
+      const hit = regex ? new RegExp(`^(?:${value})$`).test(declared) : declared === value;
+      if (negated ? hit : !hit) return false;
+    }
+    return true;
+  });
+}
+
+const inhibitBlock = alertmanager.match(/^inhibit_rules:\s*\n([\s\S]*?)(?=^\S|(?![\s\S]))/m);
+if (!inhibitBlock) {
+  failures.push('alertmanager.yml has no inhibit_rules: block — the config form changed, fix this check');
+}
+
+// The `- ` of the first key is rewritten to plain indentation so every key of a
+// rule sits at the same column. Without that the first key reads as
+// column-zero and the "block ends at the next key" lookaheads below swallow the
+// rest of the rule — the check would then compare the wrong side's matchers.
+const inhibitRules = [...(inhibitBlock?.[1] ?? '').matchAll(/^ {2}- [\s\S]*?(?=^ {2}- |(?![\s\S]))/gm)].map((match) =>
+  match[0].replace(/^ {2}- /, '    '),
+);
+// Fail-closed: a parse that understands nothing would assert nothing.
+if (inhibitBlock && inhibitRules.length < 2) {
+  failures.push(
+    `Only ${inhibitRules.length} inhibit rule(s) parsed out of alertmanager.yml — the list form changed, ` +
+      'fix this check rather than letting it pass over rules it cannot read',
+  );
+}
+
+for (const [index, rule] of inhibitRules.entries()) {
+  const equalList = rule.match(/^[ \t]*equal:\s*\[([^\]]*)\]/m)?.[1]
+    ?? rule.match(/^([ \t]*)equal:\s*\n([\s\S]*?)(?=^\1\w|(?![\s\S]))/m)?.[2];
+  if (equalList === undefined) continue; // a rule without `equal` has no trap to spring
+
+  const equal = [...equalList.matchAll(/['"]?([a-z_][a-z0-9_]*)['"]?/g)].map((m) => m[1]);
+  const where = `alertmanager.yml: inhibit rule #${index + 1}`;
+  if (equal.length === 0) {
+    failures.push(`${where} has an empty equal: list this check cannot read`);
+    continue;
+  }
+
+  for (const side of ['source', 'target']) {
+    const matching = alertsMatching(sideConstraints(rule, side));
+    if (matching.length === 0) {
+      failures.push(
+        `${where}: no alert in alerts.yml can match its ${side} — the rule is either dead or its ` +
+          'matchers name something the rules no longer declare',
+      );
+      continue;
+    }
+    for (const label of equal) {
+      for (const [name, alert] of matching) {
+        if (alertCarriesLabel(alert, label)) continue;
+        failures.push(
+          `${where} equals on \`${label}\`, but ${name} matches its ${side} without carrying that ` +
+            'label. Alertmanager compares label values and reads an absent label as the empty ' +
+            `string, so this rule also fires between every pair of alerts that has no \`${label}\` ` +
+            '— constrain the side to alerts that carry it, or drop it from equal:.',
+        );
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
