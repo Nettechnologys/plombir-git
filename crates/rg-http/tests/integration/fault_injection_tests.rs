@@ -525,7 +525,10 @@ async fn a_second_put_of_the_same_manifest_digest_is_idempotent() {
         .count(&app.db)
         .await
         .unwrap();
-    assert_eq!(blobs, 1, "the retry created a second row for the same layer");
+    assert_eq!(
+        blobs, 1,
+        "the retry created a second row for the same layer"
+    );
 }
 
 /// Two concurrent PUTs of one manifest digest both succeed, and the second one
@@ -1114,10 +1117,11 @@ async fn a_manifest_naming_an_absent_blob_fails_the_push() {
     // writer with a missing row — except by losing the race between that check
     // and the transaction, which is precisely the state the tagged half above
     // simulates and which this writer used to commit without noticing.
-    let forgekeep_repo = rg_core::repo::service::find_repo_by_owner_name(&db, "fault_ref", "lost-ref")
-        .await
-        .unwrap()
-        .unwrap();
+    let forgekeep_repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "fault_ref", "lost-ref")
+            .await
+            .unwrap()
+            .unwrap();
     let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
         .await
         .unwrap()

@@ -630,7 +630,8 @@ async fn ensure_merge_group_ci(
     // commit while the old run is still marked active on it.
     let rebuilt = entry.merge_group_sha.as_deref() != Some(group_sha.as_str());
     if rebuilt && entry.merge_group_pipeline_id.is_some() {
-        release_merge_group_pipeline(db, entry, "the merge group was rebuilt on a newer head").await;
+        release_merge_group_pipeline(db, entry, "the merge group was rebuilt on a newer head")
+            .await;
         // Stop the row naming a pipeline that has just been canceled. If the
         // trigger below fails, the next pass rebuilds from nothing rather than
         // adopting a dead run.

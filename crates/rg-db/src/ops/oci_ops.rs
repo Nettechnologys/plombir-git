@@ -594,7 +594,10 @@ pub async fn list_expired_uploads(
         // reported: the repository deletion already retired the whole
         // `oci-uploads/{owner}/{repo}` directory, chunks in flight included,
         // so there is no path left to build and nothing left to remove.
-        if let Some(repository) = OciRepo::find_by_id(upload.oci_repository_id).one(db).await? {
+        if let Some(repository) = OciRepo::find_by_id(upload.oci_repository_id)
+            .one(db)
+            .await?
+        {
             rows.push((upload, repository));
         }
     }

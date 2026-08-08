@@ -112,7 +112,10 @@ impl QueueFixture {
                 .unwrap();
         }
         std::fs::write(worktree_path.join("value.txt"), "feature\n").unwrap();
-        for args in [vec!["commit", "-am", "feature"], vec!["push", "origin", "feature"]] {
+        for args in [
+            vec!["commit", "-am", "feature"],
+            vec!["push", "origin", "feature"],
+        ] {
             git.run(&args, Some(&worktree_path))
                 .unwrap()
                 .ensure_success()

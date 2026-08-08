@@ -1898,7 +1898,11 @@ mod tests {
         let oid = "0123456789abcdef0123456789abcdef01234567";
         std::fs::create_dir_all(repo_path.join("refs/heads")).unwrap();
         for branch in ["main", "release"] {
-            std::fs::write(repo_path.join("refs/heads").join(branch), format!("{oid}\n")).unwrap();
+            std::fs::write(
+                repo_path.join("refs/heads").join(branch),
+                format!("{oid}\n"),
+            )
+            .unwrap();
         }
         std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/release\n").unwrap();
 

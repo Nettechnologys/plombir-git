@@ -15,13 +15,7 @@ use crate::common::{create_repo, register_full, spawn_test_app_with_state};
 
 /// Start a blob upload and send one chunk, leaving a session with real bytes
 /// staged behind it — the state an interrupted push leaves.
-async fn start_a_push(
-    base: &str,
-    token: &str,
-    owner: &str,
-    repo: &str,
-    payload: &[u8],
-) -> String {
+async fn start_a_push(base: &str, token: &str, owner: &str, repo: &str, payload: &[u8]) -> String {
     let client = reqwest::Client::new();
     let start = client
         .post(format!("{base}/v2/{owner}/{repo}/blobs/uploads/"))
@@ -62,7 +56,9 @@ async fn an_expired_upload_session_loses_its_row_and_its_staged_chunks() {
     let abandoned = start_a_push(&base, &token, "oci_ttl", "leaky", b"abandoned layer").await;
     let live = start_a_push(&base, &token, "oci_ttl", "leaky", b"a push still going").await;
 
-    let abandoned_file = state.oci_storage.upload_file("oci_ttl", "leaky", &abandoned);
+    let abandoned_file = state
+        .oci_storage
+        .upload_file("oci_ttl", "leaky", &abandoned);
     let live_file = state.oci_storage.upload_file("oci_ttl", "leaky", &live);
     assert!(
         abandoned_file.is_file() && live_file.is_file(),

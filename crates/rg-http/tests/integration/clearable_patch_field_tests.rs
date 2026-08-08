@@ -77,7 +77,8 @@ async fn an_issue_assignee_is_set_cleared_by_null_and_untouched_by_absence() {
 async fn an_admin_clears_a_display_name_with_null_and_not_by_omission() {
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
-    let (admin_token, admin_id) = register_full(&base, "clearadmin", "clearadmin@example.com").await;
+    let (admin_token, admin_id) =
+        register_full(&base, "clearadmin", "clearadmin@example.com").await;
     let (_, target_id) = register_full(&base, "cleartarget", "cleartarget@example.com").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
@@ -131,15 +132,18 @@ async fn an_issue_milestone_is_set_cleared_by_null_and_untouched_by_absence() {
     create_repo(&base, &token, "milestoned").await;
 
     let milestone = client
-        .post(format!(
-            "{base}/api/v1/repos/msowner/milestoned/milestones"
-        ))
+        .post(format!("{base}/api/v1/repos/msowner/milestoned/milestones"))
         .bearer_auth(&token)
         .json(&serde_json::json!({"title": "v1"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(milestone.status(), 201, "{}", milestone.text().await.unwrap());
+    assert_eq!(
+        milestone.status(),
+        201,
+        "{}",
+        milestone.text().await.unwrap()
+    );
     let milestone_id = milestone.json::<serde_json::Value>().await.unwrap()["id"]
         .as_i64()
         .unwrap();
@@ -329,9 +333,7 @@ async fn a_board_card_is_detached_from_its_issue_by_null_only() {
     let card_body = card.json::<serde_json::Value>().await.unwrap();
     let card_id = card_body["id"].as_i64().unwrap();
     assert_eq!(card_body["issue_id"], issue_id);
-    let url = format!(
-        "{base}/api/v1/repos/boardowner/boarded/boards/{board_id}/cards/{card_id}"
-    );
+    let url = format!("{base}/api/v1/repos/boardowner/boarded/boards/{board_id}/cards/{card_id}");
 
     let patch = |body: serde_json::Value| {
         let client = client.clone();
