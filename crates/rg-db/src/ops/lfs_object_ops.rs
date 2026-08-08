@@ -164,19 +164,3 @@ pub async fn update_compression(
         .context("db: update LFS object compression")?;
     Ok(())
 }
-
-/// List uncompressed LFS objects (for lazy compression).
-pub async fn list_uncompressed(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    limit: u64,
-) -> Result<Vec<LfsObject>> {
-    LfsEntity::find()
-        .filter(lfs_object::Column::RepoId.eq(repo_id))
-        .filter(lfs_object::Column::Compression.is_null())
-        .filter(lfs_object::Column::Uploaded.eq(true))
-        .limit(limit)
-        .all(db)
-        .await
-        .context("db: list uncompressed LFS objects")
-}
