@@ -22,15 +22,7 @@ const ENCRYPTION_KEY: &str = "test-encryption-key-for-mirror-race";
 /// A migrated database with more than one pooled connection, so concurrent
 /// tasks really do run their statements against separate connections.
 async fn setup(directory: &std::path::Path) -> (sea_orm::DatabaseConnection, i64) {
-    let db = rg_db::connect_with_pool(
-        &format!("sqlite://{}?mode=rwc", directory.join("test.db").display()),
-        rg_db::TEST_CONNECT_TIMEOUT_SECS,
-        60,
-        4,
-    )
-    .await
-    .expect("connect sqlite");
-    rg_db::run_migrations(&db).await.expect("run migrations");
+    let db = crate::common::migrated_sqlite(&directory.join("test.db"), 4).await;
 
     let owner = rg_db::ops::user_ops::create_user(&db, "mirrorer", "m@example.invalid", "", "M")
         .await

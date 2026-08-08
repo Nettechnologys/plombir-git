@@ -760,6 +760,16 @@ pub async fn create_milestone(
     Json(body): Json<CreateMilestoneRequest>,
 ) -> impl IntoResponse {
     let now = chrono::Utc::now();
+    // A state the listing cannot filter on makes the milestone unreachable:
+    // `list_by_repo` compares `state` for equality, so `clsoed` answered `201`
+    // and produced a row that shows up under neither tab (card_09b2665584ed).
+    let milestone_state = match body.state.as_deref() {
+        None => rg_core::issue::MilestoneState::Open,
+        Some(state) => match rg_core::issue::MilestoneState::parse(state) {
+            Ok(state) => state,
+            Err(error) => return AppError::from(error).into_response(),
+        },
+    };
     let due_date = body
         .due_date
         .as_deref()
@@ -770,7 +780,7 @@ pub async fn create_milestone(
         repo_id: sea_orm::Set(repo.id),
         title: sea_orm::Set(body.title),
         description: sea_orm::Set(body.description),
-        state: sea_orm::Set(body.state.unwrap_or_else(|| "open".to_string())),
+        state: sea_orm::Set(milestone_state.as_str().to_string()),
         due_date: sea_orm::Set(due_date),
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
@@ -859,8 +869,13 @@ pub async fn update_milestone(
         active.description = sea_orm::Set(d);
     }
     if let Some(s) = body.state {
-        if s == "open" || s == "closed" {
-            active.state = sea_orm::Set(s);
+        // There used to be no `else` here: an unrecognised state was dropped on
+        // the floor and the response carried the milestone in its old state
+        // under a `200 OK`. Validation without a reaction to its own failure is
+        // the same silent no-op one step earlier (card_09b2665584ed).
+        match rg_core::issue::MilestoneState::parse(&s) {
+            Ok(state) => active.state = sea_orm::Set(state.as_str().to_string()),
+            Err(error) => return AppError::from(error).into_response(),
         }
     }
     if let Some(d) = body.due_date {

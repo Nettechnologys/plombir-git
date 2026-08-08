@@ -97,13 +97,20 @@ pub async fn trigger_pull_request_ci(
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
 
     let ref_name = pull_request_ref(pr);
-    if !ci.trigger.has_workflow_for_event(
-        &repo_path,
-        head_sha,
-        PULL_REQUEST_EVENT,
-        &ref_name,
-        Some(&pr.base_branch),
-    ) {
+    if !ci
+        .trigger
+        .has_workflow_for_event(crate::ci::WorkflowEventQuery {
+            repo_path: &repo_path,
+            commit_sha: head_sha,
+            event: PULL_REQUEST_EVENT,
+            ref_name: &ref_name,
+            base_branch: Some(&pr.base_branch),
+            // A PR trigger has no "previous revision of this ref" to hand over:
+            // the event is about the PR's head, and a path filter falls back to
+            // that commit's own diff.
+            previous_sha: None,
+        })
+    {
         return Ok(None);
     }
 
@@ -119,6 +126,7 @@ pub async fn trigger_pull_request_ci(
             // The `branches:` filter of `on: pull_request` applies to the branch
             // the PR targets, which nothing but this call knows.
             base_branch: Some(&pr.base_branch),
+            previous_sha: None,
             triggered_by: actor_id,
             docker_enabled: ci.docker_enabled,
             external_runners: ci.external_runners,

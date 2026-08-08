@@ -533,15 +533,10 @@ pub async fn check_stage_jobs(db: &DatabaseConnection, stage_id: i64) -> Result<
     if jobs.is_empty() {
         return Ok((true, false));
     }
-    let all_done = jobs.iter().all(|j| {
-        matches!(
-            j.status.as_str(),
-            "success" | "failure" | "failed" | "error" | "skipped"
-        )
-    });
-    let any_failure = jobs.iter().any(|j| {
-        (j.status == "failure" || j.status == "error" || j.status == "failed") && !j.allow_failure
-    });
+    let all_done = jobs.iter().all(|j| is_finished_pipeline_work(&j.status));
+    let any_failure = jobs
+        .iter()
+        .any(|j| is_unsuccessful_outcome(&j.status) && !j.allow_failure);
     Ok((all_done, any_failure))
 }
 
@@ -559,12 +554,7 @@ pub async fn try_pause_stage_at_manual(db: &DatabaseConnection, stage_id: i64) -
     let automatic_done = jobs
         .iter()
         .filter(|job| !matches!(job.status.as_str(), "manual" | "waiting_approval"))
-        .all(|job| {
-            matches!(
-                job.status.as_str(),
-                "success" | "failure" | "failed" | "error" | "skipped" | "canceled"
-            )
-        });
+        .all(|job| is_finished_pipeline_work(&job.status));
     let Some(gate_status) = gate_status else {
         return Ok(false);
     };
@@ -624,17 +614,11 @@ async fn skip_downstream_stages(db: &DatabaseConnection, failed_stage_id: i64) -
             continue;
         }
         for job in jobs {
-            if !matches!(
-                job.status.as_str(),
-                "success" | "failure" | "failed" | "error" | "skipped" | "canceled"
-            ) {
+            if !is_finished_pipeline_work(&job.status) {
                 update_job_result(db, job.id, "skipped", None, None, None, now).await?;
             }
         }
-        if !matches!(
-            stage.status.as_str(),
-            "success" | "failure" | "failed" | "error" | "skipped" | "canceled"
-        ) {
+        if !is_finished_pipeline_work(&stage.status) {
             update_stage_status(db, stage.id, "skipped", None, now).await?;
         }
     }
@@ -651,24 +635,24 @@ pub async fn check_pipeline_stages(
     if stages.is_empty() {
         return Ok((true, false));
     }
-    let all_done = stages.iter().all(|stage| {
-        matches!(
-            stage.status.as_str(),
-            "success" | "failure" | "failed" | "error" | "skipped" | "canceled"
-        )
-    });
+    let all_done = stages
+        .iter()
+        .all(|stage| is_finished_pipeline_work(&stage.status));
     let any_failure = stages
         .iter()
-        .any(|stage| matches!(stage.status.as_str(), "failure" | "failed" | "error"));
+        .any(|stage| is_unsuccessful_outcome(&stage.status));
     Ok((all_done, any_failure))
 }
 
 /// After a stage finishes, update pipeline status if all stages are done.
 ///
 /// A canceled pipeline stays canceled: `check_pipeline_stages` counts a
-/// `canceled` stage as done and not as a failure, so without the guard the
-/// last late job would roll the pipeline up to `success` and release the
-/// success hooks the cancellation was supposed to prevent.
+/// `canceled` stage as done, so without the guard the last late job would roll
+/// the pipeline up out of `canceled` and contradict the answer the cancellation
+/// already gave. The guard is what holds that, not the roll-up verdict — but
+/// the verdict is `failed` rather than `success` for the same reason, so the
+/// day this is reached by some path the guard does not cover, the success hooks
+/// still do not fire.
 pub async fn try_update_pipeline(
     db: &DatabaseConnection,
     pipeline_id: i64,
@@ -1069,6 +1053,30 @@ pub fn is_active_pipeline_work(status: &str) -> bool {
     ACTIVE_WORK_STATUSES.contains(&status)
 }
 
+/// Whether a row has finished — the definition the roll-up asks for.
+///
+/// The complement of [`is_active_pipeline_work`], and deliberately *derived*
+/// from it rather than spelled out a second time. Four roll-up sites used to
+/// carry their own literal list of terminal statuses, and they had already
+/// drifted: `check_stage_jobs` omitted `canceled` while its three neighbours
+/// included it, so the same status was "finished" to one reader of a row and
+/// "still running" to another (card_39bf6a755499). A status added to the column
+/// now has exactly one place to be classified.
+pub fn is_finished_pipeline_work(status: &str) -> bool {
+    !is_active_pipeline_work(status)
+}
+
+/// Whether a finished row finished *without* succeeding.
+///
+/// `canceled` counts. It is not a failure in the sense of "the code is broken",
+/// but the roll-up asks a narrower question — may this stage/pipeline be called
+/// a success? — and the answer for work somebody stopped is no. Rolling a
+/// canceled job's stage up green would release exactly what the cancellation
+/// was meant to prevent: the success hooks and auto-merge.
+fn is_unsuccessful_outcome(status: &str) -> bool {
+    matches!(status, "failure" | "failed" | "error" | "canceled")
+}
+
 /// Whether the pipeline still owns its own execution.
 ///
 /// A worker that started before a cancellation has no other way to notice it:
@@ -1219,4 +1227,102 @@ pub fn resolve_concurrency_group(template: &str, ref_name: &str) -> String {
     template
         .replace("${{ ref }}", ref_name)
         .replace("${{ branch }}", branch)
+}
+
+/// One column, several readers — and for a while they disagreed about what
+/// "finished" meant (card_39bf6a755499). These pin the definition rather than
+/// any one caller's use of it.
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, Database, Statement};
+
+    async fn setup() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect to in-memory db");
+        crate::run_migrations(&db).await.expect("run migrations");
+        for statement in [
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(1, 'ci', 'ci@test.com', 'x', 0, 1, '2024-01-01', '2024-01-01')",
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(1, 1, 'ci', 0, 'main', 0, 0, '2024-01-01', '2024-01-01')",
+        ] {
+            db.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                statement,
+            ))
+            .await
+            .expect("seed row");
+        }
+        db
+    }
+
+    async fn stage_with_job(db: &DatabaseConnection, job_status: &str) -> (i64, i64) {
+        let pipeline = create_pipeline(db, 1, "deadbeef", "refs/heads/main", "push", None)
+            .await
+            .expect("create pipeline");
+        let stage = create_stage(db, pipeline.id, "test", 0)
+            .await
+            .expect("create stage");
+        let job = create_job(
+            db, stage.id, "test", "echo ok", None, None, None, None, None, false, None, None, None,
+        )
+        .await
+        .expect("create job");
+        update_job_result(db, job.id, job_status, None, None, None, None)
+            .await
+            .expect("settle job");
+        (pipeline.id, stage.id)
+    }
+
+    /// `canceled` was terminal to three roll-up readers and unknown to the
+    /// fourth, so a stage holding one waited for a job that was never coming
+    /// back — and the pipeline, and every required check on the PR behind it.
+    #[tokio::test]
+    async fn a_stage_holding_a_canceled_job_is_finished_not_still_running() {
+        let db = setup().await;
+        let (_, stage_id) = stage_with_job(&db, "canceled").await;
+
+        let (all_done, any_failure) = check_stage_jobs(&db, stage_id)
+            .await
+            .expect("classify stage jobs");
+
+        assert!(all_done, "a canceled job is not work still in flight");
+        assert!(
+            any_failure,
+            "work somebody stopped is not a success: rolling the stage up green \
+             would release the auto-merge the cancellation existed to prevent"
+        );
+    }
+
+    /// The verdict the roll-up actually writes, not just its inputs.
+    #[tokio::test]
+    async fn a_canceled_job_closes_its_stage_without_calling_it_a_success() {
+        let db = setup().await;
+        let (_, stage_id) = stage_with_job(&db, "canceled").await;
+
+        let rolled_up = try_update_stage(&db, stage_id)
+            .await
+            .expect("roll the stage up");
+
+        assert_eq!(rolled_up.as_deref(), Some("failed"));
+    }
+
+    /// The complement is exactly the complement — a status the active list does
+    /// not name is finished, and nothing is both.
+    #[test]
+    fn finished_is_the_complement_of_active() {
+        for status in ACTIVE_WORK_STATUSES {
+            assert!(is_active_pipeline_work(status));
+            assert!(!is_finished_pipeline_work(status));
+        }
+        for status in [
+            "success", "failure", "failed", "error", "skipped", "canceled",
+        ] {
+            assert!(is_finished_pipeline_work(status));
+        }
+    }
 }

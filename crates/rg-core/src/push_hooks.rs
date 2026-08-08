@@ -776,6 +776,9 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             trigger_type: "push",
             // A push targets no branch other than the one it moves.
             base_branch: None,
+            // Where the ref stood before this push — the other half of what a
+            // `paths:` filter needs. This is the one producer that knows it.
+            previous_sha: Some(&update.old_sha),
             // The transport knows who pushed, and every other trigger path
             // records its actor, so a push pipeline had no reason to be the one
             // anonymous row in the table — `triggered_by` was hardcoded `None`
@@ -1026,18 +1029,11 @@ mod tests {
             false
         }
 
-        fn has_workflow_for_event(
-            &self,
-            _repo_path: &Path,
-            commit_sha: &str,
-            _event: &str,
-            _ref_name: &str,
-            _base_branch: Option<&str>,
-        ) -> bool {
+        fn has_workflow_for_event(&self, query: crate::ci::WorkflowEventQuery<'_>) -> bool {
             self.checked_commits
                 .lock()
                 .expect("CI recorder lock")
-                .push(commit_sha.to_string());
+                .push(query.commit_sha.to_string());
             false
         }
 
@@ -1372,14 +1368,7 @@ mod seed_lookup_tests {
             unreachable!("the seed lookup returns before any hook runs")
         }
 
-        fn has_workflow_for_event(
-            &self,
-            _repo_path: &Path,
-            _commit_sha: &str,
-            _event: &str,
-            _ref_name: &str,
-            _base_branch: Option<&str>,
-        ) -> bool {
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
             unreachable!("the seed lookup returns before any hook runs")
         }
 

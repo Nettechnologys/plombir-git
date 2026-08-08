@@ -21,6 +21,8 @@
 //! `-E 'test(wiki_revision_tests::)'`. Isolation is unaffected — nextest, which
 //! is the gate, already runs every test in its own process.
 
+mod common;
+
 mod create_unique_race_tests;
 mod encryption_key_check_tests;
 mod encryption_rekey_tests;

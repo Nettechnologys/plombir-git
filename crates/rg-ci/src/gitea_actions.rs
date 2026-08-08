@@ -16,7 +16,7 @@
 //! - Repository-local reusable workflows with `on: workflow_call`, inputs, inherited secrets, and dependency rewriting
 //! - Basic `${{ }}` expression substitution
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -60,18 +60,36 @@ pub enum WorkflowTriggers {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowTriggerSingle {
+    /// `on:\n  push:` — a trigger with no filters — is the same declaration as
+    /// `on: push`, and a plain `Option<EventFilter>` reads its empty value as
+    /// *absent*. The matcher then answered "this workflow is not triggered by
+    /// push" for a file that plainly asks for it. Same defect, same line shape,
+    /// as the manual trigger in card_e87a1b6f9633; found by the round-trip test
+    /// that asks the matcher about every event the canon names.
+    #[serde(default, deserialize_with = "deserialize_present_filter")]
     pub push: Option<EventFilter>,
+    #[serde(default, deserialize_with = "deserialize_present_filter")]
     pub pull_request: Option<EventFilter>,
-    #[serde(rename = "pull_request_target")]
+    #[serde(
+        rename = "pull_request_target",
+        default,
+        deserialize_with = "deserialize_present_filter"
+    )]
     pub pull_request_target: Option<EventFilter>,
     pub schedule: Option<Vec<ScheduleTrigger>>,
+    /// Manual runs. Read with the same "present, even if empty" deserializer as
+    /// `workflow_call`: the usual spelling is a bare `workflow_dispatch:` with
+    /// nothing under it, which plain `Option` turns into `None` — and a trigger
+    /// that reads as absent is a Run button that answers "no workflow is
+    /// triggered by this event" for a perfectly valid file (card_e87a1b6f9633).
+    #[serde(default, deserialize_with = "deserialize_present_yaml")]
     pub workflow_dispatch: Option<serde_yaml::Value>,
     #[serde(default, deserialize_with = "deserialize_present_yaml")]
     pub workflow_call: Option<serde_yaml::Value>,
 }
 
 /// Event filter with optional branch/tag/path filtering.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EventFilter {
     pub branches: Option<Vec<String>>,
     #[serde(rename = "branches-ignore")]
@@ -354,7 +372,13 @@ impl GiteaWorkflow {
     /// *not* the head ref — a `branches:` filter under `on: pull_request` is
     /// matched against the target of the PR, which is why `ref_name` is unused
     /// on that arm.
-    pub fn matches_event(&self, event: &str, ref_name: &str, base_branch: &str) -> bool {
+    pub fn matches_event(
+        &self,
+        event: &str,
+        ref_name: &str,
+        base_branch: &str,
+        changed: &ChangedPaths<'_>,
+    ) -> bool {
         match &self.on {
             WorkflowTriggers::Simple(name) => name.as_str() == event,
             WorkflowTriggers::Array(names) => names.iter().any(|n| n.as_str() == event),
@@ -364,13 +388,14 @@ impl GiteaWorkflow {
                     pull_request,
                     pull_request_target: _,
                     schedule: _,
-                    workflow_dispatch: _,
+                    workflow_dispatch,
                     workflow_call: _,
                 } = trigger.as_ref();
                 match event {
                     "push" => {
                         if let Some(filter) = push {
                             ref_matches_filter(ref_name, filter, base_branch)
+                                && paths_match_filter(filter, changed)
                         } else {
                             false
                         }
@@ -381,10 +406,15 @@ impl GiteaWorkflow {
                             // apply to the PR's base (target) branch, not the head ref.
                             let base_ref = format!("refs/heads/{base_branch}");
                             ref_matches_filter(&base_ref, filter, base_branch)
+                                && paths_match_filter(filter, changed)
                         } else {
                             false
                         }
                     }
+                    // A manual run carries no ref filter of its own — GitHub's
+                    // `workflow_dispatch` takes `inputs`, not `branches` — so
+                    // declaring the trigger *is* the match.
+                    rg_core::ci::WORKFLOW_DISPATCH_EVENT => workflow_dispatch.is_some(),
                     _ => false,
                 }
             }
@@ -871,6 +901,22 @@ where
     })
 }
 
+/// Read a trigger key that may carry no filters at all.
+///
+/// `on:\n  push:` is a *present* trigger with an empty body; the default
+/// `Option<EventFilter>` deserializer turns that into `None`, which the matcher
+/// cannot tell from "this workflow does not ask for push".
+fn deserialize_present_filter<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<EventFilter>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<EventFilter>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
+}
+
 fn deserialize_present_yaml<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<serde_yaml::Value>, D::Error>
@@ -914,6 +960,68 @@ fn ref_matches_filter(ref_name: &str, filter: &EventFilter, default_branch: &str
         }
     }
 
+    // …and its mirror, which was declared and read by nobody: a workflow that
+    // asked to skip release tags ran on every one of them (card_e1e76c3ede65).
+    // Only a tag ref can be excluded by it — a branch push is not "a tag that
+    // was not ignored".
+    if let Some(ref ignored) = filter.tags_ignore {
+        if is_tag && ignored.iter().any(|p| match_glob(tag, p)) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Apply the `paths` / `paths-ignore` filters of one trigger.
+///
+/// Both were parsed and dropped on the floor, and this half of the defect has
+/// the opposite sign from a filter that fails to *widen*: `paths:` is how a
+/// workflow says "only when this part of the tree changes", so ignoring it does
+/// not skip work the author asked for — it runs work the author asked to skip.
+/// On a monorepo with a heavy `paths: [backend/**]` workflow, every README
+/// commit paid for a full run (card_e1e76c3ede65).
+///
+/// A trigger that declares neither filter matches, without ever asking what
+/// changed — the diff is computed lazily, so unfiltered workflows cost nothing.
+fn paths_match_filter(filter: &EventFilter, changed: &ChangedPaths<'_>) -> bool {
+    if filter.paths.is_none() && filter.paths_ignore.is_none() {
+        return true;
+    }
+
+    let Some(changed) = changed.get() else {
+        // The filter cannot be evaluated (no repository to diff, or the diff
+        // failed). Running is what this server did before the filters were read
+        // at all, and it is the safe direction: a skipped pipeline is a missing
+        // required check, while an extra one only costs time.
+        tracing::warn!(
+            "a path filter could not be evaluated for this commit; running the workflow rather \
+             than skipping it"
+        );
+        return true;
+    };
+
+    if let Some(patterns) = &filter.paths {
+        if !changed
+            .iter()
+            .any(|path| patterns.iter().any(|p| match_path_pattern(path, p)))
+        {
+            return false;
+        }
+    }
+
+    if let Some(patterns) = &filter.paths_ignore {
+        // GitHub's rule: the workflow runs when *at least one* changed file is
+        // outside the ignore list. A commit that only touches ignored paths is
+        // the one that gets skipped.
+        if !changed
+            .iter()
+            .any(|path| !patterns.iter().any(|p| match_path_pattern(path, p)))
+        {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -929,32 +1037,217 @@ fn match_branch_pattern(branch: &str, pattern: &str, _default_branch: &str) -> b
     }
 }
 
-/// Simple glob matching supporting `*` (single segment) and `**` (multi segment).
+/// The files a commit changed, computed on demand.
+///
+/// Lazy because most workflows declare no path filter at all, and a tree diff
+/// per push for a question nobody asked would be pure cost. Once computed it is
+/// shared by every workflow file in the same run.
+///
+/// `None` from [`ChangedPaths::get`] means "cannot be determined" — no
+/// repository to diff against, or the diff itself failed — and the filter falls
+/// back to running, which is what this server did before the filters were read
+/// at all.
+pub struct ChangedPaths<'a> {
+    source: Option<ChangedPathsSource<'a>>,
+    resolved: std::cell::OnceCell<Option<Vec<String>>>,
+}
+
+struct ChangedPathsSource<'a> {
+    repo: &'a gix::Repository,
+    /// Where the ref stood before this push. `None` falls back to the commit's
+    /// first parent, which is the same answer for a merge commit or a
+    /// single-commit push and an under-approximation for a fast-forward of
+    /// several commits — the honest limit of what the caller handed over.
+    previous_sha: Option<&'a str>,
+    commit_sha: &'a str,
+}
+
+impl<'a> ChangedPaths<'a> {
+    /// For a caller with no repository — a parser test, or a matcher question
+    /// asked outside a commit. Path filters fall back to running.
+    pub fn unknown() -> Self {
+        Self {
+            source: None,
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub fn of_commit(
+        repo: &'a gix::Repository,
+        previous_sha: Option<&'a str>,
+        commit_sha: &'a str,
+    ) -> Self {
+        Self {
+            source: Some(ChangedPathsSource {
+                repo,
+                previous_sha,
+                commit_sha,
+            }),
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> Option<&[String]> {
+        self.resolved
+            .get_or_init(|| {
+                let source = self.source.as_ref()?;
+                match changed_paths_between(source) {
+                    Ok(paths) => Some(paths),
+                    Err(error) => {
+                        tracing::warn!(
+                            commit = source.commit_sha,
+                            "cannot list the paths this commit changed, so its workflows' path \
+                             filters are not applied: {error:#}"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_deref()
+    }
+}
+
+fn changed_paths_between(source: &ChangedPathsSource<'_>) -> Result<Vec<String>> {
+    use gix::bstr::ByteSlice;
+
+    let repo = source.repo;
+    let commit = repo
+        .rev_parse_single(source.commit_sha)
+        .with_context(|| format!("commit not found: {}", source.commit_sha))?
+        .object()?
+        .peel_to_commit()
+        .with_context(|| format!("{} is not a commit", source.commit_sha))?;
+    let new_tree = commit.tree()?;
+
+    // The zero sha is how the git protocol spells "this ref did not exist", so
+    // it is a branch being created rather than a revision to diff against.
+    let previous = source
+        .previous_sha
+        .filter(|sha| !sha.chars().all(|c| c == '0'))
+        .map(|sha| {
+            repo.rev_parse_single(sha)
+                .with_context(|| format!("previous commit not found: {sha}"))
+                .and_then(|id| Ok(id.object()?.peel_to_commit()?.tree()?))
+        })
+        .transpose()?
+        .or_else(|| {
+            commit
+                .parent_ids()
+                .next()
+                .and_then(|id| id.object().ok()?.peel_to_commit().ok()?.tree().ok())
+        });
+
+    let Some(old_tree) = previous else {
+        // A root commit changed every file it contains.
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        new_tree.traverse().breadthfirst(&mut recorder)?;
+        return Ok(recorder
+            .records
+            .into_iter()
+            .filter(|entry| !entry.mode.is_tree())
+            .map(|entry| entry.filepath.to_str_lossy().to_string())
+            .collect());
+    };
+
+    let mut platform = old_tree.changes()?;
+    platform.options(|options| {
+        options.track_rewrites(None);
+    });
+
+    let mut paths = Vec::new();
+    {
+        let sink = &mut paths;
+        platform.for_each_to_obtain_tree(
+            &new_tree,
+            |change| -> Result<std::ops::ControlFlow<()>, anyhow::Error> {
+                let is_tree = match &change {
+                    gix::object::tree::diff::Change::Addition { entry_mode, .. }
+                    | gix::object::tree::diff::Change::Deletion { entry_mode, .. } => {
+                        entry_mode.is_tree()
+                    }
+                    gix::object::tree::diff::Change::Modification {
+                        previous_entry_mode,
+                        entry_mode,
+                        ..
+                    } => previous_entry_mode.is_tree() || entry_mode.is_tree(),
+                    gix::object::tree::diff::Change::Rewrite {
+                        source_entry_mode,
+                        entry_mode,
+                        ..
+                    } => source_entry_mode.is_tree() || entry_mode.is_tree(),
+                };
+                if !is_tree {
+                    sink.push(change.location().to_str_lossy().to_string());
+                }
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )?;
+    }
+    Ok(paths)
+}
+
+/// Match one repository-relative path against one filter pattern.
+///
+/// Separate from [`match_glob`], which matches branch and tag names: those have
+/// no meaningful path separator, while a path pattern's whole vocabulary is
+/// built around one. GitHub's rules — `*` matches any run of characters except
+/// `/`, `**` matches any run including `/`, `?` matches a single character —
+/// and a pattern ending in `/` or `/**` covers everything under that directory.
+fn match_path_pattern(path: &str, pattern: &str) -> bool {
+    // `docs/` and `docs/**` both mean "everything under docs".
+    if let Some(dir) = pattern.strip_suffix("/**").or(pattern.strip_suffix('/')) {
+        if path == dir || path.starts_with(&format!("{dir}/")) {
+            return true;
+        }
+    }
+    glob_segments(path.as_bytes(), pattern.as_bytes())
+}
+
+/// Backtracking matcher for `*`, `**` and `?` over a path.
+fn glob_segments(path: &[u8], pattern: &[u8]) -> bool {
+    match pattern.first() {
+        None => path.is_empty(),
+        Some(b'*') => {
+            if pattern.get(1) == Some(&b'*') {
+                // `**` spans separators. Skipping an optional `/` right after it
+                // is what makes `**/x.rs` match a top-level `x.rs`, exactly as
+                // GitHub documents.
+                let rest = &pattern[2..];
+                let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                (0..=path.len()).any(|skip| glob_segments(&path[skip..], rest))
+                    || glob_segments(path, rest)
+            } else {
+                let rest = &pattern[1..];
+                // A single `*` stops at the separator.
+                let bound = path.iter().position(|b| *b == b'/').unwrap_or(path.len());
+                (0..=bound).any(|skip| glob_segments(&path[skip..], rest))
+            }
+        }
+        Some(b'?') => {
+            !path.is_empty() && path[0] != b'/' && glob_segments(&path[1..], &pattern[1..])
+        }
+        Some(expected) => {
+            !path.is_empty() && path[0] == *expected && glob_segments(&path[1..], &pattern[1..])
+        }
+    }
+}
+
+/// Match a branch or tag name against a `branches:` / `tags:` pattern.
+///
+/// The same backtracking matcher the path filters use, on a ref name instead of
+/// a file path. A ref is hierarchical for exactly the same reason a path is
+/// (`release/1.0`, `v1/rc`), and GitHub draws the `*` / `**` distinction on
+/// `/` in both.
+///
+/// It used to be a ladder of `starts_with` / `ends_with` special cases, and a
+/// pattern with a star anywhere but at one end fell through it to `false`:
+/// `releases/**` was tested as `starts_with("releases/*")`, and `*-rc*` — the
+/// shape every `tags-ignore` is written in — was tested as
+/// `starts_with("*-rc")`. Both are workflows that read as configured and match
+/// nothing. (The `*middle*` arm that was meant to catch the second could never
+/// be reached: the `strip_suffix('*')` arm above it answered first.)
 fn match_glob(s: &str, pattern: &str) -> bool {
-    // Simple cases
-    if pattern == "*" {
-        return true;
-    }
-    if pattern == "**" {
-        return true;
-    }
-    // `**/*` matches anything with at least one path segment
-    if pattern == "**/*" {
-        return s.contains('/') || !s.is_empty();
-    }
-    // Simple prefix/suffix glob
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return s.starts_with(prefix);
-    }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return s.ends_with(suffix);
-    }
-    // `*middle*` case
-    if pattern.starts_with('*') && pattern.ends_with('*') && pattern.len() > 2 {
-        let middle = &pattern[1..pattern.len() - 1];
-        return s.contains(middle);
-    }
-    s == pattern
+    glob_segments(s.as_bytes(), pattern.as_bytes())
 }
 
 fn supported_condition(condition: &str, allow_matrix: bool) -> bool {
@@ -1086,7 +1379,7 @@ jobs:
         let wf = GiteaWorkflow::parse(yml).unwrap();
         wf.validate_supported_actions().unwrap();
         assert_eq!(wf.name.as_deref(), Some("CI"));
-        assert!(wf.matches_event("push", "refs/heads/main", "main"));
+        assert!(wf.matches_event("push", "refs/heads/main", "main", &ChangedPaths::unknown()));
 
         let ctx = WorkflowContext {
             ref_name: "refs/heads/main".into(),
@@ -1477,10 +1770,25 @@ jobs:
       - run: echo test
 "#;
         let wf = GiteaWorkflow::parse(yml).unwrap();
-        assert!(wf.matches_event("push", "refs/heads/main", "main"));
-        assert!(wf.matches_event("push", "refs/heads/develop", "main"));
-        assert!(!wf.matches_event("push", "refs/heads/feature", "main"));
-        assert!(wf.matches_event("pull_request", "refs/heads/feature", "main"));
+        assert!(wf.matches_event("push", "refs/heads/main", "main", &ChangedPaths::unknown()));
+        assert!(wf.matches_event(
+            "push",
+            "refs/heads/develop",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+        assert!(!wf.matches_event(
+            "push",
+            "refs/heads/feature",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+        assert!(wf.matches_event(
+            "pull_request",
+            "refs/heads/feature",
+            "main",
+            &ChangedPaths::unknown()
+        ));
     }
 
     #[test]
@@ -1494,9 +1802,14 @@ jobs:
       - run: echo hi
 "#;
         let wf = GiteaWorkflow::parse(yml).unwrap();
-        assert!(wf.matches_event("push", "refs/heads/main", "main"));
-        assert!(wf.matches_event("pull_request", "refs/heads/main", "main"));
-        assert!(!wf.matches_event("schedule", "", "main"));
+        assert!(wf.matches_event("push", "refs/heads/main", "main", &ChangedPaths::unknown()));
+        assert!(wf.matches_event(
+            "pull_request",
+            "refs/heads/main",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+        assert!(!wf.matches_event("schedule", "", "main", &ChangedPaths::unknown()));
     }
 
     #[test]
@@ -1651,4 +1964,103 @@ jobs:
             .iter()
             .any(|line| line.contains("${MATRIX_OS} ${DEPLOY_TOKEN}")));
     }
+}
+
+/// The producer side of the event vocabulary (card_e87a1b6f9633,
+/// card_074d93bfe327): a pipeline may only be created under a name a workflow
+/// can declare.
+#[cfg(test)]
+mod trigger_event_vocabulary_tests {
+    use super::*;
+
+    /// Reads the source of the crates that *create* pipelines. A producer that
+    /// invents an event name compiles, runs, answers `201`, and matches no
+    /// workflow — there is no failure to observe at runtime, which is why this
+    /// is checked by reading rather than by driving.
+    #[test]
+    fn every_event_a_pipeline_is_created_under_is_one_a_workflow_can_declare() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/ directory");
+        let mut produced: Vec<(String, String)> = Vec::new();
+
+        for crate_name in ["rg-core", "rg-http"] {
+            let mut files = vec![workspace.join(crate_name).join("src")];
+            while let Some(path) = files.pop() {
+                if path.is_dir() {
+                    files.extend(
+                        std::fs::read_dir(&path)
+                            .expect("read source directory")
+                            .map(|entry| entry.expect("read source entry").path()),
+                    );
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read source file");
+                for (index, line) in source.lines().enumerate() {
+                    let Some((_, rest)) = line.split_once("trigger_type: \"") else {
+                        continue;
+                    };
+                    let Some((event, _)) = rest.split_once('"') else {
+                        continue;
+                    };
+                    produced.push((
+                        format!("{}:{}", path.display(), index + 1),
+                        event.to_string(),
+                    ));
+                }
+            }
+        }
+
+        let unknown: Vec<_> = produced
+            .iter()
+            .filter(|(_, event)| !rg_core::ci::PIPELINE_EVENTS.contains(&event.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "these pipelines are created under an event no `on:` clause can name, so they match \
+             no workflow and produce nothing: {unknown:?}"
+        );
+    }
+
+    /// …and the matcher answers every one of them. A name in the canon that the
+    /// matcher does not handle is the same dead end from the other side.
+    ///
+    /// The declaration a workflow writes is not always the event's own name:
+    /// the merge queue runs a *speculative* merge of the PR, so it asks the
+    /// workflows the PR itself declares. Everything else is spelled as it is
+    /// raised — including the empty-bodied `on:\n  <event>:` form, which read as
+    /// "not declared" until this test asked.
+    #[test]
+    fn the_matcher_answers_yes_to_a_workflow_that_declares_any_canonical_event() {
+        for event in rg_core::ci::PIPELINE_EVENTS {
+            let declared = match event {
+                "merge_group" => "pull_request",
+                other => other,
+            };
+            let yaml = format!(
+                "name: W\non:\n  {declared}:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            );
+            let workflow: GiteaWorkflow =
+                serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse {declared}: {e}"));
+            assert!(
+                workflow.matches_event(event, "refs/heads/main", "main", &ChangedPaths::unknown()),
+                "a workflow declaring `on: {declared}:` is not matched by {event}"
+            );
+        }
+    }
+}
+
+/// Test-only re-export: the pattern rules are exercised from `lib.rs`'s
+/// filter tests, next to the filters that use them.
+#[cfg(test)]
+pub(crate) fn match_path_pattern_for_test(path: &str, pattern: &str) -> bool {
+    match_path_pattern(path, pattern)
+}
+
+#[cfg(test)]
+pub(crate) fn match_glob_for_test(name: &str, pattern: &str) -> bool {
+    match_glob(name, pattern)
 }

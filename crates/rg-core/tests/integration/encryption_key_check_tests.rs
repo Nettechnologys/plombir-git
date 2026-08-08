@@ -15,15 +15,7 @@ const OLD_SECRET: &str = "the-secret-this-database-was-built-with";
 const ROTATED_SECRET: &str = "a-freshly-generated-secret-after-a-leak";
 
 async fn fresh_db(dir: &Path) -> sea_orm::DatabaseConnection {
-    let db = rg_db::connect_with_pool(
-        &format!("sqlite://{}?mode=rwc", dir.join("test.db").display()),
-        rg_db::TEST_CONNECT_TIMEOUT_SECS,
-        60,
-        2,
-    )
-    .await
-    .expect("connect sqlite");
-    rg_db::run_migrations(&db).await.expect("run migrations");
+    let db = crate::common::migrated_sqlite(&dir.join("test.db"), 2).await;
     db
 }
 

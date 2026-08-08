@@ -739,15 +739,30 @@ async fn a_tampered_attachment_blob_fails_the_download_instead_of_serving_bad_by
         .fold(repo_root, |path, segment| path.join(segment));
     std::fs::write(&blob_path, b"tampered bytes").expect("overwrite the stored blob");
 
-    let tampered = client.get(&url).send().await.unwrap();
-    assert_eq!(
-        tampered.status(),
-        reqwest::StatusCode::OK,
-        "headers are already on the wire when the mismatch is discovered"
-    );
-    let body = tampered.bytes().await;
-    assert!(
-        body.is_err(),
-        "a digest mismatch must break the transfer, not deliver the tampered bytes: {body:?}"
-    );
+    // What must hold is that the tampered bytes never arrive complete. *Where*
+    // the client learns that is not ours to pin: the server answers `200` and
+    // then aborts the body mid-stream, so on a busy machine the headers and the
+    // truncated connection can reach the client together and `send()` itself
+    // returns `IncompleteMessage` instead of `bytes()` doing so. Asserting the
+    // second shape only made this test fail under load — a red run that says
+    // nothing about the server (card_4b0ca8d89fec).
+    match client.get(&url).send().await {
+        Ok(tampered) => {
+            assert_eq!(
+                tampered.status(),
+                reqwest::StatusCode::OK,
+                "headers are already on the wire when the mismatch is discovered"
+            );
+            let body = tampered.bytes().await;
+            assert!(
+                body.is_err(),
+                "a digest mismatch must break the transfer, not deliver the tampered bytes: \
+                 {body:?}"
+            );
+        }
+        Err(error) => assert!(
+            error.is_request(),
+            "the transfer must break on the truncated body, not on anything else: {error:?}"
+        ),
+    }
 }

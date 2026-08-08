@@ -597,6 +597,10 @@ async fn ensure_merge_group_ci(
                     // ref above is the synthetic group ref — the branch the filter
                     // is about is the one the queue is merging into.
                     base_branch: Some(&pr.base_branch),
+                    // The group commit is built fresh for this run; its first
+                    // parent is the base branch tip, which is exactly the diff a
+                    // `paths:` filter is asking about.
+                    previous_sha: None,
                     triggered_by: Some(entry.enqueued_by_id),
                     docker_enabled: ci.docker_enabled,
                     external_runners: ci.external_runners,

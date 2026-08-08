@@ -288,3 +288,56 @@ async fn a_repeated_finish_still_rolls_the_pipeline_up() {
         )
     );
 }
+
+/// card_39bf6a755499: the same endpoint, one step earlier. `status` was written
+/// into the column exactly as the runner typed it, and the roll-up recognised a
+/// fixed list of strings — so a runner that reported `succes` got `200 OK`, the
+/// job settled, and the stage and pipeline stayed `running` for good. Nothing
+/// logged anything, and the PR's required checks never unblocked.
+#[tokio::test]
+async fn an_unreadable_finish_status_is_refused_instead_of_hanging_the_pipeline() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let fixture = seed(&base, &db, "bad-status").await;
+
+    assert_eq!(poll(&base, &fixture).await, StatusCode::OK);
+    assert_eq!(start(&base, &fixture).await, StatusCode::OK);
+
+    for typo in ["succes", "SUCCESS", "done", ""] {
+        assert_eq!(
+            finish(&base, &fixture, typo, 0).await,
+            StatusCode::BAD_REQUEST,
+            "`status: {typo}` was accepted as a job outcome"
+        );
+    }
+    assert_eq!(
+        chain_statuses(&db, &fixture).await,
+        (
+            "pending".to_string(),
+            "pending".to_string(),
+            "running".to_string()
+        ),
+        "a refused report must leave the chain exactly where it was"
+    );
+
+    // The words the server decides for itself are not the runner's to report:
+    // a runner claiming `canceled` would be answering a cancellation nobody
+    // issued, and `skipped` a condition the server evaluates.
+    for reserved in ["canceled", "skipped"] {
+        assert_eq!(
+            finish(&base, &fixture, reserved, 0).await,
+            StatusCode::BAD_REQUEST,
+            "`status: {reserved}` is the server's verdict, not a runner report"
+        );
+    }
+
+    assert_eq!(finish(&base, &fixture, "success", 0).await, StatusCode::OK);
+    assert_eq!(
+        chain_statuses(&db, &fixture).await,
+        (
+            "success".to_string(),
+            "success".to_string(),
+            "success".to_string()
+        ),
+        "the guard must not cost the endpoint its actual job"
+    );
+}

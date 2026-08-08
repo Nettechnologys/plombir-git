@@ -53,14 +53,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         true
     }
 
-    fn has_workflow_for_event(
-        &self,
-        _repo_path: &Path,
-        _commit_sha: &str,
-        _event: &str,
-        _ref_name: &str,
-        _base_branch: Option<&str>,
-    ) -> bool {
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
         self.workflow_for_event
     }
 

@@ -1424,6 +1424,16 @@ pub async fn finish_job(
     Path((runner_id, job_id)): Path<(i64, i64)>,
     Json(req): Json<FinishJobRequest>,
 ) -> impl IntoResponse {
+    // Ahead of the lookup: a status this server cannot classify must not reach
+    // the column at all. Stored verbatim it settled the job while every roll-up
+    // read it as unfinished, so the stage and the pipeline stayed `running` for
+    // good and the PR's required checks never unblocked — all behind a
+    // `200 OK` (card_39bf6a755499).
+    let reported = match rg_core::ci::JobStatus::parse_runner_report(&req.status) {
+        Ok(status) => status,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
     let job = match assigned_job(&state, runner_id, job_id).await {
         Ok(job) => job,
         Err(error) => return error.into_response(),
@@ -1446,7 +1456,7 @@ pub async fn finish_job(
     let job_settled = rg_db::ops::pipeline_ops::settle_job_if_active(
         &state.db,
         job_id,
-        &req.status,
+        reported.as_str(),
         Some(req.exit_code),
         None,
         now,
@@ -1603,7 +1613,9 @@ pub async fn finish_job(
 
 #[derive(Deserialize, ToSchema)]
 pub struct FinishJobRequest {
-    status: String, // success | failure | error
+    /// Parsed by [`rg_core::ci::JobStatus::parse_runner_report`] — the domain
+    /// lives in that type, not in a comment here.
+    status: String,
     exit_code: i32,
 }
 

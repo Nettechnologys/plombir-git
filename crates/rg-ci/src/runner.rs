@@ -106,6 +106,10 @@ pub struct PipelineRunner {
     oidc_token_url: Option<String>,
     /// Per-job timeout in seconds (0 = no timeout).
     job_timeout_secs: u64,
+    /// Hub and SMTP wiring for the post-push hooks a successful pipeline
+    /// spawns. Default (both `None`) keeps every storage-side effect and drops
+    /// only the real-time events and the mail — see [`crate::CiNotifications`].
+    notifications: crate::CiNotifications,
 }
 
 impl PipelineRunner {
@@ -121,6 +125,7 @@ impl PipelineRunner {
             allow_host_runner: false,
             oidc_token_url: None,
             job_timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            notifications: crate::CiNotifications::default(),
         }
     }
 
@@ -141,6 +146,7 @@ impl PipelineRunner {
             allow_host_runner: false,
             oidc_token_url: None,
             job_timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            notifications: crate::CiNotifications::default(),
         }
     }
 
@@ -172,6 +178,13 @@ impl PipelineRunner {
 
     pub fn set_oidc_token_url(&mut self, url: String) {
         self.oidc_token_url = Some(url);
+    }
+
+    /// Wire this runner's post-success hooks to the process's notification hub
+    /// and SMTP configuration, so a merge this pipeline unblocks is as visible
+    /// as the same merge made over REST (card_85b8d59246b5).
+    pub fn set_notifications(&mut self, notifications: crate::CiNotifications) {
+        self.notifications = notifications;
     }
 
     /// Set the per-job timeout in seconds. Pass 0 to disable the timeout.
@@ -518,9 +531,25 @@ impl PipelineRunner {
             return Ok(());
         };
 
-        // The merges this unblocks move a base branch, and that move owes the
-        // post-push hooks — a pipeline on the merge commit, the `push` webhook,
-        // the watch fan-out (card_73a1ec5b32f3).
+        self.post_push_context(repo_root)
+            .evaluate_merges_and_spawn_hooks(&self.db, pipeline.repo_id, &pipeline.commit_sha, None)
+            .await;
+
+        Ok(())
+    }
+
+    /// This runner's post-push wiring, for the base-branch moves the merges it
+    /// unblocks make.
+    ///
+    /// The merges move a base branch, and that move owes the post-push hooks — a
+    /// pipeline on the merge commit, the `push` webhook, the watch fan-out
+    /// (card_73a1ec5b32f3) — plus the real-time events and the mail the process
+    /// handed over in [`set_notifications`](Self::set_notifications)
+    /// (card_85b8d59246b5).
+    fn post_push_context(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> rg_core::push_hooks::PostPushContext {
         crate::post_push_context(
             repo_root,
             self.docker_enabled,
@@ -531,11 +560,8 @@ impl PipelineRunner {
             self.oidc_token_url
                 .as_deref()
                 .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
+            &self.notifications,
         )
-        .evaluate_merges_and_spawn_hooks(&self.db, pipeline.repo_id, &pipeline.commit_sha, None)
-        .await;
-
-        Ok(())
     }
 
     /// Run a single job.
@@ -1389,6 +1415,28 @@ fn is_reserved_ci_variable(name: &str) -> bool {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, NotSet, Set};
+
+    /// The runner is the second of the two CI-completion paths, and it built the
+    /// same stripped context: a pipeline finishing under the embedded runner
+    /// auto-merged a PR whose merge commit nobody was told about
+    /// (card_85b8d59246b5).
+    #[tokio::test]
+    async fn a_wired_runner_hands_its_post_success_hooks_the_hub_and_smtp() {
+        let (recorder, notifications) = crate::test_notifier::wiring();
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let mut runner =
+            PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
+        runner.set_notifications(notifications);
+
+        let context = runner.post_push_context(std::path::Path::new("/srv/repos"));
+
+        let notifier = context
+            .notifier
+            .expect("a merge the embedded runner unblocks owes the same events as a REST merge");
+        notifier.notify(9, "push", serde_json::json!({}));
+        assert_eq!(recorder.events(), vec![(9, "push".to_string())]);
+        assert!(context.smtp_config.is_some());
+    }
 
     #[tokio::test]
     async fn execution_waits_for_and_drives_its_scoped_heartbeat() {

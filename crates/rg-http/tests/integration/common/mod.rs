@@ -20,14 +20,7 @@ impl rg_core::ci::CiTrigger for NoopCiEngine {
 
     /// Mirrors `has_ci_config`: this double has no workflow files to
     /// match an event against, so it answers the same for every event.
-    fn has_workflow_for_event(
-        &self,
-        _repo_path: &std::path::Path,
-        _commit_sha: &str,
-        _event: &str,
-        _ref_name: &str,
-        _base_branch: Option<&str>,
-    ) -> bool {
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
         false
     }
 
@@ -60,9 +53,14 @@ impl rg_core::ci::CiTrigger for NoopCiEngine {
 /// (4 samples per configuration, configurations interleaved):
 /// `journal=DELETE`/`synchronous=FULL` 2977 ms median vs WAL/`NORMAL` 455 ms.
 /// Every test pays that once, so it dominated the suite's wall-clock.
+/// Measured again after that fix: the remaining ~450 ms is the 104 migrations
+/// themselves, and every one of the tests in this binary ran all of them to
+/// arrive at the identical schema. So the chain runs **once per test binary**
+/// and each test starts from a copy of its result — see [`migrated_template`].
 pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path().join("test.db");
+    copy_migrated_template(&db_path).await;
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
     // The connect timeout is the test-suite value, not production's: it also
     // bounds the eager first connect, and under a parallel run this harness
@@ -71,8 +69,69 @@ pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
     let db = rg_db::connect_with_pool(&db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("failed to connect");
-    rg_db::run_migrations(&db).await.expect("migration failed");
     (db, dir)
+}
+
+/// The migrated schema, built once per test binary.
+///
+/// Not a hand-written schema dump: it is produced by `run_migrations` itself, so
+/// what a test starts from is exactly what the chain produces — a migration
+/// added tomorrow is in the template the moment it is in the chain, with nothing
+/// to keep in sync. The bookkeeping table travels with it, so a test that runs
+/// the migrations again gets the same no-op it always did.
+///
+/// Held in a `static`, so the directory outlives every test and is never
+/// dropped; it is a `tempfile` directory, which the OS reclaims.
+async fn migrated_template() -> &'static std::path::Path {
+    static TEMPLATE: tokio::sync::OnceCell<tempfile::TempDir> = tokio::sync::OnceCell::const_new();
+    TEMPLATE
+        .get_or_init(|| async {
+            let dir = tempfile::tempdir().expect("create the template directory");
+            let path = dir.path().join("template.db");
+            let db = rg_db::connect_with_pool(
+                &format!("sqlite://{}?mode=rwc", path.display()),
+                rg_db::TEST_CONNECT_TIMEOUT_SECS,
+                60,
+                1,
+            )
+            .await
+            .expect("connect to the template database");
+            rg_db::run_migrations(&db)
+                .await
+                .expect("migrate the template database");
+            // Closing the pool is what checkpoints the WAL into the file being
+            // copied. Without it a test would start from a database missing
+            // every table the last checkpoint did not cover.
+            db.close().await.expect("close the template database");
+            dir
+        })
+        .await
+        .path()
+}
+
+/// Lay the migrated schema down at `db_path`.
+async fn copy_migrated_template(db_path: &std::path::Path) {
+    let template = migrated_template().await.join("template.db");
+    std::fs::copy(&template, db_path).unwrap_or_else(|error| {
+        panic!(
+            "copy the migrated template {} -> {}: {error}",
+            template.display(),
+            db_path.display()
+        )
+    });
+    // Belt and braces: the close above normally removes these, but a WAL left
+    // behind belongs to the copy as much as the pages do — half of it would be
+    // a database missing its most recent commits.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = template.with_file_name(format!("template.db{suffix}"));
+        if sidecar.exists() {
+            let target = db_path.with_file_name(format!(
+                "{}{suffix}",
+                db_path.file_name().expect("db file name").to_string_lossy()
+            ));
+            std::fs::copy(&sidecar, &target).expect("copy the template WAL sidecar");
+        }
+    }
 }
 
 /// Test-only replacements for individual pieces of [`rg_http::AppState`].

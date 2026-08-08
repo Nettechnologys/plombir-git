@@ -1214,10 +1214,12 @@ async fn import_github_milestones(
             continue;
         }
 
+        // A foreign vocabulary, so an unknown word falls back rather than
+        // failing the import — but what lands in the column is named by the
+        // type that owns it, not by a literal (card_09b2665584ed).
         let state = match gm.state.as_str() {
-            "open" => "open",
-            "closed" => "closed",
-            _ => "open",
+            "closed" => crate::issue::MilestoneState::Closed,
+            _ => crate::issue::MilestoneState::Open,
         };
 
         let due_date = parse_opt_datetime(&gm.due_on);
@@ -1227,7 +1229,7 @@ async fn import_github_milestones(
             repo_id: Set(repo_id),
             title: Set(gm.title.clone()),
             description: Set(gm.description.clone()),
-            state: Set(state.to_string()),
+            state: Set(state.as_str().to_string()),
             due_date: Set(due_date),
             created_at: Set(now),
             updated_at: Set(now),
@@ -1563,11 +1565,11 @@ async fn import_gitlab_milestones(
             continue;
         }
 
-        // GitLab uses "active" instead of "open"
+        // GitLab uses "active" instead of "open"; same fallback rule as the
+        // GitHub importer above.
         let state = match gm.state.as_str() {
-            "active" => "open",
-            "closed" => "closed",
-            _ => "open",
+            "closed" => crate::issue::MilestoneState::Closed,
+            _ => crate::issue::MilestoneState::Open,
         };
 
         let due_date = parse_opt_datetime(&gm.due_date);
@@ -1577,7 +1579,7 @@ async fn import_gitlab_milestones(
             repo_id: Set(repo_id),
             title: Set(gm.title.clone()),
             description: Set(gm.description.clone()),
-            state: Set(state.to_string()),
+            state: Set(state.as_str().to_string()),
             due_date: Set(due_date),
             created_at: Set(now),
             updated_at: Set(now),

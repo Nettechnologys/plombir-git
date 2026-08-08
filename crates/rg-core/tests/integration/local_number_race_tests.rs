@@ -17,15 +17,7 @@
 //! number.
 
 async fn fresh_db(directory: &std::path::Path) -> sea_orm::DatabaseConnection {
-    let db = rg_db::connect_with_pool(
-        &format!("sqlite://{}?mode=rwc", directory.join("test.db").display()),
-        rg_db::TEST_CONNECT_TIMEOUT_SECS,
-        60,
-        4,
-    )
-    .await
-    .expect("connect sqlite");
-    rg_db::run_migrations(&db).await.expect("run migrations");
+    let db = crate::common::migrated_sqlite(&directory.join("test.db"), 4).await;
     db
 }
 

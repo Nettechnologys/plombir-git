@@ -27,15 +27,7 @@ const CI_SECRET_PLAINTEXT: &str = "ghp_a-deploy-token-nobody-wants-to-retype";
 const WEBHOOK_SECRET_PLAINTEXT: &str = "the-key-every-delivery-is-signed-with";
 
 async fn fresh_db(dir: &Path) -> DatabaseConnection {
-    let db = rg_db::connect_with_pool(
-        &format!("sqlite://{}?mode=rwc", dir.join("test.db").display()),
-        rg_db::TEST_CONNECT_TIMEOUT_SECS,
-        60,
-        2,
-    )
-    .await
-    .expect("connect sqlite");
-    rg_db::run_migrations(&db).await.expect("run migrations");
+    let db = crate::common::migrated_sqlite(&dir.join("test.db"), 2).await;
     db
 }
 

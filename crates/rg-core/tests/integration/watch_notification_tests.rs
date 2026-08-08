@@ -28,14 +28,7 @@ impl rg_core::ci::CiTrigger for NoCi {
 
     /// Mirrors `has_ci_config`: this double has no workflow files to
     /// match an event against, so it answers the same for every event.
-    fn has_workflow_for_event(
-        &self,
-        _repo_path: &std::path::Path,
-        _commit_sha: &str,
-        _event: &str,
-        _ref_name: &str,
-        _base_branch: Option<&str>,
-    ) -> bool {
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
         false
     }
 
@@ -55,17 +48,7 @@ impl rg_core::ci::CiTrigger for NoCi {
 }
 
 async fn fresh_db(dir: &Path) -> sea_orm::DatabaseConnection {
-    let db_path = dir.join("test.db");
-    let db = rg_db::connect_with_pool(
-        &format!("sqlite://{}?mode=rwc", db_path.display()),
-        rg_db::TEST_CONNECT_TIMEOUT_SECS,
-        60,
-        2,
-    )
-    .await
-    .expect("connect sqlite");
-    rg_db::run_migrations(&db).await.expect("run migrations");
-    db
+    crate::common::migrated_sqlite(&dir.join("test.db"), 2).await
 }
 
 async fn user(db: &sea_orm::DatabaseConnection, name: &str) -> rg_db::entities::user::Model {

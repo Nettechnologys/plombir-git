@@ -156,7 +156,7 @@ async fn a_cancelled_job_stops_opening_the_repository_with_its_token() {
         "baseline: a running job reads the repository it was minted for"
     );
 
-    rg_db::ops::pipeline_ops::update_job_result(&db, job_id, "cancelled", None, None, None, None)
+    rg_db::ops::pipeline_ops::update_job_result(&db, job_id, "canceled", None, None, None, None)
         .await
         .expect("cancel the job");
 

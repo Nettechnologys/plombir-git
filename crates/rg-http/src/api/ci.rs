@@ -464,8 +464,13 @@ pub async fn trigger_pipeline(
             repo_id: repo.id,
             commit_sha: &commit_sha,
             ref_name: &ref_name,
-            trigger_type: "manual",
+            // The event a workflow can actually declare. See
+            // `rg_core::ci::WORKFLOW_DISPATCH_EVENT`.
+            trigger_type: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
             base_branch: None,
+            // A manual run has no previous revision of its own; a `paths:`
+            // filter falls back to the diff of the commit it is asked to build.
+            previous_sha: None,
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,
@@ -546,7 +551,15 @@ pub async fn retry_pipeline(
             repo_id: pipeline.repo_id,
             commit_sha: &pipeline.commit_sha,
             ref_name: &pipeline.ref_name,
-            trigger_type: "retry",
+            // A retry runs the pipeline again, so it runs under the event that
+            // produced it — `"retry"` was a name no `on:` clause can carry, and
+            // it reached the matcher, which answered "nothing is triggered by
+            // this" for every repository on `.gitea/workflows/`. The column
+            // therefore no longer distinguishes a rerun from the original; if
+            // that distinction is wanted it needs a field of its own rather
+            // than the event name (card_e87a1b6f9633).
+            trigger_type: &pipeline.trigger_type,
+            previous_sha: None,
             base_branch: None,
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,

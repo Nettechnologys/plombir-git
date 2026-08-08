@@ -48,7 +48,9 @@ pub struct CreateWebhookRequest {
     pub content_type: Option<String>, // "json" (default) or "form"
     pub secret: Option<String>,
     pub active: Option<bool>,
-    pub events: Vec<String>, // e.g. ["push", "issues"]
+    /// Subscription list; every entry must be one of [`WEBHOOK_EVENTS`]
+    /// (e.g. `["push", "issue.opened"]`).
+    pub events: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,6 +234,76 @@ pub async fn strip_legacy_url_credentials(db: &DatabaseConnection) -> Result<usi
     Ok(stripped)
 }
 
+// ── The event vocabulary ──────────────────────────────────────────────────
+
+/// Every event this server ever raises.
+///
+/// The list existed only as the set of string literals passed to
+/// [`trigger_event`], so a subscription was never checked against anything:
+/// `{"events":["pull_request.merge"]}` answered `201 Created`, the hook showed
+/// up in the settings page looking configured, and it stayed silent forever
+/// (card_55c9cddfe9d6). Nothing logged a thing — there is no failure here, only
+/// a subscription to an event that does not exist.
+///
+/// Kept in sync with the trigger sites by
+/// `every_event_this_server_raises_is_in_the_canon`, which reads the source
+/// rather than trusting this comment, and with the checkbox list in
+/// `web/src/routes/[owner]/[repo]/settings/webhooks/+page.svelte`.
+pub const WEBHOOK_EVENTS: [&str; 14] = [
+    "push",
+    "branch.created",
+    "branch.deleted",
+    "tag.created",
+    "tag.deleted",
+    "release.created",
+    "release.deleted",
+    "issue.opened",
+    "issue.closed",
+    "issue.comment",
+    "milestone.closed",
+    "pull_request.opened",
+    "pull_request.closed",
+    "pull_request.merged",
+];
+
+/// Whether `event` is a name this server can ever deliver.
+pub fn is_known_event(event: &str) -> bool {
+    WEBHOOK_EVENTS.contains(&event)
+}
+
+/// Validate a subscription list and render it into the stored column.
+///
+/// Storage is one comma-joined string, which is also why an event name may not
+/// contain a comma or be empty: the reader splits on `,`, so either would
+/// produce a subscription entry that can never be matched — the same silent
+/// dead end by a different route.
+fn encode_subscriptions(events: &[String]) -> Result<String> {
+    for event in events {
+        if !is_known_event(event) {
+            return Err(crate::error::invalid_request(format!(
+                "unknown webhook event; this server delivers: {}",
+                WEBHOOK_EVENTS.join(", ")
+            )));
+        }
+    }
+    Ok(events.join(","))
+}
+
+/// Whether a stored subscription list covers `event`.
+///
+/// Membership in the split list, not a substring of the joined one. The column
+/// was matched with SQL `LIKE '%<event>%'`, which answered a question nobody
+/// asked: a hook subscribed to `issue` received all three `issue.*` events
+/// (documented nowhere), and the day an event name became a prefix of another —
+/// `push` and `push.forced` — every `push` subscriber would start receiving
+/// both. The `LIKE` stays as the *narrowing* filter in SQL; this is what
+/// decides (card_55c9cddfe9d6).
+pub fn subscription_covers(subscriptions: &str, event: &str) -> bool {
+    subscriptions
+        .split(',')
+        .any(|subscribed| subscribed.trim() == event)
+}
+
 // ── CRUD ──────────────────────────────────────────────────────────────────
 
 /// A webhook target may not carry a credential in its userinfo.
@@ -268,7 +340,7 @@ pub async fn create_webhook(
     crate::net::check_url_static(&req.url).context("invalid webhook URL")?;
     reject_url_credentials(&req.url)?;
     let now = Utc::now();
-    let events_str = req.events.join(",");
+    let events_str = encode_subscriptions(&req.events)?;
     let model = webhook::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: sea_orm::Set(repo_id),
@@ -316,6 +388,10 @@ pub async fn update_webhook(
         Some(secret) => seal_secret(Some(secret), encryption_key)?,
         None => existing.secret_encrypted.clone(),
     };
+    let events = match req.events.as_deref() {
+        Some(events) => encode_subscriptions(events)?,
+        None => existing.events.clone(),
+    };
     let model = webhook::ActiveModel {
         id: sea_orm::Set(existing.id),
         repo_id: sea_orm::Set(existing.repo_id),
@@ -327,12 +403,7 @@ pub async fn update_webhook(
         ),
         secret_encrypted: sea_orm::Set(secret_encrypted),
         active: sea_orm::Set(req.active.unwrap_or(existing.active)),
-        events: sea_orm::Set(
-            req.events
-                .as_ref()
-                .map(|e| e.join(","))
-                .unwrap_or_else(|| existing.events.clone()),
-        ),
+        events: sea_orm::Set(events),
         created_at: sea_orm::Set(existing.created_at),
         updated_at: sea_orm::Set(Utc::now()),
     };
@@ -373,7 +444,11 @@ pub(crate) async fn trigger_event_with_tracker(
 ) -> Result<()> {
     let hooks = webhook_ops::list_active_by_repo_and_event(db, repo_id, event).await?;
 
-    for hook in hooks {
+    // The query narrowed by substring; membership is decided here.
+    for hook in hooks
+        .into_iter()
+        .filter(|hook| subscription_covers(&hook.events, event))
+    {
         // Spawn delivery in background — don't block the caller. Routed through
         // the shared delivery tracker (not a bare `tokio::spawn`) so graceful
         // shutdown can await the outbound POST + `webhook_delivery` row write
@@ -751,5 +826,169 @@ mod tests {
 
         let no_key = secret_for_delivery(Some(&stored), None);
         assert!(no_key.is_err(), "signed without an at-rest key at all");
+    }
+}
+
+/// The subscription vocabulary: what may be registered, and what a registration
+/// then matches (card_55c9cddfe9d6).
+#[cfg(test)]
+mod event_vocabulary_tests {
+    use super::*;
+
+    #[test]
+    fn a_subscription_to_an_event_that_does_not_exist_is_refused() {
+        let typo = ["pull_request.merge".to_string()];
+        let error = encode_subscriptions(&typo).expect_err("a hook that can never fire");
+        let message = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "a subscription nobody can deliver is the caller's to fix: {message}"
+        );
+        assert!(
+            message.contains("pull_request.merged"),
+            "the refusal has to name what is on offer: {message}"
+        );
+
+        // Not the caller's fault, and not refused: an empty list is a hook that
+        // is registered and subscribed to nothing, which the API has always
+        // allowed.
+        assert_eq!(encode_subscriptions(&[]).expect("empty list"), "");
+    }
+
+    #[test]
+    fn every_offered_event_registers() {
+        let all: Vec<String> = WEBHOOK_EVENTS.iter().map(|e| e.to_string()).collect();
+        let encoded = encode_subscriptions(&all).expect("the canon must register");
+        for event in WEBHOOK_EVENTS {
+            assert!(subscription_covers(&encoded, event));
+        }
+    }
+
+    /// The stored column is one joined string, and it used to be matched with
+    /// `LIKE '%<event>%'`. That made a prefix a subscription: `issue` received
+    /// all three `issue.*` events, and the first pair of names where one
+    /// contains the other would start cross-firing.
+    #[test]
+    fn a_prefix_of_an_event_name_is_not_a_subscription_to_it() {
+        assert!(!subscription_covers("issue", "issue.opened"));
+        assert!(!subscription_covers("push", "push.forced"));
+        assert!(!subscription_covers("push.forced", "push"));
+        assert!(subscription_covers("push,issue.opened", "issue.opened"));
+        assert!(subscription_covers("push", "push"));
+        assert!(!subscription_covers("", "push"));
+    }
+
+    /// The canon is a list in one file and the events are raised from another,
+    /// so "keep them in sync" is a promise no comment can keep. This reads the
+    /// source: every literal handed to a trigger function has to be a name a
+    /// hook is allowed to subscribe to, or the event exists and nobody can ask
+    /// for it — which is the same dead subscription seen from the other end.
+    #[test]
+    fn every_event_this_server_raises_is_in_the_canon() {
+        let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut raised: Vec<(String, String)> = Vec::new();
+        let mut files = vec![crate_src];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(
+                    std::fs::read_dir(&path)
+                        .expect("read source directory")
+                        .map(|entry| entry.expect("read source entry").path()),
+                );
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source file");
+            for (index, line) in source.lines().enumerate() {
+                let Some(literal) = trigger_event_literal(&source, line, index) else {
+                    continue;
+                };
+                raised.push((format!("{}:{}", path.display(), index + 1), literal));
+            }
+        }
+
+        assert!(
+            raised.len() >= WEBHOOK_EVENTS.len(),
+            "the scan found only {} trigger sites — it stopped seeing the calls it is meant to \
+             read, so it can no longer catch anything: {raised:?}",
+            raised.len()
+        );
+        let unknown: Vec<_> = raised
+            .iter()
+            .filter(|(_, event)| !is_known_event(event))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "these events are raised but cannot be subscribed to: {unknown:?}"
+        );
+    }
+
+    /// The other end of the same drift: the settings page renders a checkbox per
+    /// event, and a checkbox for a name the server never raises is a
+    /// subscription that can only ever be silent — which is the defect this card
+    /// is about, arrived at from the UI instead of from the API.
+    #[test]
+    fn the_settings_page_offers_exactly_the_events_that_exist() {
+        let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/src/routes/[owner]/[repo]/settings/webhooks/+page.svelte");
+        let source = std::fs::read_to_string(&page)
+            .unwrap_or_else(|error| panic!("read {}: {error}", page.display()));
+        let (_, rest) = source
+            .split_once("const eventOptions = [")
+            .expect("the settings page still declares its event list as `const eventOptions`");
+        let (list, _) = rest
+            .split_once(']')
+            .expect("unterminated eventOptions list");
+
+        let offered: Vec<String> = list
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim().trim_matches('\'').trim_matches('"').trim();
+                (!entry.is_empty()).then(|| entry.to_string())
+            })
+            .collect();
+
+        let mut expected: Vec<String> = WEBHOOK_EVENTS.iter().map(|e| e.to_string()).collect();
+        let mut got = offered.clone();
+        expected.sort();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "the settings page and the server disagree about which events exist"
+        );
+    }
+
+    /// The event literal of a `trigger_event(...)` / `trigger_event_with_tracker(...)`
+    /// call, whether it sits on the call line or on one of the next few.
+    ///
+    /// Deliberately literal-only: a call that passes a variable is invisible
+    /// here, and that is the honest limit of reading source — every trigger site
+    /// in this crate spells its event out, and the count assertion above is what
+    /// notices if that stops being true.
+    fn trigger_event_literal(source: &str, line: &str, index: usize) -> Option<String> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("///") {
+            return None;
+        }
+        if !line.contains("trigger_event(") && !line.contains("trigger_event_with_tracker(") {
+            return None;
+        }
+        // The name quoted rather than called — this test talks about the
+        // function it is scanning for, and so may a doc comment.
+        if line.contains("\"trigger_event") || line.contains("[`trigger_event") {
+            return None;
+        }
+        if line.contains("pub async fn") || line.contains("pub(crate) async fn") {
+            return None;
+        }
+        source.lines().skip(index).take(6).find_map(|candidate| {
+            let (_, rest) = candidate.split_once('"')?;
+            let (literal, _) = rest.split_once('"')?;
+            (!literal.is_empty() && !literal.contains('(')).then(|| literal.to_string())
+        })
     }
 }

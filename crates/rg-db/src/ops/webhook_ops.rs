@@ -30,13 +30,18 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<W
         .context("db: list webhooks by repo")
 }
 
-/// List active webhooks for a repo that listen to a given event.
+/// Active webhooks of `repo_id` whose subscription list *mentions* `event`.
+///
+/// A narrowing filter, not a verdict: `events` is one comma-joined string, and
+/// `LIKE '%<event>%'` cannot tell a list entry from a substring of one. Deciding
+/// membership is `rg_core::webhook::service::subscription_covers`'s job, and the
+/// one caller applies it to every row this returns — do not use these rows as a
+/// delivery list on their own (card_55c9cddfe9d6).
 pub async fn list_active_by_repo_and_event(
     db: &DatabaseConnection,
     repo_id: i64,
     event: &str,
 ) -> Result<Vec<Webhook>> {
-    // Events are stored comma-separated; use LIKE for matching
     WebhookEntity::find()
         .filter(webhook::Column::RepoId.eq(repo_id))
         .filter(webhook::Column::Active.eq(true))

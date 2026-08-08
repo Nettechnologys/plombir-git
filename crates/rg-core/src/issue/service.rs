@@ -9,6 +9,49 @@ use rg_db::entities::issue::{self, Model as Issue};
 use rg_db::entities::issue_comment::{self, Model as Comment};
 use rg_db::ops::{issue_comment_ops, issue_label_ops, issue_ops};
 
+// ── Milestone state ─────────────────────────────────────────────────────
+
+/// The two positions of `milestones.state`.
+///
+/// The column is a free-form string that three writers filled in and one reader
+/// filters on with exact equality, and the domain was written down only in a
+/// doc comment on the entity. So `POST /milestones {"state":"clsoed"}` answered
+/// `201 Created` and produced a milestone that appears in neither
+/// `?state=open` nor `?state=closed` — it exists and cannot be reached — while
+/// `PATCH` compared the value, silently dropped anything else, and answered
+/// `200 OK` with the milestone unchanged (card_09b2665584ed).
+///
+/// Both doors parse through here now; the importers, which translate a foreign
+/// vocabulary (`active` on GitLab) and legitimately fall back rather than fail,
+/// name their result through [`MilestoneState::as_str`] instead of a literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MilestoneState {
+    Open,
+    Closed,
+}
+
+impl MilestoneState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// Parse a state a client asked for. The error is
+    /// [`crate::error::invalid_request`] — the one type `AppError::from` turns
+    /// into a `400` — and states the rule without echoing the input.
+    pub fn parse(state: &str) -> Result<Self> {
+        match state {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            _ => Err(crate::error::invalid_request(
+                "invalid milestone state: expected one of open, closed",
+            )),
+        }
+    }
+}
+
 // ── Issue CRUD ──────────────────────────────────────────────────────────
 
 /// Public issue view: the row itself plus label names read from their one

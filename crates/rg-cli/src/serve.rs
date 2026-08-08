@@ -1027,9 +1027,18 @@ pub(crate) async fn run_serve(
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
     // `push` events to the very clients the HTTP server's sockets belong to, so
     // a second hub of its own would fan out to nobody (card_b4fefeee8abf).
-    let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> =
-        std::sync::Arc::new(rg_ci::CiEngine);
+    //
+    // The engine gets the hub and the SMTP configuration too: a pipeline that
+    // goes green can land a merge commit, and until card_85b8d59246b5 the hooks
+    // rg-ci ran for it had neither, so that merge produced no real-time event
+    // and no mail while the identical merge over REST produced both.
     let notification_hub = rg_http::ws::NotificationHub::new();
+    let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> = std::sync::Arc::new(
+        rg_ci::CiEngine::with_notifications(rg_ci::CiNotifications {
+            notifier: Some(std::sync::Arc::new(notification_hub.clone())),
+            smtp_config: smtp_config.clone(),
+        }),
+    );
     let instance_settings = rg_core::instance::InstanceSettingsCache::default();
 
     let http_config = rg_http::HttpServerConfig {

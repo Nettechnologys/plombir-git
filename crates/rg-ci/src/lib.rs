@@ -45,26 +45,67 @@ use runner::PipelineRunner;
 // Re-export for backward compatibility with any code that still imports from rg_ci.
 pub use rg_core::ci::{has_ci_config, ResumePipelineParams, TriggerPipelineParams};
 
+/// The two post-push inputs that have no home in this crate: the WebSocket hub
+/// (an `rg-http` type, reachable only through rg-core's [`PushNotifier`] seam)
+/// and the SMTP configuration.
+///
+/// A pipeline finishing here can land a merge commit on a base branch, and that
+/// move owes the same automation a push does. Everything reaching storage — the
+/// pipeline, the webhooks, the notification rows — this crate could always do
+/// on its own; the real-time `push` / `ci_triggered` events and the "pipeline
+/// triggered" email it could not, because it built its [`PostPushContext`] out
+/// of thin air with both fields `None` (card_85b8d59246b5). So the same merge
+/// was loud when it came in over REST and silent when CI made it.
+///
+/// The process wires this once at startup ([`CiEngine::with_notifications`]) and
+/// every trigger path inherits it, rather than each call site remembering to
+/// pass a hub it may not have.
+///
+/// [`PushNotifier`]: rg_core::push_hooks::PushNotifier
+/// [`PostPushContext`]: rg_core::push_hooks::PostPushContext
+#[derive(Clone, Default)]
+pub struct CiNotifications {
+    /// Real-time sink. `None` = no WebSocket hub in this process (a CLI run).
+    pub notifier: Option<std::sync::Arc<dyn rg_core::push_hooks::PushNotifier>>,
+    /// `None` = no outgoing mail configured.
+    pub smtp_config: Option<rg_core::email::SmtpConfig>,
+}
+
 /// CI engine implementation. Implements `rg_core::ci::CiTrigger` so that
 /// `rg-http` can trigger pipelines without a direct dependency on `rg-ci`.
 ///
 /// M-14: This struct decouples the HTTP layer from the CI engine crate.
-pub struct CiEngine;
+#[derive(Default)]
+pub struct CiEngine {
+    /// The hub and SMTP wiring the post-push hooks this engine spawns need.
+    /// See [`CiNotifications`].
+    notifications: CiNotifications,
+}
+
+impl CiEngine {
+    /// An engine with no real-time or mail wiring — everything that reaches
+    /// storage still runs. Right for a process that has no hub (`rg-cli` one-off
+    /// commands, tests).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An engine that fans its post-push effects out through this process's
+    /// notification hub and SMTP configuration.
+    pub fn with_notifications(notifications: CiNotifications) -> Self {
+        Self { notifications }
+    }
+}
 
 impl rg_core::ci::CiTrigger for CiEngine {
     fn has_ci_config(&self, repo_path: &std::path::Path, commit_sha: &str) -> bool {
         rg_core::ci::has_ci_config(repo_path, commit_sha)
     }
 
-    fn has_workflow_for_event(
-        &self,
-        repo_path: &std::path::Path,
-        commit_sha: &str,
-        event: &str,
-        ref_name: &str,
-        base_branch: Option<&str>,
-    ) -> bool {
-        match workflow_matches_event(repo_path, commit_sha, event, ref_name, base_branch) {
+    fn has_workflow_for_event(&self, query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
+        let repo_path = query.repo_path;
+        let event = query.event;
+        match workflow_matches_event(query) {
             Ok(matched) => matched,
             Err(error) => {
                 // Fail-closed, unlike `has_ci_config`: this gate answers "should
@@ -87,21 +128,24 @@ impl rg_core::ci::CiTrigger for CiEngine {
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
-        Box::pin(trigger_pipeline(params))
+        Box::pin(trigger_pipeline(params, &self.notifications))
     }
 
     fn resume_pipeline<'a>(
         &'a self,
         params: rg_core::ci::ResumePipelineParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(resume_pipeline(params))
+        Box::pin(resume_pipeline(params, &self.notifications))
     }
 }
 
 /// Resume an already-created pipeline. External runners only need the job to
 /// be moved back to `pending`; an internal runner is recreated from persisted
 /// pipeline state and skips terminal jobs.
-pub async fn resume_pipeline(params: ResumePipelineParams<'_>) -> Result<()> {
+pub async fn resume_pipeline(
+    params: ResumePipelineParams<'_>,
+    notifications: &CiNotifications,
+) -> Result<()> {
     if params.external_runners {
         tracing::info!(
             pipeline_id = params.pipeline_id,
@@ -119,6 +163,7 @@ pub async fn resume_pipeline(params: ResumePipelineParams<'_>) -> Result<()> {
         params.jwt_secret,
         params.encryption_key,
         params.external_url,
+        notifications,
     );
     Ok(())
 }
@@ -131,7 +176,10 @@ pub async fn resume_pipeline(params: ResumePipelineParams<'_>) -> Result<()> {
 /// 3. Checks concurrency control (if configured)
 /// 4. Creates pipeline/stage/job records in the DB
 /// 5. Spawns the pipeline runner in a background task, injecting CI_JOB_TOKEN
-pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> {
+pub async fn trigger_pipeline(
+    params: TriggerPipelineParams<'_>,
+    notifications: &CiNotifications,
+) -> Result<i64> {
     let TriggerPipelineParams {
         db,
         repo_path,
@@ -140,6 +188,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
         ref_name,
         trigger_type,
         base_branch,
+        previous_sha,
         triggered_by,
         docker_enabled,
         external_runners,
@@ -150,7 +199,14 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
     } = params;
 
     // 1. Read CI config from repo
-    let config = read_ci_config(repo_path, commit_sha, ref_name, trigger_type, base_branch)?;
+    let config = read_ci_config(
+        repo_path,
+        commit_sha,
+        ref_name,
+        trigger_type,
+        base_branch,
+        previous_sha,
+    )?;
     validate_execution_semantics(&config)?;
 
     // 2. Concurrency control
@@ -276,6 +332,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
             jwt_secret,
             encryption_key,
             external_url,
+            notifications,
         )
         .await;
         return Ok(pipeline_id);
@@ -293,6 +350,7 @@ pub async fn trigger_pipeline(params: TriggerPipelineParams<'_>) -> Result<i64> 
             jwt_secret,
             encryption_key,
             external_url,
+            notifications,
         );
     } else {
         if let Some(first_stage) =
@@ -484,6 +542,7 @@ async fn evaluate_initial_success(
     jwt_secret: Option<&str>,
     encryption_key: Option<&str>,
     external_url: Option<&str>,
+    notifications: &CiNotifications,
 ) {
     let Some(repo_root) = repo_path.parent().and_then(std::path::Path::parent) else {
         return;
@@ -496,6 +555,7 @@ async fn evaluate_initial_success(
         jwt_secret,
         encryption_key,
         external_url,
+        notifications,
     )
     .evaluate_merges_and_spawn_hooks(db, repo_id, commit_sha, None)
     .await;
@@ -509,11 +569,16 @@ async fn evaluate_initial_success(
 /// Until card_73a1ec5b32f3 both CI-completion paths here ran the merge and threw
 /// the ref move away, so that commit was seen by nothing.
 ///
-/// Two of the hooks' inputs simply do not exist in this crate: there is no
-/// WebSocket hub (`notifier: None` — the real-time `push` event is the HTTP
-/// layer's) and no SMTP configuration (`smtp_config: None` — no "pipeline
-/// triggered" email). Everything that reaches storage — the pipeline, the
-/// webhooks, the notifications — runs in full.
+/// Two of the hooks' inputs have no home in this crate — the WebSocket hub is an
+/// `rg-http` type and the SMTP configuration is the process's — so until
+/// card_85b8d59246b5 this context was assembled with both of them `None` and the
+/// merge CI made was silent where the same merge over REST was loud: no
+/// real-time `push` / `ci_triggered` event, no "pipeline triggered" email.
+/// They now arrive as [`CiNotifications`], wired once at startup, and the nested
+/// engine (the one that triggers the merge commit's own pipeline, which can
+/// cascade into another merge) inherits the same wiring rather than resetting it
+/// to `None` one hop down.
+#[allow(clippy::too_many_arguments)]
 fn post_push_context(
     repo_root: &std::path::Path,
     docker_enabled: bool,
@@ -522,6 +587,7 @@ fn post_push_context(
     jwt_secret: Option<&str>,
     encryption_key: Option<&str>,
     external_url: Option<&str>,
+    notifications: &CiNotifications,
 ) -> rg_core::push_hooks::PostPushContext {
     rg_core::push_hooks::PostPushContext {
         repo_root: repo_root.to_path_buf(),
@@ -530,12 +596,22 @@ fn post_push_context(
         allow_host_runner,
         jwt_secret: jwt_secret.map(str::to_string),
         encryption_key: encryption_key.map(str::to_string),
-        smtp_config: None,
-        ci_engine: std::sync::Arc::new(CiEngine),
+        smtp_config: notifications.smtp_config.clone(),
+        ci_engine: nested_engine(notifications),
         external_url: external_url.map(str::to_string),
-        notifier: None,
+        notifier: notifications.notifier.clone(),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
     }
+}
+
+/// The engine the hooks spawned here trigger through.
+///
+/// The merge commit those hooks produce gets a pipeline of its own, and that
+/// pipeline can unblock the next merge — so the engine one hop down must carry
+/// the same wiring, or the effects fade out on the second merge instead of at
+/// the process boundary.
+fn nested_engine(notifications: &CiNotifications) -> std::sync::Arc<CiEngine> {
+    std::sync::Arc::new(CiEngine::with_notifications(notifications.clone()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -549,8 +625,10 @@ fn spawn_internal_runner(
     jwt_secret: Option<&str>,
     encryption_key: Option<&str>,
     external_url: Option<&str>,
+    notifications: &CiNotifications,
 ) {
     let db_clone = db.clone();
+    let notifications = notifications.clone();
     let repo_path_owned = repo_path.to_path_buf();
     let jwt_secret_owned = jwt_secret.map(str::to_string);
     let encryption_key_owned = encryption_key.map(str::to_string);
@@ -564,6 +642,7 @@ fn spawn_internal_runner(
         };
         runner.set_repo_id(repo_id);
         runner.set_allow_host_runner(allow_host_runner);
+        runner.set_notifications(notifications);
         if let Some(secret) = jwt_secret_owned {
             runner.set_jwt_secret(secret);
         }
@@ -774,13 +853,21 @@ fn read_ci_config(
     ref_name: &str,
     event: &str,
     base_branch: Option<&str>,
+    previous_sha: Option<&str>,
 ) -> Result<CiConfig> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let tree = tree_at_commit(&repo, commit_sha)?;
 
     // Try Gitea Actions format first
-    let gitea = try_read_gitea_workflows(&repo, commit_sha, ref_name, event, base_branch)?;
+    let gitea = try_read_gitea_workflows(
+        &repo,
+        commit_sha,
+        ref_name,
+        event,
+        base_branch,
+        previous_sha,
+    )?;
     let workflows_untriggered = matches!(gitea, GiteaWorkflows::NoneTriggered);
     if let GiteaWorkflows::Config(config) = gitea {
         tracing::info!("Using Gitea Actions workflow from {}/", WORKFLOW_DIR);
@@ -891,6 +978,7 @@ fn try_read_gitea_workflows(
     ref_name: &str,
     event: &str,
     base_branch: Option<&str>,
+    previous_sha: Option<&str>,
 ) -> Result<GiteaWorkflows> {
     let Some(workflow_sources) = load_workflow_sources(repo, commit_sha)? else {
         // Nothing at that path in this commit: the native format is next in line.
@@ -898,6 +986,7 @@ fn try_read_gitea_workflows(
     };
 
     let match_branch = event_match_branch(repo, base_branch)?;
+    let changed = gitea_actions::ChangedPaths::of_commit(repo, previous_sha, commit_sha);
 
     let mut all_jobs: std::collections::HashMap<String, config::JobConfig> =
         std::collections::HashMap::new();
@@ -916,7 +1005,7 @@ fn try_read_gitea_workflows(
         })?;
 
         // Check if this workflow should be triggered
-        if !workflow.matches_event(event, ref_name, &match_branch) {
+        if !workflow.matches_event(event, ref_name, &match_branch, &changed) {
             continue;
         }
         let workflow = workflow
@@ -1083,24 +1172,47 @@ fn event_match_branch(repo: &gix::Repository, base_branch: Option<&str>) -> Resu
 /// A file that fails to parse cannot answer, so it counts as "not triggered" and
 /// says so in the log — the caller is deciding whether an event should produce a
 /// pipeline at all, and a broken unrelated workflow must not conjure one.
-fn workflow_matches_event(
+/// The event query in the shape the tests ask it: no previous revision, so a
+/// path filter falls back to the commit's own diff.
+#[cfg(test)]
+fn workflow_matches_event_at(
     repo_path: &std::path::Path,
     commit_sha: &str,
     event: &str,
     ref_name: &str,
     base_branch: Option<&str>,
 ) -> Result<bool> {
+    workflow_matches_event(rg_core::ci::WorkflowEventQuery {
+        repo_path,
+        commit_sha,
+        event,
+        ref_name,
+        base_branch,
+        previous_sha: None,
+    })
+}
+
+fn workflow_matches_event(query: rg_core::ci::WorkflowEventQuery<'_>) -> Result<bool> {
+    let rg_core::ci::WorkflowEventQuery {
+        repo_path,
+        commit_sha,
+        event,
+        ref_name,
+        base_branch,
+        previous_sha,
+    } = query;
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let Some(sources) = load_workflow_sources(&repo, commit_sha)? else {
         return Ok(false);
     };
     let match_branch = event_match_branch(&repo, base_branch)?;
+    let changed = gitea_actions::ChangedPaths::of_commit(&repo, previous_sha, commit_sha);
 
     for (name, yml) in sorted_workflows(&sources) {
         match gitea_actions::GiteaWorkflow::parse(yml) {
             Ok(workflow) => {
-                if workflow.matches_event(event, ref_name, &match_branch) {
+                if workflow.matches_event(event, ref_name, &match_branch, &changed) {
                     return Ok(true);
                 }
             }
@@ -1154,6 +1266,137 @@ fn get_default_branch(repo: &gix::Repository) -> Result<String> {
 }
 
 // M-14: has_ci_config moved to rg_core::ci::has_ci_config and re-exported above.
+
+/// Stand-in for `rg_http::ws::NotificationHub` — this crate cannot depend on the
+/// HTTP layer, and the seam under test is the `PushNotifier` trait anyway.
+#[cfg(test)]
+pub(crate) mod test_notifier {
+    #[derive(Default)]
+    pub(crate) struct RecordingNotifier {
+        events: std::sync::Mutex<Vec<(i64, String)>>,
+    }
+
+    impl RecordingNotifier {
+        pub(crate) fn events(&self) -> Vec<(i64, String)> {
+            self.events.lock().expect("recorder mutex").clone()
+        }
+    }
+
+    impl rg_core::push_hooks::PushNotifier for RecordingNotifier {
+        fn notify(&self, user_id: i64, event_type: &str, _data: serde_json::Value) {
+            self.events
+                .lock()
+                .expect("recorder mutex")
+                .push((user_id, event_type.to_string()));
+        }
+    }
+
+    /// A wiring bundle whose notifier is the returned recorder.
+    pub(crate) fn wiring() -> (std::sync::Arc<RecordingNotifier>, super::CiNotifications) {
+        let recorder = std::sync::Arc::new(RecordingNotifier::default());
+        let notifications = super::CiNotifications {
+            notifier: Some(recorder.clone()),
+            smtp_config: Some(rg_core::email::SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 587,
+                user: "forgekeep".into(),
+                pass: "unused".into(),
+                from: "ci@example.com".into(),
+            }),
+        };
+        (recorder, notifications)
+    }
+}
+
+/// The hooks a finished pipeline runs must reach the same sinks the HTTP layer's
+/// hooks do. Both CI-completion paths used to build their `PostPushContext` with
+/// `notifier: None` / `smtp_config: None`, so a merge that auto-merge landed on
+/// green CI produced no real-time `push` event and no mail, while the identical
+/// merge over REST produced both (card_85b8d59246b5).
+#[cfg(test)]
+mod notification_wiring_tests {
+    use super::test_notifier::wiring;
+    use super::*;
+
+    #[test]
+    fn the_completion_path_hands_its_hooks_the_process_hub_and_smtp() {
+        let (recorder, notifications) = wiring();
+
+        let context = post_push_context(
+            std::path::Path::new("/srv/repos"),
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &notifications,
+        );
+
+        let notifier = context
+            .notifier
+            .expect("a merge CI unblocks owes the same real-time events as a merge over REST");
+        notifier.notify(7, "push", serde_json::json!({}));
+        assert_eq!(recorder.events(), vec![(7, "push".to_string())]);
+        assert!(
+            context.smtp_config.is_some(),
+            "the 'CI pipeline triggered' mail is part of the same effect set"
+        );
+    }
+
+    /// The merge commit gets a pipeline of its own, and that pipeline can unblock
+    /// the next merge, so the wiring has to survive an arbitrary number of hops
+    /// rather than only the first. This pins [`nested_engine`]'s own contract;
+    /// that `post_push_context` feeds it the *real* wiring is pinned by the
+    /// notifier assertion above (both read the same argument).
+    #[test]
+    fn the_engine_the_hooks_trigger_through_keeps_the_same_wiring() {
+        let (recorder, notifications) = wiring();
+
+        let mut engine = nested_engine(&notifications);
+        for hop in 1..=3 {
+            let notifier = engine
+                .notifications
+                .notifier
+                .clone()
+                .unwrap_or_else(|| panic!("hop {hop} lost the notification hub"));
+            notifier.notify(hop, "ci_triggered", serde_json::json!({}));
+            assert!(
+                engine.notifications.smtp_config.is_some(),
+                "hop {hop} lost the SMTP configuration"
+            );
+            engine = nested_engine(&engine.notifications);
+        }
+
+        assert_eq!(
+            recorder.events(),
+            vec![
+                (1, "ci_triggered".to_string()),
+                (2, "ci_triggered".to_string()),
+                (3, "ci_triggered".to_string()),
+            ]
+        );
+    }
+
+    /// The default engine is the one a process without a hub builds, and it must
+    /// stay silent rather than pretend — the assertion above would pass on any
+    /// engine if `CiNotifications` were populated from somewhere else.
+    #[test]
+    fn an_unwired_engine_carries_no_sinks() {
+        let context = post_push_context(
+            std::path::Path::new("/srv/repos"),
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &CiEngine::new().notifications,
+        );
+        assert!(context.notifier.is_none());
+        assert!(context.smtp_config.is_none());
+    }
+}
 
 #[cfg(test)]
 mod matrix_tests {
@@ -1288,22 +1531,26 @@ mod matrix_tests {
         )
         .await
         .unwrap();
-        let pipeline_id = trigger_pipeline(TriggerPipelineParams {
-            db: &db,
-            repo_path: temp.path(),
-            repo_id: repo.id,
-            commit_sha: &sha,
-            ref_name: "refs/heads/main",
-            trigger_type: "push",
-            base_branch: None,
-            triggered_by: Some(user.id),
-            docker_enabled: false,
-            external_runners: true,
-            allow_host_runner: false,
-            jwt_secret: Some("secret"),
-            encryption_key: Some("secret"),
-            external_url: None,
-        })
+        let pipeline_id = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
         .await
         .unwrap();
         let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
@@ -1387,22 +1634,26 @@ mod matrix_tests {
             "skipped"
         );
 
-        let all_skipped_pipeline_id = trigger_pipeline(TriggerPipelineParams {
-            db: &db,
-            repo_path: temp.path(),
-            repo_id: repo.id,
-            commit_sha: &sha,
-            ref_name: "refs/heads/dev",
-            trigger_type: "push",
-            base_branch: None,
-            triggered_by: Some(user.id),
-            docker_enabled: false,
-            external_runners: true,
-            allow_host_runner: false,
-            jwt_secret: Some("secret"),
-            encryption_key: Some("secret"),
-            external_url: None,
-        })
+        let all_skipped_pipeline_id = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/dev",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
         .await
         .unwrap();
         let all_skipped_pipeline =
@@ -1517,22 +1768,26 @@ mod matrix_tests {
         .await
         .unwrap();
 
-        let error = trigger_pipeline(TriggerPipelineParams {
-            db: &db,
-            repo_path: temp.path(),
-            repo_id: repo.id,
-            commit_sha: &sha,
-            ref_name: "refs/heads/main",
-            trigger_type: "push",
-            base_branch: None,
-            triggered_by: Some(user.id),
-            docker_enabled: false,
-            external_runners: true,
-            allow_host_runner: false,
-            jwt_secret: Some("secret"),
-            encryption_key: Some("secret"),
-            external_url: None,
-        })
+        let error = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
         .await
         .unwrap_err();
         // The original failure reaches the caller — the rollback does not
@@ -1688,22 +1943,26 @@ mod matrix_tests {
         .await
         .expect("install the cancellation fault");
 
-        let error = trigger_pipeline(TriggerPipelineParams {
-            db: &db,
-            repo_path: temp.path(),
-            repo_id: repo.id,
-            commit_sha: &sha,
-            ref_name: "refs/heads/main",
-            trigger_type: "push",
-            base_branch: None,
-            triggered_by: Some(user.id),
-            docker_enabled: false,
-            external_runners: true,
-            allow_host_runner: false,
-            jwt_secret: Some("secret"),
-            encryption_key: Some("secret"),
-            external_url: None,
-        })
+        let error = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
         .await
         .unwrap_err();
 
@@ -1809,22 +2068,26 @@ mod matrix_tests {
         .await
         .unwrap();
 
-        let error = trigger_pipeline(TriggerPipelineParams {
-            db: &db,
-            repo_path: temp.path(),
-            repo_id: repo.id,
-            commit_sha: &sha,
-            ref_name: "refs/heads/main",
-            trigger_type: "manual",
-            base_branch: None,
-            triggered_by: Some(user.id),
-            docker_enabled: false,
-            external_runners: true,
-            allow_host_runner: false,
-            jwt_secret: Some("secret"),
-            encryption_key: Some("secret"),
-            external_url: None,
-        })
+        let error = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "manual",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
         .await
         .unwrap_err();
 
@@ -1866,22 +2129,26 @@ mod matrix_tests {
         .await
         .expect("install the storage fault");
 
-        let storage_error = trigger_pipeline(TriggerPipelineParams {
-            db: &db,
-            repo_path: temp.path(),
-            repo_id: repo.id,
-            commit_sha: &sha,
-            ref_name: "refs/heads/other",
-            trigger_type: "manual",
-            base_branch: None,
-            triggered_by: Some(user.id),
-            docker_enabled: false,
-            external_runners: true,
-            allow_host_runner: false,
-            jwt_secret: Some("secret"),
-            encryption_key: Some("secret"),
-            external_url: None,
-        })
+        let storage_error = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/other",
+                trigger_type: "manual",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
         .await
         .unwrap_err();
         assert!(
@@ -1941,7 +2208,8 @@ mod matrix_tests {
             .stdout_str()
             .trim()
             .to_owned();
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap();
+        let config =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap();
         let job = config.jobs.get("main/shared/build").unwrap();
         assert!(job
             .script
@@ -1952,7 +2220,7 @@ mod matrix_tests {
 
     /// Commit `files` (relative path → contents) into a fresh repo and return
     /// the temp dir plus the commit sha.
-    fn commit_repo(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
+    pub(super) fn commit_repo(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
         let temp = tempfile::tempdir().unwrap();
         for (path, contents) in files {
             let target = temp.path().join(path);
@@ -2013,7 +2281,8 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml"),
@@ -2037,7 +2306,8 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("UTF-8"),
@@ -2053,7 +2323,8 @@ mod matrix_tests {
                 as &[u8],
         )]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("setup-node"),
@@ -2068,7 +2339,8 @@ mod matrix_tests {
             b"build:\n  script: [echo ok]\n   nested: bad\n" as &[u8],
         )]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         let rendered = format!("{error}");
         assert!(
             rendered.contains(".forgekeep-ci.yml") && rendered.contains("line"),
@@ -2087,7 +2359,8 @@ mod matrix_tests {
             b"build:\n  script: [echo native]\n" as &[u8],
         )]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap();
+        let config =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap();
         assert!(config.jobs.contains_key("build"));
     }
 
@@ -2102,7 +2375,8 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap();
+        let config =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap();
         assert!(config.jobs.contains_key("build"));
         assert!(!config.jobs.keys().any(|name| name.starts_with("tags/")));
     }
@@ -2115,7 +2389,8 @@ mod matrix_tests {
                 as &[u8],
         )]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         let rendered = format!("{error}");
         assert!(
             rendered.contains(".gitea/workflows") && rendered.contains("refs/heads/main"),
@@ -2131,7 +2406,8 @@ mod matrix_tests {
     fn no_config_at_all_still_reports_no_ci_config_found() {
         let (temp, sha) = commit_repo(&[("README.md", b"nothing to build\n" as &[u8])]);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         assert!(
             error.to_string().contains("no CI config found"),
             "genuinely missing config keeps its own message: {error:#}"
@@ -2156,7 +2432,7 @@ mod matrix_tests {
             .to_owned();
         remove_loose_object(temp.path(), &object_id);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
             .expect_err("a dangling config entry must not become absent config");
         let rendered = format!("{error:#}");
         assert!(
@@ -2187,7 +2463,7 @@ mod matrix_tests {
             .to_owned();
         remove_loose_object(temp.path(), &object_id);
 
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
             .expect_err("a dangling workflow must not select the native fallback");
         let rendered = format!("{error:#}");
         assert!(
@@ -2214,22 +2490,26 @@ mod matrix_tests {
         // first query, so the connection only has to exist.
         async fn trigger(repo_path: &std::path::Path, sha: &str) -> anyhow::Error {
             let db = rg_db::connect("sqlite::memory:").await.unwrap();
-            trigger_pipeline(TriggerPipelineParams {
-                db: &db,
-                repo_path,
-                repo_id: 1,
-                commit_sha: sha,
-                ref_name: "refs/heads/main",
-                trigger_type: "manual",
-                base_branch: None,
-                triggered_by: Some(1),
-                docker_enabled: false,
-                external_runners: true,
-                allow_host_runner: false,
-                jwt_secret: Some("secret"),
-                encryption_key: Some("secret"),
-                external_url: None,
-            })
+            trigger_pipeline(
+                TriggerPipelineParams {
+                    db: &db,
+                    repo_path,
+                    repo_id: 1,
+                    commit_sha: sha,
+                    ref_name: "refs/heads/main",
+                    trigger_type: "manual",
+                    base_branch: None,
+                    previous_sha: None,
+                    triggered_by: Some(1),
+                    docker_enabled: false,
+                    external_runners: true,
+                    allow_host_runner: false,
+                    jwt_secret: Some("secret"),
+                    encryption_key: Some("secret"),
+                    external_url: None,
+                },
+                &CiNotifications::default(),
+            )
             .await
             .expect_err("a broken CI config must not build a pipeline")
         }
@@ -2322,13 +2602,13 @@ mod matrix_tests {
             (".gitea/workflows/c.yml", &workflow("third")),
         ]);
 
-        let expected = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+        let expected = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
             .unwrap()
             .stages
             .unwrap();
         assert_eq!(expected.len(), 3);
         for _ in 0..8 {
-            let stages = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+            let stages = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
                 .unwrap()
                 .stages
                 .unwrap();
@@ -2354,6 +2634,7 @@ mod matrix_tests {
             "refs/pull/1/head",
             "pull_request",
             Some("main"),
+            None,
         )
         .expect("an on: pull_request workflow must be selected by the pull_request event");
         assert!(
@@ -2364,7 +2645,8 @@ mod matrix_tests {
 
         // The same repository under `push` has nothing to offer, and says so
         // rather than claiming there is no CI config at all.
-        let error = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None).unwrap_err();
+        let error =
+            read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None).unwrap_err();
         assert!(
             error.to_string().contains("pull_request") || error.to_string().contains("triggered"),
             "the push event must report an untriggered workflow: {error:#}"
@@ -2388,6 +2670,7 @@ mod matrix_tests {
             "refs/pull/7/head",
             "pull_request",
             Some("develop"),
+            None,
         )
         .expect("a PR into develop must select the workflow filtered on develop");
         assert!(config.jobs.contains_key("pr/verify"));
@@ -2400,6 +2683,7 @@ mod matrix_tests {
             "refs/pull/7/head",
             "pull_request",
             Some("main"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -2419,7 +2703,7 @@ mod matrix_tests {
             b"on: pull_request\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n"
                 as &[u8],
         )]);
-        assert!(workflow_matches_event(
+        assert!(workflow_matches_event_at(
             workflow_repo.path(),
             &workflow_sha,
             "pull_request",
@@ -2427,7 +2711,7 @@ mod matrix_tests {
             Some("main")
         )
         .unwrap());
-        assert!(!workflow_matches_event(
+        assert!(!workflow_matches_event_at(
             workflow_repo.path(),
             &workflow_sha,
             "push",
@@ -2445,7 +2729,7 @@ mod matrix_tests {
             "the fixture must look like a repository with CI"
         );
         assert!(
-            !workflow_matches_event(
+            !workflow_matches_event_at(
                 native_repo.path(),
                 &native_sha,
                 "pull_request",
@@ -2484,8 +2768,15 @@ mod matrix_tests {
             commit_repo(&[(".gitea/workflows/pr.yml", &pull_request_workflow("release"))]);
         git(temp.path(), &["branch", "-m", "release"]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
-            .expect("the repository's own default branch must satisfy the filter");
+        let config = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/3/head",
+            "pull_request",
+            None,
+            None,
+        )
+        .expect("the repository's own default branch must satisfy the filter");
         assert!(config.jobs.contains_key("pr/verify"));
     }
 
@@ -2501,9 +2792,16 @@ mod matrix_tests {
         git(temp.path(), &["branch", "-m", "main"]);
 
         // Baseline: with a readable HEAD this repository does match.
-        read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
-            .expect("fixture must match while HEAD is intact");
-        assert!(workflow_matches_event(
+        read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/3/head",
+            "pull_request",
+            None,
+            None,
+        )
+        .expect("fixture must match while HEAD is intact");
+        assert!(workflow_matches_event_at(
             temp.path(),
             &sha,
             "pull_request",
@@ -2516,8 +2814,15 @@ mod matrix_tests {
         // no longer a ref at all.
         std::fs::write(temp.path().join(".git/refs/heads/main"), b"not a ref\n").unwrap();
 
-        let error = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
-            .expect_err("an unresolvable HEAD must not be matched as `main`");
+        let error = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/3/head",
+            "pull_request",
+            None,
+            None,
+        )
+        .expect_err("an unresolvable HEAD must not be matched as `main`");
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("HEAD"),
@@ -2525,7 +2830,7 @@ mod matrix_tests {
         );
 
         let error =
-            workflow_matches_event(temp.path(), &sha, "pull_request", "refs/pull/3/head", None)
+            workflow_matches_event_at(temp.path(), &sha, "pull_request", "refs/pull/3/head", None)
                 .expect_err("the event gate must not answer from a guessed default branch");
         assert!(format!("{error:#}").contains("HEAD"), "{error:#}");
     }
@@ -2540,8 +2845,15 @@ mod matrix_tests {
         // Points HEAD at a branch that does not exist while keeping the objects.
         git(temp.path(), &["checkout", "--orphan", "future"]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
-            .expect("an unborn HEAD names the default branch just like a born one");
+        let config = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/3/head",
+            "pull_request",
+            None,
+            None,
+        )
+        .expect("an unborn HEAD names the default branch just like a born one");
         assert!(config.jobs.contains_key("pr/verify"));
     }
 
@@ -2558,8 +2870,15 @@ mod matrix_tests {
         git(temp.path(), &["branch", "-m", "trunk"]);
         git(temp.path(), &["checkout", "--detach"]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/pull/3/head", "pull_request", None)
-            .expect("a detached HEAD keeps the documented fallback");
+        let config = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/pull/3/head",
+            "pull_request",
+            None,
+            None,
+        )
+        .expect("a detached HEAD keeps the documented fallback");
         assert!(config.jobs.contains_key("pr/verify"));
     }
 
@@ -2642,7 +2961,7 @@ mod matrix_tests {
             b"stages:\n  - test\n\ndeploy:\n  stage: test\n  timeout_seconds: -1\n  script:\n    - echo ok\n",
         )]);
 
-        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None)
+        let config = read_ci_config(temp.path(), &sha, "refs/heads/main", "push", None, None)
             .expect("a negative timeout must reach the validator, not die in the parser");
         let error = validate_execution_semantics(&config)
             .expect_err("a negative timeout must not produce a runnable pipeline");
@@ -2651,5 +2970,315 @@ mod matrix_tests {
             message.contains("deploy") && message.contains("-1"),
             "the rejection must name the job and the offending value: {message}"
         );
+    }
+}
+
+/// card_e87a1b6f9633: the Run button and Retry named events no workflow can
+/// declare, so a repository whose CI lives in `.gitea/workflows/` was told its
+/// perfectly valid file triggers nothing.
+#[cfg(test)]
+mod manual_trigger_tests {
+    use super::matrix_tests::commit_repo;
+    use super::*;
+
+    const DISPATCH_WORKFLOW: &[u8] = b"name: Manual\non:\n  workflow_dispatch:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n";
+
+    #[test]
+    fn a_bare_workflow_dispatch_trigger_is_read_as_present() {
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", DISPATCH_WORKFLOW)]);
+
+        let config = read_ci_config(
+            temp.path(),
+            &sha,
+            "refs/heads/main",
+            rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+            None,
+            None,
+        )
+        .expect("the Run button must reach the workflow that asked for it");
+        assert!(
+            config.jobs.keys().any(|name| name.contains("build")),
+            "the manual run produced no runnable job: {:?}",
+            config.jobs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `on: workflow_dispatch:` with nothing under it is the usual spelling, and
+    /// a plain `Option<Value>` reads that empty value as *absent* — which is why
+    /// the field existed and still matched nothing. The array form has to keep
+    /// working too; it went through a different branch of the matcher.
+    #[test]
+    fn every_spelling_of_the_manual_trigger_matches_and_only_that_event() {
+        for workflow in [
+            DISPATCH_WORKFLOW,
+            b"name: M\non: workflow_dispatch\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+            b"name: M\non: [push, workflow_dispatch]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+            b"name: M\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+        ] {
+            let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", workflow)]);
+            assert!(
+                workflow_matches_event_at(
+                    temp.path(),
+                    &sha,
+                    rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                    "refs/heads/main",
+                    None,
+                )
+                .expect("read the committed workflows"),
+                "a manual run must reach this workflow: {}",
+                String::from_utf8_lossy(workflow)
+            );
+        }
+
+        // …and the trigger is not a wildcard: a workflow that only asks for
+        // manual runs must stay out of the push pipeline.
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", DISPATCH_WORKFLOW)]);
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/main", None)
+                .expect("read the committed workflows"),
+            "a manual-only workflow ran on a push"
+        );
+    }
+}
+
+/// card_e1e76c3ede65: `paths`, `paths-ignore` and `tags-ignore` were parsed and
+/// then read by nobody.
+///
+/// The three are driven through `read_ci_config` rather than the matcher alone,
+/// because the half that was missing is not the comparison — it is that the
+/// commit's diff never reached it.
+#[cfg(test)]
+mod trigger_filter_tests {
+    use super::matrix_tests::commit_repo;
+    use super::*;
+
+    fn workflow(on: &str) -> Vec<u8> {
+        format!("name: W\non:\n{on}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n")
+            .into_bytes()
+    }
+
+    /// Commit `files` on top of the fixture repo and return (repo, before, after).
+    fn commit_again(temp: &tempfile::TempDir, files: &[(&str, &[u8])]) -> (String, String) {
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let before = git
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        for (path, contents) in files {
+            let target = temp.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        assert!(git
+            .run(&["add", "-A"], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["commit", "-m", "change"], Some(temp.path()))
+            .unwrap()
+            .success());
+        let after = git
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        (before, after)
+    }
+
+    /// `paths:` is a *narrowing* filter, so ignoring it did not skip work the
+    /// author asked for — it ran work the author asked to skip. On a monorepo
+    /// with a heavy `paths: [backend/**]` workflow, every README commit paid for
+    /// a full run.
+    #[test]
+    fn a_paths_filter_selects_only_the_commits_that_touch_those_paths() {
+        let (temp, _) = commit_repo(&[
+            (
+                ".gitea/workflows/backend.yml",
+                &workflow("  push:\n    paths:\n      - backend/**\n"),
+            ),
+            ("backend/main.rs", b"fn main() {}\n"),
+            ("README.md", b"docs\n"),
+        ]);
+
+        let (before, after) = commit_again(&temp, &[("README.md", b"docs, edited\n")]);
+        let error = read_ci_config(
+            temp.path(),
+            &after,
+            "refs/heads/main",
+            "push",
+            None,
+            Some(&before),
+        )
+        .expect_err("a commit outside `paths:` must not select this workflow");
+        assert!(
+            format!("{error:#}").contains("triggered"),
+            "the refusal must say the workflow sat this event out: {error:#}"
+        );
+
+        let (before, after) = commit_again(&temp, &[("backend/main.rs", b"fn main() { }\n")]);
+        let config = read_ci_config(
+            temp.path(),
+            &after,
+            "refs/heads/main",
+            "push",
+            None,
+            Some(&before),
+        )
+        .expect("a commit inside `paths:` must select the workflow");
+        assert!(config.jobs.keys().any(|name| name.contains("build")));
+    }
+
+    #[test]
+    fn a_paths_ignore_filter_skips_only_commits_that_change_nothing_else() {
+        let (temp, _) = commit_repo(&[
+            (
+                ".gitea/workflows/code.yml",
+                &workflow("  push:\n    paths-ignore:\n      - docs/**\n      - '*.md'\n"),
+            ),
+            ("docs/guide.md", b"guide\n"),
+            ("src/main.rs", b"fn main() {}\n"),
+        ]);
+
+        let (before, after) = commit_again(&temp, &[("docs/guide.md", b"guide v2\n")]);
+        assert!(
+            read_ci_config(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(&before)
+            )
+            .is_err(),
+            "a docs-only commit must not run a `paths-ignore: [docs/**]` workflow"
+        );
+
+        // One file outside the ignore list is enough — that is GitHub's rule,
+        // not "no file inside it".
+        let (before, after) = commit_again(
+            &temp,
+            &[
+                ("docs/guide.md", b"guide v3\n"),
+                ("src/main.rs", b"fn main(){}\n"),
+            ],
+        );
+        assert!(
+            read_ci_config(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(&before)
+            )
+            .is_ok(),
+            "a commit touching code as well as docs must still run"
+        );
+    }
+
+    /// The filter's whole point is that the push range is wider than the last
+    /// commit: a fast-forward of two commits, only the first of which touches
+    /// the watched path, still has to run.
+    #[test]
+    fn the_filter_reads_the_whole_push_not_just_its_head_commit() {
+        let (temp, _) = commit_repo(&[
+            (
+                ".gitea/workflows/backend.yml",
+                &workflow("  push:\n    paths:\n      - backend/**\n"),
+            ),
+            ("backend/main.rs", b"fn main() {}\n"),
+            ("README.md", b"docs\n"),
+        ]);
+
+        let (before, _) = commit_again(&temp, &[("backend/main.rs", b"fn main() { /* 1 */ }\n")]);
+        let (_, after) = commit_again(&temp, &[("README.md", b"docs again\n")]);
+
+        assert!(
+            read_ci_config(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(&before)
+            )
+            .is_ok(),
+            "the push touched backend/ in its first commit; only its head did not"
+        );
+        // …and with no previous revision to compare against, the fallback is the
+        // head commit's own diff, which here says "README only".
+        assert!(
+            read_ci_config(temp.path(), &after, "refs/heads/main", "push", None, None).is_err(),
+            "the documented fallback is the commit's own diff"
+        );
+    }
+
+    #[test]
+    fn a_tags_ignore_filter_keeps_the_workflow_off_those_tags() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/release.yml",
+            &workflow("  push:\n    tags:\n      - 'v*'\n    tags-ignore:\n      - '*-rc*'\n"),
+        )]);
+
+        assert!(
+            workflow_matches_event_at(temp.path(), &sha, "push", "refs/tags/v1.0.0", None)
+                .expect("read workflows"),
+            "a release tag must still run"
+        );
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/tags/v1.0.0-rc1", None)
+                .expect("read workflows"),
+            "`tags-ignore` was parsed and read by nobody"
+        );
+        // A branch push is not "a tag that was not ignored": the exclusion only
+        // has a say over refs the tag half of the filter is about.
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/main", None)
+                .expect("read workflows"),
+            "a `tags:` filter still excludes branch pushes"
+        );
+    }
+
+    /// The ref patterns the old ladder of `starts_with` / `ends_with` special
+    /// cases silently answered `false` to. Both shapes are ordinary: `**` under
+    /// a directory, and a star at each end — which is how every `tags-ignore`
+    /// for pre-releases is written.
+    #[test]
+    fn ref_patterns_with_a_star_in_the_middle_match() {
+        use crate::gitea_actions::match_glob_for_test as m;
+        assert!(m("releases/1.0", "releases/**"));
+        assert!(m("releases/1.0/hotfix", "releases/**"));
+        assert!(!m("releases", "releases/**"));
+        assert!(m("v1.0.0-rc1", "*-rc*"));
+        assert!(!m("v1.0.0", "*-rc*"));
+        assert!(m("v1.0.0", "v*"));
+        assert!(m("main", "*"));
+        // `*` stops at the separator, `**` does not — GitHub's rule for refs as
+        // well as for paths.
+        assert!(!m("feature/x", "*"));
+        assert!(m("feature/x", "**"));
+        assert!(m("main", "main"));
+        assert!(!m("maintenance", "main"));
+    }
+
+    #[test]
+    fn path_patterns_follow_the_separator_rules() {
+        use crate::gitea_actions::match_path_pattern_for_test as m;
+        assert!(m("backend/main.rs", "backend/**"));
+        assert!(m("backend/api/v1/mod.rs", "backend/**"));
+        assert!(m("backend/main.rs", "backend/"));
+        assert!(!m("backendish/main.rs", "backend/**"));
+        // A single `*` stops at the separator; `**` does not.
+        assert!(m("README.md", "*.md"));
+        assert!(!m("docs/README.md", "*.md"));
+        assert!(m("docs/README.md", "**/*.md"));
+        assert!(m("README.md", "**/*.md"));
+        assert!(m("src/a/b/c.rs", "src/**/*.rs"));
+        assert!(m("a.rs", "?.rs"));
+        assert!(!m("ab.rs", "?.rs"));
+        assert!(m("exact/path.rs", "exact/path.rs"));
     }
 }

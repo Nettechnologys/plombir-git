@@ -22,6 +22,91 @@ const CI_JOB_TOKEN_GRACE_SECS: i64 = 300;
 /// sources and report back.
 const CI_JOB_TOKEN_MIN_LIFETIME_SECS: i64 = 60;
 
+/// The event name a manual pipeline run carries.
+///
+/// `pipeline.trigger_type` is not a label for the database — it is the event
+/// the workflow matcher is asked about, and the same string reaches the job as
+/// `CI_EVENT` / `${{ github.event_name }}`. The Run button used to invent
+/// `"manual"`, which no `on:` clause can name, so for a repository whose CI
+/// lives in `.gitea/workflows/` it always answered "no workflow is triggered by
+/// event manual" — for a completely valid file (card_e87a1b6f9633).
+/// `workflow_dispatch` is what that event is called everywhere else.
+pub const WORKFLOW_DISPATCH_EVENT: &str = "workflow_dispatch";
+
+/// Every event a pipeline may be created under.
+///
+/// The vocabulary is `Workflow::matches_event`'s, not this list's — the list
+/// exists so that a producer inventing a name of its own is caught by
+/// `every_event_a_pipeline_is_created_under_is_one_a_workflow_can_declare` in
+/// `rg-ci` rather than by a user wondering why their workflow never ran. Three
+/// producers have already made exactly that mistake (`suggestion`, `manual`,
+/// `retry`), and each failed the same way: a workflow file that is perfectly
+/// valid, and no pipeline.
+pub const PIPELINE_EVENTS: [&str; 4] = [
+    "push",
+    crate::pull_request::ci::PULL_REQUEST_EVENT,
+    "merge_group",
+    WORKFLOW_DISPATCH_EVENT,
+];
+
+/// The outcome a runner may report for a job it took.
+///
+/// `pipeline_job.status` is a string column whose domain was expressed nowhere:
+/// the writer declared it in a comment (`status: String, // success | failure |
+/// error`) and the readers spelled out literal lists. So
+/// `POST /runners/{id}/jobs/{job_id}/finish` with `{"status":"succes"}` answered
+/// `200 OK`, stored the typo, and every later roll-up read it as "still
+/// running" — the stage and the pipeline hung in `running` forever, required
+/// checks on the PR never unblocked, and nothing anywhere logged a problem
+/// (card_39bf6a755499).
+///
+/// Deliberately narrower than the column: `skipped` and `canceled` are the
+/// server's own words for work it decided not to run, and a runner reporting
+/// them would be describing a decision it did not make — the same line
+/// `mirror.status` draws between the operator's switch and the sweep's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Success,
+    /// Two spellings, both already in the column: the bundled runner reports
+    /// `failure` while the embedded one writes `failed`. Accepting only one of
+    /// them would reject a runner that copied the other, so both parse — and
+    /// each is stored as it arrived, since the readers already treat them alike.
+    Failure,
+    Failed,
+    /// The job could not be executed at all (no image, timeout, runner fault),
+    /// as opposed to a job that ran and came back non-zero.
+    Error,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Failed => "failed",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse an outcome reported over the runner API.
+    ///
+    /// The error is [`crate::error::invalid_request`], the one type
+    /// `AppError::from` turns into a `400`, and its message states the rule
+    /// without echoing the input back.
+    pub fn parse_runner_report(status: &str) -> Result<Self> {
+        match status {
+            "success" => Ok(Self::Success),
+            "failure" => Ok(Self::Failure),
+            "failed" => Ok(Self::Failed),
+            "error" => Ok(Self::Error),
+            _ => Err(crate::error::invalid_request(
+                "invalid job status: a runner reports one of success, failure, failed, error \
+                 (`skipped` and `canceled` are decided by the server, not reported)",
+            )),
+        }
+    }
+}
+
 /// Whether a declared per-job timeout falls inside the accepted range.
 ///
 /// The single authority for that range. It used to be spelled out separately in
@@ -116,6 +201,17 @@ pub struct TriggerPipelineParams<'a> {
     /// wrong for a PR into `develop`. `None` keeps the old fallback and is the
     /// right answer for events that have no target branch (a push, a manual run).
     pub base_branch: Option<&'a str>,
+    /// Where the ref stood before this event, for the `paths:` / `paths-ignore:`
+    /// filters — they ask *which files changed*, and that is a diff, not a
+    /// property of the new commit alone.
+    ///
+    /// `None` falls back to the commit's first parent, which is exact for a
+    /// merge commit or a single-commit push and an under-approximation for a
+    /// fast-forward of several. The push transports know the real answer and
+    /// pass it; a producer that has no previous revision (a manual run, a PR
+    /// trigger) leaves it `None`. The zero sha — the git protocol's "this ref
+    /// did not exist" — is treated the same as `None`.
+    pub previous_sha: Option<&'a str>,
     pub triggered_by: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,
@@ -152,6 +248,24 @@ pub struct ResumePipelineParams<'a> {
     pub external_url: Option<&'a str>,
 }
 
+/// The question [`CiTrigger::has_workflow_for_event`] answers.
+///
+/// A struct rather than five positional arguments because the gate and
+/// [`TriggerPipelineParams`] have to agree on every one of them: the gate that
+/// takes fewer inputs than the matcher it stands in front of is a gate that
+/// answers a different question, which is how `previous_sha` would have gone
+/// missing here while the trigger had it.
+pub struct WorkflowEventQuery<'a> {
+    pub repo_path: &'a Path,
+    pub commit_sha: &'a str,
+    pub event: &'a str,
+    pub ref_name: &'a str,
+    /// See [`TriggerPipelineParams::base_branch`].
+    pub base_branch: Option<&'a str>,
+    /// See [`TriggerPipelineParams::previous_sha`].
+    pub previous_sha: Option<&'a str>,
+}
+
 /// Trait for CI pipeline triggering, implemented by `rg-ci`.
 ///
 /// M-14: This trait decouples `rg-http` from `rg-ci`. The HTTP layer
@@ -171,14 +285,11 @@ pub trait CiTrigger: Send + Sync {
     ///
     /// `base_branch` is the PR's target branch (see
     /// [`TriggerPipelineParams::base_branch`]); `None` for events without one.
-    fn has_workflow_for_event(
-        &self,
-        repo_path: &Path,
-        commit_sha: &str,
-        event: &str,
-        ref_name: &str,
-        base_branch: Option<&str>,
-    ) -> bool;
+    /// `previous_sha` is the same value the trigger takes (see
+    /// [`TriggerPipelineParams::previous_sha`]) and for the same reason: this
+    /// gate has to answer with the *same* filters the trigger will apply, or it
+    /// refuses a workflow the trigger would have run — or the other way round.
+    fn has_workflow_for_event(&self, query: WorkflowEventQuery<'_>) -> bool;
 
     /// Trigger a CI pipeline. Returns the pipeline ID.
     fn trigger_pipeline<'a>(
