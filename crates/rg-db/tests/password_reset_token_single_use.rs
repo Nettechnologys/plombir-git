@@ -204,6 +204,62 @@ async fn a_first_spend_lands_and_spent_or_expired_links_are_refused() {
     );
 }
 
+/// card_dc5ea612d97a: the hashes of dead reset links do not outlive their window.
+///
+/// `delete_expired` promised "can be called periodically" and had no caller, so
+/// every "forgot my password" that was never followed through left its row in
+/// the table for good. `create` sweeps on the way past now — the same shape
+/// `webauthn_ceremony_ops::spend` uses, and for the same reason: a sweep that
+/// depends on somebody remembering to start a loop is a comment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issuing_a_link_drops_the_links_that_can_no_longer_be_spent() {
+    let (db, _temp, user_id) = setup("retention").await;
+
+    // Two dead links and one that is still inside its window. `issue` goes
+    // through `create`, so each call also sweeps — which is why the live one is
+    // planted last and the ids are read before the next call.
+    let stale_one = issue(&db, user_id, "stale1", -30).await;
+    assert!(
+        exists(&db, stale_one).await,
+        "the sweep runs before the insert, so a link cannot delete itself"
+    );
+
+    let stale_two = issue(&db, user_id, "stale2", -1).await;
+    assert!(
+        !exists(&db, stale_one).await,
+        "issuing a link must drop the expired rows that were already there"
+    );
+
+    let live = issue(&db, user_id, "live", 15).await;
+    assert!(
+        !exists(&db, stale_two).await,
+        "an expired link survived the next issue"
+    );
+    assert!(
+        exists(&db, live).await,
+        "the link that was just issued must survive its own sweep"
+    );
+
+    // Non-vacuity in the other direction: a live link is not swept either, so
+    // the filter is about the clock and not about "delete everything older".
+    let second_live = issue(&db, user_id, "live2", 15).await;
+    assert!(
+        exists(&db, live).await,
+        "a link still inside its window was swept away"
+    );
+    assert!(exists(&db, second_live).await);
+}
+
+/// Whether the row is still in the table at all.
+async fn exists(db: &DatabaseConnection, token_id: i64) -> bool {
+    rg_db::entities::password_reset_token::Entity::find()
+        .filter(rg_db::entities::password_reset_token::Column::Id.eq(token_id))
+        .one(db)
+        .await
+        .expect("look the link up")
+        .is_some()
+}
+
 /// `futures::future::join_all` without taking a dependency on `futures` for one
 /// call: poll the futures together by handing them to the runtime as tasks.
 async fn join_all<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>

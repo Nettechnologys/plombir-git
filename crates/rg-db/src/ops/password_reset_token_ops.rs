@@ -9,12 +9,36 @@ use sea_orm::{
 use crate::entities::password_reset_token;
 
 /// Create a new password reset token record.
+///
+/// Expired rows are dropped on the way past, before the insert. This is the
+/// only statement that grows the table, so sweeping here bounds it by the links
+/// still inside their fifteen-minute window — on every instance, without a
+/// background loop that has to be started, configured and shut down.
+///
+/// That is deliberate rather than convenient. [`delete_expired`] carried the
+/// doc comment "can be called periodically" and had no caller at all
+/// (`card_dc5ea612d97a`), so hashes of password-reset material sat in the table
+/// forever for every user who never opened the mail. The neighbour that hit the
+/// same wall first — [`crate::ops::webauthn_ceremony_ops::spend`] — already
+/// records this shape as the answer, and names *this* function as the
+/// cautionary tale it was avoiding.
+///
+/// A failing sweep is propagated rather than swallowed: the delete and the
+/// insert go to the same table on the same connection, so a database too unwell
+/// for one is too unwell for the other, and a caller told "your reset link was
+/// created" must not be told it about a row that was never written.
+///
+/// One consequence worth knowing when writing tests: planting an already-expired
+/// row and then creating another link removes the first. Plant the expired one
+/// last, or assert on it before the next `create`.
 pub async fn create(
     db: &DatabaseConnection,
     user_id: i64,
     token_hash: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<password_reset_token::Model, sea_orm::DbErr> {
+    delete_expired(db).await?;
+
     let model = password_reset_token::ActiveModel {
         user_id: Set(user_id),
         token_hash: Set(token_hash.to_string()),
@@ -77,7 +101,13 @@ pub async fn invalidate_user_tokens(
     Ok(())
 }
 
-/// Clean up expired tokens (can be called periodically).
+/// Drop the rows of reset links that can no longer be spent.
+///
+/// Called by [`create`] itself — see the note there for why it is not a
+/// background sweep. `used` is not part of the filter on purpose: a spent link
+/// inside its window is already removed by [`invalidate_user_tokens`], and
+/// widening this one to "spent or expired" would make it delete rows the
+/// caller's own transaction may still be looking at.
 pub async fn delete_expired(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
     let result = password_reset_token::Entity::delete_many()
         .filter(password_reset_token::Column::ExpiresAt.lt(Utc::now()))
