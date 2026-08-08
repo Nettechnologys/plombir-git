@@ -335,6 +335,27 @@ for (const [handler, annotation] of [...annotations].sort()) {
   }
 }
 
+// ── The third state: annotated, but neither mounted nor documented ────────
+//
+// The two loops above compare `mounted` against `documented`, so a handler that
+// is in NEITHER set is invisible to both. `api::ai::ai_index_repository` sat in
+// exactly that gap: a complete handler carrying a full `#[utoipa::path(post,
+// …)]` annotation, absent from the router and absent from `paths(...)` — a door
+// described but never cut, and the write half of a search feature whose read
+// half was live (card_928d72df493a). Nothing here was wrong by the old rules,
+// which is precisely why it survived.
+//
+// The annotation is what makes this checkable: writing one is a claim that the
+// handler serves an endpoint, and an unmounted handler makes that claim false.
+for (const [handler, annotation] of [...annotations].sort()) {
+  if (mounted.has(handler) || documented.has(handler)) continue;
+  failures.push(
+    `${handler} carries a #[utoipa::path(...)] annotation (${annotation.file}:${annotation.line}) but is ` +
+      'neither mounted by the route table nor listed in paths(...) — the endpoint is described and does ' +
+      'not exist. Mount it and document it, or delete the handler together with its annotation.',
+  );
+}
+
 // ── The third declaration: operation input ────────────────────────────────
 //
 // `utoipa` does not infer these inputs in this crate. Without the declaration,

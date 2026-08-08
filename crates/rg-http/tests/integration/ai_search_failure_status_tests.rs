@@ -218,9 +218,8 @@ async fn a_failed_code_search_classifies_as_a_retryable_outage() {
 ///
 /// This is the guard that was red before the fix, and the one that stays useful
 /// afterwards — the next handler added to this file cannot quietly reintroduce
-/// the same wrapper, and neither can `ai_index_repository`, whose identical
-/// stringification would ship the moment its route is mounted
-/// (card_928d72df493a).
+/// the same wrapper. `ai_index_repository` is held to it for the same reason and
+/// now actually serves traffic: its route was mounted with card_928d72df493a.
 #[test]
 fn ai_handlers_reach_the_shared_error_classifier() {
     let source = include_str!("../../src/api/ai.rs");

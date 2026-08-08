@@ -2254,6 +2254,14 @@ pub(crate) fn build_all_routes(
             "/ai/repos/{owner}/{name}/search/code",
             api::ai::ai_search_code,
         )
+        // The write half of the pair above: `ai_search_code` reads `code_fts`,
+        // this is the only thing that fills it over HTTP. `RepoWrite` because
+        // indexing replaces the repository's whole snapshot.
+        .post(
+            RepoWrite,
+            "/ai/repos/{owner}/{name}/index",
+            api::ai::ai_index_repository,
+        )
         // ── WebSocket ──────────────────────────────────────────────────────
         .get(
             WS_SESSION,

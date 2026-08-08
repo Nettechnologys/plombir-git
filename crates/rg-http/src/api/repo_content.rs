@@ -241,7 +241,7 @@ pub async fn list_tree(
 /// can't be opened or `HEAD` can't be read at all, the state is unknown, not
 /// empty — we log why and return false so the caller surfaces the real error
 /// instead of rendering a healthy-looking empty repo (card_6f2a9ab1e623).
-fn is_empty_repo(repo_path: &std::path::Path) -> bool {
+pub(crate) fn is_empty_repo(repo_path: &std::path::Path) -> bool {
     let repo = match gix::open(repo_path) {
         Ok(repo) => repo,
         Err(e) => {

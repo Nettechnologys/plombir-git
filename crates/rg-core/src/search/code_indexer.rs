@@ -194,45 +194,55 @@ impl CodeIndexer {
         repo_path: &Path,
         ref_name: &str,
     ) -> Result<usize> {
-        let repo = gix::open(repo_path)
-            .with_context(|| format!("Failed to open repository: {}", repo_path.display()))?;
+        // The whole Git traversal happens inside this block so that no `gix`
+        // value is still alive at the `.await` below. `gix::Repository` holds a
+        // `RefCell` and is therefore `!Sync`, which makes any future that keeps
+        // one across a suspension point `!Send` — and axum only serves `Send`
+        // futures. That is what kept the HTTP indexing endpoint unmountable
+        // (card_928d72df493a); the CLI never noticed because `block_on` has no
+        // such bound. Ending the borrow before the write is what makes the same
+        // function usable from both callers.
+        let entries = {
+            let repo = gix::open(repo_path)
+                .with_context(|| format!("Failed to open repository: {}", repo_path.display()))?;
 
-        let commit_id = repo
-            .rev_parse_single(ref_name)
-            .with_context(|| format!("Failed to resolve ref: {}", ref_name))?;
+            let commit_id = repo
+                .rev_parse_single(ref_name)
+                .with_context(|| format!("Failed to resolve ref: {}", ref_name))?;
 
-        let commit = repo
-            .find_commit(commit_id)
-            .with_context(|| format!("Failed to find commit: {}", commit_id))?;
+            let commit = repo
+                .find_commit(commit_id)
+                .with_context(|| format!("Failed to find commit: {}", commit_id))?;
 
-        let decoded = commit
-            .decode()
-            .with_context(|| "Failed to decode commit".to_string())?;
-        let tree_oid = decoded.tree();
+            let decoded = commit
+                .decode()
+                .with_context(|| "Failed to decode commit".to_string())?;
+            let tree_oid = decoded.tree();
 
-        let tree = repo
-            .find_tree(tree_oid)
-            .with_context(|| format!("Failed to find tree: {}", tree_oid))?;
+            let tree = repo
+                .find_tree(tree_oid)
+                .with_context(|| format!("Failed to find tree: {}", tree_oid))?;
 
-        let mut entries: Vec<IndexEntry> = Vec::new();
-        let mut visited = HashSet::new();
-        self.collect_tree_entries(
-            &repo,
-            &tree,
-            tree_oid,
-            repo_id,
-            PathBuf::new(),
-            &mut entries,
-            &mut visited,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to traverse repository {} at ref '{}'",
-                repo_path.display(),
-                ref_name
+            let mut entries: Vec<IndexEntry> = Vec::new();
+            let mut visited = HashSet::new();
+            self.collect_tree_entries(
+                &repo,
+                &tree,
+                tree_oid,
+                repo_id,
+                PathBuf::new(),
+                &mut entries,
+                &mut visited,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "Failed to traverse repository {} at ref '{}'",
+                    repo_path.display(),
+                    ref_name
+                )
+            })?;
+            entries
+        };
 
         let count = entries.len();
         // Do not discard a previously healthy index until the complete tree has
@@ -374,7 +384,7 @@ impl CodeIndexer {
         clippy::too_many_arguments,
         reason = "the traversal keeps repository, tree identity, output, and cycle state explicit"
     )]
-    async fn collect_tree_entries(
+    fn collect_tree_entries(
         &self,
         repo: &gix::Repository,
         tree: &gix::Tree<'_>,
@@ -387,8 +397,7 @@ impl CodeIndexer {
         let mut stack: Vec<(gix::ObjectId, PathBuf)> = Vec::new();
         self.collect_tree(
             repo, tree, tree_oid, repo_id, base_path, entries, visited, &mut stack,
-        )
-        .await?;
+        )?;
         while let Some((tree_oid, path)) = stack.pop() {
             let object = repo.find_object(tree_oid).with_context(|| {
                 format!(
@@ -402,8 +411,7 @@ impl CodeIndexer {
             })?;
             self.collect_tree(
                 repo, &tree, tree_oid, repo_id, path, entries, visited, &mut stack,
-            )
-            .await?;
+            )?;
         }
         Ok(())
     }
@@ -411,7 +419,7 @@ impl CodeIndexer {
     /// Collect entries from a single tree into the entries Vec.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::clone_on_copy)]
-    async fn collect_tree(
+    fn collect_tree(
         &self,
         repo: &gix::Repository,
         tree: &gix::Tree<'_>,

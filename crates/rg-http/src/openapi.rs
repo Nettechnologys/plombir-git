@@ -562,6 +562,7 @@ pub(crate) fn stamp_security(
         crate::api::ai::ai_list_prs,
         crate::api::ai::ai_repo_tree,
         crate::api::ai::ai_search_code,
+        crate::api::ai::ai_index_repository,
         // Mirrors
         crate::api::mirrors::create_mirror,
         crate::api::mirrors::get_mirror,

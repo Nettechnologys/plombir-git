@@ -12,7 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::repo_access::RepoRead;
+use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
 use sea_orm::{ConnectionTrait, Statement};
@@ -359,6 +359,17 @@ pub struct IndexResponse {
 }
 
 /// POST /api/v1/ai/repos/{owner}/{name}/index
+///
+/// The write half of the AI code-search surface. `ai_search_code` reads
+/// `code_fts`, and until this door was mounted nothing outside the server's own
+/// shell could fill it: the only producer was the `forgekeep index-repo` CLI
+/// command, so a hosted instance answered every AI code search out of an index
+/// that could never be built (card_928d72df493a).
+///
+/// `RepoWrite`, not `RepoRead`: indexing replaces the repository's entire
+/// `code_fts` snapshot. Read access is the wrong question to ask of a caller
+/// who is about to rewrite stored rows, and this is also a whole-tree traversal
+/// — not something a reader of a public repository gets to trigger.
 #[utoipa::path(
     post,
     path = "/ai/repos/{owner}/{name}/index",
@@ -367,7 +378,9 @@ pub struct IndexResponse {
         ("name" = String, Path, description = "Repository name"),
     ),
     responses(
-        (status = 200, description = "Indexing triggered successfully", body = IndexResponse),
+        (status = 200, description = "Indexing completed", body = IndexResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Repository write access required"),
         (status = 404, description = "Repository not found"),
         (status = 500, description = "Indexing error"),
     ),
@@ -376,18 +389,23 @@ pub struct IndexResponse {
 pub async fn ai_index_repository(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
-    RepoRead { repo }: RepoRead,
-    Json(_body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    // Resolve repository
-
+    RepoWrite { repo, .. }: RepoWrite,
+) -> axum::response::Response {
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
     if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
         return AppError::from(e).into_response();
     }
 
-    // Placeholder - will call indexer later
-    // Actually call the indexer
+    // A repository nobody has pushed to yet has an unborn HEAD, and the indexer
+    // resolves the default branch before it walks anything — so handing it an
+    // empty repository turns a healthy state into a `500`. Answering "indexed
+    // nothing" is both true and the same reading the contents API gives an
+    // unborn HEAD. The index itself is left alone: an empty answer here is
+    // "there is no snapshot to take", not "replace the snapshot with nothing".
+    if crate::api::repo_content::is_empty_repo(&repo_path) {
+        return (StatusCode::OK, Json(IndexResponse { indexed_files: 0 })).into_response();
+    }
+
     let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone());
     match indexer
         .index_repository(repo.id, &repo_path, &repo.default_branch)
@@ -403,8 +421,6 @@ pub async fn ai_index_repository(
         // Same boundary, same rule as `ai_search_code`: `index_repository`
         // writes every indexed file into `code_fts`, so a pool outage mid-index
         // is a `DbErr` under the anyhow chain and has to stay retryable.
-        // (Whether this handler is reachable at all is a separate question —
-        // it is not mounted, tracked as dead wiring in card_928d72df493a.)
         Err(e) => AppError::from(e).into_response(),
     }
 }

@@ -24,6 +24,7 @@ mod admin_runner_tests;
 mod admin_settings_tests;
 mod admin_sso_audit_tests;
 mod admin_user_tests;
+mod ai_index_repository_tests;
 mod ai_limit_tests;
 mod ai_search_failure_status_tests;
 mod anchored_scope_sweep_tests;
