@@ -1242,12 +1242,26 @@ pub async fn settle_pipeline_if_active(
 }
 
 /// Resolve concurrency group template variables.
-/// Supports: ${{ ref }}, ${{ branch }}
+///
+/// Supports `${{ ref }}` / `${{ branch }}` — the `.forgekeep-ci.yml` spelling —
+/// plus the two Actions names that mean exactly the same thing. A workflow in
+/// `.gitea/workflows/` has already had its full `${{ github.* }}` context
+/// expanded by `gitea_actions::expand_concurrency_group`, so this pass is a
+/// no-op for it; the aliases are here for the author of a native config who
+/// writes the spelling they know from GitHub. Getting a group *wrong* is not a
+/// cosmetic miss — an unexpanded template is a literal that every ref of the
+/// repository shares — so `trigger_pipeline` refuses a group that still carries
+/// an expression after this pass rather than serializing on it.
 pub fn resolve_concurrency_group(template: &str, ref_name: &str) -> String {
-    let branch = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+    let branch = ref_name
+        .strip_prefix("refs/heads/")
+        .or_else(|| ref_name.strip_prefix("refs/tags/"))
+        .unwrap_or(ref_name);
     template
         .replace("${{ ref }}", ref_name)
         .replace("${{ branch }}", branch)
+        .replace("${{ github.ref }}", ref_name)
+        .replace("${{ github.ref_name }}", branch)
 }
 
 /// One column, several readers — and for a while they disagreed about what

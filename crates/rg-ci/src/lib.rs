@@ -168,6 +168,40 @@ pub async fn resume_pipeline(
     Ok(())
 }
 
+/// The group this trigger serializes on, refusing one that is not fully
+/// resolved.
+///
+/// One check above both dialects rather than one per parser. A group that still
+/// carries a `${{ … }}` this engine cannot expand is a **literal**, and a
+/// literal group is shared by every ref of the repository — under
+/// `cancel_in_progress` that is a standing order to cancel whatever else is
+/// running. The canonical GitHub recipe
+/// `${{ github.workflow }}-${{ github.head_ref || github.ref }}` lands here
+/// because of the `||`, and it has to land loudly: silently degrading it to "no
+/// concurrency" is how two deploys end up running at once, which is the very
+/// thing the block was written to prevent.
+fn resolved_concurrency_group(
+    concurrency: Option<&config::ConcurrencyConfig>,
+    ref_name: &str,
+) -> Result<Option<String>> {
+    let Some(concurrency) = concurrency else {
+        return Ok(None);
+    };
+    let group = rg_db::ops::pipeline_ops::resolve_concurrency_group(&concurrency.group, ref_name);
+    if group.contains("${{") {
+        return Err(rg_core::error::invalid_request(format!(
+            "concurrency.group resolved to '{group}', which still contains an expression this \
+             engine cannot evaluate. A group may use ${{{{ github.ref }}}}, \
+             ${{{{ github.ref_name }}}}, ${{{{ github.workflow }}}}, ${{{{ github.sha }}}}, \
+             ${{{{ github.event_name }}}}, ${{{{ github.repository }}}}, \
+             ${{{{ github.repository_owner }}}} — and ${{{{ ref }}}} / ${{{{ branch }}}} in \
+             .forgekeep-ci.yml. Left unresolved it is one literal group shared by every ref of \
+             this repository."
+        )));
+    }
+    Ok(Some(group))
+}
+
 /// Trigger a CI pipeline for a push event.
 ///
 /// This function:
@@ -241,10 +275,7 @@ pub async fn trigger_pipeline(
     // other's pipelines. Only pipelines carrying the same group are this
     // trigger's business; a workflow that declared no `concurrency:` block
     // carries `NULL` and is neither waited for nor cancelled.
-    let concurrency_group = config
-        .concurrency
-        .as_ref()
-        .map(|c| rg_db::ops::pipeline_ops::resolve_concurrency_group(&c.group, ref_name));
+    let concurrency_group = resolved_concurrency_group(config.concurrency.as_ref(), ref_name)?;
     if let (Some(concurrency), Some(group)) = (config.concurrency.as_ref(), &concurrency_group) {
         let active =
             rg_db::ops::pipeline_ops::find_active_pipelines_by_group(db, repo_id, group).await?;
@@ -1123,6 +1154,10 @@ fn try_read_gitea_workflows(
     let mut all_jobs: std::collections::HashMap<String, config::JobConfig> =
         std::collections::HashMap::new();
     let mut all_stages: Vec<String> = Vec::new();
+    // `(workflow file, resolved concurrency)` for every triggered workflow that
+    // declared a `concurrency:` block. See `merge_concurrency` for why the list
+    // is kept rather than folded as it goes.
+    let mut declared_concurrency: Vec<(String, config::ConcurrencyConfig)> = Vec::new();
 
     for (name, yml) in sorted_workflows(&workflow_sources) {
         // The cause is folded into the message instead of being a `with_context`
@@ -1175,8 +1210,21 @@ fn try_read_gitea_workflows(
 
         let mut wf_config = workflow.to_ci_config(&ctx);
 
+        // `concurrency.group` is expanded here rather than at trigger time: it
+        // is built from `${{ github.* }}`, and only this loop still holds the
+        // workflow that `github.workflow` names.
+        if let Some(mut concurrency) = wf_config.concurrency.take() {
+            let label = workflow
+                .name
+                .clone()
+                .unwrap_or_else(|| workflow_prefix(name).to_string());
+            concurrency.group =
+                gitea_actions::expand_concurrency_group(&concurrency.group, &ctx, &label);
+            declared_concurrency.push((name.clone(), concurrency));
+        }
+
         // Prefix job names with workflow filename to avoid collisions
-        let wf_prefix = name.trim_end_matches(".yml").trim_end_matches(".yaml");
+        let wf_prefix = workflow_prefix(name);
         let mut renamed_jobs = std::collections::HashMap::new();
         for (job_name, mut job) in wf_config.jobs {
             let new_name = format!("{}/{}", wf_prefix, job_name);
@@ -1211,9 +1259,51 @@ fn try_read_gitea_workflows(
 
     Ok(GiteaWorkflows::Config(CiConfig {
         stages: Some(all_stages),
-        concurrency: None, // per-workflow concurrency not merged
+        concurrency: merge_concurrency(declared_concurrency)?,
         jobs: all_jobs,
     }))
+}
+
+/// The one `concurrency:` the merged pipeline can carry, or an error naming the
+/// workflows that disagree.
+///
+/// In Actions, `concurrency` lives on a workflow; here every workflow triggered
+/// by one event is merged into a single pipeline, and a pipeline has one
+/// `concurrency_group` column. The old code resolved that mismatch by dropping
+/// the field on the floor — parsed, mapped, and then `None` with a comment —
+/// so a repository declaring `cancel-in-progress: true` got neither
+/// serialization nor cancellation, and no error saying why (card_f4309bc397b2).
+///
+/// Two of the three ways out are wrong for this engine. Picking one workflow's
+/// group silently subjects the *other* workflows' jobs to somebody else's
+/// cancellation — the exact defect commit b4bf9db removed from the lookup.
+/// Inventing a composite group ("A+B") invents serialization semantics nobody
+/// declared. So: agreement is honoured, disagreement is refused by name, which
+/// is the same answer this engine already gives for an unsupported trigger or
+/// an unsupported action.
+fn merge_concurrency(
+    declared: Vec<(String, config::ConcurrencyConfig)>,
+) -> Result<Option<config::ConcurrencyConfig>> {
+    let mut declared = declared.into_iter();
+    let Some((first_file, first)) = declared.next() else {
+        return Ok(None);
+    };
+
+    for (file, other) in declared {
+        if other.group != first.group || other.cancel_in_progress != first.cancel_in_progress {
+            return Err(rg_core::error::invalid_request(format!(
+                "{WORKFLOW_DIR}/{first_file} and {WORKFLOW_DIR}/{file} are both triggered by this \
+                 event and declare different `concurrency:` blocks (group '{}' \
+                 cancel-in-progress: {} vs group '{}' cancel-in-progress: {}). \
+                 ForgeKeep runs every workflow triggered by one event as a single pipeline, which \
+                 carries one concurrency group — make the blocks agree, or split the workflows \
+                 onto different events.",
+                first.group, first.cancel_in_progress, other.group, other.cancel_in_progress
+            )));
+        }
+    }
+
+    Ok(Some(first))
 }
 
 /// Read every `*.yml` / `*.yaml` blob under [`WORKFLOW_DIR`] at `commit_sha`.
@@ -1288,6 +1378,13 @@ fn load_workflow_sources(
 ///
 /// Stage ordering of the merged config — and which broken file is reported
 /// first — must not depend on hash-map iteration order.
+/// A workflow file's basename without its YAML extension — the prefix its jobs
+/// and stages carry into the merged pipeline, and the label `github.workflow`
+/// falls back to when the file declares no `name:`.
+fn workflow_prefix(file_name: &str) -> &str {
+    file_name.trim_end_matches(".yml").trim_end_matches(".yaml")
+}
+
 fn sorted_workflows(
     sources: &std::collections::HashMap<String, String>,
 ) -> Vec<(&String, &String)> {
@@ -3205,6 +3302,204 @@ mod matrix_tests {
                     .unwrap();
             assert_eq!(stages, expected, "stage order must not depend on hashing");
         }
+    }
+
+    /// card_f4309bc397b2: `concurrency:` was parsed from the workflow, mapped
+    /// into `ConcurrencyConfig`, and then set to `None` by the merge with a
+    /// comment where the feature should have been. A repository running its CI
+    /// in Actions format got neither serialization nor cancellation, and no
+    /// error saying so.
+    #[test]
+    fn a_workflow_concurrency_block_survives_the_merge() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/deploy.yml",
+            b"on: push\nconcurrency:\n  group: deploy-production\n  cancel-in-progress: true\n\
+              jobs:\n  ship:\n    steps:\n      - run: echo ship\n" as &[u8],
+        )]);
+
+        let concurrency =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap()
+                .concurrency
+                .expect("the workflow declared a concurrency block");
+        assert_eq!(concurrency.group, "deploy-production");
+        assert!(
+            concurrency.cancel_in_progress,
+            "cancel-in-progress was declared and must reach the trigger"
+        );
+    }
+
+    /// The canonical Actions spelling. `resolve_concurrency_group` only knew
+    /// `${{ ref }}` / `${{ branch }}`, so forwarding the group without teaching
+    /// something about `github.*` would have swapped "does not work" for "every
+    /// ref of this repository is one group" — the worse of the two.
+    ///
+    /// The un-spaced `${{github.ref_name}}` is in here on purpose: Actions
+    /// accepts it, and a fixed-string replace of `"${{ github.ref_name }}"`
+    /// silently does not.
+    #[test]
+    fn a_concurrency_group_expands_the_workflow_name_and_the_ref() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/deploy.yml",
+            b"name: Deploy\non: push\n\
+              concurrency:\n  group: ${{ github.workflow }}-${{github.ref_name}}\n\
+              jobs:\n  ship:\n    steps:\n      - run: echo ship\n" as &[u8],
+        )]);
+
+        let concurrency =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap()
+                .concurrency
+                .expect("the workflow declared a concurrency block");
+        assert_eq!(
+            concurrency.group, "Deploy-main",
+            "an unexpanded group is a literal shared by every ref"
+        );
+    }
+
+    /// A workflow without `name:` still has to produce a group that differs
+    /// from its neighbour's — `github.workflow` falls back to the file.
+    #[test]
+    fn an_unnamed_workflow_falls_back_to_its_filename_as_the_workflow_label() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/nightly.yml",
+            b"on: push\nconcurrency:\n  group: ${{ github.workflow }}\n\
+              jobs:\n  audit:\n    steps:\n      - run: echo audit\n" as &[u8],
+        )]);
+
+        let concurrency =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap()
+                .concurrency
+                .expect("the workflow declared a concurrency block");
+        assert_eq!(concurrency.group, "nightly");
+    }
+
+    /// Agreement is the case the merge can represent: two workflows asking for
+    /// the same group get it, rather than the field vanishing because there
+    /// were two of them.
+    #[test]
+    fn two_workflows_declaring_the_same_group_keep_it() {
+        let workflow = |job: &str| {
+            format!(
+                "on: push\nconcurrency:\n  group: deploy-production\n  cancel-in-progress: true\n\
+                 jobs:\n  {job}:\n    steps:\n      - run: echo {job}\n"
+            )
+            .into_bytes()
+        };
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/a.yml", &workflow("first")),
+            (".gitea/workflows/b.yml", &workflow("second")),
+        ]);
+
+        let concurrency =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap()
+                .concurrency
+                .expect("both workflows declared the same block");
+        assert_eq!(concurrency.group, "deploy-production");
+        assert!(concurrency.cancel_in_progress);
+    }
+
+    /// Disagreement is refused by name. Picking one of the two would subject
+    /// the other workflow's jobs to a cancellation nobody declared for them —
+    /// the defect commit b4bf9db removed from the lookup, reintroduced through
+    /// the merge.
+    #[test]
+    fn two_workflows_declaring_different_groups_are_refused_by_name() {
+        let workflow = |job: &str, group: &str| {
+            format!(
+                "on: push\nconcurrency:\n  group: {group}\n\
+                 jobs:\n  {job}:\n    steps:\n      - run: echo {job}\n"
+            )
+            .into_bytes()
+        };
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/a.yml", &workflow("first", "alpha")),
+            (".gitea/workflows/b.yml", &workflow("second", "beta")),
+        ]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("two different groups cannot be merged into one pipeline");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the committed workflows are wrong, not the server: {error:#}"
+        );
+        let message = format!("{error:#}");
+        for expected in ["a.yml", "b.yml", "alpha", "beta"] {
+            assert!(
+                message.contains(expected),
+                "the refusal must name what disagrees, missing {expected}: {message}"
+            );
+        }
+    }
+
+    /// Two workflows on the same group that disagree about *cancellation* are
+    /// the same ambiguity: the pipeline can only be cancelled or not.
+    #[test]
+    fn two_workflows_disagreeing_about_cancellation_are_refused() {
+        let workflow = |job: &str, cancel: bool| {
+            format!(
+                "on: push\nconcurrency:\n  group: shared\n  cancel-in-progress: {cancel}\n\
+                 jobs:\n  {job}:\n    steps:\n      - run: echo {job}\n"
+            )
+            .into_bytes()
+        };
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/a.yml", &workflow("first", true)),
+            (".gitea/workflows/b.yml", &workflow("second", false)),
+        ]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("one pipeline cannot be both cancellable and not");
+        assert!(
+            format!("{error:#}").contains("cancel-in-progress"),
+            "the refusal must say which half disagrees: {error:#}"
+        );
+    }
+
+    /// A group this engine cannot finish resolving must stop the trigger, not
+    /// serialize on the template text. `${{ github.head_ref || github.ref }}`
+    /// is the recipe GitHub's own documentation gives for cancelling superseded
+    /// PR runs, and the `||` is beyond this evaluator.
+    #[test]
+    fn an_unresolved_group_expression_is_refused_not_serialized_on() {
+        let error = resolved_concurrency_group(
+            Some(&config::ConcurrencyConfig {
+                group: "ci-${{ github.head_ref || github.ref }}".to_string(),
+                cancel_in_progress: true,
+            }),
+            "refs/heads/main",
+        )
+        .expect_err("an unresolved group must not become a literal one");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the committed group is wrong, not the server: {error:#}"
+        );
+
+        assert_eq!(
+            resolved_concurrency_group(
+                Some(&config::ConcurrencyConfig {
+                    group: "ci-${{ branch }}".to_string(),
+                    cancel_in_progress: false,
+                }),
+                "refs/heads/main",
+            )
+            .expect("the native spelling resolves")
+            .as_deref(),
+            Some("ci-main"),
+        );
+        assert_eq!(
+            resolved_concurrency_group(None, "refs/heads/main").expect("no block, no group"),
+            None,
+            "a workflow that declared nothing must stay out of every group"
+        );
     }
 
     /// card_074d93bfe327: the repository the whole defect is about — its entire

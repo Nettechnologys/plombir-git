@@ -1584,6 +1584,61 @@ pub(crate) fn actions_condition_context(
     context
 }
 
+/// Expand the `${{ … }}` expressions a `concurrency.group` may be built from.
+///
+/// The group is not a shell string — it is a database key that decides which
+/// pipelines wait for or cancel each other — so it is expanded *here*, against
+/// the same context the `if:` evaluator uses, rather than deferred to the job
+/// environment the way `substitute_expr` defers `${{ github.ref }}` to
+/// `${CI_REF}`. `github.workflow` is added on top: it exists only at this level
+/// and the canonical GitHub group (`${{ github.workflow }}-${{ github.ref }}`)
+/// is built from it.
+///
+/// Anything not in the context is left **verbatim**, expression braces and all.
+/// That is the signal the caller refuses on: a group that still carries an
+/// expression is a literal shared by every ref of the repository, which turns
+/// `cancel-in-progress` into "cancel whatever else is running".
+pub(crate) fn expand_concurrency_group(
+    template: &str,
+    ctx: &WorkflowContext,
+    workflow_label: &str,
+) -> String {
+    let mut context = actions_condition_context(ctx, &HashMap::new());
+    context.insert("github.workflow".into(), workflow_label.to_string());
+    expand_expressions(template, |key| context.get(key).cloned())
+}
+
+/// Replace every `${{ key }}` the lookup answers for, leaving the rest as-is.
+///
+/// Written as a scan rather than a list of `replace("${{ github.ref }}", …)`
+/// calls so that the un-spaced `${{github.ref}}` — which Actions accepts and a
+/// fixed-string replace misses — expands too. A missed expansion here is not a
+/// cosmetic difference; it is the difference between a per-ref group and one
+/// global one.
+fn expand_expressions(template: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("${{") {
+        let after_open = &rest[open + 3..];
+        let Some(close) = after_open.find("}}") else {
+            break;
+        };
+        let key = after_open[..close].trim();
+        match lookup(key) {
+            Some(value) => {
+                out.push_str(&rest[..open]);
+                out.push_str(&value);
+            }
+            // Kept verbatim, braces included, so the caller can tell that this
+            // group was not fully resolved.
+            None => out.push_str(&rest[..open + 3 + close + 2]),
+        }
+        rest = &after_open[close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Basic `${{ expression }}` substitution.
 fn substitute_expr(
     input: &str,
