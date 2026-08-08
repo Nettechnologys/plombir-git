@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { rustFnBlock, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const files = {
   splitClient: path.join(root, 'web/src/lib/api/repos.ts'),
@@ -12,7 +14,8 @@ const files = {
 
 const splitClient = readFileSync(files.splitClient, 'utf8');
 const orgPage = readFileSync(files.orgPage, 'utf8');
-const backend = readFileSync(files.backend, 'utf8');
+// Comments are stripped so a commented-out handler reads as a deleted one.
+const backend = stripRustComments(readFileSync(files.backend, 'utf8'));
 const failures = [];
 
 function expectCreateObjectContract(label, source) {
@@ -33,12 +36,73 @@ function expectCreateObjectContract(label, source) {
 
 expectCreateObjectContract('web/src/lib/api/repos.ts', splitClient);
 
-if (!/pub struct CreateRepoRequest[\s\S]*pub org:\s*Option<String>/.test(backend)) {
+// Read inside the struct rather than `/pub struct CreateRepoRequest[\s\S]*pub org:/`,
+// which any `pub org:` further down the file satisfies — see `rustStructBody`.
+const createRepoRequest = rustStructBody(backend, 'CreateRepoRequest');
+if (createRepoRequest === null) {
+  failures.push('api/repos.rs no longer defines a `struct CreateRepoRequest` this check can read');
+} else if (!/\bpub org:\s*Option<String>/.test(createRepoRequest)) {
   failures.push('Backend CreateRepoRequest must keep org as an optional repository owner field');
 }
 
-if (!/body\.org[\s\S]*get_org_by_name/.test(backend)) {
-  failures.push('Backend create_repo must resolve the org field instead of ignoring it');
+// ── `org` must reach the repository row, through the gate that resolved it ──
+//
+// The assertion here used to be `/body\.org[\s\S]*get_org_by_name/` over the
+// whole module, for a message naming `create_repo`. The resolution moved out of
+// the handler and into the `NamespaceCreate` body extractor (card_1e1ed1ee06f1),
+// so `create_repo` has not called `get_org_by_name` for some time — the only
+// occurrence left in the file is inside `list_repos`, and `[\s\S]*` bridged the
+// two. The gate was green on a handler it no longer described, and red on a
+// rename inside a handler it never mentioned (card_c7aef378ad3d).
+//
+// So the subject is named explicitly, and it is the pair the contract actually
+// rests on now:
+//
+//   1. `CreateRepoRequest` declares `org` as the namespace the gate reads —
+//      `TargetOwnerOrSelf::target_owner_or_self` returning it is what makes
+//      `NamespaceCreate` resolve and authorize that namespace at all. A body
+//      that answers `None` there is created under the caller's own account no
+//      matter what `org` says.
+//   2. `create_repo` takes `NamespaceCreate<CreateRepoRequest>` and stores the
+//      `org_id` *the gate resolved* on the new repository. Looking the name up
+//      a second time is what let the handler's copy of the rule drift.
+const targetOwner = /impl\s+TargetOwnerOrSelf\s+for\s+CreateRepoRequest\s*\{([\s\S]*?)\n\}/.exec(backend);
+if (targetOwner === null) {
+  failures.push(
+    'api/repos.rs no longer implements TargetOwnerOrSelf for CreateRepoRequest, so nothing tells the ' +
+      'NamespaceCreate gate which namespace the `org` field asks for',
+  );
+} else if (!/self\.org\b/.test(targetOwner[1])) {
+  failures.push(
+    'CreateRepoRequest::target_owner_or_self must return the `org` field — it is the only thing that ' +
+      'points the create gate at the organization, and a body that answers None is silently created ' +
+      "under the caller's own account",
+  );
+}
+
+const createRepo = rustFnBlock(backend, 'create_repo');
+if (createRepo === null) {
+  failures.push('api/repos.rs no longer defines a `pub async fn create_repo` this check can read');
+} else {
+  if (!/NamespaceCreate\s*<\s*CreateRepoRequest\s*>/.test(createRepo.params)) {
+    failures.push(
+      'Backend create_repo must take NamespaceCreate<CreateRepoRequest>: the namespace is named by the ' +
+        'body, so the gate over it is the body extractor and a handler asking the question itself keeps ' +
+        'a second copy of the membership rule',
+    );
+  }
+  const orgIdBinding = /NamespaceCreate\s*\{[^}]*\borg_id(?:\s*:\s*(\w+))?[^}]*\}/.exec(createRepo.params);
+  if (orgIdBinding === null) {
+    failures.push('Backend create_repo must destructure `org_id` out of NamespaceCreate — the namespace the gate resolved');
+  } else {
+    const orgId = orgIdBinding[1] ?? 'org_id';
+    if (!new RegExp(`\\borg_id\\s*:\\s*${orgId}\\b|\\borg_id\\b(?=\\s*,)`).test(createRepo.body)) {
+      failures.push(
+        `Backend create_repo must pass the gate-resolved \`${orgId}\` into CreateRepoOptions.org_id — ` +
+          'otherwise the repository lands outside the organization the caller was authorized for',
+      );
+    }
+  }
 }
 
 if (!/repos\.create\(\s*\{[\s\S]*name:\s*newRepoName[\s\S]*is_private:\s*newRepoPrivate[\s\S]*org:\s*page\.params\.name!/.test(orgPage)) {

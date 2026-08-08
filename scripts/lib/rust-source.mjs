@@ -129,6 +129,32 @@ export function rustFnBlock(source, name) {
 }
 
 /**
+ * The field block of a top-level `struct <name> { … }`, or `null`.
+ *
+ * The idiom this replaces is `/pub struct Foo[\s\S]*field: T/` — which does not
+ * assert that `Foo` has the field at all. `[\s\S]*` happily bridges from the
+ * struct's header to a field of some *other* struct further down the file, so
+ * moving the field out keeps the gate green under a message that names `Foo`.
+ * Verified on `SsoProviderInfo`: three of its four asserted fields could be
+ * moved into a neighbouring struct with the check still passing
+ * (card_c7aef378ad3d). Read the body once, assert inside it.
+ *
+ * Relies on rustfmt putting the struct's closing brace at column 0, the same
+ * assumption `rustFnBlock` makes; a shape this cannot read returns `null` so the
+ * caller fails loudly instead of asserting over an empty string.
+ */
+export function rustStructBody(source, name) {
+  const start = source.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?struct ${name}\\b`, 'm'));
+  if (start < 0) return null;
+  const rest = source.slice(start);
+  const open = rest.indexOf('{');
+  if (open < 0) return null;
+  const close = rest.search(/\n\}/);
+  if (close < 0 || close < open) return null;
+  return rest.slice(open + 1, close);
+}
+
+/**
  * Split a Rust function parameter list at top-level commas.
  *
  * This is deliberately separate from `splitCallArgs`: generic type arguments

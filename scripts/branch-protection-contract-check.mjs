@@ -3,13 +3,16 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/branch_protection.rs');
 const clientPath = path.join(root, 'web/src/lib/api/branchProtections.ts');
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/branches/+page.svelte');
 
-const backend = readFileSync(backendPath, 'utf8');
+// Comments are stripped so a commented-out handler reads as a deleted one.
+const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
 const client = readFileSync(clientPath, 'utf8');
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');
@@ -45,17 +48,52 @@ if (!/settings\/branches/.test(settingsLayout)) {
   failures.push('Repository settings nav must expose the branch protection page');
 }
 
-if (!/Path\(\(owner,\s*repo,\s*id\)\):\s*Path<\(String,\s*String,\s*i64\)>/.test(backend)) {
-  failures.push('Branch protection get/update/delete handlers must destructure owner, repo, and rule id from the route.');
-}
-
-for (const call of [
-  'get_protection_for_repo(',
-  'update_protection_for_repo(',
-  'delete_protection_for_repo(',
+// ── Each id-taking handler, read on its own ──────────────────────────────
+//
+// `{id}` is a global `protected_branches` primary key, so every door that takes
+// one owes the same scoping: resolve the rule *within* the repository the route
+// named, never by bare id. This used to be asserted file-wide — one
+// `Path((owner, repo, id))` match anywhere in the module, plus three
+// `..._for_repo(` substrings anywhere in the module — for a message that names
+// three handlers. Any single occurrence satisfied it, so dropping `id` from two
+// of the three destructurings left the gate green (card_c7aef378ad3d).
+//
+// Reading each handler's own signature and body is what makes the message true:
+// a handler that stops scoping is named, and a handler this check can no longer
+// read is a failure rather than a silent pass.
+for (const [handler, scopingCall] of [
+  ['get_protection', 'get_protection_for_repo'],
+  ['update_protection', 'update_protection_for_repo'],
+  ['delete_protection', 'delete_protection_for_repo'],
 ]) {
-  if (!backend.includes(call)) {
-    failures.push(`Branch protection backend must scope routed rule ids with ${call}`);
+  const fn = rustFnBlock(backend, handler);
+  if (fn === null) {
+    failures.push(`api/branch_protection.rs no longer defines a \`pub async fn ${handler}\` this check can read`);
+    continue;
+  }
+
+  const tuple = /Path\(\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)\)\s*:\s*Path<\(\s*String\s*,\s*String\s*,\s*i64\s*\)>/.exec(
+    fn.params,
+  );
+  if (tuple === null) {
+    failures.push(
+      `Branch protection handler ${handler} must destructure Path<(String, String, i64)> — the owner, ` +
+        'the repository and the rule id it is routed for.',
+    );
+    continue;
+  }
+
+  const [, owner, repo, id] = tuple;
+  const scoped = new RegExp(
+    // `[,)]` closes the argument on either shape: `…, id)` and the rustfmt-wrapped `…, id,`.
+    `\\b${scopingCall}\\(\\s*&state\\.db\\s*,\\s*&${owner}\\s*,\\s*&${repo}\\s*,\\s*${id}\\s*[,)]`,
+  );
+  if (!scoped.test(fn.body)) {
+    failures.push(
+      `Branch protection handler ${handler} must resolve rule \`${id}\` inside \`${owner}/${repo}\` via ` +
+        `${scopingCall}(&state.db, &${owner}, &${repo}, ${id}, …). \`{id}\` is a global ` +
+        'protected_branches primary key, so admin of one repository must not reach another one\'s rules.',
+    );
   }
 }
 
