@@ -386,6 +386,40 @@ pub async fn recover_stale_merge_claim(
     Ok(result.rows_affected == 1)
 }
 
+/// Record a maintainer's permission for this PR's CI to run, against the head
+/// commit they were looking at.
+///
+/// Conditional on `head_sha` for the same reason the auto-merge claim above is
+/// conditional on `state`: the row can move between the caller reading it and
+/// this statement running, and an approval written for a head that has since
+/// been replaced is an approval of code nobody reviewed. `false` means the head
+/// moved under the approver — the caller re-reads and tells them so, rather than
+/// stamping the new commit as approved (card_94834ecee708).
+pub async fn approve_ci_for_head(
+    db: &DatabaseConnection,
+    pr_id: i64,
+    head_sha: &str,
+    approved_by: i64,
+) -> Result<bool> {
+    let result = PrEntity::update_many()
+        .col_expr(
+            pull_request::Column::CiApprovedSha,
+            Expr::value(head_sha.to_string()),
+        )
+        .col_expr(pull_request::Column::CiApprovedBy, Expr::value(approved_by))
+        .col_expr(
+            pull_request::Column::CiApprovedAt,
+            Expr::value(chrono::Utc::now()),
+        )
+        .filter(pull_request::Column::Id.eq(pr_id))
+        .filter(pull_request::Column::State.eq("open"))
+        .filter(pull_request::Column::HeadSha.eq(head_sha))
+        .exec(db)
+        .await
+        .context("db: approve pull-request CI")?;
+    Ok(result.rows_affected == 1)
+}
+
 #[cfg(test)]
 mod head_sha_refresh_tests {
     //! card_9d3b68368396: post-push tasks may finish out of order. A refresh
@@ -486,6 +520,9 @@ mod head_sha_refresh_tests {
                 merge_strategy: Set(None),
                 merge_commit_sha: Set(None),
                 head_repo_id: Set(None),
+                ci_approved_sha: Set(None),
+                ci_approved_by: Set(None),
+                ci_approved_at: Set(None),
                 milestone_id: Set(None),
                 labels: Set(None),
                 created_at: Set(now),

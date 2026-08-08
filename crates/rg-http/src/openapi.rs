@@ -370,6 +370,7 @@ pub(crate) fn stamp_security(
         crate::api::pulls::update_pr,
         crate::api::pulls::get_diff,
         crate::api::pulls::merge_pr,
+        crate::api::pulls::approve_pr_ci,
         crate::api::pulls::enable_auto_merge,
         crate::api::pulls::disable_auto_merge,
         crate::api::pulls::list_merge_queue,

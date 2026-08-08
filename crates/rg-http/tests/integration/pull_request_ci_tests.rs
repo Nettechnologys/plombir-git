@@ -36,6 +36,13 @@ type TriggeredPipeline = (String, String, String, Option<i64>, Option<String>);
 /// way.
 struct RecordingCiEngine {
     triggered: Mutex<Vec<TriggeredPipeline>>,
+    /// `(pipeline_id, job_id)` of every row this engine actually wrote.
+    ///
+    /// The rows are real because half of what this file asserts is what happens
+    /// to a pipeline *after* it exists — a stub returning a made-up id can be
+    /// asked whether a pipeline was requested, but not whether the one that was
+    /// left running ever got cancelled.
+    created: Mutex<Vec<(i64, i64)>>,
     workflow_for_event: bool,
 }
 
@@ -43,6 +50,7 @@ impl RecordingCiEngine {
     fn new(workflow_for_event: bool) -> Self {
         Self {
             triggered: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
             workflow_for_event,
         }
     }
@@ -69,8 +77,25 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             params.base_branch.map(str::to_string),
         );
         Box::pin(async move {
+            let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+                params.db,
+                params.repo_id,
+                params.commit_sha,
+                params.ref_name,
+                params.trigger_type,
+                params.triggered_by,
+            )
+            .await?;
+            let stage =
+                rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0).await?;
+            let job = rg_db::ops::pipeline_ops::create_job(
+                params.db, stage.id, "test", "true", None, None, None, None, None, false, None,
+                None, None,
+            )
+            .await?;
             self.triggered.lock().unwrap().push(entry);
-            Ok(1)
+            self.created.lock().unwrap().push((pipeline.id, job.id));
+            Ok(pipeline.id)
         })
     }
 
@@ -102,6 +127,10 @@ struct Fixture {
     ci_engine: Arc<RecordingCiEngine>,
     delivery_tracker: rg_core::task_tracker::TaskTracker,
     db: rg_db::DatabaseConnection,
+    /// Kept so a test can drive `trigger_pull_request_ci` directly — the fork
+    /// gate below has a "nothing happens" outcome, and the only honest way to
+    /// assert it is to call the producer and read its `Ok(None)`.
+    repo_root: std::path::PathBuf,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -162,6 +191,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
     // only the action under test is in the recorder.
     drain_delivery_tracker(&delivery_tracker, "the seed write's hooks").await;
     ci_engine.triggered.lock().unwrap().clear();
+    ci_engine.created.lock().unwrap().clear();
 
     Fixture {
         base,
@@ -171,6 +201,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
         ci_engine,
         delivery_tracker,
         db,
+        repo_root,
         server,
     }
 }
@@ -307,6 +338,340 @@ async fn pushing_the_head_branch_re_runs_the_pull_request_pipeline() {
         refreshed.head_sha.as_deref(),
         Some(new_sha.as_str()),
         "the PR must point at the commit its pipeline was triggered for"
+    );
+
+    fixture.server.abort();
+}
+
+// ── Closing the PR ends the run it started (card_f68eac170fa5) ───────────
+
+impl Fixture {
+    /// The single `pull_request` pipeline this fixture's PR produced.
+    fn pull_request_pipeline(&self) -> (i64, i64) {
+        let created = self.ci_engine.created.lock().unwrap();
+        assert_eq!(
+            created.len(),
+            1,
+            "these tests read one pull_request pipeline; got {created:?}"
+        );
+        created[0]
+    }
+
+    async fn pipeline_status(&self, pipeline_id: i64) -> String {
+        rg_db::ops::pipeline_ops::get_pipeline(&self.db, pipeline_id)
+            .await
+            .expect("read the pipeline")
+            .expect("the pipeline row must still be there")
+            .status
+    }
+
+    async fn job_status(&self, job_id: i64) -> String {
+        use sea_orm::EntityTrait;
+        rg_db::entities::pipeline_job::Entity::find_by_id(job_id)
+            .one(&self.db)
+            .await
+            .expect("read the job")
+            .expect("the job row must still be there")
+            .status
+    }
+
+    async fn set_pr_state(&self, owner: &str, repo_name: &str, state: &str) {
+        let patched = reqwest::Client::new()
+            .patch(format!(
+                "{}/api/v1/repos/{owner}/{repo_name}/pulls/1",
+                self.base
+            ))
+            .bearer_auth(&self.jwt)
+            .json(&serde_json::json!({ "state": state }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.status(),
+            200,
+            "setting the PR state to {state} must succeed: {}",
+            patched.text().await.unwrap()
+        );
+    }
+}
+
+/// card_f68eac170fa5: a closed PR's pipeline used to keep going. Real runners
+/// pick its jobs up and spend real minutes proving a branch nobody will merge —
+/// and because `refs/pull/{n}/head` is stable for the PR's whole life, a
+/// repository declaring `concurrency:` without `cancel_in_progress` then has
+/// every later trigger on that ref refused for a run that answers a dead
+/// question.
+///
+/// The job half of the assertion is the sharper one: `cancel_pipeline_chain`
+/// is what makes the acknowledgement a claim about the whole graph, and a
+/// cancel that stopped at the pipeline row would still leave the work for a
+/// runner to pick up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_pull_request_cancels_the_pipeline_it_left_running() {
+    let fixture = fixture("prclose", "pr-close-repo", true).await;
+    open_pr(&fixture, "prclose", "pr-close-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+
+    let (pipeline_id, job_id) = fixture.pull_request_pipeline();
+    assert_eq!(
+        fixture.pipeline_status(pipeline_id).await,
+        "pending",
+        "the fixture must leave a live pipeline for the close to act on"
+    );
+
+    fixture
+        .set_pr_state("prclose", "pr-close-repo", "closed")
+        .await;
+
+    assert_eq!(
+        fixture.pipeline_status(pipeline_id).await,
+        "canceled",
+        "the pull_request pipeline outlived the PR it was asked about"
+    );
+    assert_eq!(
+        fixture.job_status(job_id).await,
+        "canceled",
+        "the pipeline was marked canceled but its job stayed schedulable"
+    );
+
+    fixture.server.abort();
+}
+
+/// The other side of the same switch: cancellation must not rewrite a verdict
+/// that already exists, and a PR with nothing running must close as it always
+/// did. Both are the failure modes a blanket "cancel on close" would introduce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_pull_request_leaves_a_finished_pipeline_alone() {
+    let fixture = fixture("prdone", "pr-done-repo", true).await;
+    open_pr(&fixture, "prdone", "pr-done-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+
+    let (pipeline_id, _) = fixture.pull_request_pipeline();
+    rg_db::ops::pipeline_ops::update_pipeline_status(
+        &fixture.db,
+        pipeline_id,
+        "success",
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .expect("finish the pipeline");
+
+    fixture
+        .set_pr_state("prdone", "pr-done-repo", "closed")
+        .await;
+
+    assert_eq!(
+        fixture.pipeline_status(pipeline_id).await,
+        "success",
+        "closing the PR rewrote a verdict its pipeline had already reached"
+    );
+
+    fixture.server.abort();
+}
+
+/// A repository with no `on: pull_request` workflow has no run to end, and the
+/// close path must not have grown a way to fail on that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_pull_request_with_no_pipeline_still_closes() {
+    let fixture = fixture("prbare", "pr-bare-repo", false).await;
+    open_pr(&fixture, "prbare", "pr-bare-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+    assert!(
+        fixture.ci_engine.created.lock().unwrap().is_empty(),
+        "this fixture must produce no pull_request pipeline"
+    );
+
+    fixture
+        .set_pr_state("prbare", "pr-bare-repo", "closed")
+        .await;
+
+    fixture.server.abort();
+}
+
+// ── A fork PR's CI waits for a maintainer (card_94834ecee708) ────────────
+
+impl Fixture {
+    /// Turn this fixture's PR into a fork PR by pointing its head at another
+    /// repository, the way `create_pr` does for a real fork.
+    ///
+    /// A real fork would need a second checkout and a cross-repository push;
+    /// what the gate reads is `head_repo_id`, and the same shortcut is what
+    /// `pr_permission_tests` uses for the fork half of its own assertions.
+    async fn make_fork_pr(&self, head_repo_id: i64) -> rg_db::entities::pull_request::Model {
+        use sea_orm::Set;
+        let pr = self.pr().await;
+        let mut active: rg_db::entities::pull_request::ActiveModel = pr.into();
+        active.head_repo_id = Set(Some(head_repo_id));
+        rg_db::ops::pull_request_ops::update(&self.db, active)
+            .await
+            .expect("point the PR head at the fork")
+    }
+
+    async fn pr(&self) -> rg_db::entities::pull_request::Model {
+        rg_db::ops::pull_request_ops::find_by_id(&self.db, 1)
+            .await
+            .expect("read the PR")
+            .expect("the fixture's PR must exist")
+    }
+
+    /// Ask the producer directly. The unapproved outcome is "no pipeline", and
+    /// an HTTP-level assertion cannot tell that apart from "the request did
+    /// something else"; `Ok(None)` from the producer can.
+    async fn trigger_pr_ci(&self, pr: &rg_db::entities::pull_request::Model) -> Option<i64> {
+        let ci = rg_core::pull_request::PipelineCi {
+            trigger: self.ci_engine.as_ref(),
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            external_url: None,
+        };
+        rg_core::pull_request::trigger_pull_request_ci(&self.db, &self.repo_root, pr, None, &ci)
+            .await
+            .expect("the producer must not fail, it either runs or holds")
+    }
+}
+
+/// card_94834ecee708. A pipeline is created under the *base* repository's id and
+/// every job it produces is handed that repository's CI secrets, so an
+/// unreviewed fork head must not start one on its own. The answer used to be
+/// that a fork PR got no CI at all, ever — the one contribution shape that most
+/// needs a check was the only one without one.
+///
+/// All four states in one test, because the defect this guards against is any
+/// two of them collapsing: held before approval, released by it, held again once
+/// the head moves past what was approved, and not grantable by the person whose
+/// code it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_pr_runs_ci_only_for_a_head_a_maintainer_approved() {
+    use sea_orm::Set;
+
+    let fixture = fixture("forkci", "fork-ci-repo", true).await;
+    open_pr(&fixture, "forkci", "fork-ci-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+
+    // A second account with a repository of its own — the "fork" the head lives
+    // in, and the account that must not be able to approve its own code.
+    let client = reqwest::Client::new();
+    let (contributor, _) = register_full(&fixture.base, "forker", "forker@example.com").await;
+    let fork_repo_id = create_repo(&fixture.base, &contributor, "fork-of-it").await;
+    let pr = fixture.make_fork_pr(fork_repo_id).await;
+
+    fixture.ci_engine.triggered.lock().unwrap().clear();
+    fixture.ci_engine.created.lock().unwrap().clear();
+
+    assert_eq!(
+        fixture.trigger_pr_ci(&pr).await,
+        None,
+        "an unapproved fork head must not start a pipeline carrying this repository's CI secrets"
+    );
+    assert!(
+        fixture.ci_engine.triggered.lock().unwrap().is_empty(),
+        "the CI engine was asked to run something for an unapproved fork head"
+    );
+
+    // The contributor holds no write access to the base repository, so the
+    // permission is not theirs to grant — which is the entire safety of the gate.
+    let approval_url = format!(
+        "{}/api/v1/repos/forkci/fork-ci-repo/pulls/1/ci-approval",
+        fixture.base
+    );
+    let self_approved = client
+        .post(&approval_url)
+        .bearer_auth(&contributor)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        self_approved.status(),
+        403,
+        "the PR's own author approved their unreviewed head: {}",
+        self_approved.text().await.unwrap()
+    );
+    assert_eq!(
+        fixture.trigger_pr_ci(&pr).await,
+        None,
+        "a refused approval must leave the fork head held"
+    );
+
+    let approved = client
+        .post(&approval_url)
+        .bearer_auth(&fixture.jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), 200, "{}", approved.text().await.unwrap());
+    drain_delivery_tracker(&fixture.delivery_tracker, "the approval's CI trigger").await;
+
+    let triggered = fixture.ci_engine.triggered.lock().unwrap().clone();
+    assert_eq!(
+        triggered,
+        vec![(
+            fixture.head_sha.clone(),
+            "refs/pull/1/head".to_string(),
+            "pull_request".to_string(),
+            Some(fixture.user_id),
+            Some("main".to_string()),
+        )],
+        "approving must start exactly the run the PR was waiting for: {triggered:?}"
+    );
+
+    // The head moves the way a contributor pushing again moves it. The approval
+    // names a commit, so it does not follow — otherwise "approve, then push
+    // whatever you like" would be the shortest path to the base repository's
+    // secrets.
+    let moved = "0123456789012345678901234567890123456789";
+    let mut active: rg_db::entities::pull_request::ActiveModel = fixture.pr().await.into();
+    active.head_sha = Set(Some(moved.to_string()));
+    let moved_pr = rg_db::ops::pull_request_ops::update(&fixture.db, active)
+        .await
+        .unwrap();
+    assert_eq!(
+        moved_pr.ci_approved_sha.as_deref(),
+        Some(fixture.head_sha.as_str()),
+        "the approval must still name the commit it was given for"
+    );
+
+    fixture.ci_engine.triggered.lock().unwrap().clear();
+    assert_eq!(
+        fixture.trigger_pr_ci(&moved_pr).await,
+        None,
+        "a push after the approval must put the fork PR back behind the gate"
+    );
+    assert!(
+        fixture.ci_engine.triggered.lock().unwrap().is_empty(),
+        "the CI engine ran the new, unapproved head"
+    );
+
+    fixture.server.abort();
+}
+
+/// The gate is for fork PRs only. A branch inside the repository is code its
+/// writers already own, so making everyone approve their own pushes would be a
+/// ceremony that protects nothing — and a check that never runs is what this
+/// whole phase is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_repository_pr_needs_no_approval() {
+    let fixture = fixture("ownci", "own-ci-repo", true).await;
+    open_pr(&fixture, "ownci", "own-ci-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+
+    let pr = fixture.pr().await;
+    assert!(
+        pr.head_repo_id.is_none(),
+        "this fixture's PR must not be a fork PR"
+    );
+    assert!(
+        pr.ci_approved_sha.is_none(),
+        "nothing should have approved anything here"
+    );
+
+    fixture.ci_engine.triggered.lock().unwrap().clear();
+    assert!(
+        fixture.trigger_pr_ci(&pr).await.is_some(),
+        "a PR whose head lives in this repository must run without an approval"
     );
 
     fixture.server.abort();

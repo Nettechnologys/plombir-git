@@ -538,6 +538,55 @@ pub async fn disable_auto_merge(
 }
 
 #[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/pulls/{number}/ci-approval",
+    tag = "Pull Requests",
+    params(
+        ("owner" = String, Path),
+        ("name" = String, Path),
+        ("number" = i64, Path),
+    ),
+    responses(
+        (status = 200, description = "CI approved for the PR's current head", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "The head moved while the approval was being recorded", body = serde_json::Value),
+    ),
+)]
+/// POST /api/v1/repos/:owner/:name/pulls/:number/ci-approval
+///
+/// The maintainer action a fork PR waits for. A pipeline runs under the *base*
+/// repository's id and is handed that repository's CI secrets, so an unreviewed
+/// head must not start one on its own — and until this endpoint existed the
+/// answer to that was that a fork PR got no CI at all (card_94834ecee708).
+///
+/// `RepoWrite` and not the PR author: the whole point is that somebody who
+/// already has write access has looked at the diff. The approval is recorded
+/// against the head commit, so it does not survive the next push.
+pub async fn approve_pr_ci(
+    State(state): State<AppState>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    RepoWrite { actor_id, .. }: RepoWrite,
+) -> impl IntoResponse {
+    let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
+        Ok(pr) => pr,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_core::pull_request::approve_pull_request_ci(&state.db, &pr, actor_id).await {
+        Ok(approved) => {
+            // Same shape as reopening a PR: the approval is what makes this head
+            // eligible, so the run it unblocks starts from here rather than
+            // waiting for the next push that nobody may ever make.
+            state.spawn_pull_request_ci(approved.clone(), Some(actor_id));
+            (StatusCode::OK, Json(approved)).into_response()
+        }
+        // A closed PR or one with no head is `InvalidRequest` → 400; a head that
+        // moved under the approver is `Conflict` → 409; the reload behind them
+        // is ours and stays a 5xx.
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+#[utoipa::path(
     get,
     path = "/repos/{owner}/{name}/merge-queue",
     tag = "Pull Requests",

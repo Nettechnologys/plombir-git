@@ -105,6 +105,7 @@ pub mod m20260807_000001_create_mirror_sync_lease;
 pub mod m20260807_000002_add_user_totp_last_step;
 pub mod m20260807_000003_create_webauthn_ceremony_spend;
 pub mod m20260808_000001_drop_oci_blob_ref_count;
+pub mod m20260808_000002_add_pull_request_ci_approval;
 
 use sea_orm_migration::prelude::*;
 
@@ -300,6 +301,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260807_000002_add_user_totp_last_step::Migration),
             Box::new(m20260807_000003_create_webauthn_ceremony_spend::Migration),
             Box::new(m20260808_000001_drop_oci_blob_ref_count::Migration),
+            Box::new(m20260808_000002_add_pull_request_ci_approval::Migration),
         ]
     }
 }

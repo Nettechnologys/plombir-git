@@ -70,24 +70,44 @@ pub async fn trigger_pull_request_ci(
     if pr.state != "open" {
         return Ok(None);
     }
-    // A fork PR's head is code the base repository's owner has not accepted, and
-    // a pipeline carries that repository's CI secrets (`ci_secret_ops` are keyed
-    // by `repo_id` and injected into every job). Running it automatically would
-    // hand every one of them to anyone who can open a PR. Fork PRs therefore
-    // wait for the maintainer action that already exists — enqueueing into the
-    // merge queue, which builds the merge group under the same reasoning.
-    if let Some(head_repo_id) = pr.head_repo_id {
-        tracing::info!(
-            pr_id = pr.id,
-            head_repo_id,
-            "pull_request CI skipped for a fork PR: an unreviewed head must not run with this repository's CI secrets"
-        );
-        return Ok(None);
-    }
     let Some(head_sha) = pr.head_sha.as_deref() else {
         tracing::debug!(pr_id = pr.id, "pull_request CI skipped: PR has no head SHA");
         return Ok(None);
     };
+    // A fork PR's head is code the base repository's owner has not accepted, and
+    // a pipeline carries that repository's CI secrets (`ci_secret_ops` are keyed
+    // by `repo_id` and injected into every job). Running it automatically would
+    // hand every one of them to anyone who can open a PR.
+    //
+    // So it waits for a maintainer to say yes — [`approve_pull_request_ci`] —
+    // and the permission is recorded against the head commit rather than against
+    // the PR. That is the whole safety of the gate: `approve`, then push
+    // something else, and `ci_approved_sha` no longer equals `head_sha`, so this
+    // returns to refusing until the new head is approved in turn
+    // (card_94834ecee708).
+    //
+    // Before that gate existed the refusal was unconditional, which meant the
+    // one contribution shape that most needs a check — code from someone without
+    // write access — was the only one that never got one.
+    if let Some(head_repo_id) = pr.head_repo_id {
+        if pr.ci_approved_sha.as_deref() != Some(head_sha) {
+            tracing::info!(
+                pr_id = pr.id,
+                head_repo_id,
+                approved_sha = pr.ci_approved_sha.as_deref().unwrap_or("<none>"),
+                head_sha,
+                "pull_request CI held for a fork PR: this head is not approved to run with this repository's CI secrets"
+            );
+            return Ok(None);
+        }
+        tracing::info!(
+            pr_id = pr.id,
+            head_repo_id,
+            head_sha,
+            approved_by = pr.ci_approved_by,
+            "pull_request CI released for a fork PR: a maintainer approved this head"
+        );
+    }
 
     let repository = repository::Entity::find_by_id(pr.repo_id)
         .one(db)
@@ -165,5 +185,123 @@ pub async fn trigger_pull_request_ci_best_effort(
             error = %format!("{error:#}"),
             "failed to trigger the pull_request CI pipeline"
         );
+    }
+}
+
+/// Record a maintainer's permission for this PR's current head to run CI.
+///
+/// The counterpart of the fork gate in [`trigger_pull_request_ci`]. Returns the
+/// reloaded pull request, whose `ci_approved_sha` now names the head that was
+/// approved — the caller triggers the pipeline from it.
+///
+/// Three refusals, and each is a different thing having gone wrong:
+///
+/// - a PR that is not `open` has nothing left to check;
+/// - a PR with no `head_sha` has no commit to approve, which is a repository
+///   that has not been walked yet rather than a caller error;
+/// - the head moved between the approver reading the PR and this write. That
+///   one is a **conflict**, not a bad request: the maintainer approved a diff
+///   that is no longer there, and silently stamping the new commit instead is
+///   precisely the bypass this gate exists to prevent.
+pub async fn approve_pull_request_ci(
+    db: &DatabaseConnection,
+    pr: &pull_request::Model,
+    actor_id: i64,
+) -> Result<pull_request::Model> {
+    if pr.state != "open" {
+        return Err(crate::error::invalid_request(
+            "only an open pull request can have its CI approved",
+        ));
+    }
+    let Some(head_sha) = pr.head_sha.as_deref() else {
+        return Err(crate::error::invalid_request(
+            "this pull request has no head commit to approve",
+        ));
+    };
+    if !rg_db::ops::pull_request_ops::approve_ci_for_head(db, pr.id, head_sha, actor_id).await? {
+        return Err(crate::error::conflict(
+            "the pull request head moved while the approval was being recorded; re-read it and approve the new head",
+        ));
+    }
+    rg_db::ops::pull_request_ops::find_by_id(db, pr.id)
+        .await?
+        .context("approved pull request disappeared")
+}
+
+/// Cancel the `pull_request` pipelines a PR has stopped needing.
+///
+/// A `pull_request` pipeline exists to answer one question — "is this PR's head
+/// fit to merge?" — and a PR that has left `open` has ended that question
+/// without ending the run. Left going, its jobs are handed to real runners and
+/// burn real minutes on a branch nobody will merge; and because
+/// [`pull_request_ref`] is *stable* across the PR's whole life, a repository
+/// that declares `concurrency:` without `cancel_in_progress` then has every
+/// later trigger on that ref — a reopen, a push to the head branch — refused
+/// outright for an active pipeline that answers a dead question
+/// (card_f68eac170fa5).
+///
+/// Cancelled on the way to **both** terminal states, `closed` and `merged`, and
+/// that is a deliberate answer rather than an oversight. A merge does not have
+/// to wait for this pipeline — the merge queue builds its own merge-group run,
+/// and a force-merge or a repository with no required checks does not wait for
+/// anything — so a merge with the PR run still going is a real state, and once
+/// the merge has happened nobody will act on that run's verdict either. The
+/// common case where CI is what *caused* the merge costs one query and changes
+/// nothing: the pipeline is already terminal, so
+/// [`find_active_pipelines_by_ref`](rg_db::ops::pipeline_ops::find_active_pipelines_by_ref)
+/// does not even return it.
+///
+/// Best-effort, like the merge queue's [`release_merge_group_pipeline`]: the
+/// state change the caller was told about is already committed, and a pipeline
+/// that will not cancel must not unwind it. Best-effort is not silent — a
+/// failure leaves a live pipeline and nothing else in the system will come back
+/// for it, so every failure names the PR, the ref and the full cause chain.
+///
+/// [`release_merge_group_pipeline`]: super::merge_queue
+pub async fn cancel_pull_request_ci(
+    db: &DatabaseConnection,
+    pr: &pull_request::Model,
+    reason: &str,
+) {
+    let ref_name = pull_request_ref(pr);
+    let active = match rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+        db, pr.repo_id, &ref_name,
+    )
+    .await
+    {
+        Ok(pipelines) => pipelines,
+        Err(error) => {
+            tracing::warn!(
+                pr_id = pr.id,
+                pr_number = pr.number,
+                ref_name = %ref_name,
+                reason,
+                error = %format!("{error:#}"),
+                "pull_request pipelines left running: the PR left `open` and its active runs could not be read"
+            );
+            return;
+        }
+    };
+    for pipeline in active {
+        match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline.id).await {
+            Ok(true) => tracing::info!(
+                pr_id = pr.id,
+                pr_number = pr.number,
+                pipeline_id = pipeline.id,
+                reason,
+                "canceled the pull_request pipeline its PR no longer needs"
+            ),
+            // Already terminal by the time the transaction ran — the ordinary
+            // outcome for a PR merged because its CI went green.
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                pr_id = pr.id,
+                pr_number = pr.number,
+                pipeline_id = pipeline.id,
+                reason,
+                error = %format!("{error:#}"),
+                "pull_request pipeline left running: its PR left `open` and nothing else will come back for it"
+            ),
+        }
     }
 }

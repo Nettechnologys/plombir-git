@@ -1204,6 +1204,14 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/pulls/{number}/merge",
             api::pulls::merge_pr,
         )
+        // `RepoWrite` on purpose: this is the maintainer saying an unreviewed
+        // fork head may run with this repository's CI secrets, so the author of
+        // the PR must not be able to grant it to themselves (card_94834ecee708).
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/pulls/{number}/ci-approval",
+            api::pulls::approve_pr_ci,
+        )
         .put(
             RepoWrite,
             "/repos/{owner}/{name}/pulls/{number}/auto-merge",

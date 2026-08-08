@@ -97,6 +97,9 @@ pub async fn create_pr(
         merge_strategy: Set(None),
         merge_commit_sha: Set(None),
         head_repo_id: Set(head_repo_id),
+        ci_approved_sha: Set(None),
+        ci_approved_by: Set(None),
+        ci_approved_at: Set(None),
         milestone_id: Set(None),
         labels: Set(None),
         created_at: Set(Utc::now()),
@@ -602,6 +605,13 @@ pub async fn update_pr(
                 &updated.title,
                 action,
             );
+        }
+        // Same placement and the same reason as the announcement above: the
+        // transition is persisted, so this cannot cancel the CI of a close a
+        // later failure rolled back. See `cancel_pull_request_ci` for why a
+        // transition to `merged` cancels too.
+        if previous_state == "open" && updated.state != "open" {
+            super::ci::cancel_pull_request_ci(db, &updated, "pull request left `open`").await;
         }
     }
     Ok(updated)
@@ -1834,6 +1844,10 @@ async fn update_pr_merged(
         "merged",
     );
 
+    // A merge does not have to wait for the PR's own pipeline — see
+    // `cancel_pull_request_ci` for why `merged` cancels just like `closed`.
+    super::ci::cancel_pull_request_ci(db, &merged_pr, "pull request merged").await;
+
     Ok(MergeResult {
         base_ref_update: base_sha_before
             .as_deref()
@@ -2277,6 +2291,9 @@ mod number_allocation_tests {
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
             head_repo_id: Set(None),
+            ci_approved_sha: Set(None),
+            ci_approved_by: Set(None),
+            ci_approved_at: Set(None),
             milestone_id: Set(None),
             labels: Set(None),
             created_at: Set(now),

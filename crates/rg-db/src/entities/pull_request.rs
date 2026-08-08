@@ -39,6 +39,18 @@ pub struct Model {
     pub merge_commit_sha: Option<String>,
     /// For fork PRs: the repository where head_branch lives (null = same as repo_id)
     pub head_repo_id: Option<i64>,
+    /// The head commit a maintainer has permitted CI to run for.
+    ///
+    /// Keyed on the SHA rather than on the PR so that the permission cannot
+    /// outlive the code it was given for: once the head moves, this no longer
+    /// equals `head_sha` and a fork PR's CI closes again until it is renewed
+    /// (card_94834ecee708). `None` on a same-repository PR is not a refusal —
+    /// only a fork's head is unreviewed code.
+    pub ci_approved_sha: Option<String>,
+    /// Who permitted it. Nullable so the record survives that account's
+    /// deletion, like every other actor column in this schema.
+    pub ci_approved_by: Option<i64>,
+    pub ci_approved_at: Option<DateTimeUtc>,
     /// Milestone id (nullable)
     pub milestone_id: Option<i64>,
     /// Label names stored as JSON array: ["bug","feature"]
