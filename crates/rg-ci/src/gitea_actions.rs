@@ -285,6 +285,64 @@ pub struct GiteaConcurrency {
     pub cancel_in_progress: Option<bool>,
 }
 
+/// The `with:` inputs `actions/checkout` has an honest answer for.
+///
+/// ForgeKeep does not run the action; the pipeline workspace is a
+/// `git worktree add --detach <pipeline sha>` of the repository the workflow
+/// lives in. That satisfies exactly one of the action's inputs and no others:
+/// `fetch-depth` asks for *at least* that much history, and the worktree always
+/// carries all of it, so any value is met — including the `0` that workflows
+/// spell to ask for a full clone.
+///
+/// Everything else the action accepts changes what ends up in the workspace —
+/// `ref`, `repository`, `path`, `submodules`, `lfs`, `sparse-checkout`,
+/// `clean`, `persist-credentials` — and the workspace answers to none of them.
+/// Accepting those keys silently is how a job that asked to check out a
+/// different branch ran green against the pipeline's commit.
+const CHECKOUT_INPUTS: &[&str] = &["fetch-depth"];
+
+/// The `with:` inputs `actions/cache` is translated from.
+///
+/// `build_job_script` reads these two into a [`CacheConfig`]. The rest change
+/// behaviour that ForgeKeep's cache does not implement — `restore-keys` turns a
+/// miss into a fallback hit, `fail-on-cache-miss` turns a miss into a job
+/// failure, `lookup-only` skips the restore — so accepting them would report the
+/// opposite of what the workflow asked for.
+const CACHE_INPUTS: &[&str] = &["path", "key"];
+
+/// `with:` keys on a natively-implemented action that nothing consumes.
+///
+/// Returns them sorted so the same workflow always produces the same message;
+/// `with` is a `HashMap` and its iteration order is not stable.
+fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> Vec<String> {
+    let Some(uses) = step.uses.as_deref() else {
+        return Vec::new();
+    };
+    let supported = if uses.starts_with("actions/checkout") {
+        CHECKOUT_INPUTS
+    } else if uses.starts_with("actions/cache@") {
+        CACHE_INPUTS
+    } else {
+        // Any other action is already refused whole, inputs and all.
+        return Vec::new();
+    };
+
+    let mut unknown = step
+        .with
+        .keys()
+        .filter(|key| !supported.contains(&key.as_str()))
+        .map(|key| {
+            format!(
+                "{job_name}: step {} {uses} input '{key}' (supported: {})",
+                index + 1,
+                supported.join(", ")
+            )
+        })
+        .collect::<Vec<_>>();
+    unknown.sort();
+    unknown
+}
+
 /// Context for workflow expression evaluation.
 pub struct WorkflowContext {
     pub ref_name: String,
@@ -491,6 +549,37 @@ impl GiteaWorkflow {
             });
             default_shell.into_iter().chain(step_features)
         }));
+        // `container.options` is raw `docker run` flags. Passing them through
+        // would hand a committed workflow the ability to undo the sandbox the
+        // runner builds around every containerised job — `--cap-drop=ALL`,
+        // `--security-opt=no-new-privileges`, the pids/memory/cpu limits, and
+        // the deliberate absence of `--privileged` and the Docker socket. There
+        // is no honest partial support here, so the key is refused by name
+        // rather than parsed and dropped (card_e949057aaa0d).
+        //
+        // `container.env` is not in this list: it is honoured, as the job's
+        // variables, which is what the runner turns into the container's
+        // environment.
+        unsupported.extend(self.jobs.iter().filter_map(|(job_name, job)| {
+            job.container
+                .as_ref()
+                .and_then(|container| container.options.as_ref())
+                .map(|_| format!("{job_name}: container.options"))
+        }));
+
+        // An action ForgeKeep implements natively still has to be honest about
+        // *which* of its inputs it implements. `actions/checkout` was skipped
+        // whole — `has_checkout = true; continue` — so every `with:` key on it
+        // was accepted and ignored, and a job asking for `ref:` or `submodules:`
+        // ran green against a tree that had neither. Same for `actions/cache`,
+        // where only `path` and `key` are read.
+        unsupported.extend(self.jobs.iter().flat_map(|(job_name, job)| {
+            job.steps
+                .iter()
+                .enumerate()
+                .flat_map(move |(index, step)| unsupported_action_inputs(job_name, index, step))
+        }));
+
         if unsupported.is_empty() {
             Ok(())
         } else {
@@ -710,6 +799,29 @@ impl GiteaWorkflow {
         let mut job_vars: HashMap<String, String> = HashMap::new();
         let mut cache = None;
 
+        // Container env first, so workflow- and job-level `env:` override it.
+        // The runner turns a job's variables into the container's environment
+        // (`docker run -e KEY`), which is what `container.env` means — it was
+        // deserialized and then read by nothing, so a workflow declaring it ran
+        // without those variables and said so nowhere (card_e949057aaa0d).
+        if let Some(container) = &job.container {
+            // Destructured exhaustively on purpose, the same device the trigger
+            // match uses: a field added to `GiteaContainer` stops compiling here
+            // until somebody decides whether it is honoured or refused by name.
+            // That decision not being forced is how `options` and `env` came to
+            // be deserialized and read by nothing.
+            //
+            // `image` is read in `to_ci_config`; `options` cannot be honoured
+            // and is refused in `validate_supported_actions`.
+            let GiteaContainer {
+                image: _,
+                options: _,
+                env,
+            } = container;
+            for (k, v) in env {
+                job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
+            }
+        }
         // Copy workflow-level env
         for (k, v) in &self.env {
             job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
@@ -1544,6 +1656,175 @@ jobs:
         let script_str = build.script.join("\n");
         assert!(script_str.contains("cargo build --release"));
         assert!(script_str.contains("cargo test"));
+    }
+
+    /// card_e949057aaa0d: a natively-implemented action must be honest about
+    /// which of its inputs it implements.
+    ///
+    /// `actions/checkout` was skipped whole, so every `with:` key on it was
+    /// accepted and dropped — a job asking to check out a different ref ran
+    /// green against the pipeline's commit and reported nothing.
+    #[test]
+    fn checkout_inputs_the_workspace_cannot_honour_are_rejected_by_name() {
+        let yml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+          submodules: true
+      - run: cargo build
+"#;
+        let workflow = GiteaWorkflow::parse(yml).unwrap();
+        let error = workflow
+            .validate_supported_actions()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input 'ref'"), "{error}");
+        assert!(error.contains("input 'submodules'"), "{error}");
+        assert!(
+            error.contains("supported: fetch-depth"),
+            "the message must say what IS honoured: {error}"
+        );
+    }
+
+    /// The one checkout input the workspace does satisfy: the worktree carries
+    /// the repository's full history at the pipeline commit, so any requested
+    /// depth is already met.
+    #[test]
+    fn checkout_fetch_depth_is_accepted() {
+        let yml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: cargo build
+"#;
+        GiteaWorkflow::parse(yml)
+            .unwrap()
+            .validate_supported_actions()
+            .expect("fetch-depth is met by the pipeline worktree");
+    }
+
+    /// `actions/cache` reads `path` and `key`. `restore-keys` would turn a miss
+    /// into a fallback hit and `fail-on-cache-miss` would turn one into a job
+    /// failure — accepting them reports the opposite of what was asked.
+    #[test]
+    fn cache_inputs_beyond_path_and_key_are_rejected_by_name() {
+        let yml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: build-${{ github.sha }}
+          restore-keys: build-
+          fail-on-cache-miss: true
+      - run: cargo build
+"#;
+        let workflow = GiteaWorkflow::parse(yml).unwrap();
+        let error = workflow
+            .validate_supported_actions()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input 'restore-keys'"), "{error}");
+        assert!(error.contains("input 'fail-on-cache-miss'"), "{error}");
+        assert!(error.contains("supported: path, key"), "{error}");
+
+        // The two it does read stay accepted, or the rejection above would only
+        // mean "cache is unsupported".
+        let supported = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: build-key
+      - run: cargo build
+"#;
+        GiteaWorkflow::parse(supported)
+            .unwrap()
+            .validate_supported_actions()
+            .expect("path and key are the inputs the translation reads");
+    }
+
+    /// `container.options` is raw `docker run` flags, and the runner's sandbox
+    /// is built out of exactly those. There is no partial support to offer.
+    #[test]
+    fn container_options_are_rejected_rather_than_dropped() {
+        let yml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.75
+      options: --privileged -v /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - run: cargo build
+"#;
+        let workflow = GiteaWorkflow::parse(yml).unwrap();
+        let error = workflow
+            .validate_supported_actions()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("container.options"), "{error}");
+    }
+
+    /// `container.env` is honoured instead: the runner turns a job's variables
+    /// into the container's environment, which is what the key means.
+    #[test]
+    fn container_env_reaches_the_job_variables() {
+        let yml = r#"
+on: push
+env:
+  SHARED: workflow
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.75
+      env:
+        RUSTFLAGS: "-D warnings"
+        SHARED: container
+    steps:
+      - run: cargo build
+"#;
+        let workflow = GiteaWorkflow::parse(yml).unwrap();
+        workflow
+            .validate_supported_actions()
+            .expect("container.env is supported, not refused");
+        let ctx = WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc".into(),
+            event: "push".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+        };
+        let job = workflow.to_ci_config(&ctx).jobs.remove("build").unwrap();
+        let variables = job.variables.expect("container env must become variables");
+        assert_eq!(
+            variables.get("RUSTFLAGS").map(String::as_str),
+            Some("-D warnings")
+        );
+        assert_eq!(
+            variables.get("SHARED").map(String::as_str),
+            Some("workflow"),
+            "workflow-level env wins over the container's"
+        );
     }
 
     #[test]

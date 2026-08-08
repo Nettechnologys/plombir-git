@@ -2601,6 +2601,65 @@ mod matrix_tests {
         );
     }
 
+    /// card_e949057aaa0d, on the path a push actually takes: an input nothing
+    /// consumes must stop the trigger, not produce a job that ran none of what
+    /// the workflow asked for.
+    ///
+    /// The repository also carries a native `.forgekeep-ci.yml`, so a refusal
+    /// that quietly fell through to it would look like a green pipeline. The
+    /// assertion is that the trigger fails, names the key, and never gets far
+    /// enough to build anything.
+    #[tokio::test]
+    async fn an_action_input_with_no_consumer_stops_the_trigger_by_name() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/ci.yml",
+                b"on: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          submodules: true\n      - run: echo workflow\n" as &[u8],
+            ),
+            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+        ]);
+
+        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let error = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: 1,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(1),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
+        .await
+        .expect_err("an input nothing implements must not build a pipeline");
+
+        let invalid = error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .unwrap_or_else(|| panic!("a workflow feature we cannot run is a 400, got: {error:#}"));
+        let message = invalid.to_string();
+        for expected in [".gitea/workflows/ci.yml", "submodules", "fetch-depth"] {
+            assert!(
+                message.contains(expected),
+                "the committer has to learn which file, which key and what is honoured \
+                 (missing {expected:?}): {message}"
+            );
+        }
+        assert!(
+            !message.contains("echo native"),
+            "the native config must not be reported as what ran: {message}"
+        );
+    }
+
     #[test]
     fn merged_workflow_stages_are_ordered_deterministically() {
         let workflow = |job: &str| {
