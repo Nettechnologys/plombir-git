@@ -28,7 +28,9 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 use crate::api::repo_access::{CiRead, Packages, RepoWrite};
@@ -54,6 +56,176 @@ pub struct PublishPackageQuery {
     pub repository_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semver: Option<String>,
+}
+
+/// The CouchDB-shaped document `npm publish` PUTs to the package URL.
+///
+/// npm sends one new version and its tarball per request. Unknown top-level and
+/// version fields are intentionally ignored: the tarball's `package.json` is
+/// the artifact authority, while this envelope only identifies and carries it.
+#[derive(Deserialize, ToSchema)]
+pub struct NpmPublishPackument {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "dist-tags")]
+    pub dist_tags: BTreeMap<String, String>,
+    pub versions: BTreeMap<String, NpmPublishVersion>,
+    #[serde(rename = "_attachments")]
+    pub attachments: BTreeMap<String, NpmPublishAttachment>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct NpmPublishVersion {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct NpmPublishAttachment {
+    pub data: String,
+    pub length: usize,
+}
+
+#[derive(Debug)]
+struct DecodedNpmPublish {
+    filename: String,
+    version: String,
+    tarball: Vec<u8>,
+}
+
+/// Turn npm's JSON envelope into the one tarball the package service owns.
+///
+/// Current npm builds the attachment key as exactly
+/// `<manifest.name>-<manifest.version>.tgz`; retaining that spelling is also
+/// what makes a second publish of the same version hit the package-file unique
+/// constraint instead of being mistaken for an additional Maven-style file.
+fn decode_npm_publish_packument(
+    path_name: &str,
+    packument: NpmPublishPackument,
+) -> Result<DecodedNpmPublish, String> {
+    if packument.id != path_name || packument.name != path_name {
+        return Err(format!(
+            "npm package name mismatch: URL names '{path_name}', packument names '{}'",
+            packument.name
+        ));
+    }
+
+    if packument.versions.len() != 1 {
+        return Err("npm publish packument must contain exactly one version".into());
+    }
+    let (version, manifest) = packument
+        .versions
+        .into_iter()
+        .next()
+        .expect("one version checked above");
+    if manifest.name != path_name || manifest.version != version {
+        return Err(format!(
+            "npm version coordinates do not match URL and versions key '{version}'"
+        ));
+    }
+
+    if packument.dist_tags.len() != 1
+        || packument.dist_tags.get("latest").map(String::as_str) != Some(version.as_str())
+    {
+        return Err("npm publish currently supports only the default 'latest' dist-tag".into());
+    }
+
+    let filename = format!("{path_name}-{version}.tgz");
+    if packument.attachments.len() != 1 {
+        return Err(
+            "npm publish packument must contain exactly one tarball attachment; provenance attachments are not supported"
+                .into(),
+        );
+    }
+    let attachment = packument
+        .attachments
+        .get(&filename)
+        .ok_or_else(|| format!("npm publish packument is missing attachment '{filename}'"))?;
+    let tarball = base64::engine::general_purpose::STANDARD
+        .decode(&attachment.data)
+        .map_err(|error| format!("npm tarball attachment is not valid base64: {error}"))?;
+    if tarball.len() != attachment.length {
+        return Err(format!(
+            "npm tarball attachment length mismatch: declared {}, decoded {}",
+            attachment.length,
+            tarball.len()
+        ));
+    }
+
+    Ok(DecodedNpmPublish {
+        filename,
+        version,
+        tarball,
+    })
+}
+
+#[cfg(test)]
+mod npm_publish_packument_tests {
+    use super::*;
+
+    const NAME: &str = "@scope/matrix";
+    const VERSION: &str = "1.2.3";
+    const FILENAME: &str = "@scope/matrix-1.2.3.tgz";
+
+    fn document() -> serde_json::Value {
+        serde_json::json!({
+            "_id": NAME,
+            "name": NAME,
+            "dist-tags": { "latest": VERSION },
+            "versions": {
+                VERSION: { "name": NAME, "version": VERSION }
+            },
+            "_attachments": {
+                FILENAME: {
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"tarball"),
+                    "length": 7
+                }
+            }
+        })
+    }
+
+    fn decode(document: serde_json::Value) -> Result<DecodedNpmPublish, String> {
+        decode_npm_publish_packument(NAME, serde_json::from_value(document).unwrap())
+    }
+
+    #[test]
+    fn scoped_packument_keeps_the_client_attachment_name_and_bytes() {
+        let decoded = decode(document()).unwrap();
+        assert_eq!(decoded.filename, FILENAME);
+        assert_eq!(decoded.version, VERSION);
+        assert_eq!(decoded.tarball, b"tarball");
+    }
+
+    #[test]
+    fn inconsistent_or_unsupported_packuments_fail_closed() {
+        let mut wrong_name = document();
+        wrong_name["_id"] = serde_json::json!("other");
+        assert!(decode(wrong_name)
+            .unwrap_err()
+            .contains("package name mismatch"));
+
+        let mut wrong_length = document();
+        wrong_length["_attachments"][FILENAME]["length"] = serde_json::json!(8);
+        assert!(decode(wrong_length)
+            .unwrap_err()
+            .contains("length mismatch"));
+
+        let mut custom_tag = document();
+        custom_tag["dist-tags"] = serde_json::json!({ "beta": VERSION });
+        assert!(decode(custom_tag)
+            .unwrap_err()
+            .contains("default 'latest' dist-tag"));
+
+        let mut provenance = document();
+        provenance["_attachments"]["@scope/matrix-1.2.3.sigstore"] = serde_json::json!({
+            "data": "{}",
+            "length": 2
+        });
+        assert!(decode(provenance)
+            .unwrap_err()
+            .contains("provenance attachments are not supported"));
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -355,6 +527,32 @@ async fn publish_package(
         None
     };
 
+    persist_package(
+        state,
+        user_id,
+        owner,
+        name,
+        pkg_type,
+        query,
+        filename,
+        body,
+        adapter_meta,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_package(
+    state: AppState,
+    user_id: i64,
+    owner: String,
+    name: String,
+    pkg_type: String,
+    query: PublishPackageQuery,
+    filename: String,
+    body: axum::body::Bytes,
+    adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
+) -> axum::response::Response {
     let resolved = match resolve_publish_info(&query, adapter_meta) {
         Ok(v) => v,
         Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
@@ -438,6 +636,95 @@ pub async fn publish_npm(
         Query(query),
         headers,
         body,
+    )
+    .await
+}
+
+/// PUT the packument envelope emitted by `npm publish` to the package URL.
+#[utoipa::path(
+    put,
+    path = "/repos/{owner}/{name}/packages/npm/{pkg_name}",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("pkg_name" = String, Path, description = "npm package name"),
+    ),
+    request_body(
+        content = NpmPublishPackument,
+        content_type = "application/json",
+        description = "npm publish packument with a base64 tarball attachment",
+    ),
+    responses(
+        (status = 201, description = "Created", body = serde_json::Value),
+        (status = 400, description = "Malformed or unsupported packument", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "Package version already exists", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
+pub async fn publish_npm_packument(
+    State(state): State<AppState>,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
+    Path((owner, repo, pkg_name)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let packument = match serde_json::from_slice::<NpmPublishPackument>(&body) {
+        Ok(packument) => packument,
+        Err(error) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid npm publish packument: {error}"),
+            )
+        }
+    };
+    let decoded = match decode_npm_publish_packument(&pkg_name, packument) {
+        Ok(decoded) => decoded,
+        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+    };
+
+    // The envelope and the URL are claims; package.json inside the tarball is
+    // the artifact's own identity. Refuse disagreement rather than relying on
+    // the generic query-parameter override used by multi-artifact formats.
+    let adapter =
+        rg_core::package_registry::get_adapter("npm").expect("npm is a built-in package adapter");
+    if let Err(error) = adapter.validate(&decoded.tarball) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid package payload: {error:#}"),
+        );
+    }
+    let metadata = match adapter.extract_metadata(&decoded.filename, &decoded.tarball) {
+        Ok(metadata) => metadata,
+        Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    if metadata.name != pkg_name || metadata.version != decoded.version {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "npm tarball package.json does not match the publish URL and packument version",
+        );
+    }
+
+    let query = PublishPackageQuery {
+        name: Some(pkg_name),
+        version: Some(decoded.version),
+        description: None,
+        homepage: None,
+        repository_url: None,
+        semver: None,
+    };
+    persist_package(
+        state,
+        user_id,
+        owner,
+        repo,
+        "npm".to_string(),
+        query,
+        decoded.filename,
+        decoded.tarball.into(),
+        Some(metadata),
     )
     .await
 }

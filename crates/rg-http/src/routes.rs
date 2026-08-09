@@ -1999,6 +1999,11 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/npm/{pkg_name}",
             api::packages::npm_registry_metadata,
         )
+        .put(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/npm/{pkg_name}",
+            api::packages::publish_npm_packument,
+        )
         // PyPI Simple Repository API (PEP 503)
         //
         // The spec spells both of its URLs with a trailing slash — the root

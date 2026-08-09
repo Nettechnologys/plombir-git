@@ -506,6 +506,7 @@ pub(crate) fn stamp_security(
         crate::api::packages::yank_version,
         crate::api::packages::download_file,
         crate::api::packages::publish_npm,
+        crate::api::packages::publish_npm_packument,
         crate::api::packages::list_npm_packages,
         // Imports
         crate::api::imports::start_import,
@@ -680,6 +681,9 @@ pub(crate) fn stamp_security(
             crate::api::time_tracking::AddTimeRequest,
             crate::api::imports::StartImportRequest,
             crate::api::packages::YankRequest,
+            crate::api::packages::NpmPublishPackument,
+            crate::api::packages::NpmPublishVersion,
+            crate::api::packages::NpmPublishAttachment,
         )
     ),
     tags(

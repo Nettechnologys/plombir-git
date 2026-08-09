@@ -3,6 +3,7 @@
 use std::io::{Cursor, Write};
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+use base64::Engine as _;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::StatusCode;
@@ -1509,6 +1510,97 @@ async fn npm_metadata_carries_the_manifest_dependencies() {
             .ends_with("/packages/npm/matrix-deps-npm/1.0.0/matrix-deps-npm-1.0.0.tgz"),
         "version object: {version}"
     );
+}
+
+/// `npm publish` does not POST a tarball to ForgeKeep's generic upload route.
+/// It PUTs a CouchDB-shaped packument to the package URL, with the tarball in a
+/// base64 `_attachments` entry. The scoped spelling matters twice: npm escapes
+/// the slash in the request URL but retains it in the attachment key.
+#[tokio::test]
+async fn npm_put_packument_publishes_normal_and_scoped_tarballs() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "npm-put-owner", "npm-put-owner@example.com").await;
+    create_repo(&base, &token, "npm-put-repo").await;
+    let client = reqwest::Client::new();
+
+    for (name, encoded_name) in [
+        ("matrix-put-npm", "matrix-put-npm"),
+        (
+            "@matrix-scope/scoped-put-npm",
+            "@matrix-scope%2Fscoped-put-npm",
+        ),
+    ] {
+        let version = "1.0.0";
+        let package_json = format!(
+            r#"{{"name":"{name}","version":"{version}","description":"published by npm PUT"}}"#
+        );
+        let tarball = tar_gz(&[("package/package.json", package_json.as_bytes())]);
+        let attachment_name = format!("{name}-{version}.tgz");
+        let publish_url = format!(
+            "{}/api/v1/repos/npm-put-owner/npm-put-repo/packages/npm/{encoded_name}",
+            base.trim_end_matches('/')
+        );
+        let packument = serde_json::json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "description": "published by npm PUT"
+                }
+            },
+            "_attachments": {
+                attachment_name: {
+                    "content_type": "application/octet-stream",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                    "length": tarball.len()
+                }
+            }
+        });
+
+        let published = client
+            .put(&publish_url)
+            .bearer_auth(&token)
+            .json(&packument)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            published.status(),
+            StatusCode::CREATED,
+            "npm PUT failed for {name}: {}",
+            published.text().await.unwrap()
+        );
+
+        let document: serde_json::Value = client
+            .get(&publish_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tarball_url = document["versions"][version]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no dist.tarball for {name}: {document}"));
+        let downloaded = client.get(tarball_url).send().await.unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK, "{tarball_url}");
+        assert_eq!(downloaded.bytes().await.unwrap().to_vec(), tarball);
+
+        // npm versions are immutable. The deterministic attachment name makes
+        // this the package-file conflict path, not Maven's add-another-file
+        // path for an existing version.
+        let repeated = client
+            .put(&publish_url)
+            .bearer_auth(&token)
+            .json(&packument)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::CONFLICT, "{name}");
+    }
 }
 
 /// A scoped name (`@scope/name`) carries a literal slash, and `dist.tarball` is
