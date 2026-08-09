@@ -2184,6 +2184,27 @@ pub async fn delete_repo(
 
     let mut cleanup_error = None;
 
+    // `code_fts` is a second copy of the repository's source tree and has no
+    // foreign key on any backend (SQLite's FTS5 virtual table cannot have one).
+    // Clear it only after the soft-delete commits: every path above can still
+    // restore the repository, while the indexer's live-row lock now prevents a
+    // refresh that arrives later from publishing the snapshot again.
+    if let Err(error) = crate::search::code_indexer::CodeIndexer::new(db.clone())
+        .delete_repository_index(repo.id)
+        .await
+    {
+        tracing::warn!(
+            repo_id = repo.id,
+            error = %format!("{error:#}"),
+            "repository is deleted, but its code search index still retains source contents and \
+             must be cleared by hand"
+        );
+        cleanup_error = Some(error.context(format!(
+            "repository {} is deleted, but its code search index could not be cleared",
+            repo.id
+        )));
+    }
+
     // The row has left the live set, so the source's `forks_count` — declared to
     // be `COUNT(*)` over `origin_repo_id = source AND deleted_at IS NULL` — is
     // now one higher than the rows it claims to count, and nothing else ever
@@ -2204,11 +2225,13 @@ pub async fn delete_repo(
                 "fork is deleted, but its source's cached forks_count still counts it and must be \
                  refreshed by hand"
             );
-            cleanup_error = Some(error.context(format!(
-                "repository {} is deleted, but the cached forks_count of its source repository {} \
-                 could not be refreshed",
-                repo.id, origin_repo_id
-            )));
+            if cleanup_error.is_none() {
+                cleanup_error = Some(error.context(format!(
+                    "repository {} is deleted, but the cached forks_count of its source repository {} \
+                     could not be refreshed",
+                    repo.id, origin_repo_id
+                )));
+            }
         }
     }
 

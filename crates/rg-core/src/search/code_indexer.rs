@@ -280,6 +280,18 @@ impl CodeIndexer {
             .with_context(|| format!("decode code index row count for repository {repo_id}"))
     }
 
+    /// Remove the complete code-search snapshot of a deleted repository.
+    ///
+    /// Repository deletion calls this only after the metadata row has left the
+    /// live set. [`Self::lock_repository_for_refresh`] makes that soft-delete
+    /// the serialization boundary: an older refresh already holding the row
+    /// lock finishes before deletion commits, while a refresh reaching the lock
+    /// afterwards is refused. The single `DELETE` here can therefore not be
+    /// followed by a late writer that recreates the retired snapshot.
+    pub(crate) async fn delete_repository_index(&self, repo_id: i64) -> Result<()> {
+        self.clear_index_for_repo(&self.db, repo_id).await
+    }
+
     /// Publish one complete repository snapshot.
     ///
     /// The transaction is the visibility boundary: a failed clear or batch
@@ -357,22 +369,30 @@ impl CodeIndexer {
         unreachable!("the bounded code index refresh loop returns or continues on every attempt")
     }
 
-    /// Serialize refreshes on server databases without locking unrelated repos.
-    /// SQLite has one writer for the whole database, acquired by the clear below.
+    /// Serialize refreshes on server databases without locking unrelated repos,
+    /// and refuse to publish a snapshot after repository deletion has committed.
+    ///
+    /// SQLite cannot spell `FOR UPDATE`. Its live-row read followed by the clear
+    /// is still safe: a concurrent soft-delete between those statements makes
+    /// the read transaction's first write fail with `SQLITE_BUSY_SNAPSHOT`, and
+    /// the retry starts from a snapshot where the repository is no longer live.
     async fn lock_repository_for_refresh(
         &self,
         transaction: &DatabaseTransaction,
         repo_id: i64,
     ) -> Result<()> {
         let backend = transaction.get_database_backend();
-        if backend == DatabaseBackend::Sqlite {
-            return Ok(());
-        }
-
-        let sql = rg_db::prepare_sql(
-            backend,
-            "SELECT id FROM repositories WHERE id = ? FOR UPDATE",
-        );
+        let sql = if backend == DatabaseBackend::Sqlite {
+            rg_db::prepare_sql(
+                backend,
+                "SELECT id FROM repositories WHERE id = ? AND deleted_at IS NULL",
+            )
+        } else {
+            rg_db::prepare_sql(
+                backend,
+                "SELECT id FROM repositories WHERE id = ? AND deleted_at IS NULL FOR UPDATE",
+            )
+        };
         transaction
             .query_one(Statement::from_sql_and_values(
                 backend,
@@ -382,19 +402,18 @@ impl CodeIndexer {
             .await
             .with_context(|| format!("lock repository {repo_id} for code index refresh"))?
             .with_context(|| {
-                format!("repository {repo_id} disappeared before code index refresh")
+                format!("repository {repo_id} is not live; refusing code index refresh")
             })?;
         Ok(())
     }
 
-    /// Clear existing index for a repository inside the refresh transaction.
-    async fn clear_index_for_repo(
-        &self,
-        transaction: &DatabaseTransaction,
-        repo_id: i64,
-    ) -> Result<()> {
-        let backend = transaction.get_database_backend();
-        transaction
+    /// Clear an existing repository index through the supplied connection.
+    async fn clear_index_for_repo<C>(&self, connection: &C, repo_id: i64) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = connection.get_database_backend();
+        connection
             .execute(Statement::from_sql_and_values(
                 backend,
                 rg_db::prepare_sql(backend, "DELETE FROM code_fts WHERE repo_id = ?"),
@@ -948,6 +967,49 @@ mod tests {
         );
     }
 
+    async fn exercise_deleted_repository_rejects_refresh(indexer: &CodeIndexer, repo_id: i64) {
+        let old_entries = generation_entries(repo_id, "old", 2);
+        indexer
+            .replace_index_entries(repo_id, &old_entries, |_| std::future::ready(Ok(())))
+            .await
+            .expect("seed the live repository's code index");
+
+        let retirement = rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+            &indexer.db,
+            repo_id,
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("soft-delete the repository");
+        assert!(matches!(
+            retirement,
+            rg_db::ops::repo_ops::RepositoryRetirement::Deleted
+        ));
+        indexer
+            .delete_repository_index(repo_id)
+            .await
+            .expect("clear the retired repository's code index");
+
+        let error = indexer
+            .replace_index_entries(repo_id, &generation_entries(repo_id, "late", 1), |_| {
+                std::future::ready(Ok(()))
+            })
+            .await
+            .expect_err("a late refresh must not recreate a deleted repository's index");
+        assert!(
+            format!("{error:#}").contains("is not live; refusing code index refresh"),
+            "unexpected late-refresh error: {error:#}"
+        );
+        assert_eq!(
+            indexer
+                .indexed_file_count(repo_id)
+                .await
+                .expect("count the retired repository's code index"),
+            0,
+            "the late refresh resurrected a deleted repository's source snapshot"
+        );
+    }
+
     fn committed_repository(files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("temporary directory must be created");
         let worktree = dir.path().join("worktree");
@@ -994,6 +1056,12 @@ mod tests {
             .write_all(data)
             .expect("object payload must compress");
         encoder.finish().expect("object must finish compressing");
+    }
+
+    #[tokio::test]
+    async fn a_soft_deleted_repository_cannot_publish_a_late_index_refresh() {
+        let indexer = test_indexer().await;
+        exercise_deleted_repository_rejects_refresh(&indexer, TEST_REPO_ID).await;
     }
 
     #[tokio::test]
@@ -1134,6 +1202,8 @@ mod tests {
         .await;
 
         exercise_atomic_refresh(&db, TEST_REPO_ID).await;
+        exercise_deleted_repository_rejects_refresh(&CodeIndexer::new(db.clone()), TEST_REPO_ID)
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1155,6 +1225,7 @@ mod tests {
         let repo_id = seed_repository(&db, None, None, &suffix[..12]).await;
 
         exercise_atomic_refresh(&db, repo_id).await;
+        exercise_deleted_repository_rejects_refresh(&CodeIndexer::new(db), repo_id).await;
     }
 
     #[test]

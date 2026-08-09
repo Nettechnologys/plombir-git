@@ -15,8 +15,10 @@
 //! an index built for it behind their back, because indexing reads every blob
 //! of the tree and stores its text a second time.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
+use rg_core::blob_storage::LocalBlobStorage;
+use rg_core::package_registry::oci::storage::OciStorage;
 use rg_core::search::code_indexer::CodeIndexer;
 
 use crate::common::{accepted_push, git, run_post_push_hooks};
@@ -158,6 +160,67 @@ async fn a_push_to_the_default_branch_refreshes_an_existing_code_index() {
         indexed_paths(&db, repo.id, STALE_MARKER).await.is_empty(),
         "a file deleted by the push must stop being findable — a stale hit is \
          the silently-wrong answer this card is about"
+    );
+}
+
+/// Repository deletion is also the retention boundary for the opt-in source
+/// snapshot. The Git tree is removed by the same operation, so leaving its text
+/// in `code_fts` would keep a second, unbounded copy that no live repository can
+/// reach and no later hard-delete can cascade.
+#[tokio::test]
+async fn deleting_a_repository_removes_its_code_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(dir.path()).await;
+    let repo_root = dir.path().join("repos");
+
+    let owner = user(&db, "deleteindexowner").await;
+    let repo = rg_core::repo::service::create_repo(
+        &db,
+        owner.id,
+        "deleteindexrepo",
+        None,
+        false,
+        &repo_root,
+        None,
+    )
+    .await
+    .expect("create repo");
+    let bare_path = repo_root.join("deleteindexowner/deleteindexrepo.git");
+    let _worktree = seed_worktree(&bare_path);
+    let indexer = CodeIndexer::new(db.clone());
+
+    assert_eq!(
+        indexer
+            .index_repository(repo.id, &bare_path, "main")
+            .await
+            .expect("build the repository code index"),
+        1,
+        "the fixture must put source contents into code_fts before deletion"
+    );
+    assert_eq!(
+        indexer
+            .indexed_file_count(repo.id)
+            .await
+            .expect("count indexed files before deletion"),
+        1
+    );
+
+    let blob_storage = LocalBlobStorage::new(&repo_root);
+    let oci_storage = OciStorage::from_backend(
+        Arc::new(LocalBlobStorage::new(&repo_root)),
+        repo_root.join("_oci_uploads"),
+    );
+    rg_core::repo::service::delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &repo)
+        .await
+        .expect("delete the indexed repository");
+
+    assert_eq!(
+        indexer
+            .indexed_file_count(repo.id)
+            .await
+            .expect("count indexed files after deletion"),
+        0,
+        "repository deletion retained its source contents in code_fts"
     );
 }
 
