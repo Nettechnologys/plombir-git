@@ -329,6 +329,35 @@ fn sri(algorithm: &str, hex_digest: Option<&str>) -> Option<String> {
     ))
 }
 
+/// Pick the highest live npm version by SemVer precedence.
+///
+/// The input order is the deterministic publication order supplied by
+/// `package_version_ops::list_by_package`. It is only a fallback for historical
+/// rows whose version is not parseable as SemVer; once at least one live SemVer
+/// exists, an invalid spelling cannot displace it from `latest`.
+pub(crate) fn latest_live_semver<'a>(
+    versions: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Option<&'a str> {
+    let mut fallback = None;
+    let mut latest: Option<(semver::Version, &'a str)> = None;
+
+    for (version, is_yanked) in versions {
+        if is_yanked {
+            continue;
+        }
+        fallback.get_or_insert(version);
+
+        let Ok(parsed) = semver::Version::parse(version) else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|(current, _)| parsed > *current) {
+            latest = Some((parsed, version));
+        }
+    }
+
+    latest.map(|(_, version)| version).or(fallback)
+}
+
 /// Build the npm registry "abbreviated" metadata JSON response.
 ///
 /// This is the format npm expects when querying a registry.
@@ -346,13 +375,14 @@ pub fn build_npm_metadata(
     repo: &str,
 ) -> Result<serde_json::Value> {
     let mut versions_map = serde_json::Map::new();
-    let mut latest_version: Option<String> = None;
+    let latest_version = latest_live_semver(
+        versions
+            .iter()
+            .map(|version| (version.version.as_str(), version.yanked)),
+    )
+    .map(str::to_string);
 
     for vi in versions {
-        if latest_version.is_none() && !vi.yanked {
-            latest_version = Some(vi.version.clone());
-        }
-
         // Every component is percent-encoded into ONE segment. A scoped name
         // (`@scope/name`) carries a literal slash, and pasted raw it turns the
         // four-segment download route into six: the router would read
@@ -890,15 +920,16 @@ mod tests {
         );
     }
 
-    /// `dist-tags.latest` is what a bare `npm install <pkg>` resolves to, and a
-    /// yanked version is not it.
+    /// `dist-tags.latest` is what a bare `npm install <pkg>` resolves to. A
+    /// later backport must not pull it off the highest live SemVer, and a yanked
+    /// version is not a candidate even when it is higher still.
     #[test]
-    fn the_latest_tag_skips_yanked_versions() {
+    fn the_latest_tag_uses_the_highest_live_semver() {
         let document = build_npm_metadata(
             "matrix-npm",
             &[
                 NpmVersionInfo {
-                    version: "2.0.0".into(),
+                    version: "3.0.0".into(),
                     description: None,
                     sha256: None,
                     sha1: None,
@@ -908,7 +939,8 @@ mod tests {
                     metadata: None,
                 },
                 NpmVersionInfo {
-                    version: "1.0.0".into(),
+                    // Published after 2.0.0: list_by_package puts this first.
+                    version: "1.2.4".into(),
                     description: None,
                     sha256: None,
                     sha1: None,
@@ -917,21 +949,43 @@ mod tests {
                     yanked: false,
                     metadata: Some(r#"{"dependencies":{"left-pad":"^1.3.0"}}"#.into()),
                 },
+                NpmVersionInfo {
+                    version: "2.0.0".into(),
+                    description: None,
+                    sha256: None,
+                    sha1: None,
+                    sha512: None,
+                    filename: None,
+                    yanked: false,
+                    metadata: None,
+                },
             ],
             "https://forge.example",
             "acme",
             "tools",
         )
-        .expect("both versions are readable");
+        .expect("all versions are readable");
 
-        assert_eq!(document["dist-tags"]["latest"], "1.0.0", "{document}");
+        assert_eq!(document["dist-tags"]["latest"], "2.0.0", "{document}");
         assert_eq!(
-            document["versions"]["1.0.0"]["dependencies"],
+            document["versions"]["1.2.4"]["dependencies"],
             serde_json::json!({ "left-pad": "^1.3.0" }),
         );
         assert_eq!(
-            document["versions"]["2.0.0"]["dependencies"],
+            document["versions"]["3.0.0"]["dependencies"],
             serde_json::json!({}),
+        );
+    }
+
+    #[test]
+    fn unparsable_historical_versions_keep_the_deterministic_input_order() {
+        assert_eq!(
+            latest_live_semver([
+                ("legacy-backport", false),
+                ("legacy-main", false),
+                ("legacy-withdrawn", true),
+            ]),
+            Some("legacy-backport")
         );
     }
 

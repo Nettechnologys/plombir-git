@@ -582,10 +582,19 @@ pub async fn list_packages(
 
     for pkg in packages {
         let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
-        let latest = versions
-            .iter()
-            .find(|v| !v.is_yanked)
-            .map(|v| v.version.clone());
+        let latest = if package_type == package_types::NPM {
+            crate::package_registry::adapters::npm::latest_live_semver(
+                versions
+                    .iter()
+                    .map(|version| (version.version.as_str(), version.is_yanked)),
+            )
+        } else {
+            versions
+                .iter()
+                .find(|version| !version.is_yanked)
+                .map(|version| version.version.as_str())
+        }
+        .map(str::to_string);
         let count = versions.len() as i64;
 
         summaries.push(PackageSummary {

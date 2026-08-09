@@ -54,7 +54,11 @@ pub async fn find_by_id(
     PackageVersion::find_by_id(id).one(db).await
 }
 
-/// List all versions for a package, ordered by created_at descending.
+/// List all versions for a package, newest publication first.
+///
+/// `created_at` is not unique (bulk imports and coarse upstream timestamps can
+/// tie), so the primary key completes the order and keeps every consumer's
+/// fallback deterministic.
 pub async fn list_by_package(
     db: &DatabaseConnection,
     package_id: i64,
@@ -62,6 +66,7 @@ pub async fn list_by_package(
     PackageVersion::find()
         .filter(package_version::Column::PackageId.eq(package_id))
         .order_by_desc(package_version::Column::CreatedAt)
+        .order_by_desc(package_version::Column::Id)
         .all(db)
         .await
 }
@@ -123,4 +128,40 @@ pub async fn set_yanked(db: &DatabaseConnection, id: i64, yanked: bool) -> Resul
 pub async fn delete_by_id(db: &impl ConnectionTrait, id: i64) -> Result<u64, DbErr> {
     let result = PackageVersion::delete_by_id(id).exec(db).await?;
     Ok(result.rows_affected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn equal_creation_times_are_ordered_by_descending_id() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE package_versions (\
+                 id INTEGER PRIMARY KEY, package_id BIGINT NOT NULL, version TEXT NOT NULL, \
+                 semver TEXT, metadata TEXT, size BIGINT NOT NULL, sha256 TEXT, \
+                 is_yanked BOOLEAN NOT NULL, download_count BIGINT NOT NULL, \
+                 author_id BIGINT, created_at TIMESTAMP NOT NULL\
+             );\
+             INSERT INTO package_versions \
+                 (id, package_id, version, semver, metadata, size, sha256, is_yanked, \
+                  download_count, author_id, created_at) VALUES \
+                 (11, 7, '1.0.0', '1.0.0', NULL, 0, NULL, 0, 0, NULL, '2026-08-09T00:00:00Z'), \
+                 (13, 7, '1.2.0', '1.2.0', NULL, 0, NULL, 0, 0, NULL, '2026-08-09T00:00:00Z'), \
+                 (12, 7, '1.1.0', '1.1.0', NULL, 0, NULL, 0, 0, NULL, '2026-08-09T00:00:00Z');",
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            let ids = list_by_package(&db, 7)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|version| version.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, [13, 12, 11]);
+        }
+    }
 }
