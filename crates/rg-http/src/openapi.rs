@@ -507,6 +507,7 @@ pub(crate) fn stamp_security(
         crate::api::packages::download_file,
         crate::api::packages::publish_npm,
         crate::api::packages::publish_npm_packument,
+        crate::api::packages::pypi_legacy_upload,
         crate::api::packages::list_npm_packages,
         // Imports
         crate::api::imports::start_import,

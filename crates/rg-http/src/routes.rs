@@ -2004,6 +2004,19 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/npm/{pkg_name}",
             api::packages::publish_npm_packument,
         )
+        // Twine's legacy upload API. Both spellings are deliberate: users copy
+        // repository URLs with and without the trailing slash, and Twine POSTs
+        // to exactly what it was given rather than normalizing the path.
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/pypi/legacy/",
+            api::packages::pypi_legacy_upload,
+        )
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/pypi/legacy",
+            api::packages::pypi_legacy_upload,
+        )
         // PyPI Simple Repository API (PEP 503)
         //
         // The spec spells both of its URLs with a trailing slash — the root

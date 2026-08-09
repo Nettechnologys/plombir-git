@@ -12,6 +12,7 @@ use std::io::{Cursor, Write};
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 use reqwest::StatusCode;
 use sea_orm::ConnectionTrait;
+use sha2::{Digest as _, Sha256};
 
 /// A wheel is a ZIP holding `{name}-{version}.dist-info/METADATA`.
 fn wheel(dist_info: &str, metadata: &str) -> Vec<u8> {
@@ -27,6 +28,32 @@ fn wheel(dist_info: &str, metadata: &str) -> Vec<u8> {
         archive.finish().unwrap();
     }
     output.into_inner()
+}
+
+/// The multipart envelope current Twine builds in `Repository::_upload`.
+fn twine_form(
+    package_name: &str,
+    version: &str,
+    filename: &str,
+    body: Vec<u8>,
+    sha256_digest: String,
+) -> reqwest::multipart::Form {
+    reqwest::multipart::Form::new()
+        .text(":action", "file_upload")
+        .text("protocol_version", "1")
+        .text("metadata_version", "2.1")
+        .text("name", package_name.to_string())
+        .text("version", version.to_string())
+        .text("filetype", "bdist_wheel")
+        .text("pyversion", "py3")
+        .text("sha256_digest", sha256_digest)
+        .part(
+            "content",
+            reqwest::multipart::Part::bytes(body)
+                .file_name(filename.to_string())
+                .mime_str("application/octet-stream")
+                .expect("literal MIME type"),
+        )
 }
 
 struct Fixture {
@@ -88,6 +115,124 @@ async fn fixture_with_package(published_name: &str, version: &str) -> Fixture {
     );
 
     Fixture { base, client, db }
+}
+
+/// Acceptance for card_bb095aad4f76: the real Twine wire shape closes the
+/// publish -> simple index -> download round trip. Exercising one route spelling
+/// on the first upload and the other on the duplicate makes either route's
+/// removal fail this test rather than leaving a decorative alias unproved.
+#[tokio::test]
+async fn twine_multipart_upload_round_trips_through_the_simple_index() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "twine-owner", "twine-owner@example.com").await;
+    create_repo(&base, &token, "twine-repo").await;
+
+    let package_name = "matrix-twine";
+    let version = "1.2.3";
+    let filename = "matrix_twine-1.2.3-py3-none-any.whl";
+    let body = wheel(
+        "matrix_twine-1.2.3.dist-info",
+        "Metadata-Version: 2.1\nName: matrix-twine\nVersion: 1.2.3\n",
+    );
+    let digest = hex::encode(Sha256::digest(&body));
+    let client = reqwest::Client::new();
+    let legacy = format!("{base}/api/v1/repos/twine-owner/twine-repo/packages/pypi/legacy");
+
+    let uploaded = client
+        .post(format!("{legacy}/"))
+        .bearer_auth(&token)
+        .multipart(twine_form(
+            package_name,
+            version,
+            filename,
+            body.clone(),
+            digest.clone(),
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status = uploaded.status();
+    let response_body = uploaded.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Twine upload failed: {response_body}"
+    );
+
+    let index = client
+        .get(format!(
+            "{base}/api/v1/repos/twine-owner/twine-repo/packages/pypi/simple/matrix-twine/"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+    let index = index.text().await.unwrap();
+    let href = index
+        .split_once("<a href=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(url, _)| url.split('#').next().unwrap().to_string())
+        .unwrap_or_else(|| panic!("no download link in the index page: {index}"));
+    let downloaded = client.get(href).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), body.as_slice());
+
+    let duplicate = client
+        .post(&legacy)
+        .bearer_auth(&token)
+        .multipart(twine_form(package_name, version, filename, body, digest))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate.status(),
+        StatusCode::CONFLICT,
+        "repeating the same distribution must be a conflict: {}",
+        duplicate.text().await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn twine_upload_rejects_a_false_sha256_without_publishing() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "digest-owner", "digest-owner@example.com").await;
+    create_repo(&base, &token, "digest-repo").await;
+
+    let body = wheel(
+        "bad_digest-1.0.0.dist-info",
+        "Metadata-Version: 2.1\nName: bad-digest\nVersion: 1.0.0\n",
+    );
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "{base}/api/v1/repos/digest-owner/digest-repo/packages/pypi/legacy/"
+        ))
+        .bearer_auth(&token)
+        .multipart(twine_form(
+            "bad-digest",
+            "1.0.0",
+            "bad_digest-1.0.0-py3-none-any.whl",
+            body,
+            "0".repeat(64),
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response_body}");
+    assert!(response_body.contains("sha256_digest"), "{response_body}");
+
+    let index = client
+        .get(format!(
+            "{base}/api/v1/repos/digest-owner/digest-repo/packages/pypi/simple/"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+    let index = index.text().await.unwrap();
+    assert!(!index.contains("bad-digest"), "{index}");
 }
 
 /// The project page pip actually requests: `.../simple/<name>/`.

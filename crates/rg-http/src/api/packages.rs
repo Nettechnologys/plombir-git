@@ -23,13 +23,14 @@
 
 use crate::error::AppError;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
@@ -233,7 +234,7 @@ pub struct YankRequest {
     pub yank: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PublishResponse {
     pub package_id: i64,
     pub version_id: i64,
@@ -423,6 +424,197 @@ fn filename_from_disposition(headers: &axum::http::HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .and_then(parse_filename_from_disposition)
         .unwrap_or_else(|| "package".to_string())
+}
+
+#[derive(Default)]
+struct TwineUpload {
+    action: Option<String>,
+    protocol_version: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    sha256_digest: Option<String>,
+    filename: Option<String>,
+    content: Option<axum::body::Bytes>,
+}
+
+fn set_twine_field<T>(slot: &mut Option<T>, field: &str, value: T) -> Result<(), AppError> {
+    if slot.replace(value).is_some() {
+        return Err(AppError::bad_request(format!(
+            "Twine upload repeats the `{field}` field"
+        )));
+    }
+    Ok(())
+}
+
+fn required_twine_field(value: Option<String>, field: &str) -> Result<String, AppError> {
+    value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request(format!("Twine upload is missing `{field}`")))
+}
+
+/// Decode the multipart form emitted by `twine upload`.
+///
+/// Twine sends many descriptive metadata fields as well; the package adapter
+/// reads the authoritative metadata from the wheel/sdist itself, so this
+/// boundary only consumes the protocol controls, coordinates, digest and file.
+async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, AppError> {
+    let mut upload = TwineUpload::default();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::bad_request(format!("invalid Twine multipart body: {error}")))?
+    {
+        let Some(field_name) = field.name().map(str::to_owned) else {
+            continue;
+        };
+        match field_name.as_str() {
+            "content" => {
+                let filename = field
+                    .file_name()
+                    .map(str::to_owned)
+                    .filter(|filename| !filename.is_empty())
+                    .ok_or_else(|| {
+                        AppError::bad_request("Twine `content` field has no filename")
+                    })?;
+                let content = field.bytes().await.map_err(|error| {
+                    AppError::bad_request(format!("cannot read Twine `content` field: {error}"))
+                })?;
+                set_twine_field(&mut upload.filename, "content", filename)?;
+                set_twine_field(&mut upload.content, "content", content)?;
+            }
+            ":action" | "protocol_version" | "name" | "version" | "sha256_digest" => {
+                let value = field.text().await.map_err(|error| {
+                    AppError::bad_request(format!(
+                        "Twine `{field_name}` field is not valid text: {error}"
+                    ))
+                })?;
+                let slot = match field_name.as_str() {
+                    ":action" => &mut upload.action,
+                    "protocol_version" => &mut upload.protocol_version,
+                    "name" => &mut upload.name,
+                    "version" => &mut upload.version,
+                    "sha256_digest" => &mut upload.sha256_digest,
+                    _ => unreachable!("matched above"),
+                };
+                set_twine_field(slot, &field_name, value)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(upload)
+}
+
+/// POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy[/]
+///
+/// The upload side of the legacy PyPI API used by Twine. The simple index is
+/// the read side; without this protocol endpoint a package could be installed
+/// from ForgeKeep but no standard Python client could publish it there.
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/packages/pypi/legacy/",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+    ),
+    request_body(
+        content_type = "multipart/form-data",
+        description = "Twine legacy upload form with package metadata and a content file",
+    ),
+    responses(
+        (status = 200, description = "Package uploaded", body = PublishResponse),
+        (status = 400, description = "Malformed form, package, or digest", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "Distribution already exists", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
+pub async fn pypi_legacy_upload(
+    State(state): State<AppState>,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
+    Path((owner, name)): Path<(String, String)>,
+    multipart: Multipart,
+) -> axum::response::Response {
+    let upload = match decode_twine_upload(multipart).await {
+        Ok(upload) => upload,
+        Err(error) => return error.into_response(),
+    };
+
+    let action = match required_twine_field(upload.action, ":action") {
+        Ok(action) => action,
+        Err(error) => return error.into_response(),
+    };
+    if action != "file_upload" {
+        return AppError::bad_request("Twine `:action` must be `file_upload`").into_response();
+    }
+
+    let protocol_version = match required_twine_field(upload.protocol_version, "protocol_version") {
+        Ok(version) => version,
+        Err(error) => return error.into_response(),
+    };
+    if protocol_version != "1" {
+        return AppError::bad_request("Twine `protocol_version` must be `1`").into_response();
+    }
+
+    let package_name = match required_twine_field(upload.name, "name") {
+        Ok(name) => name,
+        Err(error) => return error.into_response(),
+    };
+    let version = match required_twine_field(upload.version, "version") {
+        Ok(version) => version,
+        Err(error) => return error.into_response(),
+    };
+    let claimed_digest = match required_twine_field(upload.sha256_digest, "sha256_digest") {
+        Ok(digest) => digest,
+        Err(error) => return error.into_response(),
+    };
+    if claimed_digest.len() != 64 || !claimed_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return AppError::bad_request("Twine `sha256_digest` must be 64 hexadecimal characters")
+            .into_response();
+    }
+    let Some(filename) = upload.filename else {
+        return AppError::bad_request("Twine upload is missing `content`").into_response();
+    };
+    let Some(content) = upload.content else {
+        return AppError::bad_request("Twine upload is missing `content`").into_response();
+    };
+    let actual_digest = hex::encode(Sha256::digest(&content));
+    if !claimed_digest.eq_ignore_ascii_case(&actual_digest) {
+        return AppError::bad_request(format!(
+            "Twine `sha256_digest` mismatch: claimed {claimed_digest}, calculated {actual_digest}"
+        ))
+        .into_response();
+    }
+
+    let query = PublishPackageQuery {
+        name: Some(package_name),
+        version: Some(version),
+        description: None,
+        homepage: None,
+        repository_url: None,
+        semver: None,
+    };
+    let mut response = publish_package(
+        state,
+        user_id,
+        owner,
+        name,
+        "pypi".to_string(),
+        query,
+        filename,
+        content,
+    )
+    .await;
+    // Twine's legacy upload contract uses 200 for a successful POST. Keep the
+    // generic service's body, but do not expose its REST-specific 201 here.
+    if response.status().is_success() {
+        *response.status_mut() = StatusCode::OK;
+    }
+    response
 }
 
 /// POST/PUT /api/v1/repos/{owner}/{name}/packages/nuget/publish
