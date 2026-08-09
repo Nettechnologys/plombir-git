@@ -119,8 +119,11 @@ export const repos = {
     request<{ watch_state: string }>(`/repos/${owner}/${repo}/watch`, { method: 'DELETE' }),
   delete: (owner: string, repo: string) =>
     request<{ deleted: boolean }>(`/repos/${owner}/${repo}`, { method: 'DELETE' }),
-  fork: (owner: string, repo: string) =>
-    request<any>(`/repos/${owner}/${repo}/fork`, { method: 'POST' }),
+  fork: (owner: string, repo: string, opts?: { org?: string }) =>
+    request<any>(`/repos/${owner}/${repo}/fork`, {
+      method: 'POST',
+      ...(opts ? { body: JSON.stringify(opts) } : {}),
+    }),
   forks: (owner: string, repo: string, page?: number, perPage?: number) => {
     const params = new URLSearchParams();
     if (page) params.set('page', String(page));

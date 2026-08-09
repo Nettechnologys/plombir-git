@@ -43,12 +43,165 @@ async fn create_seeded_repo(base: &str, token: &str, name: &str, is_private: boo
         .expect("repository id")
 }
 
+async fn create_org(base: &str, token: &str, name: &str) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": name, "visibility": "public" }))
+        .send()
+        .await
+        .expect("create organization");
+    assert_eq!(
+        response.status(),
+        201,
+        "baseline: destination organization creation failed: {}",
+        response.text().await.expect("organization response body")
+    );
+}
+
+async fn add_org_member(base: &str, token: &str, org: &str, user_id: i64) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/orgs/{org}/members"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "user_id": user_id, "role": "member" }))
+        .send()
+        .await
+        .expect("add organization member");
+    assert_eq!(
+        response.status(),
+        201,
+        "baseline: adding the destination member failed: {}",
+        response.text().await.expect("membership response body")
+    );
+}
+
 /// The commit `HEAD` resolves to in a bare repository on disk.
 fn head_commit(bare: &Path) -> String {
     let repo = gix::open(bare).unwrap_or_else(|error| panic!("gix cannot open {bare:?}: {error}"));
     repo.head_id()
         .unwrap_or_else(|error| panic!("{bare:?} has no resolvable HEAD: {error}"))
         .to_string()
+}
+
+/// The fork destination is a second authorization subject, independent of the
+/// readable source. A member may fork into their organization, a stranger may
+/// not, and the historical request with no body still means the caller's own
+/// account.
+#[tokio::test]
+async fn organization_destination_is_gated_and_no_body_stays_personal() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (source_token, _) =
+        register_full(&base, "fork-org-source", "fork-org-source@example.com").await;
+    create_seeded_repo(&base, &source_token, "share-me", false).await;
+
+    let (org_owner_token, _) =
+        register_full(&base, "fork-org-owner", "fork-org-owner@example.com").await;
+    let (member_token, member_id) =
+        register_full(&base, "fork-org-member", "fork-org-member@example.com").await;
+    let (outsider_token, _) =
+        register_full(&base, "fork-org-outsider", "fork-org-outsider@example.com").await;
+    create_org(&base, &org_owner_token, "fork-org-target").await;
+    add_org_member(&base, &org_owner_token, "fork-org-target", member_id).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/fork-org-source/share-me/fork");
+
+    let denied = client
+        .post(&url)
+        .bearer_auth(&outsider_token)
+        .json(&serde_json::json!({ "org": "fork-org-target" }))
+        .send()
+        .await
+        .expect("denied fork request");
+    assert_eq!(
+        denied.status(),
+        403,
+        "a non-member forked into someone else's organization: {}",
+        denied.text().await.expect("denial body")
+    );
+    assert!(
+        !repo_root.join("fork-org-target/share-me.git").exists(),
+        "the denied fork left organization storage behind"
+    );
+
+    // The compatibility branch is only for zero bytes. A non-empty body that
+    // forgot its JSON content type must not be discarded and silently become a
+    // personal fork — the exact dead-wiring failure this route used to have.
+    let untyped = client
+        .post(&url)
+        .bearer_auth(&member_token)
+        .body(r#"{"org":"fork-org-target"}"#)
+        .send()
+        .await
+        .expect("untyped fork request");
+    assert_eq!(
+        untyped.status(),
+        400,
+        "a non-empty untyped body was silently ignored: {}",
+        untyped.text().await.expect("untyped rejection body")
+    );
+    assert!(
+        !repo_root.join("fork-org-member/share-me.git").exists(),
+        "the rejected untyped body produced a personal fork"
+    );
+
+    let accepted = client
+        .post(&url)
+        .bearer_auth(&member_token)
+        .json(&serde_json::json!({ "org": "fork-org-target" }))
+        .send()
+        .await
+        .expect("organization fork request");
+    let status = accepted.status();
+    let body: serde_json::Value = accepted.json().await.expect("organization fork body");
+    assert_eq!(
+        status, 201,
+        "an organization member could not fork into it: {body}"
+    );
+    assert!(
+        body["org_id"].as_i64().is_some(),
+        "fork has no org id: {body}"
+    );
+    assert!(
+        repo_root.join("fork-org-target/share-me.git").is_dir(),
+        "the accepted fork is not stored under the organization"
+    );
+    let visible = client
+        .get(format!("{base}/api/v1/repos/fork-org-target/share-me"))
+        .bearer_auth(&member_token)
+        .send()
+        .await
+        .expect("read organization fork");
+    assert_eq!(
+        visible.status(),
+        200,
+        "the accepted fork is not addressable through the organization namespace"
+    );
+    assert!(
+        !repo_root.join("fork-org-member/share-me.git").exists(),
+        "the organization fork also appeared in the member's account"
+    );
+
+    // Baseline and backward compatibility: no JSON body at all is still a
+    // personal fork, even though the same user just forked the same source into
+    // an organization. The namespace-unique key must distinguish the two.
+    let personal = client
+        .post(&url)
+        .bearer_auth(&member_token)
+        .send()
+        .await
+        .expect("personal fork request");
+    let status = personal.status();
+    let body: serde_json::Value = personal.json().await.expect("personal fork body");
+    assert_eq!(status, 201, "no-body personal fork failed: {body}");
+    assert!(
+        body["org_id"].is_null(),
+        "personal fork gained an org: {body}"
+    );
+    assert!(
+        repo_root.join("fork-org-member/share-me.git").is_dir(),
+        "the no-body fork did not land in the member's account"
+    );
 }
 
 /// The acceptance the card asked for: an outsider forks a public repository,

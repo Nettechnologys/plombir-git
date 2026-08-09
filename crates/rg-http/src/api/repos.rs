@@ -142,6 +142,7 @@ pub async fn create_repo(
         actor_id: owner_id,
         org_id,
         body,
+        ..
     }: NamespaceCreate<CreateRepoRequest>,
 ) -> impl IntoResponse {
     // Get owner identity for template substitution and initial commit author.
@@ -640,14 +641,23 @@ pub async fn delete_repo_handler(
 
 // ── Fork handlers ──────────────────────────────────────────────────────
 
-// A `ForkRequest { org }` used to be declared here and registered in the
-// published spec's `components`, and no route ever read it: the handler takes
-// no body, and `fork_repo` forks into the caller's own account and accepts no
-// other destination. A client that believed the schema sent `{"org": "acme"}`,
-// got `201`, and found the fork under its personal account — the field did not
-// fail, it disappeared (card_98be888fb9fc). Forking into an organization is a
-// real feature and is tracked as one; until it exists, the spec does not offer
-// it. Do not re-add the type ahead of a route that reads it.
+/// Optional destination for a fork. An absent `org` — including the historical
+/// request with no body at all — means the caller's personal namespace.
+#[derive(Default, Deserialize, ToSchema)]
+pub struct ForkRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+}
+
+impl TargetOwnerOrSelf for ForkRequest {
+    fn target_owner_or_self(&self) -> Option<&str> {
+        self.org.as_deref()
+    }
+
+    fn from_empty_body() -> Option<Self> {
+        Some(Self::default())
+    }
+}
 
 /// POST /api/v1/repos/:owner/:name/fork
 #[utoipa::path(
@@ -658,13 +668,14 @@ pub async fn delete_repo_handler(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
     ),
+    request_body = Option<ForkRequest>,
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 403, description = "Source repository not readable by this caller", body = serde_json::Value),
+        (status = 403, description = "Source repository not readable, or destination namespace not writable by this caller", body = serde_json::Value),
         (status = 404, description = "No such source repository", body = serde_json::Value),
-        (status = 409, description = "The forker already owns a repository of that name", body = serde_json::Value),
+        (status = 409, description = "The destination namespace already holds a repository of that name", body = serde_json::Value),
     ),
 )]
 pub async fn fork_repo_handler(
@@ -679,19 +690,31 @@ pub async fn fork_repo_handler(
     // the old in-body `extract_bearer_claims` accepted only
     // `Authorization: Bearer`, so the browser — which holds the HttpOnly
     // `forgekeep_token` cookie and no header — got a `401` from the fork button.
-    RepoAuthRead {
-        repo: source,
-        actor_id: user_id,
-    }: RepoAuthRead,
+    RepoAuthRead { repo: source, .. }: RepoAuthRead,
     Path((owner, name)): Path<(String, String)>,
+    // The source and destination are independent gates. `RepoAuthRead` above
+    // proves the caller may clone the source; this body extractor resolves and
+    // authorizes the namespace the new row and bare repository will occupy.
+    // It has to be last because it consumes the request body.
+    NamespaceCreate {
+        actor_id: user_id,
+        org_id,
+        namespace_name,
+        body: _,
+    }: NamespaceCreate<ForkRequest>,
 ) -> impl IntoResponse {
-    match rg_core::repo::service::fork_repo(&state.db, user_id, &owner, &source, &state.repo_root)
-        .await
+    match rg_core::repo::service::fork_repo(
+        &state.db,
+        user_id,
+        org_id,
+        namespace_name.as_deref(),
+        &owner,
+        &source,
+        &state.repo_root,
+    )
+    .await
     {
-        Ok(rg_core::repo::service::ForkedRepo {
-            repo,
-            owner_username,
-        }) => {
+        Ok(rg_core::repo::service::ForkedRepo { repo, owner_name }) => {
             // Record audit log. The fork is named the way every other record in
             // this module names a repository — `owner/name` — not `<user id>/name`:
             // an audit row is read by a human looking for a path that exists.
@@ -701,9 +724,9 @@ pub async fn fork_repo_handler(
             let details = serde_json::json!({
                 "source_owner": owner,
                 "source_name": name,
-                "fork_owner": owner_username
+                "fork_owner": owner_name
             });
-            let resource_name = format!("{owner_username}/{}", repo.name);
+            let resource_name = format!("{owner_name}/{}", repo.name);
             let audit_actor =
                 rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await;
             rg_core::audit::record(

@@ -2296,7 +2296,7 @@ pub async fn delete_repo(
     cleanup_error.map_or(Ok(()), Err)
 }
 
-/// A repository that was just forked, and the account name it landed under.
+/// A repository that was just forked, and the namespace name it landed under.
 ///
 /// The name is returned rather than re-derived by the caller because it is the
 /// one that was actually used to build the directory on disk: an audit entry or
@@ -2304,11 +2304,11 @@ pub async fn delete_repo(
 /// record of something that did not happen.
 pub struct ForkedRepo {
     pub repo: rg_db::entities::repository::Model,
-    /// The forker's account name — the `owner` half of the fork's `owner/name`.
-    pub owner_username: String,
+    /// The `owner` half of the fork's public `owner/name` path.
+    pub owner_name: String,
 }
 
-/// Fork `source_repo` into `user_id`'s namespace. Returns the forked repo.
+/// Fork `source_repo` into a namespace the caller has already authorized.
 ///
 /// **The read gate on the source is the caller's**, which is why the source
 /// arrives as an already-resolved model rather than as a name to look up: the
@@ -2320,7 +2320,9 @@ pub struct ForkedRepo {
 pub async fn fork_repo(
     db: &DatabaseConnection,
     user_id: i64,
-    owner: &str,
+    destination_org_id: Option<i64>,
+    destination_namespace: Option<&str>,
+    source_owner: &str,
     source_repo: &rg_db::entities::repository::Model,
     repo_root: &std::path::Path,
 ) -> Result<ForkedRepo> {
@@ -2335,20 +2337,43 @@ pub async fn fork_repo(
         .await?
         .ok_or_else(|| anyhow::anyhow!("user not found"))?;
 
-    // A fork lands in the forker's own account, so the namespace it has to be
-    // free in is their personal one — never an organization they happen to own.
+    // `NamespaceCreate` resolved the optional organization name and handed its
+    // id to the HTTP handler. Keep the name too: it is the storage/audit path,
+    // while `org_id` is the database namespace. An explicit personal owner is
+    // accepted only when it is the authenticated forker's canonical username.
+    let destination_namespace = match (destination_org_id, destination_namespace) {
+        (Some(_), Some(namespace)) => namespace.to_string(),
+        (Some(_), None) => {
+            return Err(anyhow::anyhow!(
+                "fork destination organization has no namespace name"
+            ));
+        }
+        (None, Some(namespace)) if namespace == forker.username => forker.username.clone(),
+        (None, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "fork destination namespace does not match the authenticated account"
+            ));
+        }
+        (None, None) => forker.username.clone(),
+    };
+
+    let conflict_message = if destination_org_id.is_some() {
+        format!("repository '{repo_name}' already exists in organization '{destination_namespace}'")
+    } else {
+        format!("repository '{repo_name}' already exists in your account")
+    };
     ensure_repo_name_free(
         db,
         user_id,
-        None,
+        destination_org_id,
         repo_name,
         None,
-        &format!("repository '{repo_name}' already exists in your account"),
+        &conflict_message,
     )
     .await?;
 
-    let source_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
-    let target_path = repo_root.join(format!("{}/{}.git", forker.username, repo_name));
+    let source_path = repo_root.join(format!("{source_owner}/{repo_name}.git"));
+    let target_path = repo_root.join(format!("{destination_namespace}/{repo_name}.git"));
     std::fs::create_dir_all(
         target_path
             .parent()
@@ -2390,7 +2415,7 @@ pub async fn fork_repo(
         fork_id: Set(None),
         stars_count: Set(0),
         forks_count: Set(0),
-        org_id: Set(None),
+        org_id: Set(destination_org_id),
         origin_repo_id: Set(Some(source_repo.id)),
         created_at: Set(now),
         updated_at: Set(now),
@@ -2413,9 +2438,7 @@ pub async fn fork_repo(
         Err(error) => {
             discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
-                crate::error::conflict(format!(
-                    "repository '{repo_name}' already exists in your account"
-                ))
+                crate::error::conflict(conflict_message)
             } else {
                 error
             });
@@ -2423,16 +2446,15 @@ pub async fn fork_repo(
     };
 
     // The third entrance into a namespace, and the same re-read the other two
-    // make. A fork lands in the forker's own account, which an admin can be
-    // deleting: the claim closes every door this request came through, but a
-    // fork already past them can still commit its row after the deletion's last
-    // empty inventory pass — and `owner_id` cascades, so what is left is a bare
-    // clone with no row at all (card_da1abc6074ac, card_9323f8041cef).
+    // make. The account behind `owner_id` and the destination organization can
+    // each be claimed after the gate admitted this request but before its row
+    // commits. Both markers must undo the fork or its bare clone can outlive the
+    // row that names it (card_da1abc6074ac, card_9323f8041cef).
     if let Err(error) = namespace_still_accepts_repository(
         db,
         user_id,
-        None,
-        &forker.username,
+        destination_org_id,
+        &destination_namespace,
         repo_name,
         "not forked",
     )
@@ -2445,8 +2467,8 @@ pub async fn fork_repo(
                 owner_id = user_id,
                 reason = %format!("{error:#}"),
                 error = %format!("{rollback_error:#}"),
-                "a repository was forked into an account that is being deleted, and removing the \
-                 row failed — it now names an owner that is gone"
+                "a repository was forked into a namespace that is being deleted, and removing the \
+                 row failed — it now names a destination that is gone"
             );
             return Err(rollback_error);
         }
@@ -2468,7 +2490,7 @@ pub async fn fork_repo(
 
     Ok(ForkedRepo {
         repo: forked,
-        owner_username: forker.username,
+        owner_name: destination_namespace,
     })
 }
 
@@ -4863,6 +4885,8 @@ mod repository_deletion_tests {
             let forked = fork_repo(
                 db,
                 forker.id,
+                None,
+                None,
                 &format!("{prefix}-source"),
                 &source,
                 repo_root,
@@ -5398,10 +5422,18 @@ mod repository_deletion_tests {
         .await
         .expect("install the forker claim trigger");
 
-        let error = fork_repo(&db, forker.id, "fork-claim-source", &upstream, &repo_root)
-            .await
-            .map(|forked| forked.repo.id)
-            .expect_err("a fork into an account being deleted must not stand");
+        let error = fork_repo(
+            &db,
+            forker.id,
+            None,
+            None,
+            "fork-claim-source",
+            &upstream,
+            &repo_root,
+        )
+        .await
+        .map(|forked| forked.repo.id)
+        .expect_err("a fork into an account being deleted must not stand");
         assert!(
             format!("{error:#}").contains("being deleted"),
             "the refusal does not say the account is going away: {error:#}"
@@ -5416,6 +5448,88 @@ mod repository_deletion_tests {
         assert!(
             !repo_root.join("fork-claim-forker/forkable.git").exists(),
             "the losing fork left its bare clone behind"
+        );
+    }
+
+    /// The organization marker is an independent half of the destination. The
+    /// account behind `owner_id` can stay live while the organization itself is
+    /// being retired, so checking only the forker account would publish a row
+    /// and clone after the organization's final inventory pass.
+    #[tokio::test]
+    async fn a_fork_that_commits_after_the_organization_is_claimed_undoes_itself() {
+        let db = setup_db().await;
+        let source = user_ops::create_user(
+            &db,
+            "fork-org-claim-source",
+            "fork-org-claim-source@example.invalid",
+            "unused",
+            "Fork Org Claim Source",
+        )
+        .await
+        .expect("create source owner");
+        let forker = user_ops::create_user(
+            &db,
+            "fork-org-claim-forker",
+            "fork-org-claim-forker@example.invalid",
+            "unused",
+            "Fork Org Claim Forker",
+        )
+        .await
+        .expect("create forker");
+        let destination = crate::org::create_org(
+            &db,
+            "fork-org-claim-target",
+            None,
+            None,
+            forker.id,
+            "public",
+        )
+        .await
+        .expect("create destination organization");
+        let sandbox = tempfile::tempdir().expect("create repository root");
+        let repo_root = sandbox.path().join("repos");
+        let upstream = create_repo(&db, source.id, "forkable", None, false, &repo_root, None)
+            .await
+            .expect("create the upstream repository");
+
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER claim_fork_org_on_insert \
+             AFTER INSERT ON repositories \
+             WHEN NEW.origin_repo_id IS NOT NULL AND NEW.org_id = {} \
+             BEGIN UPDATE organizations SET deleted_at = NEW.updated_at WHERE id = {}; END",
+            destination.id, destination.id
+        ))
+        .await
+        .expect("install the organization claim trigger");
+
+        let error = fork_repo(
+            &db,
+            forker.id,
+            Some(destination.id),
+            Some(&destination.name),
+            "fork-org-claim-source",
+            &upstream,
+            &repo_root,
+        )
+        .await
+        .map(|forked| forked.repo.id)
+        .expect_err("a fork into an organization being deleted must not stand");
+        assert!(
+            format!("{error:#}").contains("organization 'fork-org-claim-target' is being deleted"),
+            "the refusal does not name the retiring organization: {error:#}"
+        );
+        assert!(
+            repo_ops::list_active_by_owner_id(&db, forker.id)
+                .await
+                .expect("inventory the forker's repositories")
+                .is_empty(),
+            "the losing fork left a live repository row in the retiring organization"
+        );
+        assert!(
+            !repo_root
+                .join("fork-org-claim-target/forkable.git")
+                .exists(),
+            "the losing fork left its organization bare clone behind"
         );
     }
 

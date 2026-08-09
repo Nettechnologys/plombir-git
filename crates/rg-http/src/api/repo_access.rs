@@ -412,6 +412,20 @@ pub trait TargetOwnerOrSelf {
     /// The account or organization the write is aimed at, or `None` for the
     /// caller's own account.
     fn target_owner_or_self(&self) -> Option<&str>;
+
+    /// Produce the payload represented by a genuinely empty request body.
+    ///
+    /// Most namespace-creating routes require a JSON body and keep the default
+    /// `None`. A route with an established no-body form may opt in without
+    /// wrapping this extractor in `Option`: that wrapper would also swallow the
+    /// extractor's authentication and authorization rejection, which is exactly
+    /// the rule this type exists to keep mandatory.
+    fn from_empty_body() -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// A body that always names its target speaks both dialects, so the create gate
@@ -461,8 +475,9 @@ pub(crate) async fn require_namespace_write(
 ///
 /// Two namespaces qualify: the caller's own account, and an organization the
 /// caller belongs to — the rule `create_repo` applies to its `org` field.
-/// Returns the organization id when the namespace is one, so a caller that has
-/// to record it does not resolve the name a second time.
+/// Returns the canonical namespace name and the organization id when the
+/// namespace is one, so a caller that has to record either does not resolve the
+/// request spelling a second time.
 ///
 /// `None` *is* the caller's own account: a body that leaves its namespace out
 /// (`POST /repos` without an `org`) names the one namespace authentication has
@@ -486,13 +501,24 @@ pub(crate) async fn require_namespace_write(
 /// by this function's own body (card_2179245d41db). The one text is kept
 /// because a reason-by-reason denial is still worth not handing out for free,
 /// not because it makes the name a secret.
+pub(crate) struct NamespaceCreateGrant {
+    org_id: Option<i64>,
+    /// Present when the body explicitly names a namespace. An omitted owner is
+    /// the caller's own account and stays `None`; the service can read its
+    /// canonical username from `actor_id` without a second name resolution.
+    namespace_name: Option<String>,
+}
+
 pub(crate) async fn require_namespace_create(
     state: &AppState,
     actor_id: i64,
     owner: Option<&str>,
-) -> Result<Option<i64>, AppError> {
+) -> Result<NamespaceCreateGrant, AppError> {
     let Some(owner) = owner else {
-        return Ok(None);
+        return Ok(NamespaceCreateGrant {
+            org_id: None,
+            namespace_name: None,
+        });
     };
 
     // An account claimed for retirement is not a namespace anything may still
@@ -505,7 +531,10 @@ pub(crate) async fn require_namespace_create(
         .map_err(AppError::from)?
     {
         return if user.id == actor_id {
-            Ok(None)
+            Ok(NamespaceCreateGrant {
+                org_id: None,
+                namespace_name: Some(user.username),
+            })
         } else {
             Err(AppError::forbidden(
                 "you may not create a repository under this owner",
@@ -526,7 +555,10 @@ pub(crate) async fn require_namespace_create(
             .await
             .map_err(AppError::from)?
         {
-            true => Ok(Some(org.id)),
+            true => Ok(NamespaceCreateGrant {
+                org_id: Some(org.id),
+                namespace_name: Some(org.name),
+            }),
             // Same text as the other two denials on purpose: the status was
             // already `403` for all three, so a second wording bought the
             // caller a membership/existence split under a single code — an
@@ -780,6 +812,10 @@ pub struct NamespaceCreate<B> {
     /// resolved by the gate, so a handler that has to store it does not look
     /// the name up a second time and cannot resolve it differently.
     pub org_id: Option<i64>,
+    /// Canonical spelling of an explicitly named destination. This comes from
+    /// the row the gate authorized, not the request bytes; it keeps storage and
+    /// audit paths aligned even on a case-insensitive database backend.
+    pub namespace_name: Option<String>,
     pub body: B,
 }
 
@@ -796,15 +832,43 @@ where
         let actor_id = super::auth::extract_user_id(req.headers(), &state.jwt_secret)
             .ok_or_else(|| AppError::unauthorized("authentication required"))?;
 
-        let axum::Json(body) = axum::Json::<B>::from_request(req, state)
-            .await
-            .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+        let body = if let Some(empty_body) = B::from_empty_body() {
+            // `POST /fork` predates its optional destination payload. Buffering
+            // lets that one request type distinguish a truly empty body from a
+            // non-empty body that merely omitted `Content-Type`: the latter
+            // must still be rejected rather than silently treated as "under
+            // me". `Bytes` applies Axum's normal body limit before the request
+            // is reconstructed for the ordinary JSON extractor.
+            let headers = req.headers().clone();
+            let bytes = axum::body::Bytes::from_request(req, state)
+                .await
+                .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+            if bytes.is_empty() {
+                empty_body
+            } else {
+                let mut req = Request::new(axum::body::Body::from(bytes));
+                *req.headers_mut() = headers;
+                let axum::Json(body) = axum::Json::<B>::from_request(req, state)
+                    .await
+                    .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+                body
+            }
+        } else {
+            let axum::Json(body) = axum::Json::<B>::from_request(req, state)
+                .await
+                .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+            body
+        };
 
-        let org_id = require_namespace_create(state, actor_id, body.target_owner_or_self()).await?;
+        let NamespaceCreateGrant {
+            org_id,
+            namespace_name,
+        } = require_namespace_create(state, actor_id, body.target_owner_or_self()).await?;
 
         Ok(Self {
             actor_id,
             org_id,
+            namespace_name,
             body,
         })
     }

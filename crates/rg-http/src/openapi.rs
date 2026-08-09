@@ -640,6 +640,7 @@ pub(crate) fn stamp_security(
             crate::api::audit::LoginAttemptEntry,
             crate::api::audit::LoginAttemptResponse,
             crate::api::repos::CreateRepoRequest,
+            crate::api::repos::ForkRequest,
             crate::api::repos::RepoResponse,
             crate::api::repos::WatchRequest,
             crate::api::repos::TransferRequest,

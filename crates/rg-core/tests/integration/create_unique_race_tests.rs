@@ -414,16 +414,17 @@ async fn a_fork_that_loses_the_namespace_race_is_the_caller_s_conflict() {
     )
     .await;
 
-    let error =
-        match rg_core::repo::service::fork_repo(&db, forker_id, "upstream", &source, &repo_root)
-            .await
-        {
-            Ok(forked) => panic!(
-                "the fork must lose the planted race, but it created repository {}",
-                forked.repo.id
-            ),
-            Err(error) => error,
-        };
+    let error = match rg_core::repo::service::fork_repo(
+        &db, forker_id, None, None, "upstream", &source, &repo_root,
+    )
+    .await
+    {
+        Ok(forked) => panic!(
+            "the fork must lose the planted race, but it created repository {}",
+            forked.repo.id
+        ),
+        Err(error) => error,
+    };
 
     assert_is_the_caller_s_conflict(
         &error,
