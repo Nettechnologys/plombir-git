@@ -14,7 +14,6 @@ pub struct Model {
     /// tracking and are served without an integrity guard.
     pub sha256: Option<String>,
     pub created_at: DateTimeUtc,
-    pub last_accessed_at: DateTimeUtc,
     pub expires_at: DateTimeUtc,
 }
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

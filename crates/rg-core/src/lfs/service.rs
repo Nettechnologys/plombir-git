@@ -62,9 +62,6 @@ use rg_db::ops::lfs_object_ops;
 /// Compression level for zstd (1-22, default 3)
 const ZSTD_LEVEL: i32 = 3;
 
-/// Compression algorithm name
-const COMPRESSION_ALGO: &str = "zstd";
-
 /// Signed download URLs are deliberately short-lived to limit leakage.
 pub const DOWNLOAD_URL_TTL_SECONDS: i64 = 60 * 60;
 /// Upload URLs allow enough time for large objects on slow connections.
@@ -637,7 +634,6 @@ async fn store_object(
             repo_id,
             oid,
             key: &key,
-            compressed_size,
             source: PublicationSource::Buffered(&compressed),
         },
     )
@@ -681,8 +677,6 @@ async fn find_or_register_object(
         oid: sea_orm::Set(oid.to_string()),
         size: sea_orm::Set(size),
         uploaded: sea_orm::Set(false),
-        compression: sea_orm::Set(None),
-        compressed_size: sea_orm::Set(None),
         created_at: sea_orm::Set(Utc::now()),
         publisher_token: sea_orm::Set(None),
         publisher_since: sea_orm::Set(None),
@@ -720,7 +714,6 @@ struct PublicationRequest<'a> {
     repo_id: i64,
     oid: &'a str,
     key: &'a BlobKey,
-    compressed_size: i64,
     source: PublicationSource<'a>,
 }
 
@@ -903,15 +896,8 @@ async fn mark_uploaded(
         }
     };
 
-    let already_uploaded = obj.uploaded;
     let mut model: lfs_object::ActiveModel = obj.into();
     model.uploaded = sea_orm::Set(true);
-    // A reused blob keeps the metadata of the publication that owns its bytes.
-    // A not-yet-uploaded row may still reuse bytes won by a concurrent publisher.
-    if publication == BlobPublication::Published || !already_uploaded {
-        model.compression = sea_orm::Set(Some(COMPRESSION_ALGO.to_string()));
-        model.compressed_size = sea_orm::Set(Some(request.compressed_size));
-    }
     if let Err(error) = model.update(db).await {
         discard_stored_blob(db, storage, request, publication, lease).await;
         return Err(error).context("db: update LFS object after store");
@@ -1075,7 +1061,6 @@ async fn stream_compress_and_store(
             repo_id,
             oid,
             key: &key,
-            compressed_size,
             source: PublicationSource::File(compressed_path),
         },
     )
@@ -1180,7 +1165,6 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>> {
 mod blob_publication_tests {
     use super::{
         compress_data, decompress_data, lfs_object_key, store_object, store_object_from_file,
-        COMPRESSION_ALGO,
     };
     use crate::blob_storage::{
         BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage, Result as BlobResult,
@@ -1408,7 +1392,6 @@ mod blob_publication_tests {
         repo_id: i64,
         oid: &str,
         payload: &[u8],
-        compressed_size: usize,
     ) {
         rg_db::ops::lfs_object_ops::create(
             db,
@@ -1418,8 +1401,6 @@ mod blob_publication_tests {
                 oid: Set(oid.to_string()),
                 size: Set(payload.len() as i64),
                 uploaded: Set(true),
-                compression: Set(Some(COMPRESSION_ALGO.to_string())),
-                compressed_size: Set(Some(compressed_size as i64)),
                 created_at: Set(chrono::Utc::now()),
                 publisher_token: Set(None),
                 publisher_since: Set(None),
@@ -1446,21 +1427,14 @@ mod blob_publication_tests {
             .put(&buffered_key, &buffered_compressed)
             .await
             .unwrap();
-        insert_uploaded_object(
-            &db,
-            1,
-            &buffered_oid,
-            buffered_payload,
-            buffered_compressed.len(),
-        )
-        .await;
+        insert_uploaded_object(&db, 1, &buffered_oid, buffered_payload).await;
 
         let file_payload = b"file-backed LFS retry";
         let file_oid = oid(file_payload);
         let file_key = lfs_object_key("owner", "repo", &file_oid, true).unwrap();
         let file_compressed = compress_data(file_payload).unwrap();
         storage.put(&file_key, &file_compressed).await.unwrap();
-        insert_uploaded_object(&db, 1, &file_oid, file_payload, file_compressed.len()).await;
+        insert_uploaded_object(&db, 1, &file_oid, file_payload).await;
 
         fail_lfs_metadata_commits(&db).await;
 

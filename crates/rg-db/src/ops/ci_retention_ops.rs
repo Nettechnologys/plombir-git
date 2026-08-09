@@ -127,7 +127,7 @@ pub async fn upsert_cache_entry(
     let now = Utc::now();
     let expires_at = now + Duration::days(retention_days as i64);
     if let Some(model) = find_cache_entry(db, repo_id, key_hash).await? {
-        return apply_cache_entry(db, model, file_path, size, sha256, now, expires_at).await;
+        return apply_cache_entry(db, model, file_path, size, sha256, expires_at).await;
     }
 
     let insert = ci_cache_entry::ActiveModel {
@@ -137,7 +137,6 @@ pub async fn upsert_cache_entry(
         size: Set(size),
         sha256: Set(sha256.map(|s| s.to_string())),
         created_at: Set(now),
-        last_accessed_at: Set(now),
         expires_at: Set(expires_at),
         ..Default::default()
     }
@@ -149,7 +148,7 @@ pub async fn upsert_cache_entry(
         Err(error) if crate::is_unique_violation(&error) => {
             match find_cache_entry(db, repo_id, key_hash).await? {
                 Some(model) => {
-                    apply_cache_entry(db, model, file_path, size, sha256, now, expires_at).await
+                    apply_cache_entry(db, model, file_path, size, sha256, expires_at).await
                 }
                 // Not there after all, so the collision was on some other
                 // constraint. Report the original failure.
@@ -167,7 +166,6 @@ async fn apply_cache_entry(
     file_path: &str,
     size: i64,
     sha256: Option<&str>,
-    now: chrono::DateTime<Utc>,
     expires_at: chrono::DateTime<Utc>,
 ) -> Result<ci_cache_entry::Model> {
     let mut active: ci_cache_entry::ActiveModel = model.into();
@@ -178,7 +176,6 @@ async fn apply_cache_entry(
     if let Some(digest) = sha256 {
         active.sha256 = Set(Some(digest.to_string()));
     }
-    active.last_accessed_at = Set(now);
     active.expires_at = Set(expires_at);
     active.update(db).await.context("db: update CI cache entry")
 }
