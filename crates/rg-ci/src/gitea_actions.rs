@@ -376,6 +376,124 @@ fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> 
     unknown
 }
 
+const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 5] = [
+    ("github.ref", "${CI_REF}"),
+    ("github.sha", "${CI_SHA}"),
+    ("github.event_name", "${CI_EVENT}"),
+    ("github.repository", "${CI_REPOSITORY}"),
+    ("github.repository_owner", "${CI_REPOSITORY_OWNER}"),
+];
+
+fn context_member<'a>(key: &'a str, context: &str) -> Option<&'a str> {
+    key.strip_prefix(context)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+
+fn supported_run_expression(key: &str) -> bool {
+    GITHUB_RUN_EXPRESSIONS
+        .iter()
+        .any(|(supported, _)| key == *supported)
+        || ["env", "vars", "secrets", "matrix", "inputs"]
+            .iter()
+            .any(|context| context_member(key, context).is_some())
+}
+
+fn unsupported_run_expressions(input: &str) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    let mut rest = input;
+    while let Some(open) = rest.find("${{") {
+        let after_open = &rest[open + 3..];
+        let Some(close) = after_open.find("}}") else {
+            unsupported.push("<missing closing `}}`>".into());
+            break;
+        };
+        let key = after_open[..close].trim();
+        if !supported_run_expression(key) {
+            unsupported.push(if key.is_empty() {
+                "<empty expression>".into()
+            } else {
+                key.to_owned()
+            });
+        }
+        rest = &after_open[close + 2..];
+    }
+    unsupported
+}
+
+/// Every user-authored string passed through [`substitute_expr`].
+///
+/// An expression that survives that function lands either in `sh -c` (where
+/// `${{` is a `bad substitution`) or in a runner environment as a convincing
+/// but false literal. Reject it while reading the workflow and name the exact
+/// site instead.
+fn unsupported_run_expression_sites(workflow: &GiteaWorkflow) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    let mut inspect = |site: String, value: &str| {
+        unsupported.extend(
+            unsupported_run_expressions(value)
+                .into_iter()
+                .map(|expression| format!("{site} expression `{expression}`")),
+        );
+    };
+
+    for (name, value) in &workflow.env {
+        inspect(format!("env.{name}"), value);
+    }
+    if let Some(directory) = workflow
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.run.as_ref())
+        .and_then(|run| run.working_directory.as_deref())
+    {
+        inspect("defaults.run.working-directory".into(), directory);
+    }
+
+    for (job_name, job) in &workflow.jobs {
+        for (name, value) in &job.env {
+            inspect(format!("{job_name}: env.{name}"), value);
+        }
+        if let Some(container) = &job.container {
+            for (name, value) in &container.env {
+                inspect(format!("{job_name}: container.env.{name}"), value);
+            }
+        }
+        if let Some(directory) = job
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_deref())
+        {
+            inspect(
+                format!("{job_name}: defaults.run.working-directory"),
+                directory,
+            );
+        }
+        for (index, step) in job.steps.iter().enumerate() {
+            let site = format!("{job_name}: step {}", index + 1);
+            for (name, value) in &step.env {
+                inspect(format!("{site} env.{name}"), value);
+            }
+            if let Some(run) = &step.run {
+                inspect(format!("{site} run"), run);
+            }
+            if let Some(directory) = &step.working_directory {
+                inspect(format!("{site} working-directory"), directory);
+            }
+            if let Some(key) = step.with.get("key") {
+                inspect(format!("{site} with.key"), key);
+            }
+        }
+    }
+
+    unsupported
+}
+
 /// Context for workflow expression evaluation.
 ///
 /// `repo_owner` / `repo_name` are the `<owner>/<name>` the pipeline is running
@@ -673,6 +791,7 @@ impl GiteaWorkflow {
                 .enumerate()
                 .flat_map(move |(index, step)| unsupported_action_inputs(job_name, index, step))
         }));
+        unsupported.extend(unsupported_run_expression_sites(self));
 
         if unsupported.is_empty() {
             Ok(())
@@ -1711,33 +1830,38 @@ fn substitute_expr(
     workflow_env: &HashMap<String, String>,
     job_env: &HashMap<String, String>,
 ) -> String {
-    let mut result = input.to_string();
-
-    // Substitute ${{ env.VAR }} and ${{ vars.VAR }}
-    for (key, value) in workflow_env.iter().chain(job_env.iter()) {
-        let pattern = format!("${{{{ env.{} }}}}", key);
-        result = result.replace(&pattern, value);
-        let pattern2 = format!("${{{{ vars.{} }}}}", key);
-        result = result.replace(&pattern2, value);
-    }
-
-    // Handle common built-in expressions
-    result = result.replace("${{ github.ref }}", "${CI_REF}");
-    result = result.replace("${{ github.sha }}", "${CI_SHA}");
-    result = result.replace("${{ github.event_name }}", "${CI_EVENT}");
-
-    result = replace_context_expression(result, "secrets", |name| format!("${{{name}}}"));
-    result = replace_context_expression(result, "matrix", |name| {
-        format!(
-            "${{MATRIX_{}}}",
-            name.to_ascii_uppercase().replace('-', "_")
-        )
-    });
-    result = replace_context_expression(result, "inputs", |name| {
-        format!("${{INPUT_{}}}", name.to_ascii_uppercase().replace('-', "_"))
-    });
-
-    result
+    expand_expressions(input, |key| {
+        if let Some((_, replacement)) = GITHUB_RUN_EXPRESSIONS
+            .iter()
+            .find(|(supported, _)| key == *supported)
+        {
+            return Some((*replacement).to_owned());
+        }
+        if let Some(name) = context_member(key, "env").or_else(|| context_member(key, "vars")) {
+            // Preserve the pre-existing precedence here: workflow values were
+            // substituted before job values. The incorrect override semantics
+            // are tracked separately instead of being changed as a side effect
+            // of this card.
+            return Some(
+                workflow_env
+                    .get(name)
+                    .or_else(|| job_env.get(name))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(name) = context_member(key, "secrets") {
+            return Some(format!("${{{name}}}"));
+        }
+        if let Some(name) = context_member(key, "matrix") {
+            return Some(format!(
+                "${{MATRIX_{}}}",
+                name.to_ascii_uppercase().replace('-', "_")
+            ));
+        }
+        context_member(key, "inputs")
+            .map(|name| format!("${{INPUT_{}}}", name.to_ascii_uppercase().replace('-', "_")))
+    })
 }
 
 fn yaml_scalar_string(value: &serde_yaml::Value) -> Option<String> {
@@ -1747,27 +1871,6 @@ fn yaml_scalar_string(value: &serde_yaml::Value) -> Option<String> {
         serde_yaml::Value::Number(v) => Some(v.to_string()),
         _ => None,
     }
-}
-
-fn replace_context_expression(
-    mut input: String,
-    context: &str,
-    replacement: impl Fn(&str) -> String,
-) -> String {
-    let prefix = format!("${{{{ {context}.");
-    while let Some(start) = input.find(&prefix) {
-        let name_start = start + prefix.len();
-        let Some(relative_end) = input[name_start..].find(" }}") else {
-            break;
-        };
-        let end = name_start + relative_end;
-        let name = input[name_start..end].trim();
-        if name.is_empty() {
-            break;
-        }
-        input.replace_range(start..end + 3, &replacement(name));
-    }
-    input
 }
 
 #[cfg(test)]
@@ -1825,6 +1928,47 @@ jobs:
         let script_str = build.script.join("\n");
         assert!(script_str.contains("cargo build --release"));
         assert!(script_str.contains("cargo test"));
+    }
+
+    #[test]
+    fn run_repository_expressions_use_runner_variables_and_unknown_ones_are_rejected() {
+        let workflow = GiteaWorkflow::parse(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ github.repository }} ${{github.repository_owner}}"
+"#,
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let script = workflow.to_ci_config(&test_context()).jobs["build"]
+            .script
+            .join("\n");
+        assert!(
+            script.contains("${CI_REPOSITORY} ${CI_REPOSITORY_OWNER}"),
+            "repository expressions did not reach the runner vocabulary: {script}"
+        );
+
+        let unknown = GiteaWorkflow::parse(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ foo.bar }}
+"#,
+        )
+        .unwrap();
+        let error = unknown
+            .validate_supported_actions()
+            .expect_err("an unknown run expression must not reach the shell")
+            .to_string();
+        assert!(error.contains("build: step 1 run"), "{error}");
+        assert!(error.contains("foo.bar"), "{error}");
     }
 
     #[test]

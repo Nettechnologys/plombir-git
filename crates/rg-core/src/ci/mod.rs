@@ -49,6 +49,30 @@ pub const PIPELINE_EVENTS: [&str; 4] = [
     WORKFLOW_DISPATCH_EVENT,
 ];
 
+/// Variables whose values belong to the pipeline runner, never to a committed
+/// job variable or a repository secret.
+///
+/// Both the embedded runner and the external-runner API inject this vocabulary.
+/// Keeping one list prevents a new built-in from being protected on one path
+/// while a user-controlled value can still replace it on the other.
+pub const BUILTIN_CI_VARIABLES: [&str; 11] = [
+    "CI",
+    "FORGEKEEP",
+    "CI_PIPELINE_ID",
+    "CI_COMMIT_SHA",
+    "CI_SHA",
+    "CI_REF",
+    "CI_EVENT",
+    "CI_REPOSITORY",
+    "CI_REPOSITORY_OWNER",
+    "CI_JOB_TOKEN",
+    "CI_OIDC_TOKEN_URL",
+];
+
+pub fn is_builtin_ci_variable(name: &str) -> bool {
+    BUILTIN_CI_VARIABLES.contains(&name)
+}
+
 /// The outcome a runner may report for a job it took.
 ///
 /// `pipeline_job.status` is a string column whose domain was expressed nowhere:

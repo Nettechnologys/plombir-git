@@ -313,6 +313,14 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
             body["variables"]["CI_PIPELINE_ID"].as_i64(),
             Some(seeded.pipeline_id)
         );
+        assert_eq!(
+            body["variables"]["CI_REPOSITORY"],
+            serde_json::json!(format!("rf-wire-{suffix}/rf-wire-{suffix}"))
+        );
+        assert_eq!(
+            body["variables"]["CI_REPOSITORY_OWNER"],
+            serde_json::json!(format!("rf-wire-{suffix}"))
+        );
         if suffix == "decodable" {
             assert_eq!(
                 body["variables"]["BUILD_MODE"],

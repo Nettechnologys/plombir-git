@@ -34,19 +34,8 @@ pub(crate) fn valid_secret_name(name: &str) -> bool {
     matches!(chars.next(), Some('_' | 'A'..='Z'))
         && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | '0'..='9'))
         && name.len() <= 100
-        && !matches!(
-            name,
-            "CI" | "FORGEKEEP"
-                | "CI_PIPELINE_ID"
-                | "CI_COMMIT_SHA"
-                | "CI_SHA"
-                | "CI_REF"
-                | "CI_EVENT"
-                | "CI_JOB_TOKEN"
-                | "CI_OIDC_TOKEN_URL"
-                | "HOME"
-                | "PATH"
-        )
+        && !rg_core::ci::is_builtin_ci_variable(name)
+        && !matches!(name, "HOME" | "PATH")
 }
 
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/secrets", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [SecretResponse]), (status = 403, body = serde_json::Value)))]
@@ -113,5 +102,7 @@ mod tests {
         assert!(valid_secret_name("DEPLOY_TOKEN_2"));
         assert!(!valid_secret_name("deploy_token"));
         assert!(!valid_secret_name("CI_JOB_TOKEN"));
+        assert!(!valid_secret_name("CI_REPOSITORY"));
+        assert!(!valid_secret_name("CI_REPOSITORY_OWNER"));
     }
 }

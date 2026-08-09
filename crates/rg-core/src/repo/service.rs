@@ -317,6 +317,22 @@ pub async fn repository_namespace_name(
         .context("repository owner not found")
 }
 
+/// Return the database-backed `<owner>/<name>` identity of a repository.
+///
+/// The namespace must not be inferred from `owner_id` or a checkout path: an
+/// organization repository keeps the organization's owner in `owner_id`, while
+/// its public and on-disk namespace is the organization name.
+pub async fn repository_identity(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> Result<(String, String)> {
+    let repository = repo_ops::find_by_id(db, repo_id)
+        .await?
+        .context("repository no longer exists")?;
+    let owner = repository_namespace_name(db, repository.owner_id, repository.org_id).await?;
+    Ok((owner, repository.name))
+}
+
 /// Find a repository by owner name (user or org) and repo name.
 ///
 /// The two branches are two namespaces, not two ways of spelling one. A

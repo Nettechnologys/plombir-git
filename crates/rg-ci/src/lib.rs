@@ -242,7 +242,7 @@ pub async fn trigger_pipeline(
     // gets its verdict first, and an unresolvable identity is re-raised below —
     // still before anything is written, so no pipeline is ever built against the
     // empty placeholder.
-    let identity = repository_identity(db, repo_id).await;
+    let identity = rg_core::repo::service::repository_identity(db, repo_id).await;
     let (identity_owner, identity_name) = identity
         .as_ref()
         .map(|(owner, name)| (owner.as_str(), name.as_str()))
@@ -914,29 +914,6 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
             variables,
         })
         .collect())
-}
-
-/// The `<owner>/<name>` the pipeline belongs to, read from the row that owns it
-/// rather than from the directory the caller passed.
-///
-/// An organization's repository keeps the organization's *owner* in `owner_id`
-/// while living under the organization's name, so the namespace is not a column —
-/// `repository_namespace_name` is the one function in the tree that resolves it,
-/// and the on-disk path is built from that same function.
-async fn repository_identity(
-    db: &sea_orm::DatabaseConnection,
-    repo_id: i64,
-) -> Result<(String, String)> {
-    let repository = rg_db::ops::repo_ops::find_by_id(db, repo_id)
-        .await?
-        .context("repository of the pipeline being triggered no longer exists")?;
-    let owner = rg_core::repo::service::repository_namespace_name(
-        db,
-        repository.owner_id,
-        repository.org_id,
-    )
-    .await?;
-    Ok((owner, repository.name))
 }
 
 /// The `<owner>/<name>` a pipeline is running for.

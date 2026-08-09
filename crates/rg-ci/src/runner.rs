@@ -955,6 +955,13 @@ impl PipelineRunner {
         env.insert("CI_SHA".into(), pipeline.commit_sha);
         env.insert("CI_REF".into(), pipeline.ref_name);
         env.insert("CI_EVENT".into(), pipeline.trigger_type);
+        let (repository_owner, repository_name) =
+            rg_core::repo::service::repository_identity(&self.db, pipeline.repo_id).await?;
+        env.insert(
+            "CI_REPOSITORY".into(),
+            format!("{repository_owner}/{repository_name}"),
+        );
+        env.insert("CI_REPOSITORY_OWNER".into(), repository_owner);
         if let Some(token) = ci_job_token {
             env.insert("CI_JOB_TOKEN".into(), token.to_string());
         }
@@ -1396,19 +1403,7 @@ fn valid_environment_name(name: &str) -> bool {
 }
 
 fn is_reserved_ci_variable(name: &str) -> bool {
-    matches!(
-        name,
-        "CI" | "FORGEKEEP"
-            | "CI_PIPELINE_ID"
-            | "CI_COMMIT_SHA"
-            | "CI_SHA"
-            | "CI_REF"
-            | "CI_EVENT"
-            | "CI_JOB_TOKEN"
-            | "CI_OIDC_TOKEN_URL"
-            | "HOME"
-            | "PATH"
-    )
+    rg_core::ci::is_builtin_ci_variable(name) || matches!(name, "HOME" | "PATH")
 }
 
 #[cfg(test)]
@@ -1471,6 +1466,8 @@ mod tests {
         assert!(!valid_environment_name("2TARGET"));
         assert!(!valid_environment_name("BAD-NAME"));
         assert!(is_reserved_ci_variable("CI_JOB_TOKEN"));
+        assert!(is_reserved_ci_variable("CI_REPOSITORY"));
+        assert!(is_reserved_ci_variable("CI_REPOSITORY_OWNER"));
         assert!(!is_reserved_ci_variable("PROJECT_MODE"));
     }
 
@@ -1834,7 +1831,7 @@ mod tests {
             &db,
             stage.id,
             "variables",
-            &format!("test \"$MESSAGE\" = hello && test \"$CI_SHA\" = {commit_sha} && test -f README.md && echo \"secret=$DEPLOY_SECRET\""),
+            &format!("test \"$MESSAGE\" = hello && test \"$CI_SHA\" = {commit_sha} && test \"$CI_REPOSITORY\" = ci-vars/variables && test \"$CI_REPOSITORY_OWNER\" = ci-vars && test -f README.md && echo \"secret=$DEPLOY_SECRET\""),
             None,
             None,
             Some(r#"{"MESSAGE":"hello","CI_JOB_TOKEN":"must-not-override"}"#),

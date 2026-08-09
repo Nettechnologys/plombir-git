@@ -473,17 +473,7 @@ pub async fn poll_job(
                         }
                     };
 
-                    for reserved in [
-                        "CI",
-                        "FORGEKEEP",
-                        "CI_PIPELINE_ID",
-                        "CI_COMMIT_SHA",
-                        "CI_SHA",
-                        "CI_REF",
-                        "CI_EVENT",
-                        "CI_JOB_TOKEN",
-                        "CI_OIDC_TOKEN_URL",
-                    ] {
+                    for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
                         variables.remove(reserved);
                     }
                     match decrypted_repo_secrets(&state, pipeline.repo_id).await {
@@ -511,6 +501,31 @@ pub async fn poll_job(
                     variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
                     variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
                     variables.insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
+                    let (repository_owner, repository_name) =
+                        match rg_core::repo::service::repository_identity(
+                            &state.db,
+                            pipeline.repo_id,
+                        )
+                        .await
+                        {
+                            Ok(identity) => identity,
+                            Err(error) => {
+                                tracing::error!(
+                                    pipeline_id,
+                                    error = %format!("{error:#}"),
+                                    "poll_job: repository identity lookup failed after assignment"
+                                );
+                                return Err(AppError::from(error).into_response());
+                            }
+                        };
+                    variables.insert(
+                        "CI_REPOSITORY".into(),
+                        serde_json::json!(format!("{repository_owner}/{repository_name}")),
+                    );
+                    variables.insert(
+                        "CI_REPOSITORY_OWNER".into(),
+                        serde_json::json!(repository_owner),
+                    );
                     // One resolution for both the token's lifetime and the
                     // deadline the runner is handed, sharing the range the
                     // config validator enforces.
