@@ -157,6 +157,7 @@ async fn a_push_elsewhere_cannot_move_another_repositorys_upload_offset() {
     let second = client
         .patch(format!("{base}{victim_location}"))
         .bearer_auth(&victim)
+        .header("content-range", "10-14")
         .body(b"layer".to_vec())
         .send()
         .await

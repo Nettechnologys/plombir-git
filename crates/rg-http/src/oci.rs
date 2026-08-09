@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use sea_orm::DatabaseConnection;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use rg_core::auth::jwt;
 use rg_core::auth::oci_token::{
@@ -33,6 +33,10 @@ const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-conten
 const DOCKER_UPLOAD_UUID: HeaderName = HeaderName::from_static("docker-upload-uuid");
 const RANGE: HeaderName = HeaderName::from_static("range");
 const DOCKER_API_VERSION: HeaderName = HeaderName::from_static("docker-distribution-api-version");
+
+const OCI_UPLOAD_STORAGE_HINT: &str =
+    "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` \
+     directory; that directory must be writable by the user running forgekeep";
 
 /// The `sub` an OCI token minted without credentials carries. It is a literal,
 /// not a username: no account may hold it, and `token_subject` reads it as
@@ -1588,17 +1592,153 @@ pub async fn chunk_upload(
     }
 
     // Verify the upload session exists *in the gated repository*.
+    match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(_) => {}
+        Err(resp) => return resp,
+    }
+
+    let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
+    let _upload_guard = match acquire_upload_file_lock(&file_path).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{error:#}"),
+            );
+        }
+    };
+    // A retry may have waited behind the request whose response it lost. The
+    // model fetched before the lock is then stale, so refresh the acknowledged
+    // offset while the staging file is exclusively ours.
     let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
         Ok(upload) => upload,
         Err(resp) => return resp,
     };
+    let requested_range = match parse_upload_content_range(&headers) {
+        Ok(range) => range,
+        Err(message) => {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::BLOB_UPLOAD_INVALID,
+                message,
+            );
+        }
+    };
 
-    // Stream body to upload file
-    let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
+    if let Some(range) = requested_range {
+        if content_length(&headers) != Some(range.len()) {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::SIZE_INVALID,
+                "Content-Length must match the inclusive Content-Range",
+            );
+        }
+    }
+
+    // The row is the acknowledged offset; the file is what finalization will
+    // hash. Refuse to resume from either one when they disagree. Otherwise a
+    // request that is correct for the row can silently append to bytes the row
+    // never acknowledged, recreating the very doubled staging file this range
+    // check is meant to prevent.
+    let staged_size = match staged_upload_size(&file_path).await {
+        Ok(size) => size,
+        Err(error) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{error:#}"),
+            );
+        }
+    };
+    let recorded_size = upload.bytes_uploaded;
+    if staged_size != recorded_size {
+        return oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!(
+                "the staged upload does not match this session: it recorded {recorded_size} \
+                 byte(s), but {} holds {staged_size} byte(s)",
+                file_path.display()
+            ),
+        );
+    }
+
+    match requested_range {
+        // A range wholly inside acknowledged bytes is a retry. Compare the
+        // body to those bytes rather than trusting coordinates alone: a
+        // different payload under an old range is out of order, not an
+        // idempotent request.
+        Some(range) if range.end < recorded_size => {
+            return match body_matches_staged_range(body, &file_path, range).await {
+                Ok(true) => upload_progress_response(
+                    StatusCode::ACCEPTED,
+                    &owner,
+                    &repo,
+                    &uuid,
+                    recorded_size,
+                ),
+                Ok(false) => upload_progress_response(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    &owner,
+                    &repo,
+                    &uuid,
+                    recorded_size,
+                ),
+                Err(error) => oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!("{error:#}"),
+                ),
+            };
+        }
+        // New bytes must start at the first byte the session has not accepted.
+        // This catches both a gap and a partial overlap before the body can
+        // touch staging.
+        Some(range) if range.start != recorded_size => {
+            return upload_progress_response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                &owner,
+                &repo,
+                &uuid,
+                recorded_size,
+            );
+        }
+        // Legacy streaming PATCHes omit Content-Range. Keep the one-shot form
+        // real clients use, but only for an empty upload: without coordinates
+        // a later request cannot distinguish a new chunk from a retry.
+        None if recorded_size != 0 => {
+            return upload_progress_response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                &owner,
+                &repo,
+                &uuid,
+                recorded_size,
+            );
+        }
+        Some(_) | None => {}
+    }
+
+    // The request is the next chunk. Stream only after every offset check, so
+    // a refusal cannot change the staging file.
     match stream_body_to_file(body, &file_path).await {
-        Ok(StagedWrite {
-            total: total_size, ..
-        }) => {
+        Ok(staged) => {
+            let total_size = staged.total;
+            if let Some(range) = requested_range {
+                if staged.written != range.len() || total_size != range.end + 1 {
+                    return oci_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "UNKNOWN",
+                        &format!(
+                            "the accepted OCI chunk did not land at its declared range: \
+                             Content-Range {}-{}, appended {} byte(s), staging now holds \
+                             {total_size} byte(s)",
+                            range.start, range.end, staged.written
+                        ),
+                    );
+                }
+            }
+
             // The `Range` below tells the client where to resume from. Reporting
             // it while the session row still holds the old offset hands the
             // client a position the server does not agree with, so a failed
@@ -1632,18 +1772,7 @@ pub async fn chunk_upload(
                 }
             }
 
-            let range_end = total_size.saturating_sub(1);
-            let location = format!("/v2/{owner}/{repo}/blobs/uploads/{uuid}");
-            (
-                StatusCode::ACCEPTED,
-                [
-                    (header::LOCATION, location.as_str()),
-                    (RANGE, format!("0-{range_end}").as_str()),
-                    (DOCKER_UPLOAD_UUID, uuid.as_str()),
-                ],
-                String::new(),
-            )
-                .into_response()
+            upload_progress_response(StatusCode::ACCEPTED, &owner, &repo, &uuid, total_size)
         }
         Err(e) => oci_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1651,6 +1780,166 @@ pub async fn chunk_upload(
             &format!("{e:#}"),
         ),
     }
+}
+
+#[derive(Clone, Copy)]
+struct UploadContentRange {
+    start: i64,
+    end: i64,
+}
+
+impl UploadContentRange {
+    fn len(self) -> i64 {
+        self.end - self.start + 1
+    }
+}
+
+/// OCI chunk ranges are inclusive and deliberately do not carry HTTP's
+/// `bytes ` prefix: the wire grammar is exactly `<decimal>-<decimal>`.
+fn parse_upload_content_range(
+    headers: &HeaderMap,
+) -> Result<Option<UploadContentRange>, &'static str> {
+    let Some(value) = headers.get(header::CONTENT_RANGE) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| "Content-Range must contain ASCII decimal offsets")?;
+    let Some((start, end)) = value.split_once('-') else {
+        return Err("Content-Range must have the form <start>-<end>");
+    };
+    if start.is_empty()
+        || end.is_empty()
+        || !start.bytes().all(|byte| byte.is_ascii_digit())
+        || !end.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("Content-Range must have the form <start>-<end>");
+    }
+    let start = start
+        .parse::<i64>()
+        .map_err(|_| "Content-Range start is too large")?;
+    let end = end
+        .parse::<i64>()
+        .map_err(|_| "Content-Range end is too large")?;
+    if end < start {
+        return Err("Content-Range end must not precede its start");
+    }
+    end.checked_sub(start)
+        .and_then(|width| width.checked_add(1))
+        .ok_or("Content-Range is too large")?;
+    Ok(Some(UploadContentRange { start, end }))
+}
+
+fn content_length(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn upload_progress_response(
+    status: StatusCode,
+    owner: &str,
+    repo: &str,
+    uuid: &str,
+    total_size: i64,
+) -> Response {
+    let range_end = total_size.saturating_sub(1).max(0);
+    let location = format!("/v2/{owner}/{repo}/blobs/uploads/{uuid}");
+    (
+        status,
+        [
+            (header::LOCATION, location.as_str()),
+            (RANGE, format!("0-{range_end}").as_str()),
+            (DOCKER_UPLOAD_UUID, uuid),
+        ],
+        String::new(),
+    )
+        .into_response()
+}
+
+fn upload_file_error(file_path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
+    rg_core::platform::fs::path_error("OCI upload file", file_path, error, OCI_UPLOAD_STORAGE_HINT)
+}
+
+/// Cross-task/process exclusion for one live staging file.
+///
+/// The range check, append and progress update are one protocol operation. If
+/// two handlers check the same old offset before either writes, append mode
+/// faithfully serializes their individual `write_all` calls but still stores
+/// both bodies. An advisory lock on the data file makes the second handler
+/// refresh the session only after the first has acknowledged its bytes.
+struct UploadFileLock {
+    _file: std::fs::File,
+}
+
+async fn acquire_upload_file_lock(file_path: &std::path::Path) -> anyhow::Result<UploadFileLock> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file_path)
+        .await
+        .map_err(|error| upload_file_error(file_path, &error))?
+        .into_std()
+        .await;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(UploadFileLock { _file: file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // An async wait keeps a slow first upload from occupying a
+                // Tokio blocking-pool thread per retry.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to lock OCI upload file {} for a range update: {error}",
+                    file_path.display()
+                ));
+            }
+        }
+    }
+}
+
+async fn staged_upload_size(file_path: &std::path::Path) -> anyhow::Result<i64> {
+    let metadata = tokio::fs::metadata(file_path)
+        .await
+        .map_err(|error| upload_file_error(file_path, &error))?;
+    Ok(metadata.len() as i64)
+}
+
+/// Compare a retried request with an already-staged inclusive range without
+/// buffering the chunk. A byte-identical retry is safe to acknowledge; a
+/// different or differently-sized body is an out-of-order request.
+async fn body_matches_staged_range(
+    body: Body,
+    file_path: &std::path::Path,
+    range: UploadContentRange,
+) -> anyhow::Result<bool> {
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(|error| upload_file_error(file_path, &error))?;
+    file.seek(std::io::SeekFrom::Start(range.start as u64))
+        .await
+        .map_err(|error| upload_file_error(file_path, &error))?;
+
+    use futures::StreamExt;
+    let mut stream = body.into_data_stream();
+    let mut remaining = range.len();
+    while let Some(chunk) = stream.next().await {
+        let data = chunk.map_err(|error| anyhow::anyhow!("body stream error: {error}"))?;
+        if data.len() as i64 > remaining {
+            return Ok(false);
+        }
+        let mut staged = vec![0_u8; data.len()];
+        file.read_exact(&mut staged)
+            .await
+            .map_err(|error| upload_file_error(file_path, &error))?;
+        if staged.as_slice() != data.as_ref() {
+            return Ok(false);
+        }
+        remaining -= data.len() as i64;
+    }
+    Ok(remaining == 0)
 }
 
 /// `PUT /v2/{owner}/{repo}/blobs/uploads/{uuid}?digest=sha256:...` — finalize upload.
@@ -1858,15 +2147,7 @@ async fn stream_body_to_file(
     body: Body,
     file_path: &std::path::Path,
 ) -> anyhow::Result<StagedWrite> {
-    let staged = |error: &std::io::Error| {
-        rg_core::platform::fs::path_error(
-            "OCI upload file",
-            file_path,
-            error,
-            "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` \
-             directory; that directory must be writable by the user running forgekeep",
-        )
-    };
+    let staged = |error: &std::io::Error| upload_file_error(file_path, error);
 
     // Read before the open, not after: `create(true)` below is what makes the
     // difference invisible, and it has to stay — a monolithic `PUT` with no

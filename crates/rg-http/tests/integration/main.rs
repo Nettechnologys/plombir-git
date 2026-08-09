@@ -95,6 +95,7 @@ mod namespace_identity_tests;
 mod notification_tests;
 mod notification_websocket_cookie_tests;
 mod oauth_pkce_tests;
+mod oci_chunk_range_tests;
 mod oci_live_client_tests;
 mod oci_permission_tests;
 mod oci_push_pull_tests;
