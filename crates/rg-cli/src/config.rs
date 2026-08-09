@@ -60,6 +60,7 @@ pub(crate) struct ConfigFile {
 // so at build time instead of the operator finding out that their setting is
 // silently ignored.
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ServerConfig {
     pub(crate) repo_root: Option<String>,
     pub(crate) http_addr: Option<String>,
@@ -73,11 +74,13 @@ pub(crate) struct ServerConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DatabaseConfig {
     pub(crate) url: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub(crate) struct AuthConfig {
     /// Secret that signs session JWTs, PAT-derived tokens and CI job tokens.
@@ -140,6 +143,7 @@ pub(crate) fn resolve_encryption_key_file(
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CiConfig {
     #[serde(default)]
     pub(crate) docker: Option<bool>,
@@ -151,6 +155,7 @@ pub(crate) struct CiConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub(crate) struct ReleasesConfig {
     /// Enable opt-in Ed25519 provenance attestation of release assets (default
@@ -160,6 +165,7 @@ pub(crate) struct ReleasesConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RateLimitConfig {
     pub(crate) max: Option<u32>,
     pub(crate) window_secs: Option<u64>,
@@ -174,6 +180,7 @@ pub(crate) struct RateLimitConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SmtpConfig {
     pub(crate) host: Option<String>,
     pub(crate) port: Option<u16>,
@@ -183,12 +190,14 @@ pub(crate) struct SmtpConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TlsConfig {
     pub(crate) cert: Option<String>,
     pub(crate) key: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LoggingConfig {
     pub(crate) file: Option<String>,
     pub(crate) max_size_mb: Option<u64>,
@@ -196,6 +205,7 @@ pub(crate) struct LoggingConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuditConfig {
     pub(crate) enabled: Option<bool>,
     pub(crate) archive_dir: Option<String>,
@@ -215,6 +225,7 @@ pub(crate) struct AuditConfig {
 /// so at startup, which is the point — "are there backups?" should be answerable
 /// from the config file and the log, not from an admin's memory of a cron entry.
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BackupConfig {
     pub(crate) enabled: Option<bool>,
     pub(crate) dir: Option<String>,
@@ -237,6 +248,7 @@ pub(crate) struct BackupConfig {
 /// mirror carries its own `sync_interval_seconds` and a pass only touches rows
 /// whose `next_sync_at` has passed.
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MirrorConfig {
     pub(crate) enabled: Option<bool>,
     pub(crate) poll_interval_secs: Option<u64>,
@@ -247,6 +259,7 @@ pub(crate) struct MirrorConfig {
 /// fields optional; with no endpoint set (here or via the `OTEL_EXPORTER_OTLP_*`
 /// env vars) OTel tracing stays off and only Prometheus `/metrics` + logs run.
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub(crate) struct ObservabilityConfig {
     /// OTLP/HTTP endpoint, e.g. "http://localhost:4318" (the `/v1/traces` path is
@@ -261,6 +274,7 @@ pub(crate) struct ObservabilityConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub(crate) struct WebhooksConfig {
     /// Shared secret for verifying HMAC-SHA256 signatures on *inbound* external
@@ -271,6 +285,7 @@ pub(crate) struct WebhooksConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TimeoutConfig {
     /// CI job timeout in seconds (default: 3600 = 1 hour).
     #[serde(default = "default_job_timeout")]
@@ -375,12 +390,42 @@ const CONFIG_FILE_HINT: &str =
     "create it first: `cp forgekeep.example.toml forgekeep.toml` (and bind-mount that file, \
      not a directory)";
 
+/// Return the TOML table active at `byte_offset`, for actionable parse errors.
+///
+/// `toml::de::Error` names an unknown field and its line, but not the table the
+/// field belongs to. For a file with several operator-facing sections that
+/// leaves `unknown field htp_addr` unnecessarily ambiguous. ForgeKeep's config
+/// model uses ordinary top-level tables, so the closest preceding `[table]`
+/// header is the section the operator has to fix.
+fn config_section_at(content: &str, byte_offset: usize) -> Option<&str> {
+    let prefix = content.get(..byte_offset.min(content.len()))?;
+    prefix.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let table = line.strip_prefix('[')?.split_once(']')?.0.trim();
+        (!table.is_empty()
+            && table
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        .then_some(table)
+    })
+}
+
 pub(crate) fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
     ensure_regular_file(std::path::Path::new(path), "config file", CONFIG_FILE_HINT)?;
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file `{path}`"))?;
-    let config: ConfigFile = toml::from_str(&content)
-        .with_context(|| format!("failed to parse config file `{path}` as TOML"))?;
+    let config: ConfigFile = toml::from_str(&content).map_err(|error| {
+        let section = error
+            .span()
+            .and_then(|span| config_section_at(&content, span.start));
+        let context = section.map_or_else(
+            || format!("failed to parse config file `{path}` as TOML"),
+            |section| {
+                format!("failed to parse config file `{path}` as TOML in section [{section}]")
+            },
+        );
+        anyhow::Error::new(error).context(context)
+    })?;
     tracing::info!(path = %path, "Loaded configuration file");
     Ok(config)
 }
@@ -517,6 +562,102 @@ pub(crate) fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> Re
 #[cfg(test)]
 mod tests {
     use super::{CliSettings, ConfigFile};
+
+    fn production_config_source() -> &'static str {
+        include_str!("config.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// Derive the nested section/type pairs from the production `ConfigFile`
+    /// declaration. This deliberately is not a hand-maintained registry: a new
+    /// `FooConfig` field must join the unknown-key contract automatically.
+    fn nested_config_sections(source: &str) -> Vec<(&str, &str)> {
+        let declaration = "pub(crate) struct ConfigFile {";
+        let body = source
+            .split_once(declaration)
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
+            .expect("ConfigFile declaration must be present in config.rs");
+
+        body.lines()
+            .filter_map(|line| line.trim().strip_prefix("pub(crate) "))
+            .filter_map(|field| field.split_once(": "))
+            .filter_map(|(section, field_type)| {
+                let field_type = field_type.trim_end_matches(',');
+                let config_type = field_type
+                    .strip_prefix("Option<")
+                    .and_then(|inner| inner.strip_suffix('>'))
+                    .unwrap_or(field_type);
+                config_type
+                    .ends_with("Config")
+                    .then_some((section, config_type))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_nested_config_section_rejects_unknown_keys() {
+        let source = production_config_source();
+        let sections = nested_config_sections(source);
+        assert!(!sections.is_empty(), "nested config inventory is empty");
+
+        for (section, config_type) in sections {
+            let declaration = format!("pub(crate) struct {config_type} {{");
+            let declaration_offset = source.find(&declaration).unwrap_or_else(|| {
+                panic!("ConfigFile section [{section}] uses missing type {config_type}")
+            });
+            let attributes = &source[source[..declaration_offset]
+                .rfind("#[derive(")
+                .unwrap_or_else(|| panic!("{config_type} has no derive block"))
+                ..declaration_offset];
+            assert!(
+                attributes.contains("#[serde(deny_unknown_fields)]"),
+                "ConfigFile section [{section}] ({config_type}) must deny unknown fields"
+            );
+
+            let unknown_key = "definitely_not_a_forgekeep_setting";
+            let toml = format!("[{section}]\n{unknown_key} = true\n");
+            let error = toml::from_str::<ConfigFile>(&toml).unwrap_err().to_string();
+            assert!(
+                error.contains(unknown_key),
+                "[{section}] rejected the key without naming it: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_config_typos_name_the_path_section_and_key() {
+        let cases = [
+            ("server", "htp_addr", "\"127.0.0.1:9000\""),
+            ("database", "urll", "\"sqlite://wrong.db\""),
+            ("observability", "otlp_endpont", "\"http://localhost:4318\""),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        for (section, key, value) in cases {
+            let path = dir.path().join(format!("{section}-typo.toml"));
+            std::fs::write(&path, format!("[{section}]\n{key} = {value}\n")).unwrap();
+
+            let error = format!(
+                "{:#}",
+                super::load_config_file(path.to_str().unwrap()).unwrap_err()
+            );
+            assert!(
+                error.contains(path.to_str().unwrap()),
+                "[{section}] error does not name the config path: {error}"
+            );
+            assert!(
+                error.contains(&format!("[{section}]")),
+                "error does not name section [{section}]: {error}"
+            );
+            assert!(
+                error.contains(key),
+                "[{section}] error does not name misspelled key {key}: {error}"
+            );
+        }
+    }
 
     /// `[server].repo_root` / `[database].url` from the config file were parsed
     /// and then thrown away: `run_serve` assigned the clap value verbatim. A
