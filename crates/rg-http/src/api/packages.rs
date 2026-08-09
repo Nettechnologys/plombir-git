@@ -23,7 +23,7 @@
 
 use crate::error::AppError;
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{FromRequest, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
@@ -617,13 +617,37 @@ pub async fn pypi_legacy_upload(
     response
 }
 
+async fn decode_nuget_push(mut multipart: Multipart) -> Result<axum::body::Bytes, AppError> {
+    let mut package = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::bad_request(format!("invalid NuGet multipart body: {error}")))?
+    {
+        if field.name() != Some("package") {
+            continue;
+        }
+        if package.is_some() {
+            return Err(AppError::bad_request(
+                "NuGet upload repeats the `package` field",
+            ));
+        }
+        package = Some(field.bytes().await.map_err(|error| {
+            AppError::bad_request(format!("cannot read NuGet `package` field: {error}"))
+        })?);
+    }
+
+    package.ok_or_else(|| AppError::bad_request("NuGet upload is missing `package`"))
+}
+
 /// POST/PUT /api/v1/repos/{owner}/{name}/packages/nuget/publish
 ///
 /// `dotnet nuget push` sends PUT to the advertised `PackagePublish` resource,
-/// and the generic publish route is POST only — so the endpoint the service
-/// index names answered `405` to the one client that reads it
-/// (card_dba77cceec56). Same body, same rules; only the verb and the fixed
-/// package type differ.
+/// with the nupkg in a multipart field named `package`. Its part filename is
+/// always the generic `package.nupkg`, not the artifact's own name. Keep raw
+/// bodies too: ForgeKeep exposed that contract before the native-client route
+/// existed, and the explicit POST route still serves those publishers.
 pub async fn nuget_publish(
     State(state): State<AppState>,
     RepoWrite {
@@ -631,10 +655,36 @@ pub async fn nuget_publish(
     }: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<PublishPackageQuery>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
-    let filename = filename_from_disposition(&headers);
+    let headers = request.headers().clone();
+    let is_multipart = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"));
+
+    let (filename, body) = if is_multipart {
+        let multipart = match Multipart::from_request(request, &state).await {
+            Ok(multipart) => multipart,
+            Err(rejection) => return rejection.into_response(),
+        };
+        let body = match decode_nuget_push(multipart).await {
+            Ok(body) => body,
+            Err(error) => return error.into_response(),
+        };
+        // NuGet.Client deliberately sends a random filename; using the same
+        // stable spelling also makes a repeated file hit the uniqueness guard.
+        ("package.nupkg".to_string(), body)
+    } else {
+        let filename = filename_from_disposition(&headers);
+        let body = match axum::body::Bytes::from_request(request, &state).await {
+            Ok(body) => body,
+            Err(rejection) => return rejection.into_response(),
+        };
+        (filename, body)
+    };
+
     publish_package(
         state,
         user_id,

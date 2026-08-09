@@ -2682,20 +2682,25 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
         assert_eq!(body["totalHits"], 1, "{label}: {body}");
     }
 
-    // `dotnet nuget push` sends PUT here. POST-only meant the one verb the
-    // document invites answered 405.
+    // `dotnet nuget push` sends PUT with one multipart field named `package`.
+    // Its filename is deliberately the generic `package.nupkg`: the package's
+    // real coordinates live in the nuspec, not in the form envelope.
+    let pushed_nupkg = zip_archive(&[(
+        "Matrix.NuGet.nuspec",
+        br#"<?xml version="1.0"?>
+<package><metadata><id>Matrix.NuGet</id><version>2.0.0</version><description>NuGet matrix package</description></metadata></package>"# as &[u8],
+    )]);
+    let dotnet_push = reqwest::multipart::Form::new().part(
+        "package",
+        reqwest::multipart::Part::bytes(pushed_nupkg.clone())
+            .file_name("package.nupkg")
+            .mime_str("application/octet-stream")
+            .expect("literal MIME type"),
+    );
     let pushed = client
         .put(advertised["PackagePublish/2.0.0"].clone())
         .bearer_auth(&token)
-        .header(
-            reqwest::header::CONTENT_DISPOSITION,
-            "attachment; filename=\"Matrix.NuGet.2.0.0.nupkg\"",
-        )
-        .body(zip_archive(&[(
-            "Matrix.NuGet.nuspec",
-            br#"<?xml version="1.0"?>
-<package><metadata><id>Matrix.NuGet</id><version>2.0.0</version><description>NuGet matrix package</description></metadata></package>"# as &[u8],
-        )]))
+        .multipart(dotnet_push)
         .send()
         .await
         .unwrap();
@@ -2718,6 +2723,57 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
         serde_json::json!(["1.0.0", "2.0.0"]),
         "the pushed version has to show up where restore looks for it"
     );
+
+    let pushed_content = client
+        .get(format!(
+            "{base_address}matrix.nuget/2.0.0/matrix.nuget.2.0.0.nupkg"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed_content.status(), StatusCode::OK);
+    assert_eq!(
+        pushed_content.bytes().await.unwrap().as_ref(),
+        pushed_nupkg.as_slice(),
+        "restore must receive the nupkg part, not the surrounding multipart envelope"
+    );
+
+    let missing_package = client
+        .put(advertised["PackagePublish/2.0.0"].clone())
+        .bearer_auth(&token)
+        .multipart(reqwest::multipart::Form::new().text("metadata", "not a package"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_package.status(), StatusCode::BAD_REQUEST);
+    assert!(missing_package
+        .text()
+        .await
+        .unwrap()
+        .contains("missing `package`"));
+
+    let duplicate_package = reqwest::multipart::Form::new()
+        .part(
+            "package",
+            reqwest::multipart::Part::bytes(pushed_nupkg.clone()).file_name("package.nupkg"),
+        )
+        .part(
+            "package",
+            reqwest::multipart::Part::bytes(pushed_nupkg).file_name("package.nupkg"),
+        );
+    let duplicate_package = client
+        .put(advertised["PackagePublish/2.0.0"].clone())
+        .bearer_auth(&token)
+        .multipart(duplicate_package)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_package.status(), StatusCode::BAD_REQUEST);
+    assert!(duplicate_package
+        .text()
+        .await
+        .unwrap()
+        .contains("repeats the `package` field"));
 }
 
 /// `mvn deploy` publishes by PUT-ing each file to the layout its resolver reads.
