@@ -120,7 +120,24 @@ pub struct EventFilter {
     pub paths: Option<Vec<String>>,
     #[serde(rename = "paths-ignore")]
     pub paths_ignore: Option<Vec<String>>,
+    /// Keys the compatibility layer cannot honour.
+    ///
+    /// This cannot be `deny_unknown_fields`: [`WorkflowTriggers`] is untagged,
+    /// so serde can collapse the useful nested error into "did not match any
+    /// variant". Keeping the spelling lets `validate_supported_triggers` name
+    /// the exact declaration the author must fix (card_444a8741da37).
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_yaml::Value>,
 }
+
+const SUPPORTED_EVENT_FILTERS: &[&str] = &[
+    "branches",
+    "branches-ignore",
+    "tags",
+    "tags-ignore",
+    "paths",
+    "paths-ignore",
+];
 
 /// Schedule trigger with cron expression.
 #[derive(Debug, Clone, Deserialize)]
@@ -455,6 +472,42 @@ impl GiteaWorkflow {
         }
     }
 
+    /// Event-filter declarations that parsed but have no consumer.
+    fn unsupported_event_filter_keys(&self) -> Vec<String> {
+        let WorkflowTriggers::Single(trigger) = &self.on else {
+            return Vec::new();
+        };
+        let WorkflowTriggerSingle {
+            push,
+            pull_request,
+            pull_request_target,
+            merge_group,
+            schedule: _,
+            workflow_dispatch: _,
+            workflow_call: _,
+            other: _,
+        } = trigger.as_ref();
+
+        let mut unsupported = Vec::new();
+        for (trigger_name, filter) in [
+            ("push", push.as_ref()),
+            (PULL_REQUEST_TRIGGER, pull_request.as_ref()),
+            (PULL_REQUEST_TARGET_TRIGGER, pull_request_target.as_ref()),
+            (MERGE_GROUP_TRIGGER, merge_group.as_ref()),
+        ] {
+            if let Some(filter) = filter {
+                unsupported.extend(
+                    filter
+                        .other
+                        .keys()
+                        .map(|key| format!("{trigger_name}.{key}")),
+                );
+            }
+        }
+        unsupported.sort();
+        unsupported
+    }
+
     /// Reject a workflow whose `on:` clause names something nothing here emits.
     ///
     /// `on: schedule`, `on: pull_request_target` and `on: release` all parse.
@@ -480,6 +533,15 @@ impl GiteaWorkflow {
     ///
     /// [`validate_supported_actions`]: GiteaWorkflow::validate_supported_actions
     pub fn validate_supported_triggers(&self) -> Result<()> {
+        let unsupported_filters = self.unsupported_event_filter_keys();
+        if !unsupported_filters.is_empty() {
+            anyhow::bail!(
+                "unsupported event filter key(s): {}. Supported event filters: {}",
+                unsupported_filters.join(", "),
+                SUPPORTED_EVENT_FILTERS.join(", ")
+            );
+        }
+
         let declared = self.declared_triggers();
         if declared.is_empty() {
             anyhow::bail!(
@@ -1760,6 +1822,74 @@ jobs:
         let script_str = build.script.join("\n");
         assert!(script_str.contains("cargo build --release"));
         assert!(script_str.contains("cargo test"));
+    }
+
+    #[test]
+    fn unknown_event_filter_keys_are_rejected_by_name() {
+        for (event, filter, expected) in [
+            ("pull_request", "types: [labeled]", "pull_request.types"),
+            ("push", "branch: [main]", "push.branch"),
+        ] {
+            let yaml = format!(
+                "on:\n  {event}:\n    {filter}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            );
+            let workflow = GiteaWorkflow::parse(&yaml).expect("the validator names the bad key");
+            let error = workflow
+                .validate_supported_triggers()
+                .expect_err("an unknown event filter must not become an absent filter")
+                .to_string();
+            assert!(error.contains(expected), "missing {expected:?}: {error}");
+            for &supported in SUPPORTED_EVENT_FILTERS {
+                assert!(
+                    error.contains(supported),
+                    "the refusal must list supported filter {supported:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_supported_event_filter_key_stays_accepted() {
+        let workflow = GiteaWorkflow::parse(
+            r#"
+on:
+  push:
+    branches: [main]
+    branches-ignore: [legacy]
+    tags: ['v*']
+    tags-ignore: ['v0.*']
+    paths: ['src/**']
+    paths-ignore: ['docs/**']
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+        )
+        .expect("all supported event filters parse");
+
+        workflow
+            .validate_supported_triggers()
+            .expect("all supported event filters validate");
+        let WorkflowTriggers::Single(trigger) = workflow.on else {
+            panic!("the mapped `on:` form must stay mapped");
+        };
+        let filter = trigger.push.expect("push filter");
+        assert!(
+            [
+                filter.branches,
+                filter.branches_ignore,
+                filter.tags,
+                filter.tags_ignore,
+                filter.paths,
+                filter.paths_ignore,
+            ]
+            .into_iter()
+            .all(|value| value.is_some()),
+            "all six supported filters must survive deserialization"
+        );
+        assert!(filter.other.is_empty());
     }
 
     /// card_e949057aaa0d: a natively-implemented action must be honest about

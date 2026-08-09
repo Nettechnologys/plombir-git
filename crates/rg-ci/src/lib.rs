@@ -3218,6 +3218,44 @@ mod matrix_tests {
         );
     }
 
+    /// card_444a8741da37: an event-filter key without a consumer must be
+    /// refused while the committed workflow is read, before matching can turn
+    /// it into an absent filter or the native fallback can run instead.
+    #[test]
+    fn an_unknown_event_filter_is_reported_with_its_file_and_key() {
+        for (event, filter, expected) in [
+            ("pull_request", "types: [labeled]", "pull_request.types"),
+            ("push", "branch: [main]", "push.branch"),
+        ] {
+            let workflow = format!(
+                "on:\n  {event}:\n    {filter}\njobs:\n  build:\n    steps:\n      - run: echo workflow\n"
+            );
+            let (temp, sha) = commit_repo(&[
+                (".gitea/workflows/ci.yml", workflow.as_bytes()),
+                (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            ]);
+
+            let error =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", event, None, None)
+                    .expect_err("an unknown event filter must stop workflow selection");
+            let invalid = error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .unwrap_or_else(|| panic!("an unsupported filter must be a 400, got: {error:#}"));
+            let message = invalid.to_string();
+            for expected in [".gitea/workflows/ci.yml", expected, "paths-ignore"] {
+                assert!(
+                    message.contains(expected),
+                    "the committer must learn which file, key and filters are supported \
+                     (missing {expected:?}): {message}"
+                );
+            }
+            assert!(
+                !message.contains("echo native"),
+                "a refused workflow must not fall through to the native config: {message}"
+            );
+        }
+    }
+
     /// card_e949057aaa0d, on the path a push actually takes: an input nothing
     /// consumes must stop the trigger, not produce a job that ran none of what
     /// the workflow asked for.
