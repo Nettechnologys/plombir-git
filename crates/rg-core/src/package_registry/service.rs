@@ -426,9 +426,10 @@ async fn discard_stored_files(
 /// something, and answering "already published" is honest where a silent 200
 /// was not.
 ///
-/// Rollback is per-file and never touches what the version already held:
-/// `delete_version` is the tool the create path uses, and here it would wipe
-/// the artifacts of every earlier request.
+/// The read below is only a cheap early answer. The database's
+/// `UNIQUE(version_id, filename)` index is the concurrency boundary: file rows
+/// and the corresponding size increase commit together, while the losing
+/// request deletes only its request-private blobs.
 async fn add_files_to_version(
     db: &DatabaseConnection,
     storage: &PackageStorage,
@@ -445,10 +446,7 @@ async fn add_files_to_version(
         }
     }
 
-    // Everything this request adds, so a failure part-way through can be undone
-    // without disturbing the files that were already there.
-    let mut added: Vec<StoredFile> = Vec::new();
-    let mut added_rows: Vec<i64> = Vec::new();
+    let mut stored_files: Vec<StoredFile> = Vec::new();
 
     for (filename, data) in &info.files {
         let stored = match storage
@@ -465,88 +463,102 @@ async fn add_files_to_version(
         {
             Ok(stored) => stored,
             Err(error) => {
-                undo_added_files(db, storage, &added, &added_rows, info).await;
+                discard_stored_files(
+                    storage,
+                    &stored_files,
+                    info,
+                    "storing a file failed while adding to an existing package version",
+                )
+                .await;
                 return Err(error);
             }
         };
+        stored_files.push(stored);
+    }
 
-        match rg_db::ops::package_file_ops::create(
-            db,
+    let transaction = match db.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            discard_stored_files(
+                storage,
+                &stored_files,
+                info,
+                "starting the existing-version publish transaction failed",
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
+
+    for stored in &stored_files {
+        if let Err(error) = rg_db::ops::package_file_ops::create(
+            &transaction,
             version.id,
             &stored.filename,
             stored.size,
-            file_digests(&stored),
+            file_digests(stored),
             &stored.storage_path,
         )
         .await
         {
-            Ok(row) => added_rows.push(row.id),
-            Err(error) => {
-                added.push(stored);
-                undo_added_files(db, storage, &added, &added_rows, info).await;
-                return Err(error.into());
+            let filename_conflict =
+                matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)));
+            rollback_publish_transaction(
+                transaction,
+                info,
+                "creating a package file row for an existing version failed",
+            )
+            .await;
+            discard_stored_files(
+                storage,
+                &stored_files,
+                info,
+                "creating a package file row for an existing version failed",
+            )
+            .await;
+            if filename_conflict {
+                return Err(crate::error::conflict(format!(
+                    "file '{}' was published concurrently in version {} of package '{}'",
+                    stored.filename, info.version, info.name
+                )));
             }
+            return Err(error.into());
         }
-
-        added.push(stored);
     }
 
-    // The version's recorded size is the total of what it holds, so it has to
-    // grow with the files just added — otherwise every listing under-reports the
-    // version from its second upload onwards.
-    let added_size: i64 = added.iter().map(|f| f.size).sum();
-    if let Err(error) = rg_db::ops::package_version_ops::add_size(db, version.id, added_size).await
+    let added_size: i64 = stored_files.iter().map(|file| file.size).sum();
+    if let Err(error) =
+        rg_db::ops::package_version_ops::add_size(&transaction, version.id, added_size).await
     {
-        // The files themselves are published and downloadable; only the total is
-        // now short. Failing the request would be worse than saying so.
+        rollback_publish_transaction(
+            transaction,
+            info,
+            "updating package version size after adding files failed",
+        )
+        .await;
+        discard_stored_files(
+            storage,
+            &stored_files,
+            info,
+            "updating package version size after adding files failed",
+        )
+        .await;
+        return Err(error.into());
+    }
+
+    if let Err(error) = transaction.commit().await {
         tracing::warn!(
-            version_id = version.id,
+            package = %format!("{}/{}", info.owner, info.repo),
+            package_type = %info.package_type,
             name = %info.name,
             version = %info.version,
-            added_size,
             error = %format!("{error:#}"),
-            "package version size not updated — the version's reported size now under-counts the files just added to it"
+            "existing-version package publish transaction commit failed with an ambiguous outcome — uploaded request-private files were left in storage rather than risk deleting files referenced by a commit that may have succeeded"
         );
+        return Err(error.into());
     }
 
     Ok(())
-}
-
-/// Undo the files one publish request added to an existing version.
-///
-/// Both halves can fail on their own and each leaves a different residue: an
-/// undeleted row points at a file that is gone, an undeleted file is storage
-/// nobody will ever ask for again. The caller only ever sees the original
-/// error, so each failure has to name what it left behind.
-async fn undo_added_files(
-    db: &DatabaseConnection,
-    storage: &PackageStorage,
-    added: &[StoredFile],
-    added_rows: &[i64],
-    info: &PublishInfo,
-) {
-    for id in added_rows {
-        if let Err(cleanup_error) = rg_db::ops::package_file_ops::delete_by_id(db, *id).await {
-            tracing::warn!(
-                file_id = *id,
-                name = %info.name,
-                version = %info.version,
-                error = %format!("{cleanup_error:#}"),
-                "orphaned package_file row: adding a file to an existing version failed and deleting the record of an already-added file failed too — it points at a file the rollback is removing"
-            );
-        }
-    }
-    for file in added {
-        if let Err(cleanup_error) = storage.delete_file(&file.storage_path).await {
-            tracing::warn!(
-                name = %info.name,
-                version = %info.version,
-                filename = %file.filename,
-                error = %format!("{cleanup_error:#}"),
-                "orphaned package file: adding a file to an existing version failed and the rollback delete failed too — the file stays in storage with no record pointing at it"
-            );
-        }
-    }
 }
 
 /// List all packages for a repository and package type.

@@ -91,7 +91,7 @@ pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Resul
 /// Written as one statement rather than read-modify-write: two uploads landing
 /// on the same version concurrently would otherwise each add their bytes to the
 /// same stale total, and one of the two would be lost.
-pub async fn add_size(db: &DatabaseConnection, id: i64, delta: i64) -> Result<(), DbErr> {
+pub async fn add_size(db: &impl ConnectionTrait, id: i64, delta: i64) -> Result<(), DbErr> {
     let backend = db.get_database_backend();
     db.execute(Statement::from_sql_and_values(
         backend,

@@ -1313,6 +1313,123 @@ async fn concurrent_new_version_publish_keeps_the_winners_file() {
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), winner_bytes);
 }
 
+/// Two additions to an already-visible version can both pass the filename
+/// precheck. The package-file UNIQUE claim must leave exactly one row and one
+/// size increment, and compensation must not touch the winner's private blob.
+#[tokio::test]
+async fn concurrent_existing_version_publish_keeps_one_filename_and_one_size_increment() {
+    let (base, db, gate) = spawn_test_app_with_two_put_gate("same.bin").await;
+    let (token, _) = register_full(&base, "pkg_file_race", "pkg_file_race@example.com").await;
+    create_repo(&base, &token, "racing-files").await;
+    let client = reqwest::Client::new();
+    let publish_url = format!(
+        "{base}/api/v1/repos/pkg_file_race/racing-files/packages/generic/publish?name=widget&version=1.0.0"
+    );
+
+    let seed = b"seed file";
+    let seeded = client
+        .post(&publish_url)
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"seed.bin\"",
+        )
+        .body(seed.as_slice())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seeded.status(), reqwest::StatusCode::CREATED);
+
+    let publish = |body: &'static str| {
+        let client = client.clone();
+        let token = token.clone();
+        let publish_url = publish_url.clone();
+        tokio::spawn(async move {
+            let response = client
+                .post(publish_url)
+                .bearer_auth(token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"same.bin\"",
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            (response, body.as_bytes().to_vec())
+        })
+    };
+
+    let mut left = publish("left existing-version bytes");
+    let mut right = publish("right existing-version bytes");
+    let ((winner, winner_bytes), (loser, _)) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                left_result = &mut left => {
+                    let left_result = left_result.unwrap();
+                    gate.release_second();
+                    (left_result, right.await.unwrap())
+                }
+                right_result = &mut right => {
+                    let right_result = right_result.unwrap();
+                    gate.release_second();
+                    (right_result, left.await.unwrap())
+                }
+            }
+        })
+        .await
+        .expect("both additions reached the gated storage write and completed");
+
+    assert_eq!(winner.status(), reqwest::StatusCode::OK);
+    assert_eq!(loser.status(), reqwest::StatusCode::CONFLICT);
+
+    let repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "pkg_file_race", "racing-files")
+            .await
+            .unwrap()
+            .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "generic")
+        .await
+        .unwrap()
+        .unwrap();
+    let package = rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "widget")
+        .await
+        .unwrap()
+        .unwrap();
+    let version =
+        rg_db::ops::package_version_ops::find_by_package_and_version(&db, package.id, "1.0.0")
+            .await
+            .unwrap()
+            .unwrap();
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, version.id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 2, "seed plus one winning same.bin row");
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file.filename == "same.bin")
+            .count(),
+        1,
+        "the losing publish left a duplicate package_file row"
+    );
+    assert_eq!(
+        version.size,
+        (seed.len() + winner_bytes.len()) as i64,
+        "the losing publish changed the version size"
+    );
+
+    let downloaded = client
+        .get(format!(
+            "{base}/api/v1/repos/pkg_file_race/racing-files/packages/generic/widget/1.0.0/same.bin"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), reqwest::StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), winner_bytes);
+}
+
 // ── Attachments ──────────────────────────────────────────────
 
 /// Upload one attachment, returning `(status, body)`.
