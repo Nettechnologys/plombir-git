@@ -241,6 +241,61 @@ async fn a_format_with_nothing_to_extract_still_publishes_on_query_params() {
     );
 }
 
+/// card_c0f6fbd66e2d: a Maven coordinate cannot be completed with a made-up
+/// `unknown` group. Query coordinates do not make the POM valid: the Maven PUT
+/// route always supplies them from the layout path, so accepting that bypass
+/// would still store a POM that Maven itself cannot consume.
+#[tokio::test]
+async fn a_pom_without_a_project_or_parent_group_id_is_refused() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (artifact_id, through_maven_layout) in [
+        ("missing-group-derived", false),
+        ("missing-group-layout", true),
+    ] {
+        let pom = format!(
+            "<?xml version=\"1.0\"?><project><artifactId>{artifact_id}</artifactId>\
+             <version>1.0.0</version></project>"
+        );
+        let filename = format!("{artifact_id}-1.0.0.pom");
+        let response = if through_maven_layout {
+            reqwest::Client::new()
+                .put(format!(
+                    "{}/api/v1/repos/{OWNER}/{REPO}/packages/maven/com/example/\
+                     {artifact_id}/1.0.0/{filename}",
+                    fixture.base
+                ))
+                .bearer_auth(&fixture.token)
+                .body(pom.into_bytes())
+                .send()
+                .await
+                .expect("Maven layout publish request")
+        } else {
+            fixture
+                .publish("maven", &filename, pom.into_bytes(), None)
+                .await
+        };
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a POM with no groupId is not publishable: {body}"
+        );
+        assert!(
+            body.contains("<groupId>"),
+            "the refusal must name the missing coordinate, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "a refused POM must not leave a version row behind"
+        );
+    }
+}
+
 /// The second of the two, and the reason a blanket refusal in the handler would
 /// have been wrong: Maven publishes one version as several files, and only the
 /// `.pom` carries coordinates. A classifier-suffixed jar defeats the

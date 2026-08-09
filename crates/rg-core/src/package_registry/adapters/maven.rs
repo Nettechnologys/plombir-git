@@ -79,9 +79,11 @@ impl PackageAdapter for MavenAdapter {
 
         // POM XML
         if preview.contains("<project") || preview.contains("<?xml") {
-            if !preview.contains("<artifactId>") {
-                anyhow::bail!("invalid POM: missing <artifactId>");
-            }
+            // A POM is the manifest, so finding its envelope is not enough:
+            // publish may otherwise fall back to query/path coordinates after
+            // metadata extraction fails. Binary Maven artifacts legitimately
+            // have no manifest and continue through the magic-byte branches.
+            extract_from_pom(data)?;
             return Ok(());
         }
 
@@ -148,11 +150,12 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
     let artifact_id = xml_tag_value(&xml, "artifactId")
         .ok_or_else(|| anyhow::anyhow!("POM missing <artifactId>"))?;
 
-    let group_id = xml_tag_value(&xml, "groupId").unwrap_or_else(|| {
-        // Fallback: try from <parent>
-        xml_tag_value(&xml[..xml.find("</parent>").unwrap_or(0)], "groupId")
-            .unwrap_or_else(|| "unknown".to_string())
-    });
+    let group_id = xml_tag_value(&xml, "groupId")
+        .or_else(|| {
+            // Fallback: try from <parent>
+            xml_tag_value(&xml[..xml.find("</parent>").unwrap_or(0)], "groupId")
+        })
+        .ok_or_else(|| anyhow::anyhow!("POM missing <groupId>"))?;
 
     let version = xml_tag_value(&xml, "version")
         .or_else(|| {
