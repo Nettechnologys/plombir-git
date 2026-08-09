@@ -41,6 +41,7 @@ pub struct CiConfig {
 
 /// A single CI job configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobConfig {
     /// Which stage this job belongs to.
     pub stage: Option<String>,

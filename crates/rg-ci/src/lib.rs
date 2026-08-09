@@ -3897,6 +3897,87 @@ mod matrix_tests {
             "the rejection must name the job and the offending value: {message}"
         );
     }
+
+    /// card_4223cbf9a0a1: a declaration below `jobs.<name>` must either be
+    /// translated or fail where the committed workflow is read. Serde normally
+    /// discards every field a struct does not name, so these three workflows
+    /// used to create runnable jobs after silently losing `services`,
+    /// `strategy.fail-fast`, or `container.credentials`.
+    #[test]
+    fn unknown_gitea_job_keys_are_reported_with_their_file_and_key() {
+        for (key, job_body) in [
+            (
+                "services",
+                "    services:\n      postgres:\n        image: postgres:17\n",
+            ),
+            (
+                "fail-fast",
+                "    strategy:\n      fail-fast: false\n      matrix:\n        os: [linux]\n",
+            ),
+            (
+                "credentials",
+                "    container:\n      image: registry.example/private:latest\n      credentials:\n        username: ci\n        password: secret\n",
+            ),
+        ] {
+            let workflow = format!(
+                "on: push\njobs:\n  build:\n{job_body}    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            );
+            let (temp, sha) = commit_repo(&[
+                (".gitea/workflows/unknown.yml", workflow.as_bytes()),
+                (
+                    ".forgekeep-ci.yml",
+                    b"fallback:\n  script: [echo must-not-run]\n" as &[u8],
+                ),
+            ]);
+
+            let error = read_ci_config_for_test(
+                temp.path(),
+                &sha,
+                "refs/heads/main",
+                "push",
+                None,
+                None,
+            )
+            .expect_err("an unknown Gitea job key must not become a runnable job");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed workflow mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".gitea/workflows/unknown.yml") && message.contains(key),
+                "the refusal must name the workflow and {key:?}: {message}"
+            );
+        }
+    }
+
+    /// The native format reaches a different parser after the top-level
+    /// `#[serde(flatten)]` job map. The job value still has to reject GitLab-
+    /// shaped or misspelled keys instead of accepting a misleading no-op.
+    #[test]
+    fn an_unknown_native_job_key_is_reported_with_its_file_and_key() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  retry: 2\n  script: [echo ok]\n",
+        )]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("an unknown native job key must not become a runnable job");
+        let message = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a committed native config mistake is a client error: {message}"
+        );
+        assert!(
+            message.contains(".forgekeep-ci.yml") && message.contains("retry"),
+            "the refusal must name the native config and key: {message}"
+        );
+    }
 }
 
 /// card_e87a1b6f9633: the Run button and Retry named events no workflow can

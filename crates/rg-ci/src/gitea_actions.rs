@@ -179,6 +179,7 @@ fn supported_trigger_list() -> String {
 
 /// A Gitea Actions job definition.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaJob {
     /// Reusable workflow invocation. Repository-local workflow files are
     /// expanded before conversion; remote targets remain unsupported.
@@ -232,6 +233,7 @@ pub struct GiteaJob {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaStrategy {
     #[serde(default)]
     pub matrix: std::collections::BTreeMap<String, Vec<serde_yaml::Value>>,
@@ -295,6 +297,7 @@ pub struct GiteaStep {
 
 /// Container specification for a job.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaContainer {
     /// Docker image.
     pub image: String,
