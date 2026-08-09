@@ -596,17 +596,22 @@ pub async fn list_packages(
 
     for pkg in packages {
         let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
-        let latest = if package_type == package_types::NPM {
-            crate::package_registry::adapters::npm::latest_live_semver(
-                versions
-                    .iter()
-                    .map(|version| (version.version.as_str(), version.is_yanked)),
-            )
-        } else {
+        let candidates = || {
             versions
                 .iter()
+                .map(|version| (version.version.as_str(), version.is_yanked))
+        };
+        let latest = match package_type {
+            package_types::NPM => {
+                crate::package_registry::adapters::npm::latest_live_semver(candidates())
+            }
+            package_types::NUGET => {
+                crate::package_registry::adapters::nuget::latest_live_nuget(candidates())
+            }
+            _ => versions
+                .iter()
                 .find(|version| is_install_candidate(version.is_yanked))
-                .map(|version| version.version.as_str())
+                .map(|version| version.version.as_str()),
         }
         .map(str::to_string);
         let count = versions.len() as i64;

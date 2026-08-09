@@ -21,7 +21,10 @@
 //! - Search:         `GET /api/v1/repos/{owner}/{repo}/packages/nuget/query?q=...`
 //! - Package Content: `GET /api/v1/repos/{owner}/{repo}/packages/nuget/{name}/{version}/{file}`
 
-use std::io::{Cursor, Read};
+use std::{
+    cmp::Ordering,
+    io::{Cursor, Read},
+};
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
 
@@ -708,6 +711,175 @@ pub struct NuGetSearchResult {
     pub registration_url: String,
 }
 
+/// The part of NuGet's version contract that differs from strict SemVer.
+///
+/// NuGet accepts one through four numeric components (missing components are
+/// zero), compares the fourth `Revision`, and compares prerelease labels
+/// case-insensitively. Build metadata does not participate in the default
+/// ordering. Keeping this parser here avoids accidentally reusing npm's strict
+/// SemVer selector for versions such as `2.0.0.1`.
+#[derive(Debug, Eq, PartialEq)]
+struct NuGetVersion {
+    numbers: [u32; 4],
+    release: Option<Vec<NuGetReleaseLabel>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum NuGetReleaseLabel {
+    Numeric(u32),
+    Text(String),
+}
+
+impl NuGetVersion {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let (without_metadata, metadata) = value
+            .split_once('+')
+            .map_or((value, None), |(version, metadata)| {
+                (version, Some(metadata))
+            });
+        if metadata.is_some_and(|metadata| !valid_nuget_labels(metadata, true)) {
+            return None;
+        }
+
+        let (numeric, release) = without_metadata
+            .split_once('-')
+            .map_or((without_metadata, None), |(numeric, release)| {
+                (numeric, Some(release))
+            });
+        let components: Vec<&str> = numeric.split('.').collect();
+        if components.is_empty() || components.len() > 4 {
+            return None;
+        }
+
+        let mut numbers = [0; 4];
+        for (slot, component) in numbers.iter_mut().zip(components) {
+            let component = component.trim();
+            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let parsed = component.parse::<u32>().ok()?;
+            if parsed > i32::MAX as u32 {
+                return None;
+            }
+            *slot = parsed;
+        }
+
+        let release = match release {
+            Some(release) => {
+                if !valid_nuget_labels(release, false) {
+                    return None;
+                }
+                Some(
+                    release
+                        .split('.')
+                        .map(|label| {
+                            label
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|value| *value <= i32::MAX as u32)
+                                .map_or_else(
+                                    || NuGetReleaseLabel::Text(label.to_ascii_lowercase()),
+                                    NuGetReleaseLabel::Numeric,
+                                )
+                        })
+                        .collect(),
+                )
+            }
+            None => None,
+        };
+
+        Some(Self { numbers, release })
+    }
+
+    fn is_prerelease(&self) -> bool {
+        self.release.is_some()
+    }
+}
+
+fn valid_nuget_labels(labels: &str, allow_numeric_leading_zeroes: bool) -> bool {
+    labels.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && (allow_numeric_leading_zeroes
+                || label.len() == 1
+                || !label.starts_with('0')
+                || !label.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+impl Ord for NuGetVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.numbers
+            .cmp(&other.numbers)
+            .then_with(|| match (&self.release, &other.release) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(right),
+            })
+    }
+}
+
+impl PartialOrd for NuGetVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NuGetReleaseLabel {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Numeric(left), Self::Numeric(right)) => left.cmp(right),
+            (Self::Numeric(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Numeric(_)) => Ordering::Greater,
+            (Self::Text(left), Self::Text(right)) => left.cmp(right),
+        }
+    }
+}
+
+impl PartialOrd for NuGetReleaseLabel {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Pick the highest live stable version using NuGetVersion precedence.
+///
+/// The iterator is in deterministic publication order. Its first unparsable
+/// live row is only a compatibility fallback when no valid stable NuGetVersion
+/// exists; a valid prerelease is deliberately not promoted to stable latest.
+pub(crate) fn latest_live_nuget<'a>(
+    versions: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Option<&'a str> {
+    let mut fallback = None;
+    let mut latest: Option<(NuGetVersion, &'a str)> = None;
+
+    for (version, is_yanked) in versions {
+        if is_yanked {
+            continue;
+        }
+        let Some(parsed) = NuGetVersion::parse(version) else {
+            fallback.get_or_insert(version);
+            continue;
+        };
+        if parsed.is_prerelease() {
+            continue;
+        }
+        if latest.as_ref().is_none_or(|(current, _)| parsed > *current) {
+            latest = Some((parsed, version));
+        }
+    }
+
+    latest.map(|(_, version)| version).or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +897,48 @@ mod tests {
             zip.finish().unwrap();
         }
         buf.into_inner()
+    }
+
+    #[test]
+    fn nuget_version_order_includes_revision_and_ignores_metadata() {
+        let revision = NuGetVersion::parse("2.0.0.1+build.7").unwrap();
+        let three_part = NuGetVersion::parse("2.0.0").unwrap();
+        let normalized_short = NuGetVersion::parse("2").unwrap();
+
+        assert!(revision > three_part);
+        assert_eq!(three_part, normalized_short);
+    }
+
+    #[test]
+    fn nuget_prerelease_order_is_numeric_and_case_insensitive() {
+        let rc_two = NuGetVersion::parse("1.0.0-RC.2").unwrap();
+        let rc_ten = NuGetVersion::parse("1.0.0-rc.10").unwrap();
+        let stable = NuGetVersion::parse("1.0.0").unwrap();
+
+        assert!(rc_two < rc_ten);
+        assert!(rc_ten < stable);
+        assert_eq!(
+            NuGetVersion::parse("1.0.0-ALPHA").unwrap(),
+            NuGetVersion::parse("1.0.0-alpha").unwrap()
+        );
+    }
+
+    #[test]
+    fn latest_nuget_version_is_stable_live_and_has_deterministic_fallback() {
+        assert_eq!(
+            latest_live_nuget([
+                ("4.0.0-beta", false),
+                ("1.2.4", false),
+                ("9.0.0", true),
+                ("2.0.0.1", false),
+            ]),
+            Some("2.0.0.1")
+        );
+        assert_eq!(
+            latest_live_nuget([("legacy-newest", false), ("legacy-older", false)]),
+            Some("legacy-newest")
+        );
+        assert_eq!(latest_live_nuget([("3.0.0-beta", false)]), None);
     }
 
     #[test]

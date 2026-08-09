@@ -1442,17 +1442,34 @@ pub async fn maven_metadata(
         Err(error) => return package_error_response(error),
     };
 
-    let entries: Vec<rg_core::package_registry::MavenVersionEntry> = versions
-        .iter()
-        // Maven metadata has no spelling for a withdrawn release. Omitting it
-        // removes it from both `<versions>` and the derived `<release>`.
-        .filter(|v| v.is_install_candidate())
-        .map(|v| rg_core::package_registry::MavenVersionEntry {
-            version: v.version.clone(),
-            is_snapshot: v.version.ends_with("-SNAPSHOT"),
-            updated: v.created_at.clone(),
-        })
-        .collect();
+    let entries: Result<Vec<rg_core::package_registry::MavenVersionEntry>, anyhow::Error> =
+        versions
+            .iter()
+            // Maven metadata has no spelling for a withdrawn release. Omitting it
+            // removes it from both `<versions>` and the derived `<release>`.
+            .filter(|v| v.is_install_candidate())
+            .map(|v| {
+                let updated = chrono::DateTime::parse_from_rfc3339(&v.created_at)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                        "stored creation time for Maven package version '{}' is invalid: {error}",
+                        v.version
+                    )
+                    })?
+                    .to_utc()
+                    .format("%Y%m%d%H%M%S")
+                    .to_string();
+                Ok(rg_core::package_registry::MavenVersionEntry {
+                    version: v.version.clone(),
+                    is_snapshot: v.version.ends_with("-SNAPSHOT"),
+                    updated,
+                })
+            })
+            .collect();
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) => return package_error_response(error),
+    };
 
     let xml =
         rg_core::package_registry::build_maven_metadata_xml(&group_id, &artifact_id, &entries);

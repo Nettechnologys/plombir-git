@@ -289,14 +289,20 @@ pub fn build_maven_metadata_xml(
     ));
     xml.push_str("  <versioning>\n");
 
-    if let Some(latest) = versions.iter().find(|v| !v.is_snapshot) {
+    // Maven defines `latest` as the last version added, including snapshots,
+    // and `release` as the last non-snapshot added. The caller supplies the
+    // deterministic newest-publication-first order from the database; these
+    // are intentionally not ComparableVersion maxima.
+    if let Some(latest) = versions.first() {
         xml.push_str(&format!(
             "    <latest>{}</latest>\n",
             escape_xml(&latest.version)
         ));
+    }
+    if let Some(release) = versions.iter().find(|v| !v.is_snapshot) {
         xml.push_str(&format!(
             "    <release>{}</release>\n",
-            escape_xml(&latest.version)
+            escape_xml(&release.version)
         ));
     }
 
@@ -309,7 +315,10 @@ pub fn build_maven_metadata_xml(
     }
     xml.push_str("    </versions>\n");
 
-    if let Some(last) = versions.last() {
+    if let Some(last) = versions
+        .iter()
+        .max_by(|left, right| left.updated.cmp(&right.updated))
+    {
         xml.push_str(&format!(
             "    <lastUpdated>{}</lastUpdated>\n",
             escape_xml(&last.updated)
@@ -334,6 +343,53 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::{build_maven_metadata_xml, MavenVersionEntry};
+
+    fn entry(version: &str, is_snapshot: bool, updated: &str) -> MavenVersionEntry {
+        MavenVersionEntry {
+            version: version.into(),
+            is_snapshot,
+            updated: updated.into(),
+        }
+    }
+
+    #[test]
+    fn latest_and_release_follow_mavens_publication_contract() {
+        let xml = build_maven_metadata_xml(
+            "com.example",
+            "matrix",
+            &[
+                entry("3.0-SNAPSHOT", true, "20260809120000"),
+                entry("1.2.4", false, "20260809110000"),
+                entry("2.0.0", false, "20260809100000"),
+            ],
+        );
+
+        assert!(xml.contains("<latest>3.0-SNAPSHOT</latest>"), "{xml}");
+        assert!(xml.contains("<release>1.2.4</release>"), "{xml}");
+    }
+
+    #[test]
+    fn last_updated_is_the_maximum_timestamp_not_the_slice_tail() {
+        let xml = build_maven_metadata_xml(
+            "com.example",
+            "matrix",
+            &[
+                entry("1.0.0", false, "20260809100000"),
+                entry("2.0.0", false, "20260809130000"),
+                entry("0.9.0", false, "20260809090000"),
+            ],
+        );
+
+        assert!(
+            xml.contains("<lastUpdated>20260809130000</lastUpdated>"),
+            "{xml}"
+        );
+    }
 }
 
 /// The digest algorithms a Maven checksum sidecar carries.

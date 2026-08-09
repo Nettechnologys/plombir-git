@@ -590,6 +590,133 @@ async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
     }
 }
 
+/// NuGet accepts version forms strict SemVer does not, and its search response
+/// must advertise the highest live stable NuGetVersion rather than the most
+/// recently inserted row.
+#[tokio::test]
+async fn nuget_search_uses_the_highest_live_stable_nuget_version() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    for version in ["2.0.0", "2.0.0.1", "9.0.0", "1.2.4", "10.0.0-beta"] {
+        let nuspec = format!(
+            "<package><metadata><id>Matrix.VersionOrder</id><version>{version}</version></metadata></package>"
+        );
+        let response = client
+            .post(package_url(&base, &["nuget", "publish"]))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"Matrix.VersionOrder.{version}.nupkg\""),
+            )
+            .body(zip_archive(&[(
+                "Matrix.VersionOrder.nuspec",
+                nuspec.as_bytes(),
+            )]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "{version}");
+    }
+
+    let yanked = client
+        .patch(package_url(
+            &base,
+            &["nuget", "Matrix.VersionOrder", "9.0.0", "yank"],
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "yank": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK);
+
+    for _ in 0..3 {
+        let mut query = package_url(&base, &["nuget", "query"]);
+        query
+            .query_pairs_mut()
+            .append_pair("q", "Matrix.VersionOrder");
+        let search = client
+            .get(query)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(search["totalHits"], 1, "{search}");
+        assert_eq!(search["data"][0]["version"], "2.0.0.1", "{search}");
+
+        let listed = client
+            .get(package_url(&base, &["nuget", "list"]))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        let summary = listed["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"] == "Matrix.VersionOrder")
+            .unwrap_or_else(|| panic!("NuGet package summary missing: {listed}"));
+        assert_eq!(summary["latest_version"], "2.0.0.1", "{listed}");
+    }
+}
+
+/// Maven's metadata model calls the last publication `latest`, while `release`
+/// is the last non-snapshot publication. It also requires a compact UTC update
+/// timestamp, not the service's RFC 3339 representation.
+#[tokio::test]
+async fn maven_metadata_distinguishes_latest_release_and_formats_last_updated() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    for version in ["2.0.0", "1.2.4", "3.0-SNAPSHOT"] {
+        let pom = format!(
+            "<project><groupId>com.example</groupId><artifactId>matrix-order</artifactId><version>{version}</version></project>"
+        );
+        let response = client
+            .post(package_url(&base, &["maven", "publish"]))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"matrix-order-{version}.pom\""),
+            )
+            .body(pom)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "{version}");
+    }
+
+    let xml = client
+        .get(package_url(
+            &base,
+            &["maven", "com.example", "matrix-order", "maven-metadata.xml"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(xml.contains("<latest>3.0-SNAPSHOT</latest>"), "{xml}");
+    assert!(xml.contains("<release>1.2.4</release>"), "{xml}");
+    let updated = xml
+        .split_once("<lastUpdated>")
+        .and_then(|(_, tail)| tail.split_once("</lastUpdated>"))
+        .map(|(value, _)| value)
+        .unwrap_or_else(|| panic!("lastUpdated missing: {xml}"));
+    assert_eq!(updated.len(), 14, "{xml}");
+    assert!(updated.bytes().all(|byte| byte.is_ascii_digit()), "{xml}");
+}
+
 #[tokio::test]
 async fn yanked_only_packages_do_not_advertise_a_fake_latest_version() {
     let (base, _db) = spawn_test_app_with_db().await;
