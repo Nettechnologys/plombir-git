@@ -1246,14 +1246,22 @@ pub async fn pypi_simple_index(
     // a page with one link per version hid every artifact but the first from
     // pip entirely. The digest beside each link is that file's own, because
     // that is what the client hashes after downloading it.
+    let requires_python_by_version = versions
+        .iter()
+        .map(|v| parse_pypi_requires_python(v.metadata.as_deref(), &project, &v.version))
+        .collect::<anyhow::Result<Vec<_>>>();
+    let requires_python_by_version = match requires_python_by_version {
+        Ok(metadata) => metadata,
+        Err(error) => return package_error_response(error),
+    };
     let entries: Vec<rg_core::package_registry::PyPIVersionEntry> = versions
         .iter()
-        .flat_map(|v| {
+        .zip(requires_python_by_version)
+        .flat_map(|(v, requires_python)| {
             // Both attributes describe the *version*, so every file of it
             // carries the same pair. A yanked version stays on the page — that
             // is what keeps an exact pin resolvable — and `data-yanked` is what
             // takes it out of every other resolution (PEP 592).
-            let requires_python = parse_pypi_requires_python(v.metadata.as_deref());
             let yanked = !v.is_install_candidate();
 
             let files: Vec<rg_core::package_registry::PyPIVersionEntry> = v
@@ -1915,9 +1923,18 @@ pub async fn nuget_registration_index(
 
     let base_url = build_base_url(&headers);
 
+    let version_metadata = versions
+        .iter()
+        .map(|v| parse_nuget_metadata(v.metadata.as_deref(), &pkg_name, &v.version))
+        .collect::<anyhow::Result<Vec<_>>>();
+    let version_metadata = match version_metadata {
+        Ok(metadata) => metadata,
+        Err(error) => return package_error_response(error),
+    };
     let entries: Vec<rg_core::package_registry::NuGetRegistrationEntry> = versions
         .iter()
-        .map(|v| {
+        .zip(version_metadata)
+        .map(|(v, meta)| {
             let primary_file = v
                 .files
                 .iter()
@@ -1948,9 +1965,6 @@ pub async fn nuget_registration_index(
                     encode_path_segment(&pkg_name),
                 )
             });
-
-            // Parse NuGet-specific metadata from version JSON if available
-            let meta = parse_nuget_metadata(v.metadata.as_deref());
 
             rg_core::package_registry::NuGetRegistrationEntry {
                 version: v.version.clone(),
@@ -2298,7 +2312,10 @@ pub async fn rubygems_dependencies(
             }
 
             // Parse dependencies from metadata JSON
-            let deps = parse_rubygems_deps(v.metadata.as_deref());
+            let deps = match parse_rubygems_deps(v.metadata.as_deref(), gem_name, &v.version) {
+                Ok(deps) => deps,
+                Err(error) => return package_error_response(error),
+            };
 
             entries.push(rg_core::package_registry::RubyGemsDependencyEntry {
                 name: gem_name.to_string(),
@@ -2351,12 +2368,22 @@ pub async fn rubygems_gem_info(
     let base_url = build_base_url(&headers);
     let root = rubygems_root(&base_url, &owner, &name);
 
+    let version_info = versions
+        .iter()
+        .filter(|v| v.is_install_candidate())
+        .map(|v| parse_rubygems_info(v.metadata.as_deref(), &gem_name, &v.version))
+        .collect::<anyhow::Result<Vec<_>>>();
+    let version_info = match version_info {
+        Ok(info) => info,
+        Err(error) => return package_error_response(error),
+    };
     let entries: Vec<rg_core::package_registry::RubyGemsVersionEntry> = versions
         .iter()
         // A withdrawn version is not on offer here either — see
         // `rubygems_dependencies`, which resolves against the same rows.
         .filter(|v| v.is_install_candidate())
-        .map(|v| {
+        .zip(version_info)
+        .map(|(v, info)| {
             // The name the file was published under, not one rebuilt from the
             // coordinates: a platform gem is stored as `{name}-{ver}-{platform}.gem`.
             let file = gem_file(v);
@@ -2370,15 +2397,13 @@ pub async fn rubygems_gem_info(
             // here is advertising a URL nothing serves.
             let gem_uri = format!("{root}/gems/{filename}");
 
-            let (summary, desc, hp, lic) = parse_rubygems_info(v.metadata.as_deref());
-
             rg_core::package_registry::RubyGemsVersionEntry {
                 number: v.version.clone(),
                 platform: gem_declared_platform(v, &gem_name),
-                summary,
-                description: desc,
-                homepage: hp,
-                license: lic,
+                summary: info.summary,
+                description: info.description,
+                homepage: info.homepage,
+                license: info.license,
                 // The digest of the `.gem` the two URLs above point at — not
                 // the version's, which is a different file as soon as the
                 // version carries more than one.
@@ -2439,23 +2464,24 @@ fn gem_file(
 fn compact_index_entries(
     gem_name: &str,
     versions: &[rg_core::package_registry::VersionDetail],
-) -> Vec<rg_core::package_registry::CompactIndexVersion> {
+) -> anyhow::Result<Vec<rg_core::package_registry::CompactIndexVersion>> {
     versions
         .iter()
         .filter(|v| v.is_install_candidate())
         .map(|v| {
             let file = gem_file(v);
+            let dependencies = parse_rubygems_deps(v.metadata.as_deref(), gem_name, &v.version)?;
             let facts = parse_rubygems_facts(v.metadata.as_deref());
-            rg_core::package_registry::CompactIndexVersion {
+            Ok(rg_core::package_registry::CompactIndexVersion {
                 number: v.version.clone(),
                 platform: facts
                     .platform
                     .or_else(|| file.and_then(|f| gem_platform(&f.filename, gem_name, &v.version))),
-                dependencies: parse_rubygems_deps(v.metadata.as_deref()),
+                dependencies,
                 checksum: file.and_then(|f| v.sha256_of(f)),
                 ruby_version: facts.ruby_version,
                 rubygems_version: facts.rubygems_version,
-            }
+            })
         })
         .collect()
 }
@@ -2559,7 +2585,10 @@ pub async fn rubygems_compact_versions(
             Err(error) => return package_error_response(error),
         };
 
-        let entries = compact_index_entries(&pkg.name, &versions);
+        let entries = match compact_index_entries(&pkg.name, &versions) {
+            Ok(entries) => entries,
+            Err(error) => return package_error_response(error),
+        };
         if entries.is_empty() {
             continue;
         }
@@ -2606,7 +2635,10 @@ pub async fn rubygems_compact_info(
         Err(e) => return package_error_response(e),
     };
 
-    let entries = compact_index_entries(&gem_name, &versions);
+    let entries = match compact_index_entries(&gem_name, &versions) {
+        Ok(entries) => entries,
+        Err(error) => return package_error_response(error),
+    };
     if entries.is_empty() {
         return err_text(
             StatusCode::NOT_FOUND,
@@ -2884,7 +2916,10 @@ pub async fn helm_index(
             );
 
             // Parse Helm-specific metadata from version JSON
-            let meta = parse_helm_metadata(v.metadata.as_deref());
+            let meta = match parse_helm_metadata(v.metadata.as_deref(), &pkg.name, &v.version) {
+                Ok(meta) => meta,
+                Err(error) => return package_error_response(error),
+            };
 
             entries.push(rg_core::package_registry::HelmIndexEntry {
                 name: pkg.name.clone(),
@@ -3044,13 +3079,14 @@ struct HelmChartMetadata {
 }
 
 /// Parse Helm-specific metadata from version metadata JSON.
-fn parse_helm_metadata(metadata_json: Option<&str>) -> HelmChartMetadata {
-    let Some(md) = metadata_json else {
-        return HelmChartMetadata::default();
-    };
-    let doc: serde_json::Value = match serde_json::from_str(md) {
-        Ok(v) => v,
-        Err(_) => return HelmChartMetadata::default(),
+fn parse_helm_metadata(
+    metadata_json: Option<&str>,
+    package_name: &str,
+    version: &str,
+) -> anyhow::Result<HelmChartMetadata> {
+    let Some(doc) = parse_stored_metadata_document("helm", package_name, version, metadata_json)?
+    else {
+        return Ok(HelmChartMetadata::default());
     };
 
     let string_list = |key: &str| {
@@ -3066,7 +3102,7 @@ fn parse_helm_metadata(metadata_json: Option<&str>) -> HelmChartMetadata {
 
     let string_field = |key: &str| doc.get(key).and_then(|v| v.as_str()).map(String::from);
 
-    HelmChartMetadata {
+    Ok(HelmChartMetadata {
         app_version: string_field("appVersion"),
         api_version: string_field("apiVersion"),
         kube_version: string_field("kubeVersion"),
@@ -3082,7 +3118,7 @@ fn parse_helm_metadata(metadata_json: Option<&str>) -> HelmChartMetadata {
             .unwrap_or_default(),
         keywords: string_list("keywords"),
         sources: string_list("sources"),
-    }
+    })
 }
 
 // ── helpers ───────────────────────────────────────────────
@@ -3117,15 +3153,14 @@ struct NuGetVersionMetadata {
 }
 
 /// Parse NuGet-specific metadata from a JSON metadata string.
-fn parse_nuget_metadata(metadata_json: Option<&str>) -> NuGetVersionMetadata {
-    let md = match metadata_json {
-        Some(s) => s,
-        None => return NuGetVersionMetadata::default(),
-    };
-
-    let doc: serde_json::Value = match serde_json::from_str(md) {
-        Ok(v) => v,
-        Err(_) => return NuGetVersionMetadata::default(),
+fn parse_nuget_metadata(
+    metadata_json: Option<&str>,
+    package_name: &str,
+    version: &str,
+) -> anyhow::Result<NuGetVersionMetadata> {
+    let Some(doc) = parse_stored_metadata_document("nuget", package_name, version, metadata_json)?
+    else {
+        return Ok(NuGetVersionMetadata::default());
     };
 
     let description = doc
@@ -3144,13 +3179,13 @@ fn parse_nuget_metadata(metadata_json: Option<&str>) -> NuGetVersionMetadata {
         .map(String::from);
     let tags = doc.get("tags").and_then(|v| v.as_str()).map(String::from);
 
-    NuGetVersionMetadata {
+    Ok(NuGetVersionMetadata {
         description,
         homepage,
         license,
         tags,
         dependency_groups: parse_nuget_dependency_groups(&doc),
-    }
+    })
 }
 
 /// The dependency groups stored beside a NuGet version.
@@ -3206,30 +3241,39 @@ fn parse_nuget_dependency_groups(
 /// Absent for anything published before the adapter read the field, and for a
 /// distribution that declared none — both mean the same thing to the page: no
 /// attribute, so no claim is made either way.
-fn parse_pypi_requires_python(metadata_json: Option<&str>) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(metadata_json?)
-        .ok()?
-        .get("requires_python")?
-        .as_str()
+fn parse_pypi_requires_python(
+    metadata_json: Option<&str>,
+    package_name: &str,
+    version: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(doc) = parse_stored_metadata_document("pypi", package_name, version, metadata_json)?
+    else {
+        return Ok(None);
+    };
+    Ok(doc
+        .get("requires_python")
+        .and_then(|value| value.as_str())
         .filter(|spec| !spec.is_empty())
-        .map(String::from)
+        .map(String::from))
 }
 
 /// Parse RubyGems dependencies from version metadata JSON.
-fn parse_rubygems_deps(metadata_json: Option<&str>) -> Vec<rg_core::package_registry::RubyGemsDep> {
-    let md = match metadata_json {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let doc: serde_json::Value = match serde_json::from_str(md) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+fn parse_rubygems_deps(
+    metadata_json: Option<&str>,
+    package_name: &str,
+    version: &str,
+) -> anyhow::Result<Vec<rg_core::package_registry::RubyGemsDep>> {
+    let Some(doc) =
+        parse_stored_metadata_document("rubygems", package_name, version, metadata_json)?
+    else {
+        return Ok(Vec::new());
     };
     let deps = match doc.get("dependencies").and_then(|v| v.as_array()) {
         Some(d) => d,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
-    deps.iter()
+    Ok(deps
+        .iter()
         .filter_map(|d| {
             let name = d.get("name").and_then(|v| v.as_str())?.to_string();
             let req = d
@@ -3242,26 +3286,27 @@ fn parse_rubygems_deps(metadata_json: Option<&str>) -> Vec<rg_core::package_regi
                 requirements: req,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Parse RubyGems gem info from version metadata JSON.
-/// Returns (summary, description, homepage, license).
+#[derive(Default)]
+struct RubyGemsInfo {
+    summary: Option<String>,
+    description: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+}
+
 fn parse_rubygems_info(
     metadata_json: Option<&str>,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
-    let md = match metadata_json {
-        Some(s) => s,
-        None => return (None, None, None, None),
-    };
-    let doc: serde_json::Value = match serde_json::from_str(md) {
-        Ok(v) => v,
-        Err(_) => return (None, None, None, None),
+    package_name: &str,
+    version: &str,
+) -> anyhow::Result<RubyGemsInfo> {
+    let Some(doc) =
+        parse_stored_metadata_document("rubygems", package_name, version, metadata_json)?
+    else {
+        return Ok(RubyGemsInfo::default());
     };
     let summary = doc
         .get("summary")
@@ -3289,7 +3334,39 @@ fn parse_rubygems_info(
                 .and_then(|v| v.as_str())
                 .map(String::from)
         });
-    (summary, description, homepage, license)
+    Ok(RubyGemsInfo {
+        summary,
+        description,
+        homepage,
+        license,
+    })
+}
+
+/// Decode protocol metadata stored on a package version without confusing a
+/// legacy `NULL` with a damaged value. The error names the affected coordinate
+/// for operators but never includes the stored blob itself.
+fn parse_stored_metadata_document(
+    package_type: &str,
+    package_name: &str,
+    version: &str,
+    metadata_json: Option<&str>,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(metadata_json) = metadata_json else {
+        return Ok(None);
+    };
+
+    let document = serde_json::from_str::<serde_json::Value>(metadata_json).map_err(|error| {
+        anyhow::anyhow!(
+            "stored {package_type} metadata for package '{package_name}' version '{version}' is not valid JSON: {error}"
+        )
+    })?;
+    if !document.is_object() {
+        anyhow::bail!(
+            "stored {package_type} metadata for package '{package_name}' version '{version}' is not a JSON object"
+        );
+    }
+
+    Ok(Some(document))
 }
 
 /// Simple XML string escaping.

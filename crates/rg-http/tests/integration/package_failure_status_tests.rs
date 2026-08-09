@@ -308,6 +308,189 @@ async fn corrupt_cargo_and_npm_metadata_is_not_served_as_an_empty_dependency_gra
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProtocolMetadataCase {
+    package_type: &'static str,
+    package_name: &'static str,
+    read_path: &'static str,
+    valid_metadata: &'static str,
+    valid_marker: &'static str,
+}
+
+const PROTOCOL_METADATA_CASES: [ProtocolMetadataCase; 7] = [
+    ProtocolMetadataCase {
+        package_type: "helm",
+        package_name: "metadata-helm",
+        read_path: "packages/helm/index.yaml",
+        valid_metadata: r#"{"apiVersion":"v2","dependencies":[{"name":"metadata-chart-dep","version":"1.0.0"}]}"#,
+        valid_marker: "metadata-chart-dep",
+    },
+    ProtocolMetadataCase {
+        package_type: "nuget",
+        package_name: "metadata-nuget",
+        read_path: "packages/nuget/registration/metadata-nuget/index.json",
+        valid_metadata: r#"{"dependencyGroups":[{"targetFramework":"net8.0","dependencies":[{"id":"Metadata.NuGet.Dep","range":"[1.0.0]"}]}]}"#,
+        valid_marker: "Metadata.NuGet.Dep",
+    },
+    ProtocolMetadataCase {
+        package_type: "pypi",
+        package_name: "metadata-pypi",
+        read_path: "packages/pypi/simple/metadata-pypi/",
+        valid_metadata: r#"{"requires_python":">=3.10"}"#,
+        valid_marker: "data-requires-python",
+    },
+    ProtocolMetadataCase {
+        package_type: "rubygems",
+        package_name: "metadata-rubygems-deps",
+        read_path: "packages/rubygems/api/v1/dependencies?gems=metadata-rubygems-deps",
+        valid_metadata: r#"{"dependencies":[{"name":"metadata-ruby-dep","requirements":">= 2"}]}"#,
+        valid_marker: "metadata-ruby-dep",
+    },
+    ProtocolMetadataCase {
+        package_type: "rubygems",
+        package_name: "metadata-rubygems-info",
+        read_path: "packages/rubygems/api/v1/gems/metadata-rubygems-info.json",
+        valid_metadata: r#"{"summary":"metadata ruby summary"}"#,
+        valid_marker: "metadata ruby summary",
+    },
+    ProtocolMetadataCase {
+        package_type: "rubygems",
+        package_name: "metadata-rubygems-versions",
+        read_path: "packages/rubygems/versions",
+        valid_metadata: r#"{"platform":"x86_64-linux","dependencies":[]}"#,
+        valid_marker: "1.0.0-x86_64-linux",
+    },
+    ProtocolMetadataCase {
+        package_type: "rubygems",
+        package_name: "metadata-rubygems-compact",
+        read_path: "packages/rubygems/info/metadata-rubygems-compact",
+        valid_metadata: r#"{"dependencies":[{"name":"metadata-compact-dep","requirements":">= 1"}],"required_ruby_version":">= 3.1"}"#,
+        valid_marker: "metadata-compact-dep",
+    },
+];
+
+async fn seed_protocol_version_without_metadata(
+    fixture: &Fixture,
+    case: ProtocolMetadataCase,
+) -> i64 {
+    let registry = rg_db::ops::package_registry_ops::find_or_create(
+        &fixture.db,
+        fixture.repo_id,
+        case.package_type,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} registry: {error}", case.package_type));
+    let package = rg_db::ops::package_ops::create(
+        &fixture.db,
+        registry.id,
+        fixture.owner_id,
+        case.package_name,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} package: {error}", case.package_type));
+    rg_db::ops::package_version_ops::create(
+        &fixture.db,
+        package.id,
+        "1.0.0",
+        Some("1.0.0"),
+        None,
+        7,
+        None,
+        Some(fixture.owner_id),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} version: {error}", case.package_type))
+    .id
+}
+
+async fn protocol_metadata_response(
+    fixture: &Fixture,
+    case: ProtocolMetadataCase,
+) -> (StatusCode, String) {
+    let response = fixture
+        .client
+        .get(format!(
+            "{}/api/v1/repos/{OWNER}/{REPO}/{}",
+            fixture.base, case.read_path
+        ))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("{} metadata request: {error}", case.package_type));
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| panic!("{} metadata body: {error}", case.package_type));
+    (status, body)
+}
+
+async fn replace_protocol_metadata(fixture: &Fixture, version_id: i64, metadata: &str) {
+    assert!(
+        !metadata.contains('\''),
+        "test metadata must remain safe for the literal fixture update"
+    );
+    let updated = fixture
+        .db
+        .execute_unprepared(&format!(
+            "UPDATE package_versions SET metadata = '{metadata}' WHERE id = {version_id}"
+        ))
+        .await
+        .expect("replace stored protocol metadata");
+    assert_eq!(updated.rows_affected(), 1, "metadata fixture row");
+}
+
+/// Acceptance for card_a4be92713930: every affected real route first proves
+/// that a legacy `NULL` and a healthy JSON object are readable, then rejects
+/// malformed JSON and a valid JSON value of the wrong top-level shape.
+#[tokio::test]
+async fn corrupt_protocol_metadata_never_becomes_a_plausible_partial_index() {
+    for case in PROTOCOL_METADATA_CASES {
+        let fixture = fixture(FailureShape::Raw404).await;
+        let version_id = seed_protocol_version_without_metadata(&fixture, case).await;
+
+        let (legacy_status, legacy_body) = protocol_metadata_response(&fixture, case).await;
+        assert_eq!(
+            legacy_status,
+            StatusCode::OK,
+            "{}: NULL metadata must keep the selected legacy response: {legacy_body}",
+            case.read_path
+        );
+        assert!(
+            legacy_body.contains("1.0.0"),
+            "{}: legacy response did not include the seeded version: {legacy_body}",
+            case.read_path
+        );
+
+        replace_protocol_metadata(&fixture, version_id, case.valid_metadata).await;
+        let (valid_status, valid_body) = protocol_metadata_response(&fixture, case).await;
+        assert_eq!(
+            valid_status,
+            StatusCode::OK,
+            "{}: valid metadata was rejected: {valid_body}",
+            case.read_path
+        );
+        assert!(
+            valid_body.contains(case.valid_marker),
+            "{}: healthy metadata field was not served: {valid_body}",
+            case.read_path
+        );
+
+        for damaged_metadata in ["{broken-json", "[]"] {
+            replace_protocol_metadata(&fixture, version_id, damaged_metadata).await;
+            let (failed_status, failed_body) = protocol_metadata_response(&fixture, case).await;
+            assert_sanitized_server_error(case.read_path, failed_status, &failed_body);
+            assert!(
+                !failed_body.contains(damaged_metadata),
+                "{}: stored metadata leaked to the client: {failed_body}",
+                case.read_path
+            );
+        }
+    }
+}
+
 /// A database row may survive a manually removed object or a failed restore.
 /// That is genuine file absence (404), not an internal error; other blob
 /// failures still pass through the shared 5xx classifier.
