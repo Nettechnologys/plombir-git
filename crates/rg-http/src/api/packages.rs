@@ -1014,7 +1014,7 @@ pub async fn cargo_sparse_index(
         .map(|v| rg_core::package_registry::CargoIndexVersion {
             version: v.version.as_str(),
             sha256: v.sha256.as_deref(),
-            yanked: v.is_yanked,
+            yanked: !v.is_install_candidate(),
             // Dependencies and features live only in the manifest inside the
             // `.crate`; the adapter lifted them here at publish, and this is
             // where cargo's resolver reads them back.
@@ -1076,6 +1076,9 @@ pub async fn npm_registry_metadata(
 
     let npm_versions: Vec<rg_core::package_registry::NpmVersionInfo> = versions
         .iter()
+        // npm has no version-level yank marker. Leaving the object in the
+        // packument makes an exact request install it as if it were live.
+        .filter(|v| v.is_install_candidate())
         .map(|v| {
             // Find the tgz file
             let tgz_file = v
@@ -1094,7 +1097,7 @@ pub async fn npm_registry_metadata(
                 sha1: tgz_file.and_then(|f| f.sha1.clone()),
                 sha512: tgz_file.and_then(|f| f.sha512.clone()),
                 filename: tgz_file.map(|f| f.filename.clone()),
-                yanked: v.is_yanked,
+                yanked: !v.is_install_candidate(),
                 // Dependency tables live only in the `package.json` inside the
                 // `.tgz`; the adapter lifted them here at publish, and this is
                 // where npm's resolver reads them back.
@@ -1251,7 +1254,7 @@ pub async fn pypi_simple_index(
             // is what keeps an exact pin resolvable — and `data-yanked` is what
             // takes it out of every other resolution (PEP 592).
             let requires_python = parse_pypi_requires_python(v.metadata.as_deref());
-            let yanked = v.is_yanked;
+            let yanked = !v.is_install_candidate();
 
             let files: Vec<rg_core::package_registry::PyPIVersionEntry> = v
                 .files
@@ -1433,6 +1436,9 @@ pub async fn maven_metadata(
 
     let entries: Vec<rg_core::package_registry::MavenVersionEntry> = versions
         .iter()
+        // Maven metadata has no spelling for a withdrawn release. Omitting it
+        // removes it from both `<versions>` and the derived `<release>`.
+        .filter(|v| v.is_install_candidate())
         .map(|v| rg_core::package_registry::MavenVersionEntry {
             version: v.version.clone(),
             is_snapshot: v.version.ends_with("-SNAPSHOT"),
@@ -1958,7 +1964,7 @@ pub async fn nuget_registration_index(
                 // A yanked version stays in the registration so a consumer that
                 // already resolved it keeps restoring; `listed` is what keeps it
                 // out of a fresh resolution.
-                listed: !v.is_yanked,
+                listed: v.is_install_candidate(),
             }
         })
         .collect();
@@ -2287,7 +2293,7 @@ pub async fn rubygems_dependencies(
             // A withdrawn version is not a candidate. The compact index has
             // always dropped them; this endpoint is the other half of the same
             // resolution and used to offer them (card_0c9e858230b6).
-            if v.is_yanked {
+            if !v.is_install_candidate() {
                 continue;
             }
 
@@ -2349,7 +2355,7 @@ pub async fn rubygems_gem_info(
         .iter()
         // A withdrawn version is not on offer here either — see
         // `rubygems_dependencies`, which resolves against the same rows.
-        .filter(|v| !v.is_yanked)
+        .filter(|v| v.is_install_candidate())
         .map(|v| {
             // The name the file was published under, not one rebuilt from the
             // coordinates: a platform gem is stored as `{name}-{ver}-{platform}.gem`.
@@ -2436,7 +2442,7 @@ fn compact_index_entries(
 ) -> Vec<rg_core::package_registry::CompactIndexVersion> {
     versions
         .iter()
-        .filter(|v| !v.is_yanked)
+        .filter(|v| v.is_install_candidate())
         .map(|v| {
             let file = gem_file(v);
             let facts = parse_rubygems_facts(v.metadata.as_deref());
@@ -2857,7 +2863,7 @@ pub async fn helm_index(
         };
 
         for v in &versions {
-            if v.is_yanked {
+            if !v.is_install_candidate() {
                 continue;
             }
 
@@ -2959,6 +2965,9 @@ pub async fn composer_packages_json(
             rg_core::package_registry::adapters::composer::ComposerVersionInfo,
         > = versions
             .iter()
+            // Composer's `abandoned` flag is package-wide, not a version yank.
+            // A withdrawn version therefore has to disappear from this map.
+            .filter(|v| v.is_install_candidate())
             .map(|v| {
                 let archive = v.files.first();
                 let filename = archive

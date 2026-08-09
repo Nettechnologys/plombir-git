@@ -58,6 +58,105 @@ struct PackageCase {
     body: Vec<u8>,
 }
 
+enum YankedIndexEncoding {
+    /// The protocol keeps an exact pin addressable, but marks it so a fresh
+    /// resolution cannot select it.
+    Marked { required: &'static [&'static str] },
+    /// The protocol has no version-level yank marker, so the index must omit
+    /// the withdrawn version altogether.
+    Omitted {
+        status: StatusCode,
+        forbidden: &'static [&'static str],
+    },
+}
+
+struct ProtocolIndexCase {
+    package_type: &'static str,
+    segments: &'static [&'static str],
+    live_marker: &'static str,
+    yanked: YankedIndexEncoding,
+}
+
+/// The candidate surface of every file-published package protocol.
+///
+/// Both the live-version smoke and the yank contract consume this registry.
+/// The census below derives the expected package types independently from the
+/// production adapters, so adding a protocol endpoint without choosing one of
+/// these two yank encodings makes the test fail.
+fn protocol_index_cases() -> [ProtocolIndexCase; 8] {
+    [
+        ProtocolIndexCase {
+            package_type: "cargo",
+            segments: &["cargo", "index", "matrix-cargo"],
+            live_marker: "\"vers\":\"1.0.0\"",
+            yanked: YankedIndexEncoding::Marked {
+                required: &["\"yanked\":true"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "npm",
+            segments: &["npm", "matrix-npm"],
+            live_marker: "\"1.0.0\":",
+            yanked: YankedIndexEncoding::Omitted {
+                status: StatusCode::OK,
+                forbidden: &["\"1.0.0\":"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "pypi",
+            segments: &["pypi", "simple", "matrix-pypi"],
+            live_marker: "matrix_pypi-1.0.0",
+            yanked: YankedIndexEncoding::Marked {
+                required: &["data-yanked"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "maven",
+            segments: &["maven", "com.example", "matrix-maven", "maven-metadata.xml"],
+            live_marker: "<version>1.0.0</version>",
+            yanked: YankedIndexEncoding::Omitted {
+                status: StatusCode::OK,
+                forbidden: &["<version>1.0.0</version>", "<release>1.0.0</release>"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "nuget",
+            segments: &["nuget", "registration", "Matrix.NuGet", "index.json"],
+            live_marker: "\"version\":\"1.0.0\"",
+            yanked: YankedIndexEncoding::Marked {
+                required: &["\"listed\":false"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "rubygems",
+            segments: &["rubygems", "info", "matrix-gem"],
+            live_marker: "1.0.0",
+            yanked: YankedIndexEncoding::Omitted {
+                status: StatusCode::NOT_FOUND,
+                forbidden: &["1.0.0"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "helm",
+            segments: &["helm", "index.yaml"],
+            live_marker: "matrix-helm",
+            yanked: YankedIndexEncoding::Omitted {
+                status: StatusCode::OK,
+                forbidden: &["matrix-helm", "1.0.0"],
+            },
+        },
+        ProtocolIndexCase {
+            package_type: "composer",
+            segments: &["composer", "packages.json"],
+            live_marker: "\"1.0.0\":",
+            yanked: YankedIndexEncoding::Omitted {
+                status: StatusCode::OK,
+                forbidden: &["\"1.0.0\":"],
+            },
+        },
+    ]
+}
+
 fn package_cases() -> Vec<PackageCase> {
     let cargo_toml = br#"[package]
 name = "matrix-cargo"
@@ -167,6 +266,34 @@ fn package_url(base: &str, segments: &[&str]) -> reqwest::Url {
     url
 }
 
+#[test]
+fn every_file_package_protocol_declares_how_yank_is_encoded() {
+    let mut production: Vec<&str> = rg_core::package_registry::adapter::REGISTERED_ADAPTER_TYPES
+        .iter()
+        .copied()
+        // OCI stores manifests and tags outside `package_versions`; its
+        // deletion semantics are a separate protocol contract.
+        .filter(|package_type| *package_type != "docker")
+        .filter(|package_type| {
+            rg_core::package_registry::adapter::get_adapter(package_type)
+                .is_some_and(|adapter| adapter.has_protocol_endpoint())
+        })
+        .collect();
+    production.sort_unstable();
+
+    let mut declared: Vec<&str> = protocol_index_cases()
+        .iter()
+        .map(|case| case.package_type)
+        .collect();
+    declared.sort_unstable();
+
+    assert_eq!(
+        declared, production,
+        "every file-published protocol index needs an explicit yank encoding; \
+         Docker/OCI is intentionally outside this matrix because it does not use package_versions"
+    );
+}
+
 #[tokio::test]
 async fn nine_native_package_formats_publish_index_and_download() {
     let (base, _db) = spawn_test_app_with_db().await;
@@ -245,34 +372,19 @@ async fn nine_native_package_formats_publish_index_and_download() {
         );
     }
 
-    let protocol_checks = [
-        (vec!["cargo", "index", "matrix-cargo"], "\"vers\":\"1.0.0\""),
-        (vec!["npm", "matrix-npm"], "\"matrix-npm\""),
-        (vec!["pypi", "simple", "matrix-pypi"], "matrix_pypi-1.0.0"),
-        (
-            vec!["maven", "com.example", "matrix-maven", "maven-metadata.xml"],
-            "<version>1.0.0</version>",
-        ),
-        (
-            vec!["nuget", "registration", "Matrix.NuGet", "index.json"],
-            "1.0.0",
-        ),
-        (
-            vec!["rubygems", "api", "v1", "gems", "matrix-gem.json"],
-            "1.0.0",
-        ),
-        (vec!["helm", "index.yaml"], "matrix-helm"),
-        (vec!["composer", "packages.json"], "vendor/matrix-composer"),
-    ];
-    for (segments, expected) in protocol_checks {
+    for check in protocol_index_cases() {
         let response = client
-            .get(package_url(&base, &segments))
+            .get(package_url(&base, check.segments))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{segments:?}");
+        assert_eq!(response.status(), StatusCode::OK, "{:?}", check.segments);
         let body = response.text().await.unwrap();
-        assert!(body.contains(expected), "{segments:?}: {body}");
+        assert!(
+            body.contains(check.live_marker),
+            "{:?}: {body}",
+            check.segments
+        );
     }
 
     let composer = client
@@ -485,67 +597,91 @@ async fn yanked_only_packages_do_not_advertise_a_fake_latest_version() {
     create_repo(&base, &token, "matrix-repo").await;
     let client = reqwest::Client::new();
 
-    let npm_json = br#"{
-  "name": "matrix-npm",
-  "version": "1.0.0",
-  "description": "npm matrix package"
-}"#;
-    let nuspec = br#"<?xml version="1.0"?>
-<package><metadata><id>Matrix.NuGet</id><version>1.0.0</version><description>NuGet matrix package</description></metadata></package>"#;
-    let chart_yaml =
-        b"apiVersion: v2\nname: matrix-helm\nversion: 1.0.0\ndescription: Helm matrix package\n";
+    let indexed_types: std::collections::HashSet<&str> = protocol_index_cases()
+        .iter()
+        .map(|case| case.package_type)
+        .collect();
+    let cases = package_cases();
 
-    for (package_type, filename, body) in [
-        (
-            "npm",
-            "matrix-npm-1.0.0.tgz",
-            tar_gz(&[("package/package.json", npm_json)]),
-        ),
-        (
-            "nuget",
-            "Matrix.NuGet.1.0.0.nupkg",
-            zip_archive(&[("Matrix.NuGet.nuspec", nuspec)]),
-        ),
-        (
-            "helm",
-            "matrix-helm-1.0.0.tgz",
-            tar_gz(&[("matrix-helm/Chart.yaml", chart_yaml)]),
-        ),
-    ] {
+    for case in cases
+        .iter()
+        .filter(|case| indexed_types.contains(case.package_type))
+    {
         let published = client
-            .post(package_url(&base, &[package_type, "publish"]))
+            .post(package_url(&base, &[case.package_type, "publish"]))
             .bearer_auth(&token)
             .header(
                 reqwest::header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
+                format!("attachment; filename=\"{}\"", case.filename),
             )
-            .body(body)
+            .body(case.body.clone())
             .send()
             .await
             .unwrap();
         assert_eq!(
             published.status(),
             StatusCode::CREATED,
-            "{package_type} publish"
+            "{} publish: {}",
+            case.package_type,
+            published.text().await.unwrap()
         );
     }
 
-    for (package_type, package_name) in [
-        ("npm", "matrix-npm"),
-        ("nuget", "Matrix.NuGet"),
-        ("helm", "matrix-helm"),
-    ] {
+    for case in cases
+        .iter()
+        .filter(|case| indexed_types.contains(case.package_type))
+    {
         let yanked = client
             .patch(package_url(
                 &base,
-                &[package_type, package_name, "1.0.0", "yank"],
+                &[case.package_type, case.name, case.version, "yank"],
             ))
             .bearer_auth(&token)
             .json(&serde_json::json!({ "yank": true }))
             .send()
             .await
             .unwrap();
-        assert_eq!(yanked.status(), StatusCode::OK, "{package_type} yank");
+        assert_eq!(
+            yanked.status(),
+            StatusCode::OK,
+            "{} yank: {}",
+            case.package_type,
+            yanked.text().await.unwrap()
+        );
+    }
+
+    for check in protocol_index_cases() {
+        let response = client
+            .get(package_url(&base, check.segments))
+            .send()
+            .await
+            .unwrap();
+        let expected_status = match &check.yanked {
+            YankedIndexEncoding::Marked { .. } => StatusCode::OK,
+            YankedIndexEncoding::Omitted { status, .. } => *status,
+        };
+        assert_eq!(response.status(), expected_status, "{:?}", check.segments);
+        let body = response.text().await.unwrap();
+        match check.yanked {
+            YankedIndexEncoding::Marked { required } => {
+                for marker in required {
+                    assert!(
+                        body.contains(marker),
+                        "yanked {} is not marked by {marker:?}: {body}",
+                        check.package_type
+                    );
+                }
+            }
+            YankedIndexEncoding::Omitted { forbidden, .. } => {
+                for marker in forbidden {
+                    assert!(
+                        !body.contains(marker),
+                        "yanked {} is still a candidate via {marker:?}: {body}",
+                        check.package_type
+                    );
+                }
+            }
+        }
     }
 
     let npm = client
@@ -560,7 +696,7 @@ async fn yanked_only_packages_do_not_advertise_a_fake_latest_version() {
         npm.get("dist-tags").is_none(),
         "all-yanked npm metadata must not publish dist-tags: {npm}"
     );
-    assert!(npm["versions"].get("1.0.0").is_some(), "{npm}");
+    assert!(npm["versions"].get("1.0.0").is_none(), "{npm}");
     assert!(
         !npm.to_string().contains("0.0.0"),
         "npm metadata must not invent a version: {npm}"

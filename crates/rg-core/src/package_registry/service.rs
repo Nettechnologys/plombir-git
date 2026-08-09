@@ -95,7 +95,21 @@ pub struct VersionDetail {
     pub created_at: String,
 }
 
+/// Whether a stored version may participate in a fresh dependency resolution.
+///
+/// Protocols differ in how they express the answer: Cargo, PyPI and NuGet keep
+/// an exact pin addressable and attach a marker, while protocols without such a
+/// marker omit the version. The underlying decision is nevertheless the same
+/// for every registry and belongs here, next to the persisted yank state.
+pub const fn is_install_candidate(is_yanked: bool) -> bool {
+    !is_yanked
+}
+
 impl VersionDetail {
+    pub const fn is_install_candidate(&self) -> bool {
+        is_install_candidate(self.is_yanked)
+    }
+
     /// The SHA-256 of one of this version's files, as far as the registry can
     /// honestly state it.
     ///
@@ -591,7 +605,7 @@ pub async fn list_packages(
         } else {
             versions
                 .iter()
-                .find(|version| !version.is_yanked)
+                .find(|version| is_install_candidate(version.is_yanked))
                 .map(|version| version.version.as_str())
         }
         .map(str::to_string);

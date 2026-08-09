@@ -72,28 +72,44 @@ pub trait PackageAdapter: Send + Sync {
 /// Boxed adapter for type-erased storage.
 pub type BoxedAdapter = Box<dyn PackageAdapter>;
 
-/// Get the adapter for a given package type, if one is registered.
-pub fn get_adapter(package_type: &str) -> Option<BoxedAdapter> {
-    match package_type {
-        "cargo" => Some(Box::new(super::adapters::CargoAdapter)),
-        "npm" => Some(Box::new(super::adapters::NpmAdapter)),
-        "nuget" => Some(Box::new(super::adapters::NuGetAdapter)),
-        "pypi" => Some(Box::new(super::adapters::PyPIAdapter)),
-        "rubygems" => Some(Box::new(super::adapters::RubyGemsAdapter)),
-        "maven" => Some(Box::new(super::adapters::MavenAdapter)),
-        "docker" => Some(Box::new(super::adapters::DockerAdapter)),
-        "generic" => Some(Box::new(super::adapters::GenericAdapter)),
-        "helm" => Some(Box::new(super::adapters::HelmAdapter)),
-        "composer" => Some(Box::new(super::adapters::ComposerAdapter)),
-        // Other types fall back to generic
-        _ => {
-            if package_type != "generic" {
-                tracing::debug!(
-                    "no specific adapter for '{}', falling back to generic",
-                    package_type
-                );
+macro_rules! register_adapters {
+    ($($package_type:literal => $adapter:path),+ $(,)?) => {
+        /// Package types with a dedicated adapter rather than the generic fallback.
+        ///
+        /// Generated from the same declaration as [`get_adapter`], so contract
+        /// tests can derive their census from production without maintaining a
+        /// second registry that can silently omit a new adapter.
+        pub const REGISTERED_ADAPTER_TYPES: &[&str] = &[$($package_type),+];
+
+        /// Get the adapter for a given package type, if one is registered.
+        pub fn get_adapter(package_type: &str) -> Option<BoxedAdapter> {
+            match package_type {
+                $($package_type => Some(Box::new($adapter)),)+
+                // Other types fall back to generic.
+                _ => {
+                    if package_type != "generic" {
+                        tracing::debug!(
+                            "no specific adapter for '{}', falling back to generic",
+                            package_type
+                        );
+                    }
+                    Some(Box::new(super::adapters::GenericAdapter))
+                }
             }
-            Some(Box::new(super::adapters::GenericAdapter))
         }
-    }
+
+    };
+}
+
+register_adapters! {
+    "cargo" => super::adapters::CargoAdapter,
+    "npm" => super::adapters::NpmAdapter,
+    "nuget" => super::adapters::NuGetAdapter,
+    "pypi" => super::adapters::PyPIAdapter,
+    "rubygems" => super::adapters::RubyGemsAdapter,
+    "maven" => super::adapters::MavenAdapter,
+    "docker" => super::adapters::DockerAdapter,
+    "generic" => super::adapters::GenericAdapter,
+    "helm" => super::adapters::HelmAdapter,
+    "composer" => super::adapters::ComposerAdapter,
 }
