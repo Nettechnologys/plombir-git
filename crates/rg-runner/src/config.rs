@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 /// Runner configuration file.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunnerConfig {
     pub(crate) server: Option<String>,
     pub(crate) token: Option<String>,
@@ -373,6 +374,34 @@ labels = ["linux", "docker"]
         );
     }
 
+    /// A typo in the remote server key used to deserialize successfully with
+    /// `server = None`, after which resolution quietly selected localhost. Drive
+    /// the production loader so the path, rejected key and remediation all stay
+    /// attached to the refusal.
+    #[test]
+    fn a_misspelled_server_key_is_rejected_before_it_can_fall_back_to_localhost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.toml");
+        std::fs::write(&path, "sever = \"https://forge.example\"\n").unwrap();
+
+        let error = load_config(path.to_str().unwrap())
+            .expect_err("an unknown runner setting must not be discarded");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(path.to_str().unwrap()),
+            "error must name the config path: {rendered}"
+        );
+        assert!(
+            rendered.contains("unknown field `sever`"),
+            "error must name the rejected setting: {rendered}"
+        );
+        assert!(
+            rendered.contains("forgekeep-runner register --save"),
+            "error must carry the remediation hint: {rendered}"
+        );
+    }
+
     /// The bug: a broken TOML went through `.ok()?` and became `None`, so the
     /// runner behaved exactly as if the operator had never written the file.
     #[test]
@@ -472,6 +501,11 @@ labels = ["linux", "docker"]
         assert_eq!(loaded.server.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(loaded.runner_id, Some(7));
         assert_eq!(loaded.token.as_deref(), Some("tok"));
+        assert_eq!(loaded.name.as_deref(), Some("builder-1"));
+        assert_eq!(
+            loaded.labels.as_deref(),
+            Some(["linux".to_string()].as_slice())
+        );
     }
 
     /// The bug: both `create_dir_all` and `write` used a bare `?`, so the deploy
