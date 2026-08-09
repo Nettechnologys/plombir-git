@@ -112,23 +112,22 @@ async fn fixture(shape: FailureShape) -> Fixture {
     }
 }
 
-fn assert_sanitized_server_error(shape: FailureShape, status: StatusCode, body: &str) {
+fn assert_sanitized_server_error(label: &str, status: StatusCode, body: &str) {
     assert!(
         status.is_server_error(),
         "{}: broken storage must be a 5xx, got {status}: {body}",
-        shape.label()
+        label
     );
     let json: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|error| {
         panic!(
             "{}: server error must use the sanitized JSON envelope ({error}): {body}",
-            shape.label()
+            label
         )
     });
     assert_eq!(
-        json["error"]["message"],
-        "Internal server error",
+        json["error"]["message"], "Internal server error",
         "{}: internal database detail reached the client: {body}",
-        shape.label()
+        label
     );
 }
 
@@ -172,7 +171,140 @@ async fn package_read_failures_are_never_404_or_empty_partial_success() {
             .unwrap_or_else(|error| panic!("{}: inject table failure: {error}", shape.label()));
 
         let (failed_status, failed_body) = fixture.get(shape).await;
-        assert_sanitized_server_error(shape, failed_status, &failed_body);
+        assert_sanitized_server_error(shape.label(), failed_status, &failed_body);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolverCase {
+    package_type: &'static str,
+    package_name: &'static str,
+    read_path: &'static str,
+}
+
+const RESOLVER_CASES: [ResolverCase; 2] = [
+    ResolverCase {
+        package_type: "cargo",
+        package_name: "metadata-cargo",
+        read_path: "packages/cargo/index/metadata-cargo",
+    },
+    ResolverCase {
+        package_type: "npm",
+        package_name: "metadata-npm",
+        read_path: "packages/npm/metadata-npm",
+    },
+];
+
+async fn seed_version_without_metadata(fixture: &Fixture, case: ResolverCase) -> i64 {
+    let registry = rg_db::ops::package_registry_ops::find_or_create(
+        &fixture.db,
+        fixture.repo_id,
+        case.package_type,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} registry: {error}", case.package_type));
+    let package = rg_db::ops::package_ops::create(
+        &fixture.db,
+        registry.id,
+        fixture.owner_id,
+        case.package_name,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} package: {error}", case.package_type));
+    rg_db::ops::package_version_ops::create(
+        &fixture.db,
+        package.id,
+        "1.0.0",
+        Some("1.0.0"),
+        None,
+        7,
+        None,
+        Some(fixture.owner_id),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{} version: {error}", case.package_type))
+    .id
+}
+
+async fn resolver_response(fixture: &Fixture, case: ResolverCase) -> (StatusCode, String) {
+    let response = fixture
+        .client
+        .get(format!(
+            "{}/api/v1/repos/{OWNER}/{REPO}/{}",
+            fixture.base, case.read_path
+        ))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("{} metadata request: {error}", case.package_type));
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| panic!("{} metadata body: {error}", case.package_type));
+    (status, body)
+}
+
+fn assert_legacy_empty_graph(case: ResolverCase, body: &str) {
+    let document: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|error| {
+        panic!(
+            "{} metadata is not JSON ({error}): {body}",
+            case.package_type
+        )
+    });
+    match case.package_type {
+        "cargo" => {
+            assert_eq!(document["deps"], serde_json::json!([]), "{body}");
+            assert_eq!(document["features"], serde_json::json!({}), "{body}");
+        }
+        "npm" => assert_eq!(
+            document["versions"]["1.0.0"]["dependencies"],
+            serde_json::json!({}),
+            "{body}"
+        ),
+        other => panic!("unhandled resolver protocol {other}"),
+    }
+}
+
+/// Acceptance for card_230f5e4a8cdd: the same stored version is first read as
+/// a documented legacy row, then made unreadable behind the HTTP route. The
+/// second request must fail closed instead of preserving the plausible empty
+/// dependency graph from the first response.
+#[tokio::test]
+async fn corrupt_cargo_and_npm_metadata_is_not_served_as_an_empty_dependency_graph() {
+    for case in RESOLVER_CASES {
+        let fixture = fixture(FailureShape::Raw404).await;
+        let version_id = seed_version_without_metadata(&fixture, case).await;
+
+        let (legacy_status, legacy_body) = resolver_response(&fixture, case).await;
+        assert_eq!(
+            legacy_status,
+            StatusCode::OK,
+            "{}: absent stored metadata keeps the selected legacy response: {legacy_body}",
+            case.package_type
+        );
+        assert_legacy_empty_graph(case, &legacy_body);
+
+        let updated = fixture
+            .db
+            .execute_unprepared(&format!(
+                "UPDATE package_versions SET metadata = '{{broken-json' WHERE id = {version_id}"
+            ))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{}: corrupt stored metadata: {error}", case.package_type)
+            });
+        assert_eq!(updated.rows_affected(), 1, "{} fixture", case.package_type);
+
+        let (failed_status, failed_body) = resolver_response(&fixture, case).await;
+        assert_sanitized_server_error(case.package_type, failed_status, &failed_body);
+        assert!(
+            !failed_body.contains("broken-json"),
+            "{}: the unreadable stored blob leaked to the client: {failed_body}",
+            case.package_type
+        );
     }
 }
 
