@@ -128,18 +128,22 @@ impl PackageAdapter for MavenAdapter {
     }
 }
 
-/// Quick XML tag extraction.  Not a full XML parser — handles Maven POM files.
-fn xml_tag_value(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MavenPom {
+    parent: Option<MavenParent>,
+    group_id: Option<String>,
+    artifact_id: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+}
 
-    if let Some(start) = xml.find(&open) {
-        let start = start + open.len();
-        if let Some(end) = xml[start..].find(&close) {
-            return Some(xml[start..start + end].trim().to_string());
-        }
-    }
-    None
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MavenParent {
+    group_id: Option<String>,
+    version: Option<String>,
 }
 
 /// Extract metadata from a POM (XML) file.
@@ -147,27 +151,25 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
     let xml = String::from_utf8(data.to_vec())
         .map_err(|e| anyhow::anyhow!("invalid POM file (not valid UTF-8): {e}"))?;
 
-    let artifact_id = xml_tag_value(&xml, "artifactId")
-        .ok_or_else(|| anyhow::anyhow!("POM missing <artifactId>"))?;
+    let MavenPom {
+        parent,
+        group_id,
+        artifact_id,
+        version,
+        description,
+        url,
+    } = quick_xml::de::from_str(&xml).map_err(|e| anyhow::anyhow!("invalid POM XML: {e}"))?;
 
-    let group_id = xml_tag_value(&xml, "groupId")
-        .or_else(|| {
-            // Fallback: try from <parent>
-            xml_tag_value(&xml[..xml.find("</parent>").unwrap_or(0)], "groupId")
-        })
+    // Only groupId and version are inherited by Maven. In particular, the
+    // parent's artifactId names a different project and must never become the
+    // package being published.
+    let artifact_id = artifact_id.ok_or_else(|| anyhow::anyhow!("POM missing <artifactId>"))?;
+    let group_id = group_id
+        .or_else(|| parent.as_ref().and_then(|parent| parent.group_id.clone()))
         .ok_or_else(|| anyhow::anyhow!("POM missing <groupId>"))?;
-
-    let version = xml_tag_value(&xml, "version")
-        .or_else(|| {
-            // Try from <parent>
-            xml_tag_value(&xml[..xml.find("</parent>").unwrap_or(0)], "version")
-        })
+    let version = version
+        .or_else(|| parent.and_then(|parent| parent.version))
         .ok_or_else(|| anyhow::anyhow!("POM missing <version>"))?;
-
-    let _name = xml_tag_value(&xml, "name").or_else(|| Some(artifact_id.clone()));
-
-    let description = xml_tag_value(&xml, "description");
-    let url = xml_tag_value(&xml, "url");
 
     // Maven uses {groupId}:{artifactId} as the package name
     let pkg_name = format!("{}:{}", group_id, artifact_id);
@@ -183,6 +185,61 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
         semver: Some(version),
         protocol_metadata: None,
     })
+}
+
+#[cfg(test)]
+mod pom_tests {
+    use super::extract_from_pom;
+
+    #[test]
+    fn project_coordinates_win_over_parent_coordinates() {
+        let metadata = extract_from_pom(
+            br#"<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.parent</groupId>
+    <artifactId>parent-bom</artifactId>
+    <version>9.8.7</version>
+  </parent>
+  <groupId>com.example.tools</groupId>
+  <artifactId>matrix-child</artifactId>
+  <version>1.2.3</version>
+</project>"#,
+        )
+        .expect("valid child POM");
+
+        assert_eq!(metadata.name, "com.example.tools:matrix-child");
+        assert_eq!(metadata.version, "1.2.3");
+    }
+
+    #[test]
+    fn group_and_version_inherit_from_parent_but_artifact_id_does_not() {
+        let metadata = extract_from_pom(
+            br#"<project>
+  <parent>
+    <groupId>org.parent</groupId>
+    <artifactId>parent-bom</artifactId>
+    <version>9.8.7</version>
+  </parent>
+  <artifactId>matrix-child</artifactId>
+</project>"#,
+        )
+        .expect("parent supplies the inheritable coordinates");
+
+        assert_eq!(metadata.name, "org.parent:matrix-child");
+        assert_eq!(metadata.version, "9.8.7");
+
+        let error = extract_from_pom(
+            br#"<project><parent>
+  <groupId>org.parent</groupId>
+  <artifactId>parent-bom</artifactId>
+  <version>9.8.7</version>
+</parent></project>"#,
+        )
+        .expect_err("a project cannot inherit its artifactId");
+        assert!(error.to_string().contains("<artifactId>"), "{error:#}");
+    }
 }
 
 /// Extract minimal metadata from Maven filename convention.

@@ -896,10 +896,20 @@ async fn maven_repository_layout_serves_metadata_and_artifacts() {
     create_repo(&base, &token, "matrix-repo").await;
     let client = reqwest::Client::new();
 
-    // A three-segment groupId, so the test fails on any implementation that
-    // reads the group as a single path segment.
+    // A three-segment project groupId, so the test fails both when the layout
+    // treats it as one path segment and when the POM parser takes the earlier
+    // parent coordinate instead of the project's direct children.
     let pom = br#"<?xml version="1.0"?>
-<project><groupId>com.example.tools</groupId><artifactId>matrix-deep</artifactId><version>1.0.0</version></project>"#
+<project>
+  <parent>
+    <groupId>org.parent</groupId>
+    <artifactId>parent-bom</artifactId>
+    <version>9.8.7</version>
+  </parent>
+  <groupId>com.example.tools</groupId>
+  <artifactId>matrix-deep</artifactId>
+  <version>1.0.0</version>
+</project>"#
         .to_vec();
     let jar = zip_archive(&[("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")]);
 
