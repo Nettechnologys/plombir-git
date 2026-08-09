@@ -551,7 +551,6 @@ pub struct NuGetRegistrationEntry {
     pub license: Option<String>,
     pub tags: Option<String>,
     pub download_url: String,
-    pub nuspec_url: Option<String>,
     /// What the nuspec's `<dependencies>` block declared. This is the graph
     /// `dotnet restore` resolves against — it never opens the `.nupkg` to find
     /// one (card_b21fb6511a25).
@@ -567,16 +566,29 @@ pub struct NuGetRegistrationEntry {
 /// Returns a single-page registration which lists all versions.
 pub fn build_registration_index(
     package_name: &str,
+    registration_url: &str,
     entries: &[NuGetRegistrationEntry],
 ) -> serde_json::Value {
+    let lower = entries
+        .first()
+        .map(|entry| entry.version.clone())
+        .unwrap_or_default();
+    let upper = entries
+        .last()
+        .map(|entry| entry.version.clone())
+        .unwrap_or_default();
+    // The page is inline, so its fragment identifies the page within the index
+    // document without advertising a second HTTP resource that does not exist.
+    let page_url = format!("{registration_url}#page/{lower}/{upper}");
+
     let mut leaves = Vec::new();
     for e in entries {
         let mut leaf = serde_json::json!({
             "packageContent": e.download_url,
-            "registration": e.nuspec_url.as_ref().unwrap_or(&String::new()),
+            "registration": registration_url,
         });
 
-        if let Some(ref catalog_entry) = build_catalog_entry(package_name, e) {
+        if let Some(ref catalog_entry) = build_catalog_entry(package_name, e, &page_url) {
             leaf["catalogEntry"] = catalog_entry.clone();
         }
 
@@ -586,10 +598,10 @@ pub fn build_registration_index(
     serde_json::json!({
         "count": 1,
         "items": [{
-            "@id": "",
+            "@id": page_url,
             "count": leaves.len(),
-            "lower": entries.first().map(|e| e.version.clone()).unwrap_or_default(),
-            "upper": entries.last().map(|e| e.version.clone()).unwrap_or_default(),
+            "lower": lower,
+            "upper": upper,
             "items": leaves,
         }]
     })
@@ -597,9 +609,13 @@ pub fn build_registration_index(
 
 /// The `catalogEntry` of one registration leaf — the document `dotnet restore`
 /// reads a version's identity, dependency graph and availability out of.
-fn build_catalog_entry(name: &str, entry: &NuGetRegistrationEntry) -> Option<serde_json::Value> {
+fn build_catalog_entry(
+    name: &str,
+    entry: &NuGetRegistrationEntry,
+    page_url: &str,
+) -> Option<serde_json::Value> {
     let mut out = serde_json::Map::new();
-    out.insert("@id".into(), "".into());
+    out.insert("@id".into(), page_url.into());
     out.insert("id".into(), name.into());
     out.insert("version".into(), entry.version.clone().into());
     // Stated rather than left to the client's default, because the default is
@@ -1056,7 +1072,6 @@ mod tests {
                 license: Some("MIT".into()),
                 tags: Some("test".into()),
                 download_url: "https://git.example.com/dl/1.0.0".into(),
-                nuspec_url: Some("https://git.example.com/dl/1.0.0.nuspec".into()),
                 dependency_groups: vec![NuGetDependencyGroup {
                     target_framework: Some("net8.0".into()),
                     dependencies: vec![NuGetDependency {
@@ -1073,14 +1088,16 @@ mod tests {
                 license: None,
                 tags: None,
                 download_url: "https://git.example.com/dl/2.0.0".into(),
-                nuspec_url: None,
                 dependency_groups: Vec::new(),
                 listed: false,
             },
         ];
 
-        let json = build_registration_index("MyLib", &entries);
+        let registration_url = "https://git.example.com/registration/mylib/index.json";
+        let json = build_registration_index("MyLib", registration_url, &entries);
         assert_eq!(json["count"], 1);
+        let page_url = format!("{registration_url}#page/1.0.0/2.0.0");
+        assert_eq!(json["items"][0]["@id"], page_url);
 
         let items = json["items"][0]["items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
@@ -1090,7 +1107,9 @@ mod tests {
             items[0]["packageContent"],
             "https://git.example.com/dl/1.0.0"
         );
+        assert_eq!(items[0]["registration"], registration_url);
         assert!(items[0]["catalogEntry"].is_object());
+        assert_eq!(items[0]["catalogEntry"]["@id"], page_url);
         assert_eq!(items[0]["catalogEntry"]["id"], "MyLib");
         assert_eq!(items[0]["catalogEntry"]["version"], "1.0.0");
 

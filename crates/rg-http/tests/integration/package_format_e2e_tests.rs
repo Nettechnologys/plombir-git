@@ -2512,14 +2512,11 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
         "restore downloads the bytes that were published"
     );
 
-    let registration = client
-        .get(format!(
-            "{}matrix.nuget/index.json",
-            advertised["RegistrationsBaseUrl/3.6.0"]
-        ))
-        .send()
-        .await
-        .unwrap();
+    let registration_url = format!(
+        "{}matrix.nuget/index.json",
+        advertised["RegistrationsBaseUrl/3.6.0"]
+    );
+    let registration = client.get(&registration_url).send().await.unwrap();
     assert_eq!(
         registration.status(),
         StatusCode::OK,
@@ -2528,6 +2525,50 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     );
     let registration: serde_json::Value = registration.json().await.unwrap();
     assert_eq!(registration["count"], 1, "registration: {registration}");
+
+    // Walk every same-origin URL the registration document publishes. This is
+    // recursive so a later registry URL cannot appear without being driven by
+    // the test — the exact blind spot that let the dead `.nuspec` link survive.
+    // Publisher-supplied project/license URLs may legitimately be external.
+    fn collect_registry_urls(
+        value: &serde_json::Value,
+        registry_origin: &str,
+        urls: &mut std::collections::BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::String(url) if url.starts_with(registry_origin) => {
+                urls.insert(url.clone());
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_registry_urls(item, registry_origin, urls);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for value in fields.values() {
+                    collect_registry_urls(value, registry_origin, urls);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut registration_urls = std::collections::BTreeSet::new();
+    collect_registry_urls(&registration, &base, &mut registration_urls);
+    for url in &registration_urls {
+        let response = client.get(url).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the registration index advertises an URL this registry does not serve: {url}"
+        );
+    }
+
+    let page = &registration["items"][0];
+    let leaf = &page["items"][0];
+    assert_eq!(leaf["registration"], registration_url);
+    assert_eq!(page["@id"], format!("{registration_url}#page/1.0.0/1.0.0"));
+    assert_eq!(leaf["catalogEntry"]["@id"], page["@id"]);
 
     for (resource, label) in [
         ("SearchQueryService/3.5.0", "search"),

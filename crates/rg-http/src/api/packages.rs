@@ -1939,6 +1939,13 @@ pub async fn nuget_registration_index(
     };
 
     let base_url = build_base_url(&headers);
+    let registration_url = format!(
+        "{}/api/v1/repos/{}/{}/packages/nuget/registration/{}/index.json",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(&owner),
+        encode_path_segment(&name),
+        encode_path_segment(&pkg_name.to_lowercase()),
+    );
 
     let version_metadata = versions
         .iter()
@@ -1971,18 +1978,6 @@ pub async fn nuget_registration_index(
                 encode_path_segment(&filename),
             );
 
-            let nuspec_url = primary_file.map(|_| {
-                format!(
-                    "{}/api/v1/repos/{}/{}/packages/nuget/{}/{}/{}.nuspec",
-                    base_url.trim_end_matches('/'),
-                    encode_path_segment(&owner),
-                    encode_path_segment(&name),
-                    encode_path_segment(&pkg_name),
-                    encode_path_segment(&v.version),
-                    encode_path_segment(&pkg_name),
-                )
-            });
-
             rg_core::package_registry::NuGetRegistrationEntry {
                 version: v.version.clone(),
                 description: meta.description,
@@ -1990,7 +1985,6 @@ pub async fn nuget_registration_index(
                 license: meta.license,
                 tags: meta.tags,
                 download_url,
-                nuspec_url,
                 dependency_groups: meta.dependency_groups,
                 // A yanked version stays in the registration so a consumer that
                 // already resolved it keeps restoring; `listed` is what keeps it
@@ -2000,7 +1994,8 @@ pub async fn nuget_registration_index(
         })
         .collect();
 
-    let json = rg_core::package_registry::build_registration_index(&pkg_name, &entries);
+    let json =
+        rg_core::package_registry::build_registration_index(&pkg_name, &registration_url, &entries);
 
     (
         StatusCode::OK,
