@@ -920,6 +920,10 @@ struct TwineUpload {
     sha256_digest: Option<String>,
     filename: Option<String>,
     content: Option<axum::body::Bytes>,
+    /// The PEP 740 `attestations` field, verbatim: a JSON array of attestation
+    /// objects describing the file in the same form. `None` means the publisher
+    /// sent none, which is a different answer from "sent some and we lost them".
+    attestations: Option<String>,
 }
 
 fn set_twine_field<T>(slot: &mut Option<T>, field: &str, value: T) -> Result<(), AppError> {
@@ -942,6 +946,11 @@ fn required_twine_field(value: Option<String>, field: &str) -> Result<String, Ap
 /// Twine sends many descriptive metadata fields as well; the package adapter
 /// reads the authoritative metadata from the wheel/sdist itself, so this
 /// boundary only consumes the protocol controls, coordinates, digest and file.
+///
+/// `attestations` is the exception to that rule: it is supply-chain evidence
+/// the publisher deliberately attached and that no other part of the request
+/// carries, so dropping it into the ignored-field arm loses it for good while
+/// the upload still answers 200 (`card_b25bd1cbc60c`).
 async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, AppError> {
     let mut upload = TwineUpload::default();
 
@@ -968,7 +977,8 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
                 set_twine_field(&mut upload.filename, "content", filename)?;
                 set_twine_field(&mut upload.content, "content", content)?;
             }
-            ":action" | "protocol_version" | "name" | "version" | "sha256_digest" => {
+            ":action" | "protocol_version" | "name" | "version" | "sha256_digest"
+            | "attestations" => {
                 let value = field.text().await.map_err(|error| {
                     AppError::bad_request(format!(
                         "Twine `{field_name}` field is not valid text: {error}"
@@ -980,6 +990,7 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
                     "name" => &mut upload.name,
                     "version" => &mut upload.version,
                     "sha256_digest" => &mut upload.sha256_digest,
+                    "attestations" => &mut upload.attestations,
                     _ => unreachable!("matched above"),
                 };
                 set_twine_field(slot, &field_name, value)?;
@@ -1006,11 +1017,12 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
     ),
     request_body(
         content_type = "multipart/form-data",
-        description = "Twine legacy upload form with package metadata and a content file",
+        description = "Twine legacy upload form with package metadata, a content file, and an \
+                       optional PEP 740 `attestations` array",
     ),
     responses(
         (status = 200, description = "Package uploaded", body = PublishResponse),
-        (status = 400, description = "Malformed form, package, or digest", body = serde_json::Value),
+        (status = 400, description = "Malformed form, package, digest, or attestations", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 409, description = "Distribution already exists", body = serde_json::Value),
         (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),
@@ -1076,6 +1088,28 @@ pub async fn pypi_legacy_upload(
         .into_response();
     }
 
+    // PEP 740: "if the index fails to verify any attestation in `attestations`,
+    // it MUST reject the upload". Verifying before anything is written is what
+    // makes that refusal total — the alternative leaves a distribution file
+    // published without the evidence its publisher meant to publish it with.
+    let provenance = match upload.attestations.as_deref() {
+        Some(raw) => {
+            match rg_core::package_registry::build_pypi_provenance(
+                raw,
+                &filename,
+                &actual_digest,
+                rg_core::package_registry::pypi_upload_token_publisher(&owner, &name),
+            ) {
+                Ok(document) => Some((
+                    rg_core::package_registry::pypi_provenance_filename(&filename),
+                    document,
+                )),
+                Err(message) => return AppError::bad_request(message).into_response(),
+            }
+        }
+        None => None,
+    };
+
     let query = PublishPackageQuery {
         name: Some(package_name),
         version: Some(version),
@@ -1084,7 +1118,7 @@ pub async fn pypi_legacy_upload(
         repository_url: None,
         semver: None,
     };
-    let mut response = publish_package(
+    let mut response = publish_package_with_extra_files(
         state,
         user_id,
         owner,
@@ -1093,6 +1127,7 @@ pub async fn pypi_legacy_upload(
         query,
         filename,
         content.to_vec(),
+        provenance.into_iter().collect(),
     )
     .await;
     // Twine's legacy upload contract uses 200 for a successful POST. Keep the
@@ -1201,6 +1236,41 @@ async fn publish_package(
     filename: String,
     body: Vec<u8>,
 ) -> axum::response::Response {
+    publish_package_with_extra_files(
+        state,
+        user_id,
+        owner,
+        name,
+        pkg_type,
+        query,
+        filename,
+        body,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Publish one artifact together with the sidecar files that belong to it.
+///
+/// `extra_files` travels into the same `publish` transaction as the artifact,
+/// which is the whole point: a PyPI distribution and its PEP 740 provenance are
+/// either both stored or neither is, so the Simple page can never advertise
+/// evidence that a half-failed publish left unwritten. They bypass the adapter
+/// checks below on purpose — a provenance document is not a distribution and
+/// would fail `validate` — so every caller owes its own validation of them
+/// *before* this call.
+#[allow(clippy::too_many_arguments)]
+async fn publish_package_with_extra_files(
+    state: AppState,
+    user_id: i64,
+    owner: String,
+    name: String,
+    pkg_type: String,
+    query: PublishPackageQuery,
+    filename: String,
+    body: Vec<u8>,
+    extra_files: Vec<(String, Vec<u8>)>,
+) -> axum::response::Response {
     if body.len() > state.package_upload_max_bytes {
         return AppError::payload_too_large(format!(
             "package artifact exceeds the configured {}-byte limit",
@@ -1268,6 +1338,9 @@ async fn publish_package(
         None
     };
 
+    let mut files = vec![(filename, body)];
+    files.extend(extra_files);
+
     persist_package(
         state,
         user_id,
@@ -1275,7 +1348,7 @@ async fn publish_package(
         name,
         pkg_type,
         query,
-        vec![(filename, body)],
+        files,
         adapter_meta,
         None,
     )
@@ -2551,17 +2624,31 @@ pub async fn pypi_simple_index(
             // takes it out of every other resolution (PEP 592).
             let yanked = !v.is_install_candidate();
 
+            // PEP 740's `data-provenance` may only name a URL this server
+            // answers, so it is derived from the stored file list rather than
+            // from a naming convention: the attribute appears exactly when the
+            // publish that wrote the distribution also wrote its provenance.
+            let stored: std::collections::HashSet<&str> =
+                v.files.iter().map(|f| f.filename.as_str()).collect();
+
             let files: Vec<rg_core::package_registry::PyPIVersionEntry> = v
                 .files
                 .iter()
                 .filter(|f| is_pypi_distribution(&f.filename))
-                .map(|f| rg_core::package_registry::PyPIVersionEntry {
-                    version: v.version.clone(),
-                    filename: f.filename.clone(),
-                    sha256: v.sha256_of(f),
-                    download_url: link_to(&v.version, &f.filename),
-                    requires_python: requires_python.clone(),
-                    yanked,
+                .map(|f| {
+                    let provenance =
+                        rg_core::package_registry::pypi_provenance_filename(&f.filename);
+                    rg_core::package_registry::PyPIVersionEntry {
+                        version: v.version.clone(),
+                        filename: f.filename.clone(),
+                        sha256: v.sha256_of(f),
+                        download_url: link_to(&v.version, &f.filename),
+                        requires_python: requires_python.clone(),
+                        yanked,
+                        provenance_url: stored
+                            .contains(provenance.as_str())
+                            .then(|| link_to(&v.version, &provenance)),
+                    }
                 })
                 .collect();
 
@@ -2581,6 +2668,9 @@ pub async fn pypi_simple_index(
                 download_url,
                 requires_python,
                 yanked,
+                // This entry names a file the version does not actually hold,
+                // so there is nothing whose provenance could be advertised.
+                provenance_url: None,
             }]
         })
         .collect();

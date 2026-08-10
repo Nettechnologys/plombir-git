@@ -23,8 +23,9 @@ pub use adapters::nuget::{
     NuGetRegistrationEntry, NuGetSearchResult, NuGetSearchVersion,
 };
 pub use adapters::pypi::{
-    build_simple_repository_html, build_simple_root_html, normalize_project_name, PyPIProjectEntry,
-    PyPIVersionEntry,
+    build_pypi_provenance, build_simple_repository_html, build_simple_root_html,
+    normalize_project_name, pypi_provenance_filename, pypi_upload_token_publisher,
+    PyPIProjectEntry, PyPIVersionEntry,
 };
 pub use adapters::rubygems::{
     build_compact_index_info, build_compact_index_names, build_compact_index_versions,

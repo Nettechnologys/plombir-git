@@ -84,6 +84,11 @@ impl PackageAdapter for PyPIAdapter {
             "application/zip".into()
         } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
             "application/gzip".into()
+        } else if lower.ends_with(PYPI_PROVENANCE_SUFFIX) {
+            // PEP 740 defines the provenance file as a JSON document, and the
+            // link the Simple page advertises is followed by tooling that
+            // parses it rather than by a browser that downloads it.
+            "application/json".into()
         } else {
             self.default_content_type().into()
         }
@@ -381,12 +386,24 @@ pub fn build_simple_repository_html(package_name: &str, versions: &[PyPIVersionE
             ""
         };
 
+        // PEP 740: the attribute is how a client finds the provenance document
+        // for this exact file. It is emitted only when the registry actually
+        // holds that document and serves it at this URL — an attribute pointing
+        // at a 404 is worse than none, because the tool that follows it reports
+        // a broken index rather than an unattested file.
+        let provenance = entry
+            .provenance_url
+            .as_ref()
+            .map(|url| format!(" data-provenance=\"{}\"", escape_html(url)))
+            .unwrap_or_default();
+
         html.push_str(&format!(
-            "  <a href=\"{}{}\"{}{}>{}</a><br/>\n",
+            "  <a href=\"{}{}\"{}{}{}>{}</a><br/>\n",
             escape_html(&entry.download_url),
             escape_html(&sha_frag),
             requires_python,
             yanked,
+            provenance,
             escape_html(&entry.filename),
         ));
     }
@@ -430,6 +447,239 @@ pub struct PyPIVersionEntry {
     pub requires_python: Option<String>,
     /// Whether the version was yanked (PEP 592).
     pub yanked: bool,
+    /// Absolute URL of this file's PEP 740 provenance document, when the
+    /// registry stores one. `None` means no attestation was ever published for
+    /// this file — never "we have one but did not look it up".
+    pub provenance_url: Option<String>,
+}
+
+// ── PEP 740 attestations ──────────────────────────────────
+
+/// The suffix of the package file that stores a distribution's provenance.
+///
+/// PEP 740 does not name the file — the index is free to serve the provenance
+/// document wherever it likes as long as the Simple API points at it. Storing
+/// it as a package file named after the distribution buys two things: the
+/// distribution and its evidence are written in one publish transaction, so
+/// neither can exist without the other, and the URL the Simple page advertises
+/// is the download route that already serves every other package file.
+pub const PYPI_PROVENANCE_SUFFIX: &str = ".provenance";
+
+/// The stored name of the provenance document belonging to `distribution`.
+pub fn pypi_provenance_filename(distribution: &str) -> String {
+    format!("{distribution}{PYPI_PROVENANCE_SUFFIX}")
+}
+
+/// The predicate types PEP 740 admits inside an attestation's statement.
+const PEP_740_PREDICATE_TYPES: [&str; 2] = [
+    "https://slsa.dev/provenance/v1",
+    "https://docs.pypi.org/attestations/publish/v1",
+];
+
+/// How many attestations one distribution may carry.
+///
+/// PEP 740 sets no number, but the field is unauthenticated publisher input
+/// that is stored verbatim, and one attestation per admissible predicate type
+/// is all a consumer can act on. The bound is generous enough that it can only
+/// be hit deliberately.
+const PEP_740_MAX_ATTESTATIONS: usize = 8;
+
+/// The publisher identity ForgeKeep can honestly state for a Twine upload.
+///
+/// PEP 740's provenance object describes *who* published, and on PyPI that is a
+/// Trusted Publisher: an OIDC workload identity whose claims the index verified
+/// itself. A ForgeKeep upload is authenticated by a repository write token,
+/// which proves the caller may write here and nothing about the build that
+/// produced the artifact. Emitting a `GitHub`-shaped publisher with invented
+/// claims would turn that token into a verified workload identity on paper, so
+/// the bundle names the registry as the publisher, carries no claims, and says
+/// `trusted_publisher: false` outright. When ForgeKeep grows Trusted Publisher
+/// support this is the one place that changes.
+pub fn pypi_upload_token_publisher(owner: &str, repo: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "ForgeKeep",
+        "claims": {},
+        "repository": format!("{owner}/{repo}"),
+        "trusted_publisher": false,
+    })
+}
+
+fn decode_base64_field(value: &str, field: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|error| format!("PEP 740 attestation `{field}` is not valid base64: {error}"))
+}
+
+fn non_empty_string<'a>(
+    parent: &'a serde_json::Value,
+    key: &str,
+    field: &str,
+) -> Result<&'a str, String> {
+    parent
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("PEP 740 attestation is missing `{field}`"))
+}
+
+/// Check one PEP 740 attestation against the distribution it was uploaded with.
+///
+/// Signature and certificate-chain verification is Sigstore's job and needs a
+/// trust root ForgeKeep does not carry — the same boundary the npm provenance
+/// path draws. What the registry *can* decide, and what nobody else can decide
+/// for it, is whether this signed statement is about *this* upload: an
+/// attestation whose subject names another file or hashes other bytes is
+/// evidence for something else and must not be filed here.
+///
+/// Returns the statement's `predicateType` so the caller can reject duplicates.
+fn inspect_pep_740_attestation(
+    attestation: &serde_json::Value,
+    filename: &str,
+    sha256_hex: &str,
+) -> Result<String, String> {
+    if !attestation.is_object() {
+        return Err("PEP 740 attestation must be a JSON object".into());
+    }
+    if attestation
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err("PEP 740 attestation `version` must be 1".into());
+    }
+
+    let material = attestation
+        .get("verification_material")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "PEP 740 attestation is missing `verification_material`".to_string())?;
+    let certificate =
+        non_empty_string(material, "certificate", "verification_material.certificate")?;
+    decode_base64_field(certificate, "verification_material.certificate")?;
+    // An attestation with no transparency log entry cannot be verified by
+    // anyone downstream either, so accepting it would mean storing material
+    // that only ever looks like evidence.
+    let has_transparency_entry = material
+        .get("transparency_entries")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| !entries.is_empty());
+    if !has_transparency_entry {
+        return Err(
+            "PEP 740 attestation `verification_material.transparency_entries` must not be empty"
+                .into(),
+        );
+    }
+
+    let envelope = attestation
+        .get("envelope")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "PEP 740 attestation is missing `envelope`".to_string())?;
+    let signature = non_empty_string(envelope, "signature", "envelope.signature")?;
+    decode_base64_field(signature, "envelope.signature")?;
+    let encoded_statement = non_empty_string(envelope, "statement", "envelope.statement")?;
+    let statement_bytes = decode_base64_field(encoded_statement, "envelope.statement")?;
+    let statement: serde_json::Value = serde_json::from_slice(&statement_bytes)
+        .map_err(|error| format!("PEP 740 attestation statement is not valid JSON: {error}"))?;
+
+    if statement.get("_type").and_then(serde_json::Value::as_str)
+        != Some("https://in-toto.io/Statement/v1")
+    {
+        return Err("PEP 740 attestation statement is not an in-toto Statement v1".into());
+    }
+    let predicate_type = statement
+        .get("predicateType")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "PEP 740 attestation statement has no `predicateType`".to_string())?;
+    if !PEP_740_PREDICATE_TYPES.contains(&predicate_type) {
+        return Err(format!(
+            "PEP 740 attestation has unsupported predicateType '{predicate_type}'"
+        ));
+    }
+
+    let subjects = statement
+        .get("subject")
+        .and_then(serde_json::Value::as_array)
+        .filter(|subjects| subjects.len() == 1)
+        .ok_or_else(|| {
+            "PEP 740 attestation statement must contain exactly one subject".to_string()
+        })?;
+    let subject_name = subjects[0]
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "PEP 740 attestation subject has no name".to_string())?;
+    if subject_name != filename {
+        return Err(format!(
+            "PEP 740 attestation subject names '{subject_name}', uploaded file is '{filename}'"
+        ));
+    }
+    let subject_digest = subjects[0]
+        .pointer("/digest/sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "PEP 740 attestation subject has no valid SHA-256 digest".to_string())?;
+    if !subject_digest.eq_ignore_ascii_case(sha256_hex) {
+        return Err(
+            "PEP 740 attestation subject SHA-256 does not match the uploaded distribution".into(),
+        );
+    }
+
+    Ok(predicate_type.to_string())
+}
+
+/// Validate the `attestations` field of a Twine upload and build the provenance
+/// document to store beside the distribution.
+///
+/// PEP 740 is explicit that a failure here is a failure of the *upload*: "if
+/// the index fails to verify any attestation in `attestations`, it MUST reject
+/// the upload". So this returns an error the caller answers with before a byte
+/// of the distribution is written, rather than a partial bundle.
+pub fn build_pypi_provenance(
+    raw_attestations: &str,
+    filename: &str,
+    sha256_hex: &str,
+    publisher: serde_json::Value,
+) -> Result<Vec<u8>, String> {
+    let attestations: Vec<serde_json::Value> = serde_json::from_str(raw_attestations)
+        .map_err(|error| format!("Twine `attestations` is not a valid JSON array: {error}"))?;
+
+    // Twine sends the field only when the publisher asked for attestations, so
+    // an empty array is a client that meant to attach evidence and attached
+    // none. Answering 200 to it is exactly the silent loss this endpoint is
+    // supposed to have stopped doing.
+    if attestations.is_empty() {
+        return Err("Twine `attestations` must not be an empty array".into());
+    }
+    if attestations.len() > PEP_740_MAX_ATTESTATIONS {
+        return Err(format!(
+            "Twine `attestations` carries {} attestations, at most {PEP_740_MAX_ATTESTATIONS} are accepted",
+            attestations.len()
+        ));
+    }
+
+    let mut predicate_types = Vec::with_capacity(attestations.len());
+    for attestation in &attestations {
+        let predicate_type = inspect_pep_740_attestation(attestation, filename, sha256_hex)?;
+        // Two attestations of the same predicate type make the pair that
+        // describes this file ambiguous, and a consumer picking either one is
+        // picking arbitrarily. PyPI refuses the same shape.
+        if predicate_types.contains(&predicate_type) {
+            return Err(format!(
+                "Twine `attestations` repeats predicateType '{predicate_type}'"
+            ));
+        }
+        predicate_types.push(predicate_type);
+    }
+
+    let provenance = serde_json::json!({
+        "version": 1,
+        "attestation_bundles": [{
+            "publisher": publisher,
+            "attestations": attestations,
+        }],
+    });
+    serde_json::to_vec(&provenance)
+        .map_err(|error| format!("cannot serialize the PEP 740 provenance document: {error}"))
 }
 
 /// One project row of the Simple Repository API root index.
@@ -475,6 +725,7 @@ mod simple_repository_tests {
                 // The resolver attributes are publisher-controlled text too.
                 requires_python: Some(">=3.10,\"><script>alert(2)</script>".into()),
                 yanked: false,
+                provenance_url: Some("https://example.test/p\"><script>alert(3)</script>".into()),
             }],
         );
 
@@ -495,6 +746,7 @@ mod simple_repository_tests {
             download_url: format!("https://example.test/matrix-{version}.whl"),
             requires_python: requires_python.map(String::from),
             yanked,
+            provenance_url: None,
         };
 
         let html = build_simple_repository_html(
@@ -521,6 +773,41 @@ mod simple_repository_tests {
         assert_eq!(html.matches("data-requires-python").count(), 2, "{html}");
     }
 
+    /// PEP 740's `data-provenance` is the only way a client finds the evidence
+    /// file, and it must appear on exactly the files whose evidence is stored.
+    #[test]
+    fn the_project_page_advertises_provenance_only_for_the_files_that_have_it() {
+        let entry = |version: &str, provenance_url: Option<&str>| PyPIVersionEntry {
+            version: version.into(),
+            filename: format!("matrix-{version}-py3-none-any.whl"),
+            sha256: Some("abc".into()),
+            download_url: format!("https://example.test/matrix-{version}.whl"),
+            requires_python: None,
+            yanked: false,
+            provenance_url: provenance_url.map(String::from),
+        };
+
+        let html = build_simple_repository_html(
+            "matrix",
+            &[
+                entry(
+                    "1.0.0",
+                    Some("https://example.test/matrix-1.0.0.whl.provenance"),
+                ),
+                entry("1.1.0", None),
+            ],
+        );
+
+        assert!(
+            html.contains(
+                "data-provenance=\"https://example.test/matrix-1.0.0.whl.provenance\">\
+                 matrix-1.0.0-py3-none-any.whl</a>"
+            ),
+            "{html}"
+        );
+        assert_eq!(html.matches("data-provenance").count(), 1, "{html}");
+    }
+
     #[test]
     fn the_root_index_links_every_project_with_its_trailing_slash() {
         let html = build_simple_root_html(&[PyPIProjectEntry {
@@ -531,6 +818,190 @@ mod simple_repository_tests {
         assert!(
             html.contains("<a href=\"https://example.test/simple/matrix-pypi/\">Matrix_PyPI</a>"),
             "{html}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pep_740_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    const FILENAME: &str = "matrix_twine-1.2.3-py3-none-any.whl";
+    const DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn statement(name: &str, sha256: &str, predicate_type: &str) -> String {
+        b64(&serde_json::to_vec(&serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{ "name": name, "digest": { "sha256": sha256 } }],
+            "predicateType": predicate_type,
+            "predicate": {},
+        }))
+        .unwrap())
+    }
+
+    fn attestation(name: &str, sha256: &str, predicate_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "verification_material": {
+                "certificate": b64(b"a DER certificate"),
+                "transparency_entries": [{ "logIndex": "1" }],
+            },
+            "envelope": {
+                "statement": statement(name, sha256, predicate_type),
+                "signature": b64(b"a DSSE signature"),
+            },
+        })
+    }
+
+    fn valid() -> serde_json::Value {
+        attestation(
+            FILENAME,
+            DIGEST,
+            "https://docs.pypi.org/attestations/publish/v1",
+        )
+    }
+
+    fn build(attestations: serde_json::Value) -> Result<serde_json::Value, String> {
+        let raw = serde_json::to_string(&attestations).unwrap();
+        build_pypi_provenance(
+            &raw,
+            FILENAME,
+            DIGEST,
+            pypi_upload_token_publisher("owner", "repo"),
+        )
+        .map(|document| serde_json::from_slice(&document).unwrap())
+    }
+
+    #[test]
+    fn a_matching_attestation_becomes_a_provenance_document() {
+        let provenance = build(serde_json::json!([valid()])).unwrap();
+
+        assert_eq!(provenance["version"], 1);
+        let bundle = &provenance["attestation_bundles"][0];
+        assert_eq!(bundle["attestations"].as_array().unwrap().len(), 1);
+        assert_eq!(bundle["attestations"][0], valid());
+        // The upload was authenticated by a write token, not by a verified
+        // workload identity, and the document has to say so.
+        assert_eq!(bundle["publisher"]["kind"], "ForgeKeep");
+        assert_eq!(bundle["publisher"]["trusted_publisher"], false);
+        assert_eq!(bundle["publisher"]["claims"], serde_json::json!({}));
+    }
+
+    /// The one check nobody downstream can make for the registry: this signed
+    /// statement is about *this* upload.
+    #[test]
+    fn an_attestation_for_another_artifact_is_refused() {
+        let foreign_name = build(serde_json::json!([attestation(
+            "matrix_twine-9.9.9-py3-none-any.whl",
+            DIGEST,
+            "https://slsa.dev/provenance/v1"
+        )]))
+        .unwrap_err();
+        assert!(foreign_name.contains("subject names"), "{foreign_name}");
+
+        let foreign_digest = build(serde_json::json!([attestation(
+            FILENAME,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "https://slsa.dev/provenance/v1"
+        )]))
+        .unwrap_err();
+        assert!(
+            foreign_digest.contains("SHA-256 does not match"),
+            "{foreign_digest}"
+        );
+    }
+
+    #[test]
+    fn one_bad_attestation_rejects_the_whole_upload() {
+        let mut broken = valid();
+        broken["envelope"]["statement"] = serde_json::json!(b64(b"not json"));
+
+        let error = build(serde_json::json!([valid(), broken])).unwrap_err();
+        assert!(error.contains("not valid JSON"), "{error}");
+    }
+
+    #[test]
+    fn structurally_unverifiable_material_is_refused() {
+        for (mutate, expected) in [
+            (
+                Box::new(|a: &mut serde_json::Value| a["version"] = serde_json::json!(2))
+                    as Box<dyn Fn(&mut serde_json::Value)>,
+                "`version` must be 1",
+            ),
+            (
+                Box::new(|a: &mut serde_json::Value| {
+                    a["verification_material"]["transparency_entries"] = serde_json::json!([])
+                }),
+                "transparency_entries` must not be empty",
+            ),
+            (
+                Box::new(|a: &mut serde_json::Value| {
+                    a["verification_material"]["certificate"] = serde_json::json!("not base64!!")
+                }),
+                "not valid base64",
+            ),
+            (
+                Box::new(|a: &mut serde_json::Value| {
+                    a["envelope"]["signature"] = serde_json::json!("")
+                }),
+                "missing `envelope.signature`",
+            ),
+            (
+                Box::new(|a: &mut serde_json::Value| {
+                    a["envelope"]["statement"] = serde_json::json!(statement(
+                        FILENAME,
+                        DIGEST,
+                        "https://example.test/made-up/v1"
+                    ))
+                }),
+                "unsupported predicateType",
+            ),
+        ] {
+            let mut broken = valid();
+            mutate(&mut broken);
+            let error = build(serde_json::json!([broken])).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_repeating_attestations_field_is_refused() {
+        let empty = build(serde_json::json!([])).unwrap_err();
+        assert!(empty.contains("must not be an empty array"), "{empty}");
+
+        let repeated = build(serde_json::json!([valid(), valid()])).unwrap_err();
+        assert!(repeated.contains("repeats predicateType"), "{repeated}");
+
+        let not_an_array = build_pypi_provenance(
+            "{}",
+            FILENAME,
+            DIGEST,
+            pypi_upload_token_publisher("owner", "repo"),
+        )
+        .unwrap_err();
+        assert!(
+            not_an_array.contains("not a valid JSON array"),
+            "{not_an_array}"
+        );
+    }
+
+    #[test]
+    fn the_provenance_file_is_named_and_typed_after_its_distribution() {
+        assert_eq!(
+            pypi_provenance_filename(FILENAME),
+            "matrix_twine-1.2.3-py3-none-any.whl.provenance"
+        );
+        assert_eq!(
+            PyPIAdapter.content_type_for_file(&pypi_provenance_filename(FILENAME)),
+            "application/json"
         );
     }
 }

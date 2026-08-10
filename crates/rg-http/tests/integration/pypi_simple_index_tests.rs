@@ -379,3 +379,228 @@ async fn a_failed_project_scan_is_not_reported_as_an_absent_project() {
         "the response body must not carry internal error detail, got: {message}"
     );
 }
+
+// ── PEP 740 attestations (card_b25bd1cbc60c) ──────────────
+
+/// One PEP 740 attestation describing `filename` / `sha256`.
+fn attestation(filename: &str, sha256: &str, predicate_type: &str) -> serde_json::Value {
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let statement = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{ "name": filename, "digest": { "sha256": sha256 } }],
+        "predicateType": predicate_type,
+        "predicate": {},
+    });
+    serde_json::json!({
+        "version": 1,
+        "verification_material": {
+            "certificate": b64(b"a DER certificate"),
+            "transparency_entries": [{ "logIndex": "1" }],
+        },
+        "envelope": {
+            "statement": b64(&serde_json::to_vec(&statement).unwrap()),
+            "signature": b64(b"a DSSE signature"),
+        },
+    })
+}
+
+struct AttestedUpload {
+    base: String,
+    owner: String,
+    token: String,
+    client: reqwest::Client,
+    /// Held for the lifetime of the test: the temporary database lives as long
+    /// as this handle.
+    _db: rg_db::DatabaseConnection,
+    filename: String,
+    body: Vec<u8>,
+    digest: String,
+}
+
+impl AttestedUpload {
+    async fn new(owner: &str) -> Self {
+        let (base, db) = spawn_test_app_with_db().await;
+        let (token, _) = register_full(&base, owner, &format!("{owner}@example.com")).await;
+        create_repo(&base, &token, "attest-repo").await;
+        let body = wheel(
+            "matrix_attest-1.0.0.dist-info",
+            "Metadata-Version: 2.1\nName: matrix-attest\nVersion: 1.0.0\n",
+        );
+        let digest = hex::encode(Sha256::digest(&body));
+        Self {
+            base,
+            owner: owner.to_string(),
+            token,
+            client: reqwest::Client::new(),
+            _db: db,
+            filename: "matrix_attest-1.0.0-py3-none-any.whl".to_string(),
+            body,
+            digest,
+        }
+    }
+
+    fn url(&self, tail: &str) -> String {
+        format!(
+            "{}/api/v1/repos/{}/attest-repo/packages/pypi{tail}",
+            self.base, self.owner
+        )
+    }
+
+    async fn get(&self, url: &str) -> (StatusCode, String) {
+        let response = self.client.get(url).send().await.unwrap();
+        let status = response.status();
+        (status, response.text().await.unwrap())
+    }
+
+    async fn upload(&self, attestations: Option<serde_json::Value>) -> (StatusCode, String) {
+        let mut form = twine_form(
+            "matrix-attest",
+            "1.0.0",
+            &self.filename,
+            self.body.clone(),
+            self.digest.clone(),
+        );
+        if let Some(attestations) = attestations {
+            form = form.text("attestations", attestations.to_string());
+        }
+        let response = self
+            .client
+            .post(self.url("/legacy/"))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response.text().await.unwrap())
+    }
+}
+
+/// Acceptance for card_b25bd1cbc60c: `twine upload --attestations` used to be
+/// answered 200 with the attestations dropped on the floor. The evidence must
+/// survive the upload, be reachable, and be advertised where a client looks.
+#[tokio::test]
+async fn twine_attestations_survive_the_upload_and_are_served() {
+    let fx = AttestedUpload::new("attest-owner").await;
+    let attestation = attestation(
+        &fx.filename,
+        &fx.digest,
+        "https://docs.pypi.org/attestations/publish/v1",
+    );
+
+    let (status, body) = fx
+        .upload(Some(serde_json::json!([attestation.clone()])))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The Simple page is the only place a client learns the provenance exists.
+    let (status, index) = fx.get(&fx.url("/simple/matrix-attest/")).await;
+    assert_eq!(status, StatusCode::OK, "{index}");
+    let provenance_url = index
+        .split_once("data-provenance=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(url, _)| url.to_string())
+        .unwrap_or_else(|| panic!("the project page advertises no provenance: {index}"));
+    assert!(
+        provenance_url.ends_with(&format!("{}.provenance", fx.filename)),
+        "{provenance_url}"
+    );
+    // The provenance file is evidence, not a distribution: pip must never be
+    // offered it as something to install.
+    assert_eq!(
+        index.matches("<a href=").count(),
+        1,
+        "only the wheel is an installable link: {index}"
+    );
+    // Storing a second file under the version must not cost the wheel its own
+    // digest — the version-level fallback only applies to a lone file, so the
+    // per-file digest is what has to carry this link now.
+    assert!(
+        index.contains(&format!("#sha256={}\"", fx.digest)),
+        "the wheel keeps its own checksum next to the link: {index}"
+    );
+
+    // And the advertised URL has to be one this server answers, with the
+    // attestation the publisher sent still inside it.
+    let (status, served) = fx.get(&provenance_url).await;
+    assert_eq!(status, StatusCode::OK, "{served}");
+    let provenance: serde_json::Value = serde_json::from_str(&served).expect("provenance is JSON");
+    assert_eq!(provenance["version"], 1);
+    let bundle = &provenance["attestation_bundles"][0];
+    assert_eq!(bundle["attestations"][0], attestation);
+    // A repository write token is not a Trusted Publisher, and the document
+    // must not pass one off as the other.
+    assert_eq!(bundle["publisher"]["trusted_publisher"], false);
+    assert_eq!(
+        bundle["publisher"]["repository"],
+        "attest-owner/attest-repo"
+    );
+}
+
+/// An attestation that does not describe this upload is evidence for something
+/// else. Refusing it after the wheel is stored would leave a distribution whose
+/// publisher believes it is attested, so the refusal must come first.
+#[tokio::test]
+async fn a_foreign_attestation_publishes_nothing_at_all() {
+    let fx = AttestedUpload::new("foreign-owner").await;
+
+    let (status, body) = fx
+        .upload(Some(serde_json::json!([attestation(
+            "matrix_attest-9.9.9-py3-none-any.whl",
+            &fx.digest,
+            "https://slsa.dev/provenance/v1"
+        )])))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("subject names"), "{body}");
+
+    let (status, index) = fx.get(&fx.url("/simple/")).await;
+    assert_eq!(status, StatusCode::OK, "{index}");
+    assert!(
+        !index.contains("matrix-attest"),
+        "the refused upload must leave no package behind: {index}"
+    );
+}
+
+/// The silent-loss shape this card is about: the field arrives, the server has
+/// no way to honour it, and the publisher is told everything went fine.
+#[tokio::test]
+async fn a_corrupt_attestations_field_is_refused_rather_than_ignored() {
+    let fx = AttestedUpload::new("corrupt-owner").await;
+
+    let (status, body) = fx.upload(Some(serde_json::json!([{ "version": 1 }]))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unusable attestation must not answer 200: {body}"
+    );
+
+    let (status, index) = fx.get(&fx.url("/simple/")).await;
+    assert_eq!(status, StatusCode::OK, "{index}");
+    assert!(!index.contains("matrix-attest"), "{index}");
+}
+
+/// The mirror of the case above: an upload that carries no attestations is
+/// still a perfectly good upload, and its page must not advertise provenance
+/// the registry does not hold.
+#[tokio::test]
+async fn an_unattested_upload_advertises_no_provenance() {
+    let fx = AttestedUpload::new("plain-owner").await;
+
+    let (status, body) = fx.upload(None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, index) = fx.get(&fx.url("/simple/matrix-attest/")).await;
+    assert_eq!(status, StatusCode::OK, "{index}");
+    assert!(!index.contains("data-provenance"), "{index}");
+
+    let (status, missing) = fx
+        .get(&fx.url(&format!("/matrix-attest/1.0.0/{}.provenance", fx.filename)))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nothing is stored, so nothing is served: {missing}"
+    );
+}
