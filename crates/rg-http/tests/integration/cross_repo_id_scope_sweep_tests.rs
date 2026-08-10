@@ -194,6 +194,10 @@ const PER_REPO_PLACEHOLDERS: &[(&str, &str)] = &[
     ("pkg", "a package name, unique within its registry"),
     ("pkg_name", "a package name, unique within its registry"),
     ("gem_name", "a package name, unique within its registry"),
+    (
+        "package_spec",
+        "an npm `<name>@<version>` spec, resolved inside the repository's own registry",
+    ),
     ("tag", "an npm dist-tag name, scoped to one package"),
     (
         "filename",
