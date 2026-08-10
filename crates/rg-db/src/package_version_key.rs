@@ -12,11 +12,31 @@ use std::cmp::Ordering;
 /// NuGet accepts one through four numeric components (missing components are
 /// zero), compares the fourth `Revision`, treats prerelease text
 /// case-insensitively and excludes build metadata from version identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Build metadata is kept on the parsed value even though it is *not* part of
+/// that identity: NuGet drops it from every address it derives from a version
+/// (flat-container token, registration leaf URL) but keeps it in the version's
+/// full spelling, which is what `catalogEntry.version` publishes. Equality and
+/// ordering therefore ignore the field — see [`NuGetVersion::full`] for the one
+/// renderer that reads it.
+#[derive(Clone, Debug)]
 pub struct NuGetVersion {
     numbers: [u32; 4],
     release: Option<Vec<NuGetReleaseLabel>>,
+    metadata: Option<String>,
 }
+
+/// Two spellings are the same version when their numbers and prerelease labels
+/// agree; build metadata is excluded from NuGet version identity, so it is
+/// excluded here rather than left to a derive that would silently disagree with
+/// [`Ord`].
+impl PartialEq for NuGetVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for NuGetVersion {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum NuGetReleaseLabel {
@@ -88,7 +108,11 @@ impl NuGetVersion {
             None => None,
         };
 
-        Some(Self { numbers, release })
+        Some(Self {
+            numbers,
+            release,
+            metadata: metadata.map(str::to_string),
+        })
     }
 
     pub fn is_prerelease(&self) -> bool {
@@ -139,6 +163,23 @@ impl NuGetVersion {
             );
         }
         normalized
+    }
+
+    /// The full normalized spelling: [`NuGetVersion::normalized`] plus the build
+    /// metadata the version was published with.
+    ///
+    /// This is what a version's *metadata* says it is, as opposed to what it is
+    /// addressed by. NuGet excludes build metadata from version identity, so a
+    /// URL derived from a version must not carry it — two spellings that differ
+    /// only in metadata are one package version and must resolve to one
+    /// address. `catalogEntry.version` is the opposite case: it is the document
+    /// stating the version's full SemVer 2 spelling, and dropping the metadata
+    /// there tells a client the package was published as something it was not.
+    pub fn full(&self) -> String {
+        match &self.metadata {
+            Some(metadata) => format!("{}+{}", self.normalized(), metadata),
+            None => self.normalized(),
+        }
     }
 }
 
@@ -202,6 +243,22 @@ mod tests {
         let parsed = spellings.map(|value| NuGetVersion::parse(value).unwrap());
         assert!(parsed.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(parsed[0].normalized(), "1.0.0-rc");
+    }
+
+    /// The address form drops build metadata because identity does; the full
+    /// form keeps it, because that is what the package was published as.
+    #[test]
+    fn full_spelling_keeps_the_build_metadata_identity_excludes() {
+        let with_metadata = NuGetVersion::parse("01.2-RC.2+Build.7").unwrap();
+        assert_eq!(with_metadata.normalized(), "1.2.0-rc.2");
+        assert_eq!(with_metadata.full(), "1.2.0-rc.2+Build.7");
+
+        // Metadata is not a version component: it neither creates a second
+        // version nor orders one spelling above the other.
+        let without_metadata = NuGetVersion::parse("1.2.0-rc.2").unwrap();
+        assert_eq!(with_metadata, without_metadata);
+        assert_eq!(with_metadata.cmp(&without_metadata), Ordering::Equal);
+        assert_eq!(without_metadata.full(), without_metadata.normalized());
     }
 
     #[test]

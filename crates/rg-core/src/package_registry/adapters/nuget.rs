@@ -626,6 +626,23 @@ fn registration_bounds(entries: &[NuGetRegistrationEntry]) -> (String, String) {
     )
 }
 
+/// The version spelling a protocol document *states* — as opposed to the token
+/// [`registration_leaf_id`] addresses it by.
+///
+/// Both are normalized, and they differ in exactly one place: build metadata.
+/// It is excluded from NuGet version identity, so an address must drop it (two
+/// spellings that differ only in metadata are one version and one leaf), while
+/// a document that reports the version has to keep it — a client reading
+/// `1.5.0-rc.2` for a package published as `1.5.0-rc.2+build.7` is being told
+/// the wrong full version. A spelling the parser cannot read is a pre-protocol
+/// row: it is reported as stored rather than lowercased, because unlike a URL
+/// token it is not addressing anything.
+fn stated_version(version: &str) -> String {
+    NuGetVersion::parse(version)
+        .map(|parsed| parsed.full())
+        .unwrap_or_else(|| version.trim().to_string())
+}
+
 /// The `catalogEntry` of one registration leaf — the document `dotnet restore`
 /// reads a version's identity, dependency graph and availability out of.
 fn build_catalog_entry(
@@ -636,7 +653,7 @@ fn build_catalog_entry(
     let mut out = serde_json::Map::new();
     out.insert("@id".into(), catalog_id.into());
     out.insert("id".into(), name.into());
-    out.insert("version".into(), entry.version.clone().into());
+    out.insert("version".into(), stated_version(&entry.version).into());
     // Stated rather than left to the client's default, because the default is
     // `true` and a yanked version would inherit it.
     out.insert("listed".into(), entry.listed.into());
@@ -710,7 +727,7 @@ pub fn build_search_results(results: &[NuGetSearchResult], total_hits: usize) ->
             item.insert("@id".into(), r.registration_url.clone().into());
             item.insert("@type".into(), "Package".into());
             item.insert("id".into(), r.name.clone().into());
-            item.insert("version".into(), r.version.clone().into());
+            item.insert("version".into(), stated_version(&r.version).into());
             if let Some(ref d) = r.description {
                 item.insert("description".into(), d.clone().into());
             }
@@ -725,7 +742,7 @@ pub fn build_search_results(results: &[NuGetSearchResult], total_hits: usize) ->
                     .map(|version| {
                         serde_json::json!({
                             "@id": registration_leaf_id(&r.registration_url, &version.version),
-                            "version": version.version,
+                            "version": stated_version(&version.version),
                             "downloads": version.downloads,
                         })
                     })
@@ -1549,6 +1566,69 @@ mod tests {
         );
     }
 
+    /// `catalogEntry.version` is the version's full normalized spelling, not the
+    /// spelling the row happens to be stored under — and not the leaf's address
+    /// either, which drops the build metadata NuGet excludes from identity.
+    #[test]
+    fn catalog_entry_states_the_full_normalized_version() {
+        let entry = |version: &str| NuGetRegistrationEntry {
+            version: version.into(),
+            description: None,
+            homepage: None,
+            license: None,
+            tags: None,
+            download_url: format!("https://git.example.com/dl/{version}"),
+            dependency_groups: Vec::new(),
+            listed: true,
+        };
+        let entries = [
+            entry("1.2"),
+            entry("2.0.0.1+Build.7"),
+            entry("1.5.0-RC.2+metadata"),
+            entry("legacy-row"),
+        ];
+        let registration_url = "https://git.example.com/registration/mylib/index.json";
+        let index = build_registration_index("MyLib", registration_url, &entries);
+        let leaves = index["items"][0]["items"].as_array().unwrap();
+
+        let stated = |leaf: &serde_json::Value| leaf["catalogEntry"]["version"].clone();
+        assert_eq!(stated(&leaves[0]), "1.2.0", "a short spelling is completed");
+        assert_eq!(
+            stated(&leaves[1]),
+            "2.0.0.1+Build.7",
+            "a non-zero revision and the published metadata both survive"
+        );
+        assert_eq!(
+            stated(&leaves[2]),
+            "1.5.0-rc.2+metadata",
+            "prerelease labels normalize, metadata is not a prerelease label"
+        );
+        assert_eq!(
+            stated(&leaves[3]),
+            "legacy-row",
+            "a pre-protocol spelling is stated as stored"
+        );
+
+        // The address must not carry what identity excludes, or two spellings of
+        // one version would advertise two leaves.
+        assert_eq!(
+            leaves[1]["@id"],
+            "https://git.example.com/registration/mylib/2.0.0.1"
+        );
+        assert_eq!(
+            leaves[2]["@id"],
+            "https://git.example.com/registration/mylib/1.5.0-rc.2"
+        );
+
+        // The standalone leaf serves the same catalog entry the page inlined.
+        let standalone = build_registration_leaf("MyLib", registration_url, &entries[2]);
+        assert_eq!(standalone["@id"], leaves[2]["@id"]);
+        assert_eq!(
+            standalone["catalogEntry"], leaves[2]["catalogEntry"]["@id"],
+            "the leaf points at the entry stating the full version"
+        );
+    }
+
     #[test]
     fn nuspec_dependency_groups_reads_both_layouts_and_neither() {
         let grouped = r#"<package><metadata>
@@ -1693,6 +1773,48 @@ mod tests {
                     "@id": "https://example.com/registration/newtonsoft.json/13.0.3",
                     "version": "13.0.3",
                     "downloads": 7,
+                },
+            ])
+        );
+    }
+
+    /// Search states the same full normalized version a catalog entry does —
+    /// a result whose `version` disagreed with the leaf it advertises would send
+    /// the client looking for a version nothing publishes.
+    #[test]
+    fn search_states_normalized_versions_next_to_the_leaf_they_address() {
+        let results = vec![NuGetSearchResult {
+            name: "Matrix.Search".into(),
+            version: "1.5.0-RC.2+metadata".into(),
+            versions: vec![
+                NuGetSearchVersion {
+                    version: "1.2".into(),
+                    downloads: 1,
+                },
+                NuGetSearchVersion {
+                    version: "1.5.0-RC.2+metadata".into(),
+                    downloads: 2,
+                },
+            ],
+            description: None,
+            tags: None,
+            registration_url: "https://example.com/registration/matrix.search/index.json".into(),
+        }];
+
+        let json = build_search_results(&results, 1);
+        assert_eq!(json["data"][0]["version"], "1.5.0-rc.2+metadata");
+        assert_eq!(
+            json["data"][0]["versions"],
+            serde_json::json!([
+                {
+                    "@id": "https://example.com/registration/matrix.search/1.2.0",
+                    "version": "1.2.0",
+                    "downloads": 1,
+                },
+                {
+                    "@id": "https://example.com/registration/matrix.search/1.5.0-rc.2",
+                    "version": "1.5.0-rc.2+metadata",
+                    "downloads": 2,
                 },
             ])
         );

@@ -3809,6 +3809,30 @@ async fn nuget_normalized_versions_round_trip_from_indexes_to_package_content() 
     let leaves = page["items"]
         .as_array()
         .unwrap_or_else(|| panic!("registration page must inline its leaves: {page}"));
+
+    // A catalog entry states the version's *full* normalized spelling: the
+    // build metadata its address has to drop — identity excludes it, so two
+    // spellings differing only there are one leaf — belongs in the document
+    // that reports what was published.
+    let stated: std::collections::HashSet<&str> = leaves
+        .iter()
+        .map(|leaf| {
+            leaf["catalogEntry"]["version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every catalog entry states a version: {leaf}"))
+        })
+        .collect();
+    assert_eq!(
+        stated,
+        std::collections::HashSet::from([
+            "1.2.0",
+            "1.5.0-rc.2+metadata",
+            "2.0.0.1+Build.7",
+            "legacy-row",
+        ]),
+        "catalog entries must state normalized versions, not the stored spelling: {page}"
+    );
+
     let mut leaf_ids = std::collections::HashSet::new();
     for inline in leaves {
         let leaf_id = inline["@id"]
