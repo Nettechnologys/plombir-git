@@ -2776,6 +2776,104 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
         .contains("repeats the `package` field"));
 }
 
+/// Registration page bounds and flat-container paths use NuGetVersion
+/// semantics, not publication order or the spelling stored in the database.
+#[tokio::test]
+async fn nuget_normalized_versions_round_trip_from_indexes_to_package_content() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let versions = [
+        ("2.0.0.1+Build.7", Some("2.0.0.1")),
+        ("1.2", Some("1.2.0")),
+        ("1.5.0-RC.2+metadata", Some("1.5.0-rc.2")),
+        ("legacy-row", None),
+    ];
+    let mut downloadable = Vec::new();
+
+    for (stored, normalized) in versions {
+        let nuspec = format!(
+            "<?xml version=\"1.0\"?><package><metadata><id>Matrix.Bounds</id>\
+             <version>{stored}</version><description>NuGet bounds</description>\
+             </metadata></package>"
+        );
+        let nupkg = zip_archive(&[("Matrix.Bounds.nuspec", nuspec.as_bytes())]);
+        let published = client
+            .post(package_url(&base, &["nuget", "publish"]))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"Matrix.Bounds.{stored}.nupkg\""),
+            )
+            .body(nupkg.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(published.status(), StatusCode::CREATED, "version {stored}");
+        if let Some(normalized) = normalized {
+            downloadable.push((normalized, nupkg));
+        }
+    }
+
+    let registration: serde_json::Value = client
+        .get(package_url(
+            &base,
+            &["nuget", "registration", "matrix.bounds", "index.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let page = &registration["items"][0];
+    assert_eq!(page["lower"], "1.2.0", "page: {page}");
+    assert_eq!(page["upper"], "2.0.0.1", "page: {page}");
+    assert_eq!(page["count"], 4, "the unreadable legacy row stays visible");
+
+    let flat: serde_json::Value = client
+        .get(package_url(
+            &base,
+            &["nuget", "package", "matrix.bounds", "index.json"],
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        flat["versions"],
+        serde_json::json!(["1.2.0", "1.5.0-rc.2", "2.0.0.1"]),
+        "flat-container versions must be normalized and ordered by NuGetVersion: {flat}"
+    );
+
+    for (normalized, nupkg) in downloadable {
+        let downloaded = client
+            .get(package_url(
+                &base,
+                &[
+                    "nuget",
+                    "package",
+                    "matrix.bounds",
+                    normalized,
+                    &format!("matrix.bounds.{normalized}.nupkg"),
+                ],
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            downloaded.status(),
+            StatusCode::OK,
+            "normalized URL for stored version must resolve: {normalized}"
+        );
+        assert_eq!(downloaded.bytes().await.unwrap().as_ref(), nupkg.as_slice());
+    }
+}
+
 /// `mvn deploy` publishes by PUT-ing each file to the layout its resolver reads.
 ///
 /// The registry only had `POST .../packages/maven/publish`, a spelling no Maven

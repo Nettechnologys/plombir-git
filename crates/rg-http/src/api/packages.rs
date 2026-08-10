@@ -2686,13 +2686,7 @@ pub async fn nuget_flat_container_index(
         Err(error) => return package_error_response(error),
     };
 
-    // Oldest first. `list_versions` answers newest first, and every other
-    // registry publishes its version list ascending — a NuGet client parses the
-    // whole array and orders it itself, so this is presentation, but presenting
-    // it backwards from every neighbour invites a reader to assume the wrong
-    // one. Publish order is the only ordering this registry can establish
-    // without a semver parser, which the workspace does not carry.
-    let listed: Vec<String> = versions.into_iter().rev().map(|v| v.version).collect();
+    let listed: Vec<String> = versions.into_iter().map(|v| v.version).collect();
     let json = rg_core::package_registry::build_flat_container_index(&listed);
 
     (
@@ -2736,10 +2730,9 @@ pub async fn nuget_flat_container_download(
         Err(error) => return package_error_response(error),
     };
 
-    let wanted_version = version.to_lowercase();
     let Some(found) = versions
         .iter()
-        .find(|v| v.version.to_lowercase() == wanted_version)
+        .find(|v| rg_core::package_registry::nuget_versions_match(&v.version, &version))
     else {
         return err_text(
             StatusCode::NOT_FOUND,

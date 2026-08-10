@@ -417,10 +417,17 @@ pub fn normalize_package_id(id: &str) -> String {
 /// here and only then asks for a `.nupkg`. Versions are lowercased because the
 /// flat container addresses them in their normalized form.
 pub fn build_flat_container_index(versions: &[String]) -> serde_json::Value {
+    let mut versions = versions
+        .iter()
+        .filter_map(|version| NuGetVersion::parse(version))
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+
     serde_json::json!({
         "versions": versions
-            .iter()
-            .map(|version| version.to_lowercase())
+            .into_iter()
+            .map(|version| version.normalized())
             .collect::<Vec<_>>(),
     })
 }
@@ -510,14 +517,7 @@ pub fn build_registration_index(
     registration_url: &str,
     entries: &[NuGetRegistrationEntry],
 ) -> serde_json::Value {
-    let lower = entries
-        .first()
-        .map(|entry| entry.version.clone())
-        .unwrap_or_default();
-    let upper = entries
-        .last()
-        .map(|entry| entry.version.clone())
-        .unwrap_or_default();
+    let (lower, upper) = registration_bounds(entries);
     // The page is inline, so its fragment identifies the page within the index
     // document without advertising a second HTTP resource that does not exist.
     let page_url = format!("{registration_url}#page/{lower}/{upper}");
@@ -546,6 +546,32 @@ pub fn build_registration_index(
             "items": leaves,
         }]
     })
+}
+
+fn registration_bounds(entries: &[NuGetRegistrationEntry]) -> (String, String) {
+    let mut parsed = entries
+        .iter()
+        .filter_map(|entry| NuGetVersion::parse(&entry.version));
+
+    if let Some(first) = parsed.next() {
+        let (lower, upper) = parsed.fold((first.clone(), first), |(lower, upper), version| {
+            (lower.min(version.clone()), upper.max(version))
+        });
+        return (lower.normalized(), upper.normalized());
+    }
+
+    // Historical rows predate protocol validation. If every spelling is
+    // unreadable as a NuGetVersion, keep the document stable without letting
+    // publication order pretend to be version precedence.
+    let mut legacy = entries
+        .iter()
+        .map(|entry| entry.version.trim().to_lowercase())
+        .collect::<Vec<_>>();
+    legacy.sort();
+    (
+        legacy.first().cloned().unwrap_or_default(),
+        legacy.last().cloned().unwrap_or_default(),
+    )
 }
 
 /// The `catalogEntry` of one registration leaf — the document `dotnet restore`
@@ -675,13 +701,13 @@ pub struct NuGetSearchResult {
 /// case-insensitively. Build metadata does not participate in the default
 /// ordering. Keeping this parser here avoids accidentally reusing npm's strict
 /// SemVer selector for versions such as `2.0.0.1`.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct NuGetVersion {
     numbers: [u32; 4],
     release: Option<Vec<NuGetReleaseLabel>>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum NuGetReleaseLabel {
     Numeric(u32),
     Text(String),
@@ -755,6 +781,42 @@ impl NuGetVersion {
 
     fn is_prerelease(&self) -> bool {
         self.release.is_some()
+    }
+
+    fn normalized(&self) -> String {
+        let mut normalized = format!(
+            "{}.{}.{}",
+            self.numbers[0], self.numbers[1], self.numbers[2]
+        );
+        if self.numbers[3] != 0 {
+            normalized.push('.');
+            normalized.push_str(&self.numbers[3].to_string());
+        }
+        if let Some(release) = &self.release {
+            normalized.push('-');
+            normalized.push_str(
+                &release
+                    .iter()
+                    .map(|label| match label {
+                        NuGetReleaseLabel::Numeric(value) => value.to_string(),
+                        NuGetReleaseLabel::Text(value) => value.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+        }
+        normalized
+    }
+}
+
+/// Whether two spellings identify the same NuGet version.
+///
+/// Unparsable historical spellings retain the old case-insensitive exact-match
+/// behavior; they cannot alias a valid normalized URL token.
+pub fn nuget_versions_match(stored: &str, requested: &str) -> bool {
+    match (NuGetVersion::parse(stored), NuGetVersion::parse(requested)) {
+        (Some(stored), Some(requested)) => stored == requested,
+        _ => stored.eq_ignore_ascii_case(requested),
     }
 }
 
@@ -878,6 +940,65 @@ mod tests {
             NuGetVersion::parse("1.0.0-ALPHA").unwrap(),
             NuGetVersion::parse("1.0.0-alpha").unwrap()
         );
+    }
+
+    #[test]
+    fn flat_container_versions_are_normalized_sorted_and_deduplicated() {
+        let versions = [
+            "2.0.0.1+Build.7",
+            "1.0.0.0",
+            "1",
+            "1.5.0-RC.2+metadata",
+            "legacy-row",
+        ]
+        .map(String::from);
+
+        let index = build_flat_container_index(&versions);
+        assert_eq!(
+            index["versions"],
+            serde_json::json!(["1.0.0", "1.5.0-rc.2", "2.0.0.1"])
+        );
+        assert!(nuget_versions_match("1", "1.0.0"));
+        assert!(nuget_versions_match("1.0.0.0", "1.0.0"));
+        assert!(nuget_versions_match("1.5.0-RC.2+metadata", "1.5.0-rc.2"));
+        assert!(!nuget_versions_match("legacy-row", "1.0.0"));
+    }
+
+    #[test]
+    fn registration_bounds_follow_nuget_precedence_with_legacy_fallback() {
+        let entry = |version: &str| NuGetRegistrationEntry {
+            version: version.into(),
+            description: None,
+            homepage: None,
+            license: None,
+            tags: None,
+            download_url: format!("https://git.example.com/dl/{version}"),
+            dependency_groups: Vec::new(),
+            listed: true,
+        };
+        let entries = [
+            entry("2.0.0.1+Build.7"),
+            entry("legacy-row"),
+            entry("1.2"),
+            entry("1.5.0-RC.2+metadata"),
+        ];
+
+        let index = build_registration_index(
+            "Matrix.Bounds",
+            "https://git.example.com/registration/matrix.bounds/index.json",
+            &entries,
+        );
+        assert_eq!(index["items"][0]["lower"], "1.2.0");
+        assert_eq!(index["items"][0]["upper"], "2.0.0.1");
+
+        let legacy_only = [entry("zeta-version"), entry("Alpha-Version")];
+        let index = build_registration_index(
+            "Matrix.Legacy",
+            "https://git.example.com/registration/matrix.legacy/index.json",
+            &legacy_only,
+        );
+        assert_eq!(index["items"][0]["lower"], "alpha-version");
+        assert_eq!(index["items"][0]["upper"], "zeta-version");
     }
 
     #[test]
