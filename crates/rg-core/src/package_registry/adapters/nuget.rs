@@ -779,6 +779,35 @@ pub fn nuget_versions_match(stored: &str, requested: &str) -> bool {
     }
 }
 
+/// One stored version, in the terms a NuGet client capability filter decides on.
+///
+/// The SemVer level of a package version is not a property of its own spelling
+/// alone: NuGet also calls it SemVer 2-specific when the minimum or maximum of
+/// any of its dependency ranges is. A row therefore carries what the stored
+/// dependency graph said, alongside the two facts the database row itself holds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NuGetVersionRow<'a> {
+    pub version: &'a str,
+    pub is_yanked: bool,
+    /// Whether this version's dependency ranges need a SemVer 2-aware client.
+    ///
+    /// `false` from a caller that never read the graph — which is sound only
+    /// because such a caller is one whose answer the graph cannot change; see
+    /// [`NuGetVersionFilter::negotiates_semver_level`].
+    pub dependencies_require_semver2: bool,
+}
+
+impl<'a> NuGetVersionRow<'a> {
+    /// A row classified by its version spelling alone.
+    pub(crate) const fn spelling_only(version: &'a str, is_yanked: bool) -> Self {
+        Self {
+            version,
+            is_yanked,
+            dependencies_require_semver2: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NuGetVersionFilter {
     include_prerelease: bool,
@@ -814,18 +843,171 @@ impl NuGetVersionFilter {
     }
 
     /// Parse one live version when it is visible to this client capability set.
-    pub(crate) fn candidate(self, version: &str, is_yanked: bool) -> Option<NuGetVersion> {
-        if is_yanked {
+    pub(crate) fn candidate(self, row: NuGetVersionRow<'_>) -> Option<NuGetVersion> {
+        if row.is_yanked {
             return None;
         }
-        let parsed = NuGetVersion::parse(version)?;
-        if (!self.include_prerelease && parsed.is_prerelease())
-            || (!self.include_semver2 && NuGetVersion::is_semver2_specific(version))
+        let parsed = NuGetVersion::parse(row.version)?;
+        if !self.include_prerelease && parsed.is_prerelease() {
+            return None;
+        }
+        // Both halves of NuGet's SemVer 2 rule: the version's own spelling, and
+        // the bounds of the dependency ranges the client would have to resolve
+        // after picking it.
+        if !self.include_semver2
+            && (NuGetVersion::is_semver2_specific(row.version) || row.dependencies_require_semver2)
         {
             return None;
         }
         Some(parsed)
     }
+
+    /// Whether this filter's answer can depend on the stored dependency graph.
+    ///
+    /// Only a client that did *not* opt into SemVer 2 can be hidden from a
+    /// package by its dependency ranges, so every other caller is spared both
+    /// the metadata read and the fail-loud decode that comes with it — a damaged
+    /// row must not fail a request whose answer it could not have changed.
+    pub(crate) const fn negotiates_semver_level(self) -> bool {
+        !self.include_semver2
+    }
+}
+
+/// The dependency groups recorded beside a NuGet version, read back out of the
+/// stored protocol metadata.
+///
+/// Kept here, next to [`nuspec_protocol_metadata`] which writes these keys, so
+/// that the registration leaf and the search capability filter classify exactly
+/// the same graph — a reader that drifts from the writer is how a leaf ends up
+/// publishing a dependency the filter never saw.
+///
+/// A group whose `dependencies` array is missing is still a group — it declares
+/// a supported framework that needs nothing — so an entry is dropped only when
+/// it carries no framework *and* no dependencies at all.
+pub fn stored_dependency_groups(doc: &serde_json::Value) -> Vec<NuGetDependencyGroup> {
+    let Some(groups) = doc.get("dependencyGroups").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    groups
+        .iter()
+        .map(|group| NuGetDependencyGroup {
+            target_framework: group
+                .get("targetFramework")
+                .and_then(|v| v.as_str())
+                .filter(|f| !f.is_empty())
+                .map(String::from),
+            dependencies: group
+                .get("dependencies")
+                .and_then(|v| v.as_array())
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(|dep| {
+                            Some(NuGetDependency {
+                                id: dep
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|id| !id.is_empty())?
+                                    .to_string(),
+                                range: dep
+                                    .get("range")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|r| !r.is_empty())
+                                    .unwrap_or("(, )")
+                                    .to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .filter(|group| group.target_framework.is_some() || !group.dependencies.is_empty())
+        .collect()
+}
+
+/// Whether a dependency graph makes the version that declares it SemVer
+/// 2-specific.
+///
+/// NuGet's own rule: a package version is SemVer 2-specific when its own version
+/// is, **or** when the minimum or maximum of any dependency range is. So a plain
+/// `1.0.0` that depends on `[2.0.0-alpha.1, )` must stay invisible to a client
+/// that did not ask for SemVer 2 — advertising it hands that client a package
+/// whose graph it cannot parse, and the failure lands at restore time as a
+/// version nobody can resolve rather than as a package that was never offered.
+pub(crate) fn dependency_groups_require_semver2(groups: &[NuGetDependencyGroup]) -> bool {
+    groups.iter().any(|group| {
+        group
+            .dependencies
+            .iter()
+            .any(|dependency| range_requires_semver2(&dependency.range))
+    })
+}
+
+/// Whether either bound of one NuGet version range needs a SemVer 2 client.
+///
+/// The interval notation is `[1.0.0]`, `[1.0.0,)`, `(,2.0.0]`, `[1.0,2.0)`; a
+/// bare `1.0.0` is shorthand for `[1.0.0, )`. Every non-empty comma-separated
+/// piece inside the brackets is a version spelling, and an omitted bound is
+/// exactly that — no bound, so nothing to classify.
+fn range_requires_semver2(range: &str) -> bool {
+    range
+        .trim()
+        .trim_start_matches(['[', '('])
+        .trim_end_matches([']', ')'])
+        .split(',')
+        .map(str::trim)
+        .filter(|bound| !bound.is_empty())
+        .any(NuGetVersion::is_semver2_specific)
+}
+
+/// Whether the version behind this stored metadata blob needs a SemVer 2 client
+/// for its dependency graph.
+///
+/// A damaged blob is an error, not a `false`. `false` means "the graph was read
+/// and it is SemVer 1", and saying that about a row nobody could read advertises
+/// the package to precisely the client least able to cope with it — the same lie
+/// `build_sparse_index_entry` refuses to tell for a cargo index entry. The
+/// message names the coordinate for operators and never carries the blob.
+pub(crate) fn stored_dependencies_require_semver2(
+    package_name: &str,
+    version: &str,
+    metadata_json: Option<&str>,
+) -> anyhow::Result<bool> {
+    // A legacy row that predates the adapter recording anything is an absence,
+    // not damage: there is no graph to be SemVer 2-specific.
+    let Some(blob) = metadata_json else {
+        return Ok(false);
+    };
+
+    let doc = serde_json::from_str::<serde_json::Value>(blob).map_err(|error| {
+        tracing::error!(
+            package = %package_name,
+            version = %version,
+            error = %error,
+            "stored nuget metadata is not valid JSON — refusing to classify the version as \
+             SemVer 1 and advertise it to a client that cannot read its dependency graph"
+        );
+        unreadable_nuget_metadata(package_name, version)
+    })?;
+    if !doc.is_object() {
+        tracing::error!(
+            package = %package_name,
+            version = %version,
+            "stored nuget metadata is valid JSON but not an object — refusing to classify the \
+             version as SemVer 1 and advertise it to a client that cannot read its dependency graph"
+        );
+        return Err(unreadable_nuget_metadata(package_name, version));
+    }
+
+    Ok(dependency_groups_require_semver2(
+        &stored_dependency_groups(&doc),
+    ))
+}
+
+/// Untyped on purpose: this is the registry's own row being unreadable, so it
+/// must reach the client as a 5xx and never as "fix your request".
+fn unreadable_nuget_metadata(package_name: &str, version: &str) -> anyhow::Error {
+    anyhow::anyhow!("stored nuget metadata for '{package_name}' {version} could not be read")
 }
 
 /// Pick the highest live version allowed by one NuGet client capability mode.
@@ -834,22 +1016,24 @@ impl NuGetVersionFilter {
 /// live row remains a compatibility fallback only for the generic package
 /// summary; protocol search never advertises a version its client cannot parse.
 pub(crate) fn latest_live_nuget<'a>(
-    versions: impl IntoIterator<Item = (&'a str, bool)>,
+    versions: impl IntoIterator<Item = NuGetVersionRow<'a>>,
     filter: NuGetVersionFilter,
 ) -> Option<&'a str> {
     let mut fallback = None;
     let mut latest: Option<(NuGetVersion, &'a str)> = None;
 
-    for (version, is_yanked) in versions {
-        let Some(parsed) = filter.candidate(version, is_yanked) else {
-            if !is_yanked && filter.allow_legacy_fallback && NuGetVersion::parse(version).is_none()
+    for row in versions {
+        let Some(parsed) = filter.candidate(row) else {
+            if !row.is_yanked
+                && filter.allow_legacy_fallback
+                && NuGetVersion::parse(row.version).is_none()
             {
-                fallback.get_or_insert(version);
+                fallback.get_or_insert(row.version);
             }
             continue;
         };
         if latest.as_ref().is_none_or(|(current, _)| parsed > *current) {
-            latest = Some((parsed, version));
+            latest = Some((parsed, row.version));
         }
     }
 
@@ -958,67 +1142,187 @@ mod tests {
         assert_eq!(index["items"][0]["upper"], "zeta-version");
     }
 
+    /// Rows classified by their version spelling alone, as every caller that
+    /// does not negotiate a SemVer level supplies them.
+    fn rows<'a>(versions: impl IntoIterator<Item = (&'a str, bool)>) -> Vec<NuGetVersionRow<'a>> {
+        versions
+            .into_iter()
+            .map(|(version, is_yanked)| NuGetVersionRow::spelling_only(version, is_yanked))
+            .collect()
+    }
+
     #[test]
     fn latest_nuget_version_is_stable_live_and_has_deterministic_fallback() {
         assert_eq!(
             latest_live_nuget(
-                [
+                rows([
                     ("4.0.0-beta", false),
                     ("1.2.4", false),
                     ("9.0.0", true),
                     ("2.0.0.1", false),
-                ],
+                ]),
                 NuGetVersionFilter::PACKAGE_SUMMARY
             ),
             Some("2.0.0.1")
         );
         assert_eq!(
             latest_live_nuget(
-                [("legacy-newest", false), ("legacy-older", false)],
+                rows([("legacy-newest", false), ("legacy-older", false)]),
                 NuGetVersionFilter::PACKAGE_SUMMARY,
             ),
             Some("legacy-newest")
         );
         assert_eq!(
-            latest_live_nuget([("3.0.0-beta", false)], NuGetVersionFilter::PACKAGE_SUMMARY,),
+            latest_live_nuget(
+                rows([("3.0.0-beta", false)]),
+                NuGetVersionFilter::PACKAGE_SUMMARY,
+            ),
             None
         );
     }
 
     #[test]
     fn search_version_filter_negotiates_prerelease_and_semver2_independently() {
-        let versions = [
+        let versions = rows([
             ("9.0.0", true),
             ("6.0.0+build.7", false),
             ("5.0.0-beta.1", false),
             ("4.0.0-beta", false),
             ("1.0.0", false),
             ("legacy-row", false),
-        ];
+        ]);
 
         assert_eq!(
-            latest_live_nuget(versions, NuGetVersionFilter::search(false, None)),
+            latest_live_nuget(
+                versions.iter().copied(),
+                NuGetVersionFilter::search(false, None)
+            ),
             Some("1.0.0")
         );
         assert_eq!(
-            latest_live_nuget(versions, NuGetVersionFilter::search(true, None)),
+            latest_live_nuget(
+                versions.iter().copied(),
+                NuGetVersionFilter::search(true, None)
+            ),
             Some("4.0.0-beta")
         );
         assert_eq!(
-            latest_live_nuget(versions, NuGetVersionFilter::search(false, Some("2.0.0")),),
-            Some("6.0.0+build.7")
-        );
-        assert_eq!(
-            latest_live_nuget(versions, NuGetVersionFilter::search(true, Some("2.1.0")),),
+            latest_live_nuget(
+                versions.iter().copied(),
+                NuGetVersionFilter::search(false, Some("2.0.0")),
+            ),
             Some("6.0.0+build.7")
         );
         assert_eq!(
             latest_live_nuget(
-                [("3.0.0-alpha.1", false)],
+                versions.iter().copied(),
+                NuGetVersionFilter::search(true, Some("2.1.0")),
+            ),
+            Some("6.0.0+build.7")
+        );
+        assert_eq!(
+            latest_live_nuget(
+                rows([("3.0.0-alpha.1", false)]),
                 NuGetVersionFilter::search(true, Some("not-a-version")),
             ),
             None
         );
+    }
+
+    /// NuGet's SemVer 2 rule has a second half: a version whose own spelling is
+    /// plain SemVer 1 is still SemVer 2-specific when a dependency range bound
+    /// is. Advertising it to a SemVer 1 client hands over a graph that client
+    /// cannot resolve.
+    #[test]
+    fn dependency_range_bounds_decide_the_semver_level_too() {
+        let semver2_dependency = NuGetVersionRow {
+            version: "1.0.0",
+            is_yanked: false,
+            dependencies_require_semver2: true,
+        };
+
+        assert_eq!(
+            latest_live_nuget(
+                [semver2_dependency],
+                NuGetVersionFilter::search(false, None)
+            ),
+            None
+        );
+        assert_eq!(
+            latest_live_nuget(
+                [semver2_dependency],
+                NuGetVersionFilter::search(false, Some("2.0.0"))
+            ),
+            Some("1.0.0")
+        );
+        // The generic package summary negotiates nothing, so it neither hides
+        // the version nor asks anyone to read the graph for it.
+        assert!(!NuGetVersionFilter::PACKAGE_SUMMARY.negotiates_semver_level());
+        assert!(NuGetVersionFilter::search(true, None).negotiates_semver_level());
+        assert!(!NuGetVersionFilter::search(false, Some("2.0.0")).negotiates_semver_level());
+    }
+
+    #[test]
+    fn semver2_range_bounds_are_recognised_at_both_ends_of_the_interval() {
+        for semver1 in [
+            "1.0.0",
+            "[1.0.0]",
+            "[1.0.0, 2.0.0)",
+            "(, 2.0.0]",
+            "(, )",
+            "[1.0.0-beta, 2.0.0-rc)",
+            "1.0.0.4",
+        ] {
+            assert!(!range_requires_semver2(semver1), "{semver1}");
+        }
+
+        for semver2 in [
+            "[2.0.0-alpha.1, )",
+            "2.0.0-alpha.1",
+            "(1.0.0, 2.0.0-rc.1]",
+            "[1.0.0+build.7, )",
+            "[1.0.0, 2.0.0+build.7)",
+        ] {
+            assert!(range_requires_semver2(semver2), "{semver2}");
+        }
+    }
+
+    #[test]
+    fn stored_dependency_graph_classifies_the_version_and_fails_loud_when_damaged() {
+        let semver2_graph = r#"{"dependencyGroups":[
+            {"targetFramework":"net8.0","dependencies":[{"id":"A","range":"[1.0.0, )"}]},
+            {"targetFramework":"net9.0","dependencies":[{"id":"B","range":"[2.0.0-alpha.1, )"}]}
+        ]}"#;
+        assert!(
+            stored_dependencies_require_semver2("Matrix.Deps", "1.0.0", Some(semver2_graph))
+                .unwrap()
+        );
+
+        let semver1_graph = r#"{"dependencyGroups":[{"targetFramework":"net8.0","dependencies":[
+                {"id":"A","range":"13.0.1"},{"id":"B","range":"[3.0.0, 4.0.0)"}]}]}"#;
+        assert!(
+            !stored_dependencies_require_semver2("Matrix.Deps", "1.0.0", Some(semver1_graph))
+                .unwrap()
+        );
+
+        // A row published before the adapter recorded anything declares no
+        // graph; that is an absence, not damage.
+        assert!(!stored_dependencies_require_semver2("Matrix.Deps", "1.0.0", None).unwrap());
+        assert!(!stored_dependencies_require_semver2(
+            "Matrix.Deps",
+            "1.0.0",
+            Some(r#"{"tags":"a b"}"#)
+        )
+        .unwrap());
+
+        for damaged in ["{broken-json", "[]", "\"a string\""] {
+            let error = stored_dependencies_require_semver2("Matrix.Deps", "1.0.0", Some(damaged))
+                .expect_err(damaged);
+            assert!(
+                !format!("{error}").contains(damaged),
+                "the unreadable blob must not travel with the error: {error}"
+            );
+        }
     }
 
     #[test]

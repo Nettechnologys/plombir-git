@@ -794,17 +794,19 @@ async fn list_package_selections(
 
     for pkg in packages {
         let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
-        let candidates = || {
-            versions
-                .iter()
-                .map(|version| (version.version.as_str(), version.is_yanked))
+        let nuget_rows = if package_type == package_types::NUGET {
+            nuget_version_rows(&pkg.name, &versions, nuget_filter)?
+        } else {
+            Vec::new()
         };
         let latest = match package_type {
-            package_types::NPM => {
-                crate::package_registry::adapters::npm::latest_live_semver(candidates())
-            }
+            package_types::NPM => crate::package_registry::adapters::npm::latest_live_semver(
+                versions
+                    .iter()
+                    .map(|version| (version.version.as_str(), version.is_yanked)),
+            ),
             package_types::NUGET => crate::package_registry::adapters::nuget::latest_live_nuget(
-                candidates(),
+                nuget_rows.iter().copied(),
                 nuget_filter,
             ),
             _ => versions
@@ -816,18 +818,17 @@ async fn list_package_selections(
         let mut nuget_versions = if collect_nuget_versions {
             versions
                 .iter()
-                .filter_map(|version| {
-                    nuget_filter
-                        .candidate(&version.version, version.is_yanked)
-                        .map(|parsed| {
-                            (
-                                parsed,
-                                crate::package_registry::adapters::nuget::NuGetSearchVersion {
-                                    version: version.version.clone(),
-                                    downloads: version.download_count,
-                                },
-                            )
-                        })
+                .zip(&nuget_rows)
+                .filter_map(|(version, row)| {
+                    nuget_filter.candidate(*row).map(|parsed| {
+                        (
+                            parsed,
+                            crate::package_registry::adapters::nuget::NuGetSearchVersion {
+                                version: version.version.clone(),
+                                downloads: version.download_count,
+                            },
+                        )
+                    })
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -856,6 +857,52 @@ async fn list_package_selections(
     }
 
     Ok(selections)
+}
+
+/// One package's stored versions, in the terms the NuGet capability filter
+/// decides on.
+///
+/// The dependency graph is read back out of the stored protocol metadata only
+/// when the requesting client's SemVer level can actually turn on it — a client
+/// that already opted into SemVer 2 sees every version regardless, so its
+/// request neither pays for the decode nor fails on a row it did not need.
+///
+/// The read is fail-loud where it happens: a version whose stored metadata
+/// cannot be parsed must not be silently classified as SemVer 1 and then
+/// advertised to the one client that cannot resolve it.
+///
+/// Returns exactly one row per input version, in the input order — the caller
+/// zips the two together to pair a row with its download count.
+fn nuget_version_rows<'a>(
+    package_name: &str,
+    versions: &'a [rg_db::entities::package_version::Model],
+    filter: crate::package_registry::adapters::nuget::NuGetVersionFilter,
+) -> Result<Vec<crate::package_registry::adapters::nuget::NuGetVersionRow<'a>>> {
+    use crate::package_registry::adapters::nuget;
+
+    if !filter.negotiates_semver_level() {
+        return Ok(versions
+            .iter()
+            .map(|version| {
+                nuget::NuGetVersionRow::spelling_only(&version.version, version.is_yanked)
+            })
+            .collect());
+    }
+
+    versions
+        .iter()
+        .map(|version| {
+            Ok(nuget::NuGetVersionRow {
+                version: &version.version,
+                is_yanked: version.is_yanked,
+                dependencies_require_semver2: nuget::stored_dependencies_require_semver2(
+                    package_name,
+                    &version.version,
+                    version.metadata.as_deref(),
+                )?,
+            })
+        })
+        .collect()
 }
 
 /// Get a package by name.

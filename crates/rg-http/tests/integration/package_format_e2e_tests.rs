@@ -10,6 +10,7 @@ use base64::Engine as _;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::StatusCode;
+use sea_orm::ConnectionTrait as _;
 use sha2::Digest as _;
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -1143,6 +1144,194 @@ async fn nuget_search_and_autocomplete_filter_prerelease_semver2_and_yanked_vers
         !all_names.contains(&"Matrix.YankedOnly"),
         "{all_autocomplete}"
     );
+}
+
+/// A NuGet client's SemVer level is negotiated over the dependency graph too,
+/// not just over the version's own spelling. NuGet calls a package version
+/// SemVer 2-specific when the minimum or maximum of any dependency range is —
+/// so a perfectly plain `1.0.0` that depends on `[2.0.0-alpha.1, )` must stay
+/// invisible to a client that did not ask for SemVer 2. Advertising it hands
+/// that client a graph it cannot parse, and the failure surfaces at restore
+/// time as an unresolvable version rather than as a package never offered.
+#[tokio::test]
+async fn nuget_search_reads_the_semver_level_out_of_dependency_ranges_too() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    // Every package here is version `1.0.0`: nothing but the dependency ranges
+    // may decide whether a SemVer 1 client gets to see it.
+    for (package, dependencies) in [
+        (
+            "Matrix.Range.DottedPrerelease",
+            r#"<group targetFramework="net8.0">
+                 <dependency id="Matrix.Stable" version="[1.0.0, 2.0.0)" />
+                 <dependency id="Matrix.Preview" version="[2.0.0-alpha.1, )" />
+               </group>"#,
+        ),
+        (
+            "Matrix.Range.BuildMetadata",
+            r#"<group targetFramework="net8.0">
+                 <dependency id="Matrix.Pinned" version="[1.0.0+build.7]" />
+               </group>"#,
+        ),
+        (
+            "Matrix.Range.SemVer1",
+            r#"<group targetFramework="net8.0">
+                 <dependency id="Matrix.Stable" version="13.0.1" />
+                 <dependency id="Matrix.Bounded" version="[3.0.0-beta, 4.0.0)" />
+               </group>"#,
+        ),
+        ("Matrix.Range.None", ""),
+    ] {
+        let nuspec = format!(
+            "<package><metadata><id>{package}</id><version>1.0.0</version>\
+             <dependencies>{dependencies}</dependencies></metadata></package>"
+        );
+        let published = client
+            .post(package_url(&base, &["nuget", "publish"]))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{package}.1.0.0.nupkg\""),
+            )
+            .body(zip_archive(&[("package.nuspec", nuspec.as_bytes())]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(published.status(), StatusCode::CREATED, "{package}");
+    }
+
+    let semver1 = search_nuget(&client, &base, &[("q", "Matrix.Range.")]).await;
+    for hidden in [
+        "Matrix.Range.DottedPrerelease",
+        "Matrix.Range.BuildMetadata",
+    ] {
+        assert_eq!(
+            nuget_search_version(&semver1, hidden),
+            None,
+            "a SemVer 2 dependency bound must hide {hidden}: {semver1}"
+        );
+    }
+    for visible in ["Matrix.Range.SemVer1", "Matrix.Range.None"] {
+        assert_eq!(
+            nuget_search_version(&semver1, visible),
+            Some("1.0.0"),
+            "an ordinary dependency graph must not hide {visible}: {semver1}"
+        );
+    }
+    assert_eq!(semver1["totalHits"], 2, "{semver1}");
+
+    let semver2 = search_nuget(
+        &client,
+        &base,
+        &[("q", "Matrix.Range."), ("semVerLevel", "2.0.0")],
+    )
+    .await;
+    for package in [
+        "Matrix.Range.DottedPrerelease",
+        "Matrix.Range.BuildMetadata",
+        "Matrix.Range.SemVer1",
+        "Matrix.Range.None",
+    ] {
+        assert_eq!(
+            nuget_search_version(&semver2, package),
+            Some("1.0.0"),
+            "a SemVer 2 client sees every version: {semver2}"
+        );
+    }
+    assert_eq!(semver2["totalHits"], 4, "{semver2}");
+
+    // The autocomplete service negotiates the same capability, so an id hidden
+    // from one surface cannot stay discoverable through the other.
+    let autocomplete_semver1 = autocomplete_nuget(&client, &base, &[("q", "Matrix.Range.")]).await;
+    let semver1_names = nuget_autocomplete_names(&autocomplete_semver1);
+    assert!(
+        !semver1_names.contains(&"Matrix.Range.DottedPrerelease"),
+        "{autocomplete_semver1}"
+    );
+    assert!(
+        semver1_names.contains(&"Matrix.Range.SemVer1"),
+        "{autocomplete_semver1}"
+    );
+    let autocomplete_semver2 = autocomplete_nuget(
+        &client,
+        &base,
+        &[("q", "Matrix.Range."), ("semVerLevel", "2.0.0")],
+    )
+    .await;
+    assert!(
+        nuget_autocomplete_names(&autocomplete_semver2).contains(&"Matrix.Range.DottedPrerelease"),
+        "{autocomplete_semver2}"
+    );
+
+    // The registration index is not a capability-negotiation surface: hiding
+    // the version from search must not have hidden the graph search read it
+    // out of.
+    let registration = client
+        .get(package_url(
+            &base,
+            &[
+                "nuget",
+                "registration",
+                "matrix.range.dottedprerelease",
+                "index.json",
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registration.status(), StatusCode::OK);
+    let registration = registration.json::<serde_json::Value>().await.unwrap();
+    let ranges = registration["items"][0]["items"][0]["catalogEntry"]["dependencyGroups"][0]
+        ["dependencies"]
+        .as_array()
+        .unwrap_or_else(|| panic!("registration dependency graph missing: {registration}"))
+        .iter()
+        .map(|dependency| dependency["range"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(ranges.contains(&"[2.0.0-alpha.1, )"), "{registration}");
+
+    // A row whose stored metadata cannot be read has no known SemVer level.
+    // Answering "SemVer 1" for it is the one answer that advertises it to the
+    // client least able to cope, so the request fails loudly instead — and only
+    // the request whose answer that graph could have changed.
+    let corrupted = db
+        .execute_unprepared(
+            "UPDATE package_versions SET metadata = '{broken-json' WHERE id IN (\
+                 SELECT pv.id FROM package_versions pv JOIN packages p ON p.id = pv.package_id \
+                 WHERE p.name = 'Matrix.Range.SemVer1')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(corrupted.rows_affected(), 1);
+
+    let mut damaged_query = package_url(&base, &["nuget", "query"]);
+    damaged_query
+        .query_pairs_mut()
+        .append_pair("q", "Matrix.Range.");
+    let damaged = client.get(damaged_query).send().await.unwrap();
+    assert_eq!(
+        damaged.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unreadable dependency graph must not be classified as SemVer 1"
+    );
+    let damaged_body = damaged.text().await.unwrap();
+    assert!(
+        !damaged_body.contains("broken-json"),
+        "the unreadable stored blob leaked to the client: {damaged_body}"
+    );
+
+    // The same damaged row cannot fail a SemVer 2 request: that client sees
+    // every version regardless, so its answer never depended on the graph.
+    let still_served = search_nuget(
+        &client,
+        &base,
+        &[("q", "Matrix.Range."), ("semVerLevel", "2.0.0")],
+    )
+    .await;
+    assert_eq!(still_served["totalHits"], 4, "{still_served}");
 }
 
 /// Maven's metadata model calls the last publication `latest`, while `release`

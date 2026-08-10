@@ -4575,56 +4575,11 @@ fn parse_nuget_metadata(
         homepage,
         license,
         tags,
-        dependency_groups: parse_nuget_dependency_groups(&doc),
+        // Read through rg-core, which also writes these keys and classifies the
+        // same graph for the search SemVer-level filter. A second reader here
+        // would be free to drift from both.
+        dependency_groups: rg_core::package_registry::stored_dependency_groups(&doc),
     })
-}
-
-/// The dependency groups stored beside a NuGet version.
-///
-/// A group whose `dependencies` array is missing is still a group — it declares
-/// a supported framework that needs nothing — so an unreadable entry is dropped
-/// only when it carries no framework *and* no dependencies at all.
-fn parse_nuget_dependency_groups(
-    doc: &serde_json::Value,
-) -> Vec<rg_core::package_registry::NuGetDependencyGroup> {
-    let Some(groups) = doc.get("dependencyGroups").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-
-    groups
-        .iter()
-        .map(|group| rg_core::package_registry::NuGetDependencyGroup {
-            target_framework: group
-                .get("targetFramework")
-                .and_then(|v| v.as_str())
-                .filter(|f| !f.is_empty())
-                .map(String::from),
-            dependencies: group
-                .get("dependencies")
-                .and_then(|v| v.as_array())
-                .map(|deps| {
-                    deps.iter()
-                        .filter_map(|dep| {
-                            Some(rg_core::package_registry::NuGetDependency {
-                                id: dep
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|id| !id.is_empty())?
-                                    .to_string(),
-                                range: dep
-                                    .get("range")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|r| !r.is_empty())
-                                    .unwrap_or("(, )")
-                                    .to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        })
-        .filter(|group| group.target_framework.is_some() || !group.dependencies.is_empty())
-        .collect()
 }
 
 /// The `Requires-Python` a PyPI version recorded at publish.

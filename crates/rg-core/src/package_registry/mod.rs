@@ -19,8 +19,8 @@ pub use adapters::npm::{
 pub use adapters::nuget::{
     build_autocomplete_results, build_flat_container_index, build_registration_index,
     build_registration_leaf, build_search_results, build_service_index, normalize_package_id,
-    nuget_versions_match, NuGetDependency, NuGetDependencyGroup, NuGetRegistrationEntry,
-    NuGetSearchResult, NuGetSearchVersion,
+    nuget_versions_match, stored_dependency_groups, NuGetDependency, NuGetDependencyGroup,
+    NuGetRegistrationEntry, NuGetSearchResult, NuGetSearchVersion,
 };
 pub use adapters::pypi::{
     build_simple_repository_html, build_simple_root_html, normalize_project_name, PyPIProjectEntry,
