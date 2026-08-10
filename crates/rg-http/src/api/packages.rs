@@ -3488,24 +3488,6 @@ async fn resolve_nuget_id(
         .map_or_else(|| requested.to_string(), |pkg| pkg.name))
 }
 
-/// The nuget packages of a repository, or nothing at all.
-///
-/// A repository that never enabled the registry is not an error on the discovery
-/// routes: the service index is served for any repository, so every resource it
-/// advertises has to answer something a client can read. An empty answer is that
-/// something — a 404 here would make the advertised endpoint look unrouted.
-async fn nuget_packages(
-    state: &AppState,
-    owner: &str,
-    repo: &str,
-) -> Result<Vec<rg_core::package_registry::PackageSummary>, axum::response::Response> {
-    match rg_core::package_registry::service::list_packages(&state.db, owner, repo, "nuget").await {
-        Ok(packages) => Ok(packages),
-        Err(error) if package_is_absent(&error) => Ok(Vec::new()),
-        Err(error) => Err(package_error_response(error)),
-    }
-}
-
 async fn nuget_search_packages(
     state: &AppState,
     owner: &str,
@@ -3649,7 +3631,15 @@ pub async fn nuget_autocomplete(
     Query(params): Query<NuGetSearchParams>,
 ) -> axum::response::Response {
     let query = params.q.as_deref().unwrap_or("").to_lowercase();
-    let packages = match nuget_packages(&state, &owner, &name).await {
+    let packages = match nuget_search_packages(
+        &state,
+        &owner,
+        &name,
+        params.prerelease,
+        params.semver_level.as_deref(),
+    )
+    .await
+    {
         Ok(packages) => packages,
         Err(response) => return response,
     };

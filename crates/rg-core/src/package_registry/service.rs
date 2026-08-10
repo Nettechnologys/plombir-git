@@ -725,7 +725,8 @@ pub async fn list_packages(
     .await
 }
 
-/// List NuGet packages using the SearchQueryService capability filters.
+/// List packages discoverable through NuGet SearchQueryService and
+/// SearchAutocompleteService capability filters.
 pub async fn list_nuget_search_packages(
     db: &DatabaseConnection,
     owner: &str,
@@ -733,7 +734,7 @@ pub async fn list_nuget_search_packages(
     include_prerelease: bool,
     semver_level: Option<&str>,
 ) -> Result<Vec<PackageSummary>> {
-    list_packages_with_nuget_filter(
+    let mut packages = list_packages_with_nuget_filter(
         db,
         owner,
         repo,
@@ -743,7 +744,9 @@ pub async fn list_nuget_search_packages(
             semver_level,
         ),
     )
-    .await
+    .await?;
+    packages.retain(|package| package.latest_version.is_some());
+    Ok(packages)
 }
 
 async fn list_packages_with_nuget_filter(

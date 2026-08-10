@@ -354,12 +354,38 @@ async fn search_nuget(
         .unwrap()
 }
 
+async fn autocomplete_nuget(
+    client: &reqwest::Client,
+    base: &str,
+    pairs: &[(&str, &str)],
+) -> serde_json::Value {
+    let mut query = package_url(base, &["nuget", "autocomplete"]);
+    query.query_pairs_mut().extend_pairs(pairs.iter().copied());
+    client
+        .get(query)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
 fn nuget_search_version<'a>(search: &'a serde_json::Value, package: &str) -> Option<&'a str> {
     search["data"]
         .as_array()?
         .iter()
         .find(|result| result["id"] == package)?["version"]
         .as_str()
+}
+
+fn nuget_autocomplete_names(autocomplete: &serde_json::Value) -> Vec<&str> {
+    autocomplete["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect()
 }
 
 #[test]
@@ -855,11 +881,11 @@ async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
     }
 }
 
-/// SearchQueryService negotiates prerelease and SemVer 2 independently. The
+/// NuGet search services negotiate prerelease and SemVer 2 independently. The
 /// selected `version` is the highest live NuGetVersion the requesting client
 /// can understand, and a package with no such version disappears altogether.
 #[tokio::test]
-async fn nuget_search_filters_prerelease_semver2_and_yanked_versions() {
+async fn nuget_search_and_autocomplete_filter_prerelease_semver2_and_yanked_versions() {
     let (base, _db) = spawn_test_app_with_db().await;
     let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
     create_repo(&base, &token, "matrix-repo").await;
@@ -997,6 +1023,64 @@ async fn nuget_search_filters_prerelease_semver2_and_yanked_versions() {
     ] {
         assert_eq!(nuget_search_version(search, "Matrix.YankedOnly"), None);
     }
+
+    // SearchAutocompleteService is the same capability surface as SearchQueryService:
+    // each flag must make a package id newly discoverable, while unlisted-only ids
+    // remain absent in every mode.
+    let stable_autocomplete = autocomplete_nuget(&client, &base, &[("q", "Matrix.")]).await;
+    assert_eq!(stable_autocomplete["totalHits"], 1, "{stable_autocomplete}");
+    assert_eq!(
+        nuget_autocomplete_names(&stable_autocomplete),
+        ["Matrix.SearchModes"]
+    );
+
+    let prerelease_autocomplete =
+        autocomplete_nuget(&client, &base, &[("q", "Matrix."), ("prerelease", "true")]).await;
+    let prerelease_names = nuget_autocomplete_names(&prerelease_autocomplete);
+    assert_eq!(
+        prerelease_autocomplete["totalHits"], 2,
+        "{prerelease_autocomplete}"
+    );
+    assert!(prerelease_names.contains(&"Matrix.SearchModes"));
+    assert!(prerelease_names.contains(&"Matrix.PrereleaseOnly"));
+
+    let semver2_autocomplete = autocomplete_nuget(
+        &client,
+        &base,
+        &[("q", "Matrix."), ("semVerLevel", "2.0.0")],
+    )
+    .await;
+    let semver2_names = nuget_autocomplete_names(&semver2_autocomplete);
+    assert_eq!(
+        semver2_autocomplete["totalHits"], 2,
+        "{semver2_autocomplete}"
+    );
+    assert!(semver2_names.contains(&"Matrix.SearchModes"));
+    assert!(semver2_names.contains(&"Matrix.SemVer2Only"));
+
+    let all_autocomplete = autocomplete_nuget(
+        &client,
+        &base,
+        &[
+            ("q", "Matrix."),
+            ("prerelease", "true"),
+            ("semVerLevel", "2.0.0"),
+        ],
+    )
+    .await;
+    let all_names = nuget_autocomplete_names(&all_autocomplete);
+    assert_eq!(all_autocomplete["totalHits"], 3, "{all_autocomplete}");
+    for package in [
+        "Matrix.SearchModes",
+        "Matrix.PrereleaseOnly",
+        "Matrix.SemVer2Only",
+    ] {
+        assert!(all_names.contains(&package), "{all_autocomplete}");
+    }
+    assert!(
+        !all_names.contains(&"Matrix.YankedOnly"),
+        "{all_autocomplete}"
+    );
 }
 
 /// Maven's metadata model calls the last publication `latest`, while `release`
