@@ -1243,6 +1243,7 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
         &db,
         package.id,
         "1.0.0",
+        None,
         Some("1.0.0"),
         None,
         0,

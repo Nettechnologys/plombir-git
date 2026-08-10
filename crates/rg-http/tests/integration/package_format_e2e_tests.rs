@@ -306,10 +306,25 @@ async fn publish_nuget_version(
     package: &str,
     version: &str,
 ) {
+    let response = send_nuget_version(client, base, token, package, version).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{package} {version}"
+    );
+}
+
+async fn send_nuget_version(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    package: &str,
+    version: &str,
+) -> reqwest::Response {
     let nuspec = format!(
         "<package><metadata><id>{package}</id><version>{version}</version></metadata></package>"
     );
-    let response = client
+    client
         .post(package_url(base, &["nuget", "publish"]))
         .bearer_auth(token)
         .header(
@@ -319,12 +334,7 @@ async fn publish_nuget_version(
         .body(zip_archive(&[("package.nuspec", nuspec.as_bytes())]))
         .send()
         .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::CREATED,
-        "{package} {version}"
-    );
+        .unwrap()
 }
 
 async fn search_nuget(
@@ -3353,6 +3363,55 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
         .await
         .unwrap()
         .contains("repeats the `package` field"));
+}
+
+/// A second raw spelling of the same NuGet identity is not an additional-file
+/// upload into the first spelling: it is a conflicting immutable publication.
+#[tokio::test]
+async fn equivalent_nuget_version_spelling_is_a_conflict_without_a_second_row() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let first = send_nuget_version(&client, &base, &token, "Matrix.Identity", "1").await;
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+
+    let equivalent = send_nuget_version(&client, &base, &token, "Matrix.Identity", "1.0.0").await;
+    assert_eq!(equivalent.status(), StatusCode::CONFLICT);
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "matrix-owner", "matrix-repo")
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "nuget")
+        .await
+        .unwrap()
+        .unwrap();
+    let package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "Matrix.Identity")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.len(),
+        1,
+        "equivalent spelling created a second row"
+    );
+    assert_eq!(
+        versions[0].version, "1",
+        "the first spelling stays canonical storage"
+    );
+    assert_eq!(versions[0].protocol_version_key.as_deref(), Some("1.0.0"));
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, versions[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "the refused publish created a file row");
 }
 
 /// Registration page bounds and flat-container paths use NuGetVersion

@@ -4,6 +4,7 @@
 //! coordinating the DB ops and the storage layer.
 
 use anyhow::Context as _;
+use rg_db::package_version_key::NuGetVersion;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
 
@@ -171,6 +172,16 @@ pub async fn publish(
         validate_npm_dist_tag(tag)?;
     }
 
+    // The package row stores the spelling supplied by the publisher, while
+    // this key stores protocol identity. NuGet considers `1`, `1.0.0`, a zero
+    // Revision, case-only prerelease changes and build metadata aliases. The
+    // key is nullable so unparsable historical spellings and protocols without
+    // a separate identity contract retain their exact-text behavior.
+    let protocol_version_key = (info.package_type == package_types::NUGET)
+        .then(|| NuGetVersion::parse(&info.version))
+        .flatten()
+        .map(|version| version.normalized());
+
     // 1. Find or create the package registry for this repo+type
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
         .await?
@@ -194,13 +205,29 @@ pub async fn publish(
     )
     .await?;
 
-    // 3. Check if version already exists
-    let existing =
-        rg_db::ops::package_version_ops::find_by_package_and_version(db, pkg.id, &info.version)
-            .await?;
+    // 3. Check if version already exists. A parseable NuGet version is looked
+    //    up by protocol identity, not by its raw spelling.
+    let existing = match protocol_version_key.as_deref() {
+        Some(key) => {
+            rg_db::ops::package_version_ops::find_by_package_and_protocol_version_key(
+                db, pkg.id, key,
+            )
+            .await?
+        }
+        None => {
+            rg_db::ops::package_version_ops::find_by_package_and_version(db, pkg.id, &info.version)
+                .await?
+        }
+    };
     let existing_version = existing.is_some();
 
     let version = if let Some(v) = existing {
+        if protocol_version_key.is_some() && v.version != info.version {
+            return Err(crate::error::conflict(format!(
+                "NuGet version {} normalizes to the already-published version {} of package '{}'",
+                info.version, v.version, info.name
+            )));
+        }
         // The version is already there, so this request is adding a file to it —
         // and the files it carries are the whole point of the request. They used
         // to be dropped on the floor here, under a `200 OK` that said nothing:
@@ -279,6 +306,7 @@ pub async fn publish(
             &transaction,
             pkg.id,
             &info.version,
+            protocol_version_key.as_deref(),
             info.semver.as_deref(),
             info.metadata.as_deref(),
             total_size,

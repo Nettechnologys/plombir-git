@@ -4227,7 +4227,7 @@ mod repository_deletion_tests {
                 .await
                 .expect("create package");
         let version = rg_db::ops::package_version_ops::create(
-            db, package.id, "1.0.0", None, None, 0, None, None,
+            db, package.id, "1.0.0", None, None, None, 0, None, None,
         )
         .await
         .expect("create package version");

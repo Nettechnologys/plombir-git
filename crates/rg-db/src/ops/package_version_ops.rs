@@ -7,6 +7,7 @@ pub async fn create(
     db: &impl ConnectionTrait,
     package_id: i64,
     version: &str,
+    protocol_version_key: Option<&str>,
     semver: Option<&str>,
     metadata: Option<&str>,
     size: i64,
@@ -20,6 +21,7 @@ pub async fn create(
         id: sea_orm::NotSet,
         package_id: Set(package_id),
         version: Set(version.to_string()),
+        protocol_version_key: Set(protocol_version_key.map(str::to_string)),
         semver: Set(semver.map(|s| s.to_string())),
         metadata: Set(metadata.map(|s| s.to_string())),
         size: Set(size),
@@ -31,6 +33,19 @@ pub async fn create(
     };
 
     v.insert(db).await
+}
+
+/// Find a version through its protocol-defined identity key.
+pub async fn find_by_package_and_protocol_version_key(
+    db: &impl ConnectionTrait,
+    package_id: i64,
+    protocol_version_key: &str,
+) -> Result<Option<package_version::Model>, DbErr> {
+    PackageVersion::find()
+        .filter(package_version::Column::PackageId.eq(package_id))
+        .filter(package_version::Column::ProtocolVersionKey.eq(protocol_version_key))
+        .one(db)
+        .await
 }
 
 /// Find a version by package and version string.
@@ -140,7 +155,7 @@ mod tests {
         db.execute_unprepared(
             "CREATE TABLE package_versions (\
                  id INTEGER PRIMARY KEY, package_id BIGINT NOT NULL, version TEXT NOT NULL, \
-                 semver TEXT, metadata TEXT, size BIGINT NOT NULL, sha256 TEXT, \
+                 protocol_version_key TEXT, semver TEXT, metadata TEXT, size BIGINT NOT NULL, sha256 TEXT, \
                  is_yanked BOOLEAN NOT NULL, download_count BIGINT NOT NULL, \
                  author_id BIGINT, created_at TIMESTAMP NOT NULL\
              );\

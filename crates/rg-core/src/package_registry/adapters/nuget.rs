@@ -22,13 +22,13 @@
 //! - Package Content: `GET /api/v1/repos/{owner}/{repo}/packages/nuget/{name}/{version}/{file}`
 
 use std::{
-    cmp::Ordering,
     collections::HashSet,
     io::{Cursor, Read},
 };
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
 use crate::package_registry::url_path::encode_path_segment;
+use rg_db::package_version_key::NuGetVersion;
 
 pub struct NuGetAdapter;
 
@@ -746,140 +746,6 @@ pub struct NuGetSearchResult {
     pub registration_url: String,
 }
 
-/// The part of NuGet's version contract that differs from strict SemVer.
-///
-/// NuGet accepts one through four numeric components (missing components are
-/// zero), compares the fourth `Revision`, and compares prerelease labels
-/// case-insensitively. Build metadata does not participate in the default
-/// ordering. Keeping this parser here avoids accidentally reusing npm's strict
-/// SemVer selector for versions such as `2.0.0.1`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct NuGetVersion {
-    numbers: [u32; 4],
-    release: Option<Vec<NuGetReleaseLabel>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum NuGetReleaseLabel {
-    Numeric(u32),
-    Text(String),
-}
-
-impl NuGetVersion {
-    fn parse(value: &str) -> Option<Self> {
-        let value = value.trim();
-        if value.is_empty() {
-            return None;
-        }
-
-        let (without_metadata, metadata) = value
-            .split_once('+')
-            .map_or((value, None), |(version, metadata)| {
-                (version, Some(metadata))
-            });
-        if metadata.is_some_and(|metadata| !valid_nuget_labels(metadata, true)) {
-            return None;
-        }
-
-        let (numeric, release) = without_metadata
-            .split_once('-')
-            .map_or((without_metadata, None), |(numeric, release)| {
-                (numeric, Some(release))
-            });
-        let components: Vec<&str> = numeric.split('.').collect();
-        if components.is_empty() || components.len() > 4 {
-            return None;
-        }
-
-        let mut numbers = [0; 4];
-        for (slot, component) in numbers.iter_mut().zip(components) {
-            let component = component.trim();
-            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
-            let parsed = component.parse::<u32>().ok()?;
-            if parsed > i32::MAX as u32 {
-                return None;
-            }
-            *slot = parsed;
-        }
-
-        let release = match release {
-            Some(release) => {
-                if !valid_nuget_labels(release, false) {
-                    return None;
-                }
-                Some(
-                    release
-                        .split('.')
-                        .map(|label| {
-                            label
-                                .parse::<u32>()
-                                .ok()
-                                .filter(|value| *value <= i32::MAX as u32)
-                                .map_or_else(
-                                    || NuGetReleaseLabel::Text(label.to_ascii_lowercase()),
-                                    NuGetReleaseLabel::Numeric,
-                                )
-                        })
-                        .collect(),
-                )
-            }
-            None => None,
-        };
-
-        Some(Self { numbers, release })
-    }
-
-    fn is_prerelease(&self) -> bool {
-        self.release.is_some()
-    }
-
-    /// Whether this spelling needs a SemVer 2-aware client.
-    ///
-    /// NuGet deliberately keeps its older four-component version extension in
-    /// the SemVer 1-compatible set. Only dotted prerelease labels and build
-    /// metadata opt a package version into SemVer 2.
-    fn is_semver2_specific(value: &str) -> bool {
-        let value = value.trim();
-        let (without_metadata, metadata) = value
-            .split_once('+')
-            .map_or((value, None), |(version, metadata)| {
-                (version, Some(metadata))
-            });
-
-        metadata.is_some()
-            || without_metadata
-                .split_once('-')
-                .is_some_and(|(_, release)| release.contains('.'))
-    }
-
-    fn normalized(&self) -> String {
-        let mut normalized = format!(
-            "{}.{}.{}",
-            self.numbers[0], self.numbers[1], self.numbers[2]
-        );
-        if self.numbers[3] != 0 {
-            normalized.push('.');
-            normalized.push_str(&self.numbers[3].to_string());
-        }
-        if let Some(release) = &self.release {
-            normalized.push('-');
-            normalized.push_str(
-                &release
-                    .iter()
-                    .map(|label| match label {
-                        NuGetReleaseLabel::Numeric(value) => value.to_string(),
-                        NuGetReleaseLabel::Text(value) => value.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("."),
-            );
-        }
-        normalized
-    }
-}
-
 /// Whether two spellings identify the same NuGet version.
 ///
 /// Unparsable historical spellings retain the old case-insensitive exact-match
@@ -888,55 +754,6 @@ pub fn nuget_versions_match(stored: &str, requested: &str) -> bool {
     match (NuGetVersion::parse(stored), NuGetVersion::parse(requested)) {
         (Some(stored), Some(requested)) => stored == requested,
         _ => stored.eq_ignore_ascii_case(requested),
-    }
-}
-
-fn valid_nuget_labels(labels: &str, allow_numeric_leading_zeroes: bool) -> bool {
-    labels.split('.').all(|label| {
-        !label.is_empty()
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            && (allow_numeric_leading_zeroes
-                || label.len() == 1
-                || !label.starts_with('0')
-                || !label.bytes().all(|byte| byte.is_ascii_digit()))
-    })
-}
-
-impl Ord for NuGetVersion {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.numbers
-            .cmp(&other.numbers)
-            .then_with(|| match (&self.release, &other.release) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(left), Some(right)) => left.cmp(right),
-            })
-    }
-}
-
-impl PartialOrd for NuGetVersion {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NuGetReleaseLabel {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::Numeric(left), Self::Numeric(right)) => left.cmp(right),
-            (Self::Numeric(_), Self::Text(_)) => Ordering::Less,
-            (Self::Text(_), Self::Numeric(_)) => Ordering::Greater,
-            (Self::Text(left), Self::Text(right)) => left.cmp(right),
-        }
-    }
-}
-
-impl PartialOrd for NuGetReleaseLabel {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -961,10 +778,8 @@ impl NuGetVersionFilter {
     /// `semVerLevel >= 2.0.0` opts into SemVer 2; invalid input is equivalent to
     /// omitting the parameter, as required by the NuGet server contract.
     pub(crate) fn search(include_prerelease: bool, semver_level: Option<&str>) -> Self {
-        let semver2_floor = NuGetVersion {
-            numbers: [2, 0, 0, 0],
-            release: None,
-        };
+        let semver2_floor =
+            NuGetVersion::parse("2.0.0").expect("the static SemVer 2 floor must be valid NuGet");
         let include_semver2 = semver_level
             .and_then(NuGetVersion::parse)
             .is_some_and(|level| level >= semver2_floor);

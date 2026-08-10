@@ -10,6 +10,9 @@ pub struct Model {
     pub id: i64,
     pub package_id: i64,
     pub version: String,
+    /// Protocol-defined identity for versions whose raw spellings can alias.
+    /// Currently populated for parseable NuGet versions only.
+    pub protocol_version_key: Option<String>,
     /// Normalized semver string (for ordering/comparison)
     pub semver: Option<String>,
     /// Package-type-specific metadata (JSON)
