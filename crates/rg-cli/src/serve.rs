@@ -16,8 +16,8 @@ use crate::admin::validate_jwt_secret;
 use crate::config::{
     default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
     default_git_stream_timeout, default_git_timeout, ensure_regular_file, load_config_file,
-    resolve_encryption_key_file, resolve_settings, CliSettings, ResolvedSettings,
-    DEFAULT_LOG_MAX_SIZE_MB,
+    resolve_encryption_key_file, resolve_package_upload_max_bytes, resolve_settings, CliSettings,
+    ResolvedSettings, DEFAULT_LOG_MAX_SIZE_MB,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -588,6 +588,7 @@ pub(crate) async fn run_serve(
         .as_ref()
         .and_then(|c| c.rate_limit.auth_window_secs)
         .unwrap_or(60);
+    let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
 
     // SMTP: CLI takes precedence, fallback to config (the port is resolved
     // alongside the other dual-source knobs above).
@@ -1022,6 +1023,10 @@ pub(crate) async fn run_serve(
              LDAP/SSO auto-provision is unaffected."
         );
     }
+    tracing::info!(
+        max_bytes = resolved_package_upload_max_bytes,
+        "Package upload artifact ceiling configured"
+    );
 
     // One CI engine and one WebSocket hub for the whole process: the SSH
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
@@ -1053,6 +1058,7 @@ pub(crate) async fn run_serve(
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,
         registration: resolved_registration,
+        package_upload_max_bytes: resolved_package_upload_max_bytes,
         rate_limit_max: resolved_rate_limit_max,
         rate_limit_window_secs: resolved_rate_limit_window,
         rate_limit_trusted_proxies: resolved_rate_limit_trusted_proxies,

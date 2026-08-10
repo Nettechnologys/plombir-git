@@ -11,6 +11,10 @@ repo_root = "./repos"
 http_addr = "0.0.0.0:8080"
 ssh_addr = "0.0.0.0:2222"
 # host_key = "/path/to/ssh_host_key"
+# Maximum decoded package artifact size. npm's base64/JSON and multipart
+# envelopes get bounded protocol headroom, so this remains the real artifact
+# ceiling for every package manager rather than a smaller npm-only limit.
+package_upload_max_mb = 512
 
 [database]
 url = "sqlite://./forgekeep.db?mode=rwc"

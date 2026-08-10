@@ -245,6 +245,8 @@ pub struct StateOverrides {
     /// The default is `Open`, which is what almost every test needs: the
     /// harness's own `register_user` helper is how fixtures get accounts.
     pub registration: Option<rg_core::user::registration::RegistrationMode>,
+    /// Overrides the decoded package artifact ceiling for boundary tests.
+    pub package_upload_max_bytes: Option<usize>,
     /// Replaces this state's provenance signing identity.
     ///
     /// The default is derived from [`TEST_INSTANCE_KEY_SECRET`] rather than
@@ -324,6 +326,9 @@ pub fn build_test_app_state_with(
         external_runners: false,
         allow_host_runner: false,
         registration: overrides.registration.unwrap_or_default(),
+        package_upload_max_bytes: overrides
+            .package_upload_max_bytes
+            .unwrap_or(rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES),
         notification_hub: rg_http::ws::NotificationHub::new(),
         smtp_config: None,
         oci_storage: Arc::new(OciStorage::from_backend(blob_storage, oci_storage_path)),

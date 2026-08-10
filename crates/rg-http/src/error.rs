@@ -81,6 +81,8 @@ pub enum AppError {
     Gone(String),
     #[error("{0}")]
     TooManyRequests(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
     /// 502 — a host this instance does not own failed to answer: an identity
     /// provider that timed out, an upstream API that returned a `5xx`. The
     /// request was well-formed and no edit to it can help, so it must not be
@@ -113,6 +115,7 @@ impl AppError {
             Self::Conflict(_) => "CONFLICT",
             Self::Gone(_) => "GONE",
             Self::TooManyRequests(_) => "RATE_LIMITED",
+            Self::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
             Self::BadGateway(_) => "UPSTREAM_ERROR",
             Self::ServiceUnavailable(_) => "DB_UNAVAILABLE",
             Self::Timeout(_) => "GIT_TIMEOUT",
@@ -130,6 +133,7 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -377,6 +381,10 @@ impl AppError {
 
     pub fn rate_limited(msg: impl std::fmt::Display) -> Self {
         Self::TooManyRequests(msg.to_string())
+    }
+
+    pub fn payload_too_large(msg: impl std::fmt::Display) -> Self {
+        Self::PayloadTooLarge(msg.to_string())
     }
 
     /// 503 — a downstream dependency is unavailable (retryable).

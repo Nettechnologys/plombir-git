@@ -48,11 +48,16 @@ use sea_orm::DatabaseConnection;
 
 /// Default directory holding the built SPA bundle, relative to the server CWD.
 pub const DEFAULT_SPA_BUILD_DIR: &str = handlers::WEB_BUILD_DIR;
+/// Default maximum size of one decoded package artifact (512 MiB).
+pub const DEFAULT_PACKAGE_UPLOAD_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 /// Shared application state injected into every Axum handler via `State<AppState>`.
 #[derive(Clone)]
 pub struct AppState {
     pub repo_root: Arc<PathBuf>,
+    /// Maximum decoded package artifact size. Protocol envelopes receive only
+    /// bounded encoding headroom; this remains the stored-file ceiling.
+    pub package_upload_max_bytes: usize,
     /// Directory holding the built SPA bundle. Production uses
     /// [`DEFAULT_SPA_BUILD_DIR`]; tests can inject a temp fixture without
     /// mutating process-global cwd or env.
@@ -290,6 +295,8 @@ pub struct HttpServerConfig {
     /// Whether self-service registration is accepted. See
     /// [`AppState::registration`].
     pub registration: rg_core::user::registration::RegistrationMode,
+    /// Maximum decoded package artifact size in bytes.
+    pub package_upload_max_bytes: usize,
     /// Rate limit: max requests per window (0 = disabled).
     pub rate_limit_max: u32,
     /// Rate limit: window duration in seconds.
@@ -439,6 +446,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         external_runners: config.external_runners,
         allow_host_runner: config.allow_host_runner,
         registration: config.registration,
+        package_upload_max_bytes: config.package_upload_max_bytes,
         notification_hub: notification_hub.clone(),
         smtp_config: config.smtp_config,
         blob_storage,

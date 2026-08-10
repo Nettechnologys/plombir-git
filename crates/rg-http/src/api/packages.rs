@@ -23,20 +23,190 @@
 
 use crate::error::AppError;
 use axum::{
+    body::Body,
     extract::{FromRequest, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
 use base64::Engine as _;
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path as FsPath};
+use tokio::io::AsyncWriteExt as _;
 use utoipa::ToSchema;
 
 use crate::api::repo_access::{CiRead, Packages, RepoWrite};
 use crate::AppState;
 use rg_core::package_registry::encode_path_segment;
+
+/// Metadata and encoding headroom above the decoded artifact ceiling.
+///
+/// npm expands a tarball to `ceil(n * 4 / 3)` before JSON framing; multipart
+/// and Cargo add smaller envelopes. Keeping one bounded request allowance for
+/// all enveloped package protocols means the configured value remains the
+/// artifact ceiling rather than an npm-only 25% haircut.
+const PACKAGE_UPLOAD_ENVELOPE_HEADROOM: usize = 1024 * 1024;
+
+pub(crate) fn package_upload_envelope_limit(artifact_limit: usize) -> usize {
+    artifact_limit
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(PACKAGE_UPLOAD_ENVELOPE_HEADROOM)
+}
+
+#[derive(Debug)]
+struct StagedPackageUpload {
+    path: tempfile::TempPath,
+    len: usize,
+}
+
+impl StagedPackageUpload {
+    async fn into_vec(self) -> Result<Vec<u8>, AppError> {
+        let bytes = tokio::fs::read(&self.path).await.map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "package upload staging file",
+                &self.path,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+        if bytes.len() != self.len {
+            return Err(AppError::internal(format!(
+                "package upload staging file changed size before validation: expected {}, got {}",
+                self.len,
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Stream one request body to a request-private temporary file, refusing the
+/// first chunk that would cross `max_bytes`.
+///
+/// This deliberately takes `Body`, not `Bytes`: the latter invokes Axum's
+/// hidden 2 MiB extractor and buffers the complete request before the handler
+/// can enforce ForgeKeep's configured boundary.
+async fn stage_package_upload(
+    body: Body,
+    repo_root: &FsPath,
+    max_bytes: usize,
+) -> Result<StagedPackageUpload, AppError> {
+    let staging_dir = repo_root.join(".tmp").join("package-uploads");
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "package upload staging directory",
+                &staging_dir,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+    let staged = tempfile::Builder::new()
+        .prefix("package-")
+        .suffix(".upload")
+        .tempfile_in(&staging_dir)
+        .map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "package upload staging file",
+                &staging_dir,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+    let (file, path) = staged.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut len = 0_usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            AppError::bad_request(format!("failed to read package upload body: {error}"))
+        })?;
+        len = len
+            .checked_add(chunk.len())
+            .filter(|size| *size <= max_bytes)
+            .ok_or_else(|| {
+                AppError::payload_too_large(format!(
+                    "package upload exceeds the configured {max_bytes}-byte request limit"
+                ))
+            })?;
+        file.write_all(&chunk).await.map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "package upload staging file",
+                &path,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+    }
+    file.flush().await.map_err(|error| {
+        AppError::internal(rg_core::platform::fs::describe_path_error(
+            "package upload staging file",
+            &path,
+            &error,
+            rg_core::platform::fs::BLOB_STORAGE_HINT,
+        ))
+    })?;
+    drop(file);
+
+    Ok(StagedPackageUpload { path, len })
+}
+
+async fn collect_package_upload(
+    state: &AppState,
+    body: Body,
+    max_request_bytes: usize,
+) -> Result<Vec<u8>, axum::response::Response> {
+    let staged = stage_package_upload(body, &state.repo_root, max_request_bytes)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    staged.into_vec().await.map_err(IntoResponse::into_response)
+}
+
+#[cfg(test)]
+mod package_upload_staging_tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    #[tokio::test]
+    async fn request_chunks_are_spooled_and_the_temporary_file_is_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(axum::body::Bytes::from_static(b"first-")),
+            Ok::<_, Infallible>(axum::body::Bytes::from_static(b"second")),
+        ]));
+
+        let staged = stage_package_upload(body, root.path(), 12).await.unwrap();
+        let path = staged.path.to_path_buf();
+        assert!(
+            path.exists(),
+            "the bounded ingress must be a real spool file"
+        );
+        assert_eq!(staged.len, 12);
+        assert_eq!(staged.into_vec().await.unwrap(), b"first-second");
+        assert!(!path.exists(), "TempPath must retire the spool after use");
+    }
+
+    #[tokio::test]
+    async fn crossing_the_ceiling_returns_413_and_leaves_no_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let error = stage_package_upload(Body::from("12345"), root.path(), 4)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error
+            .to_string()
+            .contains("configured 4-byte request limit"));
+
+        let entries = std::fs::read_dir(root.path().join(".tmp/package-uploads"))
+            .unwrap()
+            .count();
+        assert_eq!(entries, 0, "a refused upload left a staging file behind");
+    }
+}
 
 // ── Request / Response types ─────────────────────────────
 
@@ -104,6 +274,7 @@ struct DecodedNpmPublish {
 fn decode_npm_publish_packument(
     path_name: &str,
     packument: NpmPublishPackument,
+    artifact_limit: usize,
 ) -> Result<DecodedNpmPublish, String> {
     if packument.id != path_name || packument.name != path_name {
         return Err(format!(
@@ -143,6 +314,11 @@ fn decode_npm_publish_packument(
         .attachments
         .get(&filename)
         .ok_or_else(|| format!("npm publish packument is missing attachment '{filename}'"))?;
+    if attachment.length > artifact_limit {
+        return Err(format!(
+            "npm tarball attachment exceeds the configured {artifact_limit}-byte artifact limit"
+        ));
+    }
     let tarball = base64::engine::general_purpose::STANDARD
         .decode(&attachment.data)
         .map_err(|error| format!("npm tarball attachment is not valid base64: {error}"))?;
@@ -187,7 +363,7 @@ mod npm_publish_packument_tests {
     }
 
     fn decode(document: serde_json::Value) -> Result<DecodedNpmPublish, String> {
-        decode_npm_publish_packument(NAME, serde_json::from_value(document).unwrap())
+        decode_npm_publish_packument(NAME, serde_json::from_value(document).unwrap(), usize::MAX)
     }
 
     #[test]
@@ -226,6 +402,16 @@ mod npm_publish_packument_tests {
         assert!(decode(provenance)
             .unwrap_err()
             .contains("provenance attachments are not supported"));
+    }
+
+    #[test]
+    fn declared_tarball_size_is_rejected_before_base64_decode() {
+        let mut value = document();
+        value["_attachments"][FILENAME]["length"] = serde_json::json!(8);
+        value["_attachments"][FILENAME]["data"] = serde_json::json!("not base64");
+        let error = decode_npm_publish_packument(NAME, serde_json::from_value(value).unwrap(), 7)
+            .unwrap_err();
+        assert!(error.contains("7-byte artifact limit"), "{error}");
     }
 }
 
@@ -396,6 +582,7 @@ fn resolve_publish_info(
         (status = 200, description = "Updated existing package", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),
         (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]
@@ -407,9 +594,13 @@ pub async fn publish(
     Path((owner, name, pkg_type)): Path<(String, String, String)>,
     Query(query): Query<PublishPackageQuery>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
     let filename = filename_from_disposition(&headers);
+    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     publish_package(state, user_id, owner, name, pkg_type, query, filename, body).await
 }
 
@@ -528,6 +719,7 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
         (status = 400, description = "Malformed form, package, or digest", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 409, description = "Distribution already exists", body = serde_json::Value),
+        (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),
         (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]
@@ -606,7 +798,7 @@ pub async fn pypi_legacy_upload(
         "pypi".to_string(),
         query,
         filename,
-        content,
+        content.to_vec(),
     )
     .await;
     // Twine's legacy upload contract uses 200 for a successful POST. Keep the
@@ -675,12 +867,18 @@ pub async fn nuget_publish(
         };
         // NuGet.Client deliberately sends a random filename; using the same
         // stable spelling also makes a repeated file hit the uniqueness guard.
-        ("package.nupkg".to_string(), body)
+        ("package.nupkg".to_string(), body.to_vec())
     } else {
         let filename = filename_from_disposition(&headers);
-        let body = match axum::body::Bytes::from_request(request, &state).await {
+        let body = match collect_package_upload(
+            &state,
+            request.into_body(),
+            state.package_upload_max_bytes,
+        )
+        .await
+        {
             Ok(body) => body,
-            Err(rejection) => return rejection.into_response(),
+            Err(response) => return response,
         };
         (filename, body)
     };
@@ -707,8 +905,15 @@ async fn publish_package(
     pkg_type: String,
     query: PublishPackageQuery,
     filename: String,
-    body: axum::body::Bytes,
+    body: Vec<u8>,
 ) -> axum::response::Response {
+    if body.len() > state.package_upload_max_bytes {
+        return AppError::payload_too_large(format!(
+            "package artifact exceeds the configured {}-byte limit",
+            state.package_upload_max_bytes
+        ))
+        .into_response();
+    }
     if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
         return err(
             StatusCode::BAD_REQUEST,
@@ -792,7 +997,7 @@ async fn persist_package(
     pkg_type: String,
     query: PublishPackageQuery,
     filename: String,
-    body: axum::body::Bytes,
+    body: Vec<u8>,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
 ) -> axum::response::Response {
     let resolved = match resolve_publish_info(&query, adapter_meta) {
@@ -815,7 +1020,7 @@ async fn persist_package(
         homepage: resolved.homepage,
         repository_url: resolved.repository_url,
         author_id: user_id,
-        files: vec![(filename, body.to_vec())],
+        files: vec![(filename, body)],
     };
 
     match rg_core::package_registry::service::publish(&state.db, &storage, info).await {
@@ -860,23 +1065,33 @@ async fn persist_package(
         (status = 200, description = "Updated existing package", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),
         (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]
 pub async fn publish_npm(
     State(state): State<AppState>,
-    gate: RepoWrite,
+    RepoWrite {
+        actor_id: user_id, ..
+    }: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<PublishPackageQuery>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
-    publish(
-        State(state),
-        gate,
-        Path((owner, name, "npm".to_string())),
-        Query(query),
-        headers,
+    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let filename = filename_from_disposition(&headers);
+    publish_package(
+        state,
+        user_id,
+        owner,
+        name,
+        "npm".to_string(),
+        query,
+        filename,
         body,
     )
     .await
@@ -902,6 +1117,7 @@ pub async fn publish_npm(
         (status = 400, description = "Malformed or unsupported packument", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 409, description = "Package version already exists", body = serde_json::Value),
+        (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),
         (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]
@@ -911,8 +1127,18 @@ pub async fn publish_npm_packument(
         actor_id: user_id, ..
     }: RepoWrite,
     Path((owner, repo, pkg_name)): Path<(String, String, String)>,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
+    let body = match collect_package_upload(
+        &state,
+        body,
+        package_upload_envelope_limit(state.package_upload_max_bytes),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let packument = match serde_json::from_slice::<NpmPublishPackument>(&body) {
         Ok(packument) => packument,
         Err(error) => {
@@ -922,10 +1148,22 @@ pub async fn publish_npm_packument(
             )
         }
     };
-    let decoded = match decode_npm_publish_packument(&pkg_name, packument) {
-        Ok(decoded) => decoded,
-        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
-    };
+    if packument
+        .attachments
+        .values()
+        .any(|attachment| attachment.length > state.package_upload_max_bytes)
+    {
+        return AppError::payload_too_large(format!(
+            "npm tarball attachment exceeds the configured {}-byte artifact limit",
+            state.package_upload_max_bytes
+        ))
+        .into_response();
+    }
+    let decoded =
+        match decode_npm_publish_packument(&pkg_name, packument, state.package_upload_max_bytes) {
+            Ok(decoded) => decoded,
+            Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+        };
 
     // The envelope and the URL are claims; package.json inside the tarball is
     // the artifact's own identity. Refuse disagreement rather than relying on
@@ -965,7 +1203,7 @@ pub async fn publish_npm_packument(
         "npm".to_string(),
         query,
         decoded.filename,
-        decoded.tarball.into(),
+        decoded.tarball,
         Some(metadata),
     )
     .await
@@ -2146,8 +2384,18 @@ pub async fn cargo_publish_new(
         actor_id: user_id, ..
     }: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
+    let body = match collect_package_upload(
+        &state,
+        body,
+        package_upload_envelope_limit(state.package_upload_max_bytes),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let (metadata, archive) = match split_cargo_publish_frame(&body) {
         Ok(split) => split,
         Err(reason) => {
@@ -2195,7 +2443,7 @@ pub async fn cargo_publish_new(
         "cargo".to_string(),
         query,
         filename,
-        axum::body::Bytes::copy_from_slice(archive),
+        archive.to_vec(),
     )
     .await;
 
@@ -2302,11 +2550,16 @@ async fn cargo_set_yanked(
 /// the pattern rather than a capture: the shared handler would read `{m3}` as
 /// the file and mistake the coordinate for one segment short.
 pub async fn maven_upload_metadata(
-    _state: State<AppState>,
+    State(state): State<AppState>,
     _write: RepoWrite,
     _params: axum::extract::RawPathParams,
-    _body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
+    if let Err(response) =
+        collect_package_upload(&state, body, state.package_upload_max_bytes).await
+    {
+        return response;
+    }
     (StatusCode::OK, "").into_response()
 }
 
@@ -2338,8 +2591,12 @@ pub async fn maven_upload(
         actor_id: user_id, ..
     }: RepoWrite,
     params: axum::extract::RawPathParams,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
+    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let request = MavenRequest::from_params(&params);
 
     let Some((filename, head)) = request.segments.split_last() else {
@@ -3328,8 +3585,12 @@ pub async fn rubygems_push(
         actor_id: user_id, ..
     }: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> axum::response::Response {
+    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let Some(adapter) = rg_core::package_registry::get_adapter("rubygems") else {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,

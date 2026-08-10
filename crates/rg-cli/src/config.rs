@@ -66,6 +66,10 @@ pub(crate) struct ServerConfig {
     pub(crate) http_addr: Option<String>,
     pub(crate) ssh_addr: Option<String>,
     pub(crate) host_key: Option<String>,
+    /// Maximum decoded package artifact size in MiB. Protocol envelopes such
+    /// as npm's base64 JSON receive bounded headroom above this value, but the
+    /// artifact stored in the registry may never exceed it.
+    pub(crate) package_upload_max_mb: Option<u64>,
     /// External-facing URL for SSO callbacks and links (e.g., "https://git.example.com")
     pub(crate) external_url: Option<String>,
     /// Grace window (seconds) for draining in-flight requests and the CI-log
@@ -459,6 +463,30 @@ pub(crate) const DEFAULT_RATE_LIMIT_MAX: u32 = 0;
 pub(crate) const DEFAULT_RATE_LIMIT_WINDOW: u64 = 60;
 pub(crate) const DEFAULT_LOG_MAX_SIZE_MB: u64 = 10;
 pub(crate) const DEFAULT_LOG_MAX_FILES: usize = 5;
+pub(crate) const DEFAULT_PACKAGE_UPLOAD_MAX_MB: u64 =
+    (rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES / (1024 * 1024)) as u64;
+
+/// Resolve `[server].package_upload_max_mb` to the byte ceiling consumed by
+/// rg-http. Zero and values that cannot fit the current platform fail startup
+/// instead of silently disabling or wrapping the resource boundary.
+pub(crate) fn resolve_package_upload_max_bytes(cfg: Option<&ConfigFile>) -> anyhow::Result<usize> {
+    let max_mb = cfg
+        .and_then(|config| config.server.package_upload_max_mb)
+        .unwrap_or(DEFAULT_PACKAGE_UPLOAD_MAX_MB);
+    if max_mb == 0 {
+        anyhow::bail!("config `server.package_upload_max_mb` must be greater than zero");
+    }
+    let bytes = max_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+        anyhow::anyhow!(
+            "config `server.package_upload_max_mb` is too large to convert to bytes: {max_mb}"
+        )
+    })?;
+    usize::try_from(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "config `server.package_upload_max_mb` does not fit this platform: {max_mb} MiB"
+        )
+    })
+}
 
 /// `--db-url` > `[database].url` > [`DEFAULT_DB_URL`].
 ///
@@ -710,6 +738,39 @@ max_files = 7
         assert_eq!(resolved.rate_limit_window, 30);
         assert_eq!(resolved.log_max_size_mb, 42);
         assert_eq!(resolved.log_max_files, 7);
+    }
+
+    #[test]
+    fn package_upload_ceiling_is_explicit_bounded_and_nonzero() {
+        assert_eq!(
+            super::resolve_package_upload_max_bytes(None).unwrap(),
+            rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES
+        );
+
+        let configured: ConfigFile = toml::from_str(
+            r#"
+[server]
+package_upload_max_mb = 3
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::resolve_package_upload_max_bytes(Some(&configured)).unwrap(),
+            3 * 1024 * 1024
+        );
+
+        let zero: ConfigFile = toml::from_str(
+            r#"
+[server]
+package_upload_max_mb = 0
+"#,
+        )
+        .unwrap();
+        let error = super::resolve_package_upload_max_bytes(Some(&zero)).unwrap_err();
+        assert!(
+            error.to_string().contains("must be greater than zero"),
+            "{error:#}"
+        );
     }
 
     /// The documented order is `CLI args > config file > defaults`

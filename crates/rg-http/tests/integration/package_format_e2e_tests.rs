@@ -2,7 +2,10 @@
 
 use std::io::{Cursor, Write};
 
-use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, spawn_test_app_with_db, spawn_test_app_with_overrides,
+    StateOverrides,
+};
 use base64::Engine as _;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -34,6 +37,12 @@ fn tar_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
     gzip(&tar_archive(files))
+}
+
+fn tar_gz_uncompressed(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+    encoder.write_all(&tar_archive(files)).unwrap();
+    encoder.finish().unwrap()
 }
 
 fn zip_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -464,6 +473,175 @@ async fn nine_native_package_formats_publish_index_and_download() {
         .await
         .unwrap();
     assert_eq!(registries["registries"].as_array().unwrap().len(), 9);
+}
+
+/// The configured value is the decoded artifact ceiling, not Axum's extractor
+/// ceiling and not npm's larger base64/JSON request size.
+#[tokio::test]
+async fn large_generic_and_npm_artifacts_cross_two_mib_but_not_the_configured_ceiling() {
+    const MIB: usize = 1024 * 1024;
+    const ARTIFACT_LIMIT: usize = 3 * MIB;
+
+    let (base, _db) = spawn_test_app_with_overrides(StateOverrides {
+        package_upload_max_bytes: Some(ARTIFACT_LIMIT),
+        ..StateOverrides::default()
+    })
+    .await;
+    let (token, _) = register_full(&base, "matrix-owner", "large-package@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let generic = vec![0x5a; 2 * MIB + 64 * 1024];
+    let mut generic_publish = package_url(&base, &["generic", "publish"]);
+    generic_publish
+        .query_pairs_mut()
+        .append_pair("name", "large-generic")
+        .append_pair("version", "1.0.0");
+    let response = client
+        .post(generic_publish)
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"large-generic-1.0.0.bin\"",
+        )
+        .body(generic.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "large generic publish: {}",
+        response.text().await.unwrap()
+    );
+    let downloaded = client
+        .get(package_url(
+            &base,
+            &[
+                "generic",
+                "large-generic",
+                "1.0.0",
+                "large-generic-1.0.0.bin",
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), generic);
+
+    let package_json = br#"{ "name": "large-npm", "version": "1.0.0" }"#;
+    let padding = vec![0xa5; 2 * MIB + 64 * 1024];
+    let tarball = tar_gz_uncompressed(&[
+        ("package/package.json", package_json.as_slice()),
+        ("package/padding.bin", padding.as_slice()),
+    ]);
+    assert!(tarball.len() > 2 * MIB, "fixture did not cross 2 MiB");
+    assert!(
+        tarball.len() < ARTIFACT_LIMIT,
+        "fixture crossed test ceiling"
+    );
+    let attachment = "large-npm-1.0.0.tgz";
+    let packument = serde_json::json!({
+        "_id": "large-npm",
+        "name": "large-npm",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": { "name": "large-npm", "version": "1.0.0" }
+        },
+        "_attachments": {
+            attachment: {
+                "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                "length": tarball.len()
+            }
+        }
+    });
+    let npm_url = package_url(&base, &["npm", "large-npm"]);
+    let response = client
+        .put(npm_url.clone())
+        .bearer_auth(&token)
+        .json(&packument)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "large npm publish: {}",
+        response.text().await.unwrap()
+    );
+    let document: serde_json::Value = client
+        .get(npm_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tarball_url = document["versions"]["1.0.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap();
+    let downloaded = client.get(tarball_url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), tarball);
+
+    let mut too_large_url = package_url(&base, &["generic", "publish"]);
+    too_large_url
+        .query_pairs_mut()
+        .append_pair("name", "too-large")
+        .append_pair("version", "1.0.0");
+    let response = client
+        .post(too_large_url)
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"too-large.bin\"",
+        )
+        .body(vec![0; ARTIFACT_LIMIT + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains(&format!("configured {ARTIFACT_LIMIT}-byte request limit")),
+        "{body}"
+    );
+
+    let oversized_npm_manifest = br#"{ "name": "too-large-npm", "version": "1.0.0" }"#;
+    let oversized_padding = vec![0x3c; ARTIFACT_LIMIT];
+    let oversized_tarball = tar_gz_uncompressed(&[
+        ("package/package.json", oversized_npm_manifest.as_slice()),
+        ("package/padding.bin", oversized_padding.as_slice()),
+    ]);
+    assert!(oversized_tarball.len() > ARTIFACT_LIMIT);
+    let oversized_packument = serde_json::json!({
+        "_id": "too-large-npm",
+        "name": "too-large-npm",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": { "name": "too-large-npm", "version": "1.0.0" }
+        },
+        "_attachments": {
+            "too-large-npm-1.0.0.tgz": {
+                "data": base64::engine::general_purpose::STANDARD.encode(&oversized_tarball),
+                "length": oversized_tarball.len()
+            }
+        }
+    });
+    let response = client
+        .put(package_url(&base, &["npm", "too-large-npm"]))
+        .bearer_auth(&token)
+        .json(&oversized_packument)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains(&format!("configured {ARTIFACT_LIMIT}-byte artifact limit")),
+        "{body}"
+    );
 }
 
 #[tokio::test]

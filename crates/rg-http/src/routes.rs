@@ -7,6 +7,7 @@
 //! the table of `(method, path, access)` rows that falls out of the build is
 //! what the sweep test walks. See [`crate::route_table`].
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::MethodRouter;
 use axum::Router;
@@ -863,6 +864,15 @@ pub(crate) fn build_all_routes(
     });
     let limit_10gb = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
         mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
+    });
+    // Multipart package clients add framing around the artifact (and npm adds
+    // base64 JSON on its own route). Lift Axum's hidden 2 MiB extractor limit
+    // to a bounded envelope allowance; `publish_package` independently checks
+    // the decoded artifact against the configured real ceiling.
+    let package_envelope_limit =
+        api::packages::package_upload_envelope_limit(state.package_upload_max_bytes);
+    let package_envelope = Wrap::plain(move |mr: MethodRouter<AppState>| {
+        mr.layer(DefaultBodyLimit::max(package_envelope_limit))
     });
 
     // ── Git Smart HTTP routes ──────────────────────────────────────────────
@@ -2012,15 +2022,17 @@ pub(crate) fn build_all_routes(
         // Twine's legacy upload API. Both spellings are deliberate: users copy
         // repository URLs with and without the trailing slash, and Twine POSTs
         // to exactly what it was given rather than normalizing the path.
-        .post(
+        .post_with(
             RepoWrite,
             "/repos/{owner}/{name}/packages/pypi/legacy/",
             api::packages::pypi_legacy_upload,
+            &package_envelope,
         )
-        .post(
+        .post_with(
             RepoWrite,
             "/repos/{owner}/{name}/packages/pypi/legacy",
             api::packages::pypi_legacy_upload,
+            &package_envelope,
         )
         // PyPI Simple Repository API (PEP 503)
         //
@@ -2097,15 +2109,17 @@ pub(crate) fn build_all_routes(
         // which every existing publisher uses — away from the generic route and
         // answered *it* 405 instead. Same reason npm spells both of its own
         // routes out rather than leaning on the generic ones.
-        .post(
+        .post_with(
             RepoWrite,
             "/repos/{owner}/{name}/packages/nuget/publish",
             api::packages::nuget_publish,
+            &package_envelope,
         )
-        .put(
+        .put_with(
             RepoWrite,
             "/repos/{owner}/{name}/packages/nuget/publish",
             api::packages::nuget_publish,
+            &package_envelope,
         )
         // RubyGems compact index — see `rubygems_protocol_routes`.
         .with(rubygems_protocol_routes)
