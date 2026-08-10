@@ -720,12 +720,26 @@ pub fn build_search_results(results: &[NuGetSearchResult], total_hits: usize) ->
             }
             item.insert(
                 "versions".into(),
-                serde_json::json!([{
-                    "version": r.version,
-                    "downloads": 0,
-                }]),
+                r.versions
+                    .iter()
+                    .map(|version| {
+                        serde_json::json!({
+                            "@id": registration_leaf_id(&r.registration_url, &version.version),
+                            "version": version.version,
+                            "downloads": version.downloads,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
             );
-            item.insert("totalDownloads".into(), serde_json::Value::Number(0.into()));
+            item.insert(
+                "totalDownloads".into(),
+                r.versions
+                    .iter()
+                    .map(|version| version.downloads)
+                    .sum::<i64>()
+                    .into(),
+            );
             item.insert("verified".into(), serde_json::Value::Bool(false));
             serde_json::Value::Object(item)
         })
@@ -741,9 +755,17 @@ pub fn build_search_results(results: &[NuGetSearchResult], total_hits: usize) ->
 pub struct NuGetSearchResult {
     pub name: String,
     pub version: String,
+    pub versions: Vec<NuGetSearchVersion>,
     pub description: Option<String>,
     pub tags: Option<String>,
     pub registration_url: String,
+}
+
+/// One version advertised by NuGet SearchQueryService.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NuGetSearchVersion {
+    pub version: String,
+    pub downloads: i64,
 }
 
 /// Whether two spellings identify the same NuGet version.
@@ -790,6 +812,20 @@ impl NuGetVersionFilter {
             allow_legacy_fallback: false,
         }
     }
+
+    /// Parse one live version when it is visible to this client capability set.
+    pub(crate) fn candidate(self, version: &str, is_yanked: bool) -> Option<NuGetVersion> {
+        if is_yanked {
+            return None;
+        }
+        let parsed = NuGetVersion::parse(version)?;
+        if (!self.include_prerelease && parsed.is_prerelease())
+            || (!self.include_semver2 && NuGetVersion::is_semver2_specific(version))
+        {
+            return None;
+        }
+        Some(parsed)
+    }
 }
 
 /// Pick the highest live version allowed by one NuGet client capability mode.
@@ -805,20 +841,13 @@ pub(crate) fn latest_live_nuget<'a>(
     let mut latest: Option<(NuGetVersion, &'a str)> = None;
 
     for (version, is_yanked) in versions {
-        if is_yanked {
-            continue;
-        }
-        let Some(parsed) = NuGetVersion::parse(version) else {
-            if filter.allow_legacy_fallback {
+        let Some(parsed) = filter.candidate(version, is_yanked) else {
+            if !is_yanked && filter.allow_legacy_fallback && NuGetVersion::parse(version).is_none()
+            {
                 fallback.get_or_insert(version);
             }
             continue;
         };
-        if (!filter.include_prerelease && parsed.is_prerelease())
-            || (!filter.include_semver2 && NuGetVersion::is_semver2_specific(version))
-        {
-            continue;
-        }
         if latest.as_ref().is_none_or(|(current, _)| parsed > *current) {
             latest = Some((parsed, version));
         }
@@ -1325,9 +1354,19 @@ mod tests {
         let results = vec![NuGetSearchResult {
             name: "Newtonsoft.Json".into(),
             version: "13.0.3".into(),
+            versions: vec![
+                NuGetSearchVersion {
+                    version: "1.0.0".into(),
+                    downloads: 3,
+                },
+                NuGetSearchVersion {
+                    version: "13.0.3".into(),
+                    downloads: 7,
+                },
+            ],
             description: Some("Json.NET".into()),
             tags: Some("json serializer".into()),
-            registration_url: "https://example.com/reg".into(),
+            registration_url: "https://example.com/registration/newtonsoft.json/index.json".into(),
         }];
 
         let json = build_search_results(&results, 1);
@@ -1337,6 +1376,22 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], "Newtonsoft.Json");
         assert_eq!(data[0]["version"], "13.0.3");
+        assert_eq!(data[0]["totalDownloads"], 10);
+        assert_eq!(
+            data[0]["versions"],
+            serde_json::json!([
+                {
+                    "@id": "https://example.com/registration/newtonsoft.json/1.0.0",
+                    "version": "1.0.0",
+                    "downloads": 3,
+                },
+                {
+                    "@id": "https://example.com/registration/newtonsoft.json/13.0.3",
+                    "version": "13.0.3",
+                    "downloads": 7,
+                },
+            ])
+        );
     }
 
     #[test]

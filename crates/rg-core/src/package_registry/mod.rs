@@ -20,7 +20,7 @@ pub use adapters::nuget::{
     build_autocomplete_results, build_flat_container_index, build_registration_index,
     build_registration_leaf, build_search_results, build_service_index, normalize_package_id,
     nuget_versions_match, NuGetDependency, NuGetDependencyGroup, NuGetRegistrationEntry,
-    NuGetSearchResult,
+    NuGetSearchResult, NuGetSearchVersion,
 };
 pub use adapters::pypi::{
     build_simple_repository_html, build_simple_root_html, normalize_project_name, PyPIProjectEntry,
@@ -32,8 +32,8 @@ pub use adapters::rubygems::{
     CompactIndexVersion, RubyGemsDep, RubyGemsDependencyEntry, RubyGemsVersionEntry,
 };
 pub use service::{
-    package_types, FileDetail, PackageDetail, PackageSummary, PublishInfo, PublishResult,
-    VersionDetail,
+    package_types, FileDetail, NuGetSearchPackage, PackageDetail, PackageSummary, PublishInfo,
+    PublishResult, VersionDetail,
 };
 pub use storage::PackageStorage;
 pub use url_path::encode_path_segment;

@@ -84,6 +84,18 @@ pub struct PackageSummary {
     pub keywords: Option<String>,
 }
 
+/// Package metadata and the complete version set visible to NuGet Search.
+#[derive(Debug, Clone)]
+pub struct NuGetSearchPackage {
+    pub summary: PackageSummary,
+    pub versions: Vec<crate::package_registry::adapters::nuget::NuGetSearchVersion>,
+}
+
+struct PackageSelection {
+    summary: PackageSummary,
+    nuget_versions: Vec<crate::package_registry::adapters::nuget::NuGetSearchVersion>,
+}
+
 /// Details of a specific package version.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VersionDetail {
@@ -715,14 +727,18 @@ pub async fn list_packages(
     repo: &str,
     package_type: &str,
 ) -> Result<Vec<PackageSummary>> {
-    list_packages_with_nuget_filter(
+    Ok(list_package_selections(
         db,
         owner,
         repo,
         package_type,
         crate::package_registry::adapters::nuget::NuGetVersionFilter::PACKAGE_SUMMARY,
+        false,
     )
-    .await
+    .await?
+    .into_iter()
+    .map(|selection| selection.summary)
+    .collect())
 }
 
 /// List packages discoverable through NuGet SearchQueryService and
@@ -733,8 +749,8 @@ pub async fn list_nuget_search_packages(
     repo: &str,
     include_prerelease: bool,
     semver_level: Option<&str>,
-) -> Result<Vec<PackageSummary>> {
-    let mut packages = list_packages_with_nuget_filter(
+) -> Result<Vec<NuGetSearchPackage>> {
+    let packages = list_package_selections(
         db,
         owner,
         repo,
@@ -743,19 +759,27 @@ pub async fn list_nuget_search_packages(
             include_prerelease,
             semver_level,
         ),
+        true,
     )
     .await?;
-    packages.retain(|package| package.latest_version.is_some());
-    Ok(packages)
+    Ok(packages
+        .into_iter()
+        .filter(|selection| selection.summary.latest_version.is_some())
+        .map(|selection| NuGetSearchPackage {
+            summary: selection.summary,
+            versions: selection.nuget_versions,
+        })
+        .collect())
 }
 
-async fn list_packages_with_nuget_filter(
+async fn list_package_selections(
     db: &DatabaseConnection,
     owner: &str,
     repo: &str,
     package_type: &str,
     nuget_filter: crate::package_registry::adapters::nuget::NuGetVersionFilter,
-) -> Result<Vec<PackageSummary>> {
+    collect_nuget_versions: bool,
+) -> Result<Vec<PackageSelection>> {
     let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
         .ok_or_else(|| not_found("repository"))?;
@@ -766,7 +790,7 @@ async fn list_packages_with_nuget_filter(
             .ok_or_else(|| not_found("package registry"))?;
 
     let packages = rg_db::ops::package_ops::list_by_registry(db, registry.id).await?;
-    let mut summaries = Vec::new();
+    let mut selections = Vec::new();
 
     for pkg in packages {
         let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
@@ -789,21 +813,49 @@ async fn list_packages_with_nuget_filter(
                 .map(|version| version.version.as_str()),
         }
         .map(str::to_string);
+        let mut nuget_versions = if collect_nuget_versions {
+            versions
+                .iter()
+                .filter_map(|version| {
+                    nuget_filter
+                        .candidate(&version.version, version.is_yanked)
+                        .map(|parsed| {
+                            (
+                                parsed,
+                                crate::package_registry::adapters::nuget::NuGetSearchVersion {
+                                    version: version.version.clone(),
+                                    downloads: version.download_count,
+                                },
+                            )
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        nuget_versions.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let nuget_versions = nuget_versions
+            .into_iter()
+            .map(|(_, version)| version)
+            .collect();
         let count = versions.len() as i64;
 
-        summaries.push(PackageSummary {
-            id: pkg.id,
-            name: pkg.name.clone(),
-            description: pkg.description.clone(),
-            homepage: pkg.homepage.clone(),
-            version_count: count,
-            latest_version: latest,
-            download_count: pkg.download_count,
-            keywords: None, // package DB table doesn't store keywords; extracted from versions
+        selections.push(PackageSelection {
+            summary: PackageSummary {
+                id: pkg.id,
+                name: pkg.name.clone(),
+                description: pkg.description.clone(),
+                homepage: pkg.homepage.clone(),
+                version_count: count,
+                latest_version: latest,
+                download_count: pkg.download_count,
+                keywords: None, // package DB table doesn't store keywords; extracted from versions
+            },
+            nuget_versions,
         });
     }
 
-    Ok(summaries)
+    Ok(selections)
 }
 
 /// Get a package by name.

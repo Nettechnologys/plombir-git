@@ -371,12 +371,18 @@ async fn autocomplete_nuget(
         .unwrap()
 }
 
-fn nuget_search_version<'a>(search: &'a serde_json::Value, package: &str) -> Option<&'a str> {
+fn nuget_search_result<'a>(
+    search: &'a serde_json::Value,
+    package: &str,
+) -> Option<&'a serde_json::Value> {
     search["data"]
         .as_array()?
         .iter()
-        .find(|result| result["id"] == package)?["version"]
-        .as_str()
+        .find(|result| result["id"] == package)
+}
+
+fn nuget_search_version<'a>(search: &'a serde_json::Value, package: &str) -> Option<&'a str> {
+    nuget_search_result(search, package)?["version"].as_str()
 }
 
 fn nuget_autocomplete_names(autocomplete: &serde_json::Value) -> Vec<&str> {
@@ -994,6 +1000,62 @@ async fn nuget_search_and_autocomplete_filter_prerelease_semver2_and_yanked_vers
         nuget_search_version(&all_versions, "Matrix.PrereleaseOnly"),
         Some("7.0.0-alpha.1")
     );
+
+    // SearchQueryService groups every live version allowed by the same
+    // capability flags that selected the top-level `version`. It must not
+    // collapse that group back to the latest row or leak a prerelease,
+    // SemVer 2, or yanked row through a differently-filtered path.
+    for (search, expected) in [
+        (&stable_semver1, vec!["1.0.0"]),
+        (&prerelease_semver1, vec!["1.0.0", "4.0.0-beta"]),
+        (&stable_semver2, vec!["1.0.0", "6.0.0+build.7"]),
+        (
+            &all_versions,
+            vec!["1.0.0", "4.0.0-beta", "5.0.0-beta.1", "6.0.0+build.7"],
+        ),
+    ] {
+        let result = nuget_search_result(search, "Matrix.SearchModes")
+            .unwrap_or_else(|| panic!("search result missing: {search}"));
+        let actual = result["versions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("versions missing: {result}"))
+            .iter()
+            .map(|version| version["version"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "wrong capability-filtered set: {result}");
+        assert_eq!(
+            result["version"],
+            expected.last().copied().unwrap(),
+            "latest must be the maximum advertised version: {result}"
+        );
+    }
+
+    let search_modes = nuget_search_result(&all_versions, "Matrix.SearchModes").unwrap();
+    let version_rows = search_modes["versions"].as_array().unwrap();
+    let leaf_ids = version_rows
+        .iter()
+        .map(|version| {
+            assert_eq!(version["downloads"], 0, "{version}");
+            version["@id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("registration leaf @id missing: {version}"))
+        })
+        .collect::<Vec<_>>();
+    let unique_leaf_ids = leaf_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique_leaf_ids.len(), leaf_ids.len(), "{search_modes}");
+
+    for (version, leaf_id) in version_rows.iter().zip(leaf_ids) {
+        let leaf_response = client.get(leaf_id).send().await.unwrap();
+        assert_eq!(leaf_response.status(), StatusCode::OK, "{version}");
+        let leaf = leaf_response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(leaf["@id"], leaf_id, "{leaf}");
+
+        let head = client.head(leaf_id).send().await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK, "{version}");
+    }
 
     let invalid_semver_level = search_nuget(
         &client,

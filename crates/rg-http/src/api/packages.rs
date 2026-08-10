@@ -3400,25 +3400,21 @@ pub async fn nuget_search(
     let query_lower = query.to_lowercase();
 
     for pkg in &packages {
-        let name_lower = pkg.name.to_lowercase();
+        let name_lower = pkg.summary.name.to_lowercase();
         // Simple substring match
         if query.is_empty() || name_lower.contains(&query_lower) {
-            let Some(version) = pkg.latest_version.clone() else {
+            let Some(version) = pkg.summary.latest_version.clone() else {
                 continue;
             };
-            let registration_url = format!(
-                "{}/api/v1/repos/{}/{}/packages/nuget/registration/{}/index.json",
-                base_url.trim_end_matches('/'),
-                encode_path_segment(&owner),
-                encode_path_segment(&name),
-                encode_path_segment(&pkg.name),
-            );
+            let registration_url =
+                nuget_registration_url(&base_url, &owner, &name, &pkg.summary.name);
 
             results.push(rg_core::package_registry::NuGetSearchResult {
-                name: pkg.name.clone(),
+                name: pkg.summary.name.clone(),
                 version,
-                description: pkg.description.clone(),
-                tags: pkg.keywords.clone(),
+                versions: pkg.versions.clone(),
+                description: pkg.summary.description.clone(),
+                tags: pkg.summary.keywords.clone(),
                 registration_url,
             });
         }
@@ -3494,7 +3490,7 @@ async fn nuget_search_packages(
     repo: &str,
     include_prerelease: bool,
     semver_level: Option<&str>,
-) -> Result<Vec<rg_core::package_registry::PackageSummary>, axum::response::Response> {
+) -> Result<Vec<rg_core::package_registry::NuGetSearchPackage>, axum::response::Response> {
     match rg_core::package_registry::service::list_nuget_search_packages(
         &state.db,
         owner,
@@ -3646,8 +3642,8 @@ pub async fn nuget_autocomplete(
 
     let names: Vec<String> = packages
         .into_iter()
-        .filter(|pkg| query.is_empty() || pkg.name.to_lowercase().contains(&query))
-        .map(|pkg| pkg.name)
+        .filter(|pkg| query.is_empty() || pkg.summary.name.to_lowercase().contains(&query))
+        .map(|pkg| pkg.summary.name)
         .collect();
     let total_hits = names.len();
     let json = rg_core::package_registry::build_autocomplete_results(&names, total_hits);
