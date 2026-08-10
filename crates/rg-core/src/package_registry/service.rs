@@ -4,7 +4,7 @@
 //! coordinating the DB ops and the storage layer.
 
 use anyhow::Context as _;
-use sea_orm::{DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
 
 use crate::error::not_found;
@@ -54,6 +54,9 @@ pub struct PublishInfo {
     pub description: Option<String>,
     pub homepage: Option<String>,
     pub repository_url: Option<String>,
+    /// The mutable npm selector carried by a real publish packument. `None`
+    /// for every other package protocol and for ForgeKeep's generic uploader.
+    pub npm_dist_tag: Option<String>,
     pub author_id: i64,
     /// File name → file data
     pub files: Vec<(String, Vec<u8>)>,
@@ -159,6 +162,15 @@ pub async fn publish(
     storage: &PackageStorage,
     info: PublishInfo,
 ) -> Result<PublishResult> {
+    if let Some(tag) = info.npm_dist_tag.as_deref() {
+        if info.package_type != package_types::NPM {
+            return Err(crate::error::invalid_request(
+                "an npm dist-tag cannot be attached to a non-npm package",
+            ));
+        }
+        validate_npm_dist_tag(tag)?;
+    }
+
     // 1. Find or create the package registry for this repo+type
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
         .await?
@@ -331,6 +343,31 @@ pub async fn publish(
             }
         }
 
+        // The version, its file row and the selector the client supplied are
+        // one promise.  Writing the tag after commit would let a DB failure
+        // return an error for a version that is nevertheless published; the
+        // retry would then conflict and the requested selector would remain
+        // lost.  Keep all three inside the visibility transaction.
+        if let Some(tag) = info.npm_dist_tag.as_deref() {
+            if let Err(error) = persist_npm_publish_dist_tag(&transaction, pkg.id, v.id, tag).await
+            {
+                rollback_publish_transaction(
+                    transaction,
+                    &info,
+                    "persisting the npm dist-tag failed",
+                )
+                .await;
+                discard_stored_files(
+                    storage,
+                    &stored_files,
+                    &info,
+                    "persisting the npm dist-tag failed",
+                )
+                .await;
+                return Err(error);
+            }
+        }
+
         if let Err(error) = transaction.commit().await {
             // A commit error has an ambiguous outcome when the connection dies:
             // deleting these private objects could turn a commit that reached
@@ -385,6 +422,74 @@ fn file_digests(stored: &StoredFile) -> rg_db::ops::package_file_ops::FileDigest
         sha1: Some(&stored.digests.sha1),
         sha512: Some(&stored.digests.sha512),
     }
+}
+
+/// Reject only selector spellings the protocol cannot address safely. npm's
+/// own CLI performs the richer npm-semver validation before sending a request;
+/// this server-side boundary still prevents empty/path-like/control names and
+/// the SemVer ranges Rust can recognize from entering the shared namespace.
+pub fn validate_npm_dist_tag(tag: &str) -> Result<()> {
+    if tag.is_empty()
+        || tag.len() > 255
+        || tag.trim() != tag
+        || tag == "_etag"
+        || matches!(tag, "." | "..")
+        || tag.contains(['/', '\\'])
+        || tag.chars().any(char::is_control)
+    {
+        return Err(crate::error::invalid_request("invalid npm dist-tag name"));
+    }
+    if semver::VersionReq::parse(tag).is_ok() {
+        return Err(crate::error::invalid_request(
+            "npm dist-tag name must not be a valid SemVer range",
+        ));
+    }
+    Ok(())
+}
+
+/// Turn a legacy package's derived `latest` into an explicit tag exactly once.
+///
+/// `skip_version_id` is the version being published in the same transaction.
+/// A first `--tag beta` publish must preserve the `latest` the client could read
+/// immediately before this request, not manufacture `latest=beta` from the new
+/// row that has not crossed the transaction boundary yet.
+async fn initialize_npm_dist_tags(
+    db: &impl ConnectionTrait,
+    package_id: i64,
+    skip_version_id: Option<i64>,
+) -> Result<()> {
+    let token = uuid::Uuid::new_v4().to_string();
+    if !rg_db::ops::npm_dist_tag_ops::ensure_initialized(db, package_id, &token).await? {
+        return Ok(());
+    }
+
+    let versions = rg_db::ops::package_version_ops::list_by_package(db, package_id).await?;
+    let legacy_latest = crate::package_registry::adapters::npm::latest_live_semver(
+        versions
+            .iter()
+            .filter(|version| Some(version.id) != skip_version_id)
+            .map(|version| (version.version.as_str(), version.is_yanked)),
+    );
+    if let Some(legacy_latest) = legacy_latest {
+        let version_id = versions
+            .iter()
+            .find(|version| version.version == legacy_latest)
+            .map(|version| version.id)
+            .ok_or_else(|| anyhow::anyhow!("selected legacy npm latest version disappeared"))?;
+        rg_db::ops::npm_dist_tag_ops::upsert(db, package_id, "latest", version_id).await?;
+    }
+    Ok(())
+}
+
+async fn persist_npm_publish_dist_tag(
+    db: &impl ConnectionTrait,
+    package_id: i64,
+    version_id: i64,
+    tag: &str,
+) -> Result<()> {
+    initialize_npm_dist_tags(db, package_id, Some(version_id)).await?;
+    rg_db::ops::npm_dist_tag_ops::upsert(db, package_id, tag, version_id).await?;
+    Ok(())
 }
 
 /// Roll back DB work that has not crossed the transaction boundary yet.
@@ -728,6 +833,108 @@ pub async fn list_versions(
 
     let versions = rg_db::ops::package_version_ops::list_by_package(db, pkg.id).await?;
     futures_for_versions(db, versions).await
+}
+
+async fn resolve_npm_package(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    name: &str,
+) -> Result<rg_db::entities::package::Model> {
+    let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
+        .await?
+        .ok_or_else(|| not_found("repository"))?;
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(
+        db,
+        repo_model.id,
+        package_types::NPM,
+    )
+    .await?
+    .ok_or_else(|| not_found("package registry"))?;
+    rg_db::ops::package_ops::find_by_registry_and_name(db, registry.id, name)
+        .await?
+        .ok_or_else(|| not_found("package"))
+}
+
+/// Read the package's canonical npm tag map. Packages that predate persisted
+/// tags retain their historical derived `latest` until the first tag mutation
+/// atomically materializes it.
+pub async fn list_npm_dist_tags(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    name: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let package = resolve_npm_package(db, owner, repo, name).await?;
+    if !rg_db::ops::npm_dist_tag_ops::is_initialized(db, package.id).await? {
+        let versions = rg_db::ops::package_version_ops::list_by_package(db, package.id).await?;
+        let latest = crate::package_registry::adapters::npm::latest_live_semver(
+            versions
+                .iter()
+                .map(|version| (version.version.as_str(), version.is_yanked)),
+        );
+        return Ok(latest
+            .map(|version| [("latest".to_string(), version.to_string())].into())
+            .unwrap_or_default());
+    }
+
+    let mut tags = std::collections::BTreeMap::new();
+    for (tag, version) in rg_db::ops::npm_dist_tag_ops::list_by_package(db, package.id).await? {
+        // npm has no yanked marker in either the tag listing or the packument.
+        // Advertising a tag to a version we omit from `versions` makes the
+        // selector resolve to a document entry that does not exist.
+        if is_install_candidate(version.is_yanked) {
+            tags.insert(tag, version.version);
+        }
+    }
+    Ok(tags)
+}
+
+/// Set or move a dist-tag to an existing live npm version.
+pub async fn set_npm_dist_tag(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    tag: &str,
+    version: &str,
+) -> Result<()> {
+    validate_npm_dist_tag(tag)?;
+    let package = resolve_npm_package(db, owner, repo, name).await?;
+    let transaction = db.begin().await?;
+    let version = rg_db::ops::package_version_ops::find_by_package_and_version(
+        &transaction,
+        package.id,
+        version,
+    )
+    .await?
+    .filter(|version| is_install_candidate(version.is_yanked))
+    .ok_or_else(|| not_found("package version"))?;
+
+    initialize_npm_dist_tags(&transaction, package.id, None).await?;
+    rg_db::ops::npm_dist_tag_ops::upsert(&transaction, package.id, tag, version.id).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Remove a dist-tag while keeping the initialized empty set distinguishable
+/// from a legacy package whose `latest` still needs compatibility derivation.
+pub async fn remove_npm_dist_tag(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    tag: &str,
+) -> Result<()> {
+    validate_npm_dist_tag(tag)?;
+    let package = resolve_npm_package(db, owner, repo, name).await?;
+    let transaction = db.begin().await?;
+    initialize_npm_dist_tags(&transaction, package.id, None).await?;
+    if !rg_db::ops::npm_dist_tag_ops::delete(&transaction, package.id, tag).await? {
+        return Err(not_found("npm dist-tag"));
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 /// Get a specific version.

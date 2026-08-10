@@ -456,7 +456,19 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
         PACKAGE_PROTOCOL,
     ),
     (
+        "GET /api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags",
+        PACKAGE_PROTOCOL,
+    ),
+    (
         "GET /api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/index.json",
+        PACKAGE_PROTOCOL,
+    ),
+    (
+        "GET /api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}",
+        PACKAGE_PROTOCOL,
+    ),
+    (
+        "HEAD /api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}",
         PACKAGE_PROTOCOL,
     ),
     (

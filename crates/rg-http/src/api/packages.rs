@@ -263,6 +263,7 @@ pub struct NpmPublishAttachment {
 struct DecodedNpmPublish {
     filename: String,
     version: String,
+    dist_tag: String,
     tarball: Vec<u8>,
 }
 
@@ -298,11 +299,15 @@ fn decode_npm_publish_packument(
         ));
     }
 
-    if packument.dist_tags.len() != 1
-        || packument.dist_tags.get("latest").map(String::as_str) != Some(version.as_str())
-    {
-        return Err("npm publish currently supports only the default 'latest' dist-tag".into());
+    let Some((dist_tag, tagged_version)) = packument.dist_tags.iter().next() else {
+        return Err("npm publish packument must contain exactly one dist-tag".into());
+    };
+    if packument.dist_tags.len() != 1 || tagged_version != &version {
+        return Err("npm publish dist-tag must name the version being published".into());
     }
+    rg_core::package_registry::service::validate_npm_dist_tag(dist_tag)
+        .map_err(|error| format!("{error:#}"))?;
+    let dist_tag = dist_tag.clone();
 
     let filename = format!("{path_name}-{version}.tgz");
     if packument.attachments.len() != 1 {
@@ -334,6 +339,7 @@ fn decode_npm_publish_packument(
     Ok(DecodedNpmPublish {
         filename,
         version,
+        dist_tag,
         tarball,
     })
 }
@@ -372,7 +378,17 @@ mod npm_publish_packument_tests {
         let decoded = decode(document()).unwrap();
         assert_eq!(decoded.filename, FILENAME);
         assert_eq!(decoded.version, VERSION);
+        assert_eq!(decoded.dist_tag, "latest");
         assert_eq!(decoded.tarball, b"tarball");
+    }
+
+    #[test]
+    fn a_named_dist_tag_is_kept_as_part_of_the_publish() {
+        let mut custom_tag = document();
+        custom_tag["dist-tags"] = serde_json::json!({ "beta": VERSION });
+        let decoded = decode(custom_tag).unwrap();
+        assert_eq!(decoded.dist_tag, "beta");
+        assert_eq!(decoded.version, VERSION);
     }
 
     #[test]
@@ -389,11 +405,17 @@ mod npm_publish_packument_tests {
             .unwrap_err()
             .contains("length mismatch"));
 
-        let mut custom_tag = document();
-        custom_tag["dist-tags"] = serde_json::json!({ "beta": VERSION });
-        assert!(decode(custom_tag)
+        let mut wrong_tag_target = document();
+        wrong_tag_target["dist-tags"] = serde_json::json!({ "beta": "9.9.9" });
+        assert!(decode(wrong_tag_target)
             .unwrap_err()
-            .contains("default 'latest' dist-tag"));
+            .contains("must name the version being published"));
+
+        let mut multiple_tags = document();
+        multiple_tags["dist-tags"] = serde_json::json!({ "latest": VERSION, "beta": VERSION });
+        assert!(decode(multiple_tags)
+            .unwrap_err()
+            .contains("must name the version being published"));
 
         let mut provenance = document();
         provenance["_attachments"]["@scope/matrix-1.2.3.sigstore"] = serde_json::json!({
@@ -985,6 +1007,7 @@ async fn publish_package(
         filename,
         body,
         adapter_meta,
+        None,
     )
     .await
 }
@@ -1000,6 +1023,7 @@ async fn persist_package(
     filename: String,
     body: Vec<u8>,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
+    npm_dist_tag: Option<String>,
 ) -> axum::response::Response {
     let resolved = match resolve_publish_info(&query, adapter_meta) {
         Ok(v) => v,
@@ -1020,6 +1044,7 @@ async fn persist_package(
         description: resolved.description,
         homepage: resolved.homepage,
         repository_url: resolved.repository_url,
+        npm_dist_tag,
         author_id: user_id,
         files: vec![(filename, body)],
     };
@@ -1206,6 +1231,7 @@ pub async fn publish_npm_packument(
         decoded.filename,
         decoded.tarball,
         Some(metadata),
+        Some(decoded.dist_tag),
     )
     .await
 }
@@ -1874,11 +1900,21 @@ pub async fn npm_registry_metadata(
         })
         .collect();
 
+    let dist_tags = match rg_core::package_registry::service::list_npm_dist_tags(
+        &state.db, &owner, &name, &pkg_name,
+    )
+    .await
+    {
+        Ok(tags) => tags,
+        Err(e) => return package_error_response(e),
+    };
+
     // Same as the cargo index above: an unreadable row must not be served as a
     // packument saying the version depends on nothing.
-    let metadata = match rg_core::package_registry::build_npm_metadata(
+    let metadata = match rg_core::package_registry::build_npm_metadata_with_dist_tags(
         &pkg_name,
         &npm_versions,
+        &dist_tags,
         &base_url,
         &owner,
         &name,
@@ -1888,6 +1924,55 @@ pub async fn npm_registry_metadata(
     };
 
     (StatusCode::OK, Json(metadata)).into_response()
+}
+
+/// GET the mutable selectors managed by `npm dist-tag ls`.
+pub async fn npm_dist_tags(
+    State(state): State<AppState>,
+    Path((owner, repo, pkg_name)): Path<(String, String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    match rg_core::package_registry::service::list_npm_dist_tags(
+        &state.db, &owner, &repo, &pkg_name,
+    )
+    .await
+    {
+        Ok(tags) => (StatusCode::OK, Json(tags)).into_response(),
+        Err(error) => package_error_response(error),
+    }
+}
+
+/// PUT one selector, as sent by `npm dist-tag add`.
+pub async fn set_npm_dist_tag(
+    State(state): State<AppState>,
+    RepoWrite { .. }: RepoWrite,
+    Path((owner, repo, pkg_name, tag)): Path<(String, String, String, String)>,
+    Json(version): Json<String>,
+) -> axum::response::Response {
+    match rg_core::package_registry::service::set_npm_dist_tag(
+        &state.db, &owner, &repo, &pkg_name, &tag, &version,
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+/// DELETE one selector, as sent by `npm dist-tag rm`.
+pub async fn delete_npm_dist_tag(
+    State(state): State<AppState>,
+    RepoWrite { .. }: RepoWrite,
+    Path((owner, repo, pkg_name, tag)): Path<(String, String, String, String)>,
+) -> axum::response::Response {
+    match rg_core::package_registry::service::remove_npm_dist_tag(
+        &state.db, &owner, &repo, &pkg_name, &tag,
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
 }
 
 // ── PyPI Protocol Endpoints ───────────────────────────────

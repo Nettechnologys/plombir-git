@@ -1901,6 +1901,118 @@ async fn npm_put_packument_publishes_normal_and_scoped_tarballs() {
     }
 }
 
+/// Dist-tags are mutable selectors, while the version rows they point at are
+/// immutable. Publishing a prerelease under `beta` must preserve the prior
+/// `latest`, and the standalone `npm dist-tag` protocol must mutate the same
+/// canonical map the packument exposes.
+#[tokio::test]
+async fn npm_named_dist_tags_survive_publish_and_protocol_mutation() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "npm-tag-owner", "npm-tag-owner@example.com").await;
+    create_repo(&base, &token, "npm-tag-repo").await;
+    let client = reqwest::Client::new();
+    let name = "matrix-tag-npm";
+    let publish_url = format!(
+        "{}/api/v1/repos/npm-tag-owner/npm-tag-repo/packages/npm/{name}",
+        base.trim_end_matches('/')
+    );
+
+    let mut beta_tarball = Vec::new();
+    for (version, tag) in [("1.0.0", "latest"), ("2.0.0-beta.1", "beta")] {
+        let package_json =
+            format!(r#"{{"name":"{name}","version":"{version}","channel":"{tag}"}}"#);
+        let tarball = tar_gz(&[("package/package.json", package_json.as_bytes())]);
+        if tag == "beta" {
+            beta_tarball = tarball.clone();
+        }
+        let attachment_name = format!("{name}-{version}.tgz");
+        let packument = serde_json::json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": { tag: version },
+            "versions": { version: { "name": name, "version": version } },
+            "_attachments": {
+                attachment_name: {
+                    "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                    "length": tarball.len()
+                }
+            }
+        });
+        let response = client
+            .put(&publish_url)
+            .bearer_auth(&token)
+            .json(&packument)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "publish {version} under {tag}: {}",
+            response.text().await.unwrap()
+        );
+    }
+
+    let document: serde_json::Value = client
+        .get(&publish_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(document["dist-tags"]["latest"], "1.0.0", "{document}");
+    assert_eq!(document["dist-tags"]["beta"], "2.0.0-beta.1", "{document}");
+    let beta_url = document["versions"]["2.0.0-beta.1"]["dist"]["tarball"]
+        .as_str()
+        .expect("beta tarball URL");
+    let downloaded = client.get(beta_url).send().await.unwrap();
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), beta_tarball);
+
+    let tags_url = format!(
+        "{}/api/v1/repos/npm-tag-owner/npm-tag-repo/packages/npm/-/package/{name}/dist-tags",
+        base.trim_end_matches('/')
+    );
+    let stable_url = format!("{tags_url}/stable");
+    let set = client
+        .put(&stable_url)
+        .bearer_auth(&token)
+        .json("1.0.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+    let tags: serde_json::Value = client
+        .get(&tags_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tags["stable"], "1.0.0", "{tags}");
+    assert_eq!(tags["beta"], "2.0.0-beta.1", "{tags}");
+
+    let removed = client
+        .delete(&stable_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::OK);
+    let tags: serde_json::Value = client
+        .get(&tags_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(tags.get("stable").is_none(), "{tags}");
+    assert_eq!(tags["latest"], "1.0.0", "{tags}");
+}
+
 /// A scoped name (`@scope/name`) carries a literal slash, and `dist.tarball` is
 /// the *only* address npm ever downloads from — it never rebuilds the path from
 /// the package name itself. Pasted raw into the URL, that slash turns the

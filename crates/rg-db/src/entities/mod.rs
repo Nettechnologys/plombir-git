@@ -31,6 +31,8 @@ pub mod milestone;
 pub mod mirror;
 pub mod mirror_sync_lease;
 pub mod notification;
+pub mod npm_dist_tag;
+pub mod npm_dist_tag_set;
 pub mod oauth_account;
 pub mod oci_blob;
 pub mod oci_manifest;

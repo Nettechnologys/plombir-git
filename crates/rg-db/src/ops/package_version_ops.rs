@@ -35,7 +35,7 @@ pub async fn create(
 
 /// Find a version by package and version string.
 pub async fn find_by_package_and_version(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     package_id: i64,
     version: &str,
 ) -> Result<Option<package_version::Model>, DbErr> {
@@ -60,7 +60,7 @@ pub async fn find_by_id(
 /// tie), so the primary key completes the order and keeps every consumer's
 /// fallback deterministic.
 pub async fn list_by_package(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     package_id: i64,
 ) -> Result<Vec<package_version::Model>, DbErr> {
     PackageVersion::find()

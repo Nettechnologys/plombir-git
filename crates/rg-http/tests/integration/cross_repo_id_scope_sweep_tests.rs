@@ -194,6 +194,7 @@ const PER_REPO_PLACEHOLDERS: &[(&str, &str)] = &[
     ("pkg", "a package name, unique within its registry"),
     ("pkg_name", "a package name, unique within its registry"),
     ("gem_name", "a package name, unique within its registry"),
+    ("tag", "an npm dist-tag name, scoped to one package"),
     (
         "filename",
         "a published file name, resolved inside the repository's own registry",
@@ -973,6 +974,7 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
              probe reaches nothing to begin with",
         ),
         "/packages/nuget/registration/{id}/index.json"
+        | "/packages/nuget/registration/{id}/{version}"
         | "/packages/nuget/package/{id}/index.json"
         | "/packages/nuget/package/{id}/{version}/{file}" => Coverage::Skipped(
             "`{id}` here is a NuGet package name rather than a primary key — package names are \

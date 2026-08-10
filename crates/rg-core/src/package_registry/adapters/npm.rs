@@ -374,13 +374,33 @@ pub fn build_npm_metadata(
     owner: &str,
     repo: &str,
 ) -> Result<serde_json::Value> {
-    let mut versions_map = serde_json::Map::new();
     let latest_version = latest_live_semver(
         versions
             .iter()
             .map(|version| (version.version.as_str(), version.yanked)),
     )
     .map(str::to_string);
+    let dist_tags = latest_version
+        .map(|latest| [("latest".to_string(), latest)].into())
+        .unwrap_or_default();
+    build_npm_metadata_with_dist_tags(name, versions, &dist_tags, base_url, owner, repo)
+}
+
+/// Build npm metadata with the canonical persisted selector map.
+///
+/// The wrapper above retains derived `latest` only for legacy callers and old
+/// package rows. Once a package's tag set is initialized, this function is the
+/// protocol authority: an empty map stays empty and `beta` never becomes
+/// `latest` merely because it has the highest SemVer.
+pub fn build_npm_metadata_with_dist_tags(
+    name: &str,
+    versions: &[NpmVersionInfo],
+    dist_tags: &std::collections::BTreeMap<String, String>,
+    base_url: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<serde_json::Value> {
+    let mut versions_map = serde_json::Map::new();
 
     for vi in versions {
         // Every component is percent-encoded into ONE segment. A scoped name
@@ -464,8 +484,8 @@ pub fn build_npm_metadata(
 
     let mut document = serde_json::Map::new();
     document.insert("name".into(), name.into());
-    if let Some(latest) = latest_version {
-        document.insert("dist-tags".into(), serde_json::json!({ "latest": latest }));
+    if !dist_tags.is_empty() {
+        document.insert("dist-tags".into(), serde_json::to_value(dist_tags)?);
     }
     document.insert("versions".into(), serde_json::Value::Object(versions_map));
     Ok(serde_json::Value::Object(document))
@@ -974,6 +994,48 @@ mod tests {
         assert_eq!(
             document["versions"]["3.0.0"]["dependencies"],
             serde_json::json!({}),
+        );
+    }
+
+    #[test]
+    fn persisted_named_tags_are_not_rewritten_as_latest() {
+        let versions = [
+            NpmVersionInfo {
+                version: "2.0.0-beta.1".into(),
+                description: None,
+                sha256: None,
+                sha1: None,
+                sha512: None,
+                filename: None,
+                yanked: false,
+                metadata: None,
+            },
+            NpmVersionInfo {
+                version: "1.0.0".into(),
+                description: None,
+                sha256: None,
+                sha1: None,
+                sha512: None,
+                filename: None,
+                yanked: false,
+                metadata: None,
+            },
+        ];
+        let tags = [("beta".to_string(), "2.0.0-beta.1".to_string())].into();
+        let document = build_npm_metadata_with_dist_tags(
+            "matrix-npm",
+            &versions,
+            &tags,
+            "https://forge.example",
+            "acme",
+            "tools",
+        )
+        .unwrap();
+
+        assert_eq!(document["dist-tags"]["beta"], "2.0.0-beta.1");
+        assert!(
+            document["dist-tags"].get("latest").is_none(),
+            "an explicit beta-only tag set must stay beta-only: {document}"
         );
     }
 

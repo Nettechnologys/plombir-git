@@ -22,6 +22,7 @@ pub mod mfa_backup_code_ops;
 pub mod milestone_ops;
 pub mod mirror_ops;
 pub mod notification_ops;
+pub mod npm_dist_tag_ops;
 pub mod oauth_account_ops;
 pub mod oci_ops;
 pub mod org_ops;

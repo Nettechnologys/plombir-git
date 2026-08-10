@@ -2019,6 +2019,24 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/packages/npm/{pkg_name}",
             api::packages::publish_npm_packument,
         )
+        // `npm dist-tag` resolves these paths relative to the configured npm
+        // registry root. They are separate from the packument route because a
+        // tag is mutable while every published npm version is immutable.
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags",
+            api::packages::npm_dist_tags,
+        )
+        .put(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}",
+            api::packages::set_npm_dist_tag,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}",
+            api::packages::delete_npm_dist_tag,
+        )
         // Twine's legacy upload API. Both spellings are deliberate: users copy
         // repository URLs with and without the trailing slash, and Twine POSTs
         // to exactly what it was given rather than normalizing the path.

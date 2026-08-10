@@ -89,6 +89,8 @@ probed_entities!(
     mirror,
     mirror_sync_lease,
     notification,
+    npm_dist_tag,
+    npm_dist_tag_set,
     oauth_account,
     oci_blob,
     oci_manifest,

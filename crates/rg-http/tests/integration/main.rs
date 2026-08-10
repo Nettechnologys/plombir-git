@@ -94,6 +94,7 @@ mod mirror_tests;
 mod namespace_identity_tests;
 mod notification_tests;
 mod notification_websocket_cookie_tests;
+mod npm_live_client_tests;
 mod oauth_pkce_tests;
 mod oci_chunk_range_tests;
 mod oci_live_client_tests;

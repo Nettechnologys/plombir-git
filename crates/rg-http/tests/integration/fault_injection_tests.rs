@@ -1186,6 +1186,7 @@ async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
         description: None,
         homepage: None,
         repository_url: None,
+        npm_dist_tag: None,
         author_id: user_id,
         files: vec![
             ("widget-1.0.0.pom".to_string(), b"<project/>".to_vec()),
