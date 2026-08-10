@@ -2958,7 +2958,10 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     let leaf = &page["items"][0];
     assert_eq!(leaf["registration"], registration_url);
     assert_eq!(page["@id"], format!("{registration_url}#page/1.0.0/1.0.0"));
-    assert_eq!(leaf["catalogEntry"]["@id"], page["@id"]);
+    assert_eq!(
+        leaf["catalogEntry"]["@id"],
+        format!("{}#catalogEntry", leaf["@id"].as_str().unwrap())
+    );
 
     for (resource, label) in [
         ("SearchQueryService/3.5.0", "search"),
@@ -3130,6 +3133,54 @@ async fn nuget_normalized_versions_round_trip_from_indexes_to_package_content() 
     assert_eq!(page["lower"], "1.2.0", "page: {page}");
     assert_eq!(page["upper"], "2.0.0.1", "page: {page}");
     assert_eq!(page["count"], 4, "the unreadable legacy row stays visible");
+
+    let leaves = page["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("registration page must inline its leaves: {page}"));
+    let mut leaf_ids = std::collections::HashSet::new();
+    for inline in leaves {
+        let leaf_id = inline["@id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| panic!("every inline leaf needs a non-empty @id: {inline}"));
+        assert!(
+            leaf_ids.insert(leaf_id.to_string()),
+            "registration leaf @id must be unique: {leaf_id}"
+        );
+
+        let response = client.get(leaf_id).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "advertised registration leaf must be served: {leaf_id}"
+        );
+        let leaf: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(leaf["@id"], inline["@id"], "leaf identity: {leaf_id}");
+        assert_eq!(
+            leaf["packageContent"], inline["packageContent"],
+            "leaf package content: {leaf_id}"
+        );
+        assert_eq!(
+            leaf["registration"], inline["registration"],
+            "leaf registration index: {leaf_id}"
+        );
+        assert_eq!(
+            leaf["catalogEntry"], inline["catalogEntry"]["@id"],
+            "standalone leaf must point at the catalog entry embedded inline: {leaf_id}"
+        );
+        assert_eq!(
+            leaf["listed"], inline["catalogEntry"]["listed"],
+            "standalone leaf availability: {leaf_id}"
+        );
+
+        let head = client.head(leaf_id).send().await.unwrap();
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "every advertised registration URL must support HEAD: {leaf_id}"
+        );
+        assert!(head.bytes().await.unwrap().is_empty());
+    }
 
     let flat: serde_json::Value = client
         .get(package_url(

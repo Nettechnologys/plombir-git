@@ -2078,6 +2078,16 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}",
+            api::packages::nuget_registration_leaf,
+        )
+        .head(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}",
+            api::packages::nuget_registration_leaf,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/nuget/query",
             api::packages::nuget_search,
         )

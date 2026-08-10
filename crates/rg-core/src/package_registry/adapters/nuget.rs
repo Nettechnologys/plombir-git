@@ -23,10 +23,12 @@
 
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     io::{Cursor, Read},
 };
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::url_path::encode_path_segment;
 
 pub struct NuGetAdapter;
 
@@ -522,18 +524,21 @@ pub fn build_registration_index(
     // document without advertising a second HTTP resource that does not exist.
     let page_url = format!("{registration_url}#page/{lower}/{upper}");
 
+    let mut leaf_ids = HashSet::new();
     let mut leaves = Vec::new();
     for e in entries {
-        let mut leaf = serde_json::json!({
-            "packageContent": e.download_url,
-            "registration": registration_url,
-        });
-
-        if let Some(ref catalog_entry) = build_catalog_entry(package_name, e, &page_url) {
-            leaf["catalogEntry"] = catalog_entry.clone();
+        let leaf_id = registration_leaf_id(registration_url, &e.version);
+        // Historical rows can contain two spellings which NuGet considers the
+        // same version (`1`, `1.0.0`). They are one protocol leaf and therefore
+        // must not advertise the same address twice.
+        if leaf_ids.insert(leaf_id.clone()) {
+            leaves.push(build_registration_page_leaf(
+                package_name,
+                registration_url,
+                e,
+                leaf_id,
+            ));
         }
-
-        leaves.push(leaf);
     }
 
     serde_json::json!({
@@ -546,6 +551,53 @@ pub fn build_registration_index(
             "items": leaves,
         }]
     })
+}
+
+/// Build the independently fetchable document advertised by an inline leaf's
+/// `@id`.
+///
+/// A page embeds the complete catalog entry, while the standalone leaf points
+/// at that entry by URL. Both shapes are derived from the same page leaf so the
+/// package-content and registration links cannot drift apart.
+pub fn build_registration_leaf(
+    package_name: &str,
+    registration_url: &str,
+    entry: &NuGetRegistrationEntry,
+) -> serde_json::Value {
+    let leaf_id = registration_leaf_id(registration_url, &entry.version);
+    let page_leaf = build_registration_page_leaf(package_name, registration_url, entry, leaf_id);
+    serde_json::json!({
+        "@id": page_leaf["@id"],
+        "catalogEntry": page_leaf["catalogEntry"]["@id"],
+        "listed": page_leaf["catalogEntry"]["listed"],
+        "packageContent": page_leaf["packageContent"],
+        "registration": page_leaf["registration"],
+    })
+}
+
+fn build_registration_page_leaf(
+    package_name: &str,
+    registration_url: &str,
+    entry: &NuGetRegistrationEntry,
+    leaf_id: String,
+) -> serde_json::Value {
+    let catalog_id = format!("{leaf_id}#catalogEntry");
+    serde_json::json!({
+        "@id": leaf_id,
+        "catalogEntry": build_catalog_entry(package_name, entry, &catalog_id),
+        "packageContent": entry.download_url,
+        "registration": registration_url,
+    })
+}
+
+fn registration_leaf_id(registration_url: &str, version: &str) -> String {
+    let registration_base = registration_url
+        .strip_suffix("/index.json")
+        .unwrap_or_else(|| registration_url.trim_end_matches('/'));
+    let version = NuGetVersion::parse(version)
+        .map(|version| version.normalized())
+        .unwrap_or_else(|| version.trim().to_lowercase());
+    format!("{registration_base}/{}", encode_path_segment(&version))
 }
 
 fn registration_bounds(entries: &[NuGetRegistrationEntry]) -> (String, String) {
@@ -579,10 +631,10 @@ fn registration_bounds(entries: &[NuGetRegistrationEntry]) -> (String, String) {
 fn build_catalog_entry(
     name: &str,
     entry: &NuGetRegistrationEntry,
-    page_url: &str,
-) -> Option<serde_json::Value> {
+    catalog_id: &str,
+) -> serde_json::Value {
     let mut out = serde_json::Map::new();
-    out.insert("@id".into(), page_url.into());
+    out.insert("@id".into(), catalog_id.into());
     out.insert("id".into(), name.into());
     out.insert("version".into(), entry.version.clone().into());
     // Stated rather than left to the client's default, because the default is
@@ -617,7 +669,7 @@ fn build_catalog_entry(
                 .into(),
         );
     }
-    Some(serde_json::Value::Object(out))
+    serde_json::Value::Object(out)
 }
 
 /// One `PackageDependencyGroup` of a catalog entry.
@@ -1272,14 +1324,32 @@ mod tests {
 
         // First entry should have packageContent and catalogEntry
         assert_eq!(
+            items[0]["@id"],
+            "https://git.example.com/registration/mylib/1.0.0"
+        );
+        assert_eq!(
+            items[1]["@id"],
+            "https://git.example.com/registration/mylib/2.0.0"
+        );
+        assert_eq!(
             items[0]["packageContent"],
             "https://git.example.com/dl/1.0.0"
         );
         assert_eq!(items[0]["registration"], registration_url);
         assert!(items[0]["catalogEntry"].is_object());
-        assert_eq!(items[0]["catalogEntry"]["@id"], page_url);
+        assert_eq!(
+            items[0]["catalogEntry"]["@id"],
+            "https://git.example.com/registration/mylib/1.0.0#catalogEntry"
+        );
         assert_eq!(items[0]["catalogEntry"]["id"], "MyLib");
         assert_eq!(items[0]["catalogEntry"]["version"], "1.0.0");
+
+        let leaf = build_registration_leaf("MyLib", registration_url, &entries[0]);
+        assert_eq!(leaf["@id"], items[0]["@id"]);
+        assert_eq!(leaf["packageContent"], items[0]["packageContent"]);
+        assert_eq!(leaf["registration"], items[0]["registration"]);
+        assert_eq!(leaf["catalogEntry"], items[0]["catalogEntry"]["@id"]);
+        assert_eq!(leaf["listed"], true);
 
         // The graph `dotnet restore` resolves against — it never opens the
         // `.nupkg` to find one, so an absent key reads as "no dependencies".
@@ -1297,6 +1367,37 @@ mod tests {
         assert_eq!(
             items[1]["catalogEntry"]["listed"], false,
             "a yanked version stays in the registration but must not be a candidate"
+        );
+    }
+
+    #[test]
+    fn registration_leaf_ids_deduplicate_equivalent_version_spellings() {
+        let entry = |version: &str| NuGetRegistrationEntry {
+            version: version.into(),
+            description: None,
+            homepage: None,
+            license: None,
+            tags: None,
+            download_url: format!("https://git.example.com/dl/{version}"),
+            dependency_groups: Vec::new(),
+            listed: true,
+        };
+        let entries = [entry("1"), entry("1.0.0"), entry("legacy-row")];
+        let index = build_registration_index(
+            "MyLib",
+            "https://git.example.com/registration/mylib/index.json",
+            &entries,
+        );
+        let leaves = index["items"][0]["items"].as_array().unwrap();
+
+        assert_eq!(leaves.len(), 2, "equivalent NuGet versions are one leaf");
+        assert_eq!(
+            leaves[0]["@id"],
+            "https://git.example.com/registration/mylib/1.0.0"
+        );
+        assert_eq!(
+            leaves[1]["@id"],
+            "https://git.example.com/registration/mylib/legacy-row"
         );
     }
 

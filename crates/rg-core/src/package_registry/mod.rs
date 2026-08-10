@@ -16,8 +16,9 @@ pub use adapters::maven::{build_maven_metadata_xml, MavenChecksum, MavenVersionE
 pub use adapters::npm::{build_npm_metadata, NpmVersionInfo};
 pub use adapters::nuget::{
     build_autocomplete_results, build_flat_container_index, build_registration_index,
-    build_search_results, build_service_index, normalize_package_id, nuget_versions_match,
-    NuGetDependency, NuGetDependencyGroup, NuGetRegistrationEntry, NuGetSearchResult,
+    build_registration_leaf, build_search_results, build_service_index, normalize_package_id,
+    nuget_versions_match, NuGetDependency, NuGetDependencyGroup, NuGetRegistrationEntry,
+    NuGetSearchResult,
 };
 pub use adapters::pypi::{
     build_simple_repository_html, build_simple_root_html, normalize_project_name, PyPIProjectEntry,

@@ -20,6 +20,7 @@
 //! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/info/{gem}    — compact index
 //! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/names         — compact index
 //! GET    /api/v1/repos/{owner}/{repo}/packages/rubygems/gems/{file}   — `.gem` download
+//! GET    /api/v1/repos/{owner}/{repo}/packages/nuget/registration/{id}/{version}
 
 use crate::error::AppError;
 use axum::{
@@ -2725,60 +2726,15 @@ pub async fn nuget_registration_index(
     };
 
     let base_url = build_base_url(&headers);
-    let registration_url = format!(
-        "{}/api/v1/repos/{}/{}/packages/nuget/registration/{}/index.json",
-        base_url.trim_end_matches('/'),
-        encode_path_segment(&owner),
-        encode_path_segment(&name),
-        encode_path_segment(&pkg_name.to_lowercase()),
-    );
-
-    let version_metadata = versions
+    let registration_url = nuget_registration_url(&base_url, &owner, &name, &pkg_name);
+    let entries = versions
         .iter()
-        .map(|v| parse_nuget_metadata(v.metadata.as_deref(), &pkg_name, &v.version))
+        .map(|version| nuget_registration_entry(&base_url, &owner, &name, &pkg_name, version))
         .collect::<anyhow::Result<Vec<_>>>();
-    let version_metadata = match version_metadata {
-        Ok(metadata) => metadata,
+    let entries = match entries {
+        Ok(entries) => entries,
         Err(error) => return package_error_response(error),
     };
-    let entries: Vec<rg_core::package_registry::NuGetRegistrationEntry> = versions
-        .iter()
-        .zip(version_metadata)
-        .map(|(v, meta)| {
-            let primary_file = v
-                .files
-                .iter()
-                .find(|f| f.filename.to_lowercase().ends_with(".nupkg"));
-
-            let filename = primary_file
-                .map(|f| f.filename.clone())
-                .unwrap_or_else(|| format!("{}.{}.nupkg", pkg_name, v.version));
-
-            let download_url = format!(
-                "{}/api/v1/repos/{}/{}/packages/nuget/{}/{}/{}",
-                base_url.trim_end_matches('/'),
-                encode_path_segment(&owner),
-                encode_path_segment(&name),
-                encode_path_segment(&pkg_name),
-                encode_path_segment(&v.version),
-                encode_path_segment(&filename),
-            );
-
-            rg_core::package_registry::NuGetRegistrationEntry {
-                version: v.version.clone(),
-                description: meta.description,
-                homepage: meta.homepage,
-                license: meta.license,
-                tags: meta.tags,
-                download_url,
-                dependency_groups: meta.dependency_groups,
-                // A yanked version stays in the registration so a consumer that
-                // already resolved it keeps restoring; `listed` is what keeps it
-                // out of a fresh resolution.
-                listed: v.is_install_candidate(),
-            }
-        })
-        .collect();
 
     let json =
         rg_core::package_registry::build_registration_index(&pkg_name, &registration_url, &entries);
@@ -2789,6 +2745,107 @@ pub async fn nuget_registration_index(
         Json(json),
     )
         .into_response()
+}
+
+/// GET/HEAD /api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}
+///
+/// A registration index advertises this document through every inline leaf's
+/// `@id`. The URL uses NuGet's normalized version spelling, while historical
+/// rows are resolved with the same equality rules as the flat container.
+pub async fn nuget_registration_leaf(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((owner, name, pkg_name, version)): Path<(String, String, String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let pkg_name = match resolve_nuget_id(&state, &owner, &name, &pkg_name).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
+    let versions = match rg_core::package_registry::service::list_versions(
+        &state.db, &owner, &name, "nuget", &pkg_name,
+    )
+    .await
+    {
+        Ok(versions) => versions,
+        Err(error) => return package_error_response(error),
+    };
+    let Some(found) = versions
+        .iter()
+        .find(|stored| rg_core::package_registry::nuget_versions_match(&stored.version, &version))
+    else {
+        return err_text(
+            StatusCode::NOT_FOUND,
+            &format!("package '{pkg_name}' has no version '{version}'"),
+        );
+    };
+
+    let base_url = build_base_url(&headers);
+    let registration_url = nuget_registration_url(&base_url, &owner, &name, &pkg_name);
+    let entry = match nuget_registration_entry(&base_url, &owner, &name, &pkg_name, found) {
+        Ok(entry) => entry,
+        Err(error) => return package_error_response(error),
+    };
+    let json =
+        rg_core::package_registry::build_registration_leaf(&pkg_name, &registration_url, &entry);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json),
+    )
+        .into_response()
+}
+
+fn nuget_registration_url(base_url: &str, owner: &str, repo: &str, package_name: &str) -> String {
+    format!(
+        "{}/api/v1/repos/{}/{}/packages/nuget/registration/{}/index.json",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(owner),
+        encode_path_segment(repo),
+        encode_path_segment(&package_name.to_lowercase()),
+    )
+}
+
+fn nuget_registration_entry(
+    base_url: &str,
+    owner: &str,
+    repo: &str,
+    package_name: &str,
+    version: &rg_core::package_registry::VersionDetail,
+) -> anyhow::Result<rg_core::package_registry::NuGetRegistrationEntry> {
+    let metadata =
+        parse_nuget_metadata(version.metadata.as_deref(), package_name, &version.version)?;
+    let filename = version
+        .files
+        .iter()
+        .find(|file| file.filename.to_lowercase().ends_with(".nupkg"))
+        .map(|file| file.filename.clone())
+        .unwrap_or_else(|| format!("{}.{}.nupkg", package_name, version.version));
+    let download_url = format!(
+        "{}/api/v1/repos/{}/{}/packages/nuget/{}/{}/{}",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(owner),
+        encode_path_segment(repo),
+        encode_path_segment(package_name),
+        encode_path_segment(&version.version),
+        encode_path_segment(&filename),
+    );
+
+    Ok(rg_core::package_registry::NuGetRegistrationEntry {
+        version: version.version.clone(),
+        description: metadata.description,
+        homepage: metadata.homepage,
+        license: metadata.license,
+        tags: metadata.tags,
+        download_url,
+        dependency_groups: metadata.dependency_groups,
+        // A yanked version stays in the registration so a consumer that
+        // already resolved it keeps restoring; `listed` is what keeps it out
+        // of a fresh resolution.
+        listed: version.is_install_candidate(),
+    })
 }
 
 /// GET /api/v1/repos/{owner}/{name}/packages/nuget/query?q=...

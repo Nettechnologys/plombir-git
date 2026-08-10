@@ -122,6 +122,7 @@ const UNDOCUMENTED = new Map([
   ['api::packages::npm_registry_metadata', 'npm registry metadata document — layout fixed by npm'],
   ['api::packages::nuget_service_index', 'NuGet V3 service index — layout fixed by dotnet/nuget'],
   ['api::packages::nuget_registration_index', 'NuGet V3 registration index — layout fixed by dotnet/nuget'],
+  ['api::packages::nuget_registration_leaf', 'NuGet V3 registration leaf — layout fixed by dotnet/nuget'],
   ['api::packages::nuget_search', 'NuGet V3 search service — layout fixed by dotnet/nuget'],
   ['api::packages::nuget_autocomplete', 'NuGet V3 autocomplete service — layout fixed by dotnet/nuget'],
   ['api::packages::nuget_flat_container_index', 'NuGet V3 flat container (PackageBaseAddress) — layout fixed by dotnet/nuget'],
