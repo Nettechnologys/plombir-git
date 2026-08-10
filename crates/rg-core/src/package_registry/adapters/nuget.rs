@@ -80,12 +80,11 @@ impl PackageAdapter for NuGetAdapter {
 /// Case-insensitive search for an ASCII `needle`, as a byte offset into
 /// `haystack`.
 ///
-/// The neighbouring helpers lowercase the whole document and then index the
-/// original with the offset they found, which only holds while lowercasing
-/// preserves byte lengths — it does not for every character a description may
-/// carry. This one compares in place, so its offsets are offsets into the
-/// string that produced them. Every needle here begins with `<`, `</` or a
-/// space, so the offsets always land on an ASCII byte and slicing is safe.
+/// A normalized copy cannot safely supply offsets into the original: Unicode
+/// case folding may change the byte length. This compares in place, so every
+/// returned offset belongs to the string that produced it. Every needle here
+/// begins with `<`, `</` or a space, so the offsets always land on an ASCII
+/// byte and slicing is safe.
 fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     let (hay, pin) = (haystack.as_bytes(), needle.as_bytes());
     if pin.is_empty() || hay.len() < pin.len() || from > hay.len() - pin.len() {
@@ -259,58 +258,6 @@ fn nuspec_dependencies(xml: &str) -> Vec<NuGetDependency> {
     out
 }
 
-/// Extract a simple XML tag value (no attributes).
-fn xml_tag_value(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-
-    // Case-insensitive search
-    if let Some(start) = xml.to_lowercase().find(&open.to_lowercase()) {
-        let start = start + open.len();
-        if let Some(end) = xml[start..].to_lowercase().find(&close.to_lowercase()) {
-            return Some(xml[start..start + end].trim().to_string());
-        }
-    }
-    None
-}
-
-/// Extract an XML tag value that may have attributes (e.g. `<license type="expr">`).
-/// Ensures we don't match `<licenseUrl>` when looking for `<license>`.
-fn xml_tag_value_with_attrs(xml: &str, tag: &str) -> Option<String> {
-    let lower = xml.to_lowercase();
-    let open_prefix = format!("<{}", tag);
-    let close = format!("</{}>", tag);
-
-    // Search for all occurrences of the prefix; only accept if the next char after <tag
-    // is a non-alpha char (space, >, /, etc.) to avoid matching prefixes like <licenseUrl>
-    let mut search_from = 0usize;
-    while let Some(tag_start) = lower[search_from..].find(&open_prefix) {
-        let abs_start = search_from + tag_start;
-        let after_tag = abs_start + open_prefix.len();
-        // Check that the character after <tag is a terminator, not a continuation letter
-        let next_char = lower.as_bytes().get(after_tag).copied().unwrap_or(b'>');
-        if next_char.is_ascii_alphabetic() {
-            // This matched a longer tag name (e.g. <licenseUrl); skip past it
-            search_from = after_tag;
-            continue;
-        }
-
-        // Find the end of the opening tag (> character)
-        if let Some(tag_content_start) = lower[abs_start..].find('>') {
-            let content_start = abs_start + tag_content_start + 1;
-            if let Some(closing_match) = lower[content_start..].find(&close) {
-                return Some(
-                    xml[content_start..content_start + closing_match]
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
-        return None;
-    }
-    None
-}
-
 /// Parse metadata from a .nupkg file (ZIP containing .nuspec).
 fn extract_from_nupkg(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
     let cursor = Cursor::new(data);
@@ -344,25 +291,36 @@ fn extract_from_nuspec(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
     // <id>, <version>, <title>, <description>, <projectUrl>, <licenseUrl>,
     // <tags>, <authors>, <repository type="git" url="..." />
 
-    let id =
-        xml_tag_value(xml, "id").ok_or_else(|| anyhow::anyhow!(".nuspec missing <id> element"))?;
+    let simple_value = |name: &str| {
+        xml_element_at(xml, name, 0)
+            .filter(|element| element.attrs.trim().is_empty())
+            .map(|element| element.inner.trim().to_string())
+    };
 
-    let version = xml_tag_value(xml, "version")
+    let id = simple_value("id").ok_or_else(|| anyhow::anyhow!(".nuspec missing <id> element"))?;
+
+    let version = simple_value("version")
         .ok_or_else(|| anyhow::anyhow!(".nuspec missing <version> element"))?;
 
-    let description = xml_tag_value(xml, "description")
-        .or_else(|| xml_tag_value(xml, "summary"))
-        .or_else(|| xml_tag_value(xml, "title"));
+    let description = simple_value("description")
+        .or_else(|| simple_value("summary"))
+        .or_else(|| simple_value("title"));
 
-    let homepage = xml_tag_value(xml, "projectUrl");
+    let homepage = simple_value("projectUrl");
 
-    let repository_url =
-        xml_tag_value(xml, "repository").or_else(|| extract_repository_url_from_xml(xml));
+    let repository_url = xml_element_at(xml, "repository", 0).and_then(|element| {
+        if element.attrs.trim().is_empty() {
+            Some(element.inner.trim().to_string())
+        } else {
+            xml_attr(element.attrs, "url")
+        }
+    });
 
-    let license =
-        xml_tag_value_with_attrs(xml, "license").or_else(|| xml_tag_value(xml, "licenseUrl"));
+    let license = xml_element_at(xml, "license", 0)
+        .map(|element| element.inner.trim().to_string())
+        .or_else(|| simple_value("licenseUrl"));
 
-    let keywords = xml_tag_value(xml, "tags");
+    let keywords = simple_value("tags");
 
     // The registration index reads these back out of the stored metadata rather
     // than off the package row, because they describe one *version* — a later
@@ -437,23 +395,6 @@ fn nuspec_protocol_metadata(
     }
 
     (!out.is_empty()).then(|| serde_json::Value::Object(out).to_string())
-}
-
-/// Try to extract repository URL from <repository type="git" url="..." /> element.
-fn extract_repository_url_from_xml(xml: &str) -> Option<String> {
-    let lower = xml.to_lowercase();
-    let repo_tag_start = lower.find("<repository")?;
-    let repo_tag_end = lower[repo_tag_start..].find("/>")?;
-
-    // Look for url="..." attribute
-    let attr_search = &lower[repo_tag_start..repo_tag_start + repo_tag_end];
-    let url_attr_start = attr_search.find("url=\"")?;
-
-    let value_start = repo_tag_start + url_attr_start + 5; // skip 'url="'
-    let value_rest = &xml[value_start..];
-    let value_end = value_rest.find('"')?;
-
-    Some(value_rest[..value_end].to_string())
 }
 
 // ── NuGet API v3 helpers ──────────────────────────────────
@@ -1274,6 +1215,35 @@ mod tests {
             .unwrap();
         // <license> tag should be preferred over <licenseUrl>
         assert_eq!(meta.license.as_deref(), Some("MIT"));
+    }
+
+    #[test]
+    fn nuspec_metadata_offsets_survive_length_changing_unicode_case_folds() {
+        for description in ["ASCII", "İstanbul", "ẞtraße"] {
+            let nuspec = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<package>
+  <metadata>
+    <description>{description}</description>
+    <ID>Unicode.Package</ID>
+    <Version>1.2.3</Version>
+    <License TYPE="expression">MIT</License>
+    <Repository TYPE="git" URL="https://example.com/unicode.git" />
+  </metadata>
+</package>"#
+            );
+
+            let metadata = extract_from_nuspec(&nuspec)
+                .unwrap_or_else(|error| panic!("{description:?}: {error}"));
+            assert_eq!(metadata.name, "Unicode.Package", "{description:?}");
+            assert_eq!(metadata.version, "1.2.3", "{description:?}");
+            assert_eq!(metadata.license.as_deref(), Some("MIT"), "{description:?}");
+            assert_eq!(
+                metadata.repository_url.as_deref(),
+                Some("https://example.com/unicode.git"),
+                "{description:?}"
+            );
+        }
     }
 
     #[test]
