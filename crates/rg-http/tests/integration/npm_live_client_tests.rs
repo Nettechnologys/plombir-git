@@ -182,3 +182,108 @@ async fn npm_publish_beta_and_install_by_tag_round_trip() {
         ],
     );
 }
+
+// `npm --provenance` can mint a bundle only in a supported OIDC CI provider.
+// Outside one, the equivalent real-client path is `--provenance-file`: npm
+// verifies the supplied Sigstore bundle and emits the same second `.sigstore`
+// attachment; the test then probes the registry's advertised read endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs npm plus registry.npmjs.org; run with --ignored"]
+async fn npm_publish_with_public_provenance_bundle_round_trips() {
+    let upstream: serde_json::Value = reqwest::get("https://registry.npmjs.org/pino/9.13.1")
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tarball_url = upstream["dist"]["tarball"].as_str().unwrap();
+    let upstream_attestations_url = upstream["dist"]["attestations"]["url"].as_str().unwrap();
+    let tarball = reqwest::get(tarball_url)
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let upstream_attestations: serde_json::Value = reqwest::get(upstream_attestations_url)
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bundle = upstream_attestations["attestations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attestation| attestation["predicateType"] == "https://slsa.dev/provenance/v1")
+        .unwrap()["bundle"]
+        .clone();
+
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(
+        &base,
+        "npmprovenanceowner",
+        "npmprovenanceowner@example.com",
+    )
+    .await;
+    create_repo(&base, &token, "packages").await;
+    let registry = format!(
+        "{}/api/v1/repos/npmprovenanceowner/packages/packages/npm/",
+        base.trim_end_matches('/')
+    );
+    let sandbox = tempfile::tempdir().unwrap();
+    let cache = sandbox.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let tarball_path = sandbox.path().join("pino-9.13.1.tgz");
+    let bundle_path = sandbox.path().join("pino-9.13.1.sigstore");
+    std::fs::write(&tarball_path, &tarball).unwrap();
+    std::fs::write(&bundle_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+
+    let userconfig = sandbox.path().join("npmrc");
+    let auth_scope = registry.strip_prefix("http:").unwrap();
+    std::fs::write(
+        &userconfig,
+        format!("registry={registry}\n{auth_scope}:_authToken={token}\nalways-auth=true\n"),
+    )
+    .unwrap();
+    npm_ok(
+        sandbox.path(),
+        &userconfig,
+        &cache,
+        &[
+            "publish",
+            tarball_path.to_str().unwrap(),
+            "--provenance-file",
+            bundle_path.to_str().unwrap(),
+            "--registry",
+            &registry,
+        ],
+    );
+
+    let local_packument: serde_json::Value = reqwest::get(format!("{registry}pino"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let local_attestations_url = local_packument["versions"]["9.13.1"]["dist"]["attestations"]
+        ["url"]
+        .as_str()
+        .unwrap();
+    let local_attestations: serde_json::Value = reqwest::get(local_attestations_url)
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(local_attestations["attestations"][0]["bundle"], bundle);
+}

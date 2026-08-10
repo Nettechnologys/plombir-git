@@ -223,6 +223,37 @@ const ABBREVIATED_FIELDS: [&str; 13] = [
     "hasInstallScript",
 ];
 
+/// Registry-owned metadata describing the provenance attachment stored beside
+/// an npm tarball. This key can never come from `package.json`: publish stores
+/// only the whitelist above, then adds this marker after validating the
+/// Sigstore bundle against the tarball.
+const PROVENANCE_METADATA_KEY: &str = "_forgekeepNpmProvenance";
+
+/// Record that a validated npm provenance bundle belongs to this version.
+///
+/// The bundle itself is a package file. Only the predicate type lives in the
+/// version metadata so the abbreviated packument can advertise npm's standard
+/// attestation endpoint without reading blob storage on every metadata request.
+pub fn record_npm_provenance(metadata: &mut ExtractedMetadata, predicate_type: &str) -> Result<()> {
+    if predicate_type.trim().is_empty() {
+        anyhow::bail!("npm provenance predicateType must not be empty");
+    }
+
+    let mut stored = match metadata.protocol_metadata.as_deref() {
+        Some(blob) => serde_json::from_str::<serde_json::Value>(blob)?,
+        None => serde_json::json!({}),
+    };
+    let object = stored
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("npm protocol metadata must be a JSON object"))?;
+    object.insert(
+        PROVENANCE_METADATA_KEY.into(),
+        serde_json::json!({ "predicateType": predicate_type }),
+    );
+    metadata.protocol_metadata = Some(stored.to_string());
+    Ok(())
+}
+
 /// The fields npm reads as a table of name → requirement.
 ///
 /// Kept apart from the rest because a manifest that spelled one of them as
@@ -432,6 +463,7 @@ pub fn build_npm_metadata_with_dist_tags(
         // and saying it outright keeps the response self-describing.
         ver_obj.insert("dependencies".into(), serde_json::json!({}));
 
+        let mut provenance_predicate_type = None;
         if let Some(blob) = vi.metadata.as_deref() {
             let stored = serde_json::from_str::<serde_json::Value>(blob).map_err(|error| {
                 tracing::error!(
@@ -457,6 +489,14 @@ pub fn build_npm_metadata_with_dist_tags(
                     ver_obj.insert(field.into(), value.clone());
                 }
             }
+            if let Some(marker) = stored.get(PROVENANCE_METADATA_KEY) {
+                let predicate_type = marker
+                    .get("predicateType")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| unreadable_metadata(name, &vi.version))?;
+                provenance_predicate_type = Some(predicate_type.to_string());
+            }
         }
 
         // Last, and after the overlay: where the tarball is and what it hashes
@@ -477,6 +517,23 @@ pub fn build_npm_metadata_with_dist_tags(
             dist.insert("shasum".into(), sha1.into());
         }
         dist.insert("tarball".into(), tarball_url.into());
+        if let Some(predicate_type) = provenance_predicate_type {
+            let package_spec = format!("{name}@{}", vi.version);
+            let attestation_url = format!(
+                "{}/api/v1/repos/{}/{}/packages/npm/-/npm/v1/attestations/{}",
+                base_url.trim_end_matches('/'),
+                encode_path_segment(owner),
+                encode_path_segment(repo),
+                encode_path_segment(&package_spec),
+            );
+            dist.insert(
+                "attestations".into(),
+                serde_json::json!({
+                    "url": attestation_url,
+                    "provenance": { "predicateType": predicate_type }
+                }),
+            );
+        }
         ver_obj.insert("dist".into(), serde_json::Value::Object(dist));
 
         versions_map.insert(vi.version.clone(), serde_json::Value::Object(ver_obj));
@@ -635,6 +692,47 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(TARBALL))
             )),
             "integrity is an SRI string over the raw SHA-512 bytes: {dist}"
+        );
+    }
+
+    #[test]
+    fn validated_provenance_is_advertised_at_the_npm_attestation_endpoint() {
+        let mut extracted = NpmAdapter
+            .extract_metadata(
+                "@scope/matrix-1.0.0.tgz",
+                &make_tgz(r#"{ "name": "@scope/matrix", "version": "1.0.0" }"#),
+            )
+            .unwrap();
+        record_npm_provenance(&mut extracted, "https://slsa.dev/provenance/v1").unwrap();
+        let document = build_npm_metadata(
+            "@scope/matrix",
+            &[NpmVersionInfo {
+                version: "1.0.0".into(),
+                description: None,
+                sha256: None,
+                sha1: None,
+                sha512: Some(hex::encode(sha2::Sha512::digest(TARBALL))),
+                filename: Some("@scope/matrix-1.0.0.tgz".into()),
+                yanked: false,
+                metadata: extracted.protocol_metadata,
+            }],
+            "https://forge.example/",
+            "acme",
+            "tools",
+        )
+        .unwrap();
+        let version = &document["versions"]["1.0.0"];
+
+        assert_eq!(
+            version["dist"]["attestations"],
+            serde_json::json!({
+                "url": "https://forge.example/api/v1/repos/acme/tools/packages/npm/-/npm/v1/attestations/%40scope%2Fmatrix%401.0.0",
+                "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
+            })
+        );
+        assert!(
+            version.get(PROVENANCE_METADATA_KEY).is_none(),
+            "the registry marker must not leak into the npm version object: {version}"
         );
     }
 

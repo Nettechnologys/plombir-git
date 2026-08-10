@@ -2011,6 +2011,11 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/packages/npm/-/npm/v1/attestations/{package_spec}",
+            api::packages::npm_attestations,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/packages/npm/{pkg_name}",
             api::packages::npm_registry_metadata,
         )

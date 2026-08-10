@@ -13,7 +13,9 @@ pub use adapters::cargo::{
 };
 pub use adapters::helm::{build_helm_index, HelmIndexEntry};
 pub use adapters::maven::{build_maven_metadata_xml, MavenChecksum, MavenVersionEntry};
-pub use adapters::npm::{build_npm_metadata, build_npm_metadata_with_dist_tags, NpmVersionInfo};
+pub use adapters::npm::{
+    build_npm_metadata, build_npm_metadata_with_dist_tags, record_npm_provenance, NpmVersionInfo,
+};
 pub use adapters::nuget::{
     build_autocomplete_results, build_flat_container_index, build_registration_index,
     build_registration_leaf, build_search_results, build_service_index, normalize_package_id,

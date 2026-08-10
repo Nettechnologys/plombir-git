@@ -33,7 +33,7 @@ use axum::{
 use base64::Engine as _;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use std::{collections::BTreeMap, path::Path as FsPath};
 use tokio::io::AsyncWriteExt as _;
 use utoipa::ToSchema;
@@ -257,6 +257,15 @@ pub struct NpmPublishVersion {
 pub struct NpmPublishAttachment {
     pub data: String,
     pub length: usize,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug)]
+struct DecodedNpmProvenance {
+    filename: String,
+    bundle: Vec<u8>,
+    predicate_type: String,
 }
 
 #[derive(Debug)]
@@ -265,6 +274,143 @@ struct DecodedNpmPublish {
     version: String,
     dist_tag: String,
     tarball: Vec<u8>,
+    provenance: Option<DecodedNpmProvenance>,
+}
+
+#[derive(Debug)]
+struct InspectedNpmProvenance {
+    bundle: serde_json::Value,
+    bytes: Vec<u8>,
+    predicate_type: String,
+    subject_name: String,
+    subject_sha512: String,
+}
+
+fn npm_package_purl(name: &str, version: &str) -> String {
+    match name.strip_prefix('@').and_then(|name| name.split_once('/')) {
+        Some((scope, package)) => format!("pkg:npm/%40{scope}/{package}@{version}"),
+        None => format!("pkg:npm/{name}@{version}"),
+    }
+}
+
+/// Parse the Sigstore bundle shape emitted by npm and the in-toto statement it
+/// signs. Trust-chain verification remains npm/Sigstore's job; ForgeKeep's
+/// publish boundary enforces the registry-specific invariant: the one subject
+/// in that signed payload must name and hash the tarball in the same request.
+fn inspect_npm_provenance_attachment(
+    attachment: &NpmPublishAttachment,
+    artifact_limit: usize,
+) -> Result<InspectedNpmProvenance, String> {
+    let bytes = attachment.data.as_bytes().to_vec();
+    if bytes.len() > artifact_limit {
+        return Err(format!(
+            "npm provenance attachment exceeds the configured {artifact_limit}-byte artifact limit"
+        ));
+    }
+    // npm writes JavaScript's `serializedBundle.length`, which counts UTF-16
+    // code units rather than UTF-8 bytes. Real certificate material can contain
+    // non-ASCII identity text, so comparing this field with `str::len()` rejects
+    // a bundle npm itself just verified and sent.
+    let npm_length = attachment.data.encode_utf16().count();
+    if npm_length != attachment.length {
+        return Err(format!(
+            "npm provenance attachment length mismatch: declared {}, received {} UTF-16 code units",
+            attachment.length, npm_length
+        ));
+    }
+
+    let bundle: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("npm provenance attachment is not valid JSON: {error}"))?;
+    let media_type = bundle
+        .get("mediaType")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.starts_with("application/vnd.dev.sigstore.bundle."))
+        .ok_or_else(|| {
+            "npm provenance attachment has no supported Sigstore mediaType".to_string()
+        })?;
+    if attachment.content_type.as_deref() != Some(media_type) {
+        return Err(
+            "npm provenance attachment content_type does not match its Sigstore mediaType".into(),
+        );
+    }
+    if !bundle
+        .get("verificationMaterial")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err("npm provenance Sigstore bundle is missing verificationMaterial".into());
+    }
+
+    let envelope = bundle
+        .get("dsseEnvelope")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "npm provenance Sigstore bundle is missing dsseEnvelope".to_string())?;
+    if envelope
+        .get("payloadType")
+        .and_then(serde_json::Value::as_str)
+        != Some("application/vnd.in-toto+json")
+    {
+        return Err("npm provenance DSSE envelope has an unsupported payloadType".into());
+    }
+    let signatures = envelope
+        .get("signatures")
+        .and_then(serde_json::Value::as_array)
+        .filter(|signatures| {
+            !signatures.is_empty()
+                && signatures.iter().all(|signature| {
+                    signature
+                        .get("sig")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|sig| !sig.is_empty())
+                })
+        })
+        .ok_or_else(|| "npm provenance DSSE envelope has no signature".to_string())?;
+    debug_assert!(!signatures.is_empty());
+
+    let encoded_payload = envelope
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "npm provenance DSSE envelope is missing its payload".to_string())?;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(encoded_payload)
+        .map_err(|error| format!("npm provenance DSSE payload is not valid base64: {error}"))?;
+    let statement: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|error| format!("npm provenance DSSE payload is not valid JSON: {error}"))?;
+    if statement.get("_type").and_then(serde_json::Value::as_str)
+        != Some("https://in-toto.io/Statement/v1")
+    {
+        return Err("npm provenance payload is not an in-toto Statement v1".into());
+    }
+    let predicate_type = statement
+        .get("predicateType")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "npm provenance statement has no predicateType".to_string())?
+        .to_string();
+    let subjects = statement
+        .get("subject")
+        .and_then(serde_json::Value::as_array)
+        .filter(|subjects| subjects.len() == 1)
+        .ok_or_else(|| "npm provenance statement must contain exactly one subject".to_string())?;
+    let subject_name = subjects[0]
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "npm provenance subject has no name".to_string())?
+        .to_string();
+    let subject_sha512 = subjects[0]
+        .pointer("/digest/sha512")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.len() == 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "npm provenance subject has no valid SHA-512 digest".to_string())?
+        .to_ascii_lowercase();
+
+    Ok(InspectedNpmProvenance {
+        bundle,
+        bytes,
+        predicate_type,
+        subject_name,
+        subject_sha512,
+    })
 }
 
 /// Turn npm's JSON envelope into the one tarball the package service owns.
@@ -310,15 +456,10 @@ fn decode_npm_publish_packument(
     let dist_tag = dist_tag.clone();
 
     let filename = format!("{path_name}-{version}.tgz");
-    if packument.attachments.len() != 1 {
-        return Err(
-            "npm publish packument must contain exactly one tarball attachment; provenance attachments are not supported"
-                .into(),
-        );
-    }
-    let attachment = packument
-        .attachments
-        .get(&filename)
+    let provenance_filename = format!("{path_name}-{version}.sigstore");
+    let mut attachments = packument.attachments;
+    let attachment = attachments
+        .remove(&filename)
         .ok_or_else(|| format!("npm publish packument is missing attachment '{filename}'"))?;
     if attachment.length > artifact_limit {
         return Err(format!(
@@ -336,11 +477,42 @@ fn decode_npm_publish_packument(
         ));
     }
 
+    let provenance = match attachments.remove(&provenance_filename) {
+        Some(attachment) => {
+            let inspected = inspect_npm_provenance_attachment(&attachment, artifact_limit)?;
+            let expected_name = npm_package_purl(path_name, &version);
+            if inspected.subject_name != expected_name {
+                return Err(format!(
+                    "npm provenance subject names '{}', expected '{expected_name}'",
+                    inspected.subject_name
+                ));
+            }
+            let expected_sha512 = hex::encode(Sha512::digest(&tarball));
+            if inspected.subject_sha512 != expected_sha512 {
+                return Err(
+                    "npm provenance subject SHA-512 does not match the tarball attachment".into(),
+                );
+            }
+            Some(DecodedNpmProvenance {
+                filename: provenance_filename,
+                bundle: inspected.bytes,
+                predicate_type: inspected.predicate_type,
+            })
+        }
+        None => None,
+    };
+    if let Some(unexpected) = attachments.keys().next() {
+        return Err(format!(
+            "npm publish packument contains unsupported attachment '{unexpected}'"
+        ));
+    }
+
     Ok(DecodedNpmPublish {
         filename,
         version,
         dist_tag,
         tarball,
+        provenance,
     })
 }
 
@@ -373,6 +545,41 @@ mod npm_publish_packument_tests {
         decode_npm_publish_packument(NAME, serde_json::from_value(document).unwrap(), usize::MAX)
     }
 
+    fn provenance_attachment(subject_name: &str, subject_sha512: &str) -> serde_json::Value {
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{
+                "name": subject_name,
+                "digest": { "sha512": subject_sha512 }
+            }],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {}
+        });
+        let bundle = serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": {},
+            "dsseEnvelope": {
+                "payloadType": "application/vnd.in-toto+json",
+                "payload": base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&statement).unwrap()),
+                "signatures": [{ "sig": "structurally-present-signature" }]
+            }
+        });
+        let data = bundle.to_string();
+        let length = data.len();
+        serde_json::json!({
+            "data": data,
+            "length": length,
+            "content_type": "application/vnd.dev.sigstore.bundle.v0.3+json"
+        })
+    }
+
+    fn add_matching_provenance(document: &mut serde_json::Value) {
+        let sha512 = hex::encode(Sha512::digest(b"tarball"));
+        document["_attachments"]["@scope/matrix-1.2.3.sigstore"] =
+            provenance_attachment("pkg:npm/%40scope/matrix@1.2.3", &sha512);
+    }
+
     #[test]
     fn scoped_packument_keeps_the_client_attachment_name_and_bytes() {
         let decoded = decode(document()).unwrap();
@@ -380,6 +587,43 @@ mod npm_publish_packument_tests {
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.dist_tag, "latest");
         assert_eq!(decoded.tarball, b"tarball");
+        assert!(decoded.provenance.is_none());
+    }
+
+    #[test]
+    fn matching_sigstore_attachment_is_kept_with_its_predicate_type() {
+        let mut value = document();
+        add_matching_provenance(&mut value);
+
+        let decoded = decode(value).unwrap();
+        let provenance = decoded.provenance.expect("provenance was discarded");
+        assert_eq!(provenance.filename, "@scope/matrix-1.2.3.sigstore");
+        assert_eq!(provenance.predicate_type, "https://slsa.dev/provenance/v1");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&provenance.bundle).unwrap()["mediaType"],
+            "application/vnd.dev.sigstore.bundle.v0.3+json"
+        );
+    }
+
+    #[test]
+    fn provenance_length_uses_the_javascript_utf16_contract() {
+        let mut value = document();
+        let sha512 = hex::encode(Sha512::digest(b"tarball"));
+        let mut attachment = provenance_attachment("pkg:npm/%40scope/matrix@1.2.3", &sha512);
+        let mut bundle: serde_json::Value =
+            serde_json::from_str(attachment["data"].as_str().unwrap()).unwrap();
+        bundle["verificationMaterial"]["certificateIdentity"] = serde_json::json!("München");
+        let data = bundle.to_string();
+        let npm_length = data.encode_utf16().count();
+        assert!(
+            data.len() > npm_length,
+            "fixture must distinguish UTF-8 from JS length"
+        );
+        attachment["data"] = serde_json::json!(data);
+        attachment["length"] = serde_json::json!(npm_length);
+        value["_attachments"]["@scope/matrix-1.2.3.sigstore"] = attachment;
+
+        assert!(decode(value).unwrap().provenance.is_some());
     }
 
     #[test]
@@ -417,14 +661,41 @@ mod npm_publish_packument_tests {
             .unwrap_err()
             .contains("must name the version being published"));
 
-        let mut provenance = document();
-        provenance["_attachments"]["@scope/matrix-1.2.3.sigstore"] = serde_json::json!({
-            "data": "{}",
-            "length": 2
+        let mut unexpected = document();
+        unexpected["_attachments"]["README.txt"] = serde_json::json!({
+            "data": "readme",
+            "length": 6
         });
-        assert!(decode(provenance)
+        assert!(decode(unexpected)
             .unwrap_err()
-            .contains("provenance attachments are not supported"));
+            .contains("unsupported attachment"));
+    }
+
+    #[test]
+    fn malformed_or_foreign_provenance_fails_closed() {
+        let matching_sha512 = hex::encode(Sha512::digest(b"tarball"));
+
+        let mut foreign_name = document();
+        foreign_name["_attachments"]["@scope/matrix-1.2.3.sigstore"] =
+            provenance_attachment("pkg:npm/other@1.2.3", &matching_sha512);
+        assert!(decode(foreign_name).unwrap_err().contains("subject names"));
+
+        let mut foreign_tarball = document();
+        foreign_tarball["_attachments"]["@scope/matrix-1.2.3.sigstore"] = provenance_attachment(
+            "pkg:npm/%40scope/matrix@1.2.3",
+            &hex::encode(Sha512::digest(b"other tarball")),
+        );
+        assert!(decode(foreign_tarball)
+            .unwrap_err()
+            .contains("SHA-512 does not match"));
+
+        let mut malformed = document();
+        malformed["_attachments"]["@scope/matrix-1.2.3.sigstore"] = serde_json::json!({
+            "data": "not json",
+            "length": 8,
+            "content_type": "application/vnd.dev.sigstore.bundle.v0.3+json"
+        });
+        assert!(decode(malformed).unwrap_err().contains("not valid JSON"));
     }
 
     #[test]
@@ -1004,8 +1275,7 @@ async fn publish_package(
         name,
         pkg_type,
         query,
-        filename,
-        body,
+        vec![(filename, body)],
         adapter_meta,
         None,
     )
@@ -1020,8 +1290,7 @@ async fn persist_package(
     name: String,
     pkg_type: String,
     query: PublishPackageQuery,
-    filename: String,
-    body: Vec<u8>,
+    files: Vec<(String, Vec<u8>)>,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
     npm_dist_tag: Option<String>,
 ) -> axum::response::Response {
@@ -1046,7 +1315,7 @@ async fn persist_package(
         repository_url: resolved.repository_url,
         npm_dist_tag,
         author_id: user_id,
-        files: vec![(filename, body)],
+        files,
     };
 
     match rg_core::package_registry::service::publish(&state.db, &storage, info).await {
@@ -1180,7 +1449,7 @@ pub async fn publish_npm_packument(
         .any(|attachment| attachment.length > state.package_upload_max_bytes)
     {
         return AppError::payload_too_large(format!(
-            "npm tarball attachment exceeds the configured {}-byte artifact limit",
+            "npm attachment exceeds the configured {}-byte artifact limit",
             state.package_upload_max_bytes
         ))
         .into_response();
@@ -1202,7 +1471,7 @@ pub async fn publish_npm_packument(
             &format!("invalid package payload: {error:#}"),
         );
     }
-    let metadata = match adapter.extract_metadata(&decoded.filename, &decoded.tarball) {
+    let mut metadata = match adapter.extract_metadata(&decoded.filename, &decoded.tarball) {
         Ok(metadata) => metadata,
         Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
@@ -1211,6 +1480,19 @@ pub async fn publish_npm_packument(
             StatusCode::BAD_REQUEST,
             "npm tarball package.json does not match the publish URL and packument version",
         );
+    }
+    if let Some(provenance) = decoded.provenance.as_ref() {
+        if let Err(error) = rg_core::package_registry::record_npm_provenance(
+            &mut metadata,
+            &provenance.predicate_type,
+        ) {
+            return package_error_response(error);
+        }
+    }
+
+    let mut files = vec![(decoded.filename, decoded.tarball)];
+    if let Some(provenance) = decoded.provenance {
+        files.push((provenance.filename, provenance.bundle));
     }
 
     let query = PublishPackageQuery {
@@ -1228,8 +1510,7 @@ pub async fn publish_npm_packument(
         repo,
         "npm".to_string(),
         query,
-        decoded.filename,
-        decoded.tarball,
+        files,
         Some(metadata),
         Some(decoded.dist_tag),
     )
@@ -1924,6 +2205,105 @@ pub async fn npm_registry_metadata(
     };
 
     (StatusCode::OK, Json(metadata)).into_response()
+}
+
+/// GET the Sigstore bundle npm/pacote discovers through `dist.attestations`.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/packages/npm/-/npm/v1/attestations/{package_spec}",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("package_spec" = String, Path, description = "npm package name and version"),
+    ),
+    responses(
+        (status = 200, description = "npm attestation collection", body = serde_json::Value),
+        (status = 400, description = "Malformed package specification", body = serde_json::Value),
+        (status = 404, description = "Package or provenance attachment not found", body = serde_json::Value),
+        (status = 500, description = "Stored provenance is unreadable", body = serde_json::Value),
+    ),
+)]
+pub async fn npm_attestations(
+    State(state): State<AppState>,
+    Path((owner, repo, package_spec)): Path<(String, String, String)>,
+    CiRead::<Packages> { .. }: CiRead<Packages>,
+) -> axum::response::Response {
+    let Some((package_name, version)) = package_spec.rsplit_once('@') else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "npm attestation package specification must be '<name>@<version>'",
+        );
+    };
+    if package_name.is_empty() || version.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "npm attestation package name and version must not be empty",
+        );
+    }
+
+    let filename = format!("{package_name}-{version}.sigstore");
+    let storage =
+        rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
+    let downloaded = match rg_core::package_registry::service::download_file(
+        &state.db,
+        &storage,
+        &owner,
+        &repo,
+        "npm",
+        package_name,
+        version,
+        &filename,
+    )
+    .await
+    {
+        Ok(downloaded) => downloaded,
+        Err(error) => return package_error_response(error),
+    };
+
+    let raw_bundle = match String::from_utf8(downloaded.data) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return package_error_response(anyhow::anyhow!(
+                "stored npm provenance attachment is not UTF-8 JSON: {error}"
+            ))
+        }
+    };
+    let media_type = match serde_json::from_str::<serde_json::Value>(&raw_bundle)
+        .ok()
+        .and_then(|bundle| bundle.get("mediaType")?.as_str().map(String::from))
+    {
+        Some(media_type) => media_type,
+        None => {
+            return package_error_response(anyhow::anyhow!(
+                "stored npm provenance attachment has no mediaType"
+            ))
+        }
+    };
+    let attachment = NpmPublishAttachment {
+        length: raw_bundle.encode_utf16().count(),
+        data: raw_bundle,
+        content_type: Some(media_type),
+    };
+    let inspected = match inspect_npm_provenance_attachment(&attachment, usize::MAX) {
+        Ok(inspected) => inspected,
+        Err(error) => {
+            return package_error_response(anyhow::anyhow!(
+                "stored npm provenance attachment is unreadable: {error}"
+            ))
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "attestations": [{
+                "predicateType": inspected.predicate_type,
+                "bundle": inspected.bundle
+            }]
+        })),
+    )
+        .into_response()
 }
 
 /// GET the mutable selectors managed by `npm dist-tag ls`.

@@ -507,6 +507,7 @@ pub(crate) fn stamp_security(
         crate::api::packages::download_file,
         crate::api::packages::publish_npm,
         crate::api::packages::publish_npm_packument,
+        crate::api::packages::npm_attestations,
         crate::api::packages::npm_dist_tags,
         crate::api::packages::set_npm_dist_tag,
         crate::api::packages::delete_npm_dist_tag,

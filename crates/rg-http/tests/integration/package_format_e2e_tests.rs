@@ -10,6 +10,7 @@ use base64::Engine as _;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::StatusCode;
+use sha2::Digest as _;
 
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -43,6 +44,28 @@ fn tar_gz_uncompressed(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
     encoder.write_all(&tar_archive(files)).unwrap();
     encoder.finish().unwrap()
+}
+
+fn npm_provenance_bundle(name: &str, version: &str, sha512: &str) -> serde_json::Value {
+    let statement = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{
+            "name": format!("pkg:npm/{name}@{version}"),
+            "digest": { "sha512": sha512 }
+        }],
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "predicate": { "buildDefinition": {}, "runDetails": {} }
+    });
+    serde_json::json!({
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {},
+        "dsseEnvelope": {
+            "payloadType": "application/vnd.in-toto+json",
+            "payload": base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&statement).unwrap()),
+            "signatures": [{ "sig": "integration-structure-signature" }]
+        }
+    })
 }
 
 fn zip_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1899,6 +1922,149 @@ async fn npm_put_packument_publishes_normal_and_scoped_tarballs() {
             .unwrap();
         assert_eq!(repeated.status(), StatusCode::CONFLICT, "{name}");
     }
+}
+
+/// npm publishes provenance as a second raw-JSON attachment. The registry must
+/// keep it atomically with the tarball, advertise npm's standard discovery URL,
+/// and reject a DSSE statement whose SHA-512 names different bytes.
+#[tokio::test]
+async fn npm_provenance_attachment_round_trips_and_foreign_digest_is_atomic() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(
+        &base,
+        "npm-provenance-owner",
+        "npm-provenance-owner@example.com",
+    )
+    .await;
+    create_repo(&base, &token, "npm-provenance-repo").await;
+    let client = reqwest::Client::new();
+    let name = "matrix-provenance-npm";
+    let publish_url = format!(
+        "{}/api/v1/repos/npm-provenance-owner/npm-provenance-repo/packages/npm/{name}",
+        base.trim_end_matches('/')
+    );
+
+    let publish_document = |version: &str, tarball: &[u8], bundle: &serde_json::Value| {
+        let bundle_data = bundle.to_string();
+        let bundle_len = bundle_data.encode_utf16().count();
+        let tarball_filename = format!("{name}-{version}.tgz");
+        let provenance_filename = format!("{name}-{version}.sigstore");
+        serde_json::json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": { version: { "name": name, "version": version } },
+            "_attachments": {
+                tarball_filename: {
+                    "content_type": "application/octet-stream",
+                    "data": base64::engine::general_purpose::STANDARD.encode(tarball),
+                    "length": tarball.len()
+                },
+                provenance_filename: {
+                    "content_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                    "data": bundle_data,
+                    "length": bundle_len
+                }
+            }
+        })
+    };
+
+    let version = "1.0.0";
+    let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+    let tarball = tar_gz(&[("package/package.json", manifest.as_bytes())]);
+    let tarball_sha512 = hex::encode(sha2::Sha512::digest(&tarball));
+    let bundle = npm_provenance_bundle(name, version, &tarball_sha512);
+    let published = client
+        .put(&publish_url)
+        .bearer_auth(&token)
+        .json(&publish_document(version, &tarball, &bundle))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        published.status(),
+        StatusCode::CREATED,
+        "{}",
+        published.text().await.unwrap()
+    );
+
+    let packument: serde_json::Value = client
+        .get(&publish_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let dist = &packument["versions"][version]["dist"];
+    let attestation_url = dist["attestations"]["url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no dist.attestations URL: {packument}"));
+    assert_eq!(
+        dist["attestations"]["provenance"]["predicateType"],
+        "https://slsa.dev/provenance/v1"
+    );
+    assert!(
+        attestation_url.contains("/-/npm/v1/attestations/"),
+        "non-standard npm attestation URL: {attestation_url}"
+    );
+    let served: serde_json::Value = client
+        .get(attestation_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(served["attestations"][0]["bundle"], bundle);
+    assert_eq!(
+        served["attestations"][0]["predicateType"],
+        "https://slsa.dev/provenance/v1"
+    );
+
+    let foreign_version = "2.0.0";
+    let foreign_manifest = format!(r#"{{"name":"{name}","version":"{foreign_version}"}}"#);
+    let foreign_tarball = tar_gz(&[("package/package.json", foreign_manifest.as_bytes())]);
+    let foreign_bundle = npm_provenance_bundle(
+        name,
+        foreign_version,
+        &hex::encode(sha2::Sha512::digest(b"different tarball")),
+    );
+    let refused = client
+        .put(&publish_url)
+        .bearer_auth(&token)
+        .json(&publish_document(
+            foreign_version,
+            &foreign_tarball,
+            &foreign_bundle,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        refused
+            .text()
+            .await
+            .unwrap()
+            .contains("SHA-512 does not match"),
+        "foreign provenance was not diagnosed"
+    );
+
+    let after_refusal: serde_json::Value = client
+        .get(&publish_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        after_refusal["versions"].get(foreign_version).is_none(),
+        "refused provenance left a partial package version: {after_refusal}"
+    );
 }
 
 /// Dist-tags are mutable selectors, while the version rows they point at are
