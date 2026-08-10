@@ -192,6 +192,96 @@ async fn twine_multipart_upload_round_trips_through_the_simple_index() {
     );
 }
 
+/// Acceptance for card_33fcd7258af5: PEP 440 declares `1.0` and `v1.0.0` to be
+/// one public version, and a public version must be unique inside a
+/// distribution. A second spelling is therefore a conflicting immutable
+/// publication, not a second release and not an additional-file upload.
+#[tokio::test]
+async fn equivalent_pep440_version_spelling_is_a_conflict_without_a_second_row() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "pep440-owner", "pep440-owner@example.com").await;
+    create_repo(&base, &token, "pep440-repo").await;
+    let client = reqwest::Client::new();
+    let legacy = format!("{base}/api/v1/repos/pep440-owner/pep440-repo/packages/pypi/legacy/");
+
+    // Twine reads both the version field and the metadata out of the same
+    // distribution, so the two spellings differ everywhere a real upload would.
+    let upload = |version: &'static str| {
+        let client = client.clone();
+        let token = token.clone();
+        let legacy = legacy.clone();
+        async move {
+            let filename = format!("matrix_pep440-{version}-py3-none-any.whl");
+            let body = wheel(
+                &format!("matrix_pep440-{version}.dist-info"),
+                &format!("Metadata-Version: 2.1\nName: matrix-pep440\nVersion: {version}\n"),
+            );
+            let digest = hex::encode(Sha256::digest(&body));
+            client
+                .post(legacy)
+                .bearer_auth(token)
+                .multipart(twine_form(
+                    "matrix-pep440",
+                    version,
+                    &filename,
+                    body,
+                    digest,
+                ))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = upload("1.0").await;
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+
+    let equivalent = upload("v1.0.0").await;
+    assert_eq!(
+        equivalent.status(),
+        StatusCode::CONFLICT,
+        "an equivalent PEP 440 spelling was accepted: {}",
+        equivalent.text().await.unwrap()
+    );
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "pep440-owner", "pep440-repo")
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "pypi")
+        .await
+        .unwrap()
+        .unwrap();
+    let package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "matrix-pep440")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.len(),
+        1,
+        "equivalent spelling created a second row"
+    );
+    assert_eq!(
+        versions[0].version, "1.0",
+        "the first spelling stays canonical storage"
+    );
+    assert_eq!(versions[0].protocol_version_key.as_deref(), Some("1"));
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, versions[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        files.len(),
+        1,
+        "the refused publish left a second distribution file"
+    );
+}
+
 #[tokio::test]
 async fn twine_upload_rejects_a_false_sha256_without_publishing() {
     let (base, _db) = spawn_test_app_with_db().await;

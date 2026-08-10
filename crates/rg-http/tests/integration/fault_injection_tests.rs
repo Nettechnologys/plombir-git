@@ -1432,6 +1432,120 @@ async fn concurrent_equivalent_nuget_publishes_leave_one_version_and_file() {
     assert_eq!(files.len(), 1, "the losing publish left a package_file row");
 }
 
+/// A wheel is a ZIP holding `{name}-{version}.dist-info/METADATA`.
+fn python_wheel(package: &str, version: &str, marker: &str) -> Vec<u8> {
+    let metadata =
+        format!("Metadata-Version: 2.1\nName: {package}\nVersion: {version}\nSummary: {marker}\n");
+    let mut output = Cursor::new(Vec::new());
+    {
+        let mut archive = zip::ZipWriter::new(&mut output);
+        archive
+            .start_file(
+                format!("{}-{version}.dist-info/METADATA", package.replace('-', "_")),
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.write_all(metadata.as_bytes()).unwrap();
+        archive.finish().unwrap();
+    }
+    output.into_inner()
+}
+
+/// PEP 440 aliases are a database identity, not a read-before-write convention.
+/// Both requests cross the absent-version read before either insert; the
+/// protocol key's UNIQUE constraint must leave one winner for `1.0`/`v1.0.0`.
+#[tokio::test]
+async fn concurrent_equivalent_pypi_publishes_leave_one_version_and_file() {
+    let (base, db, gate) = spawn_test_app_with_two_put_gate("race.whl").await;
+    let (token, _) = register_full(&base, "pypi_race", "pypi_race@example.com").await;
+    create_repo(&base, &token, "racing-publishes").await;
+    let client = reqwest::Client::new();
+    let publish_url =
+        format!("{base}/api/v1/repos/pypi_race/racing-publishes/packages/pypi/publish");
+
+    let seed = client
+        .post(&publish_url)
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"seed.whl\"",
+        )
+        .body(python_wheel("race-identity", "0.9.0", "seed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed.status(), reqwest::StatusCode::CREATED);
+
+    let publish = |version: &'static str, marker: &'static str| {
+        let client = client.clone();
+        let token = token.clone();
+        let publish_url = publish_url.clone();
+        tokio::spawn(async move {
+            client
+                .post(publish_url)
+                .bearer_auth(token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"race.whl\"",
+                )
+                .body(python_wheel("race-identity", version, marker))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    let mut short = publish("1.0", "short spelling");
+    let mut expanded = publish("v1.0.0", "expanded spelling");
+    let (winner, loser) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut short => {
+                let result = result.unwrap();
+                gate.release_second();
+                (result, expanded.await.unwrap())
+            }
+            result = &mut expanded => {
+                let result = result.unwrap();
+                gate.release_second();
+                (result, short.await.unwrap())
+            }
+        }
+    })
+    .await
+    .expect("both equivalent publishes reached storage and completed");
+
+    assert_eq!(winner.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(loser.status(), reqwest::StatusCode::CONFLICT);
+
+    let repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "pypi_race", "racing-publishes")
+            .await
+            .unwrap()
+            .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "pypi")
+        .await
+        .unwrap()
+        .unwrap();
+    let package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "race-identity")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    let published: Vec<_> = versions
+        .iter()
+        .filter(|version| version.protocol_version_key.as_deref() == Some("1"))
+        .collect();
+    assert_eq!(published.len(), 1, "both equivalent version rows committed");
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, published[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "the losing publish left a package_file row");
+}
+
 /// Two additions to an already-visible version can both pass the filename
 /// precheck. The package-file UNIQUE claim must leave exactly one row and one
 /// size increment, and compensation must not touch the winner's private blob.

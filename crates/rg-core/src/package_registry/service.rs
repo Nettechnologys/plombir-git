@@ -4,7 +4,7 @@
 //! coordinating the DB ops and the storage layer.
 
 use anyhow::Context as _;
-use rg_db::package_version_key::NuGetVersion;
+use rg_db::package_version_key::{NuGetVersion, Pep440Version};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
 
@@ -169,6 +169,26 @@ pub struct FileDetail {
     pub sha512: Option<String>,
 }
 
+/// The protocol identity of `version`, when its protocol defines one.
+///
+/// The version row stores the spelling the publisher supplied; this key stores
+/// what the protocol considers that spelling to *be*. NuGet reads `1`, `1.0.0`,
+/// a zero `Revision`, case-only prerelease changes and build metadata as one
+/// version; PEP 440 does the same for a leading `v`, letter case, leading
+/// zeroes, the separators and alternate spellings around its pre/post/dev
+/// segments and trailing `.0` release components.
+///
+/// `None` — for a protocol with no separate identity contract, and for a
+/// spelling its parser rejects — leaves the version on its exact-text
+/// behavior, which is what keeps unparsable historical rows addressable.
+pub fn protocol_version_key(package_type: &str, version: &str) -> Option<String> {
+    match package_type {
+        package_types::NUGET => NuGetVersion::parse(version).map(|parsed| parsed.normalized()),
+        package_types::PYPI => Pep440Version::parse(version).map(|parsed| parsed.canonical()),
+        _ => None,
+    }
+}
+
 /// Publish a package version to the registry.
 pub async fn publish(
     db: &DatabaseConnection,
@@ -184,15 +204,7 @@ pub async fn publish(
         validate_npm_dist_tag(tag)?;
     }
 
-    // The package row stores the spelling supplied by the publisher, while
-    // this key stores protocol identity. NuGet considers `1`, `1.0.0`, a zero
-    // Revision, case-only prerelease changes and build metadata aliases. The
-    // key is nullable so unparsable historical spellings and protocols without
-    // a separate identity contract retain their exact-text behavior.
-    let protocol_version_key = (info.package_type == package_types::NUGET)
-        .then(|| NuGetVersion::parse(&info.version))
-        .flatten()
-        .map(|version| version.normalized());
+    let protocol_version_key = protocol_version_key(&info.package_type, &info.version);
 
     // 1. Find or create the package registry for this repo+type
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
@@ -217,8 +229,8 @@ pub async fn publish(
     )
     .await?;
 
-    // 3. Check if version already exists. A parseable NuGet version is looked
-    //    up by protocol identity, not by its raw spelling.
+    // 3. Check if version already exists. A version whose protocol defines an
+    //    identity is looked up by that identity, not by its raw spelling.
     let existing = match protocol_version_key.as_deref() {
         Some(key) => {
             rg_db::ops::package_version_ops::find_by_package_and_protocol_version_key(
@@ -236,7 +248,7 @@ pub async fn publish(
     let version = if let Some(v) = existing {
         if protocol_version_key.is_some() && v.version != info.version {
             return Err(crate::error::conflict(format!(
-                "NuGet version {} normalizes to the already-published version {} of package '{}'",
+                "version {} normalizes to the already-published version {} of package '{}'",
                 info.version, v.version, info.name
             )));
         }
