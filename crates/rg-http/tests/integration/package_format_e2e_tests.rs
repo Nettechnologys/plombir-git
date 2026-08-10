@@ -267,6 +267,59 @@ fn package_url(base: &str, segments: &[&str]) -> reqwest::Url {
     url
 }
 
+async fn publish_nuget_version(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    package: &str,
+    version: &str,
+) {
+    let nuspec = format!(
+        "<package><metadata><id>{package}</id><version>{version}</version></metadata></package>"
+    );
+    let response = client
+        .post(package_url(base, &["nuget", "publish"]))
+        .bearer_auth(token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{package}.{version}.nupkg\""),
+        )
+        .body(zip_archive(&[("package.nuspec", nuspec.as_bytes())]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{package} {version}"
+    );
+}
+
+async fn search_nuget(
+    client: &reqwest::Client,
+    base: &str,
+    pairs: &[(&str, &str)],
+) -> serde_json::Value {
+    let mut query = package_url(base, &["nuget", "query"]);
+    query.query_pairs_mut().extend_pairs(pairs.iter().copied());
+    client
+        .get(query)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn nuget_search_version<'a>(search: &'a serde_json::Value, package: &str) -> Option<&'a str> {
+    search["data"]
+        .as_array()?
+        .iter()
+        .find(|result| result["id"] == package)?["version"]
+        .as_str()
+}
+
 #[test]
 fn every_file_package_protocol_declares_how_yank_is_encoded() {
     let mut production: Vec<&str> = rg_core::package_registry::adapter::REGISTERED_ADAPTER_TYPES
@@ -591,80 +644,147 @@ async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
     }
 }
 
-/// NuGet accepts version forms strict SemVer does not, and its search response
-/// must advertise the highest live stable NuGetVersion rather than the most
-/// recently inserted row.
+/// SearchQueryService negotiates prerelease and SemVer 2 independently. The
+/// selected `version` is the highest live NuGetVersion the requesting client
+/// can understand, and a package with no such version disappears altogether.
 #[tokio::test]
-async fn nuget_search_uses_the_highest_live_stable_nuget_version() {
+async fn nuget_search_filters_prerelease_semver2_and_yanked_versions() {
     let (base, _db) = spawn_test_app_with_db().await;
     let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
     create_repo(&base, &token, "matrix-repo").await;
     let client = reqwest::Client::new();
 
-    for version in ["2.0.0", "2.0.0.1", "9.0.0", "1.2.4", "10.0.0-beta"] {
-        let nuspec = format!(
-            "<package><metadata><id>Matrix.VersionOrder</id><version>{version}</version></metadata></package>"
-        );
-        let response = client
-            .post(package_url(&base, &["nuget", "publish"]))
-            .bearer_auth(&token)
-            .header(
-                reqwest::header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"Matrix.VersionOrder.{version}.nupkg\""),
-            )
-            .body(zip_archive(&[(
-                "Matrix.VersionOrder.nuspec",
-                nuspec.as_bytes(),
-            )]))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED, "{version}");
+    for (package, version) in [
+        ("Matrix.SearchModes", "1.0.0"),
+        ("Matrix.SearchModes", "4.0.0-beta"),
+        ("Matrix.SearchModes", "5.0.0-beta.1"),
+        ("Matrix.SearchModes", "6.0.0+build.7"),
+        ("Matrix.SearchModes", "9.0.0"),
+        ("Matrix.SearchModes", "10.0.0-beta"),
+        ("Matrix.PrereleaseOnly", "3.0.0-beta"),
+        ("Matrix.PrereleaseOnly", "7.0.0-alpha.1"),
+        ("Matrix.SemVer2Only", "2.0.0+build.5"),
+        ("Matrix.YankedOnly", "11.0.0-alpha.1"),
+    ] {
+        publish_nuget_version(&client, &base, &token, package, version).await;
     }
 
-    let yanked = client
-        .patch(package_url(
-            &base,
-            &["nuget", "Matrix.VersionOrder", "9.0.0", "yank"],
-        ))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({ "yank": true }))
+    for (package, version) in [
+        ("Matrix.SearchModes", "9.0.0"),
+        ("Matrix.SearchModes", "10.0.0-beta"),
+        ("Matrix.YankedOnly", "11.0.0-alpha.1"),
+    ] {
+        let yanked = client
+            .patch(package_url(&base, &["nuget", package, version, "yank"]))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "yank": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(yanked.status(), StatusCode::OK, "{package} {version}");
+    }
+
+    // The generic package list is not a NuGet client capability surface. The
+    // refactor must preserve its existing stable-only summary while still
+    // allowing a stable SemVer 2 spelling.
+    let listed = client
+        .get(package_url(&base, &["nuget", "list"]))
         .send()
         .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
         .unwrap();
-    assert_eq!(yanked.status(), StatusCode::OK);
+    let summary = listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "Matrix.SearchModes")
+        .unwrap_or_else(|| panic!("NuGet package summary missing: {listed}"));
+    assert_eq!(summary["latest_version"], "6.0.0+build.7", "{listed}");
 
-    for _ in 0..3 {
-        let mut query = package_url(&base, &["nuget", "query"]);
-        query
-            .query_pairs_mut()
-            .append_pair("q", "Matrix.VersionOrder");
-        let search = client
-            .get(query)
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap();
-        assert_eq!(search["totalHits"], 1, "{search}");
-        assert_eq!(search["data"][0]["version"], "2.0.0.1", "{search}");
+    let stable_semver1 = search_nuget(&client, &base, &[("q", "Matrix.")]).await;
+    assert_eq!(stable_semver1["totalHits"], 1, "{stable_semver1}");
+    assert_eq!(
+        nuget_search_version(&stable_semver1, "Matrix.SearchModes"),
+        Some("1.0.0")
+    );
 
-        let listed = client
-            .get(package_url(&base, &["nuget", "list"]))
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap();
-        let summary = listed["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|package| package["name"] == "Matrix.VersionOrder")
-            .unwrap_or_else(|| panic!("NuGet package summary missing: {listed}"));
-        assert_eq!(summary["latest_version"], "2.0.0.1", "{listed}");
+    let prerelease_semver1 =
+        search_nuget(&client, &base, &[("q", "Matrix."), ("prerelease", "true")]).await;
+    assert_eq!(prerelease_semver1["totalHits"], 2, "{prerelease_semver1}");
+    assert_eq!(
+        nuget_search_version(&prerelease_semver1, "Matrix.SearchModes"),
+        Some("4.0.0-beta")
+    );
+    assert_eq!(
+        nuget_search_version(&prerelease_semver1, "Matrix.PrereleaseOnly"),
+        Some("3.0.0-beta")
+    );
+
+    let stable_semver2 = search_nuget(
+        &client,
+        &base,
+        &[("q", "Matrix."), ("semVerLevel", "2.0.0")],
+    )
+    .await;
+    assert_eq!(stable_semver2["totalHits"], 2, "{stable_semver2}");
+    assert_eq!(
+        nuget_search_version(&stable_semver2, "Matrix.SearchModes"),
+        Some("6.0.0+build.7")
+    );
+    assert_eq!(
+        nuget_search_version(&stable_semver2, "Matrix.SemVer2Only"),
+        Some("2.0.0+build.5")
+    );
+
+    let all_versions = search_nuget(
+        &client,
+        &base,
+        &[
+            ("q", "Matrix."),
+            ("prerelease", "true"),
+            ("semVerLevel", "2.1.0"),
+        ],
+    )
+    .await;
+    assert_eq!(all_versions["totalHits"], 3, "{all_versions}");
+    assert_eq!(
+        nuget_search_version(&all_versions, "Matrix.SearchModes"),
+        Some("6.0.0+build.7")
+    );
+    assert_eq!(
+        nuget_search_version(&all_versions, "Matrix.PrereleaseOnly"),
+        Some("7.0.0-alpha.1")
+    );
+
+    let invalid_semver_level = search_nuget(
+        &client,
+        &base,
+        &[
+            ("q", "Matrix."),
+            ("prerelease", "true"),
+            ("semVerLevel", "not-a-version"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        nuget_search_version(&invalid_semver_level, "Matrix.PrereleaseOnly"),
+        Some("3.0.0-beta")
+    );
+    assert_eq!(
+        nuget_search_version(&invalid_semver_level, "Matrix.SemVer2Only"),
+        None
+    );
+
+    for search in [
+        &stable_semver1,
+        &prerelease_semver1,
+        &stable_semver2,
+        &all_versions,
+        &invalid_semver_level,
+    ] {
+        assert_eq!(nuget_search_version(search, "Matrix.YankedOnly"), None);
     }
 }
 

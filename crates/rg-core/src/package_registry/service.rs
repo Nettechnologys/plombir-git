@@ -582,6 +582,44 @@ pub async fn list_packages(
     repo: &str,
     package_type: &str,
 ) -> Result<Vec<PackageSummary>> {
+    list_packages_with_nuget_filter(
+        db,
+        owner,
+        repo,
+        package_type,
+        crate::package_registry::adapters::nuget::NuGetVersionFilter::PACKAGE_SUMMARY,
+    )
+    .await
+}
+
+/// List NuGet packages using the SearchQueryService capability filters.
+pub async fn list_nuget_search_packages(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    include_prerelease: bool,
+    semver_level: Option<&str>,
+) -> Result<Vec<PackageSummary>> {
+    list_packages_with_nuget_filter(
+        db,
+        owner,
+        repo,
+        package_types::NUGET,
+        crate::package_registry::adapters::nuget::NuGetVersionFilter::search(
+            include_prerelease,
+            semver_level,
+        ),
+    )
+    .await
+}
+
+async fn list_packages_with_nuget_filter(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo: &str,
+    package_type: &str,
+    nuget_filter: crate::package_registry::adapters::nuget::NuGetVersionFilter,
+) -> Result<Vec<PackageSummary>> {
     let repo_model = crate::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
         .ok_or_else(|| not_found("repository"))?;
@@ -605,9 +643,10 @@ pub async fn list_packages(
             package_types::NPM => {
                 crate::package_registry::adapters::npm::latest_live_semver(candidates())
             }
-            package_types::NUGET => {
-                crate::package_registry::adapters::nuget::latest_live_nuget(candidates())
-            }
+            package_types::NUGET => crate::package_registry::adapters::nuget::latest_live_nuget(
+                candidates(),
+                nuget_filter,
+            ),
             _ => versions
                 .iter()
                 .find(|version| is_install_candidate(version.is_yanked))

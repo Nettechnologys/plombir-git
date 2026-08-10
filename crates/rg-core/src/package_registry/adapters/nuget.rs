@@ -783,6 +783,25 @@ impl NuGetVersion {
         self.release.is_some()
     }
 
+    /// Whether this spelling needs a SemVer 2-aware client.
+    ///
+    /// NuGet deliberately keeps its older four-component version extension in
+    /// the SemVer 1-compatible set. Only dotted prerelease labels and build
+    /// metadata opt a package version into SemVer 2.
+    fn is_semver2_specific(value: &str) -> bool {
+        let value = value.trim();
+        let (without_metadata, metadata) = value
+            .split_once('+')
+            .map_or((value, None), |(version, metadata)| {
+                (version, Some(metadata))
+            });
+
+        metadata.is_some()
+            || without_metadata
+                .split_once('-')
+                .is_some_and(|(_, release)| release.contains('.'))
+    }
+
     fn normalized(&self) -> String {
         let mut normalized = format!(
             "{}.{}.{}",
@@ -869,13 +888,51 @@ impl PartialOrd for NuGetReleaseLabel {
     }
 }
 
-/// Pick the highest live stable version using NuGetVersion precedence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NuGetVersionFilter {
+    include_prerelease: bool,
+    include_semver2: bool,
+    allow_legacy_fallback: bool,
+}
+
+impl NuGetVersionFilter {
+    /// Preserve the generic package summary contract: it is not a NuGet client
+    /// capability negotiation surface, but it still must not promote a
+    /// prerelease over a stable release.
+    pub(crate) const PACKAGE_SUMMARY: Self = Self {
+        include_prerelease: false,
+        include_semver2: true,
+        allow_legacy_fallback: true,
+    };
+
+    /// SearchQueryService defaults to SemVer 1 stable versions. A parseable
+    /// `semVerLevel >= 2.0.0` opts into SemVer 2; invalid input is equivalent to
+    /// omitting the parameter, as required by the NuGet server contract.
+    pub(crate) fn search(include_prerelease: bool, semver_level: Option<&str>) -> Self {
+        let semver2_floor = NuGetVersion {
+            numbers: [2, 0, 0, 0],
+            release: None,
+        };
+        let include_semver2 = semver_level
+            .and_then(NuGetVersion::parse)
+            .is_some_and(|level| level >= semver2_floor);
+
+        Self {
+            include_prerelease,
+            include_semver2,
+            allow_legacy_fallback: false,
+        }
+    }
+}
+
+/// Pick the highest live version allowed by one NuGet client capability mode.
 ///
 /// The iterator is in deterministic publication order. Its first unparsable
-/// live row is only a compatibility fallback when no valid stable NuGetVersion
-/// exists; a valid prerelease is deliberately not promoted to stable latest.
+/// live row remains a compatibility fallback only for the generic package
+/// summary; protocol search never advertises a version its client cannot parse.
 pub(crate) fn latest_live_nuget<'a>(
     versions: impl IntoIterator<Item = (&'a str, bool)>,
+    filter: NuGetVersionFilter,
 ) -> Option<&'a str> {
     let mut fallback = None;
     let mut latest: Option<(NuGetVersion, &'a str)> = None;
@@ -885,10 +942,14 @@ pub(crate) fn latest_live_nuget<'a>(
             continue;
         }
         let Some(parsed) = NuGetVersion::parse(version) else {
-            fallback.get_or_insert(version);
+            if filter.allow_legacy_fallback {
+                fallback.get_or_insert(version);
+            }
             continue;
         };
-        if parsed.is_prerelease() {
+        if (!filter.include_prerelease && parsed.is_prerelease())
+            || (!filter.include_semver2 && NuGetVersion::is_semver2_specific(version))
+        {
             continue;
         }
         if latest.as_ref().is_none_or(|(current, _)| parsed > *current) {
@@ -1004,19 +1065,64 @@ mod tests {
     #[test]
     fn latest_nuget_version_is_stable_live_and_has_deterministic_fallback() {
         assert_eq!(
-            latest_live_nuget([
-                ("4.0.0-beta", false),
-                ("1.2.4", false),
-                ("9.0.0", true),
-                ("2.0.0.1", false),
-            ]),
+            latest_live_nuget(
+                [
+                    ("4.0.0-beta", false),
+                    ("1.2.4", false),
+                    ("9.0.0", true),
+                    ("2.0.0.1", false),
+                ],
+                NuGetVersionFilter::PACKAGE_SUMMARY
+            ),
             Some("2.0.0.1")
         );
         assert_eq!(
-            latest_live_nuget([("legacy-newest", false), ("legacy-older", false)]),
+            latest_live_nuget(
+                [("legacy-newest", false), ("legacy-older", false)],
+                NuGetVersionFilter::PACKAGE_SUMMARY,
+            ),
             Some("legacy-newest")
         );
-        assert_eq!(latest_live_nuget([("3.0.0-beta", false)]), None);
+        assert_eq!(
+            latest_live_nuget([("3.0.0-beta", false)], NuGetVersionFilter::PACKAGE_SUMMARY,),
+            None
+        );
+    }
+
+    #[test]
+    fn search_version_filter_negotiates_prerelease_and_semver2_independently() {
+        let versions = [
+            ("9.0.0", true),
+            ("6.0.0+build.7", false),
+            ("5.0.0-beta.1", false),
+            ("4.0.0-beta", false),
+            ("1.0.0", false),
+            ("legacy-row", false),
+        ];
+
+        assert_eq!(
+            latest_live_nuget(versions, NuGetVersionFilter::search(false, None)),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            latest_live_nuget(versions, NuGetVersionFilter::search(true, None)),
+            Some("4.0.0-beta")
+        );
+        assert_eq!(
+            latest_live_nuget(versions, NuGetVersionFilter::search(false, Some("2.0.0")),),
+            Some("6.0.0+build.7")
+        );
+        assert_eq!(
+            latest_live_nuget(versions, NuGetVersionFilter::search(true, Some("2.1.0")),),
+            Some("6.0.0+build.7")
+        );
+        assert_eq!(
+            latest_live_nuget(
+                [("3.0.0-alpha.1", false)],
+                NuGetVersionFilter::search(true, Some("not-a-version")),
+            ),
+            None
+        );
     }
 
     #[test]

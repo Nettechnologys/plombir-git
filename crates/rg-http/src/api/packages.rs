@@ -2550,7 +2550,15 @@ pub async fn nuget_search(
     // List all nuget packages in the repo. A repository that never enabled the
     // registry answers an empty result set rather than a 404: the service index
     // advertises this endpoint for any repository, so it owes a readable answer.
-    let packages = match nuget_packages(&state, &owner, &name).await {
+    let packages = match nuget_search_packages(
+        &state,
+        &owner,
+        &name,
+        params.prerelease,
+        params.semver_level.as_deref(),
+    )
+    .await
+    {
         Ok(packages) => packages,
         Err(response) => return response,
     };
@@ -2602,6 +2610,10 @@ pub struct NuGetSearchParams {
     pub skip: Option<usize>,
     #[serde(default)]
     pub take: Option<usize>,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default, rename = "semVerLevel")]
+    pub semver_level: Option<String>,
 }
 
 /// Resolve the package id a NuGet client asked for to the id it was published
@@ -2655,6 +2667,28 @@ async fn nuget_packages(
     repo: &str,
 ) -> Result<Vec<rg_core::package_registry::PackageSummary>, axum::response::Response> {
     match rg_core::package_registry::service::list_packages(&state.db, owner, repo, "nuget").await {
+        Ok(packages) => Ok(packages),
+        Err(error) if package_is_absent(&error) => Ok(Vec::new()),
+        Err(error) => Err(package_error_response(error)),
+    }
+}
+
+async fn nuget_search_packages(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    include_prerelease: bool,
+    semver_level: Option<&str>,
+) -> Result<Vec<rg_core::package_registry::PackageSummary>, axum::response::Response> {
+    match rg_core::package_registry::service::list_nuget_search_packages(
+        &state.db,
+        owner,
+        repo,
+        include_prerelease,
+        semver_level,
+    )
+    .await
+    {
         Ok(packages) => Ok(packages),
         Err(error) if package_is_absent(&error) => Ok(Vec::new()),
         Err(error) => Err(package_error_response(error)),
