@@ -94,6 +94,11 @@ if (declarations.length === 0) {
 // failure — the allowlist is a ratchet, not a parking lot.
 const ALLOWED_WITHOUT_CONSUMER = new Map([
   [
+    'crates/rg-core/src/package_registry/adapters/npm.rs::build_npm_metadata',
+    'the compatibility entry point for callers that still expect derived `latest`; production ' +
+      'uses `build_npm_metadata_with_dist_tags` once persisted tag state is available',
+  ],
+  [
     'crates/rg-db/src/ops/pipeline_ops.rs::create_pipeline',
     'a two-line alias for `create_pipeline_in_group(…, None)` kept for the ~39 test fixtures ' +
       'that build a pipeline row with no concurrency group. Not the defect this check hunts: the ' +

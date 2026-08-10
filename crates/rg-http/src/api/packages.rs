@@ -1927,6 +1927,21 @@ pub async fn npm_registry_metadata(
 }
 
 /// GET the mutable selectors managed by `npm dist-tag ls`.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("pkg_name" = String, Path, description = "npm package name"),
+    ),
+    responses(
+        (status = 200, description = "Current npm dist-tags", body = serde_json::Value),
+        (status = 404, description = "Package not found", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
 pub async fn npm_dist_tags(
     State(state): State<AppState>,
     Path((owner, repo, pkg_name)): Path<(String, String, String)>,
@@ -1943,6 +1958,28 @@ pub async fn npm_dist_tags(
 }
 
 /// PUT one selector, as sent by `npm dist-tag add`.
+#[utoipa::path(
+    put,
+    path = "/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("pkg_name" = String, Path, description = "npm package name"),
+        ("tag" = String, Path, description = "mutable npm dist-tag"),
+    ),
+    request_body(
+        content = String,
+        content_type = "application/json",
+        description = "Existing package version the tag should name",
+    ),
+    responses(
+        (status = 200, description = "Dist-tag set", body = serde_json::Value),
+        (status = 400, description = "Invalid dist-tag", body = serde_json::Value),
+        (status = 404, description = "Package or version not found", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
 pub async fn set_npm_dist_tag(
     State(state): State<AppState>,
     RepoWrite { .. }: RepoWrite,
@@ -1960,6 +1997,23 @@ pub async fn set_npm_dist_tag(
 }
 
 /// DELETE one selector, as sent by `npm dist-tag rm`.
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}",
+    tag = "Packages",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "repo name"),
+        ("pkg_name" = String, Path, description = "npm package name"),
+        ("tag" = String, Path, description = "mutable npm dist-tag"),
+    ),
+    responses(
+        (status = 200, description = "Dist-tag removed", body = serde_json::Value),
+        (status = 400, description = "Invalid dist-tag", body = serde_json::Value),
+        (status = 404, description = "Package or dist-tag not found", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
+    ),
+)]
 pub async fn delete_npm_dist_tag(
     State(state): State<AppState>,
     RepoWrite { .. }: RepoWrite,
