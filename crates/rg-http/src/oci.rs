@@ -1965,7 +1965,7 @@ async fn acquire_upload_file_lock(file_path: &std::path::Path) -> anyhow::Result
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
-                    "failed to lock OCI upload file {} for a range update: {error}",
+                    "failed to lock OCI upload file {} for an upload operation: {error}",
                     file_path.display()
                 ));
             }
@@ -2015,6 +2015,23 @@ async fn body_matches_staged_range(
     Ok(remaining == 0)
 }
 
+/// Consume an unpositioned final body without letting it touch staging.
+///
+/// Empty PUT is the normal finalize-after-PATCH shape. If HTTP framing does not
+/// provide `Content-Length: 0`, inspect the stream itself so an HTTP/2 client is
+/// still accepted while a body whose offset cannot be proven is rejected.
+async fn upload_body_is_empty(body: Body) -> anyhow::Result<bool> {
+    use futures::StreamExt;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let data = chunk.map_err(|error| anyhow::anyhow!("body stream error: {error}"))?;
+        if !data.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// `PUT /v2/{owner}/{repo}/blobs/uploads/{uuid}?digest=sha256:...` — finalize upload.
 /// If the body contains data (single-chunk upload), streams it to the upload file first.
 pub async fn complete_upload(
@@ -2043,23 +2060,184 @@ pub async fn complete_upload(
     // else's, but the row is not: finalizing ends by deleting the session, and
     // keyed on the uuid alone that delete landed on whichever repository held
     // it — a stranger's `docker push` cancelled from outside.
-    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+    let upload_before_lock = match upload_in_repo(&state, &owner, &repo, &uuid).await {
         Ok(upload) => upload,
         Err(resp) => return resp,
     };
 
-    // If body is provided (single-chunk upload), stream it to the upload file first
-    // Check by reading the first frame: if there's data, stream the rest
     let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
-    let staged = match stream_body_to_file(body, &file_path).await {
-        Ok(staged) => staged,
-        Err(e) => {
+    let _upload_guard = match acquire_upload_file_lock(&file_path).await {
+        Ok(guard) => guard,
+        Err(error) => {
             return oci_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "UNKNOWN",
-                &format!("{e:#}"),
+                &format!(
+                    "upload session recorded {} byte(s), but its staging file could not be \
+                     locked: {error:#}",
+                    upload_before_lock.bytes_uploaded
+                ),
             );
         }
+    };
+    // A PATCH may have completed while this PUT waited for the staging file.
+    // Refresh the row under the same lock before using its acknowledged offset.
+    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(upload) => upload,
+        Err(resp) => return resp,
+    };
+    let requested_range = match parse_upload_content_range(&headers) {
+        Ok(range) => range,
+        Err(message) => {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::BLOB_UPLOAD_INVALID,
+                message,
+            );
+        }
+    };
+    if let Some(range) = requested_range {
+        if content_length(&headers) != Some(range.len()) {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::SIZE_INVALID,
+                "Content-Length must match the inclusive Content-Range",
+            );
+        }
+    }
+
+    // The row is the acknowledged offset; the file is what finalization hashes.
+    // Check both before the final body can touch staging, while PATCH and PUT are
+    // serialized by the same lock.
+    let recorded = upload.bytes_uploaded;
+    let staged_size = match staged_upload_size(&file_path).await {
+        Ok(size) => size,
+        Err(error) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{error:#}"),
+            );
+        }
+    };
+    if staged_size != recorded {
+        return oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!(
+                "the staged upload does not match this session: it recorded {recorded} \
+                 byte(s), but {} holds {staged_size} byte(s)",
+                file_path.display()
+            ),
+        );
+    }
+
+    let staged = match requested_range {
+        // A final PUT may repeat bytes that PATCH already acknowledged. Only a
+        // byte-identical replay is safe; finalize those bytes without appending
+        // a second copy.
+        Some(range) if range.end < recorded => {
+            match body_matches_staged_range(body, &file_path, range).await {
+                Ok(true) => StagedWrite {
+                    existed: true,
+                    written: 0,
+                    total: staged_size,
+                },
+                Ok(false) => {
+                    return upload_progress_response(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        &owner,
+                        &repo,
+                        &uuid,
+                        recorded,
+                    );
+                }
+                Err(error) => {
+                    return oci_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "UNKNOWN",
+                        &format!("{error:#}"),
+                    );
+                }
+            }
+        }
+        // A gap or a partial overlap is out of order. Refuse it before reading
+        // the body into the staging file and report the offset the client can
+        // resume from.
+        Some(range) if range.start != recorded => {
+            return upload_progress_response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                &owner,
+                &repo,
+                &uuid,
+                recorded,
+            );
+        }
+        // The normal PATCH -> empty PUT flow carries no final chunk. When the
+        // framing does not declare an empty body, consume it without writing so
+        // an unpositioned final chunk cannot silently append after acknowledged
+        // bytes. A monolithic PUT remains unambiguous at offset zero below.
+        None if recorded != 0 => {
+            let is_empty = match content_length(&headers) {
+                Some(0) => true,
+                Some(_) => false,
+                None => match upload_body_is_empty(body).await {
+                    Ok(is_empty) => is_empty,
+                    Err(error) => {
+                        return oci_err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "UNKNOWN",
+                            &format!("{error:#}"),
+                        );
+                    }
+                },
+            };
+            if !is_empty {
+                return upload_progress_response(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    &owner,
+                    &repo,
+                    &uuid,
+                    recorded,
+                );
+            }
+            StagedWrite {
+                existed: true,
+                written: 0,
+                total: staged_size,
+            }
+        }
+        Some(range) => match stream_body_to_file(body, &file_path).await {
+            Ok(staged) if staged.written == range.len() && staged.total == range.end + 1 => staged,
+            Ok(staged) => {
+                return oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!(
+                        "the accepted OCI final chunk did not land at its declared range: \
+                         Content-Range {}-{}, appended {} byte(s), staging now holds {} byte(s)",
+                        range.start, range.end, staged.written, staged.total
+                    ),
+                );
+            }
+            Err(error) => {
+                return oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!("{error:#}"),
+                );
+            }
+        },
+        None => match stream_body_to_file(body, &file_path).await {
+            Ok(staged) => staged,
+            Err(error) => {
+                return oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!("{error:#}"),
+                );
+            }
+        },
     };
 
     // What the session says should be on disk, against what is. Every byte that
@@ -2076,7 +2254,6 @@ pub async fn complete_upload(
     // of ours, reported as corrupt input, to a client that does not retry a
     // `4xx`. Measured here rather than inferred later, because after the hash
     // the evidence is gone.
-    let recorded = upload.bytes_uploaded;
     let staged_is_accountable = staged.existed && staged.total == recorded + staged.written;
 
     // The repository the session was anchored to, not a second lookup that

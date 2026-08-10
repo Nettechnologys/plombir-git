@@ -10,7 +10,9 @@ use sha2::Digest as _;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::common::{create_repo, register_full, spawn_test_app_with_oci_root};
+use crate::common::{
+    create_repo, register_full, spawn_test_app_with_oci_root, spawn_test_app_with_state,
+};
 
 fn sha256(payload: &[u8]) -> String {
     format!("sha256:{}", hex::encode(sha2::Sha256::digest(payload)))
@@ -55,6 +57,35 @@ async fn patch_range(
         .unwrap()
 }
 
+async fn put_range(
+    base: &str,
+    token: &str,
+    location: &str,
+    digest: &str,
+    range: &str,
+    payload: &[u8],
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest)])
+        .bearer_auth(token)
+        .header("content-range", range)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn upload_row(
+    db: &rg_db::DatabaseConnection,
+    uuid: &str,
+) -> rg_db::entities::oci_upload::Model {
+    rg_db::ops::oci_ops::find_upload(db, uuid)
+        .await
+        .expect("read upload row")
+        .expect("live upload row")
+}
+
 async fn open_raw_patch(
     base: &str,
     token: &str,
@@ -67,6 +98,32 @@ async fn open_raw_patch(
     let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
     let headers = format!(
         "PATCH {location} HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Range: {range}\r\n\
+         Content-Length: {payload_len}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    stream.write_all(prefix).await.unwrap();
+    stream.flush().await.unwrap();
+    stream
+}
+
+async fn open_raw_put(
+    base: &str,
+    token: &str,
+    location: &str,
+    digest: &str,
+    range: &str,
+    payload_len: usize,
+    prefix: &[u8],
+) -> tokio::net::TcpStream {
+    let authority = base.strip_prefix("http://").expect("HTTP test base URL");
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let headers = format!(
+        "PUT {location}?digest={digest} HTTP/1.1\r\n\
          Host: {authority}\r\n\
          Authorization: Bearer {token}\r\n\
          Content-Type: application/octet-stream\r\n\
@@ -167,6 +224,46 @@ async fn retrying_the_same_chunk_is_idempotent_and_the_blob_stays_exact() {
 }
 
 #[tokio::test]
+async fn final_put_can_replay_an_acknowledged_range_without_doubling_it() {
+    let (base, _repo_root, _oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(
+        &base,
+        "oci_final_range_retry",
+        "oci_final_range_retry@example.com",
+    )
+    .await;
+    create_repo(&base, &token, "retried-final-layer").await;
+
+    let payload = b"the final PUT repeats bytes whose PATCH response was lost";
+    let digest = sha256(payload);
+    let range = format!("0-{}", payload.len() - 1);
+    let (location, _) = start_upload(
+        &base,
+        &token,
+        "oci_final_range_retry",
+        "retried-final-layer",
+    )
+    .await;
+    let accepted = patch_range(&base, &token, &location, &range, payload).await;
+    assert_eq!(accepted.status(), 202);
+
+    let complete = put_range(&base, &token, &location, &digest, &range, payload).await;
+    crate::common::assert_blob_push_created(complete, payload.len()).await;
+
+    let blob = client
+        .get(format!(
+            "{base}/v2/oci_final_range_retry/retried-final-layer/blobs/{digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blob.status(), 200);
+    assert_eq!(blob.bytes().await.unwrap().as_ref(), payload);
+}
+
+#[tokio::test]
 async fn a_partially_overlapping_chunk_is_refused_without_touching_staging() {
     let (base, _repo_root, oci_root) = spawn_test_app_with_oci_root().await;
     let client = reqwest::Client::new();
@@ -229,6 +326,167 @@ async fn a_partially_overlapping_chunk_is_refused_without_touching_staging() {
         .await
         .unwrap();
     crate::common::assert_blob_push_created(finish, accepted.len()).await;
+}
+
+#[tokio::test]
+async fn final_put_accepts_the_next_range_and_refuses_out_of_order_without_mutation() {
+    let (base, db, state) = spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "oci_final_range", "oci_final_range@example.com").await;
+    create_repo(&base, &token, "final-range-layer").await;
+
+    let first_chunk = b"0123456789";
+    let final_chunk = b"abcde";
+    let payload = [first_chunk.as_slice(), final_chunk.as_slice()].concat();
+    let digest = sha256(&payload);
+    let (location, uuid) =
+        start_upload(&base, &token, "oci_final_range", "final-range-layer").await;
+    let staged = state
+        .oci_storage
+        .upload_file("oci_final_range", "final-range-layer", &uuid);
+
+    let first = patch_range(&base, &token, &location, "0-9", first_chunk).await;
+    assert_eq!(first.status(), 202);
+    let before_row = upload_row(&db, &uuid).await;
+    let before_bytes = std::fs::read(&staged).expect("read staged upload");
+
+    for (range, chunk) in [
+        ("15-19", final_chunk.as_slice()),
+        ("5-14", b"56789abcde".as_slice()),
+    ] {
+        let refused = put_range(&base, &token, &location, &digest, range, chunk).await;
+        assert_eq!(refused.status(), 416, "final range {range} must be refused");
+        assert_eq!(
+            refused
+                .headers()
+                .get(reqwest::header::RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("0-9")
+        );
+        assert_eq!(
+            upload_row(&db, &uuid).await,
+            before_row,
+            "refused final range {range} changed the session row"
+        );
+        assert_eq!(
+            std::fs::read(&staged).expect("read staged upload after refusal"),
+            before_bytes,
+            "refused final range {range} changed staged bytes"
+        );
+    }
+
+    let complete = put_range(&base, &token, &location, &digest, "10-14", final_chunk).await;
+    crate::common::assert_blob_push_created(complete, payload.len()).await;
+
+    let blob = client
+        .get(format!(
+            "{base}/v2/oci_final_range/final-range-layer/blobs/{digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blob.status(), 200);
+    assert_eq!(blob.bytes().await.unwrap().as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn monolithic_put_without_a_preceding_patch_still_publishes_the_blob() {
+    let (base, _repo_root, _oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(
+        &base,
+        "oci_monolithic_put",
+        "oci_monolithic_put@example.com",
+    )
+    .await;
+    create_repo(&base, &token, "monolithic-layer").await;
+
+    let payload = b"one body from POST straight to PUT";
+    let digest = sha256(payload);
+    let (location, _) = start_upload(&base, &token, "oci_monolithic_put", "monolithic-layer").await;
+    let complete = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    crate::common::assert_blob_push_created(complete, payload.len()).await;
+}
+
+#[tokio::test]
+async fn final_put_and_patch_on_one_session_do_not_interleave_bytes() {
+    let (base, _repo_root, oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(
+        &base,
+        "oci_final_range_race",
+        "oci_final_range_race@example.com",
+    )
+    .await;
+    create_repo(&base, &token, "final-raced-layer").await;
+
+    let payload = b"the final PUT pauses after its first byte while PATCH races it";
+    let digest = sha256(payload);
+    let range = format!("0-{}", payload.len() - 1);
+    let (location, uuid) =
+        start_upload(&base, &token, "oci_final_range_race", "final-raced-layer").await;
+    let staged = oci_root
+        .join("oci-uploads")
+        .join("oci_final_range_race")
+        .join("final-raced-layer")
+        .join(uuid)
+        .join("data");
+
+    let final_put = open_raw_put(
+        &base,
+        &token,
+        &location,
+        &digest,
+        &range,
+        payload.len(),
+        &payload[..1],
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(std::fs::metadata(&staged).map(|meta| meta.len()), Ok(1)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the final PUT never reached the staging write");
+
+    let retry = open_raw_patch(&base, &token, &location, &range, payload.len(), payload).await;
+    let mut retry = tokio::spawn(async move { finish_raw_patch(retry, &[]).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut retry)
+            .await
+            .is_err(),
+        "PATCH completed while final PUT still owned the upload session"
+    );
+
+    assert_eq!(finish_raw_patch(final_put, &payload[1..]).await, 201);
+    assert_eq!(
+        retry.await.unwrap(),
+        404,
+        "the serialized PATCH must observe that final PUT consumed the session"
+    );
+
+    let blob = client
+        .get(format!(
+            "{base}/v2/oci_final_range_race/final-raced-layer/blobs/{digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blob.status(), 200);
+    assert_eq!(blob.bytes().await.unwrap().as_ref(), payload);
 }
 
 #[tokio::test]
