@@ -3525,6 +3525,10 @@ pub async fn nuget_search(
 pub struct NuGetSearchParams {
     #[serde(default)]
     pub q: Option<String>,
+    /// The second request form of `SearchAutocompleteService`: enumerate the
+    /// versions of one package id instead of matching ids by prefix.
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub skip: Option<usize>,
     #[serde(default)]
@@ -3705,38 +3709,90 @@ pub async fn nuget_flat_container_download(
     .await
 }
 
-/// GET /api/v1/repos/{owner}/{name}/packages/nuget/autocomplete?q=...
+/// The `?id=` form of autocomplete: every version of one package, under the
+/// same capability filter that builds `versions` in SearchQueryService.
+///
+/// An id nobody published answers an empty list rather than a 404 — this
+/// endpoint feeds a picker while the user is still typing, so absence is a
+/// normal state of the request, not a diagnosis.
+async fn nuget_autocomplete_versions(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    requested: &str,
+    params: &NuGetSearchParams,
+) -> Result<Vec<String>, axum::response::Response> {
+    let resolved = resolve_nuget_id(state, owner, repo, requested).await?;
+    let packages = nuget_search_packages(
+        state,
+        owner,
+        repo,
+        params.prerelease,
+        params.semver_level.as_deref(),
+    )
+    .await?;
+
+    Ok(packages
+        .into_iter()
+        .find(|pkg| pkg.summary.name == resolved)
+        .map(|pkg| {
+            pkg.versions
+                .into_iter()
+                .map(|version| version.version)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// GET /api/v1/repos/{owner}/{name}/packages/nuget/autocomplete?q=... | ?id=...
 ///
 /// NuGet `SearchAutocompleteService/3.5.0`. The service index used to advertise
 /// this resource at the bare `nuget/` root, which is not an endpoint of anything
 /// (card_dba77cceec56).
+///
+/// One URL, two questions: `?q=` completes package ids, `?id=` completes the
+/// versions of one package. Serving only the first answered a version picker
+/// with the repository's package ids — a 200 of the right *shape*, which is
+/// worse than a 404, because the ids land in the client's version dropdown
+/// (card_11227138d44e).
 pub async fn nuget_autocomplete(
     State(state): State<AppState>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<NuGetSearchParams>,
 ) -> axum::response::Response {
-    let query = params.q.as_deref().unwrap_or("").to_lowercase();
-    let packages = match nuget_search_packages(
-        &state,
-        &owner,
-        &name,
-        params.prerelease,
-        params.semver_level.as_deref(),
-    )
-    .await
-    {
-        Ok(packages) => packages,
-        Err(response) => return response,
+    // `id` wins over `q` when a client sends both: the version enumeration is
+    // the more specific request, and the two answers are not interchangeable.
+    let data = match params.id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => match nuget_autocomplete_versions(&state, &owner, &name, id, &params).await {
+            Ok(versions) => versions,
+            Err(response) => return response,
+        },
+        None => {
+            let query = params.q.as_deref().unwrap_or("").to_lowercase();
+            let packages = match nuget_search_packages(
+                &state,
+                &owner,
+                &name,
+                params.prerelease,
+                params.semver_level.as_deref(),
+            )
+            .await
+            {
+                Ok(packages) => packages,
+                Err(response) => return response,
+            };
+
+            packages
+                .into_iter()
+                .filter(|pkg| query.is_empty() || pkg.summary.name.to_lowercase().contains(&query))
+                .map(|pkg| pkg.summary.name)
+                .collect()
+        }
     };
 
-    let names: Vec<String> = packages
-        .into_iter()
-        .filter(|pkg| query.is_empty() || pkg.summary.name.to_lowercase().contains(&query))
-        .map(|pkg| pkg.summary.name)
-        .collect();
-    let total_hits = names.len();
-    let json = rg_core::package_registry::build_autocomplete_results(&names, total_hits);
+    let total_hits = data.len();
+    let json = rg_core::package_registry::build_autocomplete_results(&data, total_hits);
 
     (
         StatusCode::OK,

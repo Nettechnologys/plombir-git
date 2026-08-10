@@ -1144,6 +1144,81 @@ async fn nuget_search_and_autocomplete_filter_prerelease_semver2_and_yanked_vers
         !all_names.contains(&"Matrix.YankedOnly"),
         "{all_autocomplete}"
     );
+
+    // The same URL answers a second question: `?id=` completes the VERSIONS of
+    // one package. That list has to be the one SearchQueryService advertises
+    // under the same capability flags — the repository's package ids, which
+    // this endpoint used to return for an `id=` request, are what a version
+    // picker would otherwise display as versions.
+    for (search, flags) in [
+        (&stable_semver1, vec![]),
+        (&prerelease_semver1, vec![("prerelease", "true")]),
+        (&stable_semver2, vec![("semVerLevel", "2.0.0")]),
+        (
+            &all_versions,
+            vec![("prerelease", "true"), ("semVerLevel", "2.1.0")],
+        ),
+    ] {
+        let expected = nuget_search_result(search, "Matrix.SearchModes")
+            .unwrap_or_else(|| panic!("search result missing: {search}"))["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|version| version["version"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        let mut pairs = vec![("id", "Matrix.SearchModes")];
+        pairs.extend(flags);
+        let completion = autocomplete_nuget(&client, &base, &pairs).await;
+        assert_eq!(
+            nuget_autocomplete_names(&completion),
+            expected,
+            "id= must complete versions, not package ids: {completion}"
+        );
+        assert_eq!(completion["totalHits"], expected.len(), "{completion}");
+    }
+
+    // Ids are case-insensitive everywhere else in v3; a query parameter is no
+    // exception.
+    let lowercased = autocomplete_nuget(
+        &client,
+        &base,
+        &[
+            ("id", "matrix.searchmodes"),
+            ("prerelease", "true"),
+            ("semVerLevel", "2.1.0"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        nuget_autocomplete_names(&lowercased),
+        ["1.0.0", "4.0.0-beta", "5.0.0-beta.1", "6.0.0+build.7"],
+        "{lowercased}"
+    );
+
+    // Both forms in one request is not ambiguous: enumerating versions is the
+    // more specific ask, so it wins.
+    let both = autocomplete_nuget(
+        &client,
+        &base,
+        &[("id", "Matrix.SearchModes"), ("q", "Matrix.")],
+    )
+    .await;
+    assert_eq!(nuget_autocomplete_names(&both), ["1.0.0"], "{both}");
+
+    // An id with nothing installable behind it — never published, or live only
+    // in versions this client cannot understand — is an empty completion, not a
+    // 404: absence is a normal state while the id is still being typed.
+    for id in ["Matrix.NeverPublished", "Matrix.YankedOnly"] {
+        let empty = autocomplete_nuget(
+            &client,
+            &base,
+            &[("id", id), ("prerelease", "true"), ("semVerLevel", "2.1.0")],
+        )
+        .await;
+        assert_eq!(empty["totalHits"], 0, "{empty}");
+        assert!(nuget_autocomplete_names(&empty).is_empty(), "{empty}");
+    }
 }
 
 /// A NuGet client's SemVer level is negotiated over the dependency graph too,
