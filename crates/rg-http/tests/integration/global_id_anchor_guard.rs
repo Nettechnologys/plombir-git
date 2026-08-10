@@ -279,7 +279,7 @@ const ANCHORED: &[AnchoredFile] = &[
             // but nothing compared the two. `PATCH` rewrote the offset of a
             // stranger's session and `PUT` deleted its row, both from inside a
             // repository the caller legitimately holds `push` on. One helper
-            // answers for both handlers.
+            // answers for every upload-session handler.
             ("uuid", &["upload_in_repo"]),
         ],
     ),
@@ -514,7 +514,7 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// The number is written down so that adding a route which takes one is a
 /// deliberate act: the census fails until the new pair is classified *and* this
 /// count is updated. It is the denominator the plan for this guard was missing.
-const CENSUS_TOTAL: usize = 126;
+const CENSUS_TOTAL: usize = 127;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

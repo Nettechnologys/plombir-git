@@ -529,6 +529,11 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
             oci::chunk_upload,
             &upload_limit,
         )
+        .get(
+            OCI_TOKEN,
+            "/v2/{owner}/{repo}/blobs/uploads/{uuid}",
+            oci::get_upload_status,
+        )
         .put_with(
             OCI_TOKEN,
             "/v2/{owner}/{repo}/blobs/uploads/{uuid}",

@@ -1572,10 +1572,83 @@ async fn upload_in_repo(
     };
 
     match rg_db::ops::oci_ops::find_upload(&state.db, uuid).await {
-        Ok(Some(upload)) if upload.oci_repository_id == oci_repo.id => Ok(upload),
+        Ok(Some(upload))
+            if upload.oci_repository_id == oci_repo.id
+                && upload.expires_at > chrono::Utc::now() =>
+        {
+            Ok(upload)
+        }
         Ok(_) => Err(unknown()),
         Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"))),
     }
+}
+
+/// `GET /v2/{owner}/{repo}/blobs/uploads/{uuid}` — report resumable-upload state.
+///
+/// Distribution clients use this endpoint after a `416` to recover the
+/// registry's acknowledged offset. The row is re-read under the same staging
+/// lock as `PATCH`, so a status response cannot observe an append before its
+/// progress write or a progress write after a concurrent session removal.
+pub async fn get_upload_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, repo, uuid)): Path<(String, String, String)>,
+) -> Response {
+    if let Err(resp) = require_access(&state, &headers, &owner, &repo, "push").await {
+        return resp;
+    }
+
+    // Refuse an unknown, expired or differently-anchored session before
+    // deriving and opening a path from the caller-supplied uuid.
+    if let Err(resp) = upload_in_repo(&state, &owner, &repo, &uuid).await {
+        return resp;
+    }
+
+    let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
+    let _upload_guard = match acquire_upload_file_lock(&file_path).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{error:#}"),
+            );
+        }
+    };
+    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(upload) => upload,
+        Err(resp) => return resp,
+    };
+    let staged_size = match staged_upload_size(&file_path).await {
+        Ok(size) => size,
+        Err(error) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{error:#}"),
+            );
+        }
+    };
+    if staged_size != upload.bytes_uploaded {
+        return oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!(
+                "the staged upload does not match this session: it recorded {} byte(s), but {} \
+                 holds {staged_size} byte(s)",
+                upload.bytes_uploaded,
+                file_path.display()
+            ),
+        );
+    }
+
+    upload_progress_response(
+        StatusCode::NO_CONTENT,
+        &owner,
+        &repo,
+        &uuid,
+        upload.bytes_uploaded,
+    )
 }
 
 /// `PATCH /v2/{owner}/{repo}/blobs/uploads/{uuid}` — chunked upload.
