@@ -1,6 +1,7 @@
 //! Database operations for access tokens.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::access_token::{
@@ -37,6 +38,20 @@ pub async fn list_by_user(db: &DatabaseConnection, user_id: i64) -> Result<Vec<A
 /// Create a new access token.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<AccessToken> {
     model.insert(db).await.context("db: create access token")
+}
+
+/// Record that a Personal Access Token was successfully authenticated.
+pub async fn touch_last_used(db: &DatabaseConnection, id: i64) -> Result<()> {
+    TokenEntity::update_many()
+        .col_expr(
+            access_token::Column::LastUsedAt,
+            Expr::value(chrono::Utc::now()),
+        )
+        .filter(access_token::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update access token last used time")?;
+    Ok(())
 }
 
 /// Delete a token by id. `Ok(false)` means no such row.

@@ -28,6 +28,23 @@ async fn create_pat_with_scopes(base: &str, jwt: &str, scopes: Option<&str>) -> 
     body["token"].as_str().unwrap().to_string()
 }
 
+async fn listed_pat(base: &str, jwt: &str) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .expect("list PATs");
+    assert_eq!(response.status(), 200, "list tokens failed");
+    response
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("token list is JSON")
+        .into_iter()
+        .find(|token| token["name"] == "api-cli")
+        .expect("created PAT appears in the token list")
+}
+
 #[tokio::test]
 async fn pat_scopes_are_enforced_by_api_family() {
     let base = spawn_test_app().await;
@@ -105,6 +122,34 @@ async fn pat_authenticates_api_via_bearer() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "PAT should authenticate repo creation");
+}
+
+/// The account-token API promises a live `last_used_at`, so drive the shared
+/// production resolver through REST and then read the same field back through
+/// its public API. `resolve_pat` is also the sole PAT resolver for git HTTP and
+/// OCI Basic auth.
+#[tokio::test]
+async fn successful_pat_auth_updates_the_api_visible_last_used_at() {
+    let base = spawn_test_app().await;
+    let jwt = register_user(&base, "pattouch", "pattouch@example.com", "Qz7$wRtm").await;
+    let pat = create_pat_with_scopes(&base, &jwt, Some("user")).await;
+    assert_eq!(
+        listed_pat(&base, &jwt).await["last_used_at"],
+        serde_json::Value::Null
+    );
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/users/me"))
+        .bearer_auth(&pat)
+        .send()
+        .await
+        .expect("authenticate with PAT");
+    assert_eq!(response.status(), 200, "PAT should authenticate the API");
+
+    assert!(
+        listed_pat(&base, &jwt).await["last_used_at"].is_string(),
+        "a successful PAT authentication must update the public usage timestamp"
+    );
 }
 
 /// Same, but the PAT presented via HTTP Basic auth (`user:token`).

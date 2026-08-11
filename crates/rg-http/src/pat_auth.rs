@@ -51,6 +51,19 @@ pub(crate) async fn resolve_pat(
         );
         return Ok(None);
     }
+    // Usage time is observability, not part of the credential proof. Match the
+    // SSH/deploy-key contract: record every accepted credential, but do not
+    // turn a write-only failure into either an invalid-token answer or an auth
+    // outage. Lookup failures above still propagate because they leave the
+    // credential's validity unknown.
+    if let Err(error) = rg_db::ops::token_ops::touch_last_used(db, tok.id).await {
+        tracing::warn!(
+            token_id = tok.id,
+            user_id = tok.user_id,
+            error = %format!("{error:#}"),
+            "failed to update personal access token usage time"
+        );
+    }
     Ok(Some((tok, owner)))
 }
 
@@ -271,4 +284,129 @@ pub(crate) async fn extract_actor_id(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_pat;
+    use sea_orm::{ActiveModelTrait, ActiveValue::NotSet, ConnectionTrait, Set};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log lock").clone()).expect("logs are UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    async fn pat_fixture() -> (rg_db::DatabaseConnection, String, i64) {
+        use sea_orm::{ConnectOptions, Database};
+        use sha2::{Digest, Sha256};
+
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect to in-memory db");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        let now = chrono::Utc::now();
+        rg_db::entities::user::ActiveModel {
+            id: Set(1),
+            username: Set("pat-touch".to_string()),
+            email: Set("pat-touch@example.test".to_string()),
+            password_hash: Set("x".to_string()),
+            is_admin: Set(false),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert PAT owner");
+
+        let raw = "ifp_touch_failure_fixture".to_string();
+        let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        let token = rg_db::ops::token_ops::create(
+            &db,
+            rg_db::entities::access_token::ActiveModel {
+                id: NotSet,
+                user_id: Set(1),
+                name: Set("touch failure".to_string()),
+                token_hash: Set(hash),
+                scopes: Set("user, repo".to_string()),
+                expires_at: Set(None),
+                last_used_at: Set(None),
+                created_at: Set(chrono::Utc::now()),
+            },
+        )
+        .await
+        .expect("create PAT");
+        (db, raw, token.id)
+    }
+
+    /// A write-only failure cannot invalidate a credential that was already
+    /// proven by healthy reads, but it must remain visible to the operator.
+    #[tokio::test]
+    async fn failed_last_used_touch_is_best_effort_and_logged() {
+        let (db, raw, token_id) = pat_fixture().await;
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_pat_touch BEFORE UPDATE ON access_tokens \
+             BEGIN SELECT RAISE(ABORT, 'injected PAT touch failure'); END;",
+        )
+        .await
+        .expect("arm PAT touch failure");
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let resolved = resolve_pat(&db, &raw).await.expect("resolve valid PAT");
+
+        assert!(
+            resolved.is_some(),
+            "usage bookkeeping must not reject the PAT"
+        );
+        let stored = rg_db::ops::token_ops::find_by_id(&db, token_id)
+            .await
+            .expect("reload PAT")
+            .expect("PAT still exists");
+        assert_eq!(
+            stored.last_used_at, None,
+            "the injected write really failed"
+        );
+        let rendered = logs.text();
+        assert!(
+            rendered.contains("failed to update personal access token usage time"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("injected PAT touch failure"),
+            "{rendered}"
+        );
+    }
 }
