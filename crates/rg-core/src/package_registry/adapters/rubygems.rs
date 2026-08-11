@@ -8,13 +8,14 @@
 //! ## RubyGems API
 //!
 //! RubyGems clients expect:
-//! - `GET /api/v1/dependencies?gems={name}` — dependency resolution (Marshall/JSON)
+//! - `GET /api/v1/dependencies?gems={name}` — legacy Marshal dependency resolution
+//! - `GET /api/v1/dependencies.json?gems={name}` — JSON dependency metadata
 //! - `GET /api/v1/gems/{name}.json` — gem metadata
 //! - `GET /gems/{name}-{version}.gem` — gem download
 //! - `POST /api/v1/gems` — gem push
 //!
 //! ForgeKeep serves these at:
-//! - Dependencies: `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/dependencies?gems={name}`
+//! - Dependencies: `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/dependencies.json?gems={name}`
 //! - Gem info:     `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/gems/{name}.json`
 //! - Download:     (standard package download endpoint)
 //!
@@ -423,9 +424,10 @@ pub struct RubyGemsDep {
     pub requirements: String,
 }
 
-/// Build the RubyGems dependencies API JSON response.
+/// Build the `/api/v1/dependencies.json` response.
 ///
-/// This is the format expected by `gem install` / Bundler for dependency resolution.
+/// The extensionless legacy endpoint is a different wire protocol: Bundler
+/// reads that body with `Marshal.load`, so this value must never be served there.
 /// Example response:
 /// ```json
 /// [{"name":"rack","number":"2.2.0","platform":"ruby","dependencies":[]}]

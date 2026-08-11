@@ -4101,13 +4101,14 @@ pub async fn nuget_autocomplete(
 
 // ── RubyGems Protocol Endpoints ───────────────────────────
 
-/// GET /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies?gems={name}
+/// GET /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies.json?gems={name}
 ///
-/// RubyGems dependencies API — returns version info for dependency resolution.
-pub async fn rubygems_dependencies(
+/// RubyGems dependencies JSON API. The extensionless endpoint uses Ruby
+/// Marshal; ForgeKeep leaves it unregistered rather than returning JSON bytes
+/// that legacy Bundler will try to pass to `Marshal.load`.
+pub async fn rubygems_dependencies_json(
     State(state): State<AppState>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
-    headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<RubyGemsDepsParams>,
 ) -> axum::response::Response {
@@ -4118,7 +4119,6 @@ pub async fn rubygems_dependencies(
         .split(',')
         .filter(|s| !s.is_empty())
         .collect();
-    let _base_url = build_base_url(&headers);
 
     let mut entries: Vec<rg_core::package_registry::RubyGemsDependencyEntry> = Vec::new();
 

@@ -344,7 +344,7 @@ const PROTOCOL_METADATA_CASES: [ProtocolMetadataCase; 7] = [
     ProtocolMetadataCase {
         package_type: "rubygems",
         package_name: "metadata-rubygems-deps",
-        read_path: "packages/rubygems/api/v1/dependencies?gems=metadata-rubygems-deps",
+        read_path: "packages/rubygems/api/v1/dependencies.json?gems=metadata-rubygems-deps",
         valid_metadata: r#"{"dependencies":[{"name":"metadata-ruby-dep","requirements":">= 2"}]}"#,
         valid_marker: "metadata-ruby-dep",
     },

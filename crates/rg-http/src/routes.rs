@@ -2156,8 +2156,10 @@ pub(crate) fn build_all_routes(
         // RubyGems protocol endpoints
         .get(
             RepoRead,
-            "/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies",
-            api::packages::rubygems_dependencies,
+            // The extensionless path is intentionally absent: its response is
+            // Ruby Marshal, not this JSON representation (card_ad2c59ea4f89).
+            "/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies.json",
+            api::packages::rubygems_dependencies_json,
         )
         .get(
             RepoRead,

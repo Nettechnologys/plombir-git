@@ -3584,19 +3584,18 @@ dependencies:
         .unwrap();
     assert_eq!(published.status(), StatusCode::CREATED);
 
-    // ── The dependencies API ────────────────────────────────────────────────
-    let mut deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies"]);
-    deps_url
+    // ── The JSON dependencies API ───────────────────────────────────────────
+    let mut deps_json_url = package_url(&base, &["rubygems", "api", "v1", "dependencies.json"]);
+    deps_json_url
         .query_pairs_mut()
         .append_pair("gems", "matrix-deps-gem");
-    let deps = client
-        .get(deps_url)
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
+    let deps_response = client.get(deps_json_url).send().await.unwrap();
+    assert_eq!(deps_response.status(), StatusCode::OK);
+    assert_eq!(
+        deps_response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json; charset=utf-8"
+    );
+    let deps = deps_response.json::<serde_json::Value>().await.unwrap();
 
     let entry = deps
         .as_array()
@@ -3608,6 +3607,16 @@ dependencies:
         serde_json::json!([["rack", ">= 2.0, < 4.0"]]),
         "the runtime dependency is missing, or the development one leaked in"
     );
+
+    // The extensionless endpoint is Ruby Marshal upstream. Until ForgeKeep
+    // implements that wire format, a miss lets clients fall back instead of
+    // handing JSON bytes to `Marshal.load`.
+    let mut legacy_deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies"]);
+    legacy_deps_url
+        .query_pairs_mut()
+        .append_pair("gems", "matrix-deps-gem");
+    let legacy_deps = client.get(legacy_deps_url).send().await.unwrap();
+    assert_eq!(legacy_deps.status(), StatusCode::NOT_FOUND);
 
     // ── The compact index, which is what a modern client actually reads ─────
     let info = client
@@ -5408,7 +5417,7 @@ required_ruby_version: !ruby/object:Gem::Requirement
     );
 
     // ── The two JSON endpoints, which used to answer `ruby` for everything ──
-    let mut deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies"]);
+    let mut deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies.json"]);
     deps_url
         .query_pairs_mut()
         .append_pair("gems", "matrix-native");

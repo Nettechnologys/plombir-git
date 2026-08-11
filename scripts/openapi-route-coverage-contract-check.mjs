@@ -133,7 +133,7 @@ const UNDOCUMENTED = new Map([
   ['api::packages::rubygems_compact_versions', 'RubyGems compact index — layout fixed by gem/bundler'],
   ['api::packages::rubygems_compact_info', 'RubyGems compact index — layout fixed by gem/bundler'],
   ['api::packages::rubygems_compact_names', 'RubyGems compact index — layout fixed by gem/bundler'],
-  ['api::packages::rubygems_dependencies', 'RubyGems dependency API — layout fixed by gem/bundler'],
+  ['api::packages::rubygems_dependencies_json', 'RubyGems JSON dependency API — layout fixed by RubyGems'],
   ['api::packages::rubygems_gem_info', 'RubyGems v1 gem info — layout fixed by gem/bundler'],
   ['api::packages::rubygems_gem_download', 'RubyGems .gem download path — derived by the client from the source URL'],
   ['api::packages::rubygems_push', 'RubyGems write API — the verb, URL and bare-body upload are fixed by `gem push`'],
