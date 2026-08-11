@@ -292,6 +292,160 @@ async fn a_docker_image_manifest_pushes_and_pulls_back_unchanged() {
     assert_eq!(tags["tags"], serde_json::json!(["v1.0.0"]));
 }
 
+/// OCI tag pagination is marker-based: every page starts strictly after the
+/// previous page's last tag, in the same total order the unpaged response uses.
+#[tokio::test]
+async fn tag_pages_follow_links_without_duplicates_and_keep_the_unpaged_contract() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_tags", "oci_tags@example.com").await;
+    create_repo(&base, &token, "tag-pages").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_tags", "tag-pages", config).await;
+
+    // Deliberately not lexical. The routed assertion pins the external order;
+    // the source guard in `rg-db` separately holds the explicit ORDER BY because
+    // SQLite may happen to read the unique tag index in order without it.
+    for tag in ["zeta", "alpha", "middle", "beta", "gamma"] {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_V1,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": config.len(),
+                "digest": config_digest,
+            },
+            "layers": [],
+            "annotations": {
+                "org.opencontainers.image.ref.name": tag,
+            },
+        })
+        .to_string();
+        let pushed = client
+            .put(format!("{base}/v2/oci_tags/tag-pages/manifests/{tag}"))
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+            .body(manifest)
+            .send()
+            .await
+            .unwrap();
+        let status = pushed.status();
+        let body = pushed.text().await.unwrap();
+        assert_eq!(status, 201, "fixture tag {tag} failed: {body}");
+    }
+
+    let expected = ["alpha", "beta", "gamma", "middle", "zeta"];
+    let unpaged = client
+        .get(format!("{base}/v2/oci_tags/tag-pages/tags/list"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpaged.status(), 200);
+    assert!(
+        unpaged.headers().get(reqwest::header::LINK).is_none(),
+        "an unpaged request must remain a complete response"
+    );
+    let unpaged_body: serde_json::Value = unpaged.json().await.unwrap();
+    assert_eq!(unpaged_body["tags"], serde_json::json!(expected));
+
+    let mut next_path = Some("/v2/oci_tags/tag-pages/tags/list?n=2".to_string());
+    let mut walked = Vec::new();
+    let mut links = Vec::new();
+    let mut requested_paths = std::collections::BTreeSet::new();
+    while let Some(path) = next_path.take() {
+        assert!(
+            requested_paths.insert(path.clone()),
+            "the pagination Link repeated {path} instead of advancing `last`"
+        );
+        let response = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "page request failed: {path}");
+        let link = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .map(|value| value.to_str().unwrap().to_string());
+        let body: serde_json::Value = response.json().await.unwrap();
+        walked.extend(
+            body["tags"]
+                .as_array()
+                .expect("tags array")
+                .iter()
+                .map(|tag| tag.as_str().expect("tag string").to_string()),
+        );
+
+        next_path = link.as_deref().map(|link| {
+            links.push(link.to_string());
+            let (target, relation) = link
+                .strip_prefix('<')
+                .and_then(|link| link.split_once('>'))
+                .expect("Link must contain one bracketed target");
+            assert_eq!(relation, "; rel=\"next\"");
+            target.to_string()
+        });
+    }
+
+    assert_eq!(walked, expected);
+    assert_eq!(
+        walked
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected.len(),
+        "the page walk returned a duplicate tag"
+    );
+    assert_eq!(
+        links,
+        [
+            "</v2/oci_tags/tag-pages/tags/list?n=2&last=beta>; rel=\"next\"",
+            "</v2/oci_tags/tag-pages/tags/list?n=2&last=middle>; rel=\"next\"",
+        ]
+    );
+
+    let after_beta = client
+        .get(format!("{base}/v2/oci_tags/tag-pages/tags/list?last=beta"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after_beta.status(), 200);
+    assert!(after_beta.headers().get(reqwest::header::LINK).is_none());
+    assert_eq!(
+        after_beta.json::<serde_json::Value>().await.unwrap()["tags"],
+        serde_json::json!(["gamma", "middle", "zeta"])
+    );
+
+    let zero = client
+        .get(format!("{base}/v2/oci_tags/tag-pages/tags/list?n=0"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(zero.status(), 200);
+    assert!(zero.headers().get(reqwest::header::LINK).is_none());
+    assert_eq!(
+        zero.json::<serde_json::Value>().await.unwrap()["tags"],
+        serde_json::json!([])
+    );
+
+    let invalid = client
+        .get(format!("{base}/v2/oci_tags/tag-pages/tags/list?n=-1"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert_eq!(
+        invalid.json::<serde_json::Value>().await.unwrap()["errors"][0]["code"],
+        "PAGINATION_NUMBER_INVALID"
+    );
+}
+
 /// A multi-arch push ends with an image index, which carries `manifests` and no
 /// `layers` at all — the other half of the wire format.
 #[tokio::test]

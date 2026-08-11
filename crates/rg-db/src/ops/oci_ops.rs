@@ -138,12 +138,21 @@ pub async fn find_manifest_by_tag(
         .await
 }
 
-/// List all tags for an OCI repository.
-pub async fn list_tags(db: &DatabaseConnection, oci_repo_id: i64) -> Result<Vec<String>, DbErr> {
+/// List tags for an OCI repository in the order used by marker pagination.
+pub async fn list_tags(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    last: Option<&str>,
+) -> Result<Vec<String>, DbErr> {
     use oci_manifest::Entity as Manifest;
-    let manifests = Manifest::find()
+    let mut query = Manifest::find()
         .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
-        .filter(oci_manifest::Column::Tag.is_not_null())
+        .filter(oci_manifest::Column::Tag.is_not_null());
+    if let Some(last) = last {
+        query = query.filter(oci_manifest::Column::Tag.gt(last));
+    }
+    let manifests = query
+        .order_by_asc(oci_manifest::Column::Tag)
         .all(db)
         .await?;
     Ok(manifests.into_iter().filter_map(|m| m.tag).collect())

@@ -512,3 +512,35 @@ fn no_paginating_op_hands_a_row_offset_to_fetch_page() {
          `.offset(offset).limit(limit)` instead: {offenders:#?}"
     );
 }
+
+/// OCI uses keyset pagination rather than LIMIT/OFFSET: `last` must be compared
+/// by the same database ordering that determines which tag follows it.
+///
+/// SQLite often reads the unique `(repository, tag)` index in tag order even
+/// without an explicit `ORDER BY`, so a behavioural test can stay green after
+/// that clause is deleted. This guard holds the query shape independently; the
+/// routed test in `rg-http` proves the resulting page walk and Link contract.
+#[test]
+fn oci_tag_marker_and_order_use_the_same_column() {
+    let source = include_str!("../../src/ops/oci_ops.rs");
+    let (_, after_name) = source
+        .split_once("\npub async fn list_tags(")
+        .expect("oci_ops::list_tags must remain discoverable");
+    let body = after_name
+        .split("\nasync fn ")
+        .next()
+        .expect("list_tags body")
+        .split("\npub async fn ")
+        .next()
+        .expect("list_tags body");
+    let body = without_the_next_item_s_doc_block(body);
+
+    assert!(
+        body.contains("oci_manifest::Column::Tag.gt(last)"),
+        "oci_ops::list_tags must start strictly after the requested tag"
+    );
+    assert!(
+        body.contains(".order_by_asc(oci_manifest::Column::Tag)"),
+        "oci_ops::list_tags must define the tag order that `last` advances through"
+    );
+}

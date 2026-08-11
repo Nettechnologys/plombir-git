@@ -463,6 +463,7 @@ async fn db_outage_in_oci_handler_returns_503_with_oci_envelope() {
         State(state),
         axum::http::HeaderMap::new(),
         Path(("owner".to_string(), "repo".to_string())),
+        Query(std::collections::HashMap::new()),
     )
     .await
     .into_response();

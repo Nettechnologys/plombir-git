@@ -98,6 +98,7 @@ pub mod error_codes {
     pub const MANIFEST_UNKNOWN: &str = "MANIFEST_UNKNOWN";
     pub const NAME_INVALID: &str = "NAME_INVALID";
     pub const NAME_UNKNOWN: &str = "NAME_UNKNOWN";
+    pub const PAGINATION_NUMBER_INVALID: &str = "PAGINATION_NUMBER_INVALID";
     pub const SIZE_INVALID: &str = "SIZE_INVALID";
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
     pub const UNSUPPORTED: &str = "UNSUPPORTED";

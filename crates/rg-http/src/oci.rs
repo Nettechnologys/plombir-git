@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderName, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -819,6 +819,7 @@ pub async fn list_tags(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, repo)): Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if let Err(resp) = require_access(&state, &headers, &owner, &repo, "pull").await {
         return resp;
@@ -830,19 +831,60 @@ pub async fn list_tags(
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
-    let tags = match rg_db::ops::oci_ops::list_tags(&state.db, oci_repo.id).await {
+    let limit = match params.get("n") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) => Some(limit),
+            Err(_) => {
+                return oci_err(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::PAGINATION_NUMBER_INVALID,
+                    "invalid number of results requested",
+                );
+            }
+        },
+        None => None,
+    };
+    let last = params.get("last").map(String::as_str);
+
+    let tags = match rg_db::ops::oci_ops::list_tags(&state.db, oci_repo.id, last).await {
         Ok(t) => t,
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
-    (
+    let has_next = limit.is_some_and(|limit| limit > 0 && tags.len() > limit);
+    let tags: Vec<_> = match limit {
+        Some(limit) => tags.into_iter().take(limit).collect(),
+        None => tags,
+    };
+    let next_marker = has_next.then(|| {
+        tags.last()
+            .expect("a non-empty page has a last tag")
+            .clone()
+    });
+
+    let mut response = (
         StatusCode::OK,
         Json(TagListResponse {
             name: format!("{owner}/{repo}"),
             tags,
         }),
     )
-        .into_response()
+        .into_response();
+
+    if let (Some(limit), Some(last)) = (limit, next_marker.as_deref()) {
+        let link = format!(
+            "</v2/{}/{}/tags/list?n={limit}&last={}>; rel=\"next\"",
+            urlencoding::encode(&owner),
+            urlencoding::encode(&repo),
+            urlencoding::encode(last),
+        );
+        response.headers_mut().insert(
+            header::LINK,
+            HeaderValue::try_from(link).expect("percent-encoded OCI pagination link is a header"),
+        );
+    }
+
+    response
 }
 
 // ── Manifest ─────────────────────────────────────────────────
