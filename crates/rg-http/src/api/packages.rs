@@ -951,6 +951,10 @@ fn required_twine_field(value: Option<String>, field: &str) -> Result<String, Ap
 /// the publisher deliberately attached and that no other part of the request
 /// carries, so dropping it into the ignored-field arm loses it for good while
 /// the upload still answers 200 (`card_b25bd1cbc60c`).
+///
+/// A detached `gpg_signature` is evidence for the same reason, but ForgeKeep
+/// does not currently verify, store, or serve GPG sidecars. Reject it before
+/// publication instead of claiming that a `twine upload --sign` succeeded.
 async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, AppError> {
     let mut upload = TwineUpload::default();
 
@@ -976,6 +980,11 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
                 })?;
                 set_twine_field(&mut upload.filename, "content", filename)?;
                 set_twine_field(&mut upload.content, "content", content)?;
+            }
+            "gpg_signature" => {
+                return Err(AppError::bad_request(
+                    "Twine GPG signatures are not supported; upload again without `--sign`",
+                ));
             }
             ":action" | "protocol_version" | "name" | "version" | "sha256_digest"
             | "attestations" => {
@@ -1018,11 +1027,11 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
     request_body(
         content_type = "multipart/form-data",
         description = "Twine legacy upload form with package metadata, a content file, and an \
-                       optional PEP 740 `attestations` array",
+                       optional PEP 740 `attestations` array; detached GPG signatures are rejected",
     ),
     responses(
         (status = 200, description = "Package uploaded", body = PublishResponse),
-        (status = 400, description = "Malformed form, package, digest, or attestations", body = serde_json::Value),
+        (status = 400, description = "Malformed form, package, digest, or attestations, or an unsupported GPG signature", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 409, description = "Distribution already exists", body = serde_json::Value),
         (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),

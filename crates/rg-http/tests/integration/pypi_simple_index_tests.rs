@@ -671,6 +671,48 @@ async fn a_corrupt_attestations_field_is_refused_rather_than_ignored() {
     assert!(!index.contains("matrix-attest"), "{index}");
 }
 
+/// Acceptance for card_68133b6fb79d: Twine sends `gpg_signature` as a file
+/// part next to `content`. Until ForgeKeep can preserve and serve that sidecar,
+/// rejecting the request is the only honest result; the wheel must not be
+/// published after its detached signature was refused.
+#[tokio::test]
+async fn a_gpg_signed_upload_is_refused_before_publishing_distribution() {
+    let fx = AttestedUpload::new("gpg-owner").await;
+    let form = twine_form(
+        "matrix-attest",
+        "1.0.0",
+        &fx.filename,
+        fx.body.clone(),
+        fx.digest.clone(),
+    )
+    .part(
+        "gpg_signature",
+        reqwest::multipart::Part::bytes(b"a detached OpenPGP signature".to_vec())
+            .file_name(format!("{}.asc", fx.filename))
+            .mime_str("application/octet-stream")
+            .expect("literal MIME type"),
+    );
+    let response = fx
+        .client
+        .post(fx.url("/legacy/"))
+        .bearer_auth(&fx.token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("GPG signatures are not supported"), "{body}");
+
+    let (status, index) = fx.get(&fx.url("/simple/")).await;
+    assert_eq!(status, StatusCode::OK, "{index}");
+    assert!(
+        !index.contains("matrix-attest"),
+        "the rejected signed upload must leave no package behind: {index}"
+    );
+}
+
 /// The mirror of the case above: an upload that carries no attestations is
 /// still a perfectly good upload, and its page must not advertise provenance
 /// the registry does not hold.
