@@ -11,8 +11,12 @@ pub struct Model {
     pub package_id: i64,
     pub version: String,
     /// Protocol-defined identity for versions whose raw spellings can alias.
-    /// Currently populated for parseable NuGet versions only.
+    /// Populated for parseable NuGet, PyPI, Cargo and RubyGems versions.
     pub protocol_version_key: Option<String>,
+    /// Non-null scope for the raw version spelling. Empty for ordinary package
+    /// protocols; the RubyGems platform for its composite `(number, platform)`
+    /// release identity.
+    pub protocol_variant_key: String,
     /// Normalized semver string (for ordering/comparison)
     pub semver: Option<String>,
     /// Package-type-specific metadata (JSON)

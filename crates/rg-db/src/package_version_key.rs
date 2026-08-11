@@ -5,6 +5,9 @@
 //! to that spelling and protected by a database UNIQUE constraint.
 
 use std::cmp::Ordering;
+use std::fmt::Write as _;
+
+use sha2::{Digest, Sha256};
 
 /// Cargo's SemVer identity for one crate version.
 ///
@@ -20,6 +23,247 @@ pub fn cargo_version_key(value: &str) -> Option<String> {
     if !parsed.pre.is_empty() {
         key.push('-');
         key.push_str(parsed.pre.as_str());
+    }
+    Some(key)
+}
+
+/// RubyGems' identity for one version number.
+///
+/// `Gem::Version` compares typed numeric/text segments, not the publisher's raw
+/// spelling. It also removes trailing numeric zeroes and, for prereleases, the
+/// first dot-anchored `[0.]+` run immediately before text. Consequently `1.0`,
+/// `1.0.0` and `1.0.0.0` are one version, as are `1.0.0.pre1` and
+/// `1.0.0.pre.1`.
+///
+/// A dash is not a separator with SemVer meaning: RubyGems rewrites every `-`
+/// to `.pre.` before partitioning. Text segments retain their case because
+/// `Gem::Version` compares Ruby strings as written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RubyGemsVersion {
+    canonical_segments: Vec<RubyGemsVersionSegment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RubyGemsVersionSegment {
+    Number(String),
+    Text(String),
+}
+
+impl RubyGemsVersion {
+    /// Parse one spelling accepted by `Gem::Version`.
+    ///
+    /// Numeric segments stay as normalized decimal strings instead of machine
+    /// integers: Ruby integers are arbitrary precision, so a very long but
+    /// otherwise valid component must not acquire a different identity here.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let value = if value.is_empty() { "0" } else { value };
+        if !valid_rubygems_version(value) {
+            return None;
+        }
+
+        let canonical_input = rubygems_canonical_input(value);
+        let bytes = canonical_input.as_bytes();
+        let mut cursor = 0;
+        let mut segments = Vec::new();
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            if byte.is_ascii_digit() {
+                let start = cursor;
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                    cursor += 1;
+                }
+                let digits = &canonical_input[start..cursor];
+                let normalized = digits.trim_start_matches('0');
+                segments.push(RubyGemsVersionSegment::Number(
+                    if normalized.is_empty() {
+                        "0"
+                    } else {
+                        normalized
+                    }
+                    .to_string(),
+                ));
+            } else if byte.is_ascii_alphabetic() {
+                let start = cursor;
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
+                    cursor += 1;
+                }
+                segments.push(RubyGemsVersionSegment::Text(
+                    canonical_input[start..cursor].to_string(),
+                ));
+            } else {
+                // Canonicalization leaves only dots here, and dots do not
+                // themselves become comparison segments.
+                cursor += 1;
+            }
+        }
+
+        while segments.len() > 1
+            && matches!(
+                segments.last(),
+                Some(RubyGemsVersionSegment::Number(number)) if number == "0"
+            )
+        {
+            segments.pop();
+        }
+
+        Some(Self {
+            canonical_segments: segments,
+        })
+    }
+
+    /// Stable, unambiguous encoding of `Gem::Version#canonical_segments`.
+    pub fn canonical(&self) -> String {
+        self.canonical_segments
+            .iter()
+            .map(|segment| match segment {
+                RubyGemsVersionSegment::Number(number) => format!("n{number}"),
+                RubyGemsVersionSegment::Text(text) => format!("s{text}"),
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
+/// Apply the spelling-level rewrite from current `Gem::Version` before its
+/// `partition_segments` scan.
+///
+/// The zero removal is intentionally not expressed only in terms of parsed
+/// segments: `1.a.0b` loses that dot-delimited zero, while `1.a0b` keeps it.
+/// Repeated dashes can also introduce adjacent dots, and Ruby's one-shot
+/// substitution must stop at the same first match.
+fn rubygems_canonical_input(value: &str) -> String {
+    let mut canonical = value.replace('-', ".pre.");
+    if !canonical.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return canonical;
+    }
+
+    let bytes = canonical.as_bytes();
+    let mut start = 0;
+    let mut removal = None;
+    while start < bytes.len() {
+        let starts_zero_run = matches!(bytes[start], b'0' | b'.');
+        let has_anchor = start == 0 || bytes[start - 1] == b'.';
+        if starts_zero_run && has_anchor {
+            let mut end = start;
+            while end < bytes.len() && matches!(bytes[end], b'0' | b'.') {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+                removal = Some(start..end);
+                break;
+            }
+        }
+        start += 1;
+    }
+    if let Some(range) = removal {
+        canonical.replace_range(range, "");
+    }
+    canonical
+}
+
+fn take_rubygems_run(bytes: &[u8], cursor: &mut usize, allowed: fn(u8) -> bool) -> bool {
+    let start = *cursor;
+    while *cursor < bytes.len() && allowed(bytes[*cursor]) {
+        *cursor += 1;
+    }
+    *cursor > start
+}
+
+fn ascii_digit(byte: u8) -> bool {
+    byte.is_ascii_digit()
+}
+
+fn ascii_alphanumeric(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+fn rubygems_suffix_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
+}
+
+/// `Gem::Version::VERSION_PATTERN`, kept as a scanner so this database-boundary
+/// parser does not gain a regex dependency or accept Unicode lookalikes.
+fn valid_rubygems_version(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    if !take_rubygems_run(bytes, &mut cursor, ascii_digit) {
+        return false;
+    }
+
+    while cursor < bytes.len() && bytes[cursor] == b'.' {
+        cursor += 1;
+        if !take_rubygems_run(bytes, &mut cursor, ascii_alphanumeric) {
+            return false;
+        }
+    }
+    if cursor == bytes.len() {
+        return true;
+    }
+    if bytes[cursor] != b'-' {
+        return false;
+    }
+
+    cursor += 1;
+    if !take_rubygems_run(bytes, &mut cursor, rubygems_suffix_character) {
+        return false;
+    }
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'.' {
+            return false;
+        }
+        cursor += 1;
+        if !take_rubygems_run(bytes, &mut cursor, rubygems_suffix_character) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recover the platform identity recorded by the RubyGems adapter.
+///
+/// A valid metadata object with no `platform` field is a known pure-Ruby gem;
+/// absent or unreadable metadata is unknown and must not be guessed as `ruby`.
+pub fn rubygems_platform_from_metadata(metadata: &str) -> Option<String> {
+    let document = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    let object = document.as_object()?;
+    match object.get("platform") {
+        None => Some("ruby".to_string()),
+        Some(serde_json::Value::String(platform)) => {
+            let platform = platform.trim();
+            (!platform.is_empty()).then(|| platform.to_string())
+        }
+        Some(_) => None,
+    }
+}
+
+/// Composite RubyGems release identity: canonical version plus platform.
+///
+/// RubyGems permits the same number for `ruby`, `java`, and native platforms;
+/// only aliases on the *same* platform conflict. Normal identities stay human
+/// readable. The rare value that would exceed the database's 255-character
+/// key column is SHA-256 compressed instead of silently losing uniqueness.
+pub fn rubygems_version_key(value: &str, platform: &str) -> Option<String> {
+    let platform = platform.trim();
+    if platform.is_empty() {
+        return None;
+    }
+    let canonical = RubyGemsVersion::parse(value)?.canonical();
+    let identity = format!("{canonical}|p:{platform}");
+    if identity.len() <= 255 {
+        return Some(identity);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"rubygems\0");
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(71);
+    key.push_str("sha256:");
+    for byte in digest {
+        write!(&mut key, "{byte:02x}").expect("writing hex to a String cannot fail");
     }
     Some(key)
 }
@@ -533,6 +777,98 @@ fn parse_pep440_local(local: &str) -> Option<Vec<Pep440LocalSegment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rubygems(value: &str) -> String {
+        RubyGemsVersion::parse(value)
+            .unwrap_or_else(|| panic!("{value:?} is a valid Gem::Version"))
+            .canonical()
+    }
+
+    #[test]
+    fn rubygems_identity_matches_canonical_segments() {
+        for spelling in ["1", "1.0", "1.0.0", "01.000.0"] {
+            assert_eq!(rubygems(spelling), "n1", "{spelling}");
+        }
+        for spelling in ["1.0.0.pre1", "1.0.0.pre.1"] {
+            assert_eq!(rubygems(spelling), "n1.spre.n1", "{spelling}");
+        }
+        for spelling in ["1.0.0-rc1", "1.0.0.pre.rc1"] {
+            assert_eq!(rubygems(spelling), "n1.spre.src.n1", "{spelling}");
+        }
+        for spelling in ["1.0.a10", "1.0.a.10"] {
+            assert_eq!(rubygems(spelling), "n1.sa.n10", "{spelling}");
+        }
+
+        // Current Gem::Version canonicalizes one spelling-level `[0.]+`
+        // run before text. The dot boundary matters, and the substitution is
+        // deliberately one-shot when repeated dashes introduce adjacent dots.
+        assert_eq!(rubygems("1-0a"), "n1.spre.sa");
+        assert_eq!(rubygems("1.a.0b"), "n1.sa.sb");
+        assert_eq!(rubygems("1.a0b"), "n1.sa.n0.sb");
+        assert_eq!(rubygems("1--0a"), "n1.spre.spre.n0.sa");
+        assert_eq!(rubygems("0.0.a.0"), "sa");
+        assert_eq!(rubygems("000000000000000000000000001.000"), "n1");
+
+        // Ruby string comparison is case-sensitive even though the segmenting
+        // regex uses `/i` to recognize both cases.
+        assert_ne!(rubygems("1.0.A1"), rubygems("1.0.a1"));
+        assert_ne!(rubygems("1.0.a1"), rubygems("1.0.b1"));
+        assert_ne!(rubygems("1.0"), rubygems("1.0.1"));
+    }
+
+    #[test]
+    fn invalid_rubygems_spelling_has_no_protocol_identity_key() {
+        for invalid in [
+            "v1.0",
+            "1+build",
+            "1..0",
+            "1.0_1",
+            "1.0-",
+            "1.-rc1",
+            "legacy row",
+            "١.0",
+        ] {
+            assert!(
+                RubyGemsVersion::parse(invalid).is_none(),
+                "{invalid:?} parsed as a Gem::Version"
+            );
+        }
+
+        // Gem::Version treats an empty spelling as zero.
+        assert_eq!(rubygems(""), rubygems("0"));
+    }
+
+    #[test]
+    fn rubygems_release_identity_includes_platform() {
+        assert_eq!(
+            rubygems_platform_from_metadata(r#"{"dependencies":[]}"#).as_deref(),
+            Some("ruby")
+        );
+        assert_eq!(
+            rubygems_platform_from_metadata(r#"{"platform":" x86_64-linux ","dependencies":[]}"#)
+                .as_deref(),
+            Some("x86_64-linux")
+        );
+        assert!(rubygems_platform_from_metadata("not json").is_none());
+        assert!(rubygems_platform_from_metadata(r#"{"platform":7}"#).is_none());
+
+        let pure_short = rubygems_version_key("1.0", "ruby").unwrap();
+        let pure_expanded = rubygems_version_key("1.0.0", "ruby").unwrap();
+        let java = rubygems_version_key("1.0.0", "java").unwrap();
+        assert_eq!(pure_short, pure_expanded);
+        assert_ne!(pure_expanded, java);
+    }
+
+    #[test]
+    fn oversized_rubygems_identity_is_stably_compressed() {
+        let long_version = format!("1.{}", "a".repeat(248));
+        let first = rubygems_version_key(&long_version, "x86_64-linux").unwrap();
+        let second = rubygems_version_key(&long_version, "x86_64-linux").unwrap();
+        assert_eq!(first, second);
+        assert!(first.starts_with("sha256:"), "{first}");
+        assert_eq!(first.len(), 71);
+        assert_ne!(first, rubygems_version_key(&long_version, "java").unwrap());
+    }
 
     #[test]
     fn cargo_identity_excludes_build_metadata_only() {

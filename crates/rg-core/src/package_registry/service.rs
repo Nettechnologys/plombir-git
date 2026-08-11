@@ -4,7 +4,10 @@
 //! coordinating the DB ops and the storage layer.
 
 use anyhow::Context as _;
-use rg_db::package_version_key::{cargo_version_key, NuGetVersion, Pep440Version};
+use rg_db::package_version_key::{
+    cargo_version_key, rubygems_platform_from_metadata, rubygems_version_key, NuGetVersion,
+    Pep440Version,
+};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
 
@@ -178,15 +181,24 @@ pub struct FileDetail {
 /// zeroes, the separators and alternate spellings around its pre/post/dev
 /// segments and trailing `.0` release components. Cargo requires strict SemVer
 /// but excludes build metadata from precedence and requirement matching.
+/// RubyGems compares canonical numeric/text segments and scopes that identity
+/// to the gem's platform.
 ///
 /// `None` — for a protocol with no separate identity contract, and for a
 /// spelling its parser rejects — leaves the version on its exact-text
 /// behavior, which is what keeps unparsable historical rows addressable.
-pub fn protocol_version_key(package_type: &str, version: &str) -> Option<String> {
+/// `protocol_variant_key` is ignored except for composite-identity protocols;
+/// today it is the RubyGems platform (`ruby`, `java`, `x86_64-linux`, ...).
+pub fn protocol_version_key(
+    package_type: &str,
+    version: &str,
+    protocol_variant_key: &str,
+) -> Option<String> {
     match package_type {
         package_types::CARGO => cargo_version_key(version),
         package_types::NUGET => NuGetVersion::parse(version).map(|parsed| parsed.normalized()),
         package_types::PYPI => Pep440Version::parse(version).map(|parsed| parsed.canonical()),
+        package_types::RUBYGEMS => rubygems_version_key(version, protocol_variant_key),
         _ => None,
     }
 }
@@ -206,7 +218,26 @@ pub async fn publish(
         validate_npm_dist_tag(tag)?;
     }
 
-    let protocol_version_key = protocol_version_key(&info.package_type, &info.version);
+    // The original raw `(package_id, version)` uniqueness could not represent
+    // two RubyGems builds with the same number on different platforms. The
+    // replacement raw key includes this non-null variant for every row; an
+    // empty variant preserves exact-text uniqueness for every other protocol.
+    let protocol_variant_key = if info.package_type == package_types::RUBYGEMS {
+        let metadata = info.metadata.as_deref().ok_or_else(|| {
+            crate::error::invalid_request(
+                "RubyGems package metadata is required to determine its platform identity",
+            )
+        })?;
+        rubygems_platform_from_metadata(metadata).ok_or_else(|| {
+            crate::error::invalid_request(
+                "RubyGems package metadata does not contain a readable platform identity",
+            )
+        })?
+    } else {
+        String::new()
+    };
+    let protocol_version_key =
+        protocol_version_key(&info.package_type, &info.version, &protocol_variant_key);
 
     // 1. Find or create the package registry for this repo+type
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
@@ -328,11 +359,12 @@ pub async fn publish(
         };
 
         // 5. Create version record
-        let v = match rg_db::ops::package_version_ops::create(
+        let v = match rg_db::ops::package_version_ops::create_with_protocol_identity(
             &transaction,
             pkg.id,
             &info.version,
             protocol_version_key.as_deref(),
+            &protocol_variant_key,
             info.semver.as_deref(),
             info.metadata.as_deref(),
             total_size,

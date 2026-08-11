@@ -14,6 +14,39 @@ pub async fn create(
     sha256: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<package_version::Model, DbErr> {
+    create_with_protocol_identity(
+        db,
+        package_id,
+        version,
+        protocol_version_key,
+        "",
+        semver,
+        metadata,
+        size,
+        sha256,
+        author_id,
+    )
+    .await
+}
+
+/// Create a version whose raw spelling is scoped by a protocol variant.
+///
+/// The variant is empty for ordinary package protocols and is the platform for
+/// RubyGems, where `1.0.0-ruby` and `1.0.0-java` are distinct releases even
+/// though both rows retain the publisher's raw version number `1.0.0`.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_with_protocol_identity(
+    db: &impl ConnectionTrait,
+    package_id: i64,
+    version: &str,
+    protocol_version_key: Option<&str>,
+    protocol_variant_key: &str,
+    semver: Option<&str>,
+    metadata: Option<&str>,
+    size: i64,
+    sha256: Option<&str>,
+    author_id: Option<i64>,
+) -> Result<package_version::Model, DbErr> {
     use package_version::ActiveModel;
     let now = chrono::Utc::now();
 
@@ -22,6 +55,7 @@ pub async fn create(
         package_id: Set(package_id),
         version: Set(version.to_string()),
         protocol_version_key: Set(protocol_version_key.map(str::to_string)),
+        protocol_variant_key: Set(protocol_variant_key.to_string()),
         semver: Set(semver.map(|s| s.to_string())),
         metadata: Set(metadata.map(|s| s.to_string())),
         size: Set(size),
@@ -155,7 +189,8 @@ mod tests {
         db.execute_unprepared(
             "CREATE TABLE package_versions (\
                  id INTEGER PRIMARY KEY, package_id BIGINT NOT NULL, version TEXT NOT NULL, \
-                 protocol_version_key TEXT, semver TEXT, metadata TEXT, size BIGINT NOT NULL, sha256 TEXT, \
+                 protocol_version_key TEXT, protocol_variant_key TEXT NOT NULL DEFAULT '', \
+                 semver TEXT, metadata TEXT, size BIGINT NOT NULL, sha256 TEXT, \
                  is_yanked BOOLEAN NOT NULL, download_count BIGINT NOT NULL, \
                  author_id BIGINT, created_at TIMESTAMP NOT NULL\
              );\

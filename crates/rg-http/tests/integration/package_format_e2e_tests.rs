@@ -5190,3 +5190,122 @@ required_ruby_version: !ruby/object:Gem::Requirement
         "the gem info API still offers a withdrawn version: {gem_info}"
     );
 }
+
+/// RubyGems owns version identity through `Gem::Version#canonical_segments`,
+/// but platform is the other half of a release coordinate. This exercises both
+/// sides through the native `gem push` wire shape: aliases on one platform
+/// conflict, while two builds with the same raw number remain installable.
+#[tokio::test]
+async fn rubygems_publish_uses_canonical_version_identity_within_each_platform() {
+    let (base, db) = spawn_test_app_with_db().await;
+    // `package_url` deliberately fixes the shared matrix coordinate.
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-identity@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let gem = |name: &str, version: &str, platform: &str| {
+        let metadata = format!(
+            "name: {name}\nversion: '{version}'\nplatform: {platform}\nsummary: identity matrix\n"
+        );
+        let compressed = gzip(metadata.as_bytes());
+        tar_archive(&[("metadata.gz", compressed.as_slice())])
+    };
+    let push = |name: &str, version: &str, platform: &str| {
+        let client = client.clone();
+        let token = token.clone();
+        let url = package_url(&base, &["rubygems", "api", "v1", "gems"]);
+        let body = gem(name, version, platform);
+        async move {
+            client
+                .post(url)
+                .header(reqwest::header::AUTHORIZATION, token)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = push("matrix-alias", "1.0", "ruby").await;
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+    let alias = push("matrix-alias", "1.0.0", "ruby").await;
+    assert_eq!(
+        alias.status(),
+        StatusCode::CONFLICT,
+        "Gem::Version aliases created two pure-ruby releases: {}",
+        alias.text().await.unwrap()
+    );
+
+    assert_eq!(
+        push("matrix-platform", "1.0.0", "ruby").await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        push("matrix-platform", "1.0.0", "java").await.status(),
+        StatusCode::CREATED,
+        "the raw version UNIQUE index still collapses platform siblings"
+    );
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "matrix-owner", "matrix-repo")
+        .await
+        .unwrap()
+        .unwrap();
+    let registry =
+        rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "rubygems")
+            .await
+            .unwrap()
+            .unwrap();
+    let alias_package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "matrix-alias")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        rg_db::ops::package_version_ops::list_by_package(&db, alias_package.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the rejected alias left a second package_version row"
+    );
+
+    let platform_package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "matrix-platform")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, platform_package.id)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 2);
+    assert!(versions.iter().all(|version| version.version == "1.0.0"));
+    let mut platforms = versions
+        .iter()
+        .map(|version| version.protocol_variant_key.as_str())
+        .collect::<Vec<_>>();
+    platforms.sort_unstable();
+    assert_eq!(platforms, ["java", "ruby"]);
+    assert_ne!(
+        versions[0].protocol_version_key,
+        versions[1].protocol_version_key
+    );
+
+    let info = client
+        .get(package_url(&base, &["rubygems", "info", "matrix-platform"]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        info.lines().any(|line| line.starts_with("1.0.0 ")),
+        "the pure-ruby release disappeared from the compact index: {info}"
+    );
+    assert!(
+        info.lines().any(|line| line.starts_with("1.0.0-java ")),
+        "the java release disappeared from the compact index: {info}"
+    );
+}
