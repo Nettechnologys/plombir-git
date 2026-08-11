@@ -45,13 +45,36 @@ const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// - The import clients (`GitHubClient` / `GitLabClient`) add their per-instance
 ///   auth headers (`Bearer` / `PRIVATE-TOKEN`) + UA. Their redirect policy keeps
 ///   the default count limit but follows only the API base's exact origin, so a
-///   rename can work without moving the PAT to another host or port. Private
-///   self-hosted origins are admitted separately through the import admin
+///   rename can work without moving the PAT to another scheme, host, or port.
+///   Private self-hosted origins are admitted separately through the import admin
 ///   trust policy, not through this generic HTTP builder.
 pub fn outbound_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(OUTBOUND_TIMEOUT)
         .connect_timeout(OUTBOUND_CONNECT_TIMEOUT)
+}
+
+/// Follow redirects only while they stay on the initiating request's exact
+/// HTTP origin (`scheme + host + effective port`).
+///
+/// Reqwest's default policy strips sensitive headers when host or port changes,
+/// but not when only the scheme changes. Stopping before any origin change is
+/// therefore the credential boundary; delegating allowed redirects back to the
+/// default policy preserves its normal redirect-count limit.
+pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    let default = reqwest::redirect::Policy::default();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let stays_on_origin = attempt.previous().first().is_some_and(|initial| {
+            initial.scheme() == attempt.url().scheme()
+                && initial.host_str() == attempt.url().host_str()
+                && initial.port_or_known_default() == attempt.url().port_or_known_default()
+        });
+        if stays_on_origin {
+            default.redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 /// Shared, SSRF-hardened outbound HTTP client for user-supplied targets.

@@ -19,6 +19,25 @@ use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_loc
 /// pin registration or the heartbeat task on the connect phase forever.
 const RUNNER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Keep runner credentials on the exact origin of each initiating request.
+/// Reqwest's built-in sensitive-header stripping ignores scheme-only changes,
+/// so an explicit policy is the credential boundary for the shared client.
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    let default = reqwest::redirect::Policy::default();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let stays_on_origin = attempt.previous().first().is_some_and(|initial| {
+            initial.scheme() == attempt.url().scheme()
+                && initial.host_str() == attempt.url().host_str()
+                && initial.port_or_known_default() == attempt.url().port_or_known_default()
+        });
+        if stays_on_origin {
+            default.redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// Bounds of the job deadline the server may hand out, mirroring
 /// `rg_core::ci::JOB_TIMEOUT_{MIN,MAX}_SECS`. Duplicated rather than imported:
 /// the agent is a standalone binary that talks to the server over HTTP only and
@@ -61,6 +80,7 @@ fn resolve_polled_timeout(job_id: i64, polled: i64) -> u64 {
 fn build_runner_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(RUNNER_CONNECT_TIMEOUT)
+        .redirect(same_origin_redirect_policy())
         .build()
         .expect("failed to build runner HTTP client: no native TLS backend available")
 }
@@ -442,6 +462,171 @@ pub async fn cmd_run(
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::build_runner_client;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: &str, headers: &str) {
+        let response =
+            format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OriginChange {
+        Scheme,
+        Host,
+        Port,
+    }
+
+    async fn assert_origin_change_is_stopped(
+        client: &reqwest::Client,
+        expected_authorization: &str,
+        change: OriginChange,
+    ) {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source.local_addr().unwrap();
+        let sink = if matches!(change, OriginChange::Port) {
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap())
+        } else {
+            None
+        };
+        let sink_address = sink.as_ref().map(|listener| listener.local_addr().unwrap());
+        let location = match change {
+            OriginChange::Scheme => {
+                format!("https://127.0.0.1:{}/changed-scheme", source_address.port())
+            }
+            OriginChange::Host => {
+                format!("http://127.0.0.1:{}/changed-host", source_address.port())
+            }
+            OriginChange::Port => format!("http://{}/changed-port", sink_address.unwrap()),
+        };
+        let initial_host = if matches!(change, OriginChange::Host) {
+            "localhost"
+        } else {
+            "127.0.0.1"
+        };
+        let initial_url = format!("http://{initial_host}:{}/start", source_address.port());
+
+        let sink_task = sink.map(|sink| {
+            tokio::spawn(async move {
+                matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), sink.accept()).await,
+                    Ok(Ok(_))
+                )
+            })
+        });
+        let source_task = tokio::spawn(async move {
+            let (mut first, _) = source.accept().await.unwrap();
+            let first_request = read_headers(&mut first).await;
+            write_response(
+                &mut first,
+                "302 Found",
+                &format!("Location: {location}\r\n"),
+            )
+            .await;
+            let same_listener_followed = if matches!(change, OriginChange::Port) {
+                false
+            } else {
+                matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), source.accept()).await,
+                    Ok(Ok(_))
+                )
+            };
+            (first_request, same_listener_followed)
+        });
+
+        let response = client
+            .get(initial_url)
+            .header("Authorization", "Bearer runner-token")
+            .send()
+            .await
+            .expect("the cross-origin redirect must be returned, not followed");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+
+        let (first_request, same_listener_followed) = source_task.await.unwrap();
+        assert!(
+            first_request
+                .to_ascii_lowercase()
+                .contains(expected_authorization),
+            "baseline request did not carry its credential: {first_request}"
+        );
+        let separate_sink_followed = match sink_task {
+            Some(task) => task.await.unwrap(),
+            None => false,
+        };
+        assert!(
+            !same_listener_followed && !separate_sink_followed,
+            "{change:?}-changing destination was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_client_stops_every_origin_change_before_sending_the_token() {
+        let client = build_runner_client();
+        for change in [OriginChange::Scheme, OriginChange::Host, OriginChange::Port] {
+            assert_origin_change_is_stopped(&client, "authorization: bearer runner-token", change)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_client_keeps_same_origin_redirects_and_the_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_headers(&mut first).await;
+            write_response(
+                &mut first,
+                "302 Found",
+                &format!("Location: http://{address}/renamed\r\n"),
+            )
+            .await;
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_headers(&mut second).await;
+            write_response(&mut second, "204 No Content", "").await;
+            (first_request, second_request)
+        });
+
+        let response = build_runner_client()
+            .get(format!("http://{address}/start"))
+            .bearer_auth("runner-token")
+            .send()
+            .await
+            .expect("same-origin redirect");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let (first, second) = server.await.unwrap();
+        for request in [first, second] {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer runner-token"),
+                "same-origin request lost the runner token: {request}"
+            );
         }
     }
 }

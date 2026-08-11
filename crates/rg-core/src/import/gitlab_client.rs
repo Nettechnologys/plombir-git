@@ -185,7 +185,7 @@ impl GitLabClient {
         // PRIVATE-TOKEN to a different scheme, host, or port.
         let client = crate::net::outbound_client_builder()
             .default_headers(headers)
-            .redirect(super::trust::same_origin_redirect_policy(&base_url)?)
+            .redirect(crate::net::same_origin_redirect_policy())
             .user_agent("ForgeKeep/0.1")
             .build()
             .context("failed to build GitLab HTTP client")?;

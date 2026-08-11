@@ -120,22 +120,6 @@ pub fn require_same_origin(expected: &str, candidate: &str) -> Result<()> {
     Ok(())
 }
 
-/// Follow API redirects only while they stay on the API base's exact origin.
-/// Reqwest's default redirect policy is retained for the count limit and
-/// same-origin repository renames, but a different host or port sees no PAT.
-pub(super) fn same_origin_redirect_policy(base_url: &str) -> Result<reqwest::redirect::Policy> {
-    let expected = ImportOrigin::from_target(base_url)
-        .ok_or_else(|| anyhow::anyhow!("import API base URL has no HTTP(S) origin"))?;
-    let default = reqwest::redirect::Policy::default();
-    Ok(reqwest::redirect::Policy::custom(move |attempt| {
-        if ImportOrigin::from_url(attempt.url()).as_ref() == Some(&expected) {
-            default.redirect(attempt)
-        } else {
-            attempt.stop()
-        }
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

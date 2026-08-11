@@ -506,6 +506,14 @@ pub(crate) async fn cmd_import(
     Ok(())
 }
 
+fn build_package_publish_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(rg_core::net::same_origin_redirect_policy())
+        .build()
+        .context("failed to build package-publish HTTP client")
+}
+
 /// `forgekeep package` — package registry management (publish / list).
 pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
     init_cli_logging();
@@ -545,10 +553,7 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
                 // could abort a legitimate slow upload. `connect_timeout` alone
                 // still stops a dead/hung `--server-url` from hanging the CLI on
                 // connect forever.
-                let client = reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .context("failed to build package-publish HTTP client")?;
+                let client = build_package_publish_client()?;
                 let url = format!(
                     "{}/api/v1/repos/{}/{}/packages/{}/publish?name={}&version={}",
                     server_url.trim_end_matches('/'),
@@ -728,7 +733,168 @@ pub(crate) async fn cmd_index_repo(
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_migrate, cmd_rotate_instance_key};
+    use super::{build_package_publish_client, cmd_migrate, cmd_rotate_instance_key};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: &str, headers: &str) {
+        let response =
+            format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OriginChange {
+        Scheme,
+        Host,
+        Port,
+    }
+
+    async fn assert_origin_change_is_stopped(
+        client: &reqwest::Client,
+        expected_authorization: &str,
+        change: OriginChange,
+    ) {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source.local_addr().unwrap();
+        let sink = if matches!(change, OriginChange::Port) {
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap())
+        } else {
+            None
+        };
+        let sink_address = sink.as_ref().map(|listener| listener.local_addr().unwrap());
+        let location = match change {
+            OriginChange::Scheme => {
+                format!("https://127.0.0.1:{}/changed-scheme", source_address.port())
+            }
+            OriginChange::Host => {
+                format!("http://127.0.0.1:{}/changed-host", source_address.port())
+            }
+            OriginChange::Port => format!("http://{}/changed-port", sink_address.unwrap()),
+        };
+        let initial_host = if matches!(change, OriginChange::Host) {
+            "localhost"
+        } else {
+            "127.0.0.1"
+        };
+        let initial_url = format!("http://{initial_host}:{}/start", source_address.port());
+
+        let sink_task = sink.map(|sink| {
+            tokio::spawn(async move {
+                matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), sink.accept()).await,
+                    Ok(Ok(_))
+                )
+            })
+        });
+        let source_task = tokio::spawn(async move {
+            let (mut first, _) = source.accept().await.unwrap();
+            let first_request = read_headers(&mut first).await;
+            write_response(
+                &mut first,
+                "302 Found",
+                &format!("Location: {location}\r\n"),
+            )
+            .await;
+            let same_listener_followed = if matches!(change, OriginChange::Port) {
+                false
+            } else {
+                matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), source.accept()).await,
+                    Ok(Ok(_))
+                )
+            };
+            (first_request, same_listener_followed)
+        });
+
+        let response = client
+            .get(initial_url)
+            .header("Authorization", "Bearer package-token")
+            .send()
+            .await
+            .expect("the cross-origin redirect must be returned, not followed");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+
+        let (first_request, same_listener_followed) = source_task.await.unwrap();
+        assert!(
+            first_request
+                .to_ascii_lowercase()
+                .contains(expected_authorization),
+            "baseline request did not carry its credential: {first_request}"
+        );
+        let separate_sink_followed = match sink_task {
+            Some(task) => task.await.unwrap(),
+            None => false,
+        };
+        assert!(
+            !same_listener_followed && !separate_sink_followed,
+            "{change:?}-changing destination was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn package_publish_client_stops_every_origin_change_before_sending_the_token() {
+        let client = build_package_publish_client().unwrap();
+        for change in [OriginChange::Scheme, OriginChange::Host, OriginChange::Port] {
+            assert_origin_change_is_stopped(&client, "authorization: bearer package-token", change)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn package_publish_client_keeps_same_origin_redirects_and_the_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_headers(&mut first).await;
+            write_response(
+                &mut first,
+                "302 Found",
+                &format!("Location: http://{address}/renamed\r\n"),
+            )
+            .await;
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_headers(&mut second).await;
+            write_response(&mut second, "204 No Content", "").await;
+            (first_request, second_request)
+        });
+
+        let response = build_package_publish_client()
+            .unwrap()
+            .get(format!("http://{address}/start"))
+            .header("Authorization", "Bearer package-token")
+            .send()
+            .await
+            .expect("same-origin redirect");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let (first, second) = server.await.unwrap();
+        for request in [first, second] {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer package-token"),
+                "same-origin request lost the package token: {request}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn migrate_refuses_a_file_backed_sqlite_database_held_by_the_server() {
