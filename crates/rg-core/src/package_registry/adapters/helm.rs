@@ -16,6 +16,7 @@
 //! - Download: standard package download endpoint
 
 use flate2::read::GzDecoder;
+use rg_db::package_version_key::helm_version_key;
 use std::io::Read;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
@@ -109,15 +110,16 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("Chart.yaml missing 'name'"))?
         .to_string();
 
-    let version = doc
+    let version_value = doc
         .get("version")
-        .and_then(|v| {
-            // version can be string or number
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_f64().map(|n| n.to_string()))
-        })
         .ok_or_else(|| anyhow::anyhow!("Chart.yaml missing 'version'"))?;
+    let version = version_value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Chart.yaml 'version' must be a string"))?
+        .to_string();
+    if helm_version_key(&version).is_none() {
+        anyhow::bail!("Chart.yaml 'version' is not a valid Helm semantic version");
+    }
 
     let description = doc
         .get("description")
@@ -482,13 +484,29 @@ sources:
     }
 
     #[test]
-    fn test_extract_chart_version_number() {
-        // version as a number — YAML parses 1.0 as float, Display strips trailing zero
+    fn chart_version_must_be_a_string() {
         let yaml = "name: test\nversion: 1.0\n";
         let data = make_chart(yaml);
         let adapter = HelmAdapter;
-        let meta = adapter.extract_metadata("test-1.0.tgz", &data).unwrap();
-        assert_eq!(meta.version, "1");
+        let error = adapter.extract_metadata("test-1.0.tgz", &data).unwrap_err();
+        assert!(error.to_string().contains("must be a string"), "{error:#}");
+    }
+
+    #[test]
+    fn chart_version_must_match_helm_semver_rules() {
+        let adapter = HelmAdapter;
+        let invalid = make_chart("name: test\nversion: not-a-version\n");
+        let error = adapter.extract_metadata("test.tgz", &invalid).unwrap_err();
+        assert!(
+            error.to_string().contains("valid Helm semantic version"),
+            "{error:#}"
+        );
+
+        for version in ["1", "1.2", "v01.002.0003+build.7"] {
+            let chart = make_chart(&format!("name: test\nversion: {version:?}\n"));
+            let metadata = adapter.extract_metadata("test.tgz", &chart).unwrap();
+            assert_eq!(metadata.version, version);
+        }
     }
 
     #[test]

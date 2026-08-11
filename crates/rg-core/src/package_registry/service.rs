@@ -5,8 +5,8 @@
 
 use anyhow::Context as _;
 use rg_db::package_version_key::{
-    cargo_version_key, rubygems_platform_from_metadata, rubygems_version_key, NuGetVersion,
-    Pep440Version,
+    cargo_version_key, helm_version_key, rubygems_platform_from_metadata, rubygems_version_key,
+    NuGetVersion, Pep440Version,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
@@ -181,6 +181,8 @@ pub struct FileDetail {
 /// zeroes, the separators and alternate spellings around its pre/post/dev
 /// segments and trailing `.0` release components. Cargo requires strict SemVer
 /// but excludes build metadata from precedence and requirement matching.
+/// Helm accepts Masterminds/semver's coerced core spellings and likewise
+/// excludes build metadata from comparison.
 /// RubyGems compares canonical numeric/text segments and scopes that identity
 /// to the gem's platform.
 ///
@@ -196,6 +198,7 @@ pub fn protocol_version_key(
 ) -> Option<String> {
     match package_type {
         package_types::CARGO => cargo_version_key(version),
+        package_types::HELM => helm_version_key(version),
         package_types::NUGET => NuGetVersion::parse(version).map(|parsed| parsed.normalized()),
         package_types::PYPI => Pep440Version::parse(version).map(|parsed| parsed.canonical()),
         package_types::RUBYGEMS => rubygems_version_key(version, protocol_variant_key),

@@ -27,6 +27,71 @@ pub fn cargo_version_key(value: &str) -> Option<String> {
     Some(key)
 }
 
+/// Helm's resolver identity for one chart version.
+///
+/// Helm validates `Metadata.Version` with Masterminds/semver `NewVersion`,
+/// whose default coercion accepts a lowercase `v`, one or two missing numeric
+/// components and leading zeroes. Comparison then ignores build metadata. We
+/// reproduce that boundary here before handing the normalized spelling to the
+/// strict Rust SemVer parser, so validation, migration and publish all share
+/// one client-compatible decision.
+pub fn helm_version_key(value: &str) -> Option<String> {
+    // Masterminds/semver caps NewVersion input at 256 bytes.
+    if value.is_empty() || value.len() > 256 {
+        return None;
+    }
+
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let suffix_start = value.find(['-', '+']).unwrap_or(value.len());
+    let (numeric, suffix) = value.split_at(suffix_start);
+    let mut components = numeric.split('.');
+    let major = helm_numeric_component(components.next()?)?;
+    let minor = match components.next() {
+        Some(component) => Some(helm_numeric_component(component)?),
+        None => None,
+    };
+    let patch = match components.next() {
+        Some(component) => Some(helm_numeric_component(component)?),
+        None => None,
+    };
+    if components.next().is_some() {
+        return None;
+    }
+
+    let normalized = format!(
+        "{major}.{}.{}{suffix}",
+        minor.unwrap_or(0),
+        patch.unwrap_or(0)
+    );
+    let parsed = semver::Version::parse(&normalized).ok()?;
+    let mut identity = format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch);
+    if !parsed.pre.is_empty() {
+        identity.push('-');
+        identity.push_str(parsed.pre.as_str());
+    }
+    if identity.len() <= 255 {
+        return Some(identity);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"helm\0");
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(71);
+    key.push_str("sha256:");
+    for byte in digest {
+        write!(&mut key, "{byte:02x}").expect("writing hex to a String cannot fail");
+    }
+    Some(key)
+}
+
+fn helm_numeric_component(component: &str) -> Option<u64> {
+    if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    component.parse().ok()
+}
+
 /// RubyGems' identity for one version number.
 ///
 /// `Gem::Version` compares typed numeric/text segments, not the publisher's raw
@@ -893,6 +958,59 @@ mod tests {
                 "{invalid:?} parsed as Cargo SemVer"
             );
         }
+    }
+
+    #[test]
+    fn helm_identity_matches_masterminds_new_version() {
+        for spelling in [
+            "1",
+            "1.0",
+            "1.0.0",
+            "v1.0.0",
+            "01.000.000+build.one",
+            "1.0.0+build.two",
+        ] {
+            assert_eq!(helm_version_key(spelling).as_deref(), Some("1.0.0"));
+        }
+        assert_eq!(
+            helm_version_key("v2.3-rc.1+linux").as_deref(),
+            Some("2.3.0-rc.1")
+        );
+        assert_ne!(
+            helm_version_key("2.3.0-rc.1"),
+            helm_version_key("2.3.0-rc.2")
+        );
+    }
+
+    #[test]
+    fn invalid_helm_spelling_has_no_protocol_identity_key() {
+        for invalid in [
+            "",
+            "V1.2.3",
+            "1.2.3.4",
+            "1.0.0-01",
+            "1.0.0+",
+            " 1.0.0",
+            "legacy row",
+            "١.٠.٠",
+        ] {
+            assert!(
+                helm_version_key(invalid).is_none(),
+                "{invalid:?} parsed as Helm SemVer"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_helm_identity_is_stably_compressed() {
+        let first_spelling = format!("1.0.0-{}", "a".repeat(250));
+        let second_spelling = format!("1.0.0-{}b", "a".repeat(249));
+        let first = helm_version_key(&first_spelling).unwrap();
+        assert_eq!(first, helm_version_key(&first_spelling).unwrap());
+        assert!(first.starts_with("sha256:"), "{first}");
+        assert_eq!(first.len(), 71);
+        assert_ne!(first, helm_version_key(&second_spelling).unwrap());
+        assert!(helm_version_key(&format!("1.0.0-{}", "a".repeat(251))).is_none());
     }
 
     #[test]

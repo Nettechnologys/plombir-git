@@ -164,6 +164,48 @@ async fn a_chart_whose_manifest_does_not_parse_is_refused_and_stores_nothing() {
     );
 }
 
+/// Helm models `Metadata.Version` as a string and validates that string with
+/// Masterminds/semver. Query coordinates must not let a non-Helm chart bypass
+/// either half of that contract.
+#[tokio::test]
+async fn a_chart_version_must_be_a_string_and_valid_helm_semver() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (filename, chart_yaml, expected_error) in [
+        (
+            "numeric-1.0.tgz",
+            b"apiVersion: v2\nname: numeric\nversion: 1.0\n".as_slice(),
+            "must be a string",
+        ),
+        (
+            "invalid.tgz",
+            b"apiVersion: v2\nname: invalid\nversion: legacy-row\n".as_slice(),
+            "valid Helm semantic version",
+        ),
+    ] {
+        let response = fixture
+            .publish(
+                "helm",
+                filename,
+                tar_gz(&[("chart/Chart.yaml", chart_yaml)]),
+                Some(("query-cannot-bypass", "1.0.0")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{filename}");
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            body.contains(expected_error),
+            "{filename} hid the Chart.yaml version error: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{filename} left a live package version behind"
+        );
+    }
+}
+
 /// The other ending of the same defect: with no query params the caller used to
 /// be told the name was missing. It was not missing — it was unreadable, and
 /// the answer has to say which.

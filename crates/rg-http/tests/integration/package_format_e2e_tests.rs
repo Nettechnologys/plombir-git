@@ -112,6 +112,13 @@ fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
     gzip(&tar_archive(files))
 }
 
+fn helm_chart(name: &str, version: &str, description: &str) -> Vec<u8> {
+    let chart_yaml =
+        format!("apiVersion: v2\nname: {name}\nversion: {version:?}\ndescription: {description}\n");
+    let path = format!("{name}/Chart.yaml");
+    tar_gz(&[(path.as_str(), chart_yaml.as_bytes())])
+}
+
 /// The exact body `cargo publish` sends to `PUT {api}/api/v1/crates/new`.
 fn cargo_publish_frame(name: &str, version: &str) -> Vec<u8> {
     let manifest = format!("[package]\nname = {name:?}\nversion = {version:?}\n");
@@ -4640,6 +4647,95 @@ async fn equivalent_cargo_build_metadata_is_a_conflict_without_a_second_row() {
         .filter(|line| !line.is_empty())
         .count();
     assert_eq!(lines, 1, "the sparse index exposed two resolver-equal rows");
+}
+
+/// Helm compares versions through Masterminds/semver and ignores build
+/// metadata, so two such spellings must not become two index entries.
+#[tokio::test]
+async fn equivalent_helm_build_metadata_is_a_conflict_without_a_second_row() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "helm-identity", "helm-identity@example.com").await;
+    create_repo(&base, &token, "helm-registry").await;
+    let client = reqwest::Client::new();
+    let publish_url =
+        format!("{base}/api/v1/repos/helm-identity/helm-registry/packages/helm/publish");
+
+    let publish = |version: &str, marker: &str, token: &str| {
+        client
+            .post(&publish_url)
+            .bearer_auth(token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"matrix-build-meta-{version}.tgz\""),
+            )
+            .body(helm_chart("matrix-build-meta", version, marker))
+    };
+
+    let first = publish("1.0.0+b", "first chart", &token)
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+
+    let equivalent = publish("1.0.0+a", "conflicting chart", &token)
+        .send()
+        .await
+        .unwrap();
+    let equivalent_status = equivalent.status();
+    let equivalent_body = equivalent.text().await.unwrap();
+    assert_eq!(
+        equivalent_status,
+        StatusCode::CONFLICT,
+        "equivalent Helm version was accepted: {equivalent_body}"
+    );
+
+    let repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "helm-identity", "helm-registry")
+            .await
+            .unwrap()
+            .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "helm")
+        .await
+        .unwrap()
+        .unwrap();
+    let package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "matrix-build-meta")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.len(),
+        1,
+        "equivalent spelling created a second row"
+    );
+    assert_eq!(versions[0].version, "1.0.0+b");
+    assert_eq!(versions[0].protocol_version_key.as_deref(), Some("1.0.0"));
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, versions[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "the refused publish created a file row");
+
+    let index = client
+        .get(format!(
+            "{base}/api/v1/repos/helm-identity/helm-registry/packages/helm/index.yaml"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let index: serde_yaml::Value = serde_yaml::from_str(&index).unwrap();
+    let entries = index["entries"]["matrix-build-meta"]
+        .as_sequence()
+        .expect("published chart entries");
+    assert_eq!(entries.len(), 1, "the Helm index exposed two equal rows");
+    assert_eq!(entries[0]["version"].as_str(), Some("1.0.0+b"));
 }
 
 /// `gem push` reaches the registry at the URL it derives from `--host`, and
