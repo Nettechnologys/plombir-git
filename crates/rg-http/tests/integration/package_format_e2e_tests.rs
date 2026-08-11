@@ -1409,6 +1409,184 @@ async fn nuget_search_reads_the_semver_level_out_of_dependency_ranges_too() {
     assert_eq!(still_served["totalHits"], 4, "{still_served}");
 }
 
+/// Both discovery surfaces advertise `skip`/`take`, so both owe the client the
+/// page it asked for. Serving the whole match set under a truthful `totalHits`
+/// is the failure that hides: page 2 repeats page 1 and nothing in the answer
+/// says so, while a large registry pays to serialize every hit on every request
+/// (card_257cedb0374d).
+#[tokio::test]
+async fn nuget_search_and_autocomplete_serve_the_page_skip_and_take_asked_for() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let ids = [
+        "Matrix.Page.A",
+        "Matrix.Page.B",
+        "Matrix.Page.C",
+        "Matrix.Page.D",
+        "Matrix.Page.E",
+    ];
+    for id in ids {
+        publish_nuget_version(&client, &base, &token, id, "1.0.0").await;
+    }
+    // One id with several versions, so the `?id=` form of autocomplete pages a
+    // different sequence than the `?q=` form does.
+    for version in ["1.0.0", "2.0.0", "3.0.0", "4.0.0", "5.0.0"] {
+        publish_nuget_version(&client, &base, &token, "Matrix.Page.Many", version).await;
+    }
+
+    // Walking the pages of SearchQueryService yields every hit exactly once, and
+    // the union is what `totalHits` promised.
+    let mut seen: Vec<String> = Vec::new();
+    let mut skip = 0usize;
+    let mut total_hits = None;
+    loop {
+        let page = search_nuget(
+            &client,
+            &base,
+            &[
+                ("q", "Matrix.Page."),
+                ("skip", &skip.to_string()),
+                ("take", "2"),
+            ],
+        )
+        .await;
+        let stated = page["totalHits"].as_u64().unwrap();
+        assert_eq!(
+            *total_hits.get_or_insert(stated),
+            stated,
+            "totalHits must describe the whole match set on every page: {page}"
+        );
+        let rows = page["data"].as_array().unwrap();
+        assert!(rows.len() <= 2, "take was not honoured: {page}");
+        if rows.is_empty() {
+            break;
+        }
+        skip += rows.len();
+        seen.extend(
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap().to_string()),
+        );
+    }
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "an id landed on two pages: {seen:?}"
+    );
+    assert_eq!(seen.len() as u64, total_hits.unwrap(), "{seen:?}");
+    assert_eq!(
+        unique,
+        [
+            "Matrix.Page.A",
+            "Matrix.Page.B",
+            "Matrix.Page.C",
+            "Matrix.Page.D",
+            "Matrix.Page.E",
+            "Matrix.Page.Many"
+        ]
+    );
+
+    // The same holds for autocomplete's id completion...
+    let mut seen: Vec<String> = Vec::new();
+    let mut skip = 0usize;
+    loop {
+        let page = autocomplete_nuget(
+            &client,
+            &base,
+            &[
+                ("q", "Matrix.Page."),
+                ("skip", &skip.to_string()),
+                ("take", "2"),
+            ],
+        )
+        .await;
+        assert_eq!(page["totalHits"], 6, "{page}");
+        let names = nuget_autocomplete_names(&page);
+        assert!(names.len() <= 2, "take was not honoured: {page}");
+        if names.is_empty() {
+            break;
+        }
+        skip += names.len();
+        seen.extend(names.into_iter().map(str::to_string));
+    }
+    assert_eq!(
+        seen,
+        [
+            "Matrix.Page.A",
+            "Matrix.Page.B",
+            "Matrix.Page.C",
+            "Matrix.Page.D",
+            "Matrix.Page.E",
+            "Matrix.Page.Many"
+        ],
+        "walking every page must return each id once, in a stable order"
+    );
+
+    // ...and for its version completion, which pages a different sequence
+    // through the same parameters.
+    let versions_page = autocomplete_nuget(
+        &client,
+        &base,
+        &[("id", "Matrix.Page.Many"), ("skip", "2"), ("take", "2")],
+    )
+    .await;
+    assert_eq!(versions_page["totalHits"], 5, "{versions_page}");
+    assert_eq!(
+        nuget_autocomplete_names(&versions_page),
+        ["3.0.0", "4.0.0"],
+        "{versions_page}"
+    );
+
+    // A window past the end is an empty page under the true count, not a wrap
+    // back to the first rows.
+    let past_end = search_nuget(
+        &client,
+        &base,
+        &[("q", "Matrix.Page."), ("skip", "99"), ("take", "2")],
+    )
+    .await;
+    assert_eq!(past_end["totalHits"], 6, "{past_end}");
+    assert!(
+        past_end["data"].as_array().unwrap().is_empty(),
+        "{past_end}"
+    );
+
+    // A zero-width window is empty — the count still answers "how many?".
+    let none_taken =
+        autocomplete_nuget(&client, &base, &[("q", "Matrix.Page."), ("take", "0")]).await;
+    assert_eq!(none_taken["totalHits"], 6, "{none_taken}");
+    assert!(
+        nuget_autocomplete_names(&none_taken).is_empty(),
+        "{none_taken}"
+    );
+
+    // An oversized ask is clamped to the ceiling rather than refused; below the
+    // ceiling it is simply the whole match set.
+    let oversized =
+        search_nuget(&client, &base, &[("q", "Matrix.Page."), ("take", "100000")]).await;
+    assert_eq!(
+        oversized["data"].as_array().unwrap().len(),
+        6,
+        "{oversized}"
+    );
+
+    // A negative page parameter never reaches the handler: it does not parse as
+    // a count, so the request is refused instead of being read as "everything".
+    let mut negative = package_url(&base, &["nuget", "query"]);
+    negative
+        .query_pairs_mut()
+        .extend_pairs([("q", "Matrix.Page."), ("take", "-1")]);
+    assert_eq!(
+        client.get(negative).send().await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
 /// Maven's metadata model calls the last publication `latest`, while `release`
 /// is the last non-snapshot publication. It also requires a compact UTC update
 /// timestamp, not the service's RFC 3339 representation.

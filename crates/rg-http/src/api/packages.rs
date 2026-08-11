@@ -3510,8 +3510,13 @@ pub async fn nuget_search(
         }
     }
 
+    // `totalHits` counts the whole match set; `data` carries the one window the
+    // client paged to. Both are cut from this same filtered sequence, which is
+    // ordered by package name — a total order, so walking the pages visits every
+    // hit exactly once.
     let total_hits = results.len();
-    let json = rg_core::package_registry::build_search_results(&results, total_hits);
+    let page = rg_core::package_registry::nuget_page(results, params.skip, params.take);
+    let json = rg_core::package_registry::build_search_results(&page, total_hits);
 
     (
         StatusCode::OK,
@@ -3791,8 +3796,13 @@ pub async fn nuget_autocomplete(
         }
     };
 
+    // One paging step for both request forms: whichever question was asked, the
+    // count describes the whole answer and `data` carries the window of it the
+    // client paged to. Ids arrive ordered by name and versions in version order,
+    // so either sequence can be walked page by page without repeats.
     let total_hits = data.len();
-    let json = rg_core::package_registry::build_autocomplete_results(&data, total_hits);
+    let page = rg_core::package_registry::nuget_page(data, params.skip, params.take);
+    let json = rg_core::package_registry::build_autocomplete_results(&page, total_hits);
 
     (
         StatusCode::OK,

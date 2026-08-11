@@ -443,6 +443,53 @@ pub fn build_autocomplete_results(names: &[String], total_hits: usize) -> serde_
     })
 }
 
+/// How many hits a NuGet discovery request gets when it does not say.
+///
+/// Same page size the rest of the API defaults to
+/// (`rg_http::pagination::DEFAULT_PER_PAGE`), and the size NuGet clients
+/// themselves ask for when they page a search.
+pub const NUGET_DEFAULT_TAKE: usize = 20;
+
+/// The largest page a NuGet discovery request can ask for.
+///
+/// Mirrors the workspace-wide `MAX_PER_PAGE`: a client is never handed more rows
+/// per request than any other list endpoint would give it. Clamping is safe to
+/// do silently here because `totalHits` still reports the whole match set, so a
+/// client that wanted more knows there is more and can ask for the next window.
+pub const NUGET_MAX_TAKE: usize = 100;
+
+/// Cut the one window of a NuGet discovery answer the client asked for.
+///
+/// `SearchQueryService` and `SearchAutocompleteService` both page with
+/// `skip`/`take` over the whole match set: `totalHits` counts every hit, `data`
+/// carries one window of it. Serving the full set under a truthful `totalHits`
+/// looks right to a client that never paginates and is wrong for every client
+/// that does — `skip=20` repeats the rows `skip=0` already returned, and no
+/// answer says so (card_257cedb0374d).
+///
+/// The window is cut exactly once, over the fully filtered sequence, so the
+/// count and the page are built from the same predicate. Policy on the two
+/// degenerate asks:
+///
+/// * `take` absent → [`NUGET_DEFAULT_TAKE`]; `take` above the ceiling →
+///   [`NUGET_MAX_TAKE`]. A negative or non-numeric value never reaches here:
+///   the parameter deserializes as `usize`, so the request is rejected with a
+///   `400` before the handler runs.
+/// * `take=0` → an empty page under the real `totalHits`. A zero-width window is
+///   empty, and answering it that way lets a client count the match set without
+///   transferring it. Clamping it up to one row instead would answer a question
+///   nobody asked.
+/// * `skip` past the end → an empty page, the same answer any past-the-end page
+///   gets elsewhere in the API.
+pub fn nuget_page<T>(items: Vec<T>, skip: Option<usize>, take: Option<usize>) -> Vec<T> {
+    let take = take.unwrap_or(NUGET_DEFAULT_TAKE).min(NUGET_MAX_TAKE);
+    items
+        .into_iter()
+        .skip(skip.unwrap_or(0))
+        .take(take)
+        .collect()
+}
+
 /// Build the NuGet Service Index JSON response.
 ///
 /// This advertises all available NuGet API resources for the repository.
@@ -1776,6 +1823,44 @@ mod tests {
                 },
             ])
         );
+    }
+
+    /// The `skip`/`take` window both discovery surfaces cut, including what the
+    /// two degenerate asks mean: a `take` of zero is an empty page, not a full
+    /// one, and a `take` above the ceiling is clamped rather than honoured.
+    #[test]
+    fn nuget_page_cuts_one_window_of_the_match_set() {
+        let ids = || (0..250).map(|n| format!("Pkg.{n:03}")).collect::<Vec<_>>();
+
+        // A request that says nothing gets the default page, not everything.
+        let first = nuget_page(ids(), None, None);
+        assert_eq!(first.len(), NUGET_DEFAULT_TAKE);
+        assert_eq!(first[0], "Pkg.000");
+
+        // Walking the pages visits every id exactly once.
+        let mut walked = Vec::new();
+        let mut skip = 0;
+        loop {
+            let page = nuget_page(ids(), Some(skip), Some(30));
+            if page.is_empty() {
+                break;
+            }
+            skip += page.len();
+            walked.extend(page);
+        }
+        assert_eq!(walked, ids(), "no id repeated and none skipped");
+
+        // A window that runs off the end stops at the end rather than wrapping.
+        assert_eq!(nuget_page(ids(), Some(240), Some(30)).len(), 10);
+        assert!(nuget_page(ids(), Some(250), Some(30)).is_empty());
+        assert!(nuget_page(ids(), Some(usize::MAX), None).is_empty());
+
+        // `take=0` is a zero-width window: the count still describes the whole
+        // match set, the page carries none of it.
+        assert!(nuget_page(ids(), None, Some(0)).is_empty());
+
+        // An oversized ask is clamped, not honoured.
+        assert_eq!(nuget_page(ids(), None, Some(10_000)).len(), NUGET_MAX_TAKE);
     }
 
     /// Search states the same full normalized version a catalog entry does —
