@@ -997,6 +997,33 @@ fn required_twine_field(value: Option<String>, field: &str) -> Result<String, Ap
         .ok_or_else(|| AppError::bad_request(format!("Twine upload is missing `{field}`")))
 }
 
+fn package_multipart_error(
+    error: axum::extract::multipart::MultipartError,
+    context: &str,
+) -> AppError {
+    if crate::body_limit::is_length_limit_error(&error) {
+        AppError::payload_too_large(format!(
+            "{context}: package upload exceeds the configured request-body limit"
+        ))
+    } else {
+        AppError::bad_request(format!("{context}: {error}"))
+    }
+}
+
+async fn decode_twine_text_field(
+    field: axum::extract::multipart::Field<'_>,
+    field_name: &str,
+) -> Result<String, AppError> {
+    let bytes = field.bytes().await.map_err(|error| {
+        package_multipart_error(error, &format!("cannot read Twine `{field_name}` field"))
+    })?;
+    String::from_utf8(bytes.to_vec()).map_err(|error| {
+        AppError::bad_request(format!(
+            "Twine `{field_name}` field is not valid UTF-8: {error}"
+        ))
+    })
+}
+
 /// Decode the multipart form emitted by `twine upload`.
 ///
 /// Twine sends many descriptive metadata fields as well; the package adapter
@@ -1017,7 +1044,7 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|error| AppError::bad_request(format!("invalid Twine multipart body: {error}")))?
+        .map_err(|error| package_multipart_error(error, "invalid Twine multipart body"))?
     {
         let Some(field_name) = field.name().map(str::to_owned) else {
             continue;
@@ -1032,7 +1059,7 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
                         AppError::bad_request("Twine `content` field has no filename")
                     })?;
                 let content = field.bytes().await.map_err(|error| {
-                    AppError::bad_request(format!("cannot read Twine `content` field: {error}"))
+                    package_multipart_error(error, "cannot read Twine `content` field")
                 })?;
                 set_twine_field(&mut upload.filename, "content", filename)?;
                 set_twine_field(&mut upload.content, "content", content)?;
@@ -1044,11 +1071,7 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
             }
             ":action" | "protocol_version" | "name" | "version" | "sha256_digest"
             | "attestations" => {
-                let value = field.text().await.map_err(|error| {
-                    AppError::bad_request(format!(
-                        "Twine `{field_name}` field is not valid text: {error}"
-                    ))
-                })?;
+                let value = decode_twine_text_field(field, &field_name).await?;
                 let slot = match field_name.as_str() {
                     ":action" => &mut upload.action,
                     "protocol_version" => &mut upload.protocol_version,
@@ -1209,7 +1232,7 @@ async fn decode_nuget_push(mut multipart: Multipart) -> Result<axum::body::Bytes
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|error| AppError::bad_request(format!("invalid NuGet multipart body: {error}")))?
+        .map_err(|error| package_multipart_error(error, "invalid NuGet multipart body"))?
     {
         if field.name() != Some("package") {
             continue;
@@ -1220,11 +1243,210 @@ async fn decode_nuget_push(mut multipart: Multipart) -> Result<axum::body::Bytes
             ));
         }
         package = Some(field.bytes().await.map_err(|error| {
-            AppError::bad_request(format!("cannot read NuGet `package` field: {error}"))
+            package_multipart_error(error, "cannot read NuGet `package` field")
         })?);
     }
 
     package.ok_or_else(|| AppError::bad_request("NuGet upload is missing `package`"))
+}
+
+#[cfg(test)]
+mod package_multipart_error_tests {
+    use super::*;
+    use axum::{
+        extract::DefaultBodyLimit,
+        http::{Method, Request},
+        routing::post,
+        Router,
+    };
+    use std::convert::Infallible;
+    use tower::ServiceExt as _;
+    use tower_http::limit::RequestBodyLimitLayer;
+
+    const BOUNDARY: &str = "forgekeep-package-boundary";
+
+    async fn twine_status(multipart: Multipart) -> axum::response::Response {
+        match decode_twine_upload(multipart).await {
+            Ok(_) => StatusCode::OK.into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    async fn nuget_status(multipart: Multipart) -> axum::response::Response {
+        match decode_nuget_push(multipart).await {
+            Ok(_) => StatusCode::OK.into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    fn multipart_part(name: &str, value: &[u8], filename: Option<&str>) -> Vec<u8> {
+        let mut body =
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"").into_bytes();
+        if let Some(filename) = filename {
+            body.extend_from_slice(format!("; filename=\"{filename}\"").as_bytes());
+        }
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(value);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    fn unknown_length_body(body: Vec<u8>, first_chunk_len: usize) -> Body {
+        assert!(first_chunk_len < body.len());
+        let first = axum::body::Bytes::copy_from_slice(&body[..first_chunk_len]);
+        let second = axum::body::Bytes::copy_from_slice(&body[first_chunk_len..]);
+        Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(first),
+            Ok::<_, Infallible>(second),
+        ]))
+    }
+
+    async fn request_outcome(
+        handler: axum::routing::MethodRouter,
+        body: Body,
+        transport_limit: usize,
+    ) -> (StatusCode, String) {
+        request_outcome_with_content_type(
+            handler,
+            body,
+            transport_limit,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .await
+    }
+
+    async fn request_outcome_with_content_type(
+        handler: axum::routing::MethodRouter,
+        body: Body,
+        transport_limit: usize,
+        content_type: String,
+    ) -> (StatusCode, String) {
+        let app = Router::new()
+            .route("/", handler)
+            .layer(DefaultBodyLimit::max(transport_limit))
+            .layer(RequestBodyLimitLayer::new(transport_limit));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn split_inside_value(body: &[u8]) -> usize {
+        body.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("multipart field header terminator")
+            + 5
+    }
+
+    #[tokio::test]
+    async fn unknown_length_twine_text_overflow_is_413() {
+        let body = multipart_part(":action", b"file_upload", None);
+        let transport_limit = split_inside_value(&body);
+
+        let (status, response_body) = request_outcome(
+            post(twine_status),
+            unknown_length_body(body, transport_limit),
+            transport_limit,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{response_body}");
+        assert!(response_body.contains("configured request-body limit"));
+    }
+
+    #[tokio::test]
+    async fn unknown_length_nuget_package_overflow_is_413() {
+        let body = multipart_part("package", b"not-a-complete-nupkg", Some("package.nupkg"));
+        let transport_limit = split_inside_value(&body);
+
+        let (status, response_body) = request_outcome(
+            post(nuget_status),
+            unknown_length_body(body, transport_limit),
+            transport_limit,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{response_body}");
+        assert!(response_body.contains("configured request-body limit"));
+    }
+
+    #[tokio::test]
+    async fn unknown_length_next_field_overflow_is_413_for_both_protocols() {
+        let head = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"ignored\"\r\n\r\npartial"
+        )
+        .into_bytes();
+        let tail = format!("-field\r\n--{BOUNDARY}--\r\n").into_bytes();
+        let transport_limit = head.len() + 1;
+        let mut body = head;
+        body.extend_from_slice(&tail);
+
+        let twine = request_outcome(
+            post(twine_status),
+            unknown_length_body(body.clone(), transport_limit),
+            transport_limit,
+        )
+        .await;
+        let nuget = request_outcome(
+            post(nuget_status),
+            unknown_length_body(body, transport_limit),
+            transport_limit,
+        )
+        .await;
+
+        assert_eq!(twine.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", twine.1);
+        assert_eq!(nuget.0, StatusCode::PAYLOAD_TOO_LARGE, "{}", nuget.1);
+        assert!(twine.1.contains("configured request-body limit"));
+        assert!(nuget.1.contains("configured request-body limit"));
+    }
+
+    #[tokio::test]
+    async fn malformed_utf8_and_ordinary_io_failures_stay_400() {
+        assert_eq!(
+            request_outcome_with_content_type(
+                post(twine_status),
+                Body::empty(),
+                1024,
+                "multipart/form-data".to_string(),
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let invalid_utf8 = multipart_part(":action", &[0xff], None);
+        assert_eq!(
+            request_outcome(post(twine_status), Body::from(invalid_utf8), 1024)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let partial = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"package\"; \
+             filename=\"package.nupkg\"\r\n\r\npartial"
+        );
+        let failed = Body::from_stream(futures::stream::iter([
+            Ok(axum::body::Bytes::from(partial)),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+        assert_eq!(
+            request_outcome(post(nuget_status), failed, 1024).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }
 
 /// POST/PUT /api/v1/repos/{owner}/{name}/packages/nuget/publish
