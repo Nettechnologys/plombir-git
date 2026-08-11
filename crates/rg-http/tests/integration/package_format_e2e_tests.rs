@@ -2623,6 +2623,119 @@ async fn npm_put_packument_publishes_normal_and_scoped_tarballs() {
     }
 }
 
+/// A hand-built packument can bypass npm's package.json cleaner, but it must
+/// not bypass node-semver identity. Both raw keys below resolve as `1.0.0`;
+/// accepting the second would make one packument advertise two names for one
+/// resolver version and two immutable tarballs for that identity.
+#[tokio::test]
+async fn npm_packument_rejects_node_semver_alias_without_a_second_version() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(
+        &base,
+        "npm-identity-owner",
+        "npm-identity-owner@example.com",
+    )
+    .await;
+    create_repo(&base, &token, "npm-identity-repo").await;
+    let client = reqwest::Client::new();
+    let name = "matrix-npm-identity";
+    let publish_url = format!(
+        "{}/api/v1/repos/npm-identity-owner/npm-identity-repo/packages/npm/{name}",
+        base.trim_end_matches('/')
+    );
+    let packument = |version: &str, marker: &str| {
+        let manifest =
+            format!(r#"{{"name":{name:?},"version":{version:?},"description":{marker:?}}}"#);
+        let tarball = tar_gz(&[("package/package.json", manifest.as_bytes())]);
+        let attachment_name = format!("{name}-{version}.tgz");
+        serde_json::json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "description": marker
+                }
+            },
+            "_attachments": {
+                attachment_name: {
+                    "content_type": "application/octet-stream",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                    "length": tarball.len()
+                }
+            }
+        })
+    };
+
+    let first = client
+        .put(&publish_url)
+        .bearer_auth(&token)
+        .json(&packument("1.0.0", "first tarball"))
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+
+    let alias = client
+        .put(&publish_url)
+        .bearer_auth(&token)
+        .json(&packument("1.0.0+build.7", "conflicting tarball"))
+        .send()
+        .await
+        .unwrap();
+    let alias_status = alias.status();
+    let alias_body = alias.text().await.unwrap();
+    assert_eq!(
+        alias_status,
+        StatusCode::CONFLICT,
+        "node-semver alias was accepted: {alias_body}"
+    );
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(
+        &db,
+        "npm-identity-owner",
+        "npm-identity-repo",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "npm")
+        .await
+        .unwrap()
+        .unwrap();
+    let package = rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, name)
+        .await
+        .unwrap()
+        .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 1, "alias created a second version row");
+    assert_eq!(versions[0].version, "1.0.0");
+    assert_eq!(versions[0].protocol_version_key.as_deref(), Some("1.0.0"));
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, versions[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "refused alias created a file row");
+
+    let document: serde_json::Value = client
+        .get(&publish_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let version_keys = document["versions"].as_object().expect("npm versions map");
+    assert_eq!(version_keys.len(), 1, "packument exposed a semver alias");
+    assert!(version_keys.contains_key("1.0.0"), "{document}");
+    assert_eq!(document["dist-tags"]["latest"], "1.0.0");
+}
+
 /// npm publishes provenance as a second raw-JSON attachment. The registry must
 /// keep it atomically with the tarball, advertise npm's standard discovery URL,
 /// and reject a DSSE statement whose SHA-512 names different bytes.

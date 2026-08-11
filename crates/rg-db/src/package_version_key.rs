@@ -195,6 +195,80 @@ fn composer_numeric_branch_regex() -> &'static Regex {
     })
 }
 
+/// npm's resolver identity for one version spelling.
+///
+/// `normalize-package-data` runs `node-semver`'s `valid` and `clean` functions
+/// in loose mode before `npm publish` builds its packument. That accepts the
+/// historical `v` / `=` prefixes, leading zeroes and a prerelease without the
+/// separating dash, then publishes the cleaned `.version`. The latter excludes
+/// build metadata entirely. Reproduce that identity here because the HTTP
+/// endpoint also accepts hand-built packuments which never passed through the
+/// client normalizer.
+pub fn npm_version_key(value: &str) -> Option<String> {
+    const NODE_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    // node-semver rejects a raw input longer than 256 JavaScript UTF-16 code
+    // units. Its `\s` prefix accepts Unicode whitespace, so byte length would
+    // incorrectly reject some inputs which the client cleans successfully.
+    if value.encode_utf16().count() > 256 {
+        return None;
+    }
+
+    let captures = npm_loose_version_regex().captures(value.trim())?;
+    let component = |index| {
+        let number = captures.get(index)?.as_str().parse::<u64>().ok()?;
+        (number <= NODE_MAX_SAFE_INTEGER).then_some(number)
+    };
+    let mut key = format!("{}.{}.{}", component(1)?, component(2)?, component(3)?);
+
+    if let Some(prerelease) = captures.get(4) {
+        key.push('-');
+        for (index, identifier) in prerelease.as_str().split('.').enumerate() {
+            if index != 0 {
+                key.push('.');
+            }
+            if identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+                // node-semver numberifies numeric prerelease identifiers only
+                // below MAX_SAFE_INTEGER. Larger identifiers retain their exact
+                // spelling, including leading zeroes.
+                if let Ok(number) = identifier.parse::<u64>() {
+                    if number < NODE_MAX_SAFE_INTEGER {
+                        write!(&mut key, "{number}")
+                            .expect("writing a number to a String cannot fail");
+                        continue;
+                    }
+                }
+            }
+            key.push_str(identifier);
+        }
+    }
+
+    if key.len() <= 255 {
+        return Some(key);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"npm\0");
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let mut compressed = String::with_capacity(71);
+    compressed.push_str("sha256:");
+    for byte in digest {
+        write!(&mut compressed, "{byte:02x}").expect("writing hex to a String cannot fail");
+    }
+    Some(compressed)
+}
+
+fn npm_loose_version_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"^[v=\s]*(\d+)\.(\d+)\.(\d+)(?:-?((?:\d*[A-Za-z-][A-Za-z0-9-]*|\d+)(?:\.(?:\d*[A-Za-z-][A-Za-z0-9-]*|\d+))*))?(?:\+(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*))?$",
+        )
+        .expect("valid regex")
+    })
+}
+
 /// Cargo's SemVer identity for one crate version.
 ///
 /// Cargo requires strict SemVer spellings, but build metadata is excluded from
@@ -1028,6 +1102,43 @@ fn parse_pep440_local(local: &str) -> Option<Vec<Pep440LocalSegment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npm_identity_matches_node_semver_loose_clean() {
+        for (raw, normalized) in [
+            ("1.0.0", "1.0.0"),
+            ("1.0.0+Build.7", "1.0.0"),
+            ("v1.0.0", "1.0.0"),
+            ("=01.002.0003", "1.2.3"),
+            (" 1.0.0 ", "1.0.0"),
+            ("\u{a0}1.0.0\u{a0}", "1.0.0"),
+            ("1.0.0-rc.01", "1.0.0-rc.1"),
+            ("1.0.0alpha1+Build.7", "1.0.0-alpha1"),
+            ("1.0.0-", "1.0.0--"),
+            ("1.0.0-09007199254740991", "1.0.0-09007199254740991"),
+        ] {
+            assert_eq!(npm_version_key(raw).as_deref(), Some(normalized), "{raw}");
+        }
+    }
+
+    #[test]
+    fn invalid_node_semver_spelling_has_no_protocol_identity_key() {
+        for invalid in [
+            "",
+            "1",
+            "1.2",
+            "V1.0.0",
+            "1.0.0+",
+            "1.0.0+build!",
+            "9007199254740992.0.0",
+            "١.٠.٠",
+        ] {
+            assert!(
+                npm_version_key(invalid).is_none(),
+                "{invalid:?} parsed as an npm version"
+            );
+        }
+    }
 
     #[test]
     fn composer_identity_matches_version_parser_normalize() {

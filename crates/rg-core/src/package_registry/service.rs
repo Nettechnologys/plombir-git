@@ -5,8 +5,8 @@
 
 use anyhow::Context as _;
 use rg_db::package_version_key::{
-    cargo_version_key, composer_version_key, helm_version_key, rubygems_platform_from_metadata,
-    rubygems_version_key, NuGetVersion, Pep440Version,
+    cargo_version_key, composer_version_key, helm_version_key, npm_version_key,
+    rubygems_platform_from_metadata, rubygems_version_key, NuGetVersion, Pep440Version,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
@@ -183,6 +183,8 @@ pub struct FileDetail {
 /// but excludes build metadata from precedence and requirement matching.
 /// Helm accepts Masterminds/semver's coerced core spellings and likewise
 /// excludes build metadata from comparison.
+/// npm cleans loose historical spellings and omits build metadata from the
+/// `.version` its resolver consumes.
 /// Composer uses its own four-component `VersionParser::normalize` grammar,
 /// which also accepts a leading `v`, named stability suffixes and dev branches.
 /// RubyGems compares canonical numeric/text segments and scopes that identity
@@ -202,6 +204,7 @@ pub fn protocol_version_key(
         package_types::CARGO => cargo_version_key(version),
         package_types::COMPOSER => composer_version_key(version),
         package_types::HELM => helm_version_key(version),
+        package_types::NPM => npm_version_key(version),
         package_types::NUGET => NuGetVersion::parse(version).map(|parsed| parsed.normalized()),
         package_types::PYPI => Pep440Version::parse(version).map(|parsed| parsed.canonical()),
         package_types::RUBYGEMS => rubygems_version_key(version, protocol_variant_key),

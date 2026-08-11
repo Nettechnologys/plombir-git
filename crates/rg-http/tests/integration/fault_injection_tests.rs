@@ -1182,6 +1182,26 @@ fn nuget_package(package: &str, version: &str, marker: &str) -> Vec<u8> {
     output.into_inner()
 }
 
+fn npm_package(package: &str, version: &str, marker: &str) -> Vec<u8> {
+    let manifest =
+        format!(r#"{{"name":{package:?},"version":{version:?},"description":{marker:?}}}"#);
+    let mut tar_bytes = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut tar_bytes);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        archive.append(&header, manifest.as_bytes()).unwrap();
+        archive.finish().unwrap();
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
 fn cargo_package(package: &str, version: &str, marker: &str) -> Vec<u8> {
     let manifest =
         format!("[package]\nname = {package:?}\nversion = {version:?}\ndescription = {marker:?}\n");
@@ -1398,6 +1418,100 @@ async fn concurrent_new_version_publish_keeps_the_winners_file() {
         .unwrap();
     assert_eq!(downloaded.status(), reqwest::StatusCode::OK);
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), winner_bytes);
+}
+
+/// npm aliases are protected by the shared protocol-key UNIQUE claim. The
+/// generic tarball endpoint is deliberate here: unlike the real packument
+/// endpoint it lets both aliases use one storage filename, so the gate can
+/// prove that both requests passed the absent-version read before either row
+/// was inserted.
+#[tokio::test]
+async fn concurrent_equivalent_npm_publishes_leave_one_version_and_file() {
+    let (base, db, gate) = spawn_test_app_with_two_put_gate("race.tgz").await;
+    let (token, _) = register_full(&base, "npm_race", "npm_race@example.com").await;
+    create_repo(&base, &token, "racing-publishes").await;
+    let client = reqwest::Client::new();
+    let publish_url = format!("{base}/api/v1/repos/npm_race/racing-publishes/packages/npm/publish");
+
+    let seed = client
+        .post(&publish_url)
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"seed.tgz\"",
+        )
+        .body(npm_package("race-npm-identity", "0.9.0", "seed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed.status(), reqwest::StatusCode::CREATED);
+
+    let publish = |version: &'static str, marker: &'static str| {
+        let client = client.clone();
+        let token = token.clone();
+        let publish_url = publish_url.clone();
+        tokio::spawn(async move {
+            client
+                .post(publish_url)
+                .bearer_auth(token)
+                .header(
+                    reqwest::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"race.tgz\"",
+                )
+                .body(npm_package("race-npm-identity", version, marker))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    let mut left = publish("1.0.0+a", "left archive");
+    let mut right = publish("1.0.0+b", "right archive");
+    let (winner, loser) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut left => {
+                let result = result.unwrap();
+                gate.release_second();
+                (result, right.await.unwrap())
+            }
+            result = &mut right => {
+                let result = result.unwrap();
+                gate.release_second();
+                (result, left.await.unwrap())
+            }
+        }
+    })
+    .await
+    .expect("both equivalent npm publishes reached storage and completed");
+
+    assert_eq!(winner.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(loser.status(), reqwest::StatusCode::CONFLICT);
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "npm_race", "racing-publishes")
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "npm")
+        .await
+        .unwrap()
+        .unwrap();
+    let package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "race-npm-identity")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    let published: Vec<_> = versions
+        .iter()
+        .filter(|version| version.protocol_version_key.as_deref() == Some("1.0.0"))
+        .collect();
+    assert_eq!(published.len(), 1, "both equivalent npm rows committed");
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, published[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "the losing npm publish left a file row");
 }
 
 /// NuGet aliases are a database identity, not a read-before-write convention.
