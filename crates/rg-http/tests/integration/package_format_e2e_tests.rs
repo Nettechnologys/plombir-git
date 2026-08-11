@@ -4738,6 +4738,116 @@ async fn equivalent_helm_build_metadata_is_a_conflict_without_a_second_row() {
     assert_eq!(entries[0]["version"].as_str(), Some("1.0.0+b"));
 }
 
+/// Composer's `ArrayLoader` turns these raw spellings into one internal
+/// version. The registry must make that identity explicit and immutable before
+/// the client sees `packages.json`.
+#[tokio::test]
+async fn equivalent_composer_version_is_a_conflict_without_a_second_entry() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) =
+        register_full(&base, "composer-identity", "composer-identity@example.com").await;
+    create_repo(&base, &token, "composer-registry").await;
+    let client = reqwest::Client::new();
+    let publish_url = format!(
+        "{base}/api/v1/repos/composer-identity/composer-registry/packages/composer/publish"
+    );
+
+    let package = |version: &str, marker: &str| {
+        let manifest = format!(
+            r#"{{"name":"vendor/matrix-identity","version":{version:?},"description":{marker:?}}}"#
+        );
+        zip_archive(&[("composer.json", manifest.as_bytes())])
+    };
+    let publish = |version: &str, marker: &str, token: &str| {
+        client
+            .post(&publish_url)
+            .bearer_auth(token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"matrix-identity-{version}.zip\""),
+            )
+            .body(package(version, marker))
+    };
+
+    let first = publish("v1.0.0+build.one", "first archive", &token)
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+
+    let equivalent = publish("1.0", "conflicting archive", &token)
+        .send()
+        .await
+        .unwrap();
+    let equivalent_status = equivalent.status();
+    let equivalent_body = equivalent.text().await.unwrap();
+    assert_eq!(
+        equivalent_status,
+        StatusCode::CONFLICT,
+        "equivalent Composer version was accepted: {equivalent_body}"
+    );
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(
+        &db,
+        "composer-identity",
+        "composer-registry",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let registry =
+        rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "composer")
+            .await
+            .unwrap()
+            .unwrap();
+    let package = rg_db::ops::package_ops::find_by_registry_and_name(
+        &db,
+        registry.id,
+        "vendor/matrix-identity",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.len(),
+        1,
+        "equivalent spelling created a second row"
+    );
+    assert_eq!(versions[0].version, "v1.0.0+build.one");
+    assert_eq!(versions[0].protocol_version_key.as_deref(), Some("1.0.0.0"));
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, versions[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "the refused publish created a file row");
+
+    let document: serde_json::Value = client
+        .get(format!(
+            "{base}/api/v1/repos/composer-identity/composer-registry/packages/composer/packages.json"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = document["packages"]["vendor/matrix-identity"]
+        .as_object()
+        .expect("Composer version map");
+    assert_eq!(
+        entries.len(),
+        1,
+        "packages.json exposed two normalized aliases"
+    );
+    let entry = &entries["v1.0.0+build.one"];
+    assert_eq!(entry["version"], "v1.0.0+build.one");
+    assert_eq!(entry["version_normalized"], "1.0.0.0");
+}
+
 /// `gem push` reaches the registry at the URL it derives from `--host`, and
 /// what it pushed is resolvable and downloadable afterwards.
 ///

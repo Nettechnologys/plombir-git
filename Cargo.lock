@@ -5255,6 +5255,7 @@ dependencies = [
  "chrono",
  "fs2",
  "rand 0.8.6",
+ "regex",
  "sea-orm",
  "sea-orm-migration",
  "semver",

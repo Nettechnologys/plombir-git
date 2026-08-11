@@ -25,6 +25,7 @@ use std::io::{Cursor, Read};
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
 use crate::package_registry::url_path::encode_path_segment;
+use rg_db::package_version_key::composer_version_normalized;
 use serde_json::Value;
 
 pub struct ComposerAdapter;
@@ -270,6 +271,14 @@ pub fn build_packages_json(
         let mut entry = serde_json::Map::new();
         entry.insert("name".into(), package_name.to_string().into());
         entry.insert("version".into(), v.version.clone().into());
+        // `ArrayLoader` otherwise normalizes `version` itself. Publishing the
+        // result of the same parser that owns the DB identity makes the server's
+        // uniqueness claim explicit and prevents client/server drift. Invalid
+        // historical spellings have no verified normal form and keep the old
+        // raw-only entry rather than receiving a fabricated identity.
+        if let Some(normalized) = composer_version_normalized(&v.version) {
+            entry.insert("version_normalized".into(), normalized.into());
+        }
 
         let mut dist = serde_json::Map::new();
         dist.insert("type".into(), "zip".into());
@@ -417,8 +426,36 @@ mod tests {
         .unwrap();
         assert!(json.contains("\"vendor/pkg\""));
         assert!(json.contains("\"1.0.0\""));
+        assert!(json.contains("\"version_normalized\": \"1.0.0.0\""));
         assert!(json.contains("\"zip\""));
         assert!(json.contains("\"abc123\""));
+    }
+
+    #[test]
+    fn an_invalid_legacy_version_keeps_its_raw_index_identity() {
+        let versions = vec![ComposerVersionInfo {
+            version: "legacy row".into(),
+            filename: "legacy.zip".into(),
+            sha256: None,
+            sha1: None,
+            description: None,
+            license: None,
+            package_type: None,
+            metadata: None,
+        }];
+        let json = build_packages_json(
+            "vendor/pkg",
+            &versions,
+            "https://forge.example",
+            "owner",
+            "repo",
+        )
+        .unwrap();
+        let document: Value = serde_json::from_str(&json).unwrap();
+        let entry = &document["packages"]["vendor/pkg"]["legacy row"];
+
+        assert_eq!(entry["version"], "legacy row");
+        assert!(entry.get("version_normalized").is_none(), "entry: {entry}");
     }
 
     /// The `dist` block a version entry carries, as a Composer client reads it.

@@ -6,8 +6,194 @@
 
 use std::cmp::Ordering;
 use std::fmt::Write as _;
+use std::sync::OnceLock;
 
+use regex::{Captures, Regex};
 use sha2::{Digest, Sha256};
+
+/// Composer's client-visible normalized version.
+///
+/// Repository entries without `version_normalized` are passed through
+/// `Composer\\Semver\\VersionParser::normalize` by `ArrayLoader`. Reproduce that
+/// normalizer here so publish-time uniqueness and the value advertised back to
+/// Composer are one decision. This deliberately follows Composer's historical
+/// compatibility grammar rather than strict SemVer: it accepts four numeric
+/// components, named stability suffixes, date versions and numeric dev branches.
+pub fn composer_version_normalized(value: &str) -> Option<String> {
+    let mut version = value.trim().to_string();
+
+    if let Some(captures) = composer_alias_regex().captures(&version) {
+        version = captures.get(1)?.as_str().to_string();
+    }
+    if let Some(stability) = composer_stability_flag_regex().find(&version) {
+        version.truncate(stability.start());
+    }
+
+    if matches!(version.as_str(), "master" | "trunk" | "default") {
+        version.insert_str(0, "dev-");
+    }
+    if version
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("dev-"))
+    {
+        return Some(format!("dev-{}", &version[4..]));
+    }
+
+    if let Some(captures) = composer_build_metadata_regex().captures(&version) {
+        version = captures.get(1)?.as_str().to_string();
+    }
+
+    if let Some(captures) = composer_classical_version_regex().captures(&version) {
+        let mut normalized = captures.get(1)?.as_str().to_string();
+        for component in 2..=4 {
+            normalized.push_str(captures.get(component).map_or(".0", |value| value.as_str()));
+        }
+        return composer_normalized_modifier(normalized, &captures, 5, 6, 7);
+    }
+
+    if let Some(captures) = composer_date_version_regex().captures(&version) {
+        let normalized = captures
+            .get(1)?
+            .as_str()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_digit() {
+                    character
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        return composer_normalized_modifier(normalized, &captures, 2, 3, 4);
+    }
+
+    let captures = composer_dev_suffix_regex().captures(&version)?;
+    let branch = captures.get(1)?.as_str();
+    composer_normalized_branch(branch)
+}
+
+/// Composer's database identity key for one raw version spelling.
+///
+/// The normal form is also what `packages.json.version_normalized` publishes.
+/// A valid but unusually long dev branch is compressed only for the bounded DB
+/// key column; the full normalized value remains available through
+/// [`composer_version_normalized`].
+pub fn composer_version_key(value: &str) -> Option<String> {
+    let normalized = composer_version_normalized(value)?;
+    if normalized.len() <= 255 {
+        return Some(normalized);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"composer\0");
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(71);
+    key.push_str("sha256:");
+    for byte in digest {
+        write!(&mut key, "{byte:02x}").expect("writing hex to a String cannot fail");
+    }
+    Some(key)
+}
+
+fn composer_normalized_modifier(
+    mut normalized: String,
+    captures: &Captures<'_>,
+    stability_index: usize,
+    number_index: usize,
+    dev_index: usize,
+) -> Option<String> {
+    if let Some(stability) = captures.get(stability_index) {
+        let stability = stability.as_str();
+        if stability.eq_ignore_ascii_case("stable") {
+            return Some(normalized);
+        }
+        normalized.push('-');
+        normalized.push_str(match stability.to_ascii_lowercase().as_str() {
+            "a" => "alpha",
+            "b" => "beta",
+            "p" | "pl" => "patch",
+            "rc" => "RC",
+            "alpha" => "alpha",
+            "beta" => "beta",
+            "patch" => "patch",
+            _ => return None,
+        });
+        if let Some(number) = captures.get(number_index) {
+            normalized.push_str(number.as_str().trim_start_matches(['.', '-']));
+        }
+    }
+    if captures.get(dev_index).is_some() {
+        normalized.push_str("-dev");
+    }
+    Some(normalized)
+}
+
+fn composer_normalized_branch(branch: &str) -> Option<String> {
+    let captures = composer_numeric_branch_regex().captures(branch)?;
+    let mut normalized = captures.get(1)?.as_str().to_string();
+    for component in 2..=4 {
+        normalized.push_str(captures.get(component).map_or(".x", |value| value.as_str()));
+    }
+    let mut expanded = String::with_capacity(normalized.len());
+    for character in normalized.chars() {
+        match character {
+            'x' | 'X' | '*' => expanded.push_str("9999999"),
+            _ => expanded.push(character),
+        }
+    }
+    normalized = expanded;
+    normalized.push_str("-dev");
+    Some(normalized)
+}
+
+fn composer_alias_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"^([^,\s]+) +as +([^,\s]+)$").expect("valid regex"))
+}
+
+fn composer_stability_flag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)@(?:stable|RC|beta|alpha|dev)$").expect("valid regex"))
+}
+
+fn composer_build_metadata_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"^([^,\s+]+)\+[^\s]+$").expect("valid regex"))
+}
+
+fn composer_classical_version_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)^v?([0-9]{1,5})(\.[0-9]+)?(\.[0-9]+)?(\.[0-9]+)?[._-]?(?:(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?[0-9]+)*)?)?([.-]?dev)?$",
+        )
+        .expect("valid regex")
+    })
+}
+
+fn composer_date_version_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)^v?([0-9]{4}(?:[.:-]?[0-9]{2}){1,6}(?:[.:-]?[0-9]{1,3}){0,2})[._-]?(?:(stable|beta|b|RC|alpha|a|patch|pl|p)((?:[.-]?[0-9]+)*)?)?([.-]?dev)?$",
+        )
+        .expect("valid regex")
+    })
+}
+
+fn composer_dev_suffix_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)^(.*?)[.-]?dev$").expect("valid regex"))
+}
+
+fn composer_numeric_branch_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)^v?([0-9]+)(\.(?:[0-9]+|[x*]))?(\.(?:[0-9]+|[x*]))?(\.(?:[0-9]+|[x*]))?$")
+            .expect("valid regex")
+    })
+}
 
 /// Cargo's SemVer identity for one crate version.
 ///
@@ -842,6 +1028,76 @@ fn parse_pep440_local(local: &str) -> Option<Vec<Pep440LocalSegment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_identity_matches_version_parser_normalize() {
+        for (raw, normalized) in [
+            ("1.0.0", "1.0.0.0"),
+            ("v1.0.0", "1.0.0.0"),
+            ("1.0", "1.0.0.0"),
+            ("1.0.0+Build.7", "1.0.0.0"),
+            (" 1.0.0 ", "1.0.0.0"),
+            ("10.4.13beta.2", "10.4.13.0-beta2"),
+            ("1.0.0-rC15-dev", "1.0.0.0-RC15-dev"),
+            ("1.0.0.pl3-dev", "1.0.0.0-patch3-dev"),
+            ("2010-01-02-10-20-30.5", "2010.01.02.10.20.30.5"),
+            ("20100102.x-dev", "20100102.9999999.9999999.9999999-dev"),
+            ("master", "dev-master"),
+            ("DEV-FOOBAR", "dev-FOOBAR"),
+            ("dev-feature+issue-1", "dev-feature+issue-1"),
+            ("dev-master as 1.0.0", "dev-master"),
+            ("1.0.0+foo@dev", "1.0.0.0"),
+            ("00.01.03.04", "00.01.03.04"),
+        ] {
+            assert_eq!(
+                composer_version_normalized(raw).as_deref(),
+                Some(normalized),
+                "{raw}"
+            );
+            assert_eq!(
+                composer_version_key(raw).as_deref(),
+                Some(normalized),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_composer_spelling_has_no_protocol_identity_key() {
+        for invalid in [
+            "",
+            "legacy row",
+            "1.0.0-meh",
+            "1.0.0.0.0",
+            "feature-foo",
+            "1.0.0+foo bar",
+            "1.0 .2",
+            "~1",
+            "^1",
+            "1.*",
+            "١.٠.٠",
+        ] {
+            assert!(
+                composer_version_key(invalid).is_none(),
+                "{invalid:?} parsed as a Composer version"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_composer_identity_is_stably_compressed() {
+        let first_spelling = format!("dev-{}", "a".repeat(300));
+        let second_spelling = format!("dev-{}b", "a".repeat(299));
+        let first = composer_version_key(&first_spelling).unwrap();
+        assert_eq!(first, composer_version_key(&first_spelling).unwrap());
+        assert!(first.starts_with("sha256:"), "{first}");
+        assert_eq!(first.len(), 71);
+        assert_ne!(first, composer_version_key(&second_spelling).unwrap());
+        assert_eq!(
+            composer_version_normalized(&first_spelling).unwrap(),
+            first_spelling
+        );
+    }
 
     fn rubygems(value: &str) -> String {
         RubyGemsVersion::parse(value)

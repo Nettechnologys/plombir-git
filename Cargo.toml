@@ -169,6 +169,7 @@ zip = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 semver = "1"
+regex = "1"
 home = "0.5"
 fs2 = "0.4"
 
