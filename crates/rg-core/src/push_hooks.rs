@@ -937,6 +937,59 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
     }
 }
 
+/// Cancel active CI work whose branch or tag has just been deleted.
+///
+/// Branches and tags are deliberately treated alike. A `push` pipeline is
+/// recorded against the full ref, and once that ref is gone its verdict has no
+/// live subject; leaving it active still hands jobs to runners and can block a
+/// later recreation of the same ref through concurrency control. This is
+/// best-effort because the receive-pack update has already committed, but a
+/// failure is never silent: the common warning below is the operator's grep
+/// point for every deleted-ref cancellation failure (card_c7a79e67b001).
+async fn cancel_deleted_ref_pipelines(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    ref_name: &str,
+    ref_kind: &str,
+) {
+    let active =
+        match rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(db, repo_id, ref_name).await {
+            Ok(pipelines) => pipelines,
+            Err(error) => {
+                tracing::warn!(
+                    repo_id,
+                    ref_name,
+                    ref_kind,
+                    error = %format!("{error:#}"),
+                    "deleted git ref left CI work running"
+                );
+                return;
+            }
+        };
+
+    for pipeline in active {
+        match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline.id).await {
+            Ok(true) => tracing::info!(
+                repo_id,
+                pipeline_id = pipeline.id,
+                ref_name,
+                ref_kind,
+                "canceled CI work for a deleted git ref"
+            ),
+            // Another completion/cancellation won after the active-list read.
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                repo_id,
+                pipeline_id = pipeline.id,
+                ref_name,
+                ref_kind,
+                error = %format!("{error:#}"),
+                "deleted git ref left CI work running"
+            ),
+        }
+    }
+}
+
 /// Sections 2–3 of the post-push hook: fire the generic `push` webhook, the
 /// branch/tag create/delete webhooks, and the real-time push notification.
 async fn trigger_push_webhooks(
@@ -996,6 +1049,7 @@ async fn trigger_push_webhooks(
             || update.new_sha == "0000000000000000000000000000000000000000"
         {
             // Branch deleted
+            cancel_deleted_ref_pipelines(params.db, repo_id, &update.refname, "branch").await;
             let payload = serde_json::json!({
                 "event": "branch.deleted",
                 "ref": branch_name,
@@ -1042,7 +1096,9 @@ async fn trigger_push_webhooks(
         } else if update.new_sha.is_empty()
             || update.new_sha == "0000000000000000000000000000000000000000"
         {
-            // Tag deleted
+            // Tag deletion is the same lifecycle boundary as branch deletion:
+            // active work against the full ref has lost its subject.
+            cancel_deleted_ref_pipelines(params.db, repo_id, &update.refname, "tag").await;
             let payload = serde_json::json!({
                 "event": "tag.deleted",
                 "ref": tag_name,
@@ -1155,6 +1211,191 @@ mod tests {
             .expect("run git");
         output.ensure_success().expect("git command succeeds");
         output.stdout_str().trim().to_string()
+    }
+
+    async fn deletion_target(
+        suffix: &str,
+    ) -> (DatabaseConnection, tempfile::TempDir, Arc<HookTarget>) {
+        let db = migrated_memory_database().await;
+        let sandbox = tempfile::tempdir().expect("create deleted-ref sandbox");
+        let repo_root = sandbox.path().join("repos");
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            &format!("ref-delete-{suffix}"),
+            &format!("ref-delete-{suffix}@example.invalid"),
+            "",
+            "Ref Delete",
+        )
+        .await
+        .expect("create repository owner");
+        let repo_name = format!("ref-delete-{suffix}");
+        let repo = crate::repo::service::create_repo(
+            &db, owner.id, &repo_name, None, false, &repo_root, None,
+        )
+        .await
+        .expect("create repository");
+        let repo_path = repo_root.join(format!("{}/{repo_name}.git", owner.username));
+        let target = Arc::new(HookTarget {
+            repo_id: repo.id,
+            owner_id: owner.id,
+            owner: owner.username,
+            name: repo_name,
+            path: repo_path,
+            default_branch: "main".to_string(),
+        });
+        (db, sandbox, target)
+    }
+
+    async fn active_ref_graph(
+        db: &DatabaseConnection,
+        repo_id: i64,
+        ref_name: &str,
+    ) -> (i64, i64, i64) {
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            db,
+            repo_id,
+            "1111111111111111111111111111111111111111",
+            ref_name,
+            "push",
+            None,
+        )
+        .await
+        .expect("create active pipeline");
+        let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+            .await
+            .expect("create active stage");
+        let job = rg_db::ops::pipeline_ops::create_job(
+            db, stage.id, "test", "echo ok", None, None, None, None, None, false, None, None, None,
+        )
+        .await
+        .expect("create active job");
+        (pipeline.id, stage.id, job.id)
+    }
+
+    async fn run_ref_deletion(db: &DatabaseConnection, target: &HookTarget, ref_name: &str) {
+        let ci = RecordingPrCi::new();
+        let smtp = None;
+        let tracker = crate::task_tracker::TaskTracker::new();
+        let repo_root = target
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .expect("target path is rooted under owner/repository");
+        let params = PostPushParams {
+            db,
+            repo_path: &target.path,
+            repo_root,
+            owner: &target.owner,
+            repo_name: &target.name,
+            pusher_id: None,
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            notifier: None,
+            smtp_config: &smtp,
+            ci_engine: &ci,
+            external_url: None,
+            delivery_tracker: &tracker,
+        };
+        trigger_push_webhooks(
+            &params,
+            target,
+            &RefUpdate {
+                old_sha: "1".repeat(40),
+                new_sha: "0".repeat(40),
+                refname: ref_name.to_string(),
+                status: "ok".to_string(),
+                message: String::new(),
+            },
+        )
+        .await;
+    }
+
+    async fn graph_statuses(
+        db: &DatabaseConnection,
+        pipeline_id: i64,
+        stage_id: i64,
+        job_id: i64,
+    ) -> (String, String, String) {
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
+            .await
+            .expect("reload pipeline")
+            .expect("pipeline still exists");
+        let stage = rg_db::ops::pipeline_ops::get_stage_by_id(db, stage_id)
+            .await
+            .expect("reload stage")
+            .expect("stage still exists");
+        let job = rg_db::ops::pipeline_ops::get_job(db, job_id)
+            .await
+            .expect("reload job")
+            .expect("job still exists");
+        (pipeline.status, stage.status, job.status)
+    }
+
+    /// A deleted branch or tag has ended the reason its ref-addressed `push`
+    /// work existed. Both decisions are explicit here: neither kind of ref may
+    /// leave schedulable jobs behind (card_c7a79e67b001).
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleting_a_branch_or_tag_cancels_its_active_pipeline_graph() {
+        let (db, _sandbox, target) = deletion_target("active").await;
+
+        for ref_name in ["refs/heads/feature", "refs/tags/v1.0.0"] {
+            let (pipeline_id, stage_id, job_id) =
+                active_ref_graph(&db, target.repo_id, ref_name).await;
+
+            run_ref_deletion(&db, &target, ref_name).await;
+
+            assert_eq!(
+                graph_statuses(&db, pipeline_id, stage_id, job_id).await,
+                (
+                    "canceled".to_string(),
+                    "canceled".to_string(),
+                    "canceled".to_string(),
+                ),
+                "deleting {ref_name} left part of its pipeline graph active"
+            );
+        }
+    }
+
+    /// A deletion is idempotent with respect to work that already produced a
+    /// verdict: the active-ref query must keep the cancellation primitive away
+    /// from the entire terminal graph.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleting_a_branch_leaves_a_terminal_pipeline_graph_unchanged() {
+        let (db, _sandbox, target) = deletion_target("terminal").await;
+        let ref_name = "refs/heads/finished";
+        let (pipeline_id, stage_id, job_id) = active_ref_graph(&db, target.repo_id, ref_name).await;
+        rg_db::ops::pipeline_ops::update_job_result(
+            &db,
+            job_id,
+            "success",
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("finish job");
+        rg_db::ops::pipeline_ops::update_stage_status(&db, stage_id, "success", None, None)
+            .await
+            .expect("finish stage");
+        rg_db::ops::pipeline_ops::update_pipeline_status(&db, pipeline_id, "success", None, None)
+            .await
+            .expect("finish pipeline");
+
+        run_ref_deletion(&db, &target, ref_name).await;
+
+        assert_eq!(
+            graph_statuses(&db, pipeline_id, stage_id, job_id).await,
+            (
+                "success".to_string(),
+                "success".to_string(),
+                "success".to_string(),
+            ),
+            "deleting a branch rewrote a verdict its pipeline already reached"
+        );
     }
 
     /// A delayed hook for A→B must reconcile the PR to the branch's current C,
