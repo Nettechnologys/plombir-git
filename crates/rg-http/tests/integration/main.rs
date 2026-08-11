@@ -71,6 +71,7 @@ mod git_http_failure_status_tests;
 mod global_id_anchor_guard;
 mod import_target_namespace_tests;
 mod import_token_tests;
+mod import_trusted_origin_tests;
 mod issue_lookup_failure_status_tests;
 mod issue_template_tests;
 mod issue_tests;

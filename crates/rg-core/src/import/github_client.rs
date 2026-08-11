@@ -190,11 +190,12 @@ impl GitHubClient {
         // Reuse the shared outbound builder so the import client inherits the
         // request + connect timeout — a slow/hanging import source (e.g. a
         // self-hosted GHES `base_url`) can't pin the import worker forever.
-        // Redirects keep reqwest's default (API hosts legitimately 3xx on a
-        // renamed repo); no `guard_outbound_url` — a private-IP GHES base_url is
-        // a legitimate admin-configured target.
+        // Same-origin redirects remain enabled (API hosts legitimately 3xx on
+        // a renamed repo), but a redirect may not move this credential to a
+        // different scheme, host, or port.
         let client = crate::net::outbound_client_builder()
             .default_headers(headers)
+            .redirect(super::trust::same_origin_redirect_policy(&base_url)?)
             .user_agent("ForgeKeep/0.1")
             .build()
             .context("failed to build GitHub HTTP client")?;
@@ -386,4 +387,84 @@ fn extract_next_link(link_header: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.expect("read request");
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: &str, headers: &str) {
+        let response =
+            format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_never_receives_the_bearer_token() {
+        let sink = TcpListener::bind("127.0.0.1:0").await.expect("bind sink");
+        let sink_addr = sink.local_addr().expect("sink address");
+        let source = TcpListener::bind("127.0.0.1:0").await.expect("bind source");
+        let source_addr = source.local_addr().expect("source address");
+
+        let sink_task = tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), sink.accept()).await {
+                Ok(Ok((mut stream, _))) => Some(read_headers(&mut stream).await),
+                _ => None,
+            }
+        });
+        let source_task = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.expect("accept source request");
+            let request = read_headers(&mut stream).await;
+            write_response(
+                &mut stream,
+                "302 Found",
+                &format!("Location: http://{sink_addr}/capture\r\n"),
+            )
+            .await;
+            request
+        });
+
+        let client = GitHubClient::new(
+            "private-import-token".to_owned(),
+            format!("http://{source_addr}"),
+        )
+        .expect("build client");
+        let error = client
+            .get_repo("team", "widgets")
+            .await
+            .expect_err("a blocked redirect remains a 302 API response");
+        assert!(format!("{error:#}").contains("302"));
+
+        let source_request = source_task.await.expect("source task");
+        assert!(
+            source_request.contains("Authorization: Bearer private-import-token")
+                || source_request.contains("authorization: Bearer private-import-token"),
+            "baseline: the configured API origin did not receive its token: {source_request}"
+        );
+        assert!(
+            sink_task.await.expect("sink task").is_none(),
+            "the cross-origin redirect was followed and could receive the PAT"
+        );
+    }
 }

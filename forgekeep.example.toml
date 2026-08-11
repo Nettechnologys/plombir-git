@@ -165,6 +165,18 @@ keep_last = 7
 # and is not is the failure worth being loud about) — schedule pg_dump /
 # mysqldump instead and leave this off.
 
+[imports]
+# Import source URLs are user-controlled and normally may not resolve to a
+# private, loopback, or link-local address. To import from an internal GitLab
+# or GitHub Enterprise Server, an administrator must opt in its exact HTTP(S)
+# origin here. Each value is scheme + host + optional port only: paths,
+# wildcards, userinfo, query strings, and fragments make startup fail.
+#
+# One origin covers both the repository clone path and that instance's API
+# path. It does NOT trust another port, host, scheme, or a redirect there.
+trusted_origins = []
+# trusted_origins = ["https://gitlab.internal.example:8443"]
+
 [mirror]
 # The background schedule that refreshes repository mirrors. A mirror is
 # configured per repository (Settings → Mirror) with its own interval; this

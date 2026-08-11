@@ -181,11 +181,11 @@ impl GitLabClient {
         // Reuse the shared outbound builder so the import client inherits the
         // request + connect timeout — a slow/hanging import source (e.g. a
         // self-hosted GitLab `base_url`) can't pin the import worker forever.
-        // Redirects keep reqwest's default; no `guard_outbound_url` — a
-        // private-IP self-hosted base_url is a legitimate admin-configured
-        // target.
+        // Same-origin redirects remain enabled, but a redirect may not move
+        // PRIVATE-TOKEN to a different scheme, host, or port.
         let client = crate::net::outbound_client_builder()
             .default_headers(headers)
+            .redirect(super::trust::same_origin_redirect_policy(&base_url)?)
             .user_agent("ForgeKeep/0.1")
             .build()
             .context("failed to build GitLab HTTP client")?;
@@ -379,5 +379,147 @@ fn urlencoding(s: &str) -> String {
     } else {
         // Path encoding: replace '/' with '%2F'
         s.replace('/', "%2F")
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.expect("read request");
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: &str, headers: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+    }
+
+    fn project_json() -> &'static str {
+        r#"{
+            "id": 1,
+            "name": "widgets",
+            "path_with_namespace": "team/widgets",
+            "visibility": "private",
+            "default_branch": "main",
+            "web_url": "https://gitlab.example/team/widgets",
+            "http_url_to_repo": "https://gitlab.example/team/widgets.git",
+            "namespace": {"id": 2, "name": "team", "path": "team", "kind": "group"}
+        }"#
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_never_receives_the_private_token() {
+        let sink = TcpListener::bind("127.0.0.1:0").await.expect("bind sink");
+        let sink_addr = sink.local_addr().expect("sink address");
+        let source = TcpListener::bind("127.0.0.1:0").await.expect("bind source");
+        let source_addr = source.local_addr().expect("source address");
+
+        let sink_task = tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), sink.accept()).await {
+                Ok(Ok((mut stream, _))) => {
+                    let request = read_headers(&mut stream).await;
+                    write_response(&mut stream, "200 OK", "", project_json()).await;
+                    Some(request)
+                }
+                _ => None,
+            }
+        });
+        let source_task = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.expect("accept source request");
+            let request = read_headers(&mut stream).await;
+            write_response(
+                &mut stream,
+                "302 Found",
+                &format!("Location: http://{sink_addr}/capture\r\n"),
+                "",
+            )
+            .await;
+            request
+        });
+
+        let client = GitLabClient::new(
+            "private-import-token".to_owned(),
+            format!("http://{source_addr}/api/v4"),
+        )
+        .expect("build client");
+        let error = client
+            .get_project("team/widgets")
+            .await
+            .expect_err("a blocked redirect remains a 302 API response");
+        assert!(format!("{error:#}").contains("302"));
+
+        let source_request = source_task.await.expect("source task");
+        assert!(
+            source_request.contains("PRIVATE-TOKEN: private-import-token")
+                || source_request.contains("private-token: private-import-token"),
+            "baseline: the configured API origin did not receive its token: {source_request}"
+        );
+        assert!(
+            sink_task.await.expect("sink task").is_none(),
+            "the cross-origin redirect was followed and could receive the PAT"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirects_still_work_and_keep_the_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind source");
+        let address = listener.local_addr().expect("source address");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("accept first request");
+            let first_request = read_headers(&mut first).await;
+            write_response(
+                &mut first,
+                "302 Found",
+                &format!("Location: http://{address}/renamed\r\n"),
+                "",
+            )
+            .await;
+
+            let (mut second, _) = listener.accept().await.expect("accept redirected request");
+            let second_request = read_headers(&mut second).await;
+            write_response(&mut second, "200 OK", "", project_json()).await;
+            (first_request, second_request)
+        });
+
+        let client = GitLabClient::new(
+            "private-import-token".to_owned(),
+            format!("http://{address}/api/v4"),
+        )
+        .expect("build client");
+        let project = client
+            .get_project("team/widgets")
+            .await
+            .expect("same-origin redirect");
+        assert_eq!(project.path_with_namespace, "team/widgets");
+
+        let (first, second) = server.await.expect("server task");
+        for request in [first, second] {
+            assert!(
+                request.contains("PRIVATE-TOKEN: private-import-token")
+                    || request.contains("private-token: private-import-token"),
+                "same-origin request lost its token: {request}"
+            );
+        }
     }
 }

@@ -362,12 +362,17 @@ pub(crate) async fn cmd_import(
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let (db_url, repo_root) = resolve_db_url_and_repo_root(db_url, repo_root, config)?;
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    let db_url = config::resolve_db_url(db_url, cfg.as_ref());
+    let repo_root = config::resolve_repo_root(repo_root, cfg.as_ref());
+    let trusted_import_origins = config::resolve_trusted_import_origins(cfg.as_ref())?;
 
     // SSRF guard (fast, DNS-free): reject an internal/loopback/metadata host or a
     // non-git transport (file://, ext::) before doing any work. The background
     // clone path re-checks with a full DNS-resolving guard.
-    rg_core::net::check_git_url_static(&source_url).context("invalid source URL")?;
+    trusted_import_origins
+        .check_url_static(&source_url)
+        .context("invalid source URL")?;
 
     // Resolve target name from source URL if not provided
     let target_repo_name = match target_name {
@@ -457,6 +462,7 @@ pub(crate) async fn cmd_import(
         !skip_releases,
         !skip_labels,
         !skip_milestones,
+        &trusted_import_origins,
         &repo_root,
     )
     .await?;

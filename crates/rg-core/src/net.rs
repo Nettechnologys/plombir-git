@@ -43,11 +43,11 @@ const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// - [`outbound_client`] adds `redirect(Policy::none())` + a webhook UA for
 ///   user-supplied webhook/mirror targets (paired with [`guard_outbound_url`]).
 /// - The import clients (`GitHubClient` / `GitLabClient`) add their per-instance
-///   auth headers (`Bearer` / `PRIVATE-TOKEN`) + UA. They deliberately keep the
-///   reqwest **default** redirect policy — API hosts legitimately 3xx (e.g. a
-///   renamed repo) — and do **not** run `guard_outbound_url`, because a
-///   self-hosted GitHub Enterprise / GitLab `base_url` on a private IP is a
-///   legitimate admin-configured target, exactly like an internal SSO IdP.
+///   auth headers (`Bearer` / `PRIVATE-TOKEN`) + UA. Their redirect policy keeps
+///   the default count limit but follows only the API base's exact origin, so a
+///   rename can work without moving the PAT to another host or port. Private
+///   self-hosted origins are admitted separately through the import admin
+///   trust policy, not through this generic HTTP builder.
 pub fn outbound_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(OUTBOUND_TIMEOUT)

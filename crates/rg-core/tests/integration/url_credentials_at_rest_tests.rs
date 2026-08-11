@@ -350,6 +350,7 @@ async fn an_import_source_url_is_stored_without_its_token() {
         false,
         false,
         false,
+        &Default::default(),
         dir.path(),
     )
     .await

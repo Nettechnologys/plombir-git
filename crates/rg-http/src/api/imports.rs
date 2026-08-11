@@ -136,7 +136,10 @@ pub async fn start_import(
     // source URL up front (DNS-free). The background clone path re-checks with a
     // full DNS-resolving guard, but this returns 400 immediately for file://,
     // ext::, and internal IP-literal hosts instead of a later async failure.
-    if let Err(e) = rg_core::net::check_git_url_static(&body.source_url) {
+    if let Err(e) = state
+        .trusted_import_origins
+        .check_url_static(&body.source_url)
+    {
         return AppError::bad_request(format!("invalid source URL: {e}")).into_response();
     }
 
@@ -158,6 +161,7 @@ pub async fn start_import(
         body.import_releases,
         body.import_labels,
         body.import_milestones,
+        &state.trusted_import_origins,
         &state.repo_root,
     )
     .await

@@ -110,6 +110,7 @@ pub async fn run_import(
     task: &ImportTask,
     repo_root: &Path,
     auth_token: Option<&str>,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
 
@@ -118,13 +119,15 @@ pub async fn run_import(
     // non-git transports (`file://`, `ext::`, …) before any subprocess runs —
     // the git twin of the mirror-sync guard. For GitLab this validates the
     // project URL; the actual API-derived clone URL is guarded again below.
-    crate::net::guard_git_url(&task.source_url).await?;
+    trusted_origins.guard_url(&task.source_url).await?;
 
     let auth_token = auth_token.unwrap_or("");
 
     match task.platform.as_str() {
         "github" => run_github_import(db, task, repo_root, auth_token, &mut stats).await?,
-        "gitlab" => run_gitlab_import(db, task, repo_root, auth_token, &mut stats).await?,
+        "gitlab" => {
+            run_gitlab_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+        }
         "gitea" | "git" => run_git_import(db, task, repo_root, auth_token, &mut stats).await?,
         other => anyhow::bail!("unsupported platform: {other}"),
     }
@@ -615,6 +618,7 @@ async fn run_gitlab_import(
     repo_root: &Path,
     token: &str,
     stats: &mut ImportStats,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
 ) -> Result<()> {
     // Parse the project identity and its API host together. Computing only the
     // path here used to leave the client's optional base URL at `None`, which
@@ -646,10 +650,11 @@ async fn run_gitlab_import(
         // the UI renders as "not started yet".
         update_stage(db, task.id, "cloning", 0, "Resolving source project...").await?;
         let project = client.get_project(&project_path).await?;
-        // The clone URL comes from the GitLab API response, not the user's
-        // source_url — re-guard it (a malicious/compromised instance could point
-        // `http_url_to_repo` at an internal host).
-        crate::net::guard_git_url(&project.http_url_to_repo).await?;
+        // The clone URL comes from the GitLab API response and receives the
+        // user's credential. It must remain on the source's exact origin; a
+        // second allowlisted origin is not authority to move this PAT there.
+        crate::import::trust::require_same_origin(&task.source_url, &project.http_url_to_repo)?;
+        trusted_origins.guard_url(&project.http_url_to_repo).await?;
         clone_into_target(
             db,
             task,
@@ -2269,6 +2274,7 @@ pub async fn start_import(
     import_releases: bool,
     import_labels: bool,
     import_milestones: bool,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
     repo_root: &Path,
 ) -> Result<ImportTask> {
     let now = Utc::now();
@@ -2329,6 +2335,7 @@ pub async fn start_import(
     // Spawn background task
     let db_clone = db.clone();
     let repo_root_clone = repo_root.to_path_buf();
+    let trusted_origins = trusted_origins.clone();
     tokio::spawn(async move {
         // These two are the last writes the task will ever get — there is no
         // caller left to notice a failure and no later pass that revisits the
@@ -2339,6 +2346,7 @@ pub async fn start_import(
             &task_clone,
             &repo_root_clone,
             auth_token.as_deref(),
+            &trusted_origins,
         )
         .await
         {
@@ -2944,6 +2952,7 @@ mod import_target_lifecycle_tests {
             false,
             false,
             false,
+            &Default::default(),
             repo_root.path(),
         )
         .await
@@ -2970,6 +2979,7 @@ mod import_target_lifecycle_tests {
             false,
             false,
             false,
+            &Default::default(),
             repo_root.path(),
         )
         .await

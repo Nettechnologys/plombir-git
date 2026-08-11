@@ -300,14 +300,19 @@ as an HTTP client of the ForgeKeep REST API and authenticates with a PAT.
 ## 8. Configuration
 
 Configuration is resolved as **CLI args > config file > defaults**. The config
-file is TOML (`forgekeep.toml`; see `forgekeep.example.toml` for all sections:
-`server`, `database`, `auth`, `ci`, `rate_limit`, `smtp`, `tls`, `logging`,
-`audit`, `backup`). The model and the resolution live in `rg-cli/src/config.rs` and are
+file is TOML (`forgekeep.toml`; see `forgekeep.example.toml` for the operator
+template). Model sections include `server`, `database`, `auth`, `ci`, `releases`,
+`rate_limit`, `smtp`, `tls`, `logging`, `audit`, `backup`, `mirror`, `imports`,
+`timeouts`, `webhooks`, and `observability`. The model and the resolution live in
+`rg-cli/src/config.rs` and are
 shared by **every** subcommand, not just `serve`: `migrate`, `rebuild-fts`,
 `backup-db`, `restore-db`, `create-repo`, `import`, `index-repo` and
 `package list` all take `--config` and read `[database].url` /
-`[server].repo_root` through the same two functions the server uses, so an admin
-command can never silently address a different database than the running server.
+`[server].repo_root` through the same functions the server uses; `import` also
+reads `[imports].trusted_origins`, so an operator-only private-origin exception
+is identical in server and one-shot import modes. An admin command therefore
+cannot silently address a different database or import trust boundary than the
+running server.
 Correspondingly, **no flag that has a config-file equivalent may carry a clap
 `default_value`** — a clap default is indistinguishable from a value the operator
 typed, so it makes the config key unreachable; the built-in defaults live in

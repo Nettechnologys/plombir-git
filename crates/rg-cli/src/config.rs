@@ -44,6 +44,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) mirror: MirrorConfig,
     #[serde(default)]
+    pub(crate) imports: ImportConfig,
+    #[serde(default)]
     pub(crate) timeouts: TimeoutConfig,
     #[serde(default)]
     pub(crate) webhooks: WebhooksConfig,
@@ -257,6 +259,17 @@ pub(crate) struct MirrorConfig {
     pub(crate) enabled: Option<bool>,
     pub(crate) poll_interval_secs: Option<u64>,
     pub(crate) batch_size: Option<u64>,
+}
+
+/// `[imports]` — operator-owned trust exceptions for private self-hosted
+/// GitHub Enterprise and GitLab origins.
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportConfig {
+    /// Exact HTTP(S) origins (`scheme://host[:port]`) allowed to bypass the
+    /// private-address SSRF rejection. Paths and wildcards are rejected.
+    #[serde(default)]
+    pub(crate) trusted_origins: Vec<String>,
 }
 
 /// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
@@ -488,6 +501,18 @@ pub(crate) fn resolve_package_upload_max_bytes(cfg: Option<&ConfigFile>) -> anyh
     })
 }
 
+/// Parse the exact admin-managed origins consumed by both `serve` and the
+/// one-shot `forgekeep import --config ...` command.
+pub(crate) fn resolve_trusted_import_origins(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_core::import::trust::TrustedImportOrigins> {
+    let values = cfg
+        .map(|config| config.imports.trusted_origins.as_slice())
+        .unwrap_or_default();
+    rg_core::import::trust::TrustedImportOrigins::parse(values)
+        .context("invalid config `[imports].trusted_origins`")
+}
+
 /// `--db-url` > `[database].url` > [`DEFAULT_DB_URL`].
 ///
 /// The single resolution point for the database URL, used both by `serve` (via
@@ -685,6 +710,41 @@ mod tests {
                 "[{section}] error does not name misspelled key {key}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn trusted_import_origins_are_parsed_from_the_operator_config() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[imports]
+trusted_origins = ["http://127.0.0.1:8443"]
+"#,
+        )
+        .expect("parse config");
+
+        let trusted =
+            super::resolve_trusted_import_origins(Some(&config)).expect("parse trusted origins");
+        trusted
+            .check_url_static("http://127.0.0.1:8443/group/project.git")
+            .expect("configured private origin");
+        assert!(trusted
+            .check_url_static("http://127.0.0.1:9443/group/project.git")
+            .is_err());
+    }
+
+    #[test]
+    fn malformed_trusted_import_origin_fails_config_resolution() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[imports]
+trusted_origins = ["https://*.internal.example"]
+"#,
+        )
+        .expect("the TOML shape itself is valid");
+
+        let error = super::resolve_trusted_import_origins(Some(&config))
+            .expect_err("wildcard trust must fail");
+        assert!(format!("{error:#}").contains("[imports].trusted_origins"));
     }
 
     /// `[server].repo_root` / `[database].url` from the config file were parsed
