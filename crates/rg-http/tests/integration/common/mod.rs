@@ -429,9 +429,23 @@ pub async fn spawn_test_app_with_routes_and_db() -> (
     Vec<rg_http::route_table::RouteFact>,
     rg_db::DatabaseConnection,
 ) {
+    let (base, facts, db, _repo_root) = spawn_test_app_with_routes_and_db_and_repo_root().await;
+    (base, facts, db)
+}
+
+/// The route-table harness plus the exact repository root used by its server.
+/// Artifact metadata tests need that root to stage bytes under the owning job.
+#[allow(dead_code)]
+pub async fn spawn_test_app_with_routes_and_db_and_repo_root() -> (
+    String,
+    Vec<rg_http::route_table::RouteFact>,
+    rg_db::DatabaseConnection,
+    std::path::PathBuf,
+) {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).ok();
+    let returned_repo_root = repo_root.clone();
     let state = build_test_app_state(db.clone(), repo_root);
     let (app, facts) = rg_http::create_router_for_test_with_routes(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -442,7 +456,7 @@ pub async fn spawn_test_app_with_routes_and_db() -> (
         axum::serve(listener, app).await.unwrap();
     });
     wait_for_listener(&addr.to_string()).await;
-    (base_url, facts, db)
+    (base_url, facts, db, returned_repo_root)
 }
 
 /// Spawn the test app and keep the db handle alive for tests that need
@@ -761,6 +775,7 @@ pub async fn seed_artifact(
     base: &str,
     client: &reqwest::Client,
     db: &rg_db::DatabaseConnection,
+    repo_root: &std::path::Path,
     repo: i64,
     runner_name: &str,
 ) -> i64 {
@@ -790,23 +805,59 @@ pub async fn seed_artifact(
         .await
         .expect("assign job");
 
-    let response = client
-        .post(format!(
-            "{base}/api/v1/runners/{}/jobs/{}/artifacts",
-            runner.id, job.id
-        ))
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", "report.txt")
-        .body("artifact bytes")
-        .send()
-        .await
-        .expect("upload artifact");
+    let response = upload_artifact_metadata(
+        base,
+        client,
+        repo_root,
+        runner.id,
+        job.id,
+        &runner_token,
+        "report.txt",
+        b"artifact bytes",
+    )
+    .await;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     assert_eq!(status, 201, "the fixture artifact was not uploaded: {body}");
     serde_json::from_str::<serde_json::Value>(&body).expect("upload json")["id"]
         .as_i64()
         .expect("artifact id")
+}
+
+/// Stage bytes where the runner and server share job storage, then publish only
+/// bounded JSON metadata through the runner route. Artifact bytes deliberately
+/// never become an HTTP request body.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub async fn upload_artifact_metadata(
+    base: &str,
+    client: &reqwest::Client,
+    repo_root: &std::path::Path,
+    runner_id: i64,
+    job_id: i64,
+    runner_token: &str,
+    name: &str,
+    bytes: &[u8],
+) -> reqwest::Response {
+    let job_root = repo_root
+        .join("_artifacts")
+        .join("jobs")
+        .join(job_id.to_string());
+    std::fs::create_dir_all(&job_root).expect("create staged artifact job root");
+    let staged = job_root.join(name);
+    std::fs::write(&staged, bytes).expect("stage artifact bytes");
+
+    client
+        .post(format!(
+            "{base}/api/v1/runners/{runner_id}/jobs/{job_id}/artifacts"
+        ))
+        .bearer_auth(runner_token)
+        .json(&serde_json::json!({
+            "name": name,
+            "file_path": staged,
+        }))
+        .send()
+        .await
+        .expect("upload artifact metadata")
 }
 
 /// Assert a blob finalize answered `201`, and say what it answered instead.

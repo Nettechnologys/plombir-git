@@ -300,10 +300,13 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
                 req = req.json(&serde_json::json!({"status": "success", "exit_code": 0}));
             }
             if *suffix == "artifacts" {
-                req = req
-                    .header("x-artifact-name", "a.txt")
-                    .header("x-artifact-path", "a.txt")
-                    .body("artifact-bytes");
+                // The artifact endpoint accepts metadata only. The path is
+                // deliberately unusable: job ownership must reject this
+                // runner before artifact metadata is interpreted.
+                req = req.json(&serde_json::json!({
+                    "name": "a.txt",
+                    "file_path": "/definitely-not-this-job/a.txt",
+                }));
             }
             let resp = req.send().await.unwrap();
             let status = resp.status();

@@ -1,6 +1,5 @@
 //! REST API handlers for CI Artifacts.
 
-use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -17,6 +16,11 @@ use crate::api::repo_access::{AnchoredRead, AnchoredWrite, RepoAnchor, RepoRead}
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::ToSchema;
+
+/// Artifact uploads carry metadata only. The artifact bytes are staged by the
+/// runner under this job's private storage directory and never cross the HTTP
+/// request boundary.
+pub(crate) const ARTIFACT_METADATA_MAX_BYTES: usize = 64 * 1024;
 
 // ── Access ─────────────────────────────────────────────
 
@@ -140,7 +144,10 @@ pub struct UploadArtifactResponse {
 // ── Handlers ───────────────────────────────────────────
 
 /// POST /api/v1/runners/:id/jobs/:job_id/artifacts
-/// Upload an artifact for a job.
+/// Publish an artifact already staged in this job's private storage directory.
+/// Raw artifact bodies are intentionally unsupported: accepting them would
+/// either inherit Axum's hidden 2 MiB extractor limit or buffer an artifact-sized
+/// allocation in the HTTP process.
 /// Auth handled by `authenticate_runner` middleware.
 #[utoipa::path(
     post,
@@ -150,17 +157,21 @@ pub struct UploadArtifactResponse {
         ("id" = i64, Path, description = "Runner ID"),
         ("job_id" = i64, Path, description = "Job ID"),
     ),
-    request_body(content = UploadArtifactRequest, description = "Artifact metadata"),
+    request_body(
+        content = UploadArtifactRequest,
+        description = "Artifact metadata (maximum 64 KiB); file_path must name a file already staged under this job's private artifact directory"
+    ),
     responses(
         (status = 201, description = "Artifact created", body = UploadArtifactResponse),
+        (status = 400, description = "Invalid artifact metadata", body = serde_json::Value),
+        (status = 413, description = "Artifact metadata exceeds 64 KiB"),
         (status = 404, description = "Job not found", body = serde_json::Value),
     ),
 )]
 pub async fn upload_artifact(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
-    headers: HeaderMap,
-    body: Bytes,
+    Json(request): Json<UploadArtifactRequest>,
 ) -> impl IntoResponse {
     // Verify job belongs to this runner. The same helper the runner routes use,
     // so a job that is not this runner's is answered exactly as an unknown id is
@@ -180,7 +191,7 @@ pub async fn upload_artifact(
         Err(error) => return AppError::from(error).into_response(),
     };
 
-    let upload = match parse_artifact_upload(&state, job_id, &headers, &body).await {
+    let upload = match persist_artifact_upload(&state, job_id, request).await {
         Ok(upload) => upload,
         Err(e) => return e.into_response(),
     };
@@ -469,73 +480,42 @@ struct ParsedArtifactUpload {
     sha256: Option<String>,
 }
 
-async fn parse_artifact_upload(
+async fn persist_artifact_upload(
     state: &AppState,
     job_id: i64,
-    headers: &HeaderMap,
-    body: &Bytes,
+    request: UploadArtifactRequest,
 ) -> Result<ParsedArtifactUpload, AppError> {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if content_type.starts_with("application/json") {
-        let req: UploadArtifactRequest =
-            serde_json::from_slice(body).map_err(|e| AppError::bad_request(e.to_string()))?;
-        let file_path = PathBuf::from(req.file_path);
-        let job_root = artifact_root(state).join("jobs").join(job_id.to_string());
-        if !is_path_under(&file_path, &job_root) {
-            return Err(AppError::bad_request(
-                "artifact metadata path must reference an existing file in this job's storage",
-            ));
-        }
-        // Reporting every errno as "does not exist" sends the runner after the
-        // wrong problem when the file is there but unreadable.
-        let size = tokio::fs::metadata(&file_path)
-            .await
-            .map_err(|error| artifact_metadata_file_error(&file_path, &error))?
-            .len() as i64;
-        let name = sanitize_artifact_name(&req.name);
-        // Stream the digest over the referenced file instead of buffering it in
-        // memory — the metadata path exists precisely to avoid loading the whole
-        // artifact into the request body.
-        let sha256 = hash_file(&file_path)
-            .await
-            .map_err(|error| artifact_metadata_file_error(&file_path, &error))?;
-        let key = artifact_key(job_id, &name).map_err(AppError::bad_request)?;
-        state
-            .blob_storage
-            .put_file(&key, &file_path)
-            .await
-            .map_err(AppError::internal)?;
-        return Ok(ParsedArtifactUpload {
-            name,
-            storage_path: key.to_string(),
-            size,
-            sha256: Some(sha256),
-        });
+    let file_path = PathBuf::from(request.file_path);
+    let job_root = artifact_root(state).join("jobs").join(job_id.to_string());
+    if !is_path_under(&file_path, &job_root) {
+        return Err(AppError::bad_request(
+            "artifact metadata path must reference an existing file in this job's storage",
+        ));
     }
-
-    if body.is_empty() {
-        return Err(AppError::bad_request("artifact upload body is empty"));
-    }
-
-    let name = artifact_name_from_headers(headers).unwrap_or_else(|| "artifact.bin".to_string());
-    let safe_name = sanitize_artifact_name(&name);
-    // The raw body is already in memory here, so hash it directly.
-    let sha256 = hex::encode(Sha256::digest(body));
-    let key = artifact_key(job_id, &safe_name).map_err(AppError::bad_request)?;
-    let stored = state
+    // Reporting every errno as "does not exist" sends the runner after the
+    // wrong problem when the file is there but unreadable.
+    let size = tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|error| artifact_metadata_file_error(&file_path, &error))?
+        .len() as i64;
+    let name = sanitize_artifact_name(&request.name);
+    // Stream the digest over the referenced file instead of buffering it in
+    // memory — the metadata path exists precisely to avoid loading the whole
+    // artifact into the request body.
+    let sha256 = hash_file(&file_path)
+        .await
+        .map_err(|error| artifact_metadata_file_error(&file_path, &error))?;
+    let key = artifact_key(job_id, &name).map_err(AppError::bad_request)?;
+    state
         .blob_storage
-        .put(&key, body)
+        .put_file(&key, &file_path)
         .await
         .map_err(AppError::internal)?;
 
     Ok(ParsedArtifactUpload {
-        name: safe_name,
+        name,
         storage_path: key.to_string(),
-        size: stored.size as i64,
+        size,
         sha256: Some(sha256),
     })
 }
@@ -849,30 +829,6 @@ impl ArtifactDeletionStaging {
 
 fn artifact_root(state: &AppState) -> PathBuf {
     state.repo_root.join("_artifacts")
-}
-
-fn artifact_name_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(name) = headers
-        .get("x-artifact-name")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return Some(name.to_string());
-    }
-
-    headers
-        .get(header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_filename_from_disposition)
-}
-
-fn parse_filename_from_disposition(value: &str) -> Option<String> {
-    value.split(';').find_map(|part| {
-        let part = part.trim();
-        let filename = part.strip_prefix("filename=")?;
-        Some(filename.trim_matches('"').to_string())
-    })
 }
 
 fn sanitize_artifact_name(name: &str) -> String {

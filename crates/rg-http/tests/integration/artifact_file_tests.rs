@@ -1,6 +1,8 @@
 use crate::common::answer::Answer;
 use crate::common::fault::spawn_test_app_for_fault_sweep;
-use crate::common::{register_full, spawn_test_app_with_db};
+use crate::common::{
+    register_full, spawn_test_app_with_db_and_repo_root, upload_artifact_metadata,
+};
 use sea_orm::{ActiveModelTrait, Set};
 use sha2::{Digest, Sha256};
 
@@ -76,8 +78,8 @@ async fn delete_answer(client: &reqwest::Client, url: &str, token: Option<&str>)
 }
 
 #[tokio::test]
-async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
-    let (base, db) = spawn_test_app_with_db().await;
+async fn artifact_metadata_upload_crosses_two_mib_and_download_respects_repo_read() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
     let client = reqwest::Client::new();
     let (owner_token, _owner_id) =
         register_full(&base, "artifact_owner", "artifact_owner@example.com").await;
@@ -113,17 +115,18 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
         200
     );
 
-    let upload_resp = client
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/artifacts",
-            base, runner.id, job_id
-        ))
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", "report.txt")
-        .body("artifact bytes")
-        .send()
-        .await
-        .unwrap();
+    let artifact_bytes = vec![b'a'; 2 * 1024 * 1024 + 1];
+    let upload_resp = upload_artifact_metadata(
+        &base,
+        &client,
+        &repo_root,
+        runner.id,
+        job_id,
+        &runner_token,
+        "report.txt",
+        &artifact_bytes,
+    )
+    .await;
     let upload_status = upload_resp.status();
     let upload_body = upload_resp.text().await.unwrap();
     assert_eq!(upload_status, 201, "upload failed: {upload_body}");
@@ -137,7 +140,8 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
     assert!(stored.file_path.starts_with("artifacts/jobs/"));
     assert!(!std::path::Path::new(&stored.file_path).is_absolute());
     // Upload records a SHA-256 digest of the artifact bytes.
-    let expected_sha = hex::encode(Sha256::digest(b"artifact bytes"));
+    assert_eq!(stored.size, artifact_bytes.len() as i64);
+    let expected_sha = hex::encode(Sha256::digest(&artifact_bytes));
     assert_eq!(stored.sha256.as_deref(), Some(expected_sha.as_str()));
     assert_eq!(expected_sha.len(), 64);
 
@@ -174,7 +178,7 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
     );
     assert_eq!(
         owner_download.bytes().await.unwrap().as_ref(),
-        b"artifact bytes"
+        artifact_bytes.as_slice()
     );
 
     let list_resp = client
@@ -208,6 +212,81 @@ async fn artifact_raw_upload_persists_file_and_download_respects_repo_read() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// The artifact route has one wire format: bounded JSON metadata. A valid
+/// runner cannot fall through to an undocumented raw-body upload, and an
+/// unauthenticated request is rejected before its oversized body is examined.
+#[tokio::test]
+async fn artifact_upload_rejects_raw_bodies_and_authenticates_before_the_metadata_ceiling() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _) =
+        register_full(&base, "artifact_contract", "artifact_contract@example.com").await;
+    let repo_id = create_private_repo(&base, &owner_token, "artifact-contract").await;
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        "artifact-contract-runner",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (_, job_id) = create_assigned_job(&db, repo_id, runner.id).await;
+    let upload_url = format!(
+        "{base}/api/v1/runners/{}/jobs/{job_id}/artifacts",
+        runner.id
+    );
+
+    let raw = client
+        .post(&upload_url)
+        .bearer_auth(&runner_token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body("artifact bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.status(),
+        415,
+        "raw artifact uploads are no longer a contract"
+    );
+
+    let job_root = repo_root
+        .join("_artifacts")
+        .join("jobs")
+        .join(job_id.to_string());
+    std::fs::create_dir_all(&job_root).unwrap();
+    let staged = job_root.join("bounded.txt");
+    std::fs::write(&staged, "artifact bytes").unwrap();
+    let oversized_metadata = serde_json::json!({
+        "name": "bounded.txt",
+        "file_path": staged,
+        "padding": "x".repeat(64 * 1024),
+    });
+
+    let unauthenticated = client
+        .post(&upload_url)
+        .json(&oversized_metadata)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated.status(),
+        401,
+        "runner authentication must run before the body ceiling"
+    );
+
+    let oversized = client
+        .post(&upload_url)
+        .bearer_auth(&runner_token)
+        .json(&oversized_metadata)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), 413, "metadata ceiling is not enforced");
 }
 
 /// The runner's JSON upload points at a file the server already staged under
@@ -305,7 +384,7 @@ async fn artifact_metadata_upload_separates_missing_files_from_storage_failures(
 /// denials cannot be a dead fixture reported as a passing security test.
 #[tokio::test]
 async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
     let client = reqwest::Client::new();
     let (owner_token, _owner_id) = register_full(
         &base,
@@ -333,17 +412,17 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
     let (other_pipeline_id, _other_job_id) =
         create_assigned_job(&db, other_repo_id, runner.id).await;
 
-    let upload = client
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/artifacts",
-            base, runner.id, job_id
-        ))
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", "report.txt")
-        .body("artifact bytes")
-        .send()
-        .await
-        .unwrap();
+    let upload = upload_artifact_metadata(
+        &base,
+        &client,
+        &repo_root,
+        runner.id,
+        job_id,
+        &runner_token,
+        "report.txt",
+        b"artifact bytes",
+    )
+    .await;
     assert_eq!(upload.status(), 201);
     let artifact_id = upload.json::<serde_json::Value>().await.unwrap()["id"]
         .as_i64()
@@ -475,17 +554,17 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
     // of second answer that reinstates the oracle one level below the status
     // code. So `admit` runs *after* the gate: the outsider is told what an
     // absent id is told, the owner is told why.
-    let second_upload = client
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/artifacts",
-            base, runner.id, job_id
-        ))
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", "aged.txt")
-        .body("stale bytes")
-        .send()
-        .await
-        .unwrap();
+    let second_upload = upload_artifact_metadata(
+        &base,
+        &client,
+        &repo_root,
+        runner.id,
+        job_id,
+        &runner_token,
+        "aged.txt",
+        b"stale bytes",
+    )
+    .await;
     assert_eq!(second_upload.status(), 201);
     let aged_id = second_upload.json::<serde_json::Value>().await.unwrap()["id"]
         .as_i64()

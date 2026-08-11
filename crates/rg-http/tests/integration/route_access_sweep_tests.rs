@@ -93,7 +93,7 @@ use rg_http::route_table::{Access, RouteFact};
 use crate::common::source_scan::anchored_handler_targets;
 use crate::common::{
     create_issue, register_user, seed_artifact, spawn_test_app_with_routes,
-    spawn_test_app_with_routes_and_db,
+    spawn_test_app_with_routes_and_db_and_repo_root,
 };
 
 const PW: &str = "Qz7$wRtm";
@@ -2180,7 +2180,7 @@ async fn every_route_answers_its_declared_access_level() {
     // repository is resolved out of an artifact, and an artifact needs a runner,
     // a pipeline, a stage and a job under it — a walk this harness exposes no
     // API for.
-    let (base, facts, db) = spawn_test_app_with_routes_and_db().await;
+    let (base, facts, db, repo_root) = spawn_test_app_with_routes_and_db_and_repo_root().await;
     // No cookie jar: every persona is identified by the bearer token this test
     // attaches, never by a `Set-Cookie` a previous request happened to leave
     // behind.
@@ -2255,7 +2255,15 @@ async fn every_route_answers_its_declared_access_level() {
     // want of a row, and a wall of `404`s satisfies `Expect::Hidden` while
     // proving nothing about the gate behind it.
     let seeded = Seeded {
-        artifact: seed_artifact(&fx.base, &fx.client, &db, private_repo_id, "sweep-runner").await,
+        artifact: seed_artifact(
+            &fx.base,
+            &fx.client,
+            &db,
+            &repo_root,
+            private_repo_id,
+            "sweep-runner",
+        )
+        .await,
     };
     // The anchored baseline, taken before the passes for the reason the
     // repository one is: a fixture whose artifact never uploaded would answer

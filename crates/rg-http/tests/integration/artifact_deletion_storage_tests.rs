@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::common::{
     create_repo,
     fault::{fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite, FaultSweepApp},
-    register_full,
+    register_full, upload_artifact_metadata,
 };
 
 /// Publish one artifact through the real runner upload route and hand back its
@@ -51,17 +51,18 @@ async fn upload_artifact(
         .await
         .expect("assign job");
 
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/artifacts",
-            app.base, runner.id, job.id
-        ))
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", name)
-        .body(format!("bytes of {name}"))
-        .send()
-        .await
-        .expect("upload artifact");
+    let client = reqwest::Client::new();
+    let response = upload_artifact_metadata(
+        &app.base,
+        &client,
+        &app.repo_root,
+        runner.id,
+        job.id,
+        &runner_token,
+        name,
+        format!("bytes of {name}").as_bytes(),
+    )
+    .await;
     assert_eq!(response.status(), 201, "artifact upload failed");
     let artifact_id = response.json::<Value>().await.unwrap()["id"]
         .as_i64()

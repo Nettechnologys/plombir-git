@@ -852,6 +852,11 @@ pub(crate) fn build_all_routes(
     // It stays a credential wrapper — the limit rides along, it does not
     // replace the check the route declares.
     let runner_auth_1gb = Wrap::runner_auth_with_body_limit(state, 1024 * 1024 * 1024);
+    // Artifact bytes are staged out of band; only their small JSON metadata is
+    // accepted here. Keep that wire contract explicit instead of inheriting
+    // Axum's unrelated 2 MiB default.
+    let runner_auth_artifact_metadata =
+        Wrap::runner_auth_with_body_limit(state, api::artifacts::ARTIFACT_METADATA_MAX_BYTES);
     // Raised body limits for the routes that carry an upload. Only the
     // body-carrying method of a resource takes one; a limit on its `GET`
     // sibling never applied to anything.
@@ -2264,7 +2269,7 @@ pub(crate) fn build_all_routes(
             RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/artifacts",
             api::artifacts::upload_artifact,
-            &runner_auth,
+            &runner_auth_artifact_metadata,
         )
         // ── Artifacts ──────────────────────────────────────────────────────
         .get(

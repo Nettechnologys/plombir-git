@@ -2653,20 +2653,18 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
             .await
             .unwrap();
     let job_id = create_assigned_job(&app.db, repo_id, runner.id).await;
-    let artifacts_url = format!(
-        "{}/api/v1/runners/{}/jobs/{}/artifacts",
-        app.base, runner.id, job_id
-    );
-
     let fault = fail_db_writes(&app.db, "artifacts", DbWrite::Insert).await;
-    let failed = client
-        .post(&artifacts_url)
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", "report.txt")
-        .body(b"forgekeep-artifact-bytes".to_vec())
-        .send()
-        .await
-        .unwrap();
+    let failed = crate::common::upload_artifact_metadata(
+        &app.base,
+        &client,
+        &app.repo_root,
+        runner.id,
+        job_id,
+        &runner_token,
+        "report.txt",
+        b"forgekeep-artifact-bytes",
+    )
+    .await;
     assert_eq!(
         failed.status(),
         500,
@@ -2682,14 +2680,17 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
     // recorded, so the emptiness above is the rollback and not a path that
     // never stored anything to begin with.
     fault.clear().await;
-    let accepted = client
-        .post(&artifacts_url)
-        .bearer_auth(&runner_token)
-        .header("x-artifact-name", "report.txt")
-        .body(b"forgekeep-artifact-bytes".to_vec())
-        .send()
-        .await
-        .unwrap();
+    let accepted = crate::common::upload_artifact_metadata(
+        &app.base,
+        &client,
+        &app.repo_root,
+        runner.id,
+        job_id,
+        &runner_token,
+        "report.txt",
+        b"forgekeep-artifact-bytes",
+    )
+    .await;
     assert_eq!(
         accepted.status(),
         201,

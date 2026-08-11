@@ -345,10 +345,10 @@ async fn drive_http(fx: &Fixture, fact: &RouteFact, url: &str, token: Option<&st
         request = request.json(&serde_json::json!({"status": "success", "exit_code": 0}));
     }
     if url.ends_with("/artifacts") {
-        request = request
-            .header("x-artifact-name", "a.txt")
-            .header("x-artifact-path", "a.txt")
-            .body("artifact-bytes");
+        request = request.json(&serde_json::json!({
+            "name": "a.txt",
+            "file_path": "/definitely-not-this-job/a.txt",
+        }));
     }
     Answer::of(request.send().await.expect("foreign-scope probe")).await
 }

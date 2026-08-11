@@ -71,7 +71,9 @@ use rg_http::route_table::RouteFact;
 
 use crate::common::answer::Answer;
 use crate::common::source_scan::{anchored_aliases, anchored_handlers, handler_type_name, Anchor};
-use crate::common::{register_full, seed_artifact, spawn_test_app_with_routes_and_db};
+use crate::common::{
+    register_full, seed_artifact, spawn_test_app_with_routes_and_db_and_repo_root,
+};
 
 const OWNER: &str = "anchorowner";
 const OUTSIDER: &str = "anchoroutsider";
@@ -238,7 +240,7 @@ struct Probe<'a> {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn no_anchored_route_confirms_a_row_of_a_private_repository() {
-    let (base, facts, db) = spawn_test_app_with_routes_and_db().await;
+    let (base, facts, db, repo_root) = spawn_test_app_with_routes_and_db_and_repo_root().await;
     let (owner_token, _owner_id) =
         register_full(&base, OWNER, &format!("{OWNER}@example.com")).await;
     let (outsider_token, _outsider_id) =
@@ -251,7 +253,7 @@ async fn no_anchored_route_confirms_a_row_of_a_private_repository() {
     };
     let repo = create_private_repo(&fx, VAULT).await;
     let seeded = Seeded {
-        artifact: seed_artifact(&fx.base, &fx.client, &db, repo, "anchor-runner").await,
+        artifact: seed_artifact(&fx.base, &fx.client, &db, &repo_root, repo, "anchor-runner").await,
     };
 
     assert!(
