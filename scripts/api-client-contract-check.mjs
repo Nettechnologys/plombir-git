@@ -3,9 +3,11 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
+import { loadUtoipaPaths } from './lib/rust-source.mjs';
+
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
 const OPENAPI_SPEC_FILE = process.env.OPENAPI_SPEC_FILE || process.env.OPENAPI_SPEC_PATH || '';
-const OPENAPI_SOURCE_DIR = process.env.OPENAPI_SOURCE_DIR || 'crates/rg-http/src';
+const OPENAPI_SOURCE_DIR = process.env.OPENAPI_SOURCE_DIR || 'crates/rg-http/src/api';
 const OPENAPI_BASE_PATH = process.env.OPENAPI_BASE_PATH || '/api/v1';
 const OPENAPI_URL = `${BACKEND_URL}/api-docs/openapi.json`;
 const CLIENT_SOURCE = process.env.CLIENT_FILES || 'web/src/lib/api';
@@ -469,7 +471,6 @@ function resolveClientSources(rawSources) {
 
 function loadOpenApiFromRustSource() {
   const paths = {};
-  const files = [];
   let rootStat;
 
   try {
@@ -484,72 +485,23 @@ function loadOpenApiFromRustSource() {
     return null;
   }
 
-  function walk(currentDir) {
-    const entries = readdirSync(currentDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name.startsWith('.')) {
-        continue;
-      }
-      const full = path.join(currentDir, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === 'target') {
-          continue;
-        }
-        walk(full);
-        continue;
-      }
-      if (entry.isFile() && entry.name.endsWith('.rs')) {
-        files.push(full);
-      }
+  for (const annotation of loadUtoipaPaths(OPENAPI_SOURCE_DIR).values()) {
+    if (annotation.method === null || annotation.path === null) {
+      throw new Error(
+        `${annotation.file}:${annotation.line}: could not read ` +
+          `${annotation.method === null ? 'the method' : 'path = "…"'} from #[utoipa::path(...)]`,
+      );
     }
+
+    const method = annotation.method.toLowerCase();
+    const normalizedPath = normalizeOpenApiPath(annotation.path);
+    paths[normalizedPath] = paths[normalizedPath] || {};
+    paths[normalizedPath][method] = {
+      requestBody: null,
+    };
   }
 
-  walk(OPENAPI_SOURCE_DIR);
-
-  if (files.length === 0) {
-    console.log(`⚠️  No .rs files found in ${OPENAPI_SOURCE_DIR}`);
-    return null;
-  }
-
-  for (const file of files) {
-    const src = readFileSync(file, 'utf8');
-    let cursor = 0;
-    const startToken = '#[utoipa::path(';
-    while (true) {
-      const start = src.indexOf(startToken, cursor);
-      if (start === -1) break;
-
-      let i = start + startToken.length;
-      let depth = 1;
-      while (i < src.length && depth > 0) {
-        if (src[i] === '(') {
-          depth += 1;
-        } else if (src[i] === ')') {
-          depth -= 1;
-        }
-        i += 1;
-      }
-
-      const body = src.slice(start + startToken.length, i - 1);
-      cursor = i;
-
-      const methodMatch = body.match(/^\s*([a-zA-Z]+)\s*,/);
-      const pathMatch = body.match(/path\s*=\s*['"]([^'\"]+)['"]/);
-      if (!methodMatch || !pathMatch) {
-        continue;
-      }
-
-      const method = methodMatch[1].toLowerCase();
-      const normalizedPath = normalizeOpenApiPath(pathMatch[1]);
-      if (!normalizedPath) continue;
-      paths[normalizedPath] = paths[normalizedPath] || {};
-      paths[normalizedPath][method] = {
-        requestBody: null,
-      };
-    }
-  }
-
-  return Object.keys(paths).length > 0 ? { paths } : null;
+  return { paths };
 }
 
 function splitSegments(pathSource) {

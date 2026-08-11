@@ -3,6 +3,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { stripRustNonCode } from './rust-consumer-contract.mjs';
+
 /**
  * Extract the block matched by `re`, or record a failure and return `null`.
  *
@@ -706,6 +708,20 @@ function attributeCallBody(body, key) {
  * document's claims with the handler input without maintaining a handler list.
  */
 export function parseUtoipaPaths(source, modulePath, file) {
+  // Search only executable Rust tokens: an annotation-shaped example in a
+  // comment or string must not create a parser failure. A near-miss opener is
+  // still evidence that the source form changed, though, and silently dropping
+  // it would weaken every coverage check built on this parser.
+  const code = stripRustNonCode(source);
+  const unsupportedOpener = /#\[utoipa::path\b(?!\()/g.exec(code);
+  if (unsupportedOpener) {
+    const line = code.slice(0, unsupportedOpener.index).split('\n').length;
+    throw new Error(
+      `${file}:${line}: unsupported #[utoipa::path] opener; expected #[utoipa::path(...)]. ` +
+        'Fix parseUtoipaPaths() in scripts/lib/rust-source.mjs rather than letting the annotation disappear.',
+    );
+  }
+
   const src = stripRustComments(source);
   const rows = [];
   const token = '#[utoipa::path(';
