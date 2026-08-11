@@ -123,9 +123,20 @@ async fn stage_package_upload(
     let mut stream = body.into_data_stream();
     let mut len = 0_usize;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            AppError::bad_request(format!("failed to read package upload body: {error}"))
-        })?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let inner = error.into_inner();
+                if crate::body_limit::is_length_limit_error(&*inner) {
+                    return Err(AppError::payload_too_large(
+                        "package upload exceeds the configured request-body limit",
+                    ));
+                }
+                return Err(AppError::bad_request(format!(
+                    "failed to read package upload body: {inner}"
+                )));
+            }
+        };
         len = len
             .checked_add(chunk.len())
             .filter(|size| *size <= max_bytes)
@@ -206,6 +217,51 @@ mod package_upload_staging_tests {
             .unwrap()
             .count();
         assert_eq!(entries, 0, "a refused upload left a staging file behind");
+    }
+
+    #[tokio::test]
+    async fn chunked_transport_overflow_is_413_and_leaves_no_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let chunks = futures::stream::iter([
+            Ok::<_, Infallible>(axum::body::Bytes::from_static(b"123")),
+            Ok::<_, Infallible>(axum::body::Bytes::from_static(b"45")),
+        ]);
+        let body = Body::from_stream(chunks);
+        let limited = Body::new(http_body_util::Limited::new(body, 4));
+
+        let error = stage_package_upload(limited, root.path(), 10)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.to_string().contains("configured request-body limit"));
+        assert_eq!(
+            std::fs::read_dir(root.path().join(".tmp/package-uploads"))
+                .unwrap()
+                .count(),
+            0,
+            "a refused chunked upload left a staging file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_body_failure_stays_400_and_leaves_no_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let body = Body::from_stream(futures::stream::once(async {
+            Err::<axum::body::Bytes, _>(std::io::Error::other("connection reset"))
+        }));
+
+        let error = stage_package_upload(body, root.path(), 10)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(error.to_string().contains("connection reset"));
+        assert_eq!(
+            std::fs::read_dir(root.path().join(".tmp/package-uploads"))
+                .unwrap()
+                .count(),
+            0,
+            "a failed body read left a staging file behind"
+        );
     }
 }
 

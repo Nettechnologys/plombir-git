@@ -2,6 +2,7 @@
 //!
 //! Implements the LFS batch API and object upload/download endpoints.
 
+use anyhow::Context as _;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -507,14 +508,10 @@ pub async fn upload_object(
                 Err(e) => AppError::from(e).into_response(),
             }
         }
-        // A body that stopped mid-stream leaves a partial `.tmp_<oid>` sized by
-        // however much arrived. `store_object_from_file` takes ownership of the
-        // staging file, but it never ran, so this is the only place left that
-        // can retire it — and nothing else ever will: no DB row points at it.
-        Err(e) => {
-            discard_file_async("LFS staging file", &temp_path).await;
-            AppError::from(e).into_response()
-        }
+        // `write_body_to_file` retires a partial `.tmp_<oid>` before returning
+        // this error; keep the typed cause until this HTTP boundary classifies
+        // a declared ceiling separately from an ordinary transport failure.
+        Err(e) => lfs_body_error(e).into_response(),
     }
 }
 
@@ -782,6 +779,14 @@ struct StagedLfsUpload {
     sha256: String,
 }
 
+fn lfs_body_error(error: anyhow::Error) -> AppError {
+    if crate::body_limit::is_length_limit_error(error.as_ref()) {
+        AppError::payload_too_large("LFS upload exceeds the configured request-body limit")
+    } else {
+        AppError::from(error)
+    }
+}
+
 /// Stream an Axum `Body` to a file, returning its size and SHA-256.
 ///
 /// This is the write path of every `git lfs push`: the staging path is derived
@@ -796,44 +801,59 @@ async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Resul
         .await
         .map_err(|error| staged(&error))?;
 
-    use futures::StreamExt;
-    let mut written: usize = 0;
-    let mut hasher = Sha256::new();
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
-        file.write_all(&data)
-            .await
-            .map_err(|error| staged(&error))?;
-        hasher.update(&data);
-        written += data.len();
+    let result = async {
+        use futures::StreamExt;
+        let mut written: usize = 0;
+        let mut hasher = Sha256::new();
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            // Preserve the typed `axum::Error` as the source. Formatting it
+            // here loses the nested `LengthLimitError` before the handler can
+            // distinguish a declared ceiling from an ordinary I/O failure.
+            let data = chunk
+                .map_err(anyhow::Error::new)
+                .context("body stream error")?;
+            file.write_all(&data)
+                .await
+                .map_err(|error| staged(&error))?;
+            hasher.update(&data);
+            written += data.len();
+        }
+
+        // `tokio::fs::File` buffers: `write_all` returns once the bytes are queued
+        // for the blocking pool, not once they are in the file, and dropping the
+        // handle does not wait for that queue either. The caller hands this path
+        // straight to `store_object_from_file`, which opens it with `std::fs` and
+        // compresses whatever is there — so under load the object that reaches
+        // blob storage is the upload minus however much had not landed yet, while
+        // `written` (counted here, in memory) says the whole thing arrived.
+        //
+        // Nothing downstream would notice. The row records `written` as the
+        // object's size, the upload answers `200`, and LFS never hashes the bytes
+        // against the `oid` they are filed under, so a truncated object is
+        // indistinguishable from a good one until somebody clones. The same
+        // missing `flush` cost the OCI registry a three-day flake, where it was at
+        // least loud (`sol_07eb75f8fb62`).
+        file.flush().await.map_err(|error| staged(&error))?;
+
+        Ok(StagedLfsUpload {
+            written,
+            sha256: hex::encode(hasher.finalize()),
+        })
     }
+    .await;
 
-    // `tokio::fs::File` buffers: `write_all` returns once the bytes are queued
-    // for the blocking pool, not once they are in the file, and dropping the
-    // handle does not wait for that queue either. The caller hands this path
-    // straight to `store_object_from_file`, which opens it with `std::fs` and
-    // compresses whatever is there — so under load the object that reaches
-    // blob storage is the upload minus however much had not landed yet, while
-    // `written` (counted here, in memory) says the whole thing arrived.
-    //
-    // Nothing downstream would notice. The row records `written` as the
-    // object's size, the upload answers `200`, and LFS never hashes the bytes
-    // against the `oid` they are filed under, so a truncated object is
-    // indistinguishable from a good one until somebody clones. The same
-    // missing `flush` cost the OCI registry a three-day flake, where it was at
-    // least loud (`sol_07eb75f8fb62`).
-    file.flush().await.map_err(|error| staged(&error))?;
-
-    Ok(StagedLfsUpload {
-        written,
-        sha256: hex::encode(hasher.finalize()),
-    })
+    drop(file);
+    if result.is_err() {
+        discard_file_async("LFS staging file", path).await;
+    }
+    result
 }
 
 #[cfg(test)]
 mod staging_path_tests {
     use super::*;
+    use axum::body::Bytes;
 
     /// Every `git lfs push` stages its object at
     /// `<owner>.lfs/<repo>/.tmp_<oid>`. A bare `?` on the io error left the
@@ -858,6 +878,39 @@ mod staging_path_tests {
         );
         assert!(rendered.contains("LFS staging file"), "{rendered}");
         assert!(rendered.contains("<owner>.lfs/<repo>/"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn chunked_transport_overflow_is_413_and_removes_the_partial_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("partial-lfs-upload");
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"123")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"45")),
+        ]));
+        let limited = Body::new(http_body_util::Limited::new(body, 4));
+
+        let error = write_body_to_file(limited, &path).await.unwrap_err();
+        let response = lfs_body_error(error).into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!path.exists(), "a refused LFS upload left a spool behind");
+    }
+
+    #[tokio::test]
+    async fn ordinary_body_failure_stays_500_and_removes_the_partial_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("failed-lfs-upload");
+        let body = Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"prefix")),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+
+        let error = write_body_to_file(body, &path).await.unwrap_err();
+        let response = lfs_body_error(error).into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!path.exists(), "a failed LFS upload left a spool behind");
     }
 
     /// The upload handler used to discard the result of creating this

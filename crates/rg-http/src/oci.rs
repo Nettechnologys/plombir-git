@@ -61,6 +61,22 @@ fn oci_err(status: StatusCode, code: &str, message: &str) -> Response {
     (status, oci_error_body(code, message)).into_response()
 }
 
+fn oci_body_error(error: anyhow::Error) -> Response {
+    if crate::body_limit::is_length_limit_error(error.as_ref()) {
+        oci_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_codes::SIZE_INVALID,
+            "OCI upload exceeds the configured request-body limit",
+        )
+    } else {
+        oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!("{error:#}"),
+        )
+    }
+}
+
 /// The envelope on its own, for the responses that carry a header of their own
 /// alongside it (see [`oci_unauthorized`]).
 fn oci_error_body(code: &str, message: &str) -> Json<ErrorResponse> {
@@ -1758,11 +1774,7 @@ pub async fn chunk_upload(
                     &uuid,
                     recorded_size,
                 ),
-                Err(error) => oci_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "UNKNOWN",
-                    &format!("{error:#}"),
-                ),
+                Err(error) => oci_body_error(error),
             };
         }
         // New bytes must start at the first byte the session has not accepted.
@@ -1847,11 +1859,7 @@ pub async fn chunk_upload(
 
             upload_progress_response(StatusCode::ACCEPTED, &owner, &repo, &uuid, total_size)
         }
-        Err(e) => oci_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("{e:#}"),
-        ),
+        Err(error) => oci_body_error(error),
     }
 }
 
@@ -1999,7 +2007,9 @@ async fn body_matches_staged_range(
     let mut stream = body.into_data_stream();
     let mut remaining = range.len();
     while let Some(chunk) = stream.next().await {
-        let data = chunk.map_err(|error| anyhow::anyhow!("body stream error: {error}"))?;
+        let data = chunk
+            .map_err(anyhow::Error::new)
+            .context("body stream error")?;
         if data.len() as i64 > remaining {
             return Ok(false);
         }
@@ -2024,7 +2034,9 @@ async fn upload_body_is_empty(body: Body) -> anyhow::Result<bool> {
     use futures::StreamExt;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
-        let data = chunk.map_err(|error| anyhow::anyhow!("body stream error: {error}"))?;
+        let data = chunk
+            .map_err(anyhow::Error::new)
+            .context("body stream error")?;
         if !data.is_empty() {
             return Ok(false);
         }
@@ -2152,13 +2164,7 @@ pub async fn complete_upload(
                         recorded,
                     );
                 }
-                Err(error) => {
-                    return oci_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "UNKNOWN",
-                        &format!("{error:#}"),
-                    );
-                }
+                Err(error) => return oci_body_error(error),
             }
         }
         // A gap or a partial overlap is out of order. Refuse it before reading
@@ -2183,13 +2189,7 @@ pub async fn complete_upload(
                 Some(_) => false,
                 None => match upload_body_is_empty(body).await {
                     Ok(is_empty) => is_empty,
-                    Err(error) => {
-                        return oci_err(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "UNKNOWN",
-                            &format!("{error:#}"),
-                        );
-                    }
+                    Err(error) => return oci_body_error(error),
                 },
             };
             if !is_empty {
@@ -2220,23 +2220,11 @@ pub async fn complete_upload(
                     ),
                 );
             }
-            Err(error) => {
-                return oci_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "UNKNOWN",
-                    &format!("{error:#}"),
-                );
-            }
+            Err(error) => return oci_body_error(error),
         },
         None => match stream_body_to_file(body, &file_path).await {
             Ok(staged) => staged,
-            Err(error) => {
-                return oci_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "UNKNOWN",
-                    &format!("{error:#}"),
-                );
-            }
+            Err(error) => return oci_body_error(error),
         },
     };
 
@@ -2373,6 +2361,7 @@ pub async fn complete_upload(
 /// between two requests and one that was written twice both come back with a
 /// `total` that reads perfectly well on its own — see the invariant in
 /// [`complete_upload`].
+#[derive(Debug)]
 struct StagedWrite {
     /// Whether the staging file was already there when this request opened it.
     ///
@@ -2384,6 +2373,52 @@ struct StagedWrite {
     written: i64,
     /// Size of the staging file after the append.
     total: i64,
+}
+
+/// Restore exactly the staging state that existed before one failed append.
+/// A successful rollback returns the original typed body/I/O error. A failed
+/// rollback deliberately becomes a new internal error: answering 413 while
+/// staging no longer matches the acknowledged offset would hide server damage
+/// behind the client's oversized request.
+async fn rollback_staged_append(
+    mut file: tokio::fs::File,
+    file_path: &std::path::Path,
+    existed: bool,
+    original_len: u64,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let mut failures = Vec::new();
+    if let Err(rollback_error) = file.flush().await {
+        failures.push(format!("flush before rollback failed: {rollback_error}"));
+    }
+
+    if existed {
+        if let Err(rollback_error) = file.set_len(original_len).await {
+            failures.push(format!(
+                "truncate back to {original_len} byte(s) failed: {rollback_error}"
+            ));
+        }
+        drop(file);
+    } else {
+        drop(file);
+        if let Err(rollback_error) = tokio::fs::remove_file(file_path).await {
+            if rollback_error.kind() != std::io::ErrorKind::NotFound {
+                failures.push(format!(
+                    "remove newly-created staging file failed: {rollback_error}"
+                ));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        error
+    } else {
+        anyhow::anyhow!(
+            "failed to roll back OCI staging file {}: {}; original upload failure: {error:#}",
+            file_path.display(),
+            failures.join("; ")
+        )
+    }
 }
 
 /// Stream an Axum `Body` to a file, appending to any existing content.
@@ -2412,15 +2447,27 @@ async fn stream_body_to_file(
         .open(file_path)
         .await
         .map_err(|error| staged(&error))?;
+    let original_len = file.metadata().await.map_err(|error| staged(&error))?.len();
 
     use futures::StreamExt;
     let mut stream = body.into_data_stream();
     let mut written = 0_i64;
     while let Some(chunk) = stream.next().await {
-        let data = chunk.map_err(|e| anyhow::anyhow!("body stream error: {}", e))?;
-        file.write_all(&data)
-            .await
-            .map_err(|error| staged(&error))?;
+        let data = match chunk {
+            Ok(data) => data,
+            Err(error) => {
+                let error = anyhow::Error::new(error).context("body stream error");
+                return Err(
+                    rollback_staged_append(file, file_path, existed, original_len, error).await,
+                );
+            }
+        };
+        if let Err(error) = file.write_all(&data).await {
+            let error = staged(&error);
+            return Err(
+                rollback_staged_append(file, file_path, existed, original_len, error).await,
+            );
+        }
         written += data.len() as i64;
     }
 
@@ -2431,9 +2478,20 @@ async fn stream_body_to_file(
     // and that number is both the `Range` the client resumes from and the
     // `bytes_uploaded` recorded for the session. The client then re-sends bytes
     // it already sent, and the push dies at the digest — as the client's fault.
-    file.flush().await.map_err(|error| staged(&error))?;
+    if let Err(error) = file.flush().await {
+        let error = staged(&error);
+        return Err(rollback_staged_append(file, file_path, existed, original_len, error).await);
+    }
 
-    let total = file.metadata().await.map_err(|error| staged(&error))?.len() as i64;
+    let total = match file.metadata().await {
+        Ok(metadata) => metadata.len() as i64,
+        Err(error) => {
+            let error = staged(&error);
+            return Err(
+                rollback_staged_append(file, file_path, existed, original_len, error).await,
+            );
+        }
+    };
     Ok(StagedWrite {
         existed,
         written,
@@ -2508,6 +2566,97 @@ fn get_base_url(headers: &HeaderMap) -> String {
             format!("{}://{}", scheme, host)
         })
         .unwrap_or_else(|| "http://localhost".into())
+}
+
+#[cfg(test)]
+mod upload_body_error_tests {
+    use super::*;
+    use axum::body::Bytes;
+
+    fn limited_body(chunks: &'static [&'static [u8]], max: usize) -> Body {
+        let chunks = chunks
+            .iter()
+            .map(|chunk| Ok::<_, std::convert::Infallible>(Bytes::from_static(chunk)));
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        Body::new(http_body_util::Limited::new(body, max))
+    }
+
+    #[tokio::test]
+    async fn chunked_overflow_is_413_and_restores_the_acknowledged_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("upload");
+        tokio::fs::write(&path, b"acknowledged").await.unwrap();
+
+        let error = stream_body_to_file(limited_body(&[b"12", b"34"], 3), &path)
+            .await
+            .unwrap_err();
+        let response = oci_body_error(error);
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"acknowledged");
+    }
+
+    #[tokio::test]
+    async fn chunked_overflow_removes_a_staging_file_created_by_the_failed_append() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new-upload");
+
+        let error = stream_body_to_file(limited_body(&[b"12", b"34"], 3), &path)
+            .await
+            .unwrap_err();
+        let response = oci_body_error(error);
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !path.exists(),
+            "overflow left a new OCI staging file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_body_failure_stays_500_and_restores_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("upload");
+        tokio::fs::write(&path, b"acknowledged").await.unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+
+        let error = stream_body_to_file(body, &path).await.unwrap_err();
+        let response = oci_body_error(error);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"acknowledged");
+    }
+
+    #[tokio::test]
+    async fn read_only_body_probes_preserve_the_length_limit_type() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("upload");
+        tokio::fs::write(&path, b"abcdef").await.unwrap();
+
+        let range_error = body_matches_staged_range(
+            limited_body(&[b"a", b"b"], 1),
+            &path,
+            UploadContentRange { start: 0, end: 5 },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            oci_body_error(range_error).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let empty_error = upload_body_is_empty(limited_body(&[b"x"], 0))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            oci_body_error(empty_error).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abcdef");
+    }
 }
 
 #[cfg(test)]

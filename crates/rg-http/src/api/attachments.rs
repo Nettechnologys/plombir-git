@@ -1,5 +1,6 @@
 //! Issue, pull-request and comment attachment APIs.
 
+use axum::extract::multipart::{Field, MultipartError};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -442,6 +443,63 @@ fn upload_path_error(what: &str, path: &std::path::Path, error: &std::io::Error)
     ))
 }
 
+fn attachment_body_error(error: MultipartError) -> AppError {
+    if crate::body_limit::is_length_limit_error(&error) {
+        AppError::payload_too_large("attachment exceeds the configured request-body limit")
+    } else {
+        AppError::bad_request(error)
+    }
+}
+
+/// Consume one attachment field into its request-private spool. Any failed
+/// read retires the partial file before the typed body error reaches the HTTP
+/// boundary.
+async fn stage_attachment_field(
+    mut field: Field<'_>,
+    upload_path: &std::path::Path,
+) -> Result<u64, AppError> {
+    let mut upload = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(upload_path)
+        .await
+        .map_err(|error| upload_path_error("attachment staging file", upload_path, &error))?;
+
+    let result = async {
+        let mut size = 0_u64;
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) => return Err(attachment_body_error(error)),
+            };
+            size = match size.checked_add(chunk.len() as u64) {
+                Some(size) if size <= rg_core::attachment::MAX_ATTACHMENT_SIZE as u64 => size,
+                _ => {
+                    return Err(AppError::payload_too_large(
+                        "attachment exceeds the 100 MiB file limit",
+                    ));
+                }
+            };
+            upload.write_all(&chunk).await.map_err(|error| {
+                upload_path_error("attachment staging file", upload_path, &error)
+            })?;
+        }
+        upload
+            .flush()
+            .await
+            .map_err(|error| upload_path_error("attachment staging file", upload_path, &error))?;
+        Ok(size)
+    }
+    .await;
+
+    drop(upload);
+    if result.is_err() {
+        discard_file_async("attachment staging file", upload_path).await;
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 /// `user_id` arrives from the handler's [`RepoAuthRead`] argument, so the
 /// session is required *before* axum hands this function a `Multipart` to read.
@@ -474,12 +532,12 @@ async fn create(
         return AppError::forbidden("write access denied").into_response();
     }
 
-    let mut field = loop {
+    let field = loop {
         match multipart.next_field().await {
             Ok(Some(field)) if field.name() == Some("attachment") => break field,
             Ok(Some(_)) => continue,
             Ok(None) => return AppError::bad_request("missing attachment field").into_response(),
-            Err(error) => return AppError::bad_request(error).into_response(),
+            Err(error) => return attachment_body_error(error).into_response(),
         }
     };
     let filename = query
@@ -496,51 +554,10 @@ async fn create(
             .into_response();
     }
     let upload_path = upload_dir.join(format!("{}.upload", uuid::Uuid::new_v4()));
-    let mut upload = match tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&upload_path)
-        .await
-    {
-        Ok(upload) => upload,
-        Err(error) => {
-            return upload_path_error("attachment staging file", &upload_path, &error)
-                .into_response();
-        }
+    let size = match stage_attachment_field(field, &upload_path).await {
+        Ok(size) => size,
+        Err(error) => return error.into_response(),
     };
-    let mut size = 0_u64;
-    loop {
-        let chunk = match field.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(error) => {
-                drop(upload);
-                discard_file_async("attachment staging file", &upload_path).await;
-                return AppError::bad_request(error).into_response();
-            }
-        };
-        size = match size.checked_add(chunk.len() as u64) {
-            Some(size) if size <= rg_core::attachment::MAX_ATTACHMENT_SIZE as u64 => size,
-            _ => {
-                drop(upload);
-                discard_file_async("attachment staging file", &upload_path).await;
-                return AppError::bad_request("attachment exceeds the 100 MiB file limit")
-                    .into_response();
-            }
-        };
-        if let Err(error) = upload.write_all(&chunk).await {
-            drop(upload);
-            discard_file_async("attachment staging file", &upload_path).await;
-            return upload_path_error("attachment staging file", &upload_path, &error)
-                .into_response();
-        }
-    }
-    if let Err(error) = upload.flush().await {
-        drop(upload);
-        discard_file_async("attachment staging file", &upload_path).await;
-        return upload_path_error("attachment staging file", &upload_path, &error).into_response();
-    }
-    drop(upload);
 
     let result = rg_core::attachment::create_attachment_from_file(
         &state.db,
@@ -843,6 +860,8 @@ fn response(
 #[cfg(test)]
 mod upload_path_error_tests {
     use super::*;
+    use axum::extract::FromRequest;
+    use std::convert::Infallible;
 
     /// The staging path is `repo_root/.tmp/attachments/<uuid>.upload`, built
     /// from a freshly generated UUID inside the handler: it appears in neither
@@ -891,5 +910,47 @@ mod upload_path_error_tests {
         );
         assert!(rendered.contains("attachment file"), "{rendered}");
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn chunked_multipart_overflow_is_413_and_removes_the_partial_spool() {
+        const BOUNDARY: &str = "forgekeep-boundary";
+        let head = axum::body::Bytes::from_static(
+            b"--forgekeep-boundary\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"report.txt\"\r\nContent-Type: text/plain\r\n\r\nabc",
+        );
+        let tail = axum::body::Bytes::from_static(b"de\r\n--forgekeep-boundary--\r\n");
+        let transport_limit = head.len() + 1;
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender.send(Ok::<_, Infallible>(head)).await.unwrap();
+        let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        let body = Body::new(http_body_util::Limited::new(body, transport_limit));
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(body)
+            .unwrap();
+        let mut multipart = Multipart::from_request(request, &()).await.unwrap();
+        let field = tokio::time::timeout(std::time::Duration::from_secs(1), multipart.next_field())
+            .await
+            .expect("multipart headers should not wait for the next body frame")
+            .unwrap()
+            .unwrap();
+        sender.send(Ok(tail)).await.unwrap();
+        drop(sender);
+        let root = tempfile::tempdir().unwrap();
+        let upload_path = root.path().join("partial.upload");
+
+        let error = stage_attachment_field(field, &upload_path)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.to_string().contains("configured request-body limit"));
+        assert!(
+            !upload_path.exists(),
+            "a refused multipart upload left its partial spool behind"
+        );
     }
 }
